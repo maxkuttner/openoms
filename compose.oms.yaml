@@ -1,0 +1,30 @@
+services:
+  oms-migrate:
+    build:
+      context: .
+    environment:
+      DATABASE_URL: postgres://oms_user:oms_password@postgres:5432/oms_db
+    command: ["/app/rustoms", "migrate"]
+    restart: "no"
+    networks:
+      - gogeling-net
+
+  oms:
+    build:
+      context: .
+    environment:
+      DATABASE_URL: postgres://oms_user:oms_password@postgres:5432/oms_db
+      OMS_BIND_ADDR: 0.0.0.0:3000
+      # Kafka runs as shared infra; see `kafka/compose.yaml`
+      KAFKA_BROKER: broker:19092
+      KAFKA_TOPIC: orders
+      KAFKA_CLIENT_ID: rust-oms
+      KAFKA_PROJECTOR_GROUP_ID: position-projector-v1
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - gogeling-net
+
+networks:
+  gogeling-net:
+    external: true
