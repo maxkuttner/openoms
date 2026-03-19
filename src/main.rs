@@ -35,6 +35,7 @@ async fn main() {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
     let mode = env::args().nth(1);
+    
 
     let db_url = match env::var("DATABASE_URL") {
         Ok(v) if !v.is_empty() => v,
@@ -63,12 +64,6 @@ async fn main() {
         return;
     }
 
-    if let Err(err) = db::verify_oms_contract(&pool).await {
-        error!("OMS contract verification failed: {}", err);
-        std::process::exit(1);
-    }
-    info!("OMS contract verification passed");
-
     let kafka_config = match kafka::KafkaConfig::from_env() {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -85,12 +80,16 @@ async fn main() {
         }
     };
     info!("Connected to Kafka");
-
+    
+    // if positions projector shall be used;
     let enable_position_projector = matches!(
         env::var("OMS_ENABLE_POSITION_PROJECTOR").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE")
     );
-
+    
+    // ... start positions projector kafka client process to 
+    // listen for certain events and apply
+    // rpojections to the db positions
     if enable_position_projector {
         let projector_pool = pool.clone();
         let projector_kafka_config = kafka_config.clone();

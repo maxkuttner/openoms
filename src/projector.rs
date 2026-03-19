@@ -48,12 +48,14 @@ pub async fn run_position_projector(
                 continue;
             }
         };
-
+        
+        // do nothing if event is not broker acknoledge
         if event.event_type != "broker_ack" {
             let _ = consumer.commit_message(&msg, CommitMode::Async);
             continue;
         }
-
+        
+        //
         let Some(fill_price) = event.order.price else {
             warn!(
                 order_id = event.order_id,

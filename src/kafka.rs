@@ -49,7 +49,8 @@ impl KafkaConfig {
     pub fn create_producer_client(&self) -> Result<KafkaClient, KafkaError> {
         KafkaClient::new(self)
     }
-
+    
+    // return a projector
     pub fn create_projector_consumer(&self) -> Result<StreamConsumer, KafkaError> {
         let consumer_client_id = format!("{}-projector", self.client_id);
         let consumer: StreamConsumer = self

@@ -1,112 +1,6 @@
 use crate::models::{Account, Connector, Order};
 use sqlx::{PgPool, Row};
 
-pub async fn verify_oms_contract(pool: &PgPool) -> Result<(), String> {
-    let tables_ok: bool = sqlx::query_scalar(
-        r#"
-        SELECT
-            EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'orders')
-        AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_events')
-        AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_fills')
-        AND EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'order_event_store')
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("Failed contract table check: {e}"))?;
-
-    if !tables_ok {
-        return Err(
-            "OMS tables missing (orders/order_events/order_fills/order_event_store)".to_string(),
-        );
-    }
-
-    let unique_client_order_key_ok: bool = sqlx::query_scalar(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.table_constraints tc
-            JOIN information_schema.key_column_usage kcu
-                ON tc.constraint_name = kcu.constraint_name
-               AND tc.table_schema = kcu.table_schema
-            WHERE tc.table_schema = 'public'
-              AND tc.table_name = 'orders'
-              AND tc.constraint_type = 'UNIQUE'
-            GROUP BY tc.constraint_name
-            HAVING
-                COUNT(*) = 2
-                AND COUNT(*) FILTER (WHERE kcu.column_name = 'account_id') = 1
-                AND COUNT(*) FILTER (WHERE kcu.column_name = 'client_order_id') = 1
-        )
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("Failed idempotency key check: {e}"))?;
-
-    if !unique_client_order_key_ok {
-        return Err("Missing UNIQUE(account_id, client_order_id) on orders".to_string());
-    }
-
-    let orders_status_check_ok: bool = sqlx::query_scalar(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM pg_constraint c
-            WHERE c.contype = 'c'
-              AND c.conrelid = 'orders'::regclass
-              AND pg_get_constraintdef(c.oid) ILIKE '%received%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%validated%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%acknowledged%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%partially_filled%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%failed%'
-        )
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("Failed orders status constraint check: {e}"))?;
-
-    if !orders_status_check_ok {
-        return Err("Missing strict orders.status check constraint".to_string());
-    }
-
-    let events_contract_checks_ok: bool = sqlx::query_scalar(
-        r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM pg_constraint c
-            WHERE c.contype = 'c'
-              AND c.conrelid = 'order_events'::regclass
-              AND pg_get_constraintdef(c.oid) ILIKE '%order_received%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%broker_ack%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%validation_reject%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%seed_import%'
-        )
-        AND EXISTS (
-            SELECT 1
-            FROM pg_constraint c
-            WHERE c.contype = 'c'
-              AND c.conrelid = 'order_events'::regclass
-              AND pg_get_constraintdef(c.oid) ILIKE '%source%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%oms%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%alpaca%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%migration%'
-              AND pg_get_constraintdef(c.oid) ILIKE '%seed%'
-        )
-        "#,
-    )
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("Failed order_events constraints check: {e}"))?;
-
-    if !events_contract_checks_ok {
-        return Err("Missing strict order_events event_type/source constraints".to_string());
-    }
-
-    Ok(())
-}
-
 #[derive(Clone)]
 pub struct AccountRepo {
     pool: PgPool,
@@ -393,7 +287,9 @@ impl PositionProjectorRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+    
 
+    // apply projection based on an order acknolwedged msg
     pub async fn apply_ack_fill_projection(
         &self,
         projector_event_id: &str,
@@ -404,6 +300,7 @@ impl PositionProjectorRepo {
         quantity: f64,
         fill_price: f64,
     ) -> Result<(), sqlx::Error> {
+        
         let mut tx = self.pool.begin().await?;
 
         let inserted = sqlx::query_scalar::<_, bool>(
