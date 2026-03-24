@@ -1,5 +1,6 @@
 use crate::models::{Account, Connector, Order};
 use sqlx::{PgPool, Row};
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AccountRepo {
@@ -206,7 +207,7 @@ impl OrderRepo {
 
     pub async fn update_order_status(
         &self,
-        order_id: i64,
+        order_id: Uuid,
         status: &str,
         external_order_id: Option<&str>,
         error_message: Option<&str>,
@@ -248,7 +249,7 @@ impl OrderRepo {
 
     pub async fn append_event(
         &self,
-        order_id: i64,
+        order_id: Uuid,
         event_type: &str,
         status_after: &str,
         payload_json: &serde_json::Value,
@@ -293,7 +294,7 @@ impl PositionProjectorRepo {
     pub async fn apply_ack_fill_projection(
         &self,
         projector_event_id: &str,
-        order_id: i64,
+        order_id: Uuid,
         account_id: i64,
         connector_id: i64,
         side: &str,

@@ -1,59 +1,94 @@
+use uuid::Uuid;
 use axum::{
-    extract::{Json, Query, State},
+    extract::State,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    body::Body,
+    response::{Response, IntoResponse},
+    Json,
+    http::Uri, 
 };
-use std::sync::Arc;
 
-use crate::models::OrderRequest;
-use crate::services::order_service::ServiceError;
-use crate::AppState;
+use tracing::{error, info};
+use crate::app_state::AppState;
+use crate::domain::orders::commands;
+use crate::event_store::{OrderEventStore, NewOrderEvent};
 
-#[derive(serde::Deserialize)]
-pub struct OrderQuery {
-    pub account_id: i64,
+
+// Generic api error struct
+pub struct ApiError {
+    
+    pub status: StatusCode,
+    pub message: String,
+
 }
 
-pub enum ApiError {
-    Forbidden(&'static str),
-    Internal(&'static str),
-    BadRequest(&'static str),
-}
-
+// Trait: to provide an error message
 impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        match self {
-            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
-            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
-            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
-        }
+
+    fn into_response(self) -> Response{
+        return (self.status, self.message).into_response();
     }
 }
 
-impl From<ServiceError> for ApiError {
-    fn from(value: ServiceError) -> Self {
-        match value {
-            ServiceError::Forbidden(msg) => ApiError::Forbidden(msg),
-            ServiceError::Internal(msg) => ApiError::Internal(msg),
-            ServiceError::BadRequest(msg) => ApiError::BadRequest(msg),
-        }
-    }
+
+// Handler: page not found
+pub async fn handler_404(uri: Uri) -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        format!("No route found for path: {}", uri),
+    )
 }
 
+// Handler: healthcheck
 pub async fn health() -> &'static str {
     "OK"
 }
 
-pub async fn create_order(
-    Query(query): Query<OrderQuery>,
-    State(state): State<Arc<AppState>>,
-    Json(order): Json<OrderRequest>,
-) -> Result<Response, ApiError> {
-    let service_response = state
-        .order_service
-        .create_order(query.account_id, order)
-        .await
-        .map_err(ApiError::from)?;
 
-    Ok((service_response.status, Json(service_response.body)).into_response())
+// Handler: orders/submit
+pub async fn orders_submit(
+    State(state): State<AppState>,
+    Json(req): Json<commands::SubmitOrder>
+) -> Result<Response, ApiError> {  
+
+    // call service layer
+    //println!("{}", req);
+    info!(?req, "submit order received");
+    let pool = state.pool().clone(); 
+
+    let event_store = OrderEventStore::new(pool);
+    let order_id = Uuid::parse_str(&req.order_id).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "order_id must be a UUID".to_string(),
+    })?;
+
+    let order_event = NewOrderEvent {
+        event_id: Uuid::new_v4().to_string(),
+        event_type: "order_submitted".to_string(),
+        actor: "oms".to_string(),
+        payload: serde_json::to_value(&req).unwrap_or(serde_json::Value::Null),
+        correlation_id: None,
+        causation_id: None,
+        schema_version: 1,
+    };
+
+    event_store
+        .append_events(order_id, 0, &[order_event])
+        .await
+        .map_err(|err| {
+            error!(error = ?err, order_id = %order_id, "failed to append order event");
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to append order event: {:?}", err),
+            }
+        })?;
+    return Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap());
 }
+
+
+
+
+ 

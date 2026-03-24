@@ -1,6 +1,7 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use uuid::Uuid;
 // Removed: use sqlx_type::SQLInsert; // The path depends on the specific crate you chose
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
@@ -43,7 +44,7 @@ pub struct OrderRequest {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct KafkaOrderEvent {
     pub projector_event_id: Option<String>,
-    pub order_id: i64,
+    pub order_id: Uuid,
     pub account_id: i64,
     pub connector_id: i64,
     pub client_order_id: String,
@@ -159,7 +160,7 @@ impl EventSource {
 
 #[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
 pub struct Order {
-    pub order_id: i64,
+    pub order_id: Uuid,
     pub account_id: i64,
     pub connector_id: i64,
     pub instrument_id: i64,
@@ -180,7 +181,7 @@ pub struct Order {
 #[allow(dead_code)]
 pub struct OrderEvent {
     pub event_id: i64,
-    pub order_id: i64,
+    pub order_id: Uuid,
     pub event_type: String,
     pub status_after: String,
     pub payload_json: serde_json::Value,

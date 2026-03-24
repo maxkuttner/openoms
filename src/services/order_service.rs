@@ -3,6 +3,7 @@ use rdkafka::producer::FutureRecord;
 use serde_json::json;
 use std::time::Duration;
 use tracing::{error, info};
+use uuid::Uuid;
 
 use crate::adapters;
 use crate::db;
@@ -33,135 +34,6 @@ impl OrderService {
             alpaca_adapter,
             kafka,
         }
-    }
-
-    pub async fn create_order(
-        &self,
-        account_id: i64,
-        order: OrderRequest,
-    ) -> Result<ServiceResponse, ServiceError> {
-        info!(
-            symbol = %order.symbol,
-            side = ?order.side,
-            qty = %order.quantity,
-            account_id = %account_id,
-            "Received new order request"
-        );
-
-        let account = self.require_active_account(account_id).await?;
-        let connector = self
-            .require_connector(order.connector_id, account_id)
-            .await?;
-
-        if let Some(existing_order) = self
-            .order_repo
-            .get_by_client_order_id(account_id, &order.request_id)
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to check idempotency for request {}: {}",
-                    order.request_id, e
-                );
-                ServiceError::Internal("Database error")
-            })?
-        {
-            return Ok(ServiceResponse {
-                status: StatusCode::OK,
-                body: json!({
-                    "message": "Duplicate request_id; returning existing order",
-                    "order_id": existing_order.order_id,
-                    "status": existing_order.status,
-                    "external_order_id": existing_order.external_order_id
-                }),
-            });
-        }
-
-        let instrument_id = self
-            .order_repo
-            .resolve_instrument_id(order.connector_id, &order.symbol)
-            .await
-            .map_err(|e| {
-                error!("Failed to resolve instrument {}: {}", order.symbol, e);
-                ServiceError::Internal("Database error")
-            })?
-            .ok_or(ServiceError::BadRequest("Unknown symbol for connector"))?;
-
-        let side_str = match &order.side {
-            models::OrderSide::Buy => "buy",
-            models::OrderSide::Sell => "sell",
-        };
-        let order_type_str = match &order.order_type {
-            models::OrderType::Market => "market",
-            models::OrderType::Limit => "limit",
-        };
-
-        let persisted_order = self
-            .order_repo
-            .insert_received_order(
-                account.account_id,
-                connector.connector_id,
-                instrument_id,
-                &order.request_id,
-                side_str,
-                order_type_str,
-                order.quantity,
-                order.price,
-            )
-            .await
-            .map_err(|e| {
-                error!("Failed to persist order {}: {}", order.request_id, e);
-                ServiceError::Internal("Failed to persist order")
-            })?;
-
-        let received_event = json!({
-            "symbol": &order.symbol,
-            "request_id": &order.request_id,
-            "connector_id": order.connector_id,
-            "quantity": order.quantity,
-            "price": order.price
-        });
-        self.append_event_safe(
-            persisted_order.order_id,
-            OrderEventType::OrderReceived,
-            models::OrderStatus::Received,
-            &received_event,
-            EventSource::Oms,
-        )
-        .await;
-
-        let persisted_order = self
-            .order_repo
-            .update_order_status(
-                persisted_order.order_id,
-                models::OrderStatus::Validated.as_str(),
-                None,
-                None,
-            )
-            .await
-            .map_err(|e| {
-                error!(
-                    "Failed to update order {} to validated: {}",
-                    persisted_order.order_id, e
-                );
-                ServiceError::Internal("Failed to update order status")
-            })?;
-
-        let validated_event = json!({
-            "account_id": account.account_id,
-            "connector_id": connector.connector_id,
-            "instrument_id": instrument_id
-        });
-        self.append_event_safe(
-            persisted_order.order_id,
-            OrderEventType::OrderValidated,
-            models::OrderStatus::Validated,
-            &validated_event,
-            EventSource::Oms,
-        )
-        .await;
-
-        self.forward_to_exchange(account, connector, persisted_order.order_id, order)
-            .await
     }
 
     async fn require_active_account(
@@ -207,7 +79,7 @@ impl OrderService {
         &self,
         account: models::Account,
         connector: models::Connector,
-        order_id: i64,
+        order_id: Uuid,
         order: OrderRequest,
     ) -> Result<ServiceResponse, ServiceError> {
         let routed_event = json!({
@@ -387,7 +259,7 @@ impl OrderService {
 
     async fn append_event_safe(
         &self,
-        order_id: i64,
+        order_id: Uuid,
         event_type: OrderEventType,
         status_after: models::OrderStatus,
         payload: &serde_json::Value,
@@ -418,7 +290,7 @@ impl OrderService {
         account_id: i64,
         connector: &models::Connector,
         order: &OrderRequest,
-        order_id: i64,
+        order_id: Uuid,
         status: &str,
         event_type: &str,
         result: &str,

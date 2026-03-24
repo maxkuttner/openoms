@@ -58,7 +58,7 @@ pub async fn run_position_projector(
         //
         let Some(fill_price) = event.order.price else {
             warn!(
-                order_id = event.order_id,
+                order_id = %event.order_id,
                 "Skipping broker_ack without fill price"
             );
             let _ = consumer.commit_message(&msg, CommitMode::Async);
@@ -83,7 +83,7 @@ pub async fn run_position_projector(
         {
             error!(
                 error = %e,
-                order_id = event.order_id,
+                order_id = %event.order_id,
                 projector_event_id = %projector_event_id,
                 "Projector apply failed"
             );
