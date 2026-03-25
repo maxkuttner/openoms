@@ -62,6 +62,7 @@ pub async fn orders_submit(
         message: "order_id must be a UUID".to_string(),
     })?;
 
+    // create new order event
     let order_event = NewOrderEvent {
         event_id: Uuid::new_v4().to_string(),
         event_type: "order_submitted".to_string(),
@@ -72,6 +73,7 @@ pub async fn orders_submit(
         schema_version: 1,
     };
 
+    // append event to order_event
     event_store
         .append_events(order_id, 0, &[order_event])
         .await
