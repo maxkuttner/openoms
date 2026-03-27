@@ -19,6 +19,24 @@ pub enum OrderEventType {
     OrderReleased,
 }
 
+impl OrderEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OrderSubmitted => "order_submitted",
+            Self::OrderRejected => "order_rejected",
+            Self::OrderRouted => "order_routed",
+            Self::OrderAmended => "order_amended",
+            Self::OrderCanceled => "order_canceled",
+            Self::CancelRejected => "cancel_rejected",
+            Self::OrderPartiallyFilled => "order_partially_filled",
+            Self::OrderFilled => "order_filled",
+            Self::OrderExpired => "order_expired",
+            Self::OrderSuspended => "order_suspended",
+            Self::OrderReleased => "order_released",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum OrderEventPayload {

@@ -72,7 +72,8 @@ async fn main() {
         }
     };
 
-        // If positions projector shall be used;
+        
+    // If positions projector shall be used;
     let enable_position_projector = matches!(
         env::var("OMS_ENABLE_POSITION_PROJECTOR").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE")
@@ -80,7 +81,7 @@ async fn main() {
 
     // ... start positions projector kafka client process to 
     // listen for certain events and apply
-    // rpojections to the db positions
+    // pojections to the db positions
     if enable_position_projector {
         let projector_pool = pool.clone();
         let projector_kafka_config = kafka_config.clone();

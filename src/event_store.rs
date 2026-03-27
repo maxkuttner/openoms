@@ -133,9 +133,30 @@ impl OrderEventStore {
         }
 
         let mut tx = self.pool.begin().await?;
-        self.lock_order_stream(&mut tx, order_id).await?;
+        let result = self
+            .append_events_in_tx(&mut tx, order_id, expected_version, events)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
 
-        let actual_version = self.current_version(&mut tx, order_id).await?;
+    pub async fn append_events_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        order_id: Uuid,
+        expected_version: i64,
+        events: &[NewOrderEvent],
+    ) -> Result<AppendResult, EventStoreError> {
+        if events.is_empty() {
+            return Ok(AppendResult {
+                last_version: expected_version,
+                appended: 0,
+            });
+        }
+
+        self.lock_order_stream(tx, order_id).await?;
+
+        let actual_version = self.current_version(tx, order_id).await?;
         if actual_version != expected_version {
             return Err(EventStoreError::Concurrency(ConcurrencyError {
                 expected: expected_version,
@@ -177,11 +198,9 @@ impl OrderEventStore {
             .bind(&event.correlation_id)
             .bind(&event.causation_id)
             .bind(event.schema_version)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
-
-        tx.commit().await?;
 
         Ok(AppendResult {
             last_version: expected_version + events.len() as i64,

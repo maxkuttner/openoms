@@ -16,10 +16,24 @@ pub struct EventMetadata {
 
 #[derive(Debug, Clone, Default)]
 pub struct OrderAggregate {
+    // the state can either be Some or None
     pub state: Option<OrderAggregateState>,
 }
 
 impl OrderAggregate {
+    
+    // create an empty state
+    pub fn empty() -> Self {
+        Self { state: None }
+    }
+    
+
+    // create a new state machine (order aggregate) from a given state
+    // note: at this point state and aggregate state are kind of the same but not
+    pub fn from_state(state: OrderAggregateState) -> Self {
+        Self { state: Some(state) }
+    }
+
     pub fn rehydrate(events: &[OrderDomainEvent]) -> Result<Self, CommandRejection> {
         let mut aggregate = Self::default();
         for event in events {
@@ -28,6 +42,11 @@ impl OrderAggregate {
         Ok(aggregate)
     }
 
+
+    // Method to decide which events ought to be issued.
+    // Note: The method returns a vector of events, since
+    // it is possible that in the future commands are modelled
+    // as a ordered list of of domain events.
     pub fn decide(
         &self,
         command: OrderCommand,
@@ -266,6 +285,10 @@ impl OrderAggregate {
         }
     }
 
+    // Method to apply the OrderDomainEvent
+    // TODO: This function should ideally already assume that it is given a
+    // valid and correct domain event. S.t. there is no need to issue a CommandRejection error
+    //
     pub fn apply(&mut self, event: &OrderDomainEvent) -> Result<(), CommandRejection> {
         match &event.payload {
             OrderEventPayload::OrderSubmitted {

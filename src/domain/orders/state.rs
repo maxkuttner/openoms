@@ -7,11 +7,29 @@ pub enum OrderSide {
     Sell,
 }
 
+impl OrderSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderType {
     Market,
     Limit,
+}
+
+impl OrderType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Market => "market",
+            Self::Limit => "limit",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -21,6 +39,17 @@ pub enum TimeInForce {
     Gtc,
     Ioc,
     Fok,
+}
+
+impl TimeInForce {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Gtc => "gtc",
+            Self::Ioc => "ioc",
+            Self::Fok => "fok",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +63,21 @@ pub enum OrderStatus {
     Canceled,
     Expired,
     Suspended,
+}
+
+impl OrderStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
+            Self::Routed => "routed",
+            Self::PartiallyFilled => "partially_filled",
+            Self::Filled => "filled",
+            Self::Rejected => "rejected",
+            Self::Canceled => "canceled",
+            Self::Expired => "expired",
+            Self::Suspended => "suspended",
+        }
+    }
 }
 
 impl OrderStatus {
