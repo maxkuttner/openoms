@@ -28,7 +28,7 @@ impl OrderAggregate {
     }
     
 
-    // create a new state machine (order aggregate) from a given state
+    // create a new state machine (aka order aggregate) from a given state
     // note: at this point state and aggregate state are kind of the same but not
     pub fn from_state(state: OrderAggregateState) -> Self {
         Self { state: Some(state) }

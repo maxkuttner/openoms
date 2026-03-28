@@ -104,6 +104,7 @@ async fn main() {
         .route("/health", get(handlers::health))
         // add prders/submit route
         .route("/orders/submit", post(handlers::orders_submit))
+        .route("/orders/cancel", post(handlers::orders_cancel))
         // add 404 route as fallback
         .fallback(handlers::handler_404)
         .with_state(state);
