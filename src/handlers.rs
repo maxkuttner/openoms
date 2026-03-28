@@ -38,6 +38,19 @@ impl IntoResponse for ApiError {
 }
 
 
+/*
+* -----------------------------
+* Missing Handlers:
+* TODO: 
+* - orders_replace
+* - orders_suspend
+* - orders_release
+* - orders_expire
+* - orders_execution_report 
+* -----------------------------
+*/
+
+
 // Handler: page not found
 pub async fn handler_404(uri: Uri) -> impl IntoResponse {
     (
@@ -396,6 +409,7 @@ fn map_rejection_to_api_error(rejection: CommandRejection) -> ApiError {
     }
 }
 
+// parse db string to OrderSide struct
 fn parse_order_side(value: String) -> Result<OrderSide, ApiError> {
     match value.as_str() {
         "buy" => Ok(OrderSide::Buy),
@@ -407,6 +421,7 @@ fn parse_order_side(value: String) -> Result<OrderSide, ApiError> {
     }
 }
 
+// parse db string to OrderType struct
 fn parse_order_type(value: String) -> Result<OrderType, ApiError> {
     match value.as_str() {
         "market" => Ok(OrderType::Market),
@@ -418,6 +433,8 @@ fn parse_order_type(value: String) -> Result<OrderType, ApiError> {
     }
 }
 
+
+// parse db string to TimeInForce struct
 fn parse_time_in_force(value: String) -> Result<TimeInForce, ApiError> {
     match value.as_str() {
         "day" => Ok(TimeInForce::Day),
@@ -431,6 +448,8 @@ fn parse_time_in_force(value: String) -> Result<TimeInForce, ApiError> {
     }
 }
 
+
+// parse db string to OrderStatus struct
 fn parse_order_status(value: String) -> Result<OrderStatus, ApiError> {
     match value.as_str() {
         "submitted" => Ok(OrderStatus::Submitted),

@@ -5,7 +5,6 @@ mod domain;
 mod handlers;
 mod models;
 mod projector;
-mod services;
 mod app_state;
 
 use crate::app_state::AppState;
