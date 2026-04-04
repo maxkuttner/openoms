@@ -6,12 +6,14 @@ mod handlers;
 mod models;
 mod projector;
 mod app_state;
+mod auth;
 
 use crate::app_state::AppState;
 
 use axum::{
     routing::get, 
     routing::post,
+    middleware,
     Router
 };
 use sqlx::PgPool;
@@ -19,6 +21,7 @@ use std::env;
 use tracing::{error, info, Level};
 use tracing_subscriber;
 mod kafka;
+use crate::auth::AuthConfig;
 
 
 
@@ -94,16 +97,45 @@ async fn main() {
     }
 
 
+    let auth_issuer = match env::var("OMS_AUTH_ISSUER") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            error!("OMS_AUTH_ISSUER is not set");
+            std::process::exit(1);
+        }
+    };
+
+    let auth_audience = match env::var("OMS_AUTH_AUDIENCE") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            error!("OMS_AUTH_AUDIENCE is not set");
+            std::process::exit(1);
+        }
+    };
+
+    let auth_jwks_url = match env::var("OMS_AUTH_JWKS_URL") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            error!("OMS_AUTH_JWKS_URL is not set");
+            std::process::exit(1);
+        }
+    };
+
+    let auth_config = AuthConfig::new(auth_issuer, auth_audience, auth_jwks_url);
+
     // AppState
-    let state = AppState::new(pool);
+    let state = AppState::new(pool, auth_config);
 
     // Register routes
+    let orders_router = Router::new()
+        .route("/orders/submit", post(handlers::orders_submit))
+        .route("/orders/cancel", post(handlers::orders_cancel))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+
     let app = Router::new()
         // add health check route
         .route("/health", get(handlers::health))
-        // add prders/submit route
-        .route("/orders/submit", post(handlers::orders_submit))
-        .route("/orders/cancel", post(handlers::orders_cancel))
+        .merge(orders_router)
         // add 404 route as fallback
         .fallback(handlers::handler_404)
         .with_state(state);

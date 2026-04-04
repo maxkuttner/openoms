@@ -19,7 +19,6 @@ use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
-use crate::domain::orders::aggregate;
 
 // Generic api error struct
 pub struct ApiError {
