@@ -1,10 +1,8 @@
 mod adapters;
-mod db;
 mod event_store;
 mod domain;
 mod handlers;
 mod models;
-mod projector;
 mod app_state;
 mod auth;
 mod admin;
@@ -74,29 +72,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-
-        
-    // If positions projector shall be used;
-    let enable_position_projector = matches!(
-        env::var("OMS_ENABLE_POSITION_PROJECTOR").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    );
-
-    // ... start positions projector kafka client process to 
-    // listen for certain events and apply
-    // pojections to the db positions
-    if enable_position_projector {
-        let projector_pool = pool.clone();
-        let projector_kafka_config = kafka_config.clone();
-        tokio::spawn(async move {
-            if let Err(err) =
-                projector::run_position_projector(projector_pool, projector_kafka_config).await
-            {
-                error!("Position projector stopped: {}", err);
-            }
-        });
-    }
-
 
     let auth_issuer = match env::var("OMS_AUTH_ISSUER") {
         Ok(v) if !v.is_empty() => v,

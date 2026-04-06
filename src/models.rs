@@ -2,33 +2,7 @@ use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
-// Removed: use sqlx_type::SQLInsert; // The path depends on the specific crate you chose
 
-#[derive(Debug, Serialize, Deserialize, FromRow)]
-pub struct Account {
-    pub account_id: i64,
-    pub user_id: i64,
-    pub name: String,
-    pub environment: String,
-    pub base_currency: String,
-    pub is_active: bool,
-    pub created_at: NaiveDateTime,
-}
-
-#[derive(Debug, Serialize, Deserialize, FromRow)]
-pub struct Connector {
-    pub connector_id: i64,
-    pub account_id: i64,
-    pub provider_id: i64,
-    pub provider_name: String,
-    pub provider_code: String,
-    pub environment: String,
-    pub base_currency: String,
-    pub external_account_id: String,
-    pub api_key: Option<String>,
-    pub connection_status: String,
-    pub last_test_at: Option<NaiveDateTime>,
-}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct OrderRequest {
