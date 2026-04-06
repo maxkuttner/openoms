@@ -1,6 +1,7 @@
 CREATE TABLE order_state (
     order_id UUID PRIMARY KEY,
     client_order_id TEXT NOT NULL,
+    book_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
     instrument_id TEXT NOT NULL,
     side TEXT NOT NULL,

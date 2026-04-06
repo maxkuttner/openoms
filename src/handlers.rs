@@ -2,6 +2,7 @@ use uuid::Uuid;
 use chrono::Utc;
 use sqlx::{query_scalar, Row};
 use axum::{
+    extract::Extension,
     extract::State,
     http::StatusCode,
     body::Body,
@@ -17,6 +18,7 @@ use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::OrderCommand;
 use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
+use crate::auth::AuthContext;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
 
@@ -67,15 +69,24 @@ pub async fn health() -> &'static str {
 // Handler: orders/submit
 pub async fn orders_submit(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(req): Json<commands::SubmitOrder>
 ) -> Result<Response, ApiError> {  
 
-    info!(?req, "submit order received");
+    info!(?req, sub = %auth.sub, "submit order received");
     let pool = state.pool().clone();
     let event_store = OrderEventStore::new(pool.clone());
     let order_id = Uuid::parse_str(&req.order_id).map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
         message: "order_id must be a UUID".to_string(),
+    })?;
+    let book_id = Uuid::parse_str(&req.book_id).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "book_id must be a UUID".to_string(),
+    })?;
+    let account_id = Uuid::parse_str(&req.account_id).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "account_id must be a UUID".to_string(),
     })?;
     
     // start of the transaction
@@ -99,6 +110,57 @@ pub async fn orders_submit(
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             message: "order already exists".to_string(),
+        });
+    }
+
+    let principal_id: Option<Uuid> = query_scalar(
+        "SELECT id FROM oms_principal WHERE external_subject = $1"
+    )
+    .bind(&auth.sub)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to resolve principal: {:?}", err),
+    })?;
+
+    let principal_id = match principal_id {
+        Some(id) => id,
+        None => {
+            return Err(ApiError {
+                status: StatusCode::FORBIDDEN,
+                message: "unauthorized".to_string(),
+            })
+        }
+    };
+
+    info!(principal_id = %principal_id, "resolved principal");
+
+    let has_grant: bool = query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM oms_principal_book_account_grant
+            WHERE principal_id = $1
+              AND book_id = $2
+              AND account_id = $3
+              AND can_trade = true
+        )"
+    )
+    .bind(principal_id)
+    .bind(book_id)
+    .bind(account_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to check grant: {:?}", err),
+    })?;
+
+    info!(has_grant, book_id = %book_id, account_id = %account_id, "checked trade grant");
+
+    if !has_grant {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "unauthorized".to_string(),
         });
     }
 
@@ -137,6 +199,7 @@ pub async fn orders_submit(
         INSERT INTO order_state (
             order_id,
             client_order_id,
+            book_id,
             account_id,
             instrument_id,
             side,
@@ -151,12 +214,13 @@ pub async fn orders_submit(
             resume_to_status,
             version
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
         )
         "#
     )
     .bind(order_id)
     .bind(&state.client_order_id) // untouched
+    .bind(&state.book_id)
     .bind(&state.account_id)      // untouched
     .bind(&state.instrument_id)   // untouched
     .bind(state.side.as_str())
@@ -239,6 +303,7 @@ pub async fn orders_cancel(
         SELECT
             order_id,
             client_order_id,
+            book_id,
             account_id,
             instrument_id,
             side,
@@ -288,6 +353,7 @@ pub async fn orders_cancel(
     let state = OrderAggregateState {
         order_id: row.get::<Uuid, _>("order_id").to_string(),
         client_order_id: row.get::<String, _>("client_order_id"),
+        book_id: row.get::<String, _>("book_id"),
         account_id: row.get::<String, _>("account_id"),
         instrument_id: row.get::<String, _>("instrument_id"),
         side,

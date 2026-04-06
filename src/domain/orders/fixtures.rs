@@ -11,6 +11,7 @@ use super::state::{OrderSide, OrderType, TimeInForce};
 pub struct OrderTestData {
     pub order_id: String,
     pub client_order_id: String,
+    pub book_id: String,
     pub account_id: String,
     pub instrument_id: String,
 }
@@ -20,6 +21,7 @@ impl OrderTestData {
         let order_id = order_id.into();
         Self {
             client_order_id: format!("c-{order_id}"),
+            book_id: "b-1".to_string(),
             account_id: "a-1".to_string(),
             instrument_id: "i-1".to_string(),
             order_id,
@@ -37,6 +39,7 @@ impl OrderTestData {
         SubmitOrder {
             order_id: self.order_id.clone(),
             client_order_id: self.client_order_id.clone(),
+            book_id: self.book_id.clone(),
             account_id: self.account_id.clone(),
             instrument_id: self.instrument_id.clone(),
             side,

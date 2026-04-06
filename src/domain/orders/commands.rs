@@ -6,6 +6,7 @@ use super::state::{OrderSide, OrderType, TimeInForce};
 pub struct SubmitOrder {
     pub order_id: String,
     pub client_order_id: String,
+    pub book_id: String,
     pub account_id: String,
     pub instrument_id: String,
     pub side: OrderSide,
@@ -45,11 +46,10 @@ pub struct ReceiveExecutionReport {
     pub report: ExecutionReport,
 }
 
-
 // An execution report is a command you get from a broker or an outside venue.
-// We as the OMS try to ingest this command. 
+// We as the OMS try to ingest this command.
 // Example: An exchange sends a confirmation that an order was filled or the OMS polls / uses a
-// websocket to find out that an order was filled or rejected. 
+// websocket to find out that an order was filled or rejected.
 // In any case, the OMS shall the issue an event
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]

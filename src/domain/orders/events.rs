@@ -42,6 +42,7 @@ impl OrderEventType {
 pub enum OrderEventPayload {
     OrderSubmitted {
         client_order_id: String,
+        book_id: String,
         account_id: String,
         instrument_id: String,
         side: OrderSide,

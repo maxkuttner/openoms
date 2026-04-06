@@ -4,47 +4,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use serde::Deserialize;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-
-#[derive(Debug, Serialize, FromRow)]
-pub struct PrincipalRecord {
-    id: Uuid,
-    code: String,
-    principal_type: String,
-    external_subject: Option<String>,
-    display_name: Option<String>,
-    status: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-pub struct BookRecord {
-    id: Uuid,
-    code: String,
-    name: String,
-    status: String,
-    base_currency: Option<String>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-pub struct AccountRecord {
-    id: Uuid,
-    code: String,
-    broker_code: String,
-    external_account_ref: String,
-    status: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
+use crate::domain::identity::{Account, Book, Principal};
 
 #[derive(Debug, Deserialize)]
 pub struct CreatePrincipal {
@@ -99,10 +64,10 @@ pub struct UpdateAccount {
 pub async fn create_principal(
     State(state): State<AppState>,
     Json(payload): Json<CreatePrincipal>,
-) -> Result<Json<PrincipalRecord>, AdminError> {
+) -> Result<Json<Principal>, AdminError> {
     info!(code = %payload.code, principal_type = %payload.principal_type, "admin create principal");
     let id = Uuid::new_v4();
-    let record = sqlx::query_as::<_, PrincipalRecord>(
+    let record = sqlx::query_as::<_, Principal>(
         r#"
         INSERT INTO oms_principal (
             id,
@@ -130,9 +95,9 @@ pub async fn create_principal(
 
 pub async fn list_principals(
     State(state): State<AppState>,
-) -> Result<Json<Vec<PrincipalRecord>>, AdminError> {
+) -> Result<Json<Vec<Principal>>, AdminError> {
     info!("admin list principals");
-    let records = sqlx::query_as::<_, PrincipalRecord>(
+    let records = sqlx::query_as::<_, Principal>(
         r#"
         SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
         FROM oms_principal
@@ -149,9 +114,9 @@ pub async fn list_principals(
 pub async fn get_principal(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<PrincipalRecord>, AdminError> {
+) -> Result<Json<Principal>, AdminError> {
     info!(principal_id = %id, "admin get principal");
-    let record = sqlx::query_as::<_, PrincipalRecord>(
+    let record = sqlx::query_as::<_, Principal>(
         r#"
         SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
         FROM oms_principal
@@ -171,9 +136,9 @@ pub async fn update_principal(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdatePrincipal>,
-) -> Result<Json<PrincipalRecord>, AdminError> {
+) -> Result<Json<Principal>, AdminError> {
     info!(principal_id = %id, "admin update principal");
-    let record = sqlx::query_as::<_, PrincipalRecord>(
+    let record = sqlx::query_as::<_, Principal>(
         r#"
         UPDATE oms_principal
         SET
@@ -204,10 +169,10 @@ pub async fn update_principal(
 pub async fn create_book(
     State(state): State<AppState>,
     Json(payload): Json<CreateBook>,
-) -> Result<Json<BookRecord>, AdminError> {
+) -> Result<Json<Book>, AdminError> {
     info!(code = %payload.code, name = %payload.name, "admin create book");
     let id = Uuid::new_v4();
-    let record = sqlx::query_as::<_, BookRecord>(
+    let record = sqlx::query_as::<_, Book>(
         r#"
         INSERT INTO oms_book (
             id,
@@ -233,9 +198,9 @@ pub async fn create_book(
 
 pub async fn list_books(
     State(state): State<AppState>,
-) -> Result<Json<Vec<BookRecord>>, AdminError> {
+) -> Result<Json<Vec<Book>>, AdminError> {
     info!("admin list books");
-    let records = sqlx::query_as::<_, BookRecord>(
+    let records = sqlx::query_as::<_, Book>(
         r#"
         SELECT id, code, name, status, base_currency, created_at, updated_at
         FROM oms_book
@@ -252,9 +217,9 @@ pub async fn list_books(
 pub async fn get_book(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<BookRecord>, AdminError> {
+) -> Result<Json<Book>, AdminError> {
     info!(book_id = %id, "admin get book");
-    let record = sqlx::query_as::<_, BookRecord>(
+    let record = sqlx::query_as::<_, Book>(
         r#"
         SELECT id, code, name, status, base_currency, created_at, updated_at
         FROM oms_book
@@ -274,9 +239,9 @@ pub async fn update_book(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateBook>,
-) -> Result<Json<BookRecord>, AdminError> {
+) -> Result<Json<Book>, AdminError> {
     info!(book_id = %id, "admin update book");
-    let record = sqlx::query_as::<_, BookRecord>(
+    let record = sqlx::query_as::<_, Book>(
         r#"
         UPDATE oms_book
         SET
@@ -305,10 +270,10 @@ pub async fn update_book(
 pub async fn create_account(
     State(state): State<AppState>,
     Json(payload): Json<CreateAccount>,
-) -> Result<Json<AccountRecord>, AdminError> {
+) -> Result<Json<Account>, AdminError> {
     info!(code = %payload.code, broker_code = %payload.broker_code, "admin create account");
     let id = Uuid::new_v4();
-    let record = sqlx::query_as::<_, AccountRecord>(
+    let record = sqlx::query_as::<_, Account>(
         r#"
         INSERT INTO oms_account (
             id,
@@ -334,9 +299,9 @@ pub async fn create_account(
 
 pub async fn list_accounts(
     State(state): State<AppState>,
-) -> Result<Json<Vec<AccountRecord>>, AdminError> {
+) -> Result<Json<Vec<Account>>, AdminError> {
     info!("admin list accounts");
-    let records = sqlx::query_as::<_, AccountRecord>(
+    let records = sqlx::query_as::<_, Account>(
         r#"
         SELECT id, code, broker_code, external_account_ref, status, created_at, updated_at
         FROM oms_account
@@ -353,9 +318,9 @@ pub async fn list_accounts(
 pub async fn get_account(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<AccountRecord>, AdminError> {
+) -> Result<Json<Account>, AdminError> {
     info!(account_id = %id, "admin get account");
-    let record = sqlx::query_as::<_, AccountRecord>(
+    let record = sqlx::query_as::<_, Account>(
         r#"
         SELECT id, code, broker_code, external_account_ref, status, created_at, updated_at
         FROM oms_account
@@ -375,9 +340,9 @@ pub async fn update_account(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateAccount>,
-) -> Result<Json<AccountRecord>, AdminError> {
+) -> Result<Json<Account>, AdminError> {
     info!(account_id = %id, "admin update account");
-    let record = sqlx::query_as::<_, AccountRecord>(
+    let record = sqlx::query_as::<_, Account>(
         r#"
         UPDATE oms_account
         SET
