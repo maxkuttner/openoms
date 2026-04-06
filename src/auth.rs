@@ -180,6 +180,7 @@ async fn read_cached_jwk(config: &AuthConfig, kid: &str) -> Option<jsonwebtoken:
         .cloned() // if we find a jwk set we clone it and return it
 }
 
+// Re-heat the jwks cache
 async fn refresh_jwks(config: &AuthConfig) -> Result<(), AuthError> {
     let jwks = fetch_jwks(&config.jwks_url).await?;
     let mut cache = config.jwks_cache.write().await;
@@ -188,6 +189,8 @@ async fn refresh_jwks(config: &AuthConfig) -> Result<(), AuthError> {
     Ok(())
 }
 
+
+// Fetch jwks (json web token key sets) from the JWKS Url
 async fn fetch_jwks(url: &str) -> Result<JwkSet, AuthError> {
     let response = reqwest::get(url)
         .await
