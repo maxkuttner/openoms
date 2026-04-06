@@ -44,6 +44,7 @@ impl AuthConfig {
 #[derive(Clone)]
 pub struct AuthContext {
     pub sub: String,
+    pub org_role: Option<String>,
 }
 
 
@@ -84,6 +85,8 @@ enum AuthError {
 #[derive(Debug, Deserialize)]
 struct Claims {
     sub: String,
+    #[serde(rename = "org_role")]
+    org_role: Option<String>,
     exp: usize,
     iss: Option<String>,
     aud: Option<serde_json::Value>,
@@ -97,7 +100,31 @@ pub async fn auth_middleware(
 ) -> Result<Response, Response> {
     let token = extract_bearer_token(req.headers())?;
     let claims = verify_jwt(&state.auth, &token).await?;
-    req.extensions_mut().insert(AuthContext { sub: claims.sub });
+    req.extensions_mut().insert(AuthContext {
+        sub: claims.sub,
+        org_role: claims.org_role,
+    });
+    Ok(next.run(req).await)
+}
+
+pub async fn admin_middleware(
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, Response> {
+    let auth = req.extensions().get::<AuthContext>();
+    let authorized = auth
+        .and_then(|ctx| ctx.org_role.as_deref())
+        .is_some_and(|role| role == "org:admin");
+
+    if !authorized {
+        return Err(
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body("forbidden".into())
+                .unwrap(),
+        );
+    }
+
     Ok(next.run(req).await)
 }
 

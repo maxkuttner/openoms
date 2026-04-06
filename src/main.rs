@@ -7,6 +7,7 @@ mod models;
 mod projector;
 mod app_state;
 mod auth;
+mod admin;
 
 use crate::app_state::AppState;
 
@@ -127,15 +128,47 @@ async fn main() {
     let state = AppState::new(pool, auth_config);
 
     // Register routes
+    
+    // 1) Register order routes
     let orders_router = Router::new()
         .route("/orders/submit", post(handlers::orders_submit))
         .route("/orders/cancel", post(handlers::orders_cancel))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+    
+    // 2) Register admin routes
+    let admin_router = Router::new()
+        .route(
+            "/admin/principals",
+            post(admin::create_principal).get(admin::list_principals),
+        )
+        .route(
+            "/admin/principals/:id",
+            axum::routing::patch(admin::update_principal).get(admin::get_principal),
+        )
+        .route(
+            "/admin/books",
+            post(admin::create_book).get(admin::list_books),
+        )
+        .route(
+            "/admin/books/:id",
+            axum::routing::patch(admin::update_book).get(admin::get_book),
+        )
+        .route(
+            "/admin/accounts",
+            post(admin::create_account).get(admin::list_accounts),
+        )
+        .route(
+            "/admin/accounts/:id",
+            axum::routing::patch(admin::update_account).get(admin::get_account),
+        )
+        .layer(middleware::from_fn(auth::admin_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
 
     let app = Router::new()
         // add health check route
         .route("/health", get(handlers::health))
         .merge(orders_router)
+        .merge(admin_router)
         // add 404 route as fallback
         .fallback(handlers::handler_404)
         .with_state(state);
