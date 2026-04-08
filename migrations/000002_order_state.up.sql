@@ -1,8 +1,8 @@
 CREATE TABLE order_state (
     order_id UUID PRIMARY KEY,
     client_order_id TEXT NOT NULL,
-    book_id TEXT NOT NULL,
-    account_id TEXT NOT NULL,
+    book_id UUID NOT NULL,
+    account_id UUID NOT NULL,
     instrument_id TEXT NOT NULL,
     side TEXT NOT NULL,
     order_type TEXT NOT NULL,
@@ -16,7 +16,9 @@ CREATE TABLE order_state (
     resume_to_status TEXT,
     version BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT order_state_book_id_fkey FOREIGN KEY (book_id) REFERENCES oms_book(id),
+    CONSTRAINT order_state_account_id_fkey FOREIGN KEY (account_id) REFERENCES oms_account(id)
 );
 
 CREATE INDEX idx_order_state_account_status ON order_state(account_id, status);
