@@ -8,14 +8,15 @@ use axum::{
     body::Body,
     response::{Response, IntoResponse},
     Json,
-    http::Uri, 
+    http::Uri,
 };
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use crate::adapters::{BrokerOrderRequest, BrokerError};
 use crate::app_state::AppState;
 use crate::domain::orders::commands;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
-use crate::domain::orders::commands::OrderCommand;
+use crate::domain::orders::commands::{OrderCommand, RouteOrder};
 use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
@@ -73,7 +74,7 @@ pub async fn orders_submit(
     Json(req): Json<commands::SubmitOrder>
 ) -> Result<Response, ApiError> {  
 
-    info!(?req, sub = %auth.sub, "submit order received");
+    info!(?req, principal_id = %auth.principal_id, "submit order received");
     let pool = state.pool().clone();
     let event_store = OrderEventStore::new(pool.clone());
     let order_id = Uuid::parse_str(&req.order_id).map_err(|_| ApiError {
@@ -113,27 +114,7 @@ pub async fn orders_submit(
         });
     }
 
-    let principal_id: Option<Uuid> = query_scalar(
-        "SELECT id FROM oms_principal WHERE external_subject = $1"
-    )
-    .bind(&auth.sub)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to resolve principal: {:?}", err),
-    })?;
-
-    let principal_id = match principal_id {
-        Some(id) => id,
-        None => {
-            return Err(ApiError {
-                status: StatusCode::FORBIDDEN,
-                message: "unauthorized".to_string(),
-            })
-        }
-    };
-
+    let principal_id = auth.principal_id;
     info!(principal_id = %principal_id, "resolved principal");
 
     let has_grant: bool = query_scalar(
@@ -188,8 +169,8 @@ pub async fn orders_submit(
     }
 
 
-    // return a Result (i.e. the value or an error)
-    let state = applied.state.ok_or(ApiError {
+    // Clone the aggregate state so applied remains usable for the RouteOrder command in TX2.
+    let state_after_submit = applied.state.clone().ok_or(ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: "missing aggregate state after submit".to_string(),
     })?;
@@ -219,21 +200,21 @@ pub async fn orders_submit(
         "#
     )
     .bind(order_id)
-    .bind(&state.client_order_id) // untouched
-    .bind(&state.book_id)
-    .bind(&state.account_id)      // untouched
-    .bind(&state.instrument_id)   // untouched
-    .bind(state.side.as_str())
-    .bind(state.order_type.as_str())
-    .bind(state.time_in_force.as_str())
-    .bind(state.limit_price)
-    .bind(state.original_qty)
-    .bind(state.leaves_qty)
-    .bind(state.cum_qty)
-    .bind(state.avg_px)
-    .bind(state.status.as_str())
-    .bind(state.resume_to_status.map(|status| status.as_str()))
-    .bind(state.version)
+    .bind(&state_after_submit.client_order_id)
+    .bind(Uuid::parse_str(&state_after_submit.book_id).unwrap())
+    .bind(Uuid::parse_str(&state_after_submit.account_id).unwrap())
+    .bind(&state_after_submit.instrument_id)
+    .bind(state_after_submit.side.as_str())
+    .bind(state_after_submit.order_type.as_str())
+    .bind(state_after_submit.time_in_force.as_str())
+    .bind(state_after_submit.limit_price)
+    .bind(state_after_submit.original_qty)
+    .bind(state_after_submit.leaves_qty)
+    .bind(state_after_submit.cum_qty)
+    .bind(state_after_submit.avg_px)
+    .bind(state_after_submit.status.as_str())
+    .bind(state_after_submit.resume_to_status.map(|status| status.as_str()))
+    .bind(state_after_submit.version)
     .execute(&mut *tx)
     .await
     .map_err(|err| ApiError {
@@ -262,14 +243,172 @@ pub async fn orders_submit(
             }
         })?;
 
-    // commit transaction
+    // commit transaction (TX1)
     tx.commit().await.map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: format!("failed to commit transaction: {:?}", err),
     })?;
 
+    // --- TX2: route order to broker ---
+    // Look up the account to get broker_code, environment, external_account_ref.
+    let account_row = sqlx::query(
+        "SELECT broker_code, environment, external_account_ref FROM oms_account WHERE id = $1"
+    )
+    .bind(account_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load account for routing: {:?}", err),
+    })?;
 
-    // return synchronous response
+    let account_row = match account_row {
+        Some(row) => row,
+        None => {
+            warn!(account_id = %account_id, "account not found during routing — order left as Submitted");
+            return Ok(Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap());
+        }
+    };
+
+    let broker_code: String = account_row.get("broker_code");
+    let environment: String = account_row.get("environment");
+    let external_account_ref: String = account_row.get("external_account_ref");
+
+    // Find the adapter for this broker+environment combination.
+    let adapter = match state.registry().get(&broker_code, &environment) {
+        Some(a) => a,
+        None => {
+            warn!(broker_code = %broker_code, environment = %environment, "no adapter registered — order left as Submitted");
+            return Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("no adapter configured for {broker_code}/{environment}"),
+            });
+        }
+    };
+
+    // Call the broker adapter.
+    // instrument_id is used directly as the broker symbol (TODO: instrument master table).
+    let broker_req = BrokerOrderRequest {
+        symbol: state_after_submit.instrument_id.clone(),
+        quantity: state_after_submit.original_qty,
+        side: state_after_submit.side.as_str().to_string(),
+        order_type: state_after_submit.order_type.as_str().to_string(),
+        time_in_force: state_after_submit.time_in_force.as_str().to_string(),
+        limit_price: state_after_submit.limit_price,
+        external_account_ref,
+    };
+
+    let broker_resp = match adapter.submit_order(&broker_req).await {
+        Ok(resp) => resp,
+        Err(BrokerError::BrokerRejected(msg)) => {
+            warn!(broker_code = %broker_code, error = %msg, "broker rejected order — order left as Submitted");
+            return Err(ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("broker rejected order: {msg}"),
+            });
+        }
+        Err(err) => {
+            error!(broker_code = %broker_code, error = %err, "adapter error routing order — order left as Submitted");
+            return Err(ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                message: format!("failed to route order to {broker_code}: {err}"),
+            });
+        }
+    };
+
+    info!(
+        order_id = %order_id,
+        external_order_id = %broker_resp.external_order_id,
+        broker = %broker_code,
+        "order routed to broker"
+    );
+
+    // Persist the OrderRouted event in TX2.
+    let route_metadata = EventMetadata {
+        event_id: Uuid::new_v4().to_string(),
+        timestamp: Utc::now(),
+        actor: "oms".to_string(),
+    };
+
+    let route_events = applied
+        .decide(
+            OrderCommand::RouteOrder(RouteOrder {
+                order_id: order_id.to_string(),
+                venue: broker_code.clone(),
+                external_order_id: broker_resp.external_order_id.clone(),
+            }),
+            route_metadata,
+        )
+        .map_err(map_rejection_to_api_error)?;
+
+    for event in &route_events {
+        applied.apply(event).map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to apply RouteOrder event: {:?}", err),
+        })?;
+    }
+
+    let routed_state = applied.state.as_ref().ok_or(ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "missing aggregate state after routing".to_string(),
+    })?;
+
+    // TODO: outbox pattern — if TX2 fails, the broker holds the order but OMS records Submitted.
+    // Detect and reconcile via a stale-Submitted sweep job.
+    let mut tx2 = pool.begin().await.map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to start TX2: {:?}", err),
+    })?;
+
+    sqlx::query(
+        r#"
+        UPDATE order_state
+        SET status = $2, version = $3, updated_at = $4
+        WHERE order_id = $1 AND version = $5
+        "#
+    )
+    .bind(order_id)
+    .bind(routed_state.status.as_str())
+    .bind(routed_state.version)
+    .bind(Utc::now())
+    .bind(state_after_submit.version)
+    .execute(&mut *tx2)
+    .await
+    .map_err(|err| {
+        error!(order_id = %order_id, error = ?err, "TX2: failed to update order_state to Routed");
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to update order_state after routing: {:?}", err),
+        }
+    })?;
+
+    let mut route_new_events = Vec::with_capacity(route_events.len());
+    for event in &route_events {
+        route_new_events.push(domain_event_to_new_event(event)?);
+    }
+
+    event_store
+        .append_events_in_tx(&mut tx2, order_id, state_after_submit.version, &route_new_events)
+        .await
+        .map_err(|err| {
+            error!(order_id = %order_id, error = ?err, "TX2: failed to append OrderRouted event");
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to persist OrderRouted event: {:?}", err),
+            }
+        })?;
+
+    tx2.commit().await.map_err(|err| {
+        error!(order_id = %order_id, error = ?err, "TX2 commit failed — broker holds order but OMS status is Submitted");
+        ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to commit routing transaction: {:?}", err),
+        }
+    })?;
+
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())

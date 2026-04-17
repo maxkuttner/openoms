@@ -73,9 +73,17 @@ pub struct ExpireOrder {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteOrder {
+    pub order_id: String,
+    pub venue: String,
+    pub external_order_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum OrderCommand {
     SubmitOrder(SubmitOrder),
+    RouteOrder(RouteOrder),
     ReplaceOrder(ReplaceOrder),
     CancelOrder(CancelOrder),
     SuspendOrder(SuspendOrder),

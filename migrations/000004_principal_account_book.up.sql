@@ -54,3 +54,8 @@ CREATE INDEX idx_oms_account_status ON oms_account(status);
 CREATE INDEX idx_oms_grant_principal ON oms_principal_book_account_grant(principal_id);
 CREATE INDEX idx_oms_grant_book ON oms_principal_book_account_grant(book_id);
 CREATE INDEX idx_oms_grant_account ON oms_principal_book_account_grant(account_id);
+
+-- Back-fill FK constraints on order_state that couldn't be added in 000002
+ALTER TABLE order_state
+    ADD CONSTRAINT order_state_book_id_fkey FOREIGN KEY (book_id) REFERENCES oms_book(id),
+    ADD CONSTRAINT order_state_account_id_fkey FOREIGN KEY (account_id) REFERENCES oms_account(id);

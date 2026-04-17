@@ -7,6 +7,9 @@ mod app_state;
 mod auth;
 mod admin;
 
+use crate::adapters::BrokerRegistry;
+use crate::adapters::alpaca::AlpacaAdapter;
+use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 
 use axum::{
@@ -20,7 +23,6 @@ use std::env;
 use tracing::{error, info, Level};
 use tracing_subscriber;
 mod kafka;
-use crate::auth::AuthConfig;
 
 
 
@@ -73,34 +75,64 @@ async fn main() {
         }
     };
 
-    let auth_issuer = match env::var("OMS_AUTH_ISSUER") {
+    let admin_token = match env::var("OMS_ADMIN_TOKEN") {
         Ok(v) if !v.is_empty() => v,
         _ => {
-            error!("OMS_AUTH_ISSUER is not set");
+            error!("OMS_ADMIN_TOKEN is not set");
             std::process::exit(1);
         }
     };
 
-    let auth_audience = match env::var("OMS_AUTH_AUDIENCE") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            error!("OMS_AUTH_AUDIENCE is not set");
-            std::process::exit(1);
-        }
-    };
+    let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
 
-    let auth_jwks_url = match env::var("OMS_AUTH_JWKS_URL") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            error!("OMS_AUTH_JWKS_URL is not set");
-            std::process::exit(1);
-        }
-    };
+    // Build broker registry — adapters are registered only when credentials are present.
+    // Env vars follow the pattern {BROKER}_{ENVIRONMENT}_{KEY}.
+    let mut registry = BrokerRegistry::new();
 
-    let auth_config = AuthConfig::new(auth_issuer, auth_audience, auth_jwks_url);
+    match (
+        env::var("ALPACA_PAPER_API_KEY"),
+        env::var("ALPACA_PAPER_API_SECRET"),
+    ) {
+        (Ok(key), Ok(secret)) if !key.is_empty() && !secret.is_empty() => {
+            use std::sync::Arc;
+            registry.register("ALPACA", "PAPER", Arc::new(AlpacaAdapter::new(key, secret, "PAPER")));
+            info!("registered ALPACA/PAPER adapter");
+        }
+        _ => info!("ALPACA_PAPER_API_KEY / ALPACA_PAPER_API_SECRET not set — ALPACA/PAPER adapter not registered"),
+    }
+
+    match (
+        env::var("ALPACA_LIVE_API_KEY"),
+        env::var("ALPACA_LIVE_API_SECRET"),
+    ) {
+        (Ok(key), Ok(secret)) if !key.is_empty() && !secret.is_empty() => {
+            use std::sync::Arc;
+            registry.register("ALPACA", "LIVE", Arc::new(AlpacaAdapter::new(key, secret, "LIVE")));
+            info!("registered ALPACA/LIVE adapter");
+        }
+        _ => info!("ALPACA_LIVE_API_KEY / ALPACA_LIVE_API_SECRET not set — ALPACA/LIVE adapter not registered"),
+    }
+
+    if let Ok(base_url) = env::var("IBKR_PAPER_BASE_URL") {
+        if !base_url.is_empty() {
+            use std::sync::Arc;
+            registry.register("IBKR", "PAPER", Arc::new(IbkrAdapter::new(base_url, "PAPER")));
+            info!("registered IBKR/PAPER adapter (stub)");
+        }
+    }
+
+    if let Ok(base_url) = env::var("IBKR_LIVE_BASE_URL") {
+        if !base_url.is_empty() {
+            use std::sync::Arc;
+            registry.register("IBKR", "LIVE", Arc::new(IbkrAdapter::new(base_url, "LIVE")));
+            info!("registered IBKR/LIVE adapter (stub)");
+        }
+    }
 
     // AppState
-    let state = AppState::new(pool, auth_config);
+    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry);
 
     // Register routes
     
@@ -110,7 +142,7 @@ async fn main() {
         .route("/orders/cancel", post(handlers::orders_cancel))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
-    // 2) Register admin routes
+    // 2) Register admin routes (protected by static bearer token only)
     let admin_router = Router::new()
         .route(
             "/admin/principals",
@@ -119,6 +151,14 @@ async fn main() {
         .route(
             "/admin/principals/:id",
             axum::routing::patch(admin::update_principal).get(admin::get_principal),
+        )
+        .route(
+            "/admin/principals/:id/keys",
+            post(admin::register_principal_key),
+        )
+        .route(
+            "/admin/principals/:id/keys/:key_id",
+            axum::routing::delete(admin::revoke_principal_key),
         )
         .route(
             "/admin/books",
@@ -136,8 +176,7 @@ async fn main() {
             "/admin/accounts/:id",
             axum::routing::patch(admin::update_account).get(admin::get_account),
         )
-        .layer(middleware::from_fn(auth::admin_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+        .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let app = Router::new()
         // add health check route

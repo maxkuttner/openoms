@@ -56,6 +56,7 @@ pub enum OrderEventPayload {
     },
     OrderRouted {
         venue: String,
+        external_order_id: String,
     },
     OrderAmended {
         previous_limit_price: Option<f64>,

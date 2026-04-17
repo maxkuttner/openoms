@@ -4,7 +4,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use uuid::Uuid;
 
@@ -49,6 +50,7 @@ pub struct UpdateBook {
 pub struct CreateAccount {
     pub code: String,
     pub broker_code: String,
+    pub environment: String,
     pub external_account_ref: String,
     pub status: String,
 }
@@ -57,6 +59,7 @@ pub struct CreateAccount {
 pub struct UpdateAccount {
     pub code: Option<String>,
     pub broker_code: Option<String>,
+    pub environment: Option<String>,
     pub external_account_ref: Option<String>,
     pub status: Option<String>,
 }
@@ -271,7 +274,13 @@ pub async fn create_account(
     State(state): State<AppState>,
     Json(payload): Json<CreateAccount>,
 ) -> Result<Json<Account>, AdminError> {
-    info!(code = %payload.code, broker_code = %payload.broker_code, "admin create account");
+    if payload.environment != "PAPER" && payload.environment != "LIVE" {
+        return Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: "environment must be PAPER or LIVE".to_string(),
+        });
+    }
+    info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create account");
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Account>(
         r#"
@@ -279,15 +288,17 @@ pub async fn create_account(
             id,
             code,
             broker_code,
+            environment,
             external_account_ref,
             status
-        ) VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, code, broker_code, external_account_ref, status, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(payload.code)
     .bind(payload.broker_code)
+    .bind(payload.environment)
     .bind(payload.external_account_ref)
     .bind(payload.status)
     .fetch_one(state.pool())
@@ -303,7 +314,7 @@ pub async fn list_accounts(
     info!("admin list accounts");
     let records = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_code, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
         FROM oms_account
         ORDER BY created_at DESC
         "#,
@@ -322,7 +333,7 @@ pub async fn get_account(
     info!(account_id = %id, "admin get account");
     let record = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_code, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
         FROM oms_account
         WHERE id = $1
         "#,
@@ -341,6 +352,14 @@ pub async fn update_account(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateAccount>,
 ) -> Result<Json<Account>, AdminError> {
+    if let Some(ref env) = payload.environment {
+        if env != "PAPER" && env != "LIVE" {
+            return Err(AdminError {
+                status: StatusCode::BAD_REQUEST,
+                message: "environment must be PAPER or LIVE".to_string(),
+            });
+        }
+    }
     info!(account_id = %id, "admin update account");
     let record = sqlx::query_as::<_, Account>(
         r#"
@@ -348,15 +367,17 @@ pub async fn update_account(
         SET
             code = COALESCE($1, code),
             broker_code = COALESCE($2, broker_code),
-            external_account_ref = COALESCE($3, external_account_ref),
-            status = COALESCE($4, status),
+            environment = COALESCE($3, environment),
+            external_account_ref = COALESCE($4, external_account_ref),
+            status = COALESCE($5, status),
             updated_at = now()
-        WHERE id = $5
-        RETURNING id, code, broker_code, external_account_ref, status, created_at, updated_at
+        WHERE id = $6
+        RETURNING id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
         "#,
     )
     .bind(payload.code)
     .bind(payload.broker_code)
+    .bind(payload.environment)
     .bind(payload.external_account_ref)
     .bind(payload.status)
     .bind(id)
@@ -367,6 +388,88 @@ pub async fn update_account(
 
     Ok(Json(record))
 }
+
+// ── API key management ────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterKey {
+    pub key_id: String,
+    pub secret: String,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ApiKeyRecord {
+    pub id: Uuid,
+    pub principal_id: Uuid,
+    pub key_id: String,
+    pub name: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn register_principal_key(
+    State(state): State<AppState>,
+    Path(principal_id): Path<Uuid>,
+    Json(payload): Json<RegisterKey>,
+) -> Result<Json<ApiKeyRecord>, AdminError> {
+    info!(principal_id = %principal_id, key_id = %payload.key_id, "admin register key");
+
+    let secret = payload.secret.clone();
+    let secret_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&secret, 12))
+        .await
+        .map_err(|_| AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "hash task failed".to_string(),
+        })?
+        .map_err(|_| AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "failed to hash secret".to_string(),
+        })?;
+
+    let record = sqlx::query_as::<_, ApiKeyRecord>(
+        r#"
+        INSERT INTO oms_api_key (principal_id, key_id, secret_hash, name)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, principal_id, key_id, name, created_at
+        "#,
+    )
+    .bind(principal_id)
+    .bind(payload.key_id)
+    .bind(secret_hash)
+    .bind(payload.name)
+    .fetch_one(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(record))
+}
+
+pub async fn revoke_principal_key(
+    State(state): State<AppState>,
+    Path((principal_id, key_id)): Path<(Uuid, String)>,
+) -> Result<StatusCode, AdminError> {
+    info!(principal_id = %principal_id, key_id = %key_id, "admin revoke key");
+
+    let result = sqlx::query(
+        r#"
+        UPDATE oms_api_key SET revoked_at = now()
+        WHERE key_id = $1 AND principal_id = $2 AND revoked_at IS NULL
+        "#,
+    )
+    .bind(&key_id)
+    .bind(principal_id)
+    .execute(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("key"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct AdminError {

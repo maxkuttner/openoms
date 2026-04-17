@@ -1,0 +1,12 @@
+{
+  "order_id": "da6ef121-b36a-49fc-9ee7-a013406145de",
+  "client_order_id": "client-ord-test-001",
+  "book_id": "baf2c204-5300-41bd-9245-530444c72622",
+  "account_id": "a49f5c8c-3983-463c-8ca4-aeb4791b29d4",
+  "instrument_id": "1",
+  "side": "buy",
+  "order_type": "limit",
+  "time_in_force": "day",
+  "limit_price": 123.45,
+  "quantity": 10.0
+}

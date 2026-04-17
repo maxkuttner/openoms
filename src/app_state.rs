@@ -1,22 +1,32 @@
+use std::sync::Arc;
 use sqlx::PgPool;
 
-use crate::auth::AuthConfig;
+use crate::adapters::BrokerRegistry;
 
-// AppState to provide stores and tools to various handlers
+/// Shared application state injected into every Axum handler via State<AppState>.
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    pub auth: AuthConfig,
+    pub admin_token: String,
+    pub admin_auth_enabled: bool,
+    registry: Arc<BrokerRegistry>,
 }
 
 impl AppState {
-    // constructor
-    pub fn new(pool: PgPool, auth: AuthConfig) -> Self {
-        Self { pool, auth }
+    pub fn new(pool: PgPool, admin_token: String, admin_auth_enabled: bool, registry: BrokerRegistry) -> Self {
+        Self {
+            pool,
+            admin_token,
+            admin_auth_enabled,
+            registry: Arc::new(registry),
+        }
     }
 
-    // pool getter
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    pub fn registry(&self) -> &Arc<BrokerRegistry> {
+        &self.registry
     }
 }

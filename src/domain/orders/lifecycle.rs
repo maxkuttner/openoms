@@ -5,6 +5,7 @@ use super::state::OrderStatus;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
     SubmitOrder,
+    RouteOrder,
     ReplaceOrder,
     CancelOrder,
     SuspendOrder,
@@ -17,6 +18,7 @@ impl CommandKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SubmitOrder => "submit_order",
+            Self::RouteOrder => "route_order",
             Self::ReplaceOrder => "replace_order",
             Self::CancelOrder => "cancel_order",
             Self::SuspendOrder => "suspend_order",
@@ -31,6 +33,7 @@ impl OrderCommand {
     pub fn kind(&self) -> CommandKind {
         match self {
             OrderCommand::SubmitOrder(_) => CommandKind::SubmitOrder,
+            OrderCommand::RouteOrder(_) => CommandKind::RouteOrder,
             OrderCommand::ReplaceOrder(_) => CommandKind::ReplaceOrder,
             OrderCommand::CancelOrder(_) => CommandKind::CancelOrder,
             OrderCommand::SuspendOrder(_) => CommandKind::SuspendOrder,
@@ -48,7 +51,15 @@ pub fn allowed_kinds_for_status(status: OrderStatus) -> &'static [CommandKind] {
     // Keep this intentionally small and easy to scan; detailed field-level validation
     // lives in the aggregate and invariants modules.
     match status {
-        Submitted | Routed | PartiallyFilled => &[
+        Submitted => &[
+            RouteOrder,
+            ReplaceOrder,
+            CancelOrder,
+            SuspendOrder,
+            ReceiveExecutionReport,
+            ExpireOrder,
+        ],
+        Routed | PartiallyFilled => &[
             ReplaceOrder,
             CancelOrder,
             SuspendOrder,

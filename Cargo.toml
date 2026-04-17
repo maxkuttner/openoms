@@ -14,9 +14,13 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13.1", features = ["json"] }
+base64 = "0.22"
+bcrypt = "0.15"
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4", "serde"] }
-jsonwebtoken = "9"
 
 # Kafka producer
 rdkafka = { version = "0.34", features = ["tokio"] }
+
+# Async trait support for dyn-compatible broker adapters
+async-trait = "0.1"

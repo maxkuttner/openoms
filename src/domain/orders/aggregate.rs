@@ -81,6 +81,23 @@ impl OrderAggregate {
                     status_after: OrderStatus::Submitted,
                 }])
             }
+            OrderCommand::RouteOrder(cmd) => {
+                let state = invariants::require_existing_order(&self.state)?;
+                let next_version = state.version + 1;
+                Ok(vec![OrderDomainEvent {
+                    event_id: metadata.event_id,
+                    event_type: OrderEventType::OrderRouted,
+                    order_id: cmd.order_id,
+                    timestamp: metadata.timestamp,
+                    actor: metadata.actor,
+                    payload: OrderEventPayload::OrderRouted {
+                        venue: cmd.venue,
+                        external_order_id: cmd.external_order_id,
+                    },
+                    version: next_version,
+                    status_after: OrderStatus::Routed,
+                }])
+            }
             OrderCommand::ReplaceOrder(cmd) => {
                 let state = invariants::require_existing_order(&self.state)?;
 
@@ -644,6 +661,7 @@ mod tests {
             actor: "test".to_string(),
             payload: OrderEventPayload::OrderRouted {
                 venue: "XNAS".to_string(),
+                external_order_id: "test-ext-id".to_string(),
             },
             version: 2,
             status_after: OrderStatus::Routed,

@@ -16,9 +16,7 @@ CREATE TABLE order_state (
     resume_to_status TEXT,
     version BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT order_state_book_id_fkey FOREIGN KEY (book_id) REFERENCES oms_book(id),
-    CONSTRAINT order_state_account_id_fkey FOREIGN KEY (account_id) REFERENCES oms_account(id)
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_order_state_account_status ON order_state(account_id, status);
