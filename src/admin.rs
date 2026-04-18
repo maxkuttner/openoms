@@ -1,9 +1,10 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
+use base64::engine::{general_purpose, Engine};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -96,20 +97,40 @@ pub async fn create_principal(
     Ok(Json(record))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PrincipalFilter {
+    pub external_subject: Option<String>,
+}
+
 pub async fn list_principals(
     State(state): State<AppState>,
+    Query(filter): Query<PrincipalFilter>,
 ) -> Result<Json<Vec<Principal>>, AdminError> {
     info!("admin list principals");
-    let records = sqlx::query_as::<_, Principal>(
-        r#"
-        SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
-        FROM oms_principal
-        ORDER BY created_at DESC
-        "#,
-    )
-    .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
+    let records = if let Some(sub) = filter.external_subject {
+        sqlx::query_as::<_, Principal>(
+            r#"
+            SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
+            FROM oms_principal
+            WHERE external_subject = $1
+            "#,
+        )
+        .bind(sub)
+        .fetch_all(state.pool())
+        .await
+        .map_err(map_db_error)?
+    } else {
+        sqlx::query_as::<_, Principal>(
+            r#"
+            SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
+            FROM oms_principal
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(state.pool())
+        .await
+        .map_err(map_db_error)?
+    };
 
     Ok(Json(records))
 }
@@ -392,9 +413,7 @@ pub async fn update_account(
 // ── API key management ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-pub struct RegisterKey {
-    pub key_id: String,
-    pub secret: String,
+pub struct CreateKey {
     pub name: Option<String>,
 }
 
@@ -405,17 +424,48 @@ pub struct ApiKeyRecord {
     pub key_id: String,
     pub name: Option<String>,
     pub created_at: DateTime<Utc>,
+    #[sqlx(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+pub async fn list_principal_keys(
+    State(state): State<AppState>,
+    Path(principal_id): Path<Uuid>,
+) -> Result<Json<Vec<ApiKeyRecord>>, AdminError> {
+    info!(principal_id = %principal_id, "admin list keys");
+    let records = sqlx::query_as::<_, ApiKeyRecord>(
+        r#"
+        SELECT id, principal_id, key_id, name, created_at
+        FROM oms_api_key
+        WHERE principal_id = $1 AND revoked_at IS NULL
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(principal_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(records))
 }
 
 pub async fn register_principal_key(
     State(state): State<AppState>,
     Path(principal_id): Path<Uuid>,
-    Json(payload): Json<RegisterKey>,
+    Json(payload): Json<CreateKey>,
 ) -> Result<Json<ApiKeyRecord>, AdminError> {
-    info!(principal_id = %principal_id, key_id = %payload.key_id, "admin register key");
+    let key_id = format!("ak_{}", Uuid::new_v4().simple());
 
-    let secret = payload.secret.clone();
-    let secret_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&secret, 12))
+    let mut raw = [0u8; 32];
+    raw[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    raw[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let plaintext_secret = format!("sk_{}", general_purpose::URL_SAFE_NO_PAD.encode(raw));
+
+    info!(principal_id = %principal_id, key_id = %key_id, "admin register key");
+
+    let secret_to_hash = plaintext_secret.clone();
+    let secret_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&secret_to_hash, 12))
         .await
         .map_err(|_| AdminError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -426,7 +476,7 @@ pub async fn register_principal_key(
             message: "failed to hash secret".to_string(),
         })?;
 
-    let record = sqlx::query_as::<_, ApiKeyRecord>(
+    let mut record = sqlx::query_as::<_, ApiKeyRecord>(
         r#"
         INSERT INTO oms_api_key (principal_id, key_id, secret_hash, name)
         VALUES ($1, $2, $3, $4)
@@ -434,13 +484,14 @@ pub async fn register_principal_key(
         "#,
     )
     .bind(principal_id)
-    .bind(payload.key_id)
+    .bind(&key_id)
     .bind(secret_hash)
     .bind(payload.name)
     .fetch_one(state.pool())
     .await
     .map_err(map_db_error)?;
 
+    record.secret = Some(plaintext_secret);
     Ok(Json(record))
 }
 

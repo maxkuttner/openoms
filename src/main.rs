@@ -154,7 +154,7 @@ async fn main() {
         )
         .route(
             "/admin/principals/:id/keys",
-            post(admin::register_principal_key),
+            post(admin::register_principal_key).get(admin::list_principal_keys),
         )
         .route(
             "/admin/principals/:id/keys/:key_id",
