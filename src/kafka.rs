@@ -1,9 +1,10 @@
 use std::env;
+use std::time::Duration;
 
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
-use rdkafka::producer::FutureProducer;
+use rdkafka::producer::{FutureProducer, FutureRecord};
 
 #[derive(Clone)]
 pub struct KafkaConfig {
@@ -86,5 +87,55 @@ impl KafkaClient {
             producer,
             topic: config.orders_topic.clone(),
         })
+    }
+}
+
+pub async fn publish_events(
+    client: Option<&KafkaClient>,
+    order_id: &str,
+    events: &[crate::domain::orders::events::OrderDomainEvent],
+) {
+    let client = match client {
+        Some(c) => c,
+        None => return,
+    };
+
+    for event in events {
+        let payload = match serde_json::to_string(event) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::error!(
+                    order_id = %order_id,
+                    event_type = %event.event_type.as_str(),
+                    error = ?err,
+                    "failed to serialize domain event for Kafka"
+                );
+                continue;
+            }
+        };
+
+        let record = FutureRecord::to(&client.topic)
+            .key(order_id)
+            .payload(payload.as_str());
+
+        match client.producer.send(record, Duration::from_secs(5)).await {
+            Ok((partition, offset)) => {
+                tracing::info!(
+                    order_id = %order_id,
+                    event_type = %event.event_type.as_str(),
+                    partition,
+                    offset,
+                    "published event to Kafka"
+                );
+            }
+            Err((err, _msg)) => {
+                tracing::error!(
+                    order_id = %order_id,
+                    event_type = %event.event_type.as_str(),
+                    error = ?err,
+                    "failed to publish event to Kafka (non-fatal)"
+                );
+            }
+        }
     }
 }

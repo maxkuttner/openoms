@@ -20,7 +20,7 @@ use axum::{
 };
 use sqlx::PgPool;
 use std::env;
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber;
 mod kafka;
 
@@ -66,13 +66,13 @@ async fn main() {
         return;
     }
     
-    // Init kafka client from .env
-    let kafka_config = match kafka::KafkaConfig::from_env() {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            error!("Kafka config is invalid or missing: {}", err);
-            std::process::exit(1);
-        }
+    // Init kafka client from .env (optional — publishing is disabled if not configured)
+    let kafka_client: Option<kafka::KafkaClient> = match kafka::KafkaConfig::from_env() {
+        Ok(cfg) => match cfg.create_producer_client() {
+            Ok(client) => { info!("Kafka producer ready (topic: {})", cfg.orders_topic); Some(client) }
+            Err(err) => { warn!("Kafka producer failed, publishing disabled: {}", err); None }
+        },
+        Err(err) => { info!("Kafka not configured ({}), publishing disabled", err); None }
     };
 
     let admin_token = match env::var("OMS_ADMIN_TOKEN") {
@@ -132,7 +132,7 @@ async fn main() {
     }
 
     // AppState
-    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry);
+    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client);
 
     // Register routes
     

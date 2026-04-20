@@ -57,18 +57,20 @@ def load_env(env_path: Path) -> dict:
     return env
 
 
-def post(base_url: str, path: str, token: str, payload: dict) -> dict:
+def post(base_url: str, path: str, token: str | None, payload: dict) -> dict:
     url = f"{base_url}{path}"
-    resp = requests.post(url, json=payload, headers={"Authorization": f"Bearer {token}"})
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.post(url, json=payload, headers=headers)
     if not resp.ok:
         print(f"  ERROR {resp.status_code}: {resp.text}")
         sys.exit(1)
     return resp.json()
 
 
-def post_no_content(base_url: str, path: str, token: str, payload: dict):
+def post_no_content(base_url: str, path: str, token: str | None, payload: dict):
     url = f"{base_url}{path}"
-    resp = requests.post(url, json=payload, headers={"Authorization": f"Bearer {token}"})
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.post(url, json=payload, headers=headers)
     if not resp.ok:
         print(f"  ERROR {resp.status_code}: {resp.text}")
         sys.exit(1)
@@ -114,7 +116,7 @@ def insert_grant(database_url: str, principal_id: str, book_id: str, account_id:
 
 def main():
     parser = argparse.ArgumentParser(description="Bootstrap OMS master data")
-    parser.add_argument("--token", required=True, help="JWT with org_role=org:admin")
+    parser.add_argument("--token", default=None, help="JWT with org_role=org:admin (required when OMS JWT verification is enabled)")
     parser.add_argument("--base-url", default="http://localhost:3001")
     parser.add_argument(
         "--sub",
@@ -141,7 +143,7 @@ def main():
 
     # Decode sub from token if not provided explicitly
     sub = args.sub
-    if not sub:
+    if not sub and args.token:
         try:
             import base64, json as _json
             payload_b64 = args.token.split(".")[1]
@@ -153,6 +155,8 @@ def main():
         except Exception:
             sub = "unknown"
             print(f"Could not decode sub from token, using: {sub}")
+    if not sub:
+        sub = "unknown"
 
     base = args.base_url
 

@@ -15,18 +15,6 @@ pub struct OrderRequest {
     pub price: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct KafkaOrderEvent {
-    pub projector_event_id: Option<String>,
-    pub order_id: Uuid,
-    pub account_id: i64,
-    pub connector_id: i64,
-    pub client_order_id: String,
-    pub status: String,
-    pub event_type: String,
-    pub order: OrderRequest,
-    pub result: String,
-}
 
 #[derive(Debug, Serialize, Deserialize, Clone, sqlx::Type)]
 #[serde(rename_all = "lowercase")] // <--- THIS IS THE KEY

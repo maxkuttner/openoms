@@ -22,6 +22,7 @@ use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
+use crate::kafka::publish_events;
 
 // Generic api error struct
 pub struct ApiError {
@@ -249,6 +250,8 @@ pub async fn orders_submit(
         message: format!("failed to commit transaction: {:?}", err),
     })?;
 
+    publish_events(state.kafka(), &order_id.to_string(), &events).await;
+
     // --- TX2: route order to broker ---
     // Look up the account to get broker_code, environment, external_account_ref.
     let account_row = sqlx::query(
@@ -409,6 +412,8 @@ pub async fn orders_submit(
         }
     })?;
 
+    publish_events(state.kafka(), &order_id.to_string(), &route_events).await;
+
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
@@ -418,12 +423,12 @@ pub async fn orders_submit(
 
 
 pub async fn orders_cancel(
-    State(state): State<AppState>,
+    State(app_state): State<AppState>,
     Json(req): Json<commands::CancelOrder>
 ) -> Result<Response, ApiError>{
     info!(?req, "cancel order received");
 
-    let pool = state.pool().clone();
+    let pool = app_state.pool().clone();
     let event_store = OrderEventStore::new(pool.clone());
 
     let order_id = Uuid::parse_str(&req.order_id).map_err(|_| ApiError {
@@ -592,7 +597,9 @@ pub async fn orders_cancel(
         message: format!("failed to commit transaction: {:?}", err),
     })?;
 
-    // return response 
+    publish_events(app_state.kafka(), &order_id.to_string(), &events).await;
+
+    // return response
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
