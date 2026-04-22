@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::app_state::AppState;
 use crate::domain::identity::{Account, Book, Principal};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePrincipal {
     pub code: String,
     pub principal_type: String,
@@ -22,7 +22,7 @@ pub struct CreatePrincipal {
     pub status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdatePrincipal {
     pub code: Option<String>,
     pub principal_type: Option<String>,
@@ -31,7 +31,7 @@ pub struct UpdatePrincipal {
     pub status: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateBook {
     pub code: String,
     pub name: String,
@@ -39,7 +39,7 @@ pub struct CreateBook {
     pub base_currency: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateBook {
     pub code: Option<String>,
     pub name: Option<String>,
@@ -47,7 +47,7 @@ pub struct UpdateBook {
     pub base_currency: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateAccount {
     pub code: String,
     pub broker_code: String,
@@ -56,7 +56,7 @@ pub struct CreateAccount {
     pub status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateAccount {
     pub code: Option<String>,
     pub broker_code: Option<String>,
@@ -65,6 +65,15 @@ pub struct UpdateAccount {
     pub status: Option<String>,
 }
 
+#[utoipa::path(
+    post, path = "/admin/principals", tag = "admin",
+    request_body = CreatePrincipal,
+    responses(
+        (status = 200, description = "Created", body = Principal),
+        (status = 409, description = "Already exists"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn create_principal(
     State(state): State<AppState>,
     Json(payload): Json<CreatePrincipal>,
@@ -97,11 +106,19 @@ pub async fn create_principal(
     Ok(Json(record))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub struct PrincipalFilter {
     pub external_subject: Option<String>,
 }
 
+#[utoipa::path(
+    get, path = "/admin/principals", tag = "admin",
+    params(PrincipalFilter),
+    responses(
+        (status = 200, description = "OK", body = [Principal]),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn list_principals(
     State(state): State<AppState>,
     Query(filter): Query<PrincipalFilter>,
@@ -135,6 +152,15 @@ pub async fn list_principals(
     Ok(Json(records))
 }
 
+#[utoipa::path(
+    get, path = "/admin/principals/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    responses(
+        (status = 200, description = "OK", body = Principal),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn get_principal(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -156,6 +182,16 @@ pub async fn get_principal(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    patch, path = "/admin/principals/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    request_body = UpdatePrincipal,
+    responses(
+        (status = 200, description = "Updated", body = Principal),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn update_principal(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -190,6 +226,15 @@ pub async fn update_principal(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    post, path = "/admin/books", tag = "admin",
+    request_body = CreateBook,
+    responses(
+        (status = 200, description = "Created", body = Book),
+        (status = 409, description = "Already exists"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn create_book(
     State(state): State<AppState>,
     Json(payload): Json<CreateBook>,
@@ -220,6 +265,13 @@ pub async fn create_book(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    get, path = "/admin/books", tag = "admin",
+    responses(
+        (status = 200, description = "OK", body = [Book]),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn list_books(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Book>>, AdminError> {
@@ -238,6 +290,15 @@ pub async fn list_books(
     Ok(Json(records))
 }
 
+#[utoipa::path(
+    get, path = "/admin/books/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Book ID")),
+    responses(
+        (status = 200, description = "OK", body = Book),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn get_book(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -259,6 +320,16 @@ pub async fn get_book(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    patch, path = "/admin/books/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Book ID")),
+    request_body = UpdateBook,
+    responses(
+        (status = 200, description = "Updated", body = Book),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn update_book(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -291,6 +362,16 @@ pub async fn update_book(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    post, path = "/admin/accounts", tag = "admin",
+    request_body = CreateAccount,
+    responses(
+        (status = 200, description = "Created", body = Account),
+        (status = 400, description = "Invalid environment (must be PAPER or LIVE)"),
+        (status = 409, description = "Already exists"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn create_account(
     State(state): State<AppState>,
     Json(payload): Json<CreateAccount>,
@@ -329,6 +410,13 @@ pub async fn create_account(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    get, path = "/admin/accounts", tag = "admin",
+    responses(
+        (status = 200, description = "OK", body = [Account]),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn list_accounts(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Account>>, AdminError> {
@@ -347,6 +435,15 @@ pub async fn list_accounts(
     Ok(Json(records))
 }
 
+#[utoipa::path(
+    get, path = "/admin/accounts/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Account ID")),
+    responses(
+        (status = 200, description = "OK", body = Account),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn get_account(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -368,6 +465,17 @@ pub async fn get_account(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    patch, path = "/admin/accounts/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Account ID")),
+    request_body = UpdateAccount,
+    responses(
+        (status = 200, description = "Updated", body = Account),
+        (status = 400, description = "Invalid environment"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn update_account(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -412,12 +520,12 @@ pub async fn update_account(
 
 // ── API key management ────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateKey {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct ApiKeyRecord {
     pub id: Uuid,
     pub principal_id: Uuid,
@@ -429,6 +537,14 @@ pub struct ApiKeyRecord {
     pub secret: Option<String>,
 }
 
+#[utoipa::path(
+    get, path = "/admin/principals/{id}/keys", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    responses(
+        (status = 200, description = "OK", body = [ApiKeyRecord]),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn list_principal_keys(
     State(state): State<AppState>,
     Path(principal_id): Path<Uuid>,
@@ -450,6 +566,15 @@ pub async fn list_principal_keys(
     Ok(Json(records))
 }
 
+#[utoipa::path(
+    post, path = "/admin/principals/{id}/keys", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    request_body = CreateKey,
+    responses(
+        (status = 200, description = "Created — plaintext secret included once", body = ApiKeyRecord),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn register_principal_key(
     State(state): State<AppState>,
     Path(principal_id): Path<Uuid>,
@@ -495,6 +620,18 @@ pub async fn register_principal_key(
     Ok(Json(record))
 }
 
+#[utoipa::path(
+    delete, path = "/admin/principals/{id}/keys/{key_id}", tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Principal ID"),
+        ("key_id" = String, Path, description = "Key ID"),
+    ),
+    responses(
+        (status = 204, description = "Revoked"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn revoke_principal_key(
     State(state): State<AppState>,
     Path((principal_id, key_id)): Path<(Uuid, String)>,

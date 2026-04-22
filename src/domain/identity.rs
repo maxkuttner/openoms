@@ -3,7 +3,7 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, FromRow, Clone)]
+#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
 pub struct Principal {
     pub id: Uuid,
     pub code: String,
@@ -15,7 +15,7 @@ pub struct Principal {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, FromRow, Clone)]
+#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
 pub struct Book {
     pub id: Uuid,
     pub code: String,
@@ -26,7 +26,7 @@ pub struct Book {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, FromRow, Clone)]
+#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
 pub struct Account {
     pub id: Uuid,
     pub code: String,

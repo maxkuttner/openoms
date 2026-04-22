@@ -11,18 +11,85 @@ use crate::adapters::BrokerRegistry;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
+use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
+use crate::domain::orders::state::{OrderSide, OrderType, TimeInForce};
+use crate::domain::identity::{Principal, Book, Account};
+use crate::admin::{
+    CreatePrincipal, UpdatePrincipal,
+    CreateBook, UpdateBook,
+    CreateAccount, UpdateAccount,
+    CreateKey, ApiKeyRecord,
+};
 
 use axum::{
-    routing::get, 
+    response::Html,
+    routing::get,
     routing::post,
     middleware,
     Router
 };
+use serde_json::json;
 use sqlx::PgPool;
 use std::env;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber;
+use utoipa::OpenApi;
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 mod kafka;
+
+#[derive(OpenApi)]
+#[openapi(
+    info(title = "OMS API", version = "0.1.0"),
+    paths(
+        handlers::health,
+        handlers::orders_submit,
+        handlers::orders_cancel,
+        admin::create_principal,
+        admin::list_principals,
+        admin::get_principal,
+        admin::update_principal,
+        admin::register_principal_key,
+        admin::list_principal_keys,
+        admin::revoke_principal_key,
+        admin::create_book,
+        admin::list_books,
+        admin::get_book,
+        admin::update_book,
+        admin::create_account,
+        admin::list_accounts,
+        admin::get_account,
+        admin::update_account,
+    ),
+    components(schemas(
+        SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce,
+        Principal, Book, Account,
+        CreatePrincipal, UpdatePrincipal,
+        CreateBook, UpdateBook,
+        CreateAccount, UpdateAccount,
+        CreateKey, ApiKeyRecord,
+    )),
+    modifiers(&SecurityAddon),
+    tags(
+        (name = "orders", description = "Order submission and cancellation"),
+        (name = "admin", description = "Admin management of principals, books, accounts, and keys"),
+    )
+)]
+struct ApiDoc;
+
+struct SecurityAddon;
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.get_or_insert_default();
+        components.add_security_scheme(
+            "basic_auth",
+            SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
+        );
+        components.add_security_scheme(
+            "bearer_token",
+            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+        );
+    }
+}
 
 
 
@@ -177,8 +244,16 @@ async fn main() {
             axum::routing::patch(admin::update_account).get(admin::get_account),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
+    
+
+    let scalar_html = {
+        let config = json!({ "url": "/api-docs/openapi.json" });
+        scalar_api_reference::scalar_html_default(&config)
+    };
 
     let app = Router::new()
+        .route("/scalar", get(move || async move { Html(scalar_html) }))
+        .route("/api-docs/openapi.json", get(|| async { axum::Json(ApiDoc::openapi()) }))
         // add health check route
         .route("/health", get(handlers::health))
         .merge(orders_router)

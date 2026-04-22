@@ -16,7 +16,7 @@ use crate::adapters::{BrokerOrderRequest, BrokerError};
 use crate::app_state::AppState;
 use crate::domain::orders::commands;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
-use crate::domain::orders::commands::{OrderCommand, RouteOrder};
+use crate::domain::orders::commands::{OrderCommand, RouteOrder, SubmitOrder, CancelOrder};
 use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
@@ -62,13 +62,28 @@ pub async fn handler_404(uri: Uri) -> impl IntoResponse {
     )
 }
 
-// Handler: healthcheck
+#[utoipa::path(
+    get, path = "/health",
+    responses((status = 200, description = "OK", body = String))
+)]
 pub async fn health() -> &'static str {
     "OK"
 }
 
 
-// Handler: orders/submit
+#[utoipa::path(
+    post, path = "/orders/submit", tag = "orders",
+    request_body = SubmitOrder,
+    responses(
+        (status = 204, description = "Order accepted and routed"),
+        (status = 400, description = "Validation error"),
+        (status = 403, description = "No trade grant for principal/book/account"),
+        (status = 409, description = "Order already exists"),
+        (status = 502, description = "Broker rejected the order"),
+        (status = 503, description = "No broker adapter configured"),
+    ),
+    security(("basic_auth" = []))
+)]
 pub async fn orders_submit(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -422,6 +437,17 @@ pub async fn orders_submit(
 
 
 
+#[utoipa::path(
+    post, path = "/orders/cancel", tag = "orders",
+    request_body = CancelOrder,
+    responses(
+        (status = 204, description = "Cancel accepted"),
+        (status = 400, description = "Invalid UUID"),
+        (status = 404, description = "Order not found"),
+        (status = 409, description = "Order state version mismatch"),
+    ),
+    security(("basic_auth" = []))
+)]
 pub async fn orders_cancel(
     State(app_state): State<AppState>,
     Json(req): Json<commands::CancelOrder>

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::state::{OrderSide, OrderType, TimeInForce};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct SubmitOrder {
     pub order_id: String,
     pub client_order_id: String,
@@ -23,7 +23,7 @@ pub struct ReplaceOrder {
     pub new_quantity: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct CancelOrder {
     pub order_id: String,
     pub reason: Option<String>,

@@ -24,3 +24,8 @@ rdkafka = { version = "0.34", features = ["tokio"] }
 
 # Async trait support for dyn-compatible broker adapters
 async-trait = "0.1"
+
+scalar_api_reference = { version = "0.1.0", features = ["axum"] }
+
+# OpenAPI spec generation
+utoipa = { version = "4", features = ["uuid", "chrono"] }
