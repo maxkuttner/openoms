@@ -19,7 +19,9 @@ use crate::admin::{
     CreateBook, UpdateBook,
     CreateAccount, UpdateAccount,
     CreateKey, ApiKeyRecord,
+    CreateGrant, UpdateGrant,
 };
+use crate::domain::identity::Grant;
 
 use axum::{
     response::Html,
@@ -51,6 +53,10 @@ mod kafka;
         admin::register_principal_key,
         admin::list_principal_keys,
         admin::revoke_principal_key,
+        admin::create_grant,
+        admin::list_grants,
+        admin::update_grant,
+        admin::delete_grant,
         admin::create_book,
         admin::list_books,
         admin::get_book,
@@ -67,6 +73,7 @@ mod kafka;
         CreateBook, UpdateBook,
         CreateAccount, UpdateAccount,
         CreateKey, ApiKeyRecord,
+        Grant, CreateGrant, UpdateGrant,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -242,6 +249,14 @@ async fn main() {
         .route(
             "/admin/accounts/:id",
             axum::routing::patch(admin::update_account).get(admin::get_account),
+        )
+        .route(
+            "/admin/principals/:id/grants",
+            post(admin::create_grant).get(admin::list_grants),
+        )
+        .route(
+            "/admin/principals/:id/grants/:grant_id",
+            axum::routing::patch(admin::update_grant).delete(admin::delete_grant),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
     

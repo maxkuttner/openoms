@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -34,6 +34,19 @@ pub struct Account {
     pub environment: String,
     pub external_account_ref: String,
     pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
+pub struct Grant {
+    pub id: Uuid,
+    pub principal_id: Uuid,
+    pub book_id: Uuid,
+    pub account_id: Uuid,
+    pub can_trade: bool,
+    pub can_view: bool,
+    pub can_allocate: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

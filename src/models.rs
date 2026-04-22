@@ -120,24 +120,6 @@ impl EventSource {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
-pub struct Order {
-    pub order_id: Uuid,
-    pub account_id: i64,
-    pub connector_id: i64,
-    pub instrument_id: i64,
-    pub client_order_id: String,
-    pub side: String,
-    pub order_type: String,
-    pub quantity: f64,
-    pub limit_price: Option<f64>,
-    pub filled_quantity: f64,
-    pub status: String,
-    pub external_order_id: Option<String>,
-    pub error_message: Option<String>,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
 
 #[derive(Debug, Serialize, Deserialize, FromRow, Clone)]
 #[allow(dead_code)]

@@ -11,7 +11,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::domain::identity::{Account, Book, Principal};
+use crate::domain::identity::{Account, Book, Grant, Principal};
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePrincipal {
@@ -652,6 +652,168 @@ pub async fn revoke_principal_key(
 
     if result.rows_affected() == 0 {
         return Err(AdminError::not_found("key"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Grant management ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateGrant {
+    pub book_id: Uuid,
+    pub account_id: Uuid,
+    pub can_trade: bool,
+    pub can_view: bool,
+    pub can_allocate: bool,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateGrant {
+    pub can_trade: Option<bool>,
+    pub can_view: Option<bool>,
+    pub can_allocate: Option<bool>,
+}
+
+#[utoipa::path(
+    post, path = "/admin/principals/{id}/grants", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    request_body = CreateGrant,
+    responses(
+        (status = 200, description = "Created", body = Grant),
+        (status = 409, description = "Grant already exists for this principal/book/account"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn create_grant(
+    State(state): State<AppState>,
+    Path(principal_id): Path<Uuid>,
+    Json(payload): Json<CreateGrant>,
+) -> Result<Json<Grant>, AdminError> {
+    info!(principal_id = %principal_id, book_id = %payload.book_id, account_id = %payload.account_id, "admin create grant");
+    let id = Uuid::new_v4();
+    let record = sqlx::query_as::<_, Grant>(
+        r#"
+        INSERT INTO oms_principal_book_account_grant (id, principal_id, book_id, account_id, can_trade, can_view, can_allocate)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        "#,
+    )
+    .bind(id)
+    .bind(principal_id)
+    .bind(payload.book_id)
+    .bind(payload.account_id)
+    .bind(payload.can_trade)
+    .bind(payload.can_view)
+    .bind(payload.can_allocate)
+    .fetch_one(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    get, path = "/admin/principals/{id}/grants", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    responses(
+        (status = 200, description = "OK", body = [Grant]),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn list_grants(
+    State(state): State<AppState>,
+    Path(principal_id): Path<Uuid>,
+) -> Result<Json<Vec<Grant>>, AdminError> {
+    info!(principal_id = %principal_id, "admin list grants");
+    let records = sqlx::query_as::<_, Grant>(
+        r#"
+        SELECT id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        FROM oms_principal_book_account_grant
+        WHERE principal_id = $1
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(principal_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(records))
+}
+
+#[utoipa::path(
+    patch, path = "/admin/principals/{id}/grants/{grant_id}", tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Principal ID"),
+        ("grant_id" = Uuid, Path, description = "Grant ID"),
+    ),
+    request_body = UpdateGrant,
+    responses(
+        (status = 200, description = "Updated", body = Grant),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn update_grant(
+    State(state): State<AppState>,
+    Path((principal_id, grant_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<UpdateGrant>,
+) -> Result<Json<Grant>, AdminError> {
+    info!(principal_id = %principal_id, grant_id = %grant_id, "admin update grant");
+    let record = sqlx::query_as::<_, Grant>(
+        r#"
+        UPDATE oms_principal_book_account_grant
+        SET
+            can_trade    = COALESCE($1, can_trade),
+            can_view     = COALESCE($2, can_view),
+            can_allocate = COALESCE($3, can_allocate),
+            updated_at   = now()
+        WHERE id = $4 AND principal_id = $5
+        RETURNING id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        "#,
+    )
+    .bind(payload.can_trade)
+    .bind(payload.can_view)
+    .bind(payload.can_allocate)
+    .bind(grant_id)
+    .bind(principal_id)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(map_db_error)?
+    .ok_or_else(|| AdminError::not_found("grant"))?;
+
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    delete, path = "/admin/principals/{id}/grants/{grant_id}", tag = "admin",
+    params(
+        ("id" = Uuid, Path, description = "Principal ID"),
+        ("grant_id" = Uuid, Path, description = "Grant ID"),
+    ),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn delete_grant(
+    State(state): State<AppState>,
+    Path((principal_id, grant_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AdminError> {
+    info!(principal_id = %principal_id, grant_id = %grant_id, "admin delete grant");
+    let result = sqlx::query(
+        "DELETE FROM oms_principal_book_account_grant WHERE id = $1 AND principal_id = $2",
+    )
+    .bind(grant_id)
+    .bind(principal_id)
+    .execute(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("grant"));
     }
 
     Ok(StatusCode::NO_CONTENT)
