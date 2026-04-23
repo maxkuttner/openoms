@@ -89,7 +89,7 @@ impl OrderStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct OrderAggregateState {
     pub order_id: String,
     pub client_order_id: String,

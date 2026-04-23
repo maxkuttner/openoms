@@ -12,7 +12,7 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
-use crate::domain::orders::state::{OrderSide, OrderType, TimeInForce};
+use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Book, Account};
 use crate::admin::{
     CreatePrincipal, UpdatePrincipal,
@@ -38,6 +38,7 @@ use tracing_subscriber;
 use utoipa::OpenApi;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 mod kafka;
+mod alpaca_stream;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -46,6 +47,7 @@ mod kafka;
         handlers::health,
         handlers::orders_submit,
         handlers::orders_cancel,
+        handlers::get_order,
         admin::create_principal,
         admin::list_principals,
         admin::get_principal,
@@ -67,7 +69,7 @@ mod kafka;
         admin::update_account,
     ),
     components(schemas(
-        SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce,
+        SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         Principal, Book, Account,
         CreatePrincipal, UpdatePrincipal,
         CreateBook, UpdateBook,
@@ -208,12 +210,25 @@ async fn main() {
     // AppState
     let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client);
 
+    // Spawn Alpaca trade-update stream tasks (one per configured environment)
+    if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
+        if !key.is_empty() && !secret.is_empty() {
+            tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned()));
+        }
+    }
+    if let (Ok(key), Ok(secret)) = (env::var("ALPACA_LIVE_API_KEY"), env::var("ALPACA_LIVE_API_SECRET")) {
+        if !key.is_empty() && !secret.is_empty() {
+            tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned()));
+        }
+    }
+
     // Register routes
     
     // 1) Register order routes
     let orders_router = Router::new()
         .route("/orders/submit", post(handlers::orders_submit))
         .route("/orders/cancel", post(handlers::orders_cancel))
+        .route("/orders/:id", get(handlers::get_order))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes (protected by static bearer token only)

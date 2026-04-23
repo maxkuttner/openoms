@@ -29,3 +29,7 @@ scalar_api_reference = { version = "0.1.0", features = ["axum"] }
 
 # OpenAPI spec generation
 utoipa = { version = "4", features = ["uuid", "chrono"] }
+
+# Alpaca trade-update WebSocket stream
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"

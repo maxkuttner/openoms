@@ -6,6 +6,7 @@ use super::{BrokerAdapter, BrokerError, BrokerOrderRequest, BrokerOrderResponse}
 
 #[derive(Serialize)]
 struct AlpacaOrderRequest {
+    client_order_id: String,
     symbol: String,
     qty: String, // Alpaca expects strings for numeric precision
     side: String,
@@ -52,6 +53,7 @@ impl BrokerAdapter for AlpacaAdapter {
         };
 
         let alpaca_order = AlpacaOrderRequest {
+            client_order_id: req.order_id.clone(),
             symbol: req.symbol.clone(),
             qty: req.quantity.to_string(),
             side: req.side.clone(),

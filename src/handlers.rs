@@ -3,6 +3,7 @@ use chrono::Utc;
 use sqlx::{query_scalar, Row};
 use axum::{
     extract::Extension,
+    extract::Path,
     extract::State,
     http::StatusCode,
     body::Body,
@@ -310,6 +311,7 @@ pub async fn orders_submit(
     // Call the broker adapter.
     // instrument_id is used directly as the broker symbol (TODO: instrument master table).
     let broker_req = BrokerOrderRequest {
+        order_id: order_id.to_string(),
         symbol: state_after_submit.instrument_id.clone(),
         quantity: state_after_submit.original_qty,
         side: state_after_submit.side.as_str().to_string(),
@@ -523,8 +525,8 @@ pub async fn orders_cancel(
     let state = OrderAggregateState {
         order_id: row.get::<Uuid, _>("order_id").to_string(),
         client_order_id: row.get::<String, _>("client_order_id"),
-        book_id: row.get::<String, _>("book_id"),
-        account_id: row.get::<String, _>("account_id"),
+        book_id: row.get::<Uuid, _>("book_id").to_string(),
+        account_id: row.get::<Uuid, _>("account_id").to_string(),
         instrument_id: row.get::<String, _>("instrument_id"),
         side,
         order_type,
@@ -633,6 +635,77 @@ pub async fn orders_cancel(
 }
 
 
+#[utoipa::path(
+    get, path = "/orders/{id}", tag = "orders",
+    params(("id" = Uuid, Path, description = "Order ID")),
+    responses(
+        (status = 200, description = "OK", body = OrderAggregateState),
+        (status = 400, description = "Invalid UUID"),
+        (status = 404, description = "Order not found"),
+    ),
+    security(("basic_auth" = []))
+)]
+pub async fn get_order(
+    State(state): State<AppState>,
+    Path(order_id_str): Path<String>,
+) -> Result<Json<OrderAggregateState>, ApiError> {
+    let order_id = Uuid::parse_str(&order_id_str).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "id must be a UUID".to_string(),
+    })?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            order_id, client_order_id, book_id, account_id, instrument_id,
+            side, order_type, time_in_force,
+            limit_price::double precision AS limit_price,
+            original_qty::double precision AS original_qty,
+            leaves_qty::double precision AS leaves_qty,
+            cum_qty::double precision AS cum_qty,
+            avg_px::double precision AS avg_px,
+            status, resume_to_status, version
+        FROM order_state
+        WHERE order_id = $1
+        "#,
+    )
+    .bind(order_id)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load order: {:?}", err),
+    })?
+    .ok_or_else(|| ApiError {
+        status: StatusCode::NOT_FOUND,
+        message: "order not found".to_string(),
+    })?;
+
+    let order = OrderAggregateState {
+        order_id: row.get::<Uuid, _>("order_id").to_string(),
+        client_order_id: row.get("client_order_id"),
+        book_id: row.get::<Uuid, _>("book_id").to_string(),
+        account_id: row.get::<Uuid, _>("account_id").to_string(),
+        instrument_id: row.get("instrument_id"),
+        side: parse_order_side(row.get("side"))?,
+        order_type: parse_order_type(row.get("order_type"))?,
+        time_in_force: parse_time_in_force(row.get("time_in_force"))?,
+        limit_price: row.get("limit_price"),
+        original_qty: row.get("original_qty"),
+        leaves_qty: row.get("leaves_qty"),
+        cum_qty: row.get("cum_qty"),
+        avg_px: row.get("avg_px"),
+        status: parse_order_status(row.get("status"))?,
+        resume_to_status: row
+            .get::<Option<String>, _>("resume_to_status")
+            .map(parse_order_status)
+            .transpose()?,
+        version: row.get("version"),
+    };
+
+    Ok(Json(order))
+}
+
 // Function to issue an api error
 fn map_rejection_to_api_error(rejection: CommandRejection) -> ApiError {
     let status = match rejection.code {
@@ -646,8 +719,7 @@ fn map_rejection_to_api_error(rejection: CommandRejection) -> ApiError {
     }
 }
 
-// parse db string to OrderSide struct
-fn parse_order_side(value: String) -> Result<OrderSide, ApiError> {
+pub(crate) fn parse_order_side(value: String) -> Result<OrderSide, ApiError> {
     match value.as_str() {
         "buy" => Ok(OrderSide::Buy),
         "sell" => Ok(OrderSide::Sell),
@@ -658,8 +730,7 @@ fn parse_order_side(value: String) -> Result<OrderSide, ApiError> {
     }
 }
 
-// parse db string to OrderType struct
-fn parse_order_type(value: String) -> Result<OrderType, ApiError> {
+pub(crate) fn parse_order_type(value: String) -> Result<OrderType, ApiError> {
     match value.as_str() {
         "market" => Ok(OrderType::Market),
         "limit" => Ok(OrderType::Limit),
@@ -671,8 +742,7 @@ fn parse_order_type(value: String) -> Result<OrderType, ApiError> {
 }
 
 
-// parse db string to TimeInForce struct
-fn parse_time_in_force(value: String) -> Result<TimeInForce, ApiError> {
+pub(crate) fn parse_time_in_force(value: String) -> Result<TimeInForce, ApiError> {
     match value.as_str() {
         "day" => Ok(TimeInForce::Day),
         "gtc" => Ok(TimeInForce::Gtc),
@@ -686,8 +756,7 @@ fn parse_time_in_force(value: String) -> Result<TimeInForce, ApiError> {
 }
 
 
-// parse db string to OrderStatus struct
-fn parse_order_status(value: String) -> Result<OrderStatus, ApiError> {
+pub(crate) fn parse_order_status(value: String) -> Result<OrderStatus, ApiError> {
     match value.as_str() {
         "submitted" => Ok(OrderStatus::Submitted),
         "routed" => Ok(OrderStatus::Routed),

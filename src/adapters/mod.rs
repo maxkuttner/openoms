@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 /// Broker-agnostic order request passed to any adapter.
 pub struct BrokerOrderRequest {
+    /// Our internal order UUID — sent as client_order_id so brokers echo it back on updates.
+    pub order_id: String,
     /// Ticker symbol (e.g. "AAPL"). Used directly as the broker symbol.
     /// TODO: replace with an instrument master lookup when added.
     pub symbol: String,
