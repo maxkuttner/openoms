@@ -6,6 +6,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use std::sync::Arc;
+
+use crate::adapters::alpaca::AlpacaAdapter;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::{ExecutionReport, OrderCommand, ReceiveExecutionReport};
 use crate::domain::orders::state::OrderAggregateState;
@@ -21,8 +24,10 @@ pub async fn run(
     api_secret: String,
     pool: PgPool,
     kafka: Option<KafkaClient>,
+    adapter: Arc<AlpacaAdapter>,
 ) {
     info!(env = environment, "starting Alpaca trade-update stream");
+    reconcile_routed_orders(&pool, &kafka, &adapter).await;
 
     let ws_url = if environment == "LIVE" {
         "wss://api.alpaca.markets/stream"
@@ -45,6 +50,81 @@ pub async fn run(
         sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
     }
+}
+
+async fn reconcile_routed_orders(pool: &PgPool, kafka: &Option<KafkaClient>, adapter: &AlpacaAdapter) {
+    info!("starting reconciliation of routed orders");
+
+    let rows = match sqlx::query("SELECT order_id FROM order_state WHERE status = 'routed'")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => { error!(error = %e, "reconciliation: failed to query routed orders"); return; }
+    };
+
+    if rows.is_empty() {
+        info!("reconciliation complete: no routed orders");
+        return;
+    }
+
+    info!(count = rows.len(), "reconciliation: checking routed orders");
+
+    for row in rows {
+        let order_id: Uuid = row.get("order_id");
+
+        // fetch the Alpaca order ID from the OrderRouted event payload
+        let ext_row = sqlx::query(
+            "SELECT payload_json->'payload'->>'external_order_id' AS ext_id \
+             FROM order_event WHERE order_id = $1 AND event_type = 'order_routed' LIMIT 1",
+        )
+        .bind(order_id)
+        .fetch_optional(pool)
+        .await;
+
+        let external_order_id: String = match ext_row {
+            Ok(Some(r)) => match r.get::<Option<String>, _>("ext_id") {
+                Some(id) if !id.is_empty() => id,
+                _ => { warn!(order_id = %order_id, "reconciliation: no external_order_id found, skipping"); continue; }
+            },
+            Ok(None) => { warn!(order_id = %order_id, "reconciliation: OrderRouted event not found, skipping"); continue; }
+            Err(e) => { error!(order_id = %order_id, error = %e, "reconciliation: DB error fetching external_order_id"); continue; }
+        };
+
+        let alpaca_order = match adapter.get_order(&external_order_id).await {
+            Ok(o) => o,
+            Err(e) => { warn!(order_id = %order_id, error = %e, "reconciliation: failed to fetch order from Alpaca, skipping"); continue; }
+        };
+
+        let status = alpaca_order["status"].as_str().unwrap_or("");
+        let report = match status {
+            "filled" | "partially_filled" => {
+                let fill_qty: f64 = alpaca_order["filled_qty"]
+                    .as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let fill_price: f64 = alpaca_order["filled_avg_price"]
+                    .as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let execution_id = alpaca_order["id"].as_str().unwrap_or("").to_string();
+                ExecutionReport::Fill { execution_id, fill_qty, fill_price, venue: "ALPACA".to_string() }
+            }
+            "rejected" | "canceled" | "expired" => {
+                ExecutionReport::Reject {
+                    reason: status.to_string(),
+                    venue: Some("ALPACA".to_string()),
+                }
+            }
+            other => {
+                info!(order_id = %order_id, alpaca_status = other, "reconciliation: order still pending at Alpaca, skipping");
+                continue;
+            }
+        };
+
+        match process_execution_report(pool, kafka, order_id, report).await {
+            Ok(()) => info!(order_id = %order_id, alpaca_status = status, "reconciliation: applied missed fill"),
+            Err(e) => error!(order_id = %order_id, error = %e, "reconciliation: failed to apply execution report"),
+        }
+    }
+
+    info!("reconciliation complete");
 }
 
 async fn connect_and_run(
@@ -225,6 +305,12 @@ async fn process_execution_report(
             return Ok(());
         }
     };
+
+    let current_status: &str = row.get("status");
+    if matches!(current_status, "filled" | "rejected" | "canceled" | "expired") {
+        warn!(order_id = %order_id, status = current_status, "Alpaca stream: order already in terminal state, skipping duplicate event");
+        return Ok(());
+    }
 
     // Reuse parse helpers from handlers — map errors to strings for the boxed error type
     let side = parse_order_side(row.get("side")).map_err(|e| e.message.clone())?;

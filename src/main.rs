@@ -173,7 +173,7 @@ async fn main() {
     ) {
         (Ok(key), Ok(secret)) if !key.is_empty() && !secret.is_empty() => {
             use std::sync::Arc;
-            registry.register("ALPACA", "PAPER", Arc::new(AlpacaAdapter::new(key, secret, "PAPER")));
+            registry.register_alpaca("PAPER", Arc::new(AlpacaAdapter::new(key, secret, "PAPER")));
             info!("registered ALPACA/PAPER adapter");
         }
         _ => info!("ALPACA_PAPER_API_KEY / ALPACA_PAPER_API_SECRET not set — ALPACA/PAPER adapter not registered"),
@@ -185,7 +185,7 @@ async fn main() {
     ) {
         (Ok(key), Ok(secret)) if !key.is_empty() && !secret.is_empty() => {
             use std::sync::Arc;
-            registry.register("ALPACA", "LIVE", Arc::new(AlpacaAdapter::new(key, secret, "LIVE")));
+            registry.register_alpaca("LIVE", Arc::new(AlpacaAdapter::new(key, secret, "LIVE")));
             info!("registered ALPACA/LIVE adapter");
         }
         _ => info!("ALPACA_LIVE_API_KEY / ALPACA_LIVE_API_SECRET not set — ALPACA/LIVE adapter not registered"),
@@ -213,12 +213,16 @@ async fn main() {
     // Spawn Alpaca trade-update stream tasks (one per configured environment)
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
-            tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned()));
+            if let Some(adapter) = state.registry().get_alpaca("PAPER") {
+                tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned(), adapter));
+            }
         }
     }
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_LIVE_API_KEY"), env::var("ALPACA_LIVE_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
-            tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned()));
+            if let Some(adapter) = state.registry().get_alpaca("LIVE") {
+                tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter));
+            }
         }
     }
 

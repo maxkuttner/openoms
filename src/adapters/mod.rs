@@ -4,6 +4,8 @@ pub mod ibkr;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::adapters::alpaca::AlpacaAdapter;
+
 /// Broker-agnostic order request passed to any adapter.
 pub struct BrokerOrderRequest {
     /// Our internal order UUID — sent as client_order_id so brokers echo it back on updates.
@@ -54,12 +56,14 @@ pub trait BrokerAdapter: Send + Sync {
 /// Built once at startup and shared read-only via Arc.
 pub struct BrokerRegistry {
     adapters: HashMap<(String, String), Arc<dyn BrokerAdapter>>,
+    alpaca_adapters: HashMap<String, Arc<AlpacaAdapter>>,
 }
 
 impl BrokerRegistry {
     pub fn new() -> Self {
         Self {
             adapters: HashMap::new(),
+            alpaca_adapters: HashMap::new(),
         }
     }
 
@@ -73,9 +77,18 @@ impl BrokerRegistry {
             .insert((broker_code.to_string(), environment.to_string()), adapter);
     }
 
+    pub fn register_alpaca(&mut self, environment: &str, adapter: Arc<AlpacaAdapter>) {
+        self.alpaca_adapters.insert(environment.to_string(), adapter.clone());
+        self.adapters.insert(("ALPACA".to_string(), environment.to_string()), adapter);
+    }
+
     pub fn get(&self, broker_code: &str, environment: &str) -> Option<Arc<dyn BrokerAdapter>> {
         self.adapters
             .get(&(broker_code.to_string(), environment.to_string()))
             .cloned()
+    }
+
+    pub fn get_alpaca(&self, environment: &str) -> Option<Arc<AlpacaAdapter>> {
+        self.alpaca_adapters.get(environment).cloned()
     }
 }

@@ -39,6 +39,23 @@ impl AlpacaAdapter {
             base_url,
         }
     }
+
+    pub async fn get_order(&self, external_order_id: &str) -> Result<serde_json::Value, BrokerError> {
+        let url = format!("{}/v2/orders/{}", self.base_url, external_order_id);
+        let resp = self
+            .client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if resp.status().is_success() {
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))
+        } else {
+            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+        }
+    }
 }
 
 #[async_trait::async_trait]
