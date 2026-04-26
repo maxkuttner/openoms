@@ -9,14 +9,29 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1
-        with:
-          host: ${{ secrets.DEV_SERVER_HOST }}
-          username: ${{ secrets.DEV_SERVER_USER }}
-          key: ${{ secrets.DEV_SERVER_SSH_KEY }}
-          script: |
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEV_SERVER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DEV_SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copy binary to server
+        run: scp -i ~/.ssh/deploy_key target/release/rustoms ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:/home/max/stack/oms/rustoms
+
+      - name: Migrate and restart
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }} << 'EOF'
             cd /home/max/stack/oms
-            git pull
             docker compose -f compose.oms.yaml run --rm oms-migrate
             docker compose -f compose.oms.yaml up -d --build oms
+          EOF

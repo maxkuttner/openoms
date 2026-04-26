@@ -2,6 +2,7 @@ services:
   oms-migrate:
     build:
       context: .
+      dockerfile: Dockerfile.prebuilt
     env_file:
       - .env
     environment:
@@ -14,6 +15,7 @@ services:
   oms:
     build:
       context: .
+      dockerfile: Dockerfile.prebuilt
     env_file:
       - .env
     environment:
