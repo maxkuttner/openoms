@@ -5,13 +5,13 @@
 
 
 **1) Order Groups**
-- add a `order_group_id` to indicate contracts that belong to one trade
-  e.g. say a user wants to trade a straddle - then the use would 
-  want to know which orders belong together afterwards (long Call / Put)
-  => how would that change the status of an order? would it be partially filled or not?
-  => does it even make sense to model composite trades in the oms - or should there
-     be responsibility to model the composite trade be handled on the client side?
-
+I have decided that the client already gets the order objects 
+for each leg of a composite trade. Therefore, it should be possible
+to leave the trade leg management up to the client.
+We could use the causation id (which meant for like trading strategies etc.) 
+to identify correlated orders. However, I think by using a group id or thinking
+about how orders relate to each other would also build the pressure to 
+add endpoints to handle group ids, like cancellation, lifecycle management.
 
 **2) Instrument Mappings**
 - add broker/exchange <-> master instrument mapping 
