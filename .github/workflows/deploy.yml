@@ -33,12 +33,14 @@ jobs:
           ssh-keyscan -H ${{ secrets.DEV_SERVER_HOST }} >> ~/.ssh/known_hosts
 
       - name: Copy binary to server
-        run: scp -i ~/.ssh/deploy_key target/release/rustoms ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:/home/max/stack/oms/rustoms
+        run: |
+          ssh -i ~/.ssh/deploy_key ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }} "mkdir -p /home/${{ secrets.DEV_SERVER_USER }}/stack/oms"
+          scp -i ~/.ssh/deploy_key target/release/rustoms ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }}:/home/${{ secrets.DEV_SERVER_USER }}/stack/oms/rustoms
 
       - name: Migrate and restart
         run: |
           ssh -i ~/.ssh/deploy_key ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_HOST }} << 'EOF'
-            cd /home/max/stack/oms
+            cd ~/stack/oms
             docker compose -f compose.oms.yaml run --rm oms-migrate
             docker compose -f compose.oms.yaml up -d --build oms
           EOF
