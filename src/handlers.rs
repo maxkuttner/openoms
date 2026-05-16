@@ -80,6 +80,7 @@ pub async fn health() -> &'static str {
         (status = 400, description = "Validation error"),
         (status = 403, description = "No trade grant for principal/book/account"),
         (status = 409, description = "Order already exists"),
+        (status = 422, description = "Instrument not found, inactive, or no tradeable broker mapping"),
         (status = 502, description = "Broker rejected the order"),
         (status = 503, description = "No broker adapter configured"),
     ),
@@ -106,7 +107,71 @@ pub async fn orders_submit(
         status: StatusCode::BAD_REQUEST,
         message: "account_id must be a UUID".to_string(),
     })?;
-    
+    let instrument_id_uuid = Uuid::parse_str(&req.instrument_id).map_err(|_| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "instrument_id must be a UUID".to_string(),
+    })?;
+
+    // Pre-flight: resolve account (broker_code, environment, external_account_ref) so we can
+    // validate the instrument mapping before committing anything to the event store.
+    let account_row_pre = sqlx::query(
+        "SELECT broker_code, environment, external_account_ref FROM oms_account WHERE id = $1"
+    )
+    .bind(account_id)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load account: {:?}", err),
+    })?
+    .ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "account not found".to_string(),
+    })?;
+
+    let broker_code: String = account_row_pre.get("broker_code");
+    let environment: String = account_row_pre.get("environment");
+    let external_account_ref: String = account_row_pre.get("external_account_ref");
+
+    // Validate instrument is ACTIVE.
+    let instrument_ok: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM oms_instrument WHERE id = $1 AND status = 'ACTIVE')"
+    )
+    .bind(instrument_id_uuid)
+    .fetch_one(&pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to validate instrument: {:?}", err),
+    })?;
+
+    if !instrument_ok {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: "instrument not found or not active".to_string(),
+        });
+    }
+
+    // Validate broker mapping exists and is tradeable; retrieve broker-specific symbol.
+    let broker_instrument_row = sqlx::query(
+        "SELECT broker_symbol FROM oms_broker_instrument \
+         WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
+    )
+    .bind(instrument_id_uuid)
+    .bind(&broker_code)
+    .fetch_optional(&pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to validate broker instrument mapping: {:?}", err),
+    })?
+    .ok_or_else(|| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        message: format!("no tradeable mapping for instrument on broker {broker_code}"),
+    })?;
+
+    let broker_symbol: String = broker_instrument_row.get("broker_symbol");
+
     // start of the transaction
     let mut tx = pool.begin().await.map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -269,32 +334,8 @@ pub async fn orders_submit(
     publish_events(state.kafka(), &order_id.to_string(), &events).await;
 
     // --- TX2: route order to broker ---
-    // Look up the account to get broker_code, environment, external_account_ref.
-    let account_row = sqlx::query(
-        "SELECT broker_code, environment, external_account_ref FROM oms_account WHERE id = $1"
-    )
-    .bind(account_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to load account for routing: {:?}", err),
-    })?;
-
-    let account_row = match account_row {
-        Some(row) => row,
-        None => {
-            warn!(account_id = %account_id, "account not found during routing — order left as Submitted");
-            return Ok(Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Body::empty())
-                .unwrap());
-        }
-    };
-
-    let broker_code: String = account_row.get("broker_code");
-    let environment: String = account_row.get("environment");
-    let external_account_ref: String = account_row.get("external_account_ref");
+    // broker_code, environment, external_account_ref, and broker_symbol were resolved in the
+    // pre-flight validation block before TX1.
 
     // Find the adapter for this broker+environment combination.
     let adapter = match state.registry().get(&broker_code, &environment) {
@@ -309,10 +350,9 @@ pub async fn orders_submit(
     };
 
     // Call the broker adapter.
-    // instrument_id is used directly as the broker symbol (TODO: instrument master table).
     let broker_req = BrokerOrderRequest {
         order_id: order_id.to_string(),
-        symbol: state_after_submit.instrument_id.clone(),
+        symbol: broker_symbol.clone(),
         quantity: state_after_submit.original_qty,
         side: state_after_submit.side.as_str().to_string(),
         order_type: state_after_submit.order_type.as_str().to_string(),

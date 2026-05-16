@@ -20,7 +20,7 @@ services:
       - .env
     environment:
       DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@postgres:${DB_PORT}/${DB_NAME}
-      OMS_BIND_ADDR: 0.0.0.0:3000
+      OMS_BIND_ADDR: 127.0.0.1:3000
       # Kafka runs as shared infra; see `kafka/compose.yaml`
       KAFKA_BROKER: broker:19092
       KAFKA_TOPIC: orders

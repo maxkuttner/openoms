@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send a test market order for 1 NVDA via Alpaca Paper."""
+"""Send a test market order via Alpaca Paper. Reads OMS_INSTRUMENT_ID from scripts/.env."""
 
 import json
 import os
@@ -28,18 +28,19 @@ if not os.path.exists(_env_path):
 
 _env = _load_env(_env_path)
 
-KEY_ID     = _env["OMS_KEY_ID"]
-SECRET     = _env["OMS_SECRET"]
-ACCOUNT_ID = _env["OMS_ACCOUNT_ID"]
-BOOK_ID    = _env["OMS_BOOK_ID"]
-BASE_URL   = _env.get("OMS_BASE_URL", "http://localhost:3001")
+KEY_ID        = _env["OMS_KEY_ID"]
+SECRET        = _env["OMS_SECRET"]
+ACCOUNT_ID    = _env["OMS_ACCOUNT_ID"]
+BOOK_ID       = _env["OMS_BOOK_ID"]
+INSTRUMENT_ID = _env["OMS_INSTRUMENT_ID"]
+BASE_URL      = _env.get("OMS_BASE_URL", "http://localhost:3001")
 
 payload = {
     "order_id":        str(uuid.uuid4()),
     "client_order_id": str(uuid.uuid4()),
     "book_id":         BOOK_ID,
     "account_id":      ACCOUNT_ID,
-    "instrument_id":   "NVDA",
+    "instrument_id":   INSTRUMENT_ID,
     "side":            "buy",
     "order_type":      "market",
     "time_in_force":   "day",

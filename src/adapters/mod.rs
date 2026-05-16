@@ -10,8 +10,7 @@ use crate::adapters::alpaca::AlpacaAdapter;
 pub struct BrokerOrderRequest {
     /// Our internal order UUID — sent as client_order_id so brokers echo it back on updates.
     pub order_id: String,
-    /// Ticker symbol (e.g. "AAPL"). Used directly as the broker symbol.
-    /// TODO: replace with an instrument master lookup when added.
+    /// Broker-specific symbol resolved from oms_broker_instrument (e.g. "AAPL" for Alpaca).
     pub symbol: String,
     pub quantity: f64,
     pub side: String,       // "buy" | "sell"

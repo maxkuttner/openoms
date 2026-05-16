@@ -1,5 +1,18 @@
 # OpenOMS
 
+
+
+**Issues:**
+When an order was not updated asynchronuously throught the 
+alpaca reconciliation task it should indicate in the message when 
+the order was changed on the brokers side. Otherwise one might think 
+that the order is idle until the reconsilation works... 
+
+need to think about it ... because this could also be a desirable feature
+because in a sense the order is idle from the perspective of the oms.
+
+
+
 **TODO:**
 
 
