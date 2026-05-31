@@ -247,7 +247,7 @@ async fn main() {
     }
 
     // Register routes
-    
+
     // 1) Register order routes
     let orders_router = Router::new()
         .route("/orders/submit", post(handlers::orders_submit))
@@ -316,7 +316,6 @@ async fn main() {
                 .delete(admin::delete_broker_instrument),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
-    
 
     let scalar_html = {
         let config = json!({ "url": "/api-docs/openapi.json" });
@@ -344,6 +343,9 @@ async fn main() {
 
     // Start TCP listener
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-    info!("OMS listening on {}", bind_addr);
+    let host_url = format!("http://{}", bind_addr);
+    info!("OMS listening on {}", host_url);
+    info!("Scalar UI: {}/scalar", host_url);
+    info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);
     axum::serve(listener, app).await.unwrap();
 }
