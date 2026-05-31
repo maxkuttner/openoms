@@ -35,6 +35,7 @@ use axum::{
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
+use dotenvy::dotenv;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber;
 use utoipa::OpenApi;
@@ -119,39 +120,40 @@ impl utoipa::Modify for SecurityAddon {
 // Main async entry point
 #[tokio::main]
 async fn main() {
-    let _ = dotenvy::dotenv();
+    dotenv().ok();
+
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
+    // parse mode: {cargo run -- migrate}
     let mode = env::args().nth(1);
 
+    // parse db config or panic
+    let db_user = env::var("DB_USER").expect("DB_USER must be set");
+    let db_host = env::var("DB_HOST").expect("DB_HOST must be set");
+    let db_port = env::var("DB_PORT").expect("DB_PORT must bes set");
+    let db_password = env::var("DB_PASSWORD").expect("DB_PASSWORD must be set");
+    let db_name = env::var("DB_NAME").expect("DB_NAME must be set");
+    let database_url = format!(
+        "postgres://{}:{}@{}:{}/{}?sslmode=disable",
+        db_user, db_password, db_host, db_port, db_name
+    );
 
-    // Init database connection
-    let db_url = match env::var("DATABASE_URL") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            error!("DATABASE_URL is not set");
-            std::process::exit(1);
-        }
-    };
-    info!("Connecting to the database at {}", db_url);
-    let pool = match PgPool::connect(&db_url).await {
+    info!("Connecting to the database at {}", database_url);
+    let pool = match PgPool::connect(&database_url).await {
         Ok(pool) => pool,
         Err(e) => {
             error!("Failed to connect to the database: {}", e);
             return;
         }
     };
-    info!("Connected to the database");
 
-
-        // Migrate (mode) -> run for database migrations in ../migrations/
-    if mode.as_deref() == Some("migrate") {
+    // Migrate (mode) -> run for database migrations in ../migrations/
+    if mode == Some("migrate".to_string()) {
         info!("Running SQL migrations");
         if let Err(e) = sqlx::migrate!().run(&pool).await {
             error!("Migration failed: {}", e);
             std::process::exit(1);
         }
-        info!("Migrations complete");
         return;
     }
     
@@ -164,17 +166,22 @@ async fn main() {
         Err(err) => { info!("Kafka not configured ({}), publishing disabled", err); None }
     };
 
-    let admin_token = match env::var("OMS_ADMIN_TOKEN") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            error!("OMS_ADMIN_TOKEN is not set");
-            std::process::exit(1);
-        }
-    };
 
     let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
         .map(|v| v.to_lowercase() != "false")
         .unwrap_or(true);
+
+    let admin_token = if !admin_auth_enabled {
+        String::new()
+    } else {
+        env::var("OMS_ADMIN_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                error!("OMS_ADMIN_TOKEN is not set");
+                std::process::exit(1);
+            })
+    };
 
     // Build broker registry — adapters are registered only when credentials are present.
     // Env vars follow the pattern {BROKER}_{ENVIRONMENT}_{KEY}.

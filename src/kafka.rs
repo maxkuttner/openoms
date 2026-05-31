@@ -5,6 +5,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use tracing::info;
 
 #[derive(Clone)]
 pub struct KafkaConfig {
@@ -20,15 +21,21 @@ impl KafkaConfig {
             Ok(v) if !v.is_empty() => v,
             _ => return Err("KAFKA_BROKER is not set".to_string()),
         };
+        info!("KAFKA_BROKER: {}", brokers);
 
         let orders_topic = match env::var("KAFKA_TOPIC") {
             Ok(v) if !v.is_empty() => v,
             _ => return Err("KAFKA_TOPIC is not set".to_string()),
         };
+        info!("KAFKA_TOPIC: {}", orders_topic);
 
-        let client_id = env::var("KAFKA_CLIENT_ID").unwrap_or_else(|_| "rust-oms".to_string());
+        let client_id = env::var("KAFKA_CLIENT_ID").
+            unwrap_or_else(|_| "rust-oms".to_string());
+        info!("KAFKA_CLIENT_ID: {}", client_id);
+
         let projector_group_id = env::var("KAFKA_PROJECTOR_GROUP_ID")
             .unwrap_or_else(|_| "position-projector-v1".to_string());
+        info!("KAFKA_PROJECTOR_GROUP_ID: {}", projector_group_id);
 
         Ok(Self {
             brokers,
