@@ -13,15 +13,13 @@ use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
-use crate::domain::identity::{Principal, Book, Account, Instrument, BrokerInstrument};
+use crate::domain::identity::{Principal, Book, Account};
 use crate::admin::{
     CreatePrincipal, UpdatePrincipal,
     CreateBook, UpdateBook,
     CreateAccount, UpdateAccount,
     CreateKey, ApiKeyRecord,
     CreateGrant, UpdateGrant,
-    CreateInstrument, UpdateInstrument,
-    CreateBrokerInstrument, UpdateBrokerInstrument,
 };
 use crate::domain::identity::Grant;
 
@@ -70,15 +68,6 @@ mod alpaca_stream;
         admin::list_accounts,
         admin::get_account,
         admin::update_account,
-        admin::create_instrument,
-        admin::list_instruments,
-        admin::get_instrument,
-        admin::update_instrument,
-        admin::create_broker_instrument,
-        admin::list_broker_instruments,
-        admin::get_broker_instrument,
-        admin::update_broker_instrument,
-        admin::delete_broker_instrument,
     ),
     components(schemas(
         SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -88,8 +77,6 @@ mod alpaca_stream;
         CreateAccount, UpdateAccount,
         CreateKey, ApiKeyRecord,
         Grant, CreateGrant, UpdateGrant,
-        Instrument, CreateInstrument, UpdateInstrument,
-        BrokerInstrument, CreateBrokerInstrument, UpdateBrokerInstrument,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -296,24 +283,6 @@ async fn main() {
         .route(
             "/admin/principals/:id/grants/:grant_id",
             axum::routing::patch(admin::update_grant).delete(admin::delete_grant),
-        )
-        .route(
-            "/admin/instruments",
-            post(admin::create_instrument).get(admin::list_instruments),
-        )
-        .route(
-            "/admin/instruments/:id",
-            axum::routing::patch(admin::update_instrument).get(admin::get_instrument),
-        )
-        .route(
-            "/admin/broker-instruments",
-            post(admin::create_broker_instrument).get(admin::list_broker_instruments),
-        )
-        .route(
-            "/admin/broker-instruments/:id",
-            axum::routing::patch(admin::update_broker_instrument)
-                .get(admin::get_broker_instrument)
-                .delete(admin::delete_broker_instrument),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 

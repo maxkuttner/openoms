@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use serde_json::Value;
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -48,34 +47,6 @@ pub struct Grant {
     pub can_trade: bool,
     pub can_view: bool,
     pub can_allocate: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
-pub struct Instrument {
-    pub id: Uuid,
-    pub code: String,
-    pub symbol: String,
-    pub asset_class: String,
-    pub name: String,
-    pub currency: String,
-    pub exchange: Option<String>,
-    pub status: String,
-    pub metadata: Option<Value>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
-pub struct BrokerInstrument {
-    pub id: Uuid,
-    pub instrument_id: Uuid,
-    pub broker_code: String,
-    pub broker_symbol: String,
-    pub broker_exchange: Option<String>,
-    pub is_tradeable: bool,
-    pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

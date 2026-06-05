@@ -135,7 +135,7 @@ pub async fn orders_submit(
 
     // Validate instrument is ACTIVE.
     let instrument_ok: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM oms_instrument WHERE id = $1 AND status = 'ACTIVE')"
+        "SELECT EXISTS (SELECT 1 FROM instrument WHERE id = $1 AND status = 'ACTIVE')"
     )
     .bind(instrument_id_uuid)
     .fetch_one(&pool)
@@ -154,7 +154,7 @@ pub async fn orders_submit(
 
     // Validate broker mapping exists and is tradeable; retrieve broker-specific symbol.
     let broker_instrument_row = sqlx::query(
-        "SELECT broker_symbol FROM oms_broker_instrument \
+        "SELECT broker_symbol FROM broker_instrument \
          WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
     )
     .bind(instrument_id_uuid)
