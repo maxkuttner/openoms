@@ -115,7 +115,7 @@ pub async fn orders_submit(
     // Pre-flight: resolve account (broker_code, environment, external_account_ref) so we can
     // validate the instrument mapping before committing anything to the event store.
     let account_row_pre = sqlx::query(
-        "SELECT broker_code, environment, external_account_ref FROM oms_account WHERE id = $1"
+        "SELECT broker_code, environment, external_account_ref FROM account WHERE id = $1"
     )
     .bind(account_id)
     .fetch_optional(&pool)
@@ -201,7 +201,7 @@ pub async fn orders_submit(
 
     let has_grant: bool = query_scalar(
         "SELECT EXISTS (
-            SELECT 1 FROM oms_principal_book_account_grant
+            SELECT 1 FROM principal_book_account_grant
             WHERE principal_id = $1
               AND book_id = $2
               AND account_id = $3

@@ -82,7 +82,7 @@ pub async fn create_principal(
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Principal>(
         r#"
-        INSERT INTO oms_principal (
+        INSERT INTO principal (
             id,
             code,
             principal_type,
@@ -128,7 +128,7 @@ pub async fn list_principals(
         sqlx::query_as::<_, Principal>(
             r#"
             SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
-            FROM oms_principal
+            FROM principal
             WHERE external_subject = $1
             "#,
         )
@@ -140,7 +140,7 @@ pub async fn list_principals(
         sqlx::query_as::<_, Principal>(
             r#"
             SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
-            FROM oms_principal
+            FROM principal
             ORDER BY created_at DESC
             "#,
         )
@@ -169,7 +169,7 @@ pub async fn get_principal(
     let record = sqlx::query_as::<_, Principal>(
         r#"
         SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
-        FROM oms_principal
+        FROM principal
         WHERE id = $1
         "#,
     )
@@ -200,7 +200,7 @@ pub async fn update_principal(
     info!(principal_id = %id, "admin update principal");
     let record = sqlx::query_as::<_, Principal>(
         r#"
-        UPDATE oms_principal
+        UPDATE principal
         SET
             code = COALESCE($1, code),
             principal_type = COALESCE($2, principal_type),
@@ -243,7 +243,7 @@ pub async fn create_book(
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Book>(
         r#"
-        INSERT INTO oms_book (
+        INSERT INTO book (
             id,
             code,
             name,
@@ -279,7 +279,7 @@ pub async fn list_books(
     let records = sqlx::query_as::<_, Book>(
         r#"
         SELECT id, code, name, status, base_currency, created_at, updated_at
-        FROM oms_book
+        FROM book
         ORDER BY created_at DESC
         "#,
     )
@@ -307,7 +307,7 @@ pub async fn get_book(
     let record = sqlx::query_as::<_, Book>(
         r#"
         SELECT id, code, name, status, base_currency, created_at, updated_at
-        FROM oms_book
+        FROM book
         WHERE id = $1
         "#,
     )
@@ -338,7 +338,7 @@ pub async fn update_book(
     info!(book_id = %id, "admin update book");
     let record = sqlx::query_as::<_, Book>(
         r#"
-        UPDATE oms_book
+        UPDATE book
         SET
             code = COALESCE($1, code),
             name = COALESCE($2, name),
@@ -386,7 +386,7 @@ pub async fn create_account(
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Account>(
         r#"
-        INSERT INTO oms_account (
+        INSERT INTO account (
             id,
             code,
             broker_code,
@@ -424,7 +424,7 @@ pub async fn list_accounts(
     let records = sqlx::query_as::<_, Account>(
         r#"
         SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
-        FROM oms_account
+        FROM account
         ORDER BY created_at DESC
         "#,
     )
@@ -452,7 +452,7 @@ pub async fn get_account(
     let record = sqlx::query_as::<_, Account>(
         r#"
         SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
-        FROM oms_account
+        FROM account
         WHERE id = $1
         "#,
     )
@@ -492,7 +492,7 @@ pub async fn update_account(
     info!(account_id = %id, "admin update account");
     let record = sqlx::query_as::<_, Account>(
         r#"
-        UPDATE oms_account
+        UPDATE account
         SET
             code = COALESCE($1, code),
             broker_code = COALESCE($2, broker_code),
@@ -553,7 +553,7 @@ pub async fn list_principal_keys(
     let records = sqlx::query_as::<_, ApiKeyRecord>(
         r#"
         SELECT id, principal_id, key_id, name, created_at
-        FROM oms_api_key
+        FROM api_key
         WHERE principal_id = $1 AND revoked_at IS NULL
         ORDER BY created_at DESC
         "#,
@@ -603,7 +603,7 @@ pub async fn register_principal_key(
 
     let mut record = sqlx::query_as::<_, ApiKeyRecord>(
         r#"
-        INSERT INTO oms_api_key (principal_id, key_id, secret_hash, name)
+        INSERT INTO api_key (principal_id, key_id, secret_hash, name)
         VALUES ($1, $2, $3, $4)
         RETURNING id, principal_id, key_id, name, created_at
         "#,
@@ -640,7 +640,7 @@ pub async fn revoke_principal_key(
 
     let result = sqlx::query(
         r#"
-        UPDATE oms_api_key SET revoked_at = now()
+        UPDATE api_key SET revoked_at = now()
         WHERE key_id = $1 AND principal_id = $2 AND revoked_at IS NULL
         "#,
     )
@@ -694,7 +694,7 @@ pub async fn create_grant(
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        INSERT INTO oms_principal_book_account_grant (id, principal_id, book_id, account_id, can_trade, can_view, can_allocate)
+        INSERT INTO principal_book_account_grant (id, principal_id, book_id, account_id, can_trade, can_view, can_allocate)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
         "#,
@@ -729,7 +729,7 @@ pub async fn list_grants(
     let records = sqlx::query_as::<_, Grant>(
         r#"
         SELECT id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
-        FROM oms_principal_book_account_grant
+        FROM principal_book_account_grant
         WHERE principal_id = $1
         ORDER BY created_at DESC
         "#,
@@ -763,7 +763,7 @@ pub async fn update_grant(
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin update grant");
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        UPDATE oms_principal_book_account_grant
+        UPDATE principal_book_account_grant
         SET
             can_trade    = COALESCE($1, can_trade),
             can_view     = COALESCE($2, can_view),
@@ -804,7 +804,7 @@ pub async fn delete_grant(
 ) -> Result<StatusCode, AdminError> {
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin delete grant");
     let result = sqlx::query(
-        "DELETE FROM oms_principal_book_account_grant WHERE id = $1 AND principal_id = $2",
+        "DELETE FROM principal_book_account_grant WHERE id = $1 AND principal_id = $2",
     )
     .bind(grant_id)
     .bind(principal_id)
