@@ -27,8 +27,8 @@ pub async fn auth_middleware(
     let row = sqlx::query_as::<_, (Uuid, String)>(
         r#"
         SELECT k.principal_id, k.secret_hash
-        FROM oms_api_key k
-        JOIN oms_principal p ON p.id = k.principal_id
+        FROM api_key k
+        JOIN principal p ON p.id = k.principal_id
         WHERE k.key_id = $1 AND k.revoked_at IS NULL AND p.status = 'ACTIVE'
         "#,
     )

@@ -17,7 +17,7 @@ pub struct BrokerOrderRequest {
     pub order_type: String, // "market" | "limit"
     pub time_in_force: String,
     pub limit_price: Option<f64>,
-    /// The broker's own account identifier (oms_account.external_account_ref).
+    /// The broker's own account identifier (account.external_account_ref).
     pub external_account_ref: String,
 }
 

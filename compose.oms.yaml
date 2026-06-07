@@ -1,17 +1,6 @@
 services:
-  oms-migrate:
-    build:
-      context: .
-      dockerfile: Dockerfile.prebuilt
-    env_file:
-      - .env
-    environment:
-      DATABASE_URL: postgres://${DB_USER}:${DB_PASSWORD}@postgres:${DB_PORT}/${DB_NAME}
-    command: ["/app/rustoms", "migrate"]
-    restart: "no"
-    networks:
-      - gogeling-net
-
+  # Schema is owned and migrated by the `mdm` repo (run `make migrate` there);
+  # OMS only connects to the `ods` database.
   oms:
     build:
       context: .

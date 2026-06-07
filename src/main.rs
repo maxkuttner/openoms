@@ -111,9 +111,6 @@ async fn main() {
 
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
-    // parse mode: {cargo run -- migrate}
-    let mode = env::args().nth(1);
-
     // parse db config or panic
     let db_user = env::var("DB_USER").expect("DB_USER must be set");
     let db_host = env::var("DB_HOST").expect("DB_HOST must be set");
@@ -134,16 +131,8 @@ async fn main() {
         }
     };
 
-    // Migrate (mode) -> run for database migrations in ../migrations/
-    if mode == Some("migrate".to_string()) {
-        info!("Running SQL migrations");
-        if let Err(e) = sqlx::migrate!().run(&pool).await {
-            error!("Migration failed: {}", e);
-            std::process::exit(1);
-        }
-        return;
-    }
-    
+    // Schema is owned and migrated by the `mdm` repo; OMS only connects.
+
     // Init kafka client from .env (optional — publishing is disabled if not configured)
     let kafka_client: Option<kafka::KafkaClient> = match kafka::KafkaConfig::from_env() {
         Ok(cfg) => match cfg.create_producer_client() {
