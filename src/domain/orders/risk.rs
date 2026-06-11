@@ -1,10 +1,12 @@
 use super::state::OrderSide;
 
 // A strategy/book/trader is in a particular trading state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingState { Active, Reducing, Halted}
 
 
 // TODO: refine which risk limit shall be part of the oms risk check
+#[derive(Debug, Clone, Copy)]
 pub struct RiskLimits {
     pub max_order_quantity: Option<f64>,
     pub max_order_notional: Option<f64>,
@@ -13,11 +15,13 @@ pub struct RiskLimits {
 }
 
 
+#[derive(Debug, Clone, Copy)]
 pub struct Exposure {
     pub position_qty: f64, // filled position qty
     pub working_qty: f64,  // still open position qty
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RiskRejection { pub code: String, pub message: String}
 
 
@@ -31,7 +35,7 @@ pub fn check_trading_state(
         TradingState::Halted => Err(
             RiskRejection {
                 code: "trading_halted".into(),
-                message: "trading halted; ".to_string(),
+                message: "trading halted".to_string(),
         }),
         TradingState::Reducing => {
             // Only orders which shrink abs(position) are allowed
@@ -76,7 +80,7 @@ pub fn check_limit(
         if notional > max {
             return Err(RiskRejection {
                 code: "max_order_notional".into(),
-                message: format!("order notional exceeds max {notional}")
+                message: format!("order notional exceeds {max} < {notional}")
             });
         }
     }

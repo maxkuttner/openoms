@@ -6,6 +6,7 @@ mod models;
 mod app_state;
 mod auth;
 mod admin;
+mod risk_engine;
 
 use crate::adapters::BrokerRegistry;
 use crate::adapters::alpaca::AlpacaAdapter;

@@ -24,6 +24,9 @@ use crate::auth::AuthContext;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
 use crate::kafka::publish_events;
+use crate::risk_engine::{PgRiskDataProvider, RiskCheckError, RiskEngine};
+
+
 
 // Generic api error struct
 pub struct ApiError {
@@ -72,6 +75,7 @@ pub async fn health() -> &'static str {
 }
 
 
+
 #[utoipa::path(
     post, path = "/orders/submit", tag = "orders",
     request_body = SubmitOrder,
@@ -80,7 +84,7 @@ pub async fn health() -> &'static str {
         (status = 400, description = "Validation error"),
         (status = 403, description = "No trade grant for principal/book/account"),
         (status = 409, description = "Order already exists"),
-        (status = 422, description = "Instrument not found, inactive, or no tradeable broker mapping"),
+        (status = 422, description = "Instrument not found, inactive, no tradeable broker mapping, or rejected by pre-trade risk"),
         (status = 502, description = "Broker rejected the order"),
         (status = 503, description = "No broker adapter configured"),
     ),
@@ -227,12 +231,38 @@ pub async fn orders_submit(
         });
     }
 
+    // Pre-trade risk check. Runs inside TX1 so the FOR UPDATE lock on the
+    // risk_limits row serializes concurrent submits for the same
+    // book/account/instrument scope until this transaction commits.
+    RiskEngine::new(PgRiskDataProvider::new(&mut *tx))
+        .check_submit(book_id, account_id, &req)
+        .await
+        .map_err(|err| match err {
+            RiskCheckError::Rejected(rejection) => {
+                warn!(
+                    order_id = %order_id,
+                    code = %rejection.code,
+                    message = %rejection.message,
+                    "order rejected by pre-trade risk"
+                );
+                // TODO: also persist an OrderDenied audit event for rejected orders.
+                ApiError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    message: format!("risk check failed [{}]: {}", rejection.code, rejection.message),
+                }
+            }
+            RiskCheckError::Data(err) => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to evaluate pre-trade risk: {:?}", err),
+            },
+        })?;
+
     // create empty aggregate
     let aggregate = OrderAggregate::empty();
     let metadata = EventMetadata {
-        event_id: Uuid::new_v4().to_string(),
+        event_id: Uuid::new_v4().into(),
         timestamp: Utc::now(),
-        actor: "oms".to_string(),
+        actor: "oms".into(),
     };
 
     // run through state machine and decide whether can proceed
