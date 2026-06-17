@@ -111,9 +111,10 @@ pub async fn orders_submit(
         status: StatusCode::BAD_REQUEST,
         message: "account_id must be a UUID".to_string(),
     })?;
-    let instrument_id_uuid = Uuid::parse_str(&req.instrument_id).map_err(|_| ApiError {
+    // instrument.id is a BIGINT surrogate key (the mdm master instrument), not a UUID.
+    let instrument_id_bigint: i64 = req.instrument_id.parse().map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
-        message: "instrument_id must be a UUID".to_string(),
+        message: "instrument_id must be a BIGINT".to_string(),
     })?;
 
     // Pre-flight: resolve account (broker_code, environment, external_account_ref) so we can
@@ -141,7 +142,7 @@ pub async fn orders_submit(
     let instrument_ok: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM instrument WHERE id = $1 AND status = 'ACTIVE')"
     )
-    .bind(instrument_id_uuid)
+    .bind(instrument_id_bigint)
     .fetch_one(&pool)
     .await
     .map_err(|err| ApiError {
@@ -161,7 +162,7 @@ pub async fn orders_submit(
         "SELECT broker_symbol FROM broker_instrument \
          WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
     )
-    .bind(instrument_id_uuid)
+    .bind(instrument_id_bigint)
     .bind(&broker_code)
     .fetch_optional(&pool)
     .await
