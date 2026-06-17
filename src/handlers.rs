@@ -159,7 +159,8 @@ pub async fn orders_submit(
 
     // Validate broker mapping exists and is tradeable; retrieve broker-specific symbol.
     let broker_instrument_row = sqlx::query(
-        "SELECT broker_symbol, native_id FROM broker_instrument \
+        "SELECT broker_symbol, native_id, min_quantity::float8 AS min_quantity \
+         FROM broker_instrument \
          WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
     )
     .bind(instrument_id_bigint)
@@ -177,6 +178,21 @@ pub async fn orders_submit(
 
     let broker_symbol: String = broker_instrument_row.get("broker_symbol");
     let broker_native_id: Option<String> = broker_instrument_row.get("native_id");
+
+    // Broker-intrinsic floor only: reject below the broker's minimum order size
+    // (synced from the broker, e.g. Alpaca min_order_size; NULL = no minimum).
+    // All *admin* caps (max order/position quantity & notional) are policy, not
+    // broker facts — they live in risk_limits and are enforced by the risk engine
+    // (check_submit, below), keyed per (book, account, instrument).
+    let min_quantity: Option<f64> = broker_instrument_row.get("min_quantity");
+    if let Some(min) = min_quantity {
+        if req.quantity < min {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("quantity {} below broker minimum {min}", req.quantity),
+            });
+        }
+    }
 
     // start of the transaction
     let mut tx = pool.begin().await.map_err(|err| ApiError {
