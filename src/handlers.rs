@@ -159,7 +159,7 @@ pub async fn orders_submit(
 
     // Validate broker mapping exists and is tradeable; retrieve broker-specific symbol.
     let broker_instrument_row = sqlx::query(
-        "SELECT broker_symbol FROM broker_instrument \
+        "SELECT broker_symbol, native_id FROM broker_instrument \
          WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
     )
     .bind(instrument_id_bigint)
@@ -176,6 +176,7 @@ pub async fn orders_submit(
     })?;
 
     let broker_symbol: String = broker_instrument_row.get("broker_symbol");
+    let broker_native_id: Option<String> = broker_instrument_row.get("native_id");
 
     // start of the transaction
     let mut tx = pool.begin().await.map_err(|err| ApiError {
@@ -384,6 +385,7 @@ pub async fn orders_submit(
     let broker_req = BrokerOrderRequest {
         order_id: order_id.to_string(),
         symbol: broker_symbol.clone(),
+        native_id: broker_native_id,
         quantity: state_after_submit.original_qty,
         side: state_after_submit.side.as_str().to_string(),
         order_type: state_after_submit.order_type.as_str().to_string(),
