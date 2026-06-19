@@ -12,6 +12,9 @@ pub struct BrokerOrderRequest {
     pub order_id: String,
     /// Broker-specific symbol resolved from broker_instrument (e.g. "AAPL" for Alpaca).
     pub symbol: String,
+    /// Broker-native instrument id from broker_instrument (Alpaca asset UUID, IBKR conId).
+    /// Preferred over `symbol` for routing when present — immutable across ticker renames.
+    pub native_id: Option<String>,
     pub quantity: f64,
     pub side: String,       // "buy" | "sell"
     pub order_type: String, // "market" | "limit"

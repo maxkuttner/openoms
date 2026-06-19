@@ -69,9 +69,13 @@ impl BrokerAdapter for AlpacaAdapter {
             other => return Err(BrokerError::NotConfigured(format!("unsupported order type: {other}"))),
         };
 
+        // Alpaca's `symbol` field accepts the ticker OR the asset_id; prefer the
+        // immutable native_id (asset UUID) when present, falling back to the ticker.
+        let routing_symbol = req.native_id.clone().unwrap_or_else(|| req.symbol.clone());
+
         let alpaca_order = AlpacaOrderRequest {
             client_order_id: req.order_id.clone(),
-            symbol: req.symbol.clone(),
+            symbol: routing_symbol,
             qty: req.quantity.to_string(),
             side: req.side.clone(),
             order_type: order_type_str.to_string(),
@@ -79,7 +83,7 @@ impl BrokerAdapter for AlpacaAdapter {
             limit_price: final_limit_price,
         };
 
-        info!(url = %url, symbol = %req.symbol, "submitting order to Alpaca");
+        info!(url = %url, symbol = %req.symbol, by_native_id = req.native_id.is_some(), "submitting order to Alpaca");
 
         let response = self
             .client

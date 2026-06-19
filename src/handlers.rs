@@ -24,6 +24,9 @@ use crate::auth::AuthContext;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
 use crate::kafka::publish_events;
+use crate::risk_engine::{PgRiskDataProvider, RiskCheckError, RiskEngine};
+
+
 
 // Generic api error struct
 pub struct ApiError {
@@ -72,6 +75,7 @@ pub async fn health() -> &'static str {
 }
 
 
+
 #[utoipa::path(
     post, path = "/orders/submit", tag = "orders",
     request_body = SubmitOrder,
@@ -80,7 +84,7 @@ pub async fn health() -> &'static str {
         (status = 400, description = "Validation error"),
         (status = 403, description = "No trade grant for principal/book/account"),
         (status = 409, description = "Order already exists"),
-        (status = 422, description = "Instrument not found, inactive, or no tradeable broker mapping"),
+        (status = 422, description = "Instrument not found, inactive, no tradeable broker mapping, or rejected by pre-trade risk"),
         (status = 502, description = "Broker rejected the order"),
         (status = 503, description = "No broker adapter configured"),
     ),
@@ -107,9 +111,10 @@ pub async fn orders_submit(
         status: StatusCode::BAD_REQUEST,
         message: "account_id must be a UUID".to_string(),
     })?;
-    let instrument_id_uuid = Uuid::parse_str(&req.instrument_id).map_err(|_| ApiError {
+    // instrument.id is a BIGINT surrogate key (the mdm master instrument), not a UUID.
+    let instrument_id_bigint: i64 = req.instrument_id.parse().map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
-        message: "instrument_id must be a UUID".to_string(),
+        message: "instrument_id must be a BIGINT".to_string(),
     })?;
 
     // Pre-flight: resolve account (broker_code, environment, external_account_ref) so we can
@@ -137,7 +142,7 @@ pub async fn orders_submit(
     let instrument_ok: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM instrument WHERE id = $1 AND status = 'ACTIVE')"
     )
-    .bind(instrument_id_uuid)
+    .bind(instrument_id_bigint)
     .fetch_one(&pool)
     .await
     .map_err(|err| ApiError {
@@ -154,10 +159,11 @@ pub async fn orders_submit(
 
     // Validate broker mapping exists and is tradeable; retrieve broker-specific symbol.
     let broker_instrument_row = sqlx::query(
-        "SELECT broker_symbol FROM broker_instrument \
+        "SELECT broker_symbol, native_id, min_quantity::float8 AS min_quantity \
+         FROM broker_instrument \
          WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
     )
-    .bind(instrument_id_uuid)
+    .bind(instrument_id_bigint)
     .bind(&broker_code)
     .fetch_optional(&pool)
     .await
@@ -171,6 +177,22 @@ pub async fn orders_submit(
     })?;
 
     let broker_symbol: String = broker_instrument_row.get("broker_symbol");
+    let broker_native_id: Option<String> = broker_instrument_row.get("native_id");
+
+    // Broker-intrinsic floor only: reject below the broker's minimum order size
+    // (synced from the broker, e.g. Alpaca min_order_size; NULL = no minimum).
+    // All *admin* caps (max order/position quantity & notional) are policy, not
+    // broker facts — they live in risk_limits and are enforced by the risk engine
+    // (check_submit, below), keyed per (book, account, instrument).
+    let min_quantity: Option<f64> = broker_instrument_row.get("min_quantity");
+    if let Some(min) = min_quantity {
+        if req.quantity < min {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("quantity {} below broker minimum {min}", req.quantity),
+            });
+        }
+    }
 
     // start of the transaction
     let mut tx = pool.begin().await.map_err(|err| ApiError {
@@ -227,12 +249,38 @@ pub async fn orders_submit(
         });
     }
 
+    // Pre-trade risk check. Runs inside TX1 so the FOR UPDATE lock on the
+    // risk_limits row serializes concurrent submits for the same
+    // book/account/instrument scope until this transaction commits.
+    RiskEngine::new(PgRiskDataProvider::new(&mut *tx))
+        .check_submit(book_id, account_id, &req)
+        .await
+        .map_err(|err| match err {
+            RiskCheckError::Rejected(rejection) => {
+                warn!(
+                    order_id = %order_id,
+                    code = %rejection.code,
+                    message = %rejection.message,
+                    "order rejected by pre-trade risk"
+                );
+                // TODO: also persist an OrderDenied audit event for rejected orders.
+                ApiError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    message: format!("risk check failed [{}]: {}", rejection.code, rejection.message),
+                }
+            }
+            RiskCheckError::Data(err) => ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to evaluate pre-trade risk: {:?}", err),
+            },
+        })?;
+
     // create empty aggregate
     let aggregate = OrderAggregate::empty();
     let metadata = EventMetadata {
-        event_id: Uuid::new_v4().to_string(),
+        event_id: Uuid::new_v4().into(),
         timestamp: Utc::now(),
-        actor: "oms".to_string(),
+        actor: "oms".into(),
     };
 
     // run through state machine and decide whether can proceed
@@ -353,6 +401,7 @@ pub async fn orders_submit(
     let broker_req = BrokerOrderRequest {
         order_id: order_id.to_string(),
         symbol: broker_symbol.clone(),
+        native_id: broker_native_id,
         quantity: state_after_submit.original_qty,
         side: state_after_submit.side.as_str().to_string(),
         order_type: state_after_submit.order_type.as_str().to_string(),
