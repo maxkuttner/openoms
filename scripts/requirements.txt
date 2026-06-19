@@ -1,2 +1,7 @@
 requests>=2.31.0
 psycopg2-binary>=2.9.0
+
+# seeders moved from marketbox (seed_instruments.py, broker_sync.py, seed_venues.py)
+databento>=0.77.0
+psycopg[binary]>=3.0
+python-dotenv>=1.0
