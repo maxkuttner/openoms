@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup seed-instruments sync-brokers
+.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments sync-brokers
 
 # Load .env into the recipe shell (one shell per recipe line, so chain with &&).
 ENV := set -a && . ./.env && set +a
@@ -11,6 +11,12 @@ help: ## Show available targets
 # --- one-shot standalone bootstrap (no data-provider creds needed) ---
 db-setup: db-provision db-migrate db-access db-seed db-fixtures ## Full standalone DB bootstrap (roles, schema, ref data, SPY fixture)
 	@echo "✅ openoms DB ready — start the service and place a paper order."
+
+db-reset: ## Drop the ods database and rebuild it from scratch (roles are kept)
+	@$(ENV) && PGPASSWORD="$$ADMIN_PASSWORD" psql -v ON_ERROR_STOP=1 \
+		-h "$$DB_HOST" -p "$$DB_PORT" -U "$$ADMIN_USER" -d postgres \
+		-c "DROP DATABASE IF EXISTS $${ODS_DB:-ods} WITH (FORCE);"
+	@$(MAKE) db-setup
 
 # --- individual steps ---
 db-provision: ## Create roles + the ods database (needs ADMIN superuser creds)
