@@ -12,15 +12,4 @@ CREATE TABLE venue (
 -- Note: timezone intentionally omitted — it isn't in the MIC registry and the
 -- trading-hours timezone authority is `calendar.timezone`.
 
-CREATE TABLE currency (
-    code              TEXT PRIMARY KEY,
-    name              TEXT NOT NULL,
-    numeric_code      TEXT,
-    minor_units       INT,
-    is_active         BOOLEAN NOT NULL DEFAULT true,
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
 COMMENT ON TABLE venue IS 'Trading venues (exchanges) — NYSE, NASDAQ, LSE, etc.';
-COMMENT ON TABLE currency IS 'ISO 4217 currency codes and metadata';
