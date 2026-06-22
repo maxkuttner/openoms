@@ -36,11 +36,16 @@ db-fixtures: ## Load the minimal no-creds fixture (SPY)
 		-h "$$DB_HOST" -p "$$DB_PORT" -U "$$ADMIN_USER" -d "$${ODS_DB:-ods}" \
 		-f scripts/fixtures/minimal_seed.sql
 
-# --- live universe (on-demand, NOT scheduled; the seeders write as market_user) ---
-seed-instruments: ## Seed the instrument universe from Databento (needs DATABENTO_API_KEY)
-	@$(ENV) && DB_USER=market_user DB_PASSWORD="$$MARKET_USER_PASSWORD" \
-		python3 scripts/seed_instruments.py --symbol $${SYMBOL:-SPY}
+# --- live universe (on-demand, NOT scheduled) ---
+# Default to the admin role (like every other seeder) so standalone works out of
+# the box. Note .env sets DB_USER=oms_user for the app (read-only on public), so we
+# use a separate SEED_DB_USER var: a managed deployment can export it to point the
+# seeders at a least-privilege write role (e.g. market_user) without touching DB_USER.
+seed-instruments: ## Seed instrument universes from Databento (interactive; UNIVERSE=CODE for one)
+	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
+		python3 scripts/seed_instruments.py \
+		$${UNIVERSE:+--universe $$UNIVERSE} $${UNIVERSE:---interactive}
 
 sync-brokers: ## Sync broker_instrument from the broker catalog (needs ALPACA_PAPER_*)
-	@$(ENV) && DB_USER=market_user DB_PASSWORD="$$MARKET_USER_PASSWORD" \
+	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
 		python3 scripts/broker_sync.py

@@ -38,6 +38,9 @@ psql_db "$ODS_DB" -f scripts/seed_currencies.sql
 echo "→ seeding venues (ISO 10383 MIC registry)"
 python3 scripts/seed_venues.py --source data/ISO10383_MIC.csv
 
+echo "→ seeding instrument universes (seeder catalog)"
+psql_db "$ODS_DB" -f scripts/seed_universes.sql
+
 # Instruments + broker/provider mappings are seeded on demand (not here, not
 # scheduled): `make seed-instruments` (Databento) and `make sync-brokers` (Alpaca),
 # or `make db-fixtures` for the no-creds minimal set. They depend on currency +

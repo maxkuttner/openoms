@@ -25,3 +25,7 @@ GRANT CONNECT ON DATABASE ods TO market_user;
 GRANT USAGE ON SCHEMA public TO market_user;
 GRANT SELECT ON public.venue, public.currency TO market_user;
 GRANT SELECT, INSERT, UPDATE ON public.instrument, public.instrument_derivative, public.broker_instrument, public.provider_instrument TO market_user;
+-- Instrument-universe catalog: the seeder reads enabled universes + their symbols
+-- and writes the seed-state columns (status, last_seeded_at, …) back on the parent.
+GRANT SELECT ON public.instrument_universe, public.instrument_universe_symbol TO market_user;
+GRANT UPDATE ON public.instrument_universe TO market_user;

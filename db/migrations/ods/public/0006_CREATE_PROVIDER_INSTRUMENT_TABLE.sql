@@ -10,7 +10,10 @@ CREATE TABLE provider_instrument (
     instrument_id    BIGINT NOT NULL REFERENCES instrument(id) ON DELETE CASCADE,
     provider_code    TEXT NOT NULL,
     provider_symbol  TEXT NOT NULL,
-    provider_exchange TEXT,
+    -- The provider's own exchange label (its raw string, e.g. Databento's exchange
+    -- field), NOT necessarily our canonical venue MIC. NOT NULL so it can anchor the
+    -- resolver key below (NULLs are distinct in Postgres and would defeat it).
+    provider_exchange TEXT NOT NULL,
     -- Provider-native instrument id, refreshed each sync (e.g. Databento publisher
     -- instrument_id; may rotate). Deliberately NOT unique — not every provider's
     -- native id is stable/unique over time, so it's a refreshed reference, not a key.
@@ -20,9 +23,12 @@ CREATE TABLE provider_instrument (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (instrument_id, provider_code),
-    -- The stable resolver key: a provider's symbol maps to exactly one master
-    -- instrument, so the table can resolve provider symbol -> instrument_id.
-    CONSTRAINT provider_instrument_provider_symbol_uq UNIQUE (provider_code, provider_symbol)
+    -- The stable resolver key. A provider symbol resolves to one master instrument
+    -- per exchange — a consolidated provider lists the same symbol across venues
+    -- (SPY on ARCX, XNAS, …), each a distinct (symbol, venue) master instrument,
+    -- so the exchange is part of the key. Mirrors Nautilus's Symbol@Venue identity.
+    CONSTRAINT provider_instrument_provider_symbol_uq
+        UNIQUE (provider_code, provider_symbol, provider_exchange)
 );
 
 CREATE INDEX idx_provider_instrument_provider ON provider_instrument(provider_code);
