@@ -16,7 +16,7 @@ pub struct Principal {
 }
 
 #[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
-pub struct Book {
+pub struct Portfolio {
     pub id: Uuid,
     pub code: String,
     pub name: String,
@@ -42,7 +42,7 @@ pub struct Account {
 pub struct Grant {
     pub id: Uuid,
     pub principal_id: Uuid,
-    pub book_id: Uuid,
+    pub portfolio_id: Uuid,
     pub account_id: Uuid,
     pub can_trade: bool,
     pub can_view: bool,

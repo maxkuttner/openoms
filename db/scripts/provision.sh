@@ -15,20 +15,15 @@ cd "$ROOT"
 : "${DB_PORT:?DB_PORT must be set}"
 : "${ADMIN_USER:?ADMIN_USER must be set (a Postgres superuser)}"
 : "${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set}"
-: "${MDM_MASTER_PASSWORD:?MDM_MASTER_PASSWORD must be set}"
-: "${MARKET_USER_PASSWORD:?MARKET_USER_PASSWORD must be set}"
 : "${OMS_USER_PASSWORD:?OMS_USER_PASSWORD must be set}"
 ODS_DB="${ODS_DB:-ods}"
 
 # %I/%L quote the identifier/literal safely; \gexec runs the generated statement.
 PGPASSWORD="$ADMIN_PASSWORD" psql -v ON_ERROR_STOP=1 \
   -h "$DB_HOST" -p "$DB_PORT" -U "$ADMIN_USER" -d postgres \
-  -v mdm_pw="$MDM_MASTER_PASSWORD" -v market_pw="$MARKET_USER_PASSWORD" \
   -v oms_pw="$OMS_USER_PASSWORD" -v ods="$ODS_DB" <<'SQL'
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', 'mdm_master',  :'mdm_pw')    WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='mdm_master')\gexec
-SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', 'market_user', :'market_pw') WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='market_user')\gexec
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', 'oms_user',    :'oms_pw')    WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='oms_user')\gexec
 SELECT format('CREATE DATABASE %I OWNER mdm_master', :'ods') WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname=:'ods')\gexec
 SQL
 
-echo "provisioned roles (mdm_master, market_user, oms_user) + database '$ODS_DB'"
+echo "provisioned roles postgres(admin), oms_user(oms-owner) + database '$ODS_DB'"

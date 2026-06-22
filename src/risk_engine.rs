@@ -20,9 +20,9 @@ use crate::domain::orders::risk::{
     check_limit, check_trading_state, Exposure, RiskLimits, RiskRejection, TradingState,
 };
 
-/// The (book, account, instrument) slice that limits and exposure are keyed by.
+/// The (portfolio, account, instrument) slice that limits and exposure are keyed by.
 pub struct RiskScope<'a> {
-    pub book_id: Uuid,
+    pub portfolio_id: Uuid,
     pub account_id: Uuid,
     pub instrument_id: &'a str,
 }
@@ -73,12 +73,12 @@ impl<P: RiskDataProvider> RiskEngine<P> {
     /// `Ok(())` means the order may proceed; no configured limits means pass.
     pub async fn check_submit(
         &mut self,
-        book_id: Uuid,
+        portfolio_id: Uuid,
         account_id: Uuid,
         cmd: &SubmitOrder,
     ) -> Result<(), RiskCheckError> {
         let scope = RiskScope {
-            book_id,
+            portfolio_id,
             account_id,
             instrument_id: &cmd.instrument_id,
         };
@@ -125,10 +125,10 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
                     max_position_quantity::double precision AS max_position_quantity, \
                     max_position_notional::double precision AS max_position_notional \
              FROM risk_limits \
-             WHERE book_id = $1 AND account_id = $2 AND instrument_id = $3 \
+             WHERE portfolio_id = $1 AND account_id = $2 AND instrument_id = $3 \
              FOR UPDATE",
         )
-        .bind(scope.book_id)
+        .bind(scope.portfolio_id)
         .bind(scope.account_id)
         .bind(scope.instrument_id)
         .fetch_optional(&mut *self.conn)
@@ -165,9 +165,9 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
                                   ELSE 0 END), 0)::double precision \
                     AS working_qty \
              FROM order_state \
-             WHERE book_id = $1 AND account_id = $2 AND instrument_id = $3",
+             WHERE portfolio_id = $1 AND account_id = $2 AND instrument_id = $3",
         )
-        .bind(scope.book_id)
+        .bind(scope.portfolio_id)
         .bind(scope.account_id)
         .bind(scope.instrument_id)
         .fetch_one(&mut *self.conn)
@@ -217,7 +217,7 @@ mod tests {
         SubmitOrder {
             order_id: Uuid::new_v4().to_string(),
             client_order_id: "c-1".to_string(),
-            book_id: Uuid::new_v4().to_string(),
+            portfolio_id: Uuid::new_v4().to_string(),
             account_id: Uuid::new_v4().to_string(),
             instrument_id: Uuid::new_v4().to_string(),
             side,

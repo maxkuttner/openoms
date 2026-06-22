@@ -93,7 +93,7 @@ impl OrderStatus {
 pub struct OrderAggregateState {
     pub order_id: String,
     pub client_order_id: String,
-    pub book_id: String,
+    pub portfolio_id: String,
     pub account_id: String,
     pub instrument_id: String,
     pub side: OrderSide,

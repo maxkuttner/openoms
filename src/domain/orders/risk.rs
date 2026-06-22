@@ -1,6 +1,6 @@
 use super::state::OrderSide;
 
-// A strategy/book/trader is in a particular trading state
+// A strategy/portfolio/trader is in a particular trading state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradingState { Active, Reducing, Halted}
 

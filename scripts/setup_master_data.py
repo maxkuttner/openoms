@@ -4,9 +4,9 @@ setup_master_data.py — bootstrap OMS master data for local development.
 
 Creates:
   1. A principal (linked to your JWT sub)
-  2. A trading book
+  2. A trading portfolio
   3. A broker account (ALPACA / PAPER by default)
-  4. A can_trade grant linking principal → book → account  (inserted directly
+  4. A can_trade grant linking principal → portfolio → account  (inserted directly
      into the DB because there is no REST endpoint for grants yet)
 
 Usage:
@@ -76,7 +76,7 @@ def post_no_content(base_url: str, path: str, token: str | None, payload: dict):
         sys.exit(1)
 
 
-def insert_grant(database_url: str, principal_id: str, book_id: str, account_id: str):
+def insert_grant(database_url: str, principal_id: str, portfolio_id: str, account_id: str):
     """Insert a can_trade grant directly into the DB (no REST endpoint exists)."""
     try:
         import psycopg2
@@ -84,10 +84,10 @@ def insert_grant(database_url: str, principal_id: str, book_id: str, account_id:
         print()
         print("  psycopg2 not installed — insert the grant manually:")
         print(f"""
-    INSERT INTO oms_principal_book_account_grant
-        (id, principal_id, book_id, account_id, can_trade, can_view, can_allocate)
+    INSERT INTO oms_principal_portfolio_account_grant
+        (id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate)
     VALUES
-        ('{uuid.uuid4()}', '{principal_id}', '{book_id}', '{account_id}', true, true, false);
+        ('{uuid.uuid4()}', '{principal_id}', '{portfolio_id}', '{account_id}', true, true, false);
 """)
         return
 
@@ -97,12 +97,12 @@ def insert_grant(database_url: str, principal_id: str, book_id: str, account_id:
             grant_id = str(uuid.uuid4())
             cur.execute(
                 """
-                INSERT INTO oms_principal_book_account_grant
-                    (id, principal_id, book_id, account_id, can_trade, can_view, can_allocate)
+                INSERT INTO oms_principal_portfolio_account_grant
+                    (id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate)
                 VALUES (%s, %s, %s, %s, true, true, false)
-                ON CONFLICT (principal_id, book_id, account_id) DO NOTHING
+                ON CONFLICT (principal_id, portfolio_id, account_id) DO NOTHING
                 """,
-                (grant_id, principal_id, book_id, account_id),
+                (grant_id, principal_id, portfolio_id, account_id),
             )
         conn.commit()
         print(f"  grant inserted  id={grant_id}")
@@ -171,15 +171,15 @@ def main():
     })
     print(f"  principal created  id={principal['id']}  code={principal['code']}")
 
-    # 2. Create book
-    print("\n[2] Creating book...")
-    book = post(base, "/admin/books", args.token, {
-        "code": "dev-book-1",
-        "name": "Development Book",
+    # 2. Create portfolio
+    print("\n[2] Creating portfolio...")
+    portfolio = post(base, "/admin/portfolios", args.token, {
+        "code": "dev-portfolio-1",
+        "name": "Development Portfolio",
         "status": "ACTIVE",
         "base_currency": "USD",
     })
-    print(f"  book created       id={book['id']}  code={book['code']}")
+    print(f"  portfolio created       id={portfolio['id']}  code={portfolio['code']}")
 
     # 3. Create account
     print("\n[3] Creating account...")
@@ -195,9 +195,9 @@ def main():
     # 4. Grant
     print("\n[4] Inserting can_trade grant...")
     if database_url:
-        insert_grant(database_url, principal["id"], book["id"], account["id"])
+        insert_grant(database_url, principal["id"], portfolio["id"], account["id"])
     else:
-        insert_grant(None, principal["id"], book["id"], account["id"])
+        insert_grant(None, principal["id"], portfolio["id"], account["id"])
 
     # 5. Register API key (optional)
     if args.key_id and args.secret:
@@ -212,7 +212,7 @@ def main():
     print("\n" + "=" * 60)
     print("Master data ready. Use these with submit_order.py:")
     print(f"  PRINCIPAL_ID = \"{principal['id']}\"")
-    print(f"  BOOK_ID      = \"{book['id']}\"")
+    print(f"  PORTFOLIO_ID      = \"{portfolio['id']}\"")
     print(f"  ACCOUNT_ID   = \"{account['id']}\"")
     if args.key_id:
         print(f"  KEY_ID       = \"{args.key_id}\"")

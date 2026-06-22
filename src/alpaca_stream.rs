@@ -282,7 +282,7 @@ async fn process_execution_report(
     let row = sqlx::query(
         r#"
         SELECT
-            order_id, client_order_id, book_id, account_id, instrument_id,
+            order_id, client_order_id, portfolio_id, account_id, instrument_id,
             side, order_type, time_in_force,
             limit_price::double precision AS limit_price,
             original_qty::double precision AS original_qty,
@@ -326,7 +326,7 @@ async fn process_execution_report(
     let state = OrderAggregateState {
         order_id: row.get::<Uuid, _>("order_id").to_string(),
         client_order_id: row.get("client_order_id"),
-        book_id: row.get::<Uuid, _>("book_id").to_string(),
+        portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
         account_id: row.get::<Uuid, _>("account_id").to_string(),
         instrument_id: row.get("instrument_id"),
         side,

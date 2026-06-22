@@ -11,7 +11,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::domain::identity::{Account, Book, Grant, Principal};
+use crate::domain::identity::{Account, Portfolio, Grant, Principal};
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePrincipal {
@@ -32,7 +32,7 @@ pub struct UpdatePrincipal {
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct CreateBook {
+pub struct CreatePortfolio {
     pub code: String,
     pub name: String,
     pub status: String,
@@ -40,7 +40,7 @@ pub struct CreateBook {
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct UpdateBook {
+pub struct UpdatePortfolio {
     pub code: Option<String>,
     pub name: Option<String>,
     pub status: Option<String>,
@@ -227,23 +227,23 @@ pub async fn update_principal(
 }
 
 #[utoipa::path(
-    post, path = "/admin/books", tag = "admin",
-    request_body = CreateBook,
+    post, path = "/admin/portfolios", tag = "admin",
+    request_body = CreatePortfolio,
     responses(
-        (status = 200, description = "Created", body = Book),
+        (status = 200, description = "Created", body = Portfolio),
         (status = 409, description = "Already exists"),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn create_book(
+pub async fn create_portfolio(
     State(state): State<AppState>,
-    Json(payload): Json<CreateBook>,
-) -> Result<Json<Book>, AdminError> {
-    info!(code = %payload.code, name = %payload.name, "admin create book");
+    Json(payload): Json<CreatePortfolio>,
+) -> Result<Json<Portfolio>, AdminError> {
+    info!(code = %payload.code, name = %payload.name, "admin create portfolio");
     let id = Uuid::new_v4();
-    let record = sqlx::query_as::<_, Book>(
+    let record = sqlx::query_as::<_, Portfolio>(
         r#"
-        INSERT INTO book (
+        INSERT INTO portfolio (
             id,
             code,
             name,
@@ -266,20 +266,20 @@ pub async fn create_book(
 }
 
 #[utoipa::path(
-    get, path = "/admin/books", tag = "admin",
+    get, path = "/admin/portfolios", tag = "admin",
     responses(
-        (status = 200, description = "OK", body = [Book]),
+        (status = 200, description = "OK", body = [Portfolio]),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn list_books(
+pub async fn list_portfolios(
     State(state): State<AppState>,
-) -> Result<Json<Vec<Book>>, AdminError> {
-    info!("admin list books");
-    let records = sqlx::query_as::<_, Book>(
+) -> Result<Json<Vec<Portfolio>>, AdminError> {
+    info!("admin list portfolios");
+    let records = sqlx::query_as::<_, Portfolio>(
         r#"
         SELECT id, code, name, status, base_currency, created_at, updated_at
-        FROM book
+        FROM portfolio
         ORDER BY created_at DESC
         "#,
     )
@@ -291,23 +291,23 @@ pub async fn list_books(
 }
 
 #[utoipa::path(
-    get, path = "/admin/books/{id}", tag = "admin",
-    params(("id" = Uuid, Path, description = "Book ID")),
+    get, path = "/admin/portfolios/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Portfolio ID")),
     responses(
-        (status = 200, description = "OK", body = Book),
+        (status = 200, description = "OK", body = Portfolio),
         (status = 404, description = "Not found"),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn get_book(
+pub async fn get_portfolio(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Book>, AdminError> {
-    info!(book_id = %id, "admin get book");
-    let record = sqlx::query_as::<_, Book>(
+) -> Result<Json<Portfolio>, AdminError> {
+    info!(portfolio_id = %id, "admin get portfolio");
+    let record = sqlx::query_as::<_, Portfolio>(
         r#"
         SELECT id, code, name, status, base_currency, created_at, updated_at
-        FROM book
+        FROM portfolio
         WHERE id = $1
         "#,
     )
@@ -315,30 +315,30 @@ pub async fn get_book(
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("book"))?;
+    .ok_or_else(|| AdminError::not_found("portfolio"))?;
 
     Ok(Json(record))
 }
 
 #[utoipa::path(
-    patch, path = "/admin/books/{id}", tag = "admin",
-    params(("id" = Uuid, Path, description = "Book ID")),
-    request_body = UpdateBook,
+    patch, path = "/admin/portfolios/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Portfolio ID")),
+    request_body = UpdatePortfolio,
     responses(
-        (status = 200, description = "Updated", body = Book),
+        (status = 200, description = "Updated", body = Portfolio),
         (status = 404, description = "Not found"),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn update_book(
+pub async fn update_portfolio(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateBook>,
-) -> Result<Json<Book>, AdminError> {
-    info!(book_id = %id, "admin update book");
-    let record = sqlx::query_as::<_, Book>(
+    Json(payload): Json<UpdatePortfolio>,
+) -> Result<Json<Portfolio>, AdminError> {
+    info!(portfolio_id = %id, "admin update portfolio");
+    let record = sqlx::query_as::<_, Portfolio>(
         r#"
-        UPDATE book
+        UPDATE portfolio
         SET
             code = COALESCE($1, code),
             name = COALESCE($2, name),
@@ -357,7 +357,7 @@ pub async fn update_book(
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("book"))?;
+    .ok_or_else(|| AdminError::not_found("portfolio"))?;
 
     Ok(Json(record))
 }
@@ -661,7 +661,7 @@ pub async fn revoke_principal_key(
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateGrant {
-    pub book_id: Uuid,
+    pub portfolio_id: Uuid,
     pub account_id: Uuid,
     pub can_trade: bool,
     pub can_view: bool,
@@ -681,7 +681,7 @@ pub struct UpdateGrant {
     request_body = CreateGrant,
     responses(
         (status = 200, description = "Created", body = Grant),
-        (status = 409, description = "Grant already exists for this principal/book/account"),
+        (status = 409, description = "Grant already exists for this principal/portfolio/account"),
     ),
     security(("bearer_token" = []))
 )]
@@ -690,18 +690,18 @@ pub async fn create_grant(
     Path(principal_id): Path<Uuid>,
     Json(payload): Json<CreateGrant>,
 ) -> Result<Json<Grant>, AdminError> {
-    info!(principal_id = %principal_id, book_id = %payload.book_id, account_id = %payload.account_id, "admin create grant");
+    info!(principal_id = %principal_id, portfolio_id = %payload.portfolio_id, account_id = %payload.account_id, "admin create grant");
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        INSERT INTO principal_book_account_grant (id, principal_id, book_id, account_id, can_trade, can_view, can_allocate)
+        INSERT INTO principal_portfolio_account_grant (id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        RETURNING id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(principal_id)
-    .bind(payload.book_id)
+    .bind(payload.portfolio_id)
     .bind(payload.account_id)
     .bind(payload.can_trade)
     .bind(payload.can_view)
@@ -728,8 +728,8 @@ pub async fn list_grants(
     info!(principal_id = %principal_id, "admin list grants");
     let records = sqlx::query_as::<_, Grant>(
         r#"
-        SELECT id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
-        FROM principal_book_account_grant
+        SELECT id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        FROM principal_portfolio_account_grant
         WHERE principal_id = $1
         ORDER BY created_at DESC
         "#,
@@ -763,14 +763,14 @@ pub async fn update_grant(
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin update grant");
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        UPDATE principal_book_account_grant
+        UPDATE principal_portfolio_account_grant
         SET
             can_trade    = COALESCE($1, can_trade),
             can_view     = COALESCE($2, can_view),
             can_allocate = COALESCE($3, can_allocate),
             updated_at   = now()
         WHERE id = $4 AND principal_id = $5
-        RETURNING id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        RETURNING id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
         "#,
     )
     .bind(payload.can_trade)
@@ -804,7 +804,7 @@ pub async fn delete_grant(
 ) -> Result<StatusCode, AdminError> {
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin delete grant");
     let result = sqlx::query(
-        "DELETE FROM principal_book_account_grant WHERE id = $1 AND principal_id = $2",
+        "DELETE FROM principal_portfolio_account_grant WHERE id = $1 AND principal_id = $2",
     )
     .bind(grant_id)
     .bind(principal_id)

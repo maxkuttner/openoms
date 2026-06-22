@@ -68,7 +68,7 @@ impl OrderAggregate {
                     actor: metadata.actor,
                     payload: OrderEventPayload::OrderSubmitted {
                         client_order_id: cmd.client_order_id,
-                        book_id: cmd.book_id,
+                        portfolio_id: cmd.portfolio_id,
                         account_id: cmd.account_id,
                         instrument_id: cmd.instrument_id,
                         side: cmd.side,
@@ -308,7 +308,7 @@ impl OrderAggregate {
         match &event.payload {
             OrderEventPayload::OrderSubmitted {
                 client_order_id,
-                book_id,
+                portfolio_id,
                 account_id,
                 instrument_id,
                 side,
@@ -320,7 +320,7 @@ impl OrderAggregate {
                 self.state = Some(OrderAggregateState {
                     order_id: event.order_id.clone(),
                     client_order_id: client_order_id.clone(),
-                    book_id: book_id.clone(),
+                    portfolio_id: portfolio_id.clone(),
                     account_id: account_id.clone(),
                     instrument_id: instrument_id.clone(),
                     side: *side,
@@ -921,7 +921,7 @@ mod tests {
                 OrderCommand::SubmitOrder(SubmitOrder {
                     order_id: "o-2".to_string(),
                     client_order_id: "c-2".to_string(),
-                    book_id: "b-2".to_string(),
+                    portfolio_id: "b-2".to_string(),
                     account_id: "a-2".to_string(),
                     instrument_id: "i-2".to_string(),
                     side: OrderSide::Buy,

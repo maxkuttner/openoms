@@ -82,7 +82,7 @@ pub async fn health() -> &'static str {
     responses(
         (status = 204, description = "Order accepted and routed"),
         (status = 400, description = "Validation error"),
-        (status = 403, description = "No trade grant for principal/book/account"),
+        (status = 403, description = "No trade grant for principal/portfolio/account"),
         (status = 409, description = "Order already exists"),
         (status = 422, description = "Instrument not found, inactive, no tradeable broker mapping, or rejected by pre-trade risk"),
         (status = 502, description = "Broker rejected the order"),
@@ -103,9 +103,9 @@ pub async fn orders_submit(
         status: StatusCode::BAD_REQUEST,
         message: "order_id must be a UUID".to_string(),
     })?;
-    let book_id = Uuid::parse_str(&req.book_id).map_err(|_| ApiError {
+    let portfolio_id = Uuid::parse_str(&req.portfolio_id).map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
-        message: "book_id must be a UUID".to_string(),
+        message: "portfolio_id must be a UUID".to_string(),
     })?;
     let account_id = Uuid::parse_str(&req.account_id).map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
@@ -183,7 +183,7 @@ pub async fn orders_submit(
     // (synced from the broker, e.g. Alpaca min_order_size; NULL = no minimum).
     // All *admin* caps (max order/position quantity & notional) are policy, not
     // broker facts — they live in risk_limits and are enforced by the risk engine
-    // (check_submit, below), keyed per (book, account, instrument).
+    // (check_submit, below), keyed per (portfolio, account, instrument).
     let min_quantity: Option<f64> = broker_instrument_row.get("min_quantity");
     if let Some(min) = min_quantity {
         if req.quantity < min {
@@ -223,15 +223,15 @@ pub async fn orders_submit(
 
     let has_grant: bool = query_scalar(
         "SELECT EXISTS (
-            SELECT 1 FROM principal_book_account_grant
+            SELECT 1 FROM principal_portfolio_account_grant
             WHERE principal_id = $1
-              AND book_id = $2
+              AND portfolio_id = $2
               AND account_id = $3
               AND can_trade = true
         )"
     )
     .bind(principal_id)
-    .bind(book_id)
+    .bind(portfolio_id)
     .bind(account_id)
     .fetch_one(&mut *tx)
     .await
@@ -240,7 +240,7 @@ pub async fn orders_submit(
         message: format!("failed to check grant: {:?}", err),
     })?;
 
-    info!(has_grant, book_id = %book_id, account_id = %account_id, "checked trade grant");
+    info!(has_grant, portfolio_id = %portfolio_id, account_id = %account_id, "checked trade grant");
 
     if !has_grant {
         return Err(ApiError {
@@ -251,9 +251,9 @@ pub async fn orders_submit(
 
     // Pre-trade risk check. Runs inside TX1 so the FOR UPDATE lock on the
     // risk_limits row serializes concurrent submits for the same
-    // book/account/instrument scope until this transaction commits.
+    // portfolio/account/instrument scope until this transaction commits.
     RiskEngine::new(PgRiskDataProvider::new(&mut *tx))
-        .check_submit(book_id, account_id, &req)
+        .check_submit(portfolio_id, account_id, &req)
         .await
         .map_err(|err| match err {
             RiskCheckError::Rejected(rejection) => {
@@ -310,7 +310,7 @@ pub async fn orders_submit(
         INSERT INTO order_state (
             order_id,
             client_order_id,
-            book_id,
+            portfolio_id,
             account_id,
             instrument_id,
             side,
@@ -331,7 +331,7 @@ pub async fn orders_submit(
     )
     .bind(order_id)
     .bind(&state_after_submit.client_order_id)
-    .bind(Uuid::parse_str(&state_after_submit.book_id).unwrap())
+    .bind(Uuid::parse_str(&state_after_submit.portfolio_id).unwrap())
     .bind(Uuid::parse_str(&state_after_submit.account_id).unwrap())
     .bind(&state_after_submit.instrument_id)
     .bind(state_after_submit.side.as_str())
@@ -564,7 +564,7 @@ pub async fn orders_cancel(
         SELECT
             order_id,
             client_order_id,
-            book_id,
+            portfolio_id,
             account_id,
             instrument_id,
             side,
@@ -614,7 +614,7 @@ pub async fn orders_cancel(
     let state = OrderAggregateState {
         order_id: row.get::<Uuid, _>("order_id").to_string(),
         client_order_id: row.get::<String, _>("client_order_id"),
-        book_id: row.get::<Uuid, _>("book_id").to_string(),
+        portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
         account_id: row.get::<Uuid, _>("account_id").to_string(),
         instrument_id: row.get::<String, _>("instrument_id"),
         side,
@@ -746,7 +746,7 @@ pub async fn get_order(
     let row = sqlx::query(
         r#"
         SELECT
-            order_id, client_order_id, book_id, account_id, instrument_id,
+            order_id, client_order_id, portfolio_id, account_id, instrument_id,
             side, order_type, time_in_force,
             limit_price::double precision AS limit_price,
             original_qty::double precision AS original_qty,
@@ -773,7 +773,7 @@ pub async fn get_order(
     let order = OrderAggregateState {
         order_id: row.get::<Uuid, _>("order_id").to_string(),
         client_order_id: row.get("client_order_id"),
-        book_id: row.get::<Uuid, _>("book_id").to_string(),
+        portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
         account_id: row.get::<Uuid, _>("account_id").to_string(),
         instrument_id: row.get("instrument_id"),
         side: parse_order_side(row.get("side"))?,

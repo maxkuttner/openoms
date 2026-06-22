@@ -1,4 +1,4 @@
-CREATE TABLE book (
+CREATE TABLE portfolio (
     id                  UUID PRIMARY KEY,
     code                TEXT NOT NULL UNIQUE,
     name                TEXT NOT NULL,
@@ -9,4 +9,4 @@ CREATE TABLE book (
     CHECK (status IN ('ACTIVE', 'CLOSED'))
 );
 
-CREATE INDEX idx_book_status ON book(status);
+CREATE INDEX idx_portfolio_status ON portfolio(status);

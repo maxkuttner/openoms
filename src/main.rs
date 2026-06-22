@@ -14,10 +14,10 @@ use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
-use crate::domain::identity::{Principal, Book, Account};
+use crate::domain::identity::{Principal, Portfolio, Account};
 use crate::admin::{
     CreatePrincipal, UpdatePrincipal,
-    CreateBook, UpdateBook,
+    CreatePortfolio, UpdatePortfolio,
     CreateAccount, UpdateAccount,
     CreateKey, ApiKeyRecord,
     CreateGrant, UpdateGrant,
@@ -61,10 +61,10 @@ mod alpaca_stream;
         admin::list_grants,
         admin::update_grant,
         admin::delete_grant,
-        admin::create_book,
-        admin::list_books,
-        admin::get_book,
-        admin::update_book,
+        admin::create_portfolio,
+        admin::list_portfolios,
+        admin::get_portfolio,
+        admin::update_portfolio,
         admin::create_account,
         admin::list_accounts,
         admin::get_account,
@@ -72,9 +72,9 @@ mod alpaca_stream;
     ),
     components(schemas(
         SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
-        Principal, Book, Account,
+        Principal, Portfolio, Account,
         CreatePrincipal, UpdatePrincipal,
-        CreateBook, UpdateBook,
+        CreatePortfolio, UpdatePortfolio,
         CreateAccount, UpdateAccount,
         CreateKey, ApiKeyRecord,
         Grant, CreateGrant, UpdateGrant,
@@ -82,7 +82,7 @@ mod alpaca_stream;
     modifiers(&SecurityAddon),
     tags(
         (name = "orders", description = "Order submission and cancellation"),
-        (name = "admin", description = "Admin management of principals, books, accounts, and keys"),
+        (name = "admin", description = "Admin management of principals, portfolios, accounts, and keys"),
     )
 )]
 struct ApiDoc;
@@ -251,12 +251,12 @@ async fn main() {
             axum::routing::delete(admin::revoke_principal_key),
         )
         .route(
-            "/admin/books",
-            post(admin::create_book).get(admin::list_books),
+            "/admin/portfolios",
+            post(admin::create_portfolio).get(admin::list_portfolios),
         )
         .route(
-            "/admin/books/:id",
-            axum::routing::patch(admin::update_book).get(admin::get_book),
+            "/admin/portfolios/:id",
+            axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
         )
         .route(
             "/admin/accounts",

@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
-#
-# Central migration runner for the whole cluster.
-#
-# mdm owns all schema. Each "target" is a (database, schema, owner) tuple with
-# its own directory of forward-only `NNNN_name.sql` files:
-#
-#   ods / public / mdm_master   → master data (instrument, venue, …)   "dbo"
-#   ods / oms    / oms_user      → operational (account, order_*, …)
-#   mds / public / market_user   → market data (equity_ohlcv_1d, …)
-#
-# The runner connects to each database as an admin/superuser, and for every
-# migration: SET ROLE <owner> + search_path=<schema> so objects are created in
-# the right schema AND owned by the right role; the tracking table
-# (public._mdm_migrations) is owned and written by the admin.
-#
-# Usage: scripts/migrate.sh [up|status]   (default: up)
-#
+# Central migration runner for the ods database.
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,7 +23,7 @@ fi
 ODS_DB="${ODS_DB:-ods}"
 
 # target = "db|schema|owner|dir"
-# openoms owns only the ods layer; mds (market data) lives with the data pipeline.
+# openoms owns only the ods layer;
 TARGETS=(
   "${ODS_DB}|public|mdm_master|migrations/ods/public"
   "${ODS_DB}|oms|oms_user|migrations/ods/oms"
