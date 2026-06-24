@@ -11,7 +11,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::domain::identity::{Account, Portfolio, Grant, Principal};
+use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePrincipal {
@@ -50,8 +50,7 @@ pub struct UpdatePortfolio {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateAccount {
     pub code: String,
-    pub broker_code: String,
-    pub environment: String,
+    pub broker_connection_code: String,
     pub external_account_ref: String,
     pub status: String,
 }
@@ -59,9 +58,23 @@ pub struct CreateAccount {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateAccount {
     pub code: Option<String>,
+    pub broker_connection_code: Option<String>,
+    pub external_account_ref: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateBrokerConnection {
+    pub code: String,
+    pub broker_code: String,
+    pub environment: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateBrokerConnection {
     pub broker_code: Option<String>,
     pub environment: Option<String>,
-    pub external_account_ref: Option<String>,
     pub status: Option<String>,
 }
 
@@ -367,7 +380,6 @@ pub async fn update_portfolio(
     request_body = CreateAccount,
     responses(
         (status = 200, description = "Created", body = Account),
-        (status = 400, description = "Invalid environment (must be PAPER or LIVE)"),
         (status = 409, description = "Already exists"),
     ),
     security(("bearer_token" = []))
@@ -376,31 +388,23 @@ pub async fn create_account(
     State(state): State<AppState>,
     Json(payload): Json<CreateAccount>,
 ) -> Result<Json<Account>, AdminError> {
-    if payload.environment != "PAPER" && payload.environment != "LIVE" {
-        return Err(AdminError {
-            status: StatusCode::BAD_REQUEST,
-            message: "environment must be PAPER or LIVE".to_string(),
-        });
-    }
-    info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create account");
+    info!(code = %payload.code, broker_connection_code = %payload.broker_connection_code, "admin create account");
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Account>(
         r#"
         INSERT INTO account (
             id,
             code,
-            broker_code,
-            environment,
+            broker_connection_code,
             external_account_ref,
             status
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(payload.code)
-    .bind(payload.broker_code)
-    .bind(payload.environment)
+    .bind(payload.broker_connection_code)
     .bind(payload.external_account_ref)
     .bind(payload.status)
     .fetch_one(state.pool())
@@ -423,7 +427,7 @@ pub async fn list_accounts(
     info!("admin list accounts");
     let records = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
         FROM account
         ORDER BY created_at DESC
         "#,
@@ -451,7 +455,7 @@ pub async fn get_account(
     info!(account_id = %id, "admin get account");
     let record = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
         FROM account
         WHERE id = $1
         "#,
@@ -471,7 +475,6 @@ pub async fn get_account(
     request_body = UpdateAccount,
     responses(
         (status = 200, description = "Updated", body = Account),
-        (status = 400, description = "Invalid environment"),
         (status = 404, description = "Not found"),
     ),
     security(("bearer_token" = []))
@@ -481,6 +484,145 @@ pub async fn update_account(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateAccount>,
 ) -> Result<Json<Account>, AdminError> {
+    info!(account_id = %id, "admin update account");
+    let record = sqlx::query_as::<_, Account>(
+        r#"
+        UPDATE account
+        SET
+            code = COALESCE($1, code),
+            broker_connection_code = COALESCE($2, broker_connection_code),
+            external_account_ref = COALESCE($3, external_account_ref),
+            status = COALESCE($4, status),
+            updated_at = now()
+        WHERE id = $5
+        RETURNING id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
+        "#,
+    )
+    .bind(payload.code)
+    .bind(payload.broker_connection_code)
+    .bind(payload.external_account_ref)
+    .bind(payload.status)
+    .bind(id)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(map_db_error)?
+    .ok_or_else(|| AdminError::not_found("account"))?;
+
+    Ok(Json(record))
+}
+
+// ── Broker connections ────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    post, path = "/admin/broker-connections", tag = "admin",
+    request_body = CreateBrokerConnection,
+    responses(
+        (status = 200, description = "Created", body = BrokerConnection),
+        (status = 400, description = "Invalid environment (must be PAPER or LIVE)"),
+        (status = 409, description = "Already exists"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn create_broker_connection(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateBrokerConnection>,
+) -> Result<Json<BrokerConnection>, AdminError> {
+    if payload.environment != "PAPER" && payload.environment != "LIVE" {
+        return Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: "environment must be PAPER or LIVE".to_string(),
+        });
+    }
+    info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create broker connection");
+    let record = sqlx::query_as::<_, BrokerConnection>(
+        r#"
+        INSERT INTO broker_connection (code, broker_code, environment, status)
+        VALUES ($1, $2, $3, $4)
+        RETURNING code, broker_code, environment, status, created_at, updated_at
+        "#,
+    )
+    .bind(payload.code)
+    .bind(payload.broker_code)
+    .bind(payload.environment)
+    .bind(payload.status)
+    .fetch_one(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    get, path = "/admin/broker-connections", tag = "admin",
+    responses(
+        (status = 200, description = "OK", body = [BrokerConnection]),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn list_broker_connections(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BrokerConnection>>, AdminError> {
+    info!("admin list broker connections");
+    let records = sqlx::query_as::<_, BrokerConnection>(
+        r#"
+        SELECT code, broker_code, environment, status, created_at, updated_at
+        FROM broker_connection
+        ORDER BY code
+        "#,
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(records))
+}
+
+#[utoipa::path(
+    get, path = "/admin/broker-connections/{code}", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "OK", body = BrokerConnection),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_broker_connection(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<BrokerConnection>, AdminError> {
+    info!(broker_connection_code = %code, "admin get broker connection");
+    let record = sqlx::query_as::<_, BrokerConnection>(
+        r#"
+        SELECT code, broker_code, environment, status, created_at, updated_at
+        FROM broker_connection
+        WHERE code = $1
+        "#,
+    )
+    .bind(code)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(map_db_error)?
+    .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    patch, path = "/admin/broker-connections/{code}", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    request_body = UpdateBrokerConnection,
+    responses(
+        (status = 200, description = "Updated", body = BrokerConnection),
+        (status = 400, description = "Invalid environment"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn update_broker_connection(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(payload): Json<UpdateBrokerConnection>,
+) -> Result<Json<BrokerConnection>, AdminError> {
     if let Some(ref env) = payload.environment {
         if env != "PAPER" && env != "LIVE" {
             return Err(AdminError {
@@ -489,31 +631,27 @@ pub async fn update_account(
             });
         }
     }
-    info!(account_id = %id, "admin update account");
-    let record = sqlx::query_as::<_, Account>(
+    info!(broker_connection_code = %code, "admin update broker connection");
+    let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
-        UPDATE account
+        UPDATE broker_connection
         SET
-            code = COALESCE($1, code),
-            broker_code = COALESCE($2, broker_code),
-            environment = COALESCE($3, environment),
-            external_account_ref = COALESCE($4, external_account_ref),
-            status = COALESCE($5, status),
+            broker_code = COALESCE($1, broker_code),
+            environment = COALESCE($2, environment),
+            status = COALESCE($3, status),
             updated_at = now()
-        WHERE id = $6
-        RETURNING id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        WHERE code = $4
+        RETURNING code, broker_code, environment, status, created_at, updated_at
         "#,
     )
-    .bind(payload.code)
     .bind(payload.broker_code)
     .bind(payload.environment)
-    .bind(payload.external_account_ref)
     .bind(payload.status)
-    .bind(id)
+    .bind(code)
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("account"))?;
+    .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
     Ok(Json(record))
 }

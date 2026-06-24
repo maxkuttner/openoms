@@ -27,11 +27,20 @@ pub struct Portfolio {
 }
 
 #[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
-pub struct Account {
-    pub id: Uuid,
+pub struct BrokerConnection {
     pub code: String,
     pub broker_code: String,
     pub environment: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
+pub struct Account {
+    pub id: Uuid,
+    pub code: String,
+    pub broker_connection_code: String,
     pub external_account_ref: String,
     pub status: String,
     pub created_at: DateTime<Utc>,

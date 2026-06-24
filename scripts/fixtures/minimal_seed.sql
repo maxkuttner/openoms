@@ -27,3 +27,10 @@ INSERT INTO broker_instrument
 SELECT id, 'ALPACA', 'SPY', 'ARCA', 'b28f4066-5c6d-479b-a2af-85dc1a8f16fb', true
 FROM   instrument WHERE symbol = 'SPY' AND venue = 'ARCX'
 ON CONFLICT (instrument_id, broker_code) DO NOTHING;
+
+-- A test broker connection so an account can be created and orders can route.
+-- Creds are resolved from env by (broker_code, environment); this is just the
+-- routing target an account references. Schema-qualified — it lives in `oms`.
+INSERT INTO oms.broker_connection (code, broker_code, environment, status)
+VALUES ('alpaca-paper', 'ALPACA', 'PAPER', 'ACTIVE')
+ON CONFLICT (code) DO NOTHING;

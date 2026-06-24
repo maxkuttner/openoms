@@ -117,10 +117,14 @@ pub async fn orders_submit(
         message: "instrument_id must be a BIGINT".to_string(),
     })?;
 
-    // Pre-flight: resolve account (broker_code, environment, external_account_ref) so we can
-    // validate the instrument mapping before committing anything to the event store.
+    // Pre-flight: resolve the account's routing coordinates from its broker_connection
+    // (broker_code, environment) + the custodial ref, so we can validate the instrument
+    // mapping before committing anything to the event store. Requires an ACTIVE connection.
     let account_row_pre = sqlx::query(
-        "SELECT broker_code, environment, external_account_ref FROM account WHERE id = $1"
+        "SELECT bc.broker_code, bc.environment, a.external_account_ref \
+         FROM account a \
+         JOIN broker_connection bc ON bc.code = a.broker_connection_code \
+         WHERE a.id = $1 AND bc.status = 'ACTIVE'"
     )
     .bind(account_id)
     .fetch_optional(&pool)
@@ -131,7 +135,7 @@ pub async fn orders_submit(
     })?
     .ok_or_else(|| ApiError {
         status: StatusCode::BAD_REQUEST,
-        message: "account not found".to_string(),
+        message: "account not found or its broker connection is not active".to_string(),
     })?;
 
     let broker_code: String = account_row_pre.get("broker_code");

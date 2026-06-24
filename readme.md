@@ -34,7 +34,7 @@ matches broker-neutral pro OMSs (Charles River, FlexTrade, Bloomberg). Today the
 account fuses *custodial account* with *broker routing target* and is forced onto
 every order. Architecture is already half multi-broker (`BrokerRegistry` keyed by
 `(broker_code, environment)`, per-broker `broker_instrument`, `RouteOrder`/`OrderRouted`).
-- [ ] rename `book` → `portfolio` to align naming with pro OMS (schema + API + code)
+- [x] rename `book` → `portfolio` to align naming with pro OMS (schema + API + code)
 - [ ] split broker route/connection from account: account = custodial/allocation only;
       add a `broker_connection` entity (broker_code + environment + creds); orders route
       to a *connection*, not an account

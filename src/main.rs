@@ -14,11 +14,12 @@ use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
-use crate::domain::identity::{Principal, Portfolio, Account};
+use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
     CreatePrincipal, UpdatePrincipal,
     CreatePortfolio, UpdatePortfolio,
     CreateAccount, UpdateAccount,
+    CreateBrokerConnection, UpdateBrokerConnection,
     CreateKey, ApiKeyRecord,
     CreateGrant, UpdateGrant,
 };
@@ -69,20 +70,25 @@ mod alpaca_stream;
         admin::list_accounts,
         admin::get_account,
         admin::update_account,
+        admin::create_broker_connection,
+        admin::list_broker_connections,
+        admin::get_broker_connection,
+        admin::update_broker_connection,
     ),
     components(schemas(
         SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
-        Principal, Portfolio, Account,
+        Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
         CreateAccount, UpdateAccount,
+        CreateBrokerConnection, UpdateBrokerConnection,
         CreateKey, ApiKeyRecord,
         Grant, CreateGrant, UpdateGrant,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "orders", description = "Order submission and cancellation"),
-        (name = "admin", description = "Admin management of principals, portfolios, accounts, and keys"),
+        (name = "admin", description = "Admin management of principals, portfolios, accounts, broker connections, and keys"),
     )
 )]
 struct ApiDoc;
@@ -265,6 +271,14 @@ async fn main() {
         .route(
             "/admin/accounts/:id",
             axum::routing::patch(admin::update_account).get(admin::get_account),
+        )
+        .route(
+            "/admin/broker-connections",
+            post(admin::create_broker_connection).get(admin::list_broker_connections),
+        )
+        .route(
+            "/admin/broker-connections/:code",
+            axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
         )
         .route(
             "/admin/principals/:id/grants",
