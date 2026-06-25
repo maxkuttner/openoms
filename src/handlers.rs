@@ -12,6 +12,7 @@ use axum::{
     http::Uri,
 };
 
+use serde::Deserialize;
 use tracing::{error, info, warn};
 use crate::adapters::{BrokerOrderRequest, BrokerError};
 use crate::app_state::AppState;
@@ -76,9 +77,42 @@ pub async fn health() -> &'static str {
 
 
 
+/// Wire payload for POST /orders/submit. `account_id` is optional — when omitted it is
+/// resolved from the portfolio's `default_account_id`; when present it overrides.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SubmitOrderRequest {
+    pub order_id: String,
+    pub client_order_id: String,
+    pub portfolio_id: String,
+    pub account_id: Option<String>,
+    pub instrument_id: String,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub time_in_force: TimeInForce,
+    pub limit_price: Option<f64>,
+    pub quantity: f64,
+}
+
+impl SubmitOrderRequest {
+    fn into_command(self, account_id: String) -> SubmitOrder {
+        SubmitOrder {
+            order_id: self.order_id,
+            client_order_id: self.client_order_id,
+            portfolio_id: self.portfolio_id,
+            account_id,
+            instrument_id: self.instrument_id,
+            side: self.side,
+            order_type: self.order_type,
+            time_in_force: self.time_in_force,
+            limit_price: self.limit_price,
+            quantity: self.quantity,
+        }
+    }
+}
+
 #[utoipa::path(
     post, path = "/orders/submit", tag = "orders",
-    request_body = SubmitOrder,
+    request_body = SubmitOrderRequest,
     responses(
         (status = 204, description = "Order accepted and routed"),
         (status = 400, description = "Validation error"),
@@ -93,8 +127,8 @@ pub async fn health() -> &'static str {
 pub async fn orders_submit(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    Json(req): Json<commands::SubmitOrder>
-) -> Result<Response, ApiError> {  
+    Json(req): Json<SubmitOrderRequest>
+) -> Result<Response, ApiError> {
 
     info!(?req, principal_id = %auth.principal_id, "submit order received");
     let pool = state.pool().clone();
@@ -107,15 +141,36 @@ pub async fn orders_submit(
         status: StatusCode::BAD_REQUEST,
         message: "portfolio_id must be a UUID".to_string(),
     })?;
-    let account_id = Uuid::parse_str(&req.account_id).map_err(|_| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        message: "account_id must be a UUID".to_string(),
-    })?;
+    // Resolve the account: explicit override if given, else the portfolio's default route.
+    let account_id: Uuid = match req.account_id.as_deref() {
+        Some(a) => Uuid::parse_str(a).map_err(|_| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "account_id must be a UUID".to_string(),
+        })?,
+        None => query_scalar::<_, Option<Uuid>>(
+            "SELECT default_account_id FROM portfolio WHERE id = $1",
+        )
+        .bind(portfolio_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to load portfolio default account: {:?}", err),
+        })?
+        .flatten()
+        .ok_or_else(|| ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "no account_id given and portfolio has no default account".to_string(),
+        })?,
+    };
     // instrument.id is a BIGINT surrogate key (the mdm master instrument), not a UUID.
     let instrument_id_bigint: i64 = req.instrument_id.parse().map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
         message: "instrument_id must be a BIGINT".to_string(),
     })?;
+
+    // Boundary → domain: fold the resolved account into the pure SubmitOrder command.
+    let cmd = req.into_command(account_id.to_string());
 
     // Pre-flight: resolve the account's routing coordinates from its broker_connection
     // (broker_code, environment) + the custodial ref, so we can validate the instrument
@@ -190,10 +245,10 @@ pub async fn orders_submit(
     // (check_submit, below), keyed per (portfolio, account, instrument).
     let min_quantity: Option<f64> = broker_instrument_row.get("min_quantity");
     if let Some(min) = min_quantity {
-        if req.quantity < min {
+        if cmd.quantity < min {
             return Err(ApiError {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: format!("quantity {} below broker minimum {min}", req.quantity),
+                message: format!("quantity {} below broker minimum {min}", cmd.quantity),
             });
         }
     }
@@ -257,7 +312,7 @@ pub async fn orders_submit(
     // risk_limits row serializes concurrent submits for the same
     // portfolio/account/instrument scope until this transaction commits.
     RiskEngine::new(PgRiskDataProvider::new(&mut *tx))
-        .check_submit(portfolio_id, account_id, &req)
+        .check_submit(portfolio_id, account_id, &cmd)
         .await
         .map_err(|err| match err {
             RiskCheckError::Rejected(rejection) => {
@@ -289,7 +344,7 @@ pub async fn orders_submit(
 
     // run through state machine and decide whether can proceed
     let events = aggregate
-        .decide(OrderCommand::SubmitOrder(req), metadata)
+        .decide(OrderCommand::SubmitOrder(cmd), metadata)
         .map_err(map_rejection_to_api_error)?;
 
 

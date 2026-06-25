@@ -22,6 +22,7 @@ pub struct Portfolio {
     pub name: String,
     pub status: String,
     pub base_currency: Option<String>,
+    pub default_account_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

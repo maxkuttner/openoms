@@ -13,6 +13,7 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
+use crate::handlers::SubmitOrderRequest;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
@@ -76,7 +77,7 @@ mod alpaca_stream;
         admin::update_broker_connection,
     ),
     components(schemas(
-        SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
+        SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,

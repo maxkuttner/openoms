@@ -37,6 +37,7 @@ pub struct CreatePortfolio {
     pub name: String,
     pub status: String,
     pub base_currency: Option<String>,
+    pub default_account_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -45,6 +46,7 @@ pub struct UpdatePortfolio {
     pub name: Option<String>,
     pub status: Option<String>,
     pub base_currency: Option<String>,
+    pub default_account_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -261,9 +263,10 @@ pub async fn create_portfolio(
             code,
             name,
             status,
-            base_currency
-        ) VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, code, name, status, base_currency, created_at, updated_at
+            base_currency,
+            default_account_id
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, code, name, status, base_currency, default_account_id, created_at, updated_at
         "#,
     )
     .bind(id)
@@ -271,6 +274,7 @@ pub async fn create_portfolio(
     .bind(payload.name)
     .bind(payload.status)
     .bind(payload.base_currency)
+    .bind(payload.default_account_id)
     .fetch_one(state.pool())
     .await
     .map_err(map_db_error)?;
@@ -291,7 +295,7 @@ pub async fn list_portfolios(
     info!("admin list portfolios");
     let records = sqlx::query_as::<_, Portfolio>(
         r#"
-        SELECT id, code, name, status, base_currency, created_at, updated_at
+        SELECT id, code, name, status, base_currency, default_account_id, created_at, updated_at
         FROM portfolio
         ORDER BY created_at DESC
         "#,
@@ -319,7 +323,7 @@ pub async fn get_portfolio(
     info!(portfolio_id = %id, "admin get portfolio");
     let record = sqlx::query_as::<_, Portfolio>(
         r#"
-        SELECT id, code, name, status, base_currency, created_at, updated_at
+        SELECT id, code, name, status, base_currency, default_account_id, created_at, updated_at
         FROM portfolio
         WHERE id = $1
         "#,
@@ -357,15 +361,17 @@ pub async fn update_portfolio(
             name = COALESCE($2, name),
             status = COALESCE($3, status),
             base_currency = COALESCE($4, base_currency),
+            default_account_id = COALESCE($5, default_account_id),
             updated_at = now()
-        WHERE id = $5
-        RETURNING id, code, name, status, base_currency, created_at, updated_at
+        WHERE id = $6
+        RETURNING id, code, name, status, base_currency, default_account_id, created_at, updated_at
         "#,
     )
     .bind(payload.code)
     .bind(payload.name)
     .bind(payload.status)
     .bind(payload.base_currency)
+    .bind(payload.default_account_id)
     .bind(id)
     .fetch_optional(state.pool())
     .await
