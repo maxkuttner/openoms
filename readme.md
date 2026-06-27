@@ -1,11 +1,6 @@
 # OpenOMS
 
-
-
-
 **TODO:**
-
-
 
 **1) Order Groups**
 I have decided that the client already gets the order objects 
@@ -28,30 +23,18 @@ add endpoints to handle group ids, like cancellation, lifecycle management.
 - [ ] cache Databento `definition` fetches to `.dbn` so resets replay offline (no refetch)
 - [ ] `EQUS_SUMMARY` is consolidated like the removed `DBEQ.BASIC` — same symbol-spans-venues collision risk if enabled
 
-**4) Identity model & multi-broker routing**
-Rework so a client only needs a trader + portfolio to send orders, and so routing
-matches broker-neutral pro OMSs (Charles River, FlexTrade, Bloomberg). Today the
-account fuses *custodial account* with *broker routing target* and is forced onto
-every order. Architecture is already half multi-broker (`BrokerRegistry` keyed by
-`(broker_code, environment)`, per-broker `broker_instrument`, `RouteOrder`/`OrderRouted`).
-- [x] rename `book` → `portfolio` to align naming with pro OMS (schema + API + code)
-- [x] split broker route/connection from account: account = custodial/allocation only;
-      add a `broker_connection` entity (broker_code + environment + creds); orders route
-      to a *connection*, not an account
-- [ ] routing decision layer: explicit broker on the order / default bound to the
-      portfolio / smart (SOR, algo-wheel) later — today routing is implicit via
-      `account.broker_code` in `handlers.rs` (portfolio-default + explicit-account override done)
-- [x] drop `account` from the common `/orders/submit` path — default the route from the
-      portfolio, allow an explicit override only
+**4) Multi-broker routing**
+The identity rework is done: a client needs only a **principal + portfolio** to send
+orders. Account is custodial-only and inferred from the portfolio's default route (with an
+optional explicit override); the route is recorded on `order_state.broker_connection_code`;
+the grant is (principal × portfolio) and risk is (portfolio × instrument). The no-creds
+fixture seeds the `alpaca-paper` connection plus a ready-to-trade test user
+(HTTP Basic `ak_test` : `test-secret`). Remaining multi-broker work:
+- [ ] routing decision layer: explicit broker on the order / smart (SOR, algo-wheel) —
+      today the broker is whatever the resolved account's `broker_connection` says
 - [ ] generalize execution streams: one per broker connection (currently Alpaca-only in
       `alpaca_stream.rs`); add IBKR inbound (adapter exists, no stream)
-- [x] store the resolved broker/route on `order_state` (`broker_connection_code`)
-- [x] re-key entitlements & risk: trade grant → (principal × portfolio); risk →
-      (portfolio, instrument). NOTE: separate account/connection routing permission still
-      deferred — an explicit-account override is not entitlement-checked
+- [ ] separate account/connection routing permission — an explicit-account override is
+      not entitlement-checked today
 - [ ] (advanced, only if multi-account) post-trade allocation across accounts —
       `AllocationInstruction`-style endpoint
-- [x] minimal version for multi-broker without institutional weight: `broker_connection`
-      + portfolio-default route (+ optional override) + route stored on the order
-- [ ] no-creds test-user fixture: seed principal + account + portfolio (default route) +
-      grant + api_key (bcrypt via pgcrypto) so a fresh `db-setup` is immediately tradeable
