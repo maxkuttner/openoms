@@ -53,7 +53,6 @@ pub struct Grant {
     pub id: Uuid,
     pub principal_id: Uuid,
     pub portfolio_id: Uuid,
-    pub account_id: Uuid,
     pub can_trade: bool,
     pub can_view: bool,
     pub can_allocate: bool,

@@ -20,10 +20,9 @@ use crate::domain::orders::risk::{
     check_limit, check_trading_state, Exposure, RiskLimits, RiskRejection, TradingState,
 };
 
-/// The (portfolio, account, instrument) slice that limits and exposure are keyed by.
+/// The (portfolio, instrument) slice that limits and exposure are keyed by.
 pub struct RiskScope<'a> {
     pub portfolio_id: Uuid,
-    pub account_id: Uuid,
     pub instrument_id: &'a str,
 }
 
@@ -74,12 +73,10 @@ impl<P: RiskDataProvider> RiskEngine<P> {
     pub async fn check_submit(
         &mut self,
         portfolio_id: Uuid,
-        account_id: Uuid,
         cmd: &SubmitOrder,
     ) -> Result<(), RiskCheckError> {
         let scope = RiskScope {
             portfolio_id,
-            account_id,
             instrument_id: &cmd.instrument_id,
         };
 
@@ -125,11 +122,10 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
                     max_position_quantity::double precision AS max_position_quantity, \
                     max_position_notional::double precision AS max_position_notional \
              FROM risk_limits \
-             WHERE portfolio_id = $1 AND account_id = $2 AND instrument_id = $3 \
+             WHERE portfolio_id = $1 AND instrument_id = $2 \
              FOR UPDATE",
         )
         .bind(scope.portfolio_id)
-        .bind(scope.account_id)
         .bind(scope.instrument_id)
         .fetch_optional(&mut *self.conn)
         .await?;
@@ -165,10 +161,9 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
                                   ELSE 0 END), 0)::double precision \
                     AS working_qty \
              FROM order_state \
-             WHERE portfolio_id = $1 AND account_id = $2 AND instrument_id = $3",
+             WHERE portfolio_id = $1 AND instrument_id = $2",
         )
         .bind(scope.portfolio_id)
-        .bind(scope.account_id)
         .bind(scope.instrument_id)
         .fetch_one(&mut *self.conn)
         .await?;
@@ -230,7 +225,7 @@ mod tests {
 
     async fn run(provider: StubProvider, cmd: &SubmitOrder) -> Result<(), RiskCheckError> {
         RiskEngine::new(provider)
-            .check_submit(Uuid::new_v4(), Uuid::new_v4(), cmd)
+            .check_submit(Uuid::new_v4(), cmd)
             .await
     }
 

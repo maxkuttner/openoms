@@ -806,7 +806,6 @@ pub async fn revoke_principal_key(
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateGrant {
     pub portfolio_id: Uuid,
-    pub account_id: Uuid,
     pub can_trade: bool,
     pub can_view: bool,
     pub can_allocate: bool,
@@ -825,7 +824,7 @@ pub struct UpdateGrant {
     request_body = CreateGrant,
     responses(
         (status = 200, description = "Created", body = Grant),
-        (status = 409, description = "Grant already exists for this principal/portfolio/account"),
+        (status = 409, description = "Grant already exists for this principal/portfolio"),
     ),
     security(("bearer_token" = []))
 )]
@@ -834,19 +833,18 @@ pub async fn create_grant(
     Path(principal_id): Path<Uuid>,
     Json(payload): Json<CreateGrant>,
 ) -> Result<Json<Grant>, AdminError> {
-    info!(principal_id = %principal_id, portfolio_id = %payload.portfolio_id, account_id = %payload.account_id, "admin create grant");
+    info!(principal_id = %principal_id, portfolio_id = %payload.portfolio_id, "admin create grant");
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        INSERT INTO principal_portfolio_account_grant (id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view, can_allocate)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(principal_id)
     .bind(payload.portfolio_id)
-    .bind(payload.account_id)
     .bind(payload.can_trade)
     .bind(payload.can_view)
     .bind(payload.can_allocate)
@@ -872,8 +870,8 @@ pub async fn list_grants(
     info!(principal_id = %principal_id, "admin list grants");
     let records = sqlx::query_as::<_, Grant>(
         r#"
-        SELECT id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
-        FROM principal_portfolio_account_grant
+        SELECT id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
+        FROM principal_portfolio_grant
         WHERE principal_id = $1
         ORDER BY created_at DESC
         "#,
@@ -907,14 +905,14 @@ pub async fn update_grant(
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin update grant");
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        UPDATE principal_portfolio_account_grant
+        UPDATE principal_portfolio_grant
         SET
             can_trade    = COALESCE($1, can_trade),
             can_view     = COALESCE($2, can_view),
             can_allocate = COALESCE($3, can_allocate),
             updated_at   = now()
         WHERE id = $4 AND principal_id = $5
-        RETURNING id, principal_id, portfolio_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        RETURNING id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
         "#,
     )
     .bind(payload.can_trade)
@@ -948,7 +946,7 @@ pub async fn delete_grant(
 ) -> Result<StatusCode, AdminError> {
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin delete grant");
     let result = sqlx::query(
-        "DELETE FROM principal_portfolio_account_grant WHERE id = $1 AND principal_id = $2",
+        "DELETE FROM principal_portfolio_grant WHERE id = $1 AND principal_id = $2",
     )
     .bind(grant_id)
     .bind(principal_id)

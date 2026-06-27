@@ -176,7 +176,7 @@ pub async fn orders_submit(
     // (broker_code, environment) + the custodial ref, so we can validate the instrument
     // mapping before committing anything to the event store. Requires an ACTIVE connection.
     let account_row_pre = sqlx::query(
-        "SELECT bc.broker_code, bc.environment, a.external_account_ref \
+        "SELECT bc.broker_code, bc.environment, bc.code AS broker_connection_code, a.external_account_ref \
          FROM account a \
          JOIN broker_connection bc ON bc.code = a.broker_connection_code \
          WHERE a.id = $1 AND bc.status = 'ACTIVE'"
@@ -195,6 +195,7 @@ pub async fn orders_submit(
 
     let broker_code: String = account_row_pre.get("broker_code");
     let environment: String = account_row_pre.get("environment");
+    let broker_connection_code: String = account_row_pre.get("broker_connection_code");
     let external_account_ref: String = account_row_pre.get("external_account_ref");
 
     // Validate instrument is ACTIVE.
@@ -282,16 +283,14 @@ pub async fn orders_submit(
 
     let has_grant: bool = query_scalar(
         "SELECT EXISTS (
-            SELECT 1 FROM principal_portfolio_account_grant
+            SELECT 1 FROM principal_portfolio_grant
             WHERE principal_id = $1
               AND portfolio_id = $2
-              AND account_id = $3
               AND can_trade = true
         )"
     )
     .bind(principal_id)
     .bind(portfolio_id)
-    .bind(account_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|err| ApiError {
@@ -310,9 +309,9 @@ pub async fn orders_submit(
 
     // Pre-trade risk check. Runs inside TX1 so the FOR UPDATE lock on the
     // risk_limits row serializes concurrent submits for the same
-    // portfolio/account/instrument scope until this transaction commits.
+    // portfolio/instrument scope until this transaction commits.
     RiskEngine::new(PgRiskDataProvider::new(&mut *tx))
-        .check_submit(portfolio_id, account_id, &cmd)
+        .check_submit(portfolio_id, &cmd)
         .await
         .map_err(|err| match err {
             RiskCheckError::Rejected(rejection) => {
@@ -382,9 +381,10 @@ pub async fn orders_submit(
             avg_px,
             status,
             resume_to_status,
-            version
+            version,
+            broker_connection_code
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
         )
         "#
     )
@@ -404,6 +404,7 @@ pub async fn orders_submit(
     .bind(state_after_submit.status.as_str())
     .bind(state_after_submit.resume_to_status.map(|status| status.as_str()))
     .bind(state_after_submit.version)
+    .bind(&broker_connection_code)
     .execute(&mut *tx)
     .await
     .map_err(|err| ApiError {
