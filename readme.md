@@ -35,20 +35,23 @@ account fuses *custodial account* with *broker routing target* and is forced ont
 every order. Architecture is already half multi-broker (`BrokerRegistry` keyed by
 `(broker_code, environment)`, per-broker `broker_instrument`, `RouteOrder`/`OrderRouted`).
 - [x] rename `book` → `portfolio` to align naming with pro OMS (schema + API + code)
-- [ ] split broker route/connection from account: account = custodial/allocation only;
+- [x] split broker route/connection from account: account = custodial/allocation only;
       add a `broker_connection` entity (broker_code + environment + creds); orders route
       to a *connection*, not an account
 - [ ] routing decision layer: explicit broker on the order / default bound to the
       portfolio / smart (SOR, algo-wheel) later — today routing is implicit via
-      `account.broker_code` in `handlers.rs`
-- [ ] drop `account` from the common `/orders/submit` path — default the route from the
+      `account.broker_code` in `handlers.rs` (portfolio-default + explicit-account override done)
+- [x] drop `account` from the common `/orders/submit` path — default the route from the
       portfolio, allow an explicit override only
 - [ ] generalize execution streams: one per broker connection (currently Alpaca-only in
       `alpaca_stream.rs`); add IBKR inbound (adapter exists, no stream)
-- [ ] store the resolved broker/route on `order_state` (currently keys on `account_id`)
-- [ ] re-key entitlements & risk: trade grant → (principal × portfolio); separate routing
-      permission ("can this desk use IBKR?"); risk → (portfolio, instrument)
+- [x] store the resolved broker/route on `order_state` (`broker_connection_code`)
+- [x] re-key entitlements & risk: trade grant → (principal × portfolio); risk →
+      (portfolio, instrument). NOTE: separate account/connection routing permission still
+      deferred — an explicit-account override is not entitlement-checked
 - [ ] (advanced, only if multi-account) post-trade allocation across accounts —
       `AllocationInstruction`-style endpoint
-- [ ] minimal version for multi-broker without institutional weight: `broker_connection`
+- [x] minimal version for multi-broker without institutional weight: `broker_connection`
       + portfolio-default route (+ optional override) + route stored on the order
+- [ ] no-creds test-user fixture: seed principal + account + portfolio (default route) +
+      grant + api_key (bcrypt via pgcrypto) so a fresh `db-setup` is immediately tradeable
