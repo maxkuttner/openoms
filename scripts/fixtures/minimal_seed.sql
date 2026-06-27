@@ -38,7 +38,7 @@ ON CONFLICT (code) DO NOTHING;
 -- --- Test identity chain: a ready-to-trade principal so a fresh install can place
 -- a paper order over the API with no admin setup. Idempotent via natural keys.
 --
---   HTTP Basic auth:  ak_test : test-secret      (PAPER/dev only — not for prod)
+--   HTTP Basic auth:  test-trader-key : test-secret   (PAPER/dev only — not for prod)
 --
 -- UUID ids are generated, then resolved by code for the FK references
 -- (principal/account/portfolio all have UNIQUE code).
@@ -66,11 +66,11 @@ FROM   oms.principal p, oms.portfolio pf
 WHERE  p.code = 'test-trader' AND pf.code = 'test-portfolio'
 ON CONFLICT (principal_id, portfolio_id) DO NOTHING;
 
--- API key for the trader. key_id 'ak_test', secret 'test-secret'.
+-- API key for the trader. key_id 'test-trader-key', secret 'test-secret'.
 -- secret_hash is a precomputed bcrypt ($2y$, cost 12) of 'test-secret' — pgcrypto
 -- isn't available on the server, and the app's bcrypt::verify accepts $2y$.
 INSERT INTO oms.api_key (principal_id, key_id, secret_hash, name)
-SELECT p.id, 'ak_test',
+SELECT p.id, 'test-trader-key',
        '$2y$12$haJ5Dxm/IzRmKITzcrZ.sOvTyt2KCvS7KAEC2OvDaycL1TmojvuSm', 'test-key'
 FROM   oms.principal p WHERE p.code = 'test-trader'
 ON CONFLICT (key_id) DO NOTHING;

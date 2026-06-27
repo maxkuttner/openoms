@@ -29,7 +29,7 @@ orders. Account is custodial-only and inferred from the portfolio's default rout
 optional explicit override); the route is recorded on `order_state.broker_connection_code`;
 the grant is (principal × portfolio) and risk is (portfolio × instrument). The no-creds
 fixture seeds the `alpaca-paper` connection plus a ready-to-trade test user
-(HTTP Basic `ak_test` : `test-secret`). Remaining multi-broker work:
+(HTTP Basic `test-trader-key` : `test-secret`). Remaining multi-broker work:
 - [ ] routing decision layer: explicit broker on the order / smart (SOR, algo-wheel) —
       today the broker is whatever the resolved account's `broker_connection` says
 - [ ] generalize execution streams: one per broker connection (currently Alpaca-only in
