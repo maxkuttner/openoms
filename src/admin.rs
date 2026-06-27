@@ -11,7 +11,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::domain::identity::{Account, Book, Grant, Principal};
+use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePrincipal {
@@ -32,26 +32,27 @@ pub struct UpdatePrincipal {
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct CreateBook {
+pub struct CreatePortfolio {
     pub code: String,
     pub name: String,
     pub status: String,
     pub base_currency: Option<String>,
+    pub default_account_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct UpdateBook {
+pub struct UpdatePortfolio {
     pub code: Option<String>,
     pub name: Option<String>,
     pub status: Option<String>,
     pub base_currency: Option<String>,
+    pub default_account_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateAccount {
     pub code: String,
-    pub broker_code: String,
-    pub environment: String,
+    pub broker_connection_code: String,
     pub external_account_ref: String,
     pub status: String,
 }
@@ -59,9 +60,23 @@ pub struct CreateAccount {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateAccount {
     pub code: Option<String>,
+    pub broker_connection_code: Option<String>,
+    pub external_account_ref: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateBrokerConnection {
+    pub code: String,
+    pub broker_code: String,
+    pub environment: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateBrokerConnection {
     pub broker_code: Option<String>,
     pub environment: Option<String>,
-    pub external_account_ref: Option<String>,
     pub status: Option<String>,
 }
 
@@ -227,30 +242,31 @@ pub async fn update_principal(
 }
 
 #[utoipa::path(
-    post, path = "/admin/books", tag = "admin",
-    request_body = CreateBook,
+    post, path = "/admin/portfolios", tag = "admin",
+    request_body = CreatePortfolio,
     responses(
-        (status = 200, description = "Created", body = Book),
+        (status = 200, description = "Created", body = Portfolio),
         (status = 409, description = "Already exists"),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn create_book(
+pub async fn create_portfolio(
     State(state): State<AppState>,
-    Json(payload): Json<CreateBook>,
-) -> Result<Json<Book>, AdminError> {
-    info!(code = %payload.code, name = %payload.name, "admin create book");
+    Json(payload): Json<CreatePortfolio>,
+) -> Result<Json<Portfolio>, AdminError> {
+    info!(code = %payload.code, name = %payload.name, "admin create portfolio");
     let id = Uuid::new_v4();
-    let record = sqlx::query_as::<_, Book>(
+    let record = sqlx::query_as::<_, Portfolio>(
         r#"
-        INSERT INTO book (
+        INSERT INTO portfolio (
             id,
             code,
             name,
             status,
-            base_currency
-        ) VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, code, name, status, base_currency, created_at, updated_at
+            base_currency,
+            default_account_id
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, code, name, status, base_currency, default_account_id, created_at, updated_at
         "#,
     )
     .bind(id)
@@ -258,6 +274,7 @@ pub async fn create_book(
     .bind(payload.name)
     .bind(payload.status)
     .bind(payload.base_currency)
+    .bind(payload.default_account_id)
     .fetch_one(state.pool())
     .await
     .map_err(map_db_error)?;
@@ -266,20 +283,20 @@ pub async fn create_book(
 }
 
 #[utoipa::path(
-    get, path = "/admin/books", tag = "admin",
+    get, path = "/admin/portfolios", tag = "admin",
     responses(
-        (status = 200, description = "OK", body = [Book]),
+        (status = 200, description = "OK", body = [Portfolio]),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn list_books(
+pub async fn list_portfolios(
     State(state): State<AppState>,
-) -> Result<Json<Vec<Book>>, AdminError> {
-    info!("admin list books");
-    let records = sqlx::query_as::<_, Book>(
+) -> Result<Json<Vec<Portfolio>>, AdminError> {
+    info!("admin list portfolios");
+    let records = sqlx::query_as::<_, Portfolio>(
         r#"
-        SELECT id, code, name, status, base_currency, created_at, updated_at
-        FROM book
+        SELECT id, code, name, status, base_currency, default_account_id, created_at, updated_at
+        FROM portfolio
         ORDER BY created_at DESC
         "#,
     )
@@ -291,23 +308,23 @@ pub async fn list_books(
 }
 
 #[utoipa::path(
-    get, path = "/admin/books/{id}", tag = "admin",
-    params(("id" = Uuid, Path, description = "Book ID")),
+    get, path = "/admin/portfolios/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Portfolio ID")),
     responses(
-        (status = 200, description = "OK", body = Book),
+        (status = 200, description = "OK", body = Portfolio),
         (status = 404, description = "Not found"),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn get_book(
+pub async fn get_portfolio(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Book>, AdminError> {
-    info!(book_id = %id, "admin get book");
-    let record = sqlx::query_as::<_, Book>(
+) -> Result<Json<Portfolio>, AdminError> {
+    info!(portfolio_id = %id, "admin get portfolio");
+    let record = sqlx::query_as::<_, Portfolio>(
         r#"
-        SELECT id, code, name, status, base_currency, created_at, updated_at
-        FROM book
+        SELECT id, code, name, status, base_currency, default_account_id, created_at, updated_at
+        FROM portfolio
         WHERE id = $1
         "#,
     )
@@ -315,49 +332,51 @@ pub async fn get_book(
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("book"))?;
+    .ok_or_else(|| AdminError::not_found("portfolio"))?;
 
     Ok(Json(record))
 }
 
 #[utoipa::path(
-    patch, path = "/admin/books/{id}", tag = "admin",
-    params(("id" = Uuid, Path, description = "Book ID")),
-    request_body = UpdateBook,
+    patch, path = "/admin/portfolios/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Portfolio ID")),
+    request_body = UpdatePortfolio,
     responses(
-        (status = 200, description = "Updated", body = Book),
+        (status = 200, description = "Updated", body = Portfolio),
         (status = 404, description = "Not found"),
     ),
     security(("bearer_token" = []))
 )]
-pub async fn update_book(
+pub async fn update_portfolio(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateBook>,
-) -> Result<Json<Book>, AdminError> {
-    info!(book_id = %id, "admin update book");
-    let record = sqlx::query_as::<_, Book>(
+    Json(payload): Json<UpdatePortfolio>,
+) -> Result<Json<Portfolio>, AdminError> {
+    info!(portfolio_id = %id, "admin update portfolio");
+    let record = sqlx::query_as::<_, Portfolio>(
         r#"
-        UPDATE book
+        UPDATE portfolio
         SET
             code = COALESCE($1, code),
             name = COALESCE($2, name),
             status = COALESCE($3, status),
             base_currency = COALESCE($4, base_currency),
+            default_account_id = COALESCE($5, default_account_id),
             updated_at = now()
-        WHERE id = $5
-        RETURNING id, code, name, status, base_currency, created_at, updated_at
+        WHERE id = $6
+        RETURNING id, code, name, status, base_currency, default_account_id, created_at, updated_at
         "#,
     )
     .bind(payload.code)
     .bind(payload.name)
     .bind(payload.status)
     .bind(payload.base_currency)
+    .bind(payload.default_account_id)
     .bind(id)
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("book"))?;
+    .ok_or_else(|| AdminError::not_found("portfolio"))?;
 
     Ok(Json(record))
 }
@@ -367,7 +386,6 @@ pub async fn update_book(
     request_body = CreateAccount,
     responses(
         (status = 200, description = "Created", body = Account),
-        (status = 400, description = "Invalid environment (must be PAPER or LIVE)"),
         (status = 409, description = "Already exists"),
     ),
     security(("bearer_token" = []))
@@ -376,31 +394,23 @@ pub async fn create_account(
     State(state): State<AppState>,
     Json(payload): Json<CreateAccount>,
 ) -> Result<Json<Account>, AdminError> {
-    if payload.environment != "PAPER" && payload.environment != "LIVE" {
-        return Err(AdminError {
-            status: StatusCode::BAD_REQUEST,
-            message: "environment must be PAPER or LIVE".to_string(),
-        });
-    }
-    info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create account");
+    info!(code = %payload.code, broker_connection_code = %payload.broker_connection_code, "admin create account");
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Account>(
         r#"
         INSERT INTO account (
             id,
             code,
-            broker_code,
-            environment,
+            broker_connection_code,
             external_account_ref,
             status
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(payload.code)
-    .bind(payload.broker_code)
-    .bind(payload.environment)
+    .bind(payload.broker_connection_code)
     .bind(payload.external_account_ref)
     .bind(payload.status)
     .fetch_one(state.pool())
@@ -423,7 +433,7 @@ pub async fn list_accounts(
     info!("admin list accounts");
     let records = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
         FROM account
         ORDER BY created_at DESC
         "#,
@@ -451,7 +461,7 @@ pub async fn get_account(
     info!(account_id = %id, "admin get account");
     let record = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
         FROM account
         WHERE id = $1
         "#,
@@ -471,7 +481,6 @@ pub async fn get_account(
     request_body = UpdateAccount,
     responses(
         (status = 200, description = "Updated", body = Account),
-        (status = 400, description = "Invalid environment"),
         (status = 404, description = "Not found"),
     ),
     security(("bearer_token" = []))
@@ -481,6 +490,145 @@ pub async fn update_account(
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateAccount>,
 ) -> Result<Json<Account>, AdminError> {
+    info!(account_id = %id, "admin update account");
+    let record = sqlx::query_as::<_, Account>(
+        r#"
+        UPDATE account
+        SET
+            code = COALESCE($1, code),
+            broker_connection_code = COALESCE($2, broker_connection_code),
+            external_account_ref = COALESCE($3, external_account_ref),
+            status = COALESCE($4, status),
+            updated_at = now()
+        WHERE id = $5
+        RETURNING id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
+        "#,
+    )
+    .bind(payload.code)
+    .bind(payload.broker_connection_code)
+    .bind(payload.external_account_ref)
+    .bind(payload.status)
+    .bind(id)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(map_db_error)?
+    .ok_or_else(|| AdminError::not_found("account"))?;
+
+    Ok(Json(record))
+}
+
+// ── Broker connections ────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    post, path = "/admin/broker-connections", tag = "admin",
+    request_body = CreateBrokerConnection,
+    responses(
+        (status = 200, description = "Created", body = BrokerConnection),
+        (status = 400, description = "Invalid environment (must be PAPER or LIVE)"),
+        (status = 409, description = "Already exists"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn create_broker_connection(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateBrokerConnection>,
+) -> Result<Json<BrokerConnection>, AdminError> {
+    if payload.environment != "PAPER" && payload.environment != "LIVE" {
+        return Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: "environment must be PAPER or LIVE".to_string(),
+        });
+    }
+    info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create broker connection");
+    let record = sqlx::query_as::<_, BrokerConnection>(
+        r#"
+        INSERT INTO broker_connection (code, broker_code, environment, status)
+        VALUES ($1, $2, $3, $4)
+        RETURNING code, broker_code, environment, status, created_at, updated_at
+        "#,
+    )
+    .bind(payload.code)
+    .bind(payload.broker_code)
+    .bind(payload.environment)
+    .bind(payload.status)
+    .fetch_one(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    get, path = "/admin/broker-connections", tag = "admin",
+    responses(
+        (status = 200, description = "OK", body = [BrokerConnection]),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn list_broker_connections(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BrokerConnection>>, AdminError> {
+    info!("admin list broker connections");
+    let records = sqlx::query_as::<_, BrokerConnection>(
+        r#"
+        SELECT code, broker_code, environment, status, created_at, updated_at
+        FROM broker_connection
+        ORDER BY code
+        "#,
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(records))
+}
+
+#[utoipa::path(
+    get, path = "/admin/broker-connections/{code}", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "OK", body = BrokerConnection),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_broker_connection(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<BrokerConnection>, AdminError> {
+    info!(broker_connection_code = %code, "admin get broker connection");
+    let record = sqlx::query_as::<_, BrokerConnection>(
+        r#"
+        SELECT code, broker_code, environment, status, created_at, updated_at
+        FROM broker_connection
+        WHERE code = $1
+        "#,
+    )
+    .bind(code)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(map_db_error)?
+    .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    patch, path = "/admin/broker-connections/{code}", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    request_body = UpdateBrokerConnection,
+    responses(
+        (status = 200, description = "Updated", body = BrokerConnection),
+        (status = 400, description = "Invalid environment"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn update_broker_connection(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(payload): Json<UpdateBrokerConnection>,
+) -> Result<Json<BrokerConnection>, AdminError> {
     if let Some(ref env) = payload.environment {
         if env != "PAPER" && env != "LIVE" {
             return Err(AdminError {
@@ -489,31 +637,27 @@ pub async fn update_account(
             });
         }
     }
-    info!(account_id = %id, "admin update account");
-    let record = sqlx::query_as::<_, Account>(
+    info!(broker_connection_code = %code, "admin update broker connection");
+    let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
-        UPDATE account
+        UPDATE broker_connection
         SET
-            code = COALESCE($1, code),
-            broker_code = COALESCE($2, broker_code),
-            environment = COALESCE($3, environment),
-            external_account_ref = COALESCE($4, external_account_ref),
-            status = COALESCE($5, status),
+            broker_code = COALESCE($1, broker_code),
+            environment = COALESCE($2, environment),
+            status = COALESCE($3, status),
             updated_at = now()
-        WHERE id = $6
-        RETURNING id, code, broker_code, environment, external_account_ref, status, created_at, updated_at
+        WHERE code = $4
+        RETURNING code, broker_code, environment, status, created_at, updated_at
         "#,
     )
-    .bind(payload.code)
     .bind(payload.broker_code)
     .bind(payload.environment)
-    .bind(payload.external_account_ref)
     .bind(payload.status)
-    .bind(id)
+    .bind(code)
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("account"))?;
+    .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
     Ok(Json(record))
 }
@@ -661,8 +805,7 @@ pub async fn revoke_principal_key(
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateGrant {
-    pub book_id: Uuid,
-    pub account_id: Uuid,
+    pub portfolio_id: Uuid,
     pub can_trade: bool,
     pub can_view: bool,
     pub can_allocate: bool,
@@ -681,7 +824,7 @@ pub struct UpdateGrant {
     request_body = CreateGrant,
     responses(
         (status = 200, description = "Created", body = Grant),
-        (status = 409, description = "Grant already exists for this principal/book/account"),
+        (status = 409, description = "Grant already exists for this principal/portfolio"),
     ),
     security(("bearer_token" = []))
 )]
@@ -690,19 +833,18 @@ pub async fn create_grant(
     Path(principal_id): Path<Uuid>,
     Json(payload): Json<CreateGrant>,
 ) -> Result<Json<Grant>, AdminError> {
-    info!(principal_id = %principal_id, book_id = %payload.book_id, account_id = %payload.account_id, "admin create grant");
+    info!(principal_id = %principal_id, portfolio_id = %payload.portfolio_id, "admin create grant");
     let id = Uuid::new_v4();
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        INSERT INTO principal_book_account_grant (id, principal_id, book_id, account_id, can_trade, can_view, can_allocate)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view, can_allocate)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(principal_id)
-    .bind(payload.book_id)
-    .bind(payload.account_id)
+    .bind(payload.portfolio_id)
     .bind(payload.can_trade)
     .bind(payload.can_view)
     .bind(payload.can_allocate)
@@ -728,8 +870,8 @@ pub async fn list_grants(
     info!(principal_id = %principal_id, "admin list grants");
     let records = sqlx::query_as::<_, Grant>(
         r#"
-        SELECT id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
-        FROM principal_book_account_grant
+        SELECT id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
+        FROM principal_portfolio_grant
         WHERE principal_id = $1
         ORDER BY created_at DESC
         "#,
@@ -763,14 +905,14 @@ pub async fn update_grant(
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin update grant");
     let record = sqlx::query_as::<_, Grant>(
         r#"
-        UPDATE principal_book_account_grant
+        UPDATE principal_portfolio_grant
         SET
             can_trade    = COALESCE($1, can_trade),
             can_view     = COALESCE($2, can_view),
             can_allocate = COALESCE($3, can_allocate),
             updated_at   = now()
         WHERE id = $4 AND principal_id = $5
-        RETURNING id, principal_id, book_id, account_id, can_trade, can_view, can_allocate, created_at, updated_at
+        RETURNING id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
         "#,
     )
     .bind(payload.can_trade)
@@ -804,7 +946,7 @@ pub async fn delete_grant(
 ) -> Result<StatusCode, AdminError> {
     info!(principal_id = %principal_id, grant_id = %grant_id, "admin delete grant");
     let result = sqlx::query(
-        "DELETE FROM principal_book_account_grant WHERE id = $1 AND principal_id = $2",
+        "DELETE FROM principal_portfolio_grant WHERE id = $1 AND principal_id = $2",
     )
     .bind(grant_id)
     .bind(principal_id)

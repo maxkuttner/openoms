@@ -16,12 +16,23 @@ pub struct Principal {
 }
 
 #[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
-pub struct Book {
+pub struct Portfolio {
     pub id: Uuid,
     pub code: String,
     pub name: String,
     pub status: String,
     pub base_currency: Option<String>,
+    pub default_account_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
+pub struct BrokerConnection {
+    pub code: String,
+    pub broker_code: String,
+    pub environment: String,
+    pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -30,8 +41,7 @@ pub struct Book {
 pub struct Account {
     pub id: Uuid,
     pub code: String,
-    pub broker_code: String,
-    pub environment: String,
+    pub broker_connection_code: String,
     pub external_account_ref: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -42,8 +52,7 @@ pub struct Account {
 pub struct Grant {
     pub id: Uuid,
     pub principal_id: Uuid,
-    pub book_id: Uuid,
-    pub account_id: Uuid,
+    pub portfolio_id: Uuid,
     pub can_trade: bool,
     pub can_view: bool,
     pub can_allocate: bool,

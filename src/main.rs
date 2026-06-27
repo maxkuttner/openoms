@@ -13,12 +13,14 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
+use crate::handlers::SubmitOrderRequest;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
-use crate::domain::identity::{Principal, Book, Account};
+use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
     CreatePrincipal, UpdatePrincipal,
-    CreateBook, UpdateBook,
+    CreatePortfolio, UpdatePortfolio,
     CreateAccount, UpdateAccount,
+    CreateBrokerConnection, UpdateBrokerConnection,
     CreateKey, ApiKeyRecord,
     CreateGrant, UpdateGrant,
 };
@@ -61,28 +63,33 @@ mod alpaca_stream;
         admin::list_grants,
         admin::update_grant,
         admin::delete_grant,
-        admin::create_book,
-        admin::list_books,
-        admin::get_book,
-        admin::update_book,
+        admin::create_portfolio,
+        admin::list_portfolios,
+        admin::get_portfolio,
+        admin::update_portfolio,
         admin::create_account,
         admin::list_accounts,
         admin::get_account,
         admin::update_account,
+        admin::create_broker_connection,
+        admin::list_broker_connections,
+        admin::get_broker_connection,
+        admin::update_broker_connection,
     ),
     components(schemas(
-        SubmitOrder, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
-        Principal, Book, Account,
+        SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
+        Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
-        CreateBook, UpdateBook,
+        CreatePortfolio, UpdatePortfolio,
         CreateAccount, UpdateAccount,
+        CreateBrokerConnection, UpdateBrokerConnection,
         CreateKey, ApiKeyRecord,
         Grant, CreateGrant, UpdateGrant,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "orders", description = "Order submission and cancellation"),
-        (name = "admin", description = "Admin management of principals, books, accounts, and keys"),
+        (name = "admin", description = "Admin management of principals, portfolios, accounts, broker connections, and keys"),
     )
 )]
 struct ApiDoc;
@@ -251,12 +258,12 @@ async fn main() {
             axum::routing::delete(admin::revoke_principal_key),
         )
         .route(
-            "/admin/books",
-            post(admin::create_book).get(admin::list_books),
+            "/admin/portfolios",
+            post(admin::create_portfolio).get(admin::list_portfolios),
         )
         .route(
-            "/admin/books/:id",
-            axum::routing::patch(admin::update_book).get(admin::get_book),
+            "/admin/portfolios/:id",
+            axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
         )
         .route(
             "/admin/accounts",
@@ -265,6 +272,14 @@ async fn main() {
         .route(
             "/admin/accounts/:id",
             axum::routing::patch(admin::update_account).get(admin::get_account),
+        )
+        .route(
+            "/admin/broker-connections",
+            post(admin::create_broker_connection).get(admin::list_broker_connections),
+        )
+        .route(
+            "/admin/broker-connections/:code",
+            axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
         )
         .route(
             "/admin/principals/:id/grants",
