@@ -24,7 +24,10 @@ pre-trade risk + trading-state HALT · positions + P&L · multi-broker routing �
 allocation. (A client needs only a **principal + portfolio** to trade; account is custodial-only
 and inferred from the portfolio's default route. No-creds fixture seeds `alpaca-paper` + a test
 user `test-trader-key` : `test-secret`.)
-- [ ] **amend/replace + cancel fully wired** API→broker→event (`ReplaceOrder`/`CancelOrder` exist)
+- [x] **cancel — broker-confirmed** — `POST /orders/cancel` requests the cancel at the broker
+      (202); the execution stream finalizes `OrderCanceled` on confirmation (fixes the fill-vs-
+      cancel race); `external_order_id` now stored on `order_state`
+- [ ] **amend/replace** — wire `ReplaceOrder` API→broker→event (Alpaca replace = cancel + new order)
 - [x] **blotter / oversight query API** — `GET /admin/orders`: all orders across principals/
       portfolios with `principal_id` on the order, filterable (status/portfolio/instrument/
       principal/connection/side/time) + paginated ("who is trading what"). Fills/positions

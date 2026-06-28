@@ -64,6 +64,10 @@ pub enum ExecutionReport {
         reason: String,
         venue: Option<String>,
     },
+    Canceled {
+        reason: Option<String>,
+        venue: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -19,7 +19,7 @@ use crate::adapters::{BrokerOrderRequest, BrokerError};
 use crate::app_state::AppState;
 use crate::domain::orders::commands;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
-use crate::domain::orders::commands::{OrderCommand, RouteOrder, SubmitOrder, CancelOrder};
+use crate::domain::orders::commands::{OrderCommand, RouteOrder, SubmitOrder};
 use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
@@ -539,13 +539,14 @@ pub async fn orders_submit(
     sqlx::query(
         r#"
         UPDATE order_state
-        SET status = $2, version = $3, updated_at = $4
-        WHERE order_id = $1 AND version = $5
+        SET status = $2, version = $3, external_order_id = $4, updated_at = $5
+        WHERE order_id = $1 AND version = $6
         "#
     )
     .bind(order_id)
     .bind(routed_state.status.as_str())
     .bind(routed_state.version)
+    .bind(&broker_resp.external_order_id)
     .bind(Utc::now())
     .bind(state_after_submit.version)
     .execute(&mut *tx2)
@@ -641,7 +642,9 @@ pub async fn orders_cancel(
             avg_px::double precision AS avg_px,
             status,
             resume_to_status,
-            version
+            version,
+            external_order_id,
+            broker_connection_code
         FROM order_state
         WHERE order_id = $1
         "#
@@ -665,6 +668,54 @@ pub async fn orders_cancel(
         }
     };
 
+    // Already done: nothing to cancel.
+    let status_str: String = row.get("status");
+    if matches!(status_str.as_str(), "filled" | "canceled" | "rejected" | "expired") {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("order is already terminal ({status_str}); cannot cancel"),
+        });
+    }
+
+    // Broker-confirmed cancel: if the order is live at a venue, request the cancel
+    // there and return 202 Accepted — the execution stream finalizes OrderCanceled
+    // when the broker confirms. (Fixes the fill-vs-cancel race.)
+    if let Some(ext) = row.get::<Option<String>, _>("external_order_id") {
+        let broker_connection_code: String = row.get("broker_connection_code");
+        let conn = sqlx::query(
+            "SELECT broker_code, environment FROM broker_connection WHERE code = $1",
+        )
+        .bind(&broker_connection_code)
+        .fetch_one(&pool)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to load broker connection: {:?}", err),
+        })?;
+        let broker_code: String = conn.get("broker_code");
+        let environment: String = conn.get("environment");
+
+        let adapter = app_state
+            .registry()
+            .get(&broker_code, &environment)
+            .ok_or_else(|| ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("no adapter configured for {broker_code}/{environment}"),
+            })?;
+
+        adapter.cancel_order(&ext).await.map_err(|err| ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("broker rejected cancel: {err}"),
+        })?;
+
+        info!(order_id = %order_id, external_order_id = %ext, "cancel requested at broker; awaiting confirmation");
+        return Ok(Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .body(Body::empty())
+            .unwrap());
+    }
+
+    // No external_order_id: the order never reached a broker — cancel locally (no race).
     let side = parse_order_side(row.get::<String, _>("side"))?;
     let order_type = parse_order_type(row.get::<String, _>("order_type"))?;
     let time_in_force = parse_time_in_force(row.get::<String, _>("time_in_force"))?;

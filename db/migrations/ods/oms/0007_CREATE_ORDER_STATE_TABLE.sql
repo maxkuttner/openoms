@@ -16,6 +16,7 @@ CREATE TABLE order_state (
     avg_px NUMERIC,
     status TEXT NOT NULL,
     resume_to_status TEXT,
+    external_order_id TEXT,            -- the broker's order handle, set at route time
     version BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP

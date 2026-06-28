@@ -207,6 +207,20 @@ impl OrderAggregate {
                             status_after: OrderStatus::Rejected,
                         }])
                     }
+                    // Broker-confirmed cancellation: the venue acked the cancel request.
+                    ExecutionReport::Canceled { reason, .. } => {
+                        let next_version = state.version + 1;
+                        Ok(vec![OrderDomainEvent {
+                            event_id: metadata.event_id,
+                            event_type: OrderEventType::OrderCanceled,
+                            order_id: cmd.order_id,
+                            timestamp: metadata.timestamp,
+                            actor: metadata.actor,
+                            payload: OrderEventPayload::OrderCanceled { reason },
+                            version: next_version,
+                            status_after: OrderStatus::Canceled,
+                        }])
+                    }
                     ExecutionReport::Fill {
                         execution_id,
                         fill_qty,
@@ -581,6 +595,31 @@ mod tests {
             )
             .expect_err("cancel must be rejected");
         assert_eq!(err.code, RejectionCode::InvalidStateTransition);
+    }
+
+    #[test]
+    fn broker_canceled_report_finalizes_cancellation() {
+        // A broker-confirmed cancellation arrives as an execution report and
+        // drives the terminal OrderCanceled (the stream is the source of truth).
+        let mut aggregate = submitted_aggregate();
+        let events = aggregate
+            .decide(
+                OrderCommand::ReceiveExecutionReport(ReceiveExecutionReport {
+                    order_id: "o-1".to_string(),
+                    report: ExecutionReport::Canceled {
+                        reason: Some("broker canceled".to_string()),
+                        venue: Some("ALPACA".to_string()),
+                    },
+                }),
+                metadata("e-2"),
+            )
+            .expect("canceled report should produce an event");
+        aggregate
+            .apply(events.first().expect("event must exist"))
+            .expect("apply should succeed");
+
+        let state = aggregate.state.expect("state should exist");
+        assert_eq!(state.status, OrderStatus::Canceled);
     }
 
     #[test]

@@ -108,7 +108,11 @@ async fn reconcile_routed_orders(pool: &PgPool, kafka: &Option<KafkaClient>, ada
                 let execution_id = alpaca_order["id"].as_str().unwrap_or("").to_string();
                 ExecutionReport::Fill { execution_id, fill_qty, fill_price, venue: "ALPACA".to_string() }
             }
-            "rejected" | "canceled" | "expired" => {
+            "canceled" => ExecutionReport::Canceled {
+                reason: None,
+                venue: Some("ALPACA".to_string()),
+            },
+            "rejected" | "expired" => {
                 ExecutionReport::Reject {
                     reason: status.to_string(),
                     venue: Some("ALPACA".to_string()),
@@ -245,7 +249,11 @@ async fn handle_trade_update(
                 venue: Some("ALPACA".to_string()),
             }
         }
-        "canceled" | "expired" | "pending_new" | "new" | "accepted" | "done_for_day" => {
+        "canceled" => ExecutionReport::Canceled {
+            reason: None,
+            venue: Some("ALPACA".to_string()),
+        },
+        "expired" | "pending_new" | "new" | "accepted" | "done_for_day" => {
             return Ok(());
         }
         other => {
