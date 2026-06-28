@@ -1,5 +1,10 @@
 # OMS Feature Gap Analysis — vs a professional OEMS
 
+> **Note:** the *prioritization* below was written for a small-buy-side target. The live,
+> broadened roadmap (small + mid/higher-frequency funds; REST OMS → low-latency execution
+> engine) lives in the README "Roadmap" section. This doc stays as the feature *catalog* /
+> benchmark; the README is the authority on ordering.
+
 What our OMS needs to be a *viable professional OMS*, benchmarked against two real
 institutional references:
 - **FIS Front Arena (PRIME) Buy-Side OMS** User Guide (`FCA4750-OMS.pdf`) — the buy-side

@@ -6,52 +6,60 @@
 - [ ] cache Databento `definition` fetches to `.dbn` so resets replay offline (no refetch)
 - [ ] `EQUS_SUMMARY` is consolidated like the removed `DBEQ.BASIC` — same symbol-spans-venues collision risk if enabled
 
-**Multi-broker routing — done.** Identity rework complete: a client needs only a
-**principal + portfolio** to send orders; account is custodial-only and inferred from the
-portfolio's default route (optional override); route recorded on
-`order_state.broker_connection_code`; grant is (principal × portfolio), risk is
-(portfolio × instrument). The no-creds fixture seeds the `alpaca-paper` connection plus a
-ready-to-trade test user (HTTP Basic `test-trader-key` : `test-secret`). Remaining
-multi-broker tasks are folded into the roadmap below.
+## Roadmap — REST OMS now → low-latency execution engine
 
-**OMS feature roadmap (small buy-side)**
-From `docs/oems-feature-gap.md` (benchmarked vs Front Arena OEMS). Target = hedge funds /
-family offices / small trading firms, so heavy institutional plumbing (FIX, venue reporting,
-settlement) is the prime broker's job and stays out; position-keeping + allocation move up.
+Vision: ship a correct REST OMS (**system of record + governance + oversight**), then evolve the
+same Rust, event-sourced core into a **low-latency, execution-capable** system — to serve
+systematic / quant funds (QRT-scale and smaller), not just discretionary buy-side. Latency
+ladder: **ms (REST) → sub-ms (in-memory + FIX) → μs (lock-free / colo)**. Feature benchmark in
+`docs/oems-feature-gap.md`.
 
-_Tier 1 — to be a viable small-buy-side OMS:_
-- [x] **positions + P&L** — `position` table (portfolio × instrument) built from fills,
-      average-cost + realized P&L; risk reads it (O(1)); `GET /portfolios/:id/positions`.
-      Unrealized P&L pending market-data marks
-- [x] **post-trade allocation across funds (shaping)** — `POST/GET /orders/:id/allocations`;
-      cost-preserving transfer between portfolios at the block price (no P&L on the conduit),
-      `can_allocate`-entitled
-- [ ] allocation: pre-trade (basket pre-assigned) + bulking of blocks (aggregate same
-      instrument/side); across-accounts grain (needs per-account positions)
-- [ ] **order groups / baskets** — group orders into a program for joint submit / compliance /
-      allocation
-- [ ] **light pre-trade mandate compliance** — restricted/blocked lists, concentration,
-      leverage, layered on the risk engine (not an auditable regulatory engine)
-- [ ] **amend/replace + cancel fully wired** API→broker→event (`ReplaceOrder`/`CancelOrder`
-      exist in the domain)
-- [ ] **blotter / query API** (+ basic UI) — orders & fills by state / portfolio / instrument /
-      time / connection (today only `GET /orders/:id`)
-- [ ] **optional maker-checker approval** — configurable toggle, not a mandatory gate
+The reusable asset across every phase is the **domain core** (event-sourced order aggregate,
+lifecycle, risk, positions). Phases rebuild the I/O + persistence layers, not the brain.
 
-_Tier 2 — depth, after Tier 1:_
-- [ ] market data / pricing — marks for P&L + notional risk
-- [ ] broker/custodian reconciliation — match our records against broker positions/fills
-- [ ] generalize execution streams: one per broker connection (currently Alpaca-only in
-      `alpaca_stream.rs`); add IBKR inbound (adapter exists, no stream)
-- [ ] more broker adapters + FIX-out (broker breadth)
-- [ ] routing decision layer — explicit broker on order / SOR / order splitting (slicing)
-- [ ] crossing — internal netting of opposite sides within a client
-- [ ] manual fill entry (non-electronic / reconciliation)
-- [ ] execution algos (TWAP / VWAP / POV)
-- [ ] light best-execution logging
-- [ ] separate account/connection routing permission (explicit-account override not
-      entitlement-checked today)
+### Phase 1 — OMS core (REST · system of record + governance)
 
-_Out of scope (small buy-side):_ inbound FIX order entry, venue-level regulatory trade/
-transaction reporting, settlement-instruction generation, full portfolio analytics
-(rebalancing, index/model tracking, NAV / what-if, OTC RFQ).
+Done: event-sourced order SoR + audit log · entitlements (principal × portfolio grants) ·
+pre-trade risk + trading-state HALT · positions + P&L · multi-broker routing · post-trade
+allocation. (A client needs only a **principal + portfolio** to trade; account is custodial-only
+and inferred from the portfolio's default route. No-creds fixture seeds `alpaca-paper` + a test
+user `test-trader-key` : `test-secret`.)
+- [ ] **amend/replace + cancel fully wired** API→broker→event (`ReplaceOrder`/`CancelOrder` exist)
+- [ ] **blotter / oversight query API** — orders, fills, positions across principals/portfolios,
+      filterable ("who is trading what"); today only `GET /orders/:id`
+- [ ] **broker/custodian reconciliation** — match our records against broker positions/fills
+
+### Phase 2 — oversight & control depth (REST)
+
+- [ ] **central kill-switch / trading-halt** — HALT a portfolio / instrument / principal on demand
+- [ ] **drop-copy / external-execution ingestion** — report orders + fills executed *elsewhere*
+      into the OMS, so it has central oversight even off the execution path (the quant bridge)
+- [ ] **light mandate compliance** — restricted/blocked lists; concentration / leverage (w/ marks)
+- [ ] **finer entitlements & risk** — per-instrument / per-strategy limits
+- [ ] **market data / P&L marks** — unrealized P&L, exposure valuation
+- [ ] optional **maker-checker approval** — configurable, not a mandatory gate
+
+### Phase 3 — execution capability + latency foundation (the pivot)
+
+- [ ] **decouple the hot path from Postgres** — in-memory authoritative order/risk/position state
+      + **async event journal**; Postgres becomes a downstream projection (event-sourcing done
+      right; ms → sub-ms; prerequisite for everything below)
+- [ ] **FIX / binary order entry** (persistent sessions) alongside REST
+- [ ] **direct venue connectivity** (exchange gateways) + **L2 market data** (order books)
+- [ ] **SOR + execution algos** (TWAP / VWAP / POV) + order slicing; per-connection execution
+      streams; crossing (internal netting)
+
+### Phase 4 — low-latency hardening (mid → high frequency)
+
+- [ ] thread-per-core / lock-free / no-allocation hot path, pinned threads, busy-poll
+- [ ] binary wire protocol (e.g. SBE), kernel-bypass networking
+- [ ] colocation; in-line μs pre-trade risk
+
+### Discretionary add-ons (as needed)
+
+- [ ] pre-trade **baskets** + bulking; across-accounts allocation grain; best-execution logging
+
+### Out of scope
+
+Settlement-instruction generation + venue-level regulatory reporting (broker/custodian's job);
+full portfolio analytics (rebalancing, index/model tracking, NAV / what-if, OTC RFQ).
