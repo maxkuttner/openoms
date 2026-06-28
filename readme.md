@@ -27,7 +27,6 @@ user `test-trader-key` : `test-secret`.)
 - [x] **cancel — broker-confirmed** — `POST /orders/cancel` requests the cancel at the broker
       (202); the execution stream finalizes `OrderCanceled` on confirmation (fixes the fill-vs-
       cancel race); `external_order_id` now stored on `order_state`
-- [ ] **amend/replace** — wire `ReplaceOrder` API→broker→event (Alpaca replace = cancel + new order)
 - [x] **blotter / oversight query API** — `GET /admin/orders`: all orders across principals/
       portfolios with `principal_id` on the order, filterable (status/portfolio/instrument/
       principal/connection/side/time) + paginated ("who is trading what"). Fills/positions
@@ -37,6 +36,8 @@ user `test-trader-key` : `test-secret`.)
 ### Phase 2 — oversight & control depth (REST)
 
 - [ ] **central kill-switch / trading-halt** — HALT a portfolio / instrument / principal on demand
+- [ ] **amend/replace** — wire `ReplaceOrder` API→broker→event (Alpaca replace = cancel + new
+      order); nice-to-have, the cancel groundwork (`external_order_id`, `ExecutionReport`) carries over
 - [ ] **drop-copy / external-execution ingestion** — report orders + fills executed *elsewhere*
       into the OMS, so it has central oversight even off the execution path (the quant bridge)
 - [ ] **light mandate compliance** — restricted/blocked lists; concentration / leverage (w/ marks)
