@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { Group, Title, Table, Select, TextInput, Loader, Text, Badge, Stack, Button } from "@mantine/core";
+import { Group, Title, Table, Select, Loader, Text, Badge, Stack, Button } from "@mantine/core";
 import { useList } from "../api/hooks";
+import { InstrumentSelect } from "../components/InstrumentSelect";
 import type { BlotterRow, Portfolio, Principal } from "../api/types";
 
 const STATUSES = ["submitted", "routed", "partially_filled", "filled", "canceled", "rejected", "expired"].map(
@@ -21,7 +22,7 @@ export function BlotterPage() {
   const [status, setStatus] = useState<string | null>(null);
   const [portfolioId, setPortfolioId] = useState<string | null>(null);
   const [principalId, setPrincipalId] = useState<string | null>(null);
-  const [instrument, setInstrument] = useState("");
+  const [instrument, setInstrument] = useState<string | null>(null);
 
   const portfolios = useList<Portfolio>("/admin/portfolios");
   const principals = useList<Principal>("/admin/principals");
@@ -30,7 +31,7 @@ export function BlotterPage() {
   if (status) qs.set("status", status);
   if (portfolioId) qs.set("portfolio_id", portfolioId);
   if (principalId) qs.set("principal_id", principalId);
-  if (instrument.trim()) qs.set("instrument_id", instrument.trim());
+  if (instrument) qs.set("instrument_id", instrument);
   const q = qs.toString();
   const orders = useList<BlotterRow>(`/admin/orders${q ? `?${q}` : ""}`);
 
@@ -38,7 +39,7 @@ export function BlotterPage() {
     setStatus(null);
     setPortfolioId(null);
     setPrincipalId(null);
-    setInstrument("");
+    setInstrument(null);
   };
 
   return (
@@ -64,7 +65,9 @@ export function BlotterPage() {
           searchable
           w={180}
         />
-        <TextInput label="Instrument id" value={instrument} onChange={(e) => setInstrument(e.currentTarget.value)} w={140} />
+        <div style={{ width: 240 }}>
+          <InstrumentSelect label="Instrument" value={instrument} onChange={setInstrument} />
+        </div>
         <Button variant="default" onClick={clear}>Clear</Button>
       </Group>
 

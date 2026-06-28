@@ -6,11 +6,12 @@ import {
 import { useForm } from "@mantine/form";
 import { api } from "../api/client";
 import { useList, useApiMutation } from "../api/hooks";
+import { InstrumentSelect } from "./InstrumentSelect";
 
 export type Field = {
   name: string;
   label: string;
-  type?: "text" | "number" | "select" | "checkbox";
+  type?: "text" | "number" | "select" | "checkbox" | "instrument";
   options?: { value: string; label: string }[];
   // Populate a select from another list endpoint, mapping each row to {value,label}.
   optionsPath?: string;
@@ -38,6 +39,15 @@ function FieldInput({ field, form }: { field: Field; form: any }) {
   const remote = useList<any>(field.optionsPath ?? "", !!field.optionsPath);
   const props = { label: field.label, ...form.getInputProps(field.name) };
   switch (field.type) {
+    case "instrument":
+      return (
+        <InstrumentSelect
+          label={field.label}
+          required={field.required}
+          value={(form.values[field.name] as string) || null}
+          onChange={(v) => form.setFieldValue(field.name, v ?? "")}
+        />
+      );
     case "number":
       return <NumberInput {...props} />;
     case "checkbox":

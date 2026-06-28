@@ -85,6 +85,7 @@ mod alpaca_stream;
         admin::get_risk_limit,
         admin::update_risk_limit,
         admin::delete_risk_limit,
+        admin::list_instruments,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -98,6 +99,7 @@ mod alpaca_stream;
         CreateKey, ApiKeyRecord,
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
+        admin::InstrumentSummary,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -332,6 +334,7 @@ async fn main() {
                 .patch(admin::update_risk_limit)
                 .delete(admin::delete_risk_limit),
         )
+        .route("/admin/instruments", get(admin::list_instruments))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let scalar_html = {

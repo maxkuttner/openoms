@@ -33,7 +33,7 @@ export function RiskLimitsPage() {
           optionValue: "id",
           optionLabel: "code",
         },
-        { name: "instrument_id", label: "Instrument id", required: true, inEdit: false },
+        { name: "instrument_id", label: "Instrument", type: "instrument", required: true, inEdit: false },
         { name: "trading_state", label: "Trading state", type: "select", options: TRADING_STATE },
         { name: "max_order_quantity", label: "Max order quantity", type: "number" },
         { name: "max_order_notional", label: "Max order notional", type: "number" },

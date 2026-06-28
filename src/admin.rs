@@ -1174,6 +1174,51 @@ pub async fn delete_risk_limit(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Instruments (lookup for forms) ────────────────────────────────────────────
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct InstrumentSummary {
+    pub id: i64,
+    pub symbol: String,
+    pub name: String,
+    pub venue: String,
+    pub asset_class: String,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct InstrumentSearch {
+    pub search: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[utoipa::path(
+    get, path = "/admin/instruments", tag = "admin",
+    params(InstrumentSearch),
+    responses((status = 200, description = "OK", body = [InstrumentSummary])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_instruments(
+    State(state): State<AppState>,
+    Query(params): Query<InstrumentSearch>,
+) -> Result<Json<Vec<InstrumentSummary>>, AdminError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let pattern = params.search.as_deref().map(|s| format!("%{s}%"));
+    let records = sqlx::query_as::<_, InstrumentSummary>(
+        "SELECT id, symbol, name, venue, asset_class, status \
+         FROM instrument \
+         WHERE status = 'ACTIVE' AND ($1::text IS NULL OR symbol ILIKE $1 OR name ILIKE $1) \
+         ORDER BY symbol \
+         LIMIT $2",
+    )
+    .bind(pattern)
+    .bind(limit)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(records))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
