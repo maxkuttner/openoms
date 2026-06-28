@@ -23,8 +23,11 @@ _Tier 1 — to be a viable small-buy-side OMS:_
 - [x] **positions + P&L** — `position` table (portfolio × instrument) built from fills,
       average-cost + realized P&L; risk reads it (O(1)); `GET /portfolios/:id/positions`.
       Unrealized P&L pending market-data marks
-- [ ] **allocation across funds/accounts** — pre-trade (basket pre-assigned) and post-trade
-      (shaping), plus bulking of blocks
+- [x] **post-trade allocation across funds (shaping)** — `POST/GET /orders/:id/allocations`;
+      cost-preserving transfer between portfolios at the block price (no P&L on the conduit),
+      `can_allocate`-entitled
+- [ ] allocation: pre-trade (basket pre-assigned) + bulking of blocks (aggregate same
+      instrument/side); across-accounts grain (needs per-account positions)
 - [ ] **order groups / baskets** — group orders into a program for joint submit / compliance /
       allocation
 - [ ] **light pre-trade mandate compliance** — restricted/blocked lists, concentration,

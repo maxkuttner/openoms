@@ -67,6 +67,19 @@ impl PositionMath {
             }
         }
     }
+
+    /// Reduce the open position by `qty` toward zero, preserving cost basis and
+    /// realizing **no** P&L — the source side of an allocation transfer (a conduit).
+    /// Caller guarantees `qty <= |net_qty|`.
+    pub fn reduce_at_cost(self, qty: f64) -> PositionMath {
+        let sign_n = if self.net_qty >= 0.0 { 1.0 } else { -1.0 };
+        let net_qty = self.net_qty - sign_n * qty;
+        PositionMath {
+            net_qty,
+            avg_cost: if net_qty == 0.0 { 0.0 } else { self.avg_cost },
+            realized_pnl: self.realized_pnl,
+        }
+    }
 }
 
 /// A position row as returned by the API.
@@ -80,16 +93,12 @@ pub struct Position {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Load → apply one fill → upsert, inside the caller's transaction (so it commits
-/// atomically with the order_state update + event append).
-pub async fn persist_fill(
+/// Read the current position (FOR UPDATE), or FLAT if none.
+async fn load(
     conn: &mut PgConnection,
     portfolio_id: Uuid,
     instrument_id: &str,
-    side: OrderSide,
-    fill_qty: f64,
-    fill_price: f64,
-) -> Result<(), sqlx::Error> {
+) -> Result<PositionMath, sqlx::Error> {
     let row = sqlx::query(
         "SELECT net_qty::double precision AS net_qty, \
                 avg_cost::double precision AS avg_cost, \
@@ -100,17 +109,22 @@ pub async fn persist_fill(
     .bind(instrument_id)
     .fetch_optional(&mut *conn)
     .await?;
-
-    let current = match row {
+    Ok(match row {
         Some(r) => PositionMath {
             net_qty: r.get("net_qty"),
             avg_cost: r.get("avg_cost"),
             realized_pnl: r.get("realized_pnl"),
         },
         None => PositionMath::FLAT,
-    };
-    let next = current.apply_fill(side, fill_qty, fill_price);
+    })
+}
 
+async fn upsert(
+    conn: &mut PgConnection,
+    portfolio_id: Uuid,
+    instrument_id: &str,
+    p: PositionMath,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO position \
             (portfolio_id, instrument_id, net_qty, avg_cost, realized_pnl, updated_at) \
@@ -121,12 +135,45 @@ pub async fn persist_fill(
     )
     .bind(portfolio_id)
     .bind(instrument_id)
-    .bind(next.net_qty)
-    .bind(next.avg_cost)
-    .bind(next.realized_pnl)
+    .bind(p.net_qty)
+    .bind(p.avg_cost)
+    .bind(p.realized_pnl)
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Load → apply one fill → upsert, inside the caller's transaction (so it commits
+/// atomically with the order_state update + event append).
+pub async fn persist_fill(
+    conn: &mut PgConnection,
+    portfolio_id: Uuid,
+    instrument_id: &str,
+    side: OrderSide,
+    fill_qty: f64,
+    fill_price: f64,
+) -> Result<(), sqlx::Error> {
+    let next = load(conn, portfolio_id, instrument_id).await?.apply_fill(side, fill_qty, fill_price);
+    upsert(conn, portfolio_id, instrument_id, next).await
+}
+
+/// Cost-preserving allocation transfer of `qty` (> 0) of `instrument_id` from one
+/// portfolio to another at `price`, inside the caller's tx. The source reduces at
+/// cost (no P&L — a conduit); the destination books at `price` via the normal fill
+/// logic. Caller validates `qty <= |source net_qty|`.
+pub async fn persist_transfer(
+    conn: &mut PgConnection,
+    from_portfolio: Uuid,
+    to_portfolio: Uuid,
+    instrument_id: &str,
+    side: OrderSide,
+    qty: f64,
+    price: f64,
+) -> Result<(), sqlx::Error> {
+    let from = load(conn, from_portfolio, instrument_id).await?.reduce_at_cost(qty);
+    upsert(conn, from_portfolio, instrument_id, from).await?;
+    let to = load(conn, to_portfolio, instrument_id).await?.apply_fill(side, qty, price);
+    upsert(conn, to_portfolio, instrument_id, to).await
 }
 
 /// Recovery / backfill: rebuild every position by replaying the fill events from the
@@ -248,5 +295,37 @@ mod tests {
         approx(p.net_qty, 0.0);
         approx(p.avg_cost, 0.0);
         approx(p.realized_pnl, 200.0); // short: 100 * (18 - 20) * sign(-1) = +200
+    }
+
+    #[test]
+    fn reduce_at_cost_preserves_cost_and_pnl() {
+        let long = PositionMath { net_qty: 100.0, avg_cost: 10.0, realized_pnl: 5.0 };
+        let r = long.reduce_at_cost(40.0);
+        approx(r.net_qty, 60.0);
+        approx(r.avg_cost, 10.0); // unchanged
+        approx(r.realized_pnl, 5.0); // unchanged — conduit, no P&L
+    }
+
+    #[test]
+    fn reduce_short_and_to_flat() {
+        let short = PositionMath { net_qty: -100.0, avg_cost: 20.0, realized_pnl: 0.0 };
+        approx(short.reduce_at_cost(30.0).net_qty, -70.0);
+        let flat = short.reduce_at_cost(100.0);
+        approx(flat.net_qty, 0.0);
+        approx(flat.avg_cost, 0.0); // cost cleared when flat
+    }
+
+    #[test]
+    fn transfer_round_trip_buy_block() {
+        // Staging long 1000 @ 10; allocate 600 to a flat fund at the block price.
+        let staging = PositionMath { net_qty: 1000.0, avg_cost: 10.0, realized_pnl: 0.0 };
+        let fund = PositionMath::FLAT;
+        let staging_after = staging.reduce_at_cost(600.0);
+        let fund_after = fund.apply_fill(OrderSide::Buy, 600.0, 10.0);
+        approx(staging_after.net_qty, 400.0);
+        approx(staging_after.realized_pnl, 0.0); // no P&L on the conduit
+        approx(fund_after.net_qty, 600.0);
+        approx(fund_after.avg_cost, 10.0); // booked at the block price
+        approx(fund_after.realized_pnl, 0.0); // adding -> no P&L
     }
 }

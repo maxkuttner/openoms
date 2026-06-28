@@ -1,5 +1,5 @@
 use uuid::Uuid;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::{query_scalar, Row};
 use axum::{
     extract::Extension,
@@ -12,7 +12,7 @@ use axum::{
     http::Uri,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use crate::adapters::{BrokerOrderRequest, BrokerError};
 use crate::app_state::AppState;
@@ -917,6 +917,206 @@ pub async fn get_portfolio_positions(
         })
         .collect();
     Ok(Json(positions))
+}
+
+// ── Post-trade allocation ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct AllocationSplit {
+    pub portfolio_id: Uuid,
+    pub qty: f64,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateAllocations {
+    pub splits: Vec<AllocationSplit>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct Allocation {
+    pub id: Uuid,
+    pub order_id: Uuid,
+    pub from_portfolio_id: Uuid,
+    pub to_portfolio_id: Uuid,
+    pub instrument_id: String,
+    pub qty: f64,
+    pub price: f64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[utoipa::path(
+    post, path = "/orders/{id}/allocations", tag = "orders",
+    params(("id" = Uuid, Path, description = "Block order ID")),
+    request_body = CreateAllocations,
+    responses(
+        (status = 200, description = "Allocated", body = [Allocation]),
+        (status = 403, description = "No allocate grant on the block portfolio"),
+        (status = 404, description = "Order not found"),
+        (status = 422, description = "Nothing filled, over-allocation, or invalid target"),
+    ),
+    security(("basic_auth" = []))
+)]
+pub async fn create_allocations(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(order_id): Path<Uuid>,
+    Json(req): Json<CreateAllocations>,
+) -> Result<Json<Vec<Allocation>>, ApiError> {
+    let pool = state.pool();
+    let err500 = |m: String| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: m };
+    let err422 = |m: &str| ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message: m.to_string() };
+
+    // 1. the block order: source portfolio, instrument, side, filled qty + avg price.
+    let order = sqlx::query(
+        "SELECT portfolio_id, instrument_id, side, \
+                cum_qty::double precision AS cum_qty, \
+                avg_px::double precision  AS avg_px \
+         FROM order_state WHERE order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| err500(format!("failed to load order: {e:?}")))?
+    .ok_or_else(|| ApiError { status: StatusCode::NOT_FOUND, message: "order not found".to_string() })?;
+
+    let from_portfolio: Uuid = order.get("portfolio_id");
+    let instrument_id: String = order.get("instrument_id");
+    let side = parse_order_side(order.get("side"))?;
+    let cum_qty: f64 = order.get("cum_qty");
+    let avg_px: Option<f64> = order.get("avg_px");
+    if cum_qty <= 0.0 {
+        return Err(err422("order has no filled quantity to allocate"));
+    }
+    let price = avg_px.ok_or_else(|| err422("order has no fill price"))?;
+
+    // 2. entitlement: can_allocate on the block (source) portfolio.
+    let can_allocate: bool = query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant \
+         WHERE principal_id = $1 AND portfolio_id = $2 AND can_allocate = true)",
+    )
+    .bind(auth.principal_id)
+    .bind(from_portfolio)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| err500(format!("failed to check grant: {e:?}")))?;
+    if !can_allocate {
+        return Err(ApiError { status: StatusCode::FORBIDDEN, message: "unauthorized".to_string() });
+    }
+
+    // 3. validate splits + cap at the filled (and not-yet-allocated) quantity.
+    if req.splits.is_empty() {
+        return Err(err422("no splits provided"));
+    }
+    if req.splits.iter().any(|s| s.qty <= 0.0) {
+        return Err(err422("split qty must be > 0"));
+    }
+    let total_new: f64 = req.splits.iter().map(|s| s.qty).sum();
+    let already: f64 = query_scalar(
+        "SELECT COALESCE(SUM(qty), 0)::double precision FROM allocation WHERE order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| err500(format!("failed to sum allocations: {e:?}")))?;
+    if already + total_new > cum_qty + 1e-9 {
+        return Err(err422("over-allocation: would exceed the filled quantity"));
+    }
+    // every target portfolio must exist.
+    let mut target_ids: Vec<Uuid> = req.splits.iter().map(|s| s.portfolio_id).collect();
+    target_ids.sort();
+    target_ids.dedup();
+    let existing: i64 = query_scalar("SELECT count(*) FROM portfolio WHERE id = ANY($1)")
+        .bind(&target_ids)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| err500(format!("failed to check portfolios: {e:?}")))?;
+    if existing != target_ids.len() as i64 {
+        return Err(err422("a target portfolio does not exist"));
+    }
+
+    // 4. apply atomically: record each allocation + transfer the position at cost.
+    let mut tx = pool.begin().await.map_err(|e| err500(format!("tx begin: {e:?}")))?;
+    let mut created = Vec::with_capacity(req.splits.len());
+    for s in &req.splits {
+        let row = sqlx::query(
+            "INSERT INTO allocation \
+                (order_id, from_portfolio_id, to_portfolio_id, instrument_id, qty, price) \
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, created_at",
+        )
+        .bind(order_id)
+        .bind(from_portfolio)
+        .bind(s.portfolio_id)
+        .bind(&instrument_id)
+        .bind(s.qty)
+        .bind(price)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| err500(format!("failed to insert allocation: {e:?}")))?;
+
+        crate::positions::persist_transfer(
+            &mut *tx,
+            from_portfolio,
+            s.portfolio_id,
+            &instrument_id,
+            side,
+            s.qty,
+            price,
+        )
+        .await
+        .map_err(|e| err500(format!("failed to transfer position: {e:?}")))?;
+
+        created.push(Allocation {
+            id: row.get("id"),
+            order_id,
+            from_portfolio_id: from_portfolio,
+            to_portfolio_id: s.portfolio_id,
+            instrument_id: instrument_id.clone(),
+            qty: s.qty,
+            price,
+            created_at: row.get("created_at"),
+        });
+    }
+    tx.commit().await.map_err(|e| err500(format!("commit: {e:?}")))?;
+    Ok(Json(created))
+}
+
+#[utoipa::path(
+    get, path = "/orders/{id}/allocations", tag = "orders",
+    params(("id" = Uuid, Path, description = "Order ID")),
+    responses((status = 200, description = "OK", body = [Allocation])),
+    security(("basic_auth" = []))
+)]
+pub async fn list_allocations(
+    State(state): State<AppState>,
+    Path(order_id): Path<Uuid>,
+) -> Result<Json<Vec<Allocation>>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, order_id, from_portfolio_id, to_portfolio_id, instrument_id, \
+                qty::double precision AS qty, price::double precision AS price, created_at \
+         FROM allocation WHERE order_id = $1 ORDER BY created_at",
+    )
+    .bind(order_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load allocations: {:?}", err),
+    })?;
+
+    let allocs = rows
+        .iter()
+        .map(|r| Allocation {
+            id: r.get("id"),
+            order_id: r.get("order_id"),
+            from_portfolio_id: r.get("from_portfolio_id"),
+            to_portfolio_id: r.get("to_portfolio_id"),
+            instrument_id: r.get("instrument_id"),
+            qty: r.get("qty"),
+            price: r.get("price"),
+            created_at: r.get("created_at"),
+        })
+        .collect();
+    Ok(Json(allocs))
 }
 
 // Function to issue an api error

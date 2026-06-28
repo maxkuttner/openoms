@@ -14,7 +14,7 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
-use crate::handlers::SubmitOrderRequest;
+use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
@@ -54,6 +54,8 @@ mod alpaca_stream;
         handlers::orders_cancel,
         handlers::get_order,
         handlers::get_portfolio_positions,
+        handlers::create_allocations,
+        handlers::list_allocations,
         admin::create_principal,
         admin::list_principals,
         admin::get_principal,
@@ -81,6 +83,7 @@ mod alpaca_stream;
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         crate::positions::Position,
+        Allocation, CreateAllocations, AllocationSplit,
         Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
@@ -255,6 +258,10 @@ async fn main() {
         .route("/orders/cancel", post(handlers::orders_cancel))
         .route("/orders/:id", get(handlers::get_order))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
+        .route(
+            "/orders/:id/allocations",
+            post(handlers::create_allocations).get(handlers::list_allocations),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes (protected by static bearer token only)
