@@ -1,9 +1,10 @@
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
-use sqlx::{query_scalar, Row};
+use sqlx::{query_scalar, Postgres, QueryBuilder, Row};
 use axum::{
     extract::Extension,
     extract::Path,
+    extract::Query,
     extract::State,
     http::StatusCode,
     body::Body,
@@ -369,6 +370,7 @@ pub async fn orders_submit(
         INSERT INTO order_state (
             order_id,
             client_order_id,
+            principal_id,
             portfolio_id,
             account_id,
             instrument_id,
@@ -385,12 +387,13 @@ pub async fn orders_submit(
             version,
             broker_connection_code
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
         )
         "#
     )
     .bind(order_id)
     .bind(&state_after_submit.client_order_id)
+    .bind(auth.principal_id)
     .bind(Uuid::parse_str(&state_after_submit.portfolio_id).unwrap())
     .bind(Uuid::parse_str(&state_after_submit.account_id).unwrap())
     .bind(&state_after_submit.instrument_id)
@@ -1117,6 +1120,113 @@ pub async fn list_allocations(
         })
         .collect();
     Ok(Json(allocs))
+}
+
+// ── Blotter / oversight ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct BlotterFilter {
+    pub status: Option<String>,
+    pub portfolio_id: Option<Uuid>,
+    pub instrument_id: Option<String>,
+    pub principal_id: Option<Uuid>,
+    pub broker_connection_code: Option<String>,
+    pub side: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BlotterRow {
+    pub order_id: Uuid,
+    pub principal_id: Uuid,
+    pub principal_code: String,
+    pub portfolio_id: Uuid,
+    pub portfolio_code: String,
+    pub account_id: Uuid,
+    pub broker_connection_code: String,
+    pub instrument_id: String,
+    pub side: String,
+    pub order_type: String,
+    pub status: String,
+    pub original_qty: f64,
+    pub leaves_qty: f64,
+    pub cum_qty: f64,
+    pub avg_px: Option<f64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[utoipa::path(
+    get, path = "/admin/orders", tag = "admin",
+    params(BlotterFilter),
+    responses((status = 200, description = "OK", body = [BlotterRow])),
+    security(("bearer_token" = []))
+)]
+pub async fn get_orders_blotter(
+    State(state): State<AppState>,
+    Query(f): Query<BlotterFilter>,
+) -> Result<Json<Vec<BlotterRow>>, ApiError> {
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "SELECT os.order_id, os.principal_id, p.code AS principal_code, \
+                os.portfolio_id, pf.code AS portfolio_code, os.account_id, \
+                os.broker_connection_code, os.instrument_id, os.side, os.order_type, os.status, \
+                os.original_qty::double precision AS original_qty, \
+                os.leaves_qty::double precision   AS leaves_qty, \
+                os.cum_qty::double precision      AS cum_qty, \
+                os.avg_px::double precision       AS avg_px, \
+                os.created_at, os.updated_at \
+         FROM order_state os \
+         JOIN principal p  ON p.id  = os.principal_id \
+         JOIN portfolio pf ON pf.id = os.portfolio_id \
+         WHERE TRUE",
+    );
+    if let Some(v) = &f.status { qb.push(" AND os.status = ").push_bind(v.clone()); }
+    if let Some(v) = f.portfolio_id { qb.push(" AND os.portfolio_id = ").push_bind(v); }
+    if let Some(v) = &f.instrument_id { qb.push(" AND os.instrument_id = ").push_bind(v.clone()); }
+    if let Some(v) = f.principal_id { qb.push(" AND os.principal_id = ").push_bind(v); }
+    if let Some(v) = &f.broker_connection_code {
+        qb.push(" AND os.broker_connection_code = ").push_bind(v.clone());
+    }
+    if let Some(v) = &f.side { qb.push(" AND os.side = ").push_bind(v.clone()); }
+    if let Some(v) = f.since { qb.push(" AND os.created_at >= ").push_bind(v); }
+    if let Some(v) = f.until { qb.push(" AND os.created_at <= ").push_bind(v); }
+    qb.push(" ORDER BY os.created_at DESC");
+    let limit = f.limit.unwrap_or(100).clamp(1, 500);
+    let offset = f.offset.unwrap_or(0).max(0);
+    qb.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+
+    let rows = qb.build().fetch_all(state.pool()).await.map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load blotter: {:?}", err),
+    })?;
+
+    let out = rows
+        .iter()
+        .map(|r| BlotterRow {
+            order_id: r.get("order_id"),
+            principal_id: r.get("principal_id"),
+            principal_code: r.get("principal_code"),
+            portfolio_id: r.get("portfolio_id"),
+            portfolio_code: r.get("portfolio_code"),
+            account_id: r.get("account_id"),
+            broker_connection_code: r.get("broker_connection_code"),
+            instrument_id: r.get("instrument_id"),
+            side: r.get("side"),
+            order_type: r.get("order_type"),
+            status: r.get("status"),
+            original_qty: r.get("original_qty"),
+            leaves_qty: r.get("leaves_qty"),
+            cum_qty: r.get("cum_qty"),
+            avg_px: r.get("avg_px"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        })
+        .collect();
+    Ok(Json(out))
 }
 
 // Function to issue an api error

@@ -25,8 +25,10 @@ allocation. (A client needs only a **principal + portfolio** to trade; account i
 and inferred from the portfolio's default route. No-creds fixture seeds `alpaca-paper` + a test
 user `test-trader-key` : `test-secret`.)
 - [ ] **amend/replace + cancel fully wired** API→broker→event (`ReplaceOrder`/`CancelOrder` exist)
-- [ ] **blotter / oversight query API** — orders, fills, positions across principals/portfolios,
-      filterable ("who is trading what"); today only `GET /orders/:id`
+- [x] **blotter / oversight query API** — `GET /admin/orders`: all orders across principals/
+      portfolios with `principal_id` on the order, filterable (status/portfolio/instrument/
+      principal/connection/side/time) + paginated ("who is trading what"). Fills/positions
+      oversight views are quick follow-ons
 - [ ] **broker/custodian reconciliation** — match our records against broker positions/fills
 
 ### Phase 2 — oversight & control depth (REST)

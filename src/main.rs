@@ -14,7 +14,7 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
-use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit};
+use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit, BlotterRow};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
@@ -56,6 +56,7 @@ mod alpaca_stream;
         handlers::get_portfolio_positions,
         handlers::create_allocations,
         handlers::list_allocations,
+        handlers::get_orders_blotter,
         admin::create_principal,
         admin::list_principals,
         admin::get_principal,
@@ -83,7 +84,7 @@ mod alpaca_stream;
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         crate::positions::Position,
-        Allocation, CreateAllocations, AllocationSplit,
+        Allocation, CreateAllocations, AllocationSplit, BlotterRow,
         Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
@@ -266,6 +267,7 @@ async fn main() {
     
     // 2) Register admin routes (protected by static bearer token only)
     let admin_router = Router::new()
+        .route("/admin/orders", get(handlers::get_orders_blotter))
         .route(
             "/admin/principals",
             post(admin::create_principal).get(admin::list_principals),
