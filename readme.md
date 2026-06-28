@@ -6,6 +6,13 @@
 - [ ] cache Databento `definition` fetches to `.dbn` so resets replay offline (no refetch)
 - [ ] `EQUS_SUMMARY` is consolidated like the removed `DBEQ.BASIC` — same symbol-spans-venues collision risk if enabled
 
+## Cockpit (admin webapp)
+
+`cockpit/` — a React/TS SPA over the admin API to set up principals (+ keys + grants),
+portfolios, accounts, broker connections, and risk limits, and to watch the order **blotter**.
+Dev: start the OMS, then `cd cockpit && npm install && npm run dev` (Vite proxies `/api` → the
+OMS). See `cockpit/README.md`. Backend: risk limits are now CRUD-able at `/admin/risk-limits`.
+
 ## Roadmap — REST OMS now → low-latency execution engine
 
 Vision: ship a correct REST OMS (**system of record + governance + oversight**), then evolve the
