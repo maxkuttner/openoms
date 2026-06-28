@@ -146,32 +146,30 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
     }
 
     async fn exposure(&mut self, scope: &RiskScope<'_>) -> Result<Exposure, sqlx::Error> {
-        // Signed nets from order_state: buys positive, sells negative.
-        // - position_qty: everything filled so far (cum_qty survives terminal states)
-        // - working_qty:  open quantity of live orders only
-        // TODO(position projection): replace with an O(1) read from a `position`
-        // table maintained on execution reports; that also covers external fills
-        // this order-derived approximation cannot see.
-        let row = sqlx::query(
-            "SELECT \
-                COALESCE(SUM(CASE WHEN side = 'buy' THEN cum_qty ELSE -cum_qty END), 0)::double precision \
-                    AS position_qty, \
-                COALESCE(SUM(CASE WHEN status IN ('submitted', 'routed', 'partially_filled') \
-                                  THEN CASE WHEN side = 'buy' THEN leaves_qty ELSE -leaves_qty END \
-                                  ELSE 0 END), 0)::double precision \
-                    AS working_qty \
-             FROM order_state \
-             WHERE portfolio_id = $1 AND instrument_id = $2",
+        // position_qty: O(1) read of the signed net holding from the `position`
+        // projection (maintained on fills; covers external fills too). 0 if flat.
+        let position_qty: f64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT net_qty::double precision FROM position \
+                              WHERE portfolio_id = $1 AND instrument_id = $2), 0)",
         )
         .bind(scope.portfolio_id)
         .bind(scope.instrument_id)
         .fetch_one(&mut *self.conn)
         .await?;
 
-        Ok(Exposure {
-            position_qty: row.get("position_qty"),
-            working_qty: row.get("working_qty"),
-        })
+        // working_qty: signed open quantity of live (unfilled) orders only.
+        let working_qty: f64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(CASE WHEN side = 'buy' THEN leaves_qty ELSE -leaves_qty END), 0)::double precision \
+             FROM order_state \
+             WHERE portfolio_id = $1 AND instrument_id = $2 \
+               AND status IN ('submitted', 'routed', 'partially_filled')",
+        )
+        .bind(scope.portfolio_id)
+        .bind(scope.instrument_id)
+        .fetch_one(&mut *self.conn)
+        .await?;
+
+        Ok(Exposure { position_qty, working_qty })
     }
 }
 

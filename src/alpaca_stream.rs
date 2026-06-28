@@ -11,8 +11,10 @@ use std::sync::Arc;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::{ExecutionReport, OrderCommand, ReceiveExecutionReport};
+use crate::domain::orders::events::OrderEventPayload;
 use crate::domain::orders::state::OrderAggregateState;
 use crate::event_store::{NewOrderEvent, OrderEventStore};
+use crate::positions;
 use crate::handlers::{
     parse_order_side, parse_order_status, parse_order_type, parse_time_in_force,
 };
@@ -392,6 +394,26 @@ async fn process_execution_report(
     .bind(expected_version)
     .execute(&mut *tx)
     .await?;
+
+    // Maintain the position projection from any fill events, in the same tx so it
+    // commits atomically with the order_state update + event append below.
+    let portfolio_uuid = Uuid::parse_str(&new_state.portfolio_id)?;
+    for event in &events {
+        let (fill_qty, fill_price) = match &event.payload {
+            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
+            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (*fill_qty, *fill_price),
+            _ => continue,
+        };
+        positions::persist_fill(
+            &mut *tx,
+            portfolio_uuid,
+            &new_state.instrument_id,
+            new_state.side,
+            fill_qty,
+            fill_price,
+        )
+        .await?;
+    }
 
     let new_events: Vec<NewOrderEvent> = events
         .iter()

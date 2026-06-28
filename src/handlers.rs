@@ -22,6 +22,7 @@ use crate::domain::orders::commands::{OrderCommand, RouteOrder, SubmitOrder, Can
 use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
+use crate::positions::Position;
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
 use crate::kafka::publish_events;
@@ -853,6 +854,69 @@ pub async fn get_order(
     };
 
     Ok(Json(order))
+}
+
+#[utoipa::path(
+    get, path = "/portfolios/{id}/positions", tag = "orders",
+    params(("id" = Uuid, Path, description = "Portfolio ID")),
+    responses(
+        (status = 200, description = "OK", body = [Position]),
+        (status = 403, description = "No view grant for principal/portfolio"),
+    ),
+    security(("basic_auth" = []))
+)]
+pub async fn get_portfolio_positions(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(portfolio_id): Path<Uuid>,
+) -> Result<Json<Vec<Position>>, ApiError> {
+    let can_view: bool = query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant \
+         WHERE principal_id = $1 AND portfolio_id = $2 AND can_view = true)",
+    )
+    .bind(auth.principal_id)
+    .bind(portfolio_id)
+    .fetch_one(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to check grant: {:?}", err),
+    })?;
+    if !can_view {
+        return Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "unauthorized".to_string(),
+        });
+    }
+
+    let rows = sqlx::query(
+        "SELECT portfolio_id, instrument_id, \
+                net_qty::double precision      AS net_qty, \
+                avg_cost::double precision     AS avg_cost, \
+                realized_pnl::double precision AS realized_pnl, \
+                updated_at \
+         FROM position WHERE portfolio_id = $1 ORDER BY instrument_id",
+    )
+    .bind(portfolio_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load positions: {:?}", err),
+    })?;
+
+    let positions = rows
+        .iter()
+        .map(|r| Position {
+            portfolio_id: r.get("portfolio_id"),
+            instrument_id: r.get("instrument_id"),
+            net_qty: r.get("net_qty"),
+            avg_cost: r.get("avg_cost"),
+            realized_pnl: r.get("realized_pnl"),
+            updated_at: r.get("updated_at"),
+        })
+        .collect();
+    Ok(Json(positions))
 }
 
 // Function to issue an api error

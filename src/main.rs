@@ -7,6 +7,7 @@ mod app_state;
 mod auth;
 mod admin;
 mod risk_engine;
+mod positions;
 
 use crate::adapters::BrokerRegistry;
 use crate::adapters::alpaca::AlpacaAdapter;
@@ -52,6 +53,7 @@ mod alpaca_stream;
         handlers::orders_submit,
         handlers::orders_cancel,
         handlers::get_order,
+        handlers::get_portfolio_positions,
         admin::create_principal,
         admin::list_principals,
         admin::get_principal,
@@ -78,6 +80,7 @@ mod alpaca_stream;
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
+        crate::positions::Position,
         Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
@@ -214,6 +217,20 @@ async fn main() {
     // AppState
     let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client);
 
+    // One-time backfill: if the position projection is empty, rebuild it from the
+    // event log so existing fills are reflected. No-op on a fresh install.
+    match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM position")
+        .fetch_one(state.pool())
+        .await
+    {
+        Ok(0) => match positions::rebuild_positions(state.pool()).await {
+            Ok(n) => info!(positions = n, "rebuilt position projection from event log"),
+            Err(e) => error!(error = ?e, "failed to rebuild position projection"),
+        },
+        Ok(_) => {}
+        Err(e) => error!(error = ?e, "failed to check position projection"),
+    }
+
     // Spawn Alpaca trade-update stream tasks (one per configured environment)
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
@@ -237,6 +254,7 @@ async fn main() {
         .route("/orders/submit", post(handlers::orders_submit))
         .route("/orders/cancel", post(handlers::orders_cancel))
         .route("/orders/:id", get(handlers::get_order))
+        .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes (protected by static bearer token only)
