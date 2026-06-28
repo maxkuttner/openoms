@@ -961,6 +961,219 @@ pub async fn delete_grant(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Risk limits ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct RiskLimit {
+    pub id: Uuid,
+    pub portfolio_id: Uuid,
+    pub instrument_id: String,
+    pub trading_state: String,
+    pub max_order_quantity: Option<f64>,
+    pub max_order_notional: Option<f64>,
+    pub max_position_quantity: Option<f64>,
+    pub max_position_notional: Option<f64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateRiskLimit {
+    pub portfolio_id: Uuid,
+    pub instrument_id: String,
+    pub trading_state: Option<String>,
+    pub max_order_quantity: Option<f64>,
+    pub max_order_notional: Option<f64>,
+    pub max_position_quantity: Option<f64>,
+    pub max_position_notional: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct UpdateRiskLimit {
+    pub trading_state: Option<String>,
+    pub max_order_quantity: Option<f64>,
+    pub max_order_notional: Option<f64>,
+    pub max_position_quantity: Option<f64>,
+    pub max_position_notional: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct RiskLimitFilter {
+    pub portfolio_id: Option<Uuid>,
+}
+
+// NUMERIC columns are cast to double precision so FromRow decodes them into f64.
+const RISK_LIMIT_SELECT: &str = "id, portfolio_id, instrument_id, trading_state, \
+    max_order_quantity::double precision    AS max_order_quantity, \
+    max_order_notional::double precision    AS max_order_notional, \
+    max_position_quantity::double precision AS max_position_quantity, \
+    max_position_notional::double precision AS max_position_notional, \
+    created_at, updated_at";
+
+fn validate_trading_state(s: &str) -> Result<(), AdminError> {
+    match s {
+        "ACTIVE" | "REDUCING" | "HALTED" => Ok(()),
+        _ => Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: "trading_state must be ACTIVE, REDUCING, or HALTED".to_string(),
+        }),
+    }
+}
+
+#[utoipa::path(
+    post, path = "/admin/risk-limits", tag = "admin",
+    request_body = CreateRiskLimit,
+    responses(
+        (status = 200, description = "Created", body = RiskLimit),
+        (status = 400, description = "Invalid trading_state"),
+        (status = 409, description = "Limit already exists for this portfolio/instrument"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn create_risk_limit(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateRiskLimit>,
+) -> Result<Json<RiskLimit>, AdminError> {
+    let trading_state = payload.trading_state.unwrap_or_else(|| "ACTIVE".to_string());
+    validate_trading_state(&trading_state)?;
+    info!(portfolio_id = %payload.portfolio_id, instrument_id = %payload.instrument_id, "admin create risk limit");
+    let sql = format!(
+        "INSERT INTO risk_limits \
+           (portfolio_id, instrument_id, trading_state, max_order_quantity, \
+            max_order_notional, max_position_quantity, max_position_notional) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         RETURNING {RISK_LIMIT_SELECT}"
+    );
+    let record = sqlx::query_as::<_, RiskLimit>(&sql)
+        .bind(payload.portfolio_id)
+        .bind(payload.instrument_id)
+        .bind(trading_state)
+        .bind(payload.max_order_quantity)
+        .bind(payload.max_order_notional)
+        .bind(payload.max_position_quantity)
+        .bind(payload.max_position_notional)
+        .fetch_one(state.pool())
+        .await
+        .map_err(map_db_error)?;
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    get, path = "/admin/risk-limits", tag = "admin",
+    params(RiskLimitFilter),
+    responses((status = 200, description = "OK", body = [RiskLimit])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_risk_limits(
+    State(state): State<AppState>,
+    Query(filter): Query<RiskLimitFilter>,
+) -> Result<Json<Vec<RiskLimit>>, AdminError> {
+    info!("admin list risk limits");
+    let sql = format!(
+        "SELECT {RISK_LIMIT_SELECT} FROM risk_limits \
+         WHERE ($1::uuid IS NULL OR portfolio_id = $1) ORDER BY created_at DESC"
+    );
+    let records = sqlx::query_as::<_, RiskLimit>(&sql)
+        .bind(filter.portfolio_id)
+        .fetch_all(state.pool())
+        .await
+        .map_err(map_db_error)?;
+    Ok(Json(records))
+}
+
+#[utoipa::path(
+    get, path = "/admin/risk-limits/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Risk limit ID")),
+    responses(
+        (status = 200, description = "OK", body = RiskLimit),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_risk_limit(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RiskLimit>, AdminError> {
+    let sql = format!("SELECT {RISK_LIMIT_SELECT} FROM risk_limits WHERE id = $1");
+    let record = sqlx::query_as::<_, RiskLimit>(&sql)
+        .bind(id)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(map_db_error)?
+        .ok_or_else(|| AdminError::not_found("risk_limit"))?;
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    patch, path = "/admin/risk-limits/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Risk limit ID")),
+    request_body = UpdateRiskLimit,
+    responses(
+        (status = 200, description = "Updated", body = RiskLimit),
+        (status = 400, description = "Invalid trading_state"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn update_risk_limit(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateRiskLimit>,
+) -> Result<Json<RiskLimit>, AdminError> {
+    if let Some(ref ts) = payload.trading_state {
+        validate_trading_state(ts)?;
+    }
+    info!(risk_limit_id = %id, "admin update risk limit");
+    let sql = format!(
+        "UPDATE risk_limits SET \
+            trading_state         = COALESCE($1, trading_state), \
+            max_order_quantity    = COALESCE($2, max_order_quantity), \
+            max_order_notional    = COALESCE($3, max_order_notional), \
+            max_position_quantity = COALESCE($4, max_position_quantity), \
+            max_position_notional = COALESCE($5, max_position_notional), \
+            updated_at = now() \
+         WHERE id = $6 \
+         RETURNING {RISK_LIMIT_SELECT}"
+    );
+    let record = sqlx::query_as::<_, RiskLimit>(&sql)
+        .bind(payload.trading_state)
+        .bind(payload.max_order_quantity)
+        .bind(payload.max_order_notional)
+        .bind(payload.max_position_quantity)
+        .bind(payload.max_position_notional)
+        .bind(id)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(map_db_error)?
+        .ok_or_else(|| AdminError::not_found("risk_limit"))?;
+    Ok(Json(record))
+}
+
+#[utoipa::path(
+    delete, path = "/admin/risk-limits/{id}", tag = "admin",
+    params(("id" = Uuid, Path, description = "Risk limit ID")),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn delete_risk_limit(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AdminError> {
+    info!(risk_limit_id = %id, "admin delete risk limit");
+    let result = sqlx::query("DELETE FROM risk_limits WHERE id = $1")
+        .bind(id)
+        .execute(state.pool())
+        .await
+        .map_err(map_db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("risk_limit"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]

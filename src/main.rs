@@ -80,6 +80,11 @@ mod alpaca_stream;
         admin::list_broker_connections,
         admin::get_broker_connection,
         admin::update_broker_connection,
+        admin::create_risk_limit,
+        admin::list_risk_limits,
+        admin::get_risk_limit,
+        admin::update_risk_limit,
+        admin::delete_risk_limit,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -92,6 +97,7 @@ mod alpaca_stream;
         CreateBrokerConnection, UpdateBrokerConnection,
         CreateKey, ApiKeyRecord,
         Grant, CreateGrant, UpdateGrant,
+        admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -315,6 +321,16 @@ async fn main() {
         .route(
             "/admin/principals/:id/grants/:grant_id",
             axum::routing::patch(admin::update_grant).delete(admin::delete_grant),
+        )
+        .route(
+            "/admin/risk-limits",
+            post(admin::create_risk_limit).get(admin::list_risk_limits),
+        )
+        .route(
+            "/admin/risk-limits/:id",
+            get(admin::get_risk_limit)
+                .patch(admin::update_risk_limit)
+                .delete(admin::delete_risk_limit),
         )
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
