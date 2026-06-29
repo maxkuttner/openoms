@@ -7,6 +7,18 @@
 -->
 **TODO:**
 
+**★ #1 — Central instrument symbology (consolidate the mapping)**
+- [ ] One **resolution engine** every source and runtime path goes through, instead of today's
+      fragmented logic (`seed_instruments.py` matches venue-aware, `broker_sync.py` symbol-only,
+      Rust routing/recon each query `broker_instrument` directly — inconsistent + duplicated, and
+      the symbol-only path collapses multi-venue symbols).
+      - target: `resolve(source, {symbol, exchange, native_id, isin, cusip, figi}) -> instrument_id`
+        with consistent precedence (native_id → FIGI/ISIN/CUSIP → symbol@venue → symbol)
+      - backed by a unified **`instrument_xref`** (generalising `provider_instrument` +
+        `broker_instrument`) and standard ids (ISIN/CUSIP/FIGI) on the master `instrument`
+      - one writer, one place to audit unresolved/ambiguous securities; new sources (3rd-party
+        custodians) plug in without another bespoke matcher
+
 **Instrument Seeding**
 - [ ] cache Databento `definition` fetches to `.dbn` so resets replay offline (no refetch)
 - [ ] `EQUS_SUMMARY` is consolidated like the removed `DBEQ.BASIC` — same symbol-spans-venues collision risk if enabled
