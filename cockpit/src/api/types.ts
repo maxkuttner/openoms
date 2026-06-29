@@ -75,6 +75,24 @@ export interface RiskLimit {
   updated_at: string;
 }
 
+export interface ReconBreak {
+  instrument_id: string | null;
+  symbol: string | null;
+  oms_qty: number;
+  custodian_qty: number;
+  diff: number;
+  kind: string;
+}
+
+export interface ReconSummary {
+  run_id: string;
+  broker_connection_code: string;
+  oms_count: number;
+  custodian_count: number;
+  break_count: number;
+  breaks: ReconBreak[];
+}
+
 export interface BlotterRow {
   order_id: string;
   principal_id: string;

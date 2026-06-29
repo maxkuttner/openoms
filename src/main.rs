@@ -8,6 +8,7 @@ mod auth;
 mod admin;
 mod risk_engine;
 mod positions;
+mod recon;
 
 use crate::adapters::BrokerRegistry;
 use crate::adapters::alpaca::AlpacaAdapter;
@@ -86,6 +87,9 @@ mod alpaca_stream;
         admin::update_risk_limit,
         admin::delete_risk_limit,
         admin::list_instruments,
+        admin::run_recon,
+        admin::list_recon_runs,
+        admin::list_recon_breaks,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -100,6 +104,8 @@ mod alpaca_stream;
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary,
+        admin::RunReconRequest, admin::ReconRunRow, admin::ReconBreakRow,
+        crate::recon::ReconSummary, crate::recon::ReconBreak, crate::recon::BreakKind,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -335,6 +341,9 @@ async fn main() {
                 .delete(admin::delete_risk_limit),
         )
         .route("/admin/instruments", get(admin::list_instruments))
+        .route("/admin/recon/run", post(admin::run_recon))
+        .route("/admin/recon/runs", get(admin::list_recon_runs))
+        .route("/admin/recon/runs/:id/breaks", get(admin::list_recon_breaks))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let scalar_html = {

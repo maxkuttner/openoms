@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
+use crate::recon::{run_reconciliation, ReconError, ReconSummary};
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePrincipal {
@@ -1217,6 +1218,120 @@ pub async fn list_instruments(
     .await
     .map_err(map_db_error)?;
     Ok(Json(records))
+}
+
+// ── Custodian reconciliation ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct RunReconRequest {
+    pub broker_connection_code: String,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct ReconRunRow {
+    pub id: Uuid,
+    pub broker_connection_code: String,
+    pub oms_count: i32,
+    pub custodian_count: i32,
+    pub break_count: i32,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct ReconBreakRow {
+    pub id: Uuid,
+    pub recon_run_id: Uuid,
+    pub instrument_id: Option<String>,
+    pub symbol: Option<String>,
+    pub oms_qty: f64,
+    pub custodian_qty: f64,
+    pub diff: f64,
+    pub kind: String,
+    pub created_at: DateTime<Utc>,
+}
+
+fn map_recon_error(err: ReconError) -> AdminError {
+    match err {
+        ReconError::NotFound(m) => AdminError { status: StatusCode::NOT_FOUND, message: m },
+        ReconError::Unsupported(b) => AdminError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("reconciliation not supported for broker {b}"),
+        },
+        ReconError::NoAdapter(m) => AdminError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("no adapter configured for {m}"),
+        },
+        ReconError::Broker(m) => AdminError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("custodian error: {m}"),
+        },
+        ReconError::Db(e) => AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("database error: {e}"),
+        },
+    }
+}
+
+#[utoipa::path(
+    post, path = "/admin/recon/run", tag = "admin",
+    request_body = RunReconRequest,
+    responses(
+        (status = 200, description = "Reconciliation run", body = ReconSummary),
+        (status = 404, description = "Broker connection not found"),
+        (status = 422, description = "Broker not supported for reconciliation"),
+        (status = 502, description = "Custodian fetch failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn run_recon(
+    State(state): State<AppState>,
+    Json(req): Json<RunReconRequest>,
+) -> Result<Json<ReconSummary>, AdminError> {
+    info!(broker_connection_code = %req.broker_connection_code, "admin run reconciliation");
+    let summary = run_reconciliation(state.pool(), state.registry().as_ref(), &req.broker_connection_code)
+        .await
+        .map_err(map_recon_error)?;
+    Ok(Json(summary))
+}
+
+#[utoipa::path(
+    get, path = "/admin/recon/runs", tag = "admin",
+    responses((status = 200, description = "OK", body = [ReconRunRow])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_recon_runs(State(state): State<AppState>) -> Result<Json<Vec<ReconRunRow>>, AdminError> {
+    let rows = sqlx::query_as::<_, ReconRunRow>(
+        "SELECT id, broker_connection_code, oms_count, custodian_count, break_count, started_at, finished_at \
+         FROM recon_run ORDER BY started_at DESC LIMIT 100",
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(rows))
+}
+
+#[utoipa::path(
+    get, path = "/admin/recon/runs/{id}/breaks", tag = "admin",
+    params(("id" = Uuid, Path, description = "Recon run ID")),
+    responses((status = 200, description = "OK", body = [ReconBreakRow])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_recon_breaks(
+    State(state): State<AppState>,
+    Path(run_id): Path<Uuid>,
+) -> Result<Json<Vec<ReconBreakRow>>, AdminError> {
+    let rows = sqlx::query_as::<_, ReconBreakRow>(
+        "SELECT id, recon_run_id, instrument_id, symbol, \
+                oms_qty::float8 AS oms_qty, custodian_qty::float8 AS custodian_qty, \
+                diff::float8 AS diff, kind, created_at \
+         FROM recon_break WHERE recon_run_id = $1 ORDER BY created_at",
+    )
+    .bind(run_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(rows))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

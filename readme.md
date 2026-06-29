@@ -43,7 +43,13 @@ user `test-trader-key` : `test-secret`.)
       portfolios with `principal_id` on the order, filterable (status/portfolio/instrument/
       principal/connection/side/time) + paginated ("who is trading what"). Fills/positions
       oversight views are quick follow-ons
-- [ ] **broker/custodian reconciliation** — match our records against broker positions/fills
+- [x] **custodian reconciliation (read & compare)** — `POST /admin/recon/run` fetches a
+      custodian's holdings (Alpaca paper = broker+custodian) and diffs them against our positions,
+      per broker connection; breaks (qty mismatch / missing either side / unresolved security)
+      are stored + shown in the cockpit. Symbology resolves via `broker_instrument`
+      - [ ] _future: central cross-reference (`instrument_xref` + ISIN/CUSIP/FIGI on the master)
+            for real 3rd-party custodians that report by ISIN/CUSIP; the OMS reconciles, it does
+            **not** instruct settlement (that's the custodian + market infra's job)_
 
 ### Phase 2 — oversight & control depth (REST)
 

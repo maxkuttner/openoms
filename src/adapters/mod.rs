@@ -30,6 +30,16 @@ pub struct BrokerOrderResponse {
     pub external_order_id: String,
 }
 
+/// A position as reported by a broker/custodian — the custodian side of reconciliation.
+pub struct BrokerHolding {
+    /// Broker symbol (e.g. "SPY").
+    pub symbol: String,
+    /// Broker-native instrument id (Alpaca asset UUID), when present.
+    pub native_id: Option<String>,
+    /// Signed quantity: + long, - short.
+    pub qty: f64,
+}
+
 #[derive(Debug)]
 pub enum BrokerError {
     Network(String),
