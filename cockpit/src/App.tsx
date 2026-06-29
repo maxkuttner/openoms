@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { AppShell, Group, NavLink, Button, Modal, TextInput, Stack, Text } from "@mantine/core";
+import { useState, lazy, Suspense } from "react";
+import { AppShell, Group, NavLink, Button, Modal, TextInput, Stack, Text, Loader } from "@mantine/core";
 import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { getToken, setToken } from "./api/client";
@@ -11,6 +11,9 @@ import { BrokerConnectionsPage } from "./pages/BrokerConnections";
 import { RiskLimitsPage } from "./pages/RiskLimits";
 import { BlotterPage } from "./pages/Blotter";
 
+// Scalar's bundle is heavy — only load it when the API docs page is opened.
+const ApiDocsPage = lazy(() => import("./pages/ApiDocs").then((m) => ({ default: m.ApiDocsPage })));
+
 const NAV = [
   { to: "/principals", label: "Principals" },
   { to: "/portfolios", label: "Portfolios" },
@@ -18,6 +21,7 @@ const NAV = [
   { to: "/broker-connections", label: "Broker connections" },
   { to: "/risk-limits", label: "Risk limits" },
   { to: "/blotter", label: "Blotter" },
+  { to: "/api-docs", label: "API docs" },
 ];
 
 function TokenModal({ opened, onClose }: { opened: boolean; onClose: () => void }) {
@@ -94,6 +98,14 @@ export function App() {
           <Route path="/broker-connections" element={<BrokerConnectionsPage />} />
           <Route path="/risk-limits" element={<RiskLimitsPage />} />
           <Route path="/blotter" element={<BlotterPage />} />
+          <Route
+            path="/api-docs"
+            element={
+              <Suspense fallback={<Loader />}>
+                <ApiDocsPage />
+              </Suspense>
+            }
+          />
         </Routes>
       </AppShell.Main>
       <TokenModal opened={tokenOpen} onClose={() => setTokenOpen(false)} />

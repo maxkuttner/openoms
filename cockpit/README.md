@@ -32,4 +32,5 @@ npm run build   # tsc + vite build -> dist/  (base path /cockpit/)
   `hooks.ts` (TanStack Query helpers).
 - `src/components/CrudResource.tsx` — generic list + create/edit/delete used by the simple pages.
 - `src/pages/` — Principals (+ keys + grants), Portfolios, Accounts, BrokerConnections,
-  RiskLimits, Blotter.
+  RiskLimits, Blotter, ApiDocs (embedded [Scalar](https://scalar.com) reference, lazy-loaded,
+  fed from the OMS OpenAPI doc).
