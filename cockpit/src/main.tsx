@@ -7,6 +7,7 @@ import { BrowserRouter } from "react-router-dom";
 import "@mantine/core/styles.css";
 import "@mantine/notifications/styles.css";
 import { App } from "./App";
+import { theme } from "./theme";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
@@ -17,7 +18,7 @@ const basename = import.meta.env.BASE_URL;
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <MantineProvider defaultColorScheme="auto">
+    <MantineProvider theme={theme} defaultColorScheme="dark">
       <Notifications position="top-right" />
       <QueryClientProvider client={queryClient}>
         <BrowserRouter basename={basename}>

@@ -1,4 +1,9 @@
-# OpenOMS
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/openoms-banner-dark.svg">
+    <img alt="openOMS — a high-performance, open-source order management system" src="assets/openoms-banner-light.svg" width="820">
+  </picture>
+</p>
 
 **TODO:**
 
