@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/symbology"]
+resolver = "2"
+
 [package]
 name = "rustoms"
 version = "0.1.0"

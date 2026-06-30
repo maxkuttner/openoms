@@ -8,16 +8,19 @@
 **TODO:**
 
 **★ #1 — Central instrument symbology (consolidate the mapping)**
-- [ ] One **resolution engine** every source and runtime path goes through, instead of today's
-      fragmented logic (`seed_instruments.py` matches venue-aware, `broker_sync.py` symbol-only,
-      Rust routing/recon each query `broker_instrument` directly — inconsistent + duplicated, and
-      the symbol-only path collapses multi-venue symbols).
-      - target: `resolve(source, {symbol, exchange, native_id, isin, cusip, figi}) -> instrument_id`
-        with consistent precedence (native_id → FIGI/ISIN/CUSIP → symbol@venue → symbol)
+- [x] **`crates/symbology`** — a standalone, exposable Rust library that identifies an instrument
+      record (ticker+exchange / ISIN / CUSIP / FIGI) to a canonical **FIGI** identity via OpenFIGI
+      (pure resolver + swappable `FigiProvider` + cache; `cargo run -p symbology --example identify
+      -- AAPL US` → `BBG000B9XRY4`). The engine's brain.
+- [ ] **wire it into the OMS** as the single resolution path, replacing today's fragmented logic
+      (`seed_instruments.py` venue-aware, `broker_sync.py` symbol-only, Rust routing/recon query
+      `broker_instrument` directly — inconsistent, and the symbol-only path collapses multi-venue
+      symbols):
+      - add `figi`/`cusip` to the master `instrument`; a thin resolver feeds each external record
+        (Databento def / Alpaca asset / custodian holding) through `symbology::identify`
       - backed by a unified **`instrument_xref`** (generalising `provider_instrument` +
-        `broker_instrument`) and standard ids (ISIN/CUSIP/FIGI) on the master `instrument`
-      - one writer, one place to audit unresolved/ambiguous securities; new sources (3rd-party
-        custodians) plug in without another bespoke matcher
+        `broker_instrument`); one writer, one place to audit unresolved/ambiguous securities, so
+        new sources (3rd-party custodians) plug in without another bespoke matcher
 
 **Instrument Seeding**
 - [ ] cache Databento `definition` fetches to `.dbn` so resets replay offline (no refetch)
