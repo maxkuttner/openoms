@@ -12,15 +12,15 @@
       record (ticker+exchange / ISIN / CUSIP / FIGI) to a canonical **FIGI** identity via OpenFIGI
       (pure resolver + swappable `FigiProvider` + cache; `cargo run -p symbology --example identify
       -- AAPL US` → `BBG000B9XRY4`). The engine's brain.
-- [ ] **wire it into the OMS** as the single resolution path, replacing today's fragmented logic
-      (`seed_instruments.py` venue-aware, `broker_sync.py` symbol-only, Rust routing/recon query
-      `broker_instrument` directly — inconsistent, and the symbol-only path collapses multi-venue
-      symbols):
-      - add `figi`/`cusip` to the master `instrument`; a thin resolver feeds each external record
-        (Databento def / Alpaca asset / custodian holding) through `symbology::identify`
-      - backed by a unified **`instrument_xref`** (generalising `provider_instrument` +
-        `broker_instrument`); one writer, one place to audit unresolved/ambiguous securities, so
-        new sources (3rd-party custodians) plug in without another bespoke matcher
+- [x] **wired into the OMS (additive)** — `figi`/`cusip` on the master; a unified
+      **`oms.instrument_xref`**; a resolver (`symbology_resolver.rs`, xref-first → OpenFIGI →
+      match master + stamp figi + upsert xref) exposed at `POST /admin/symbology/resolve` +
+      `/backfill`, and used as a fallback in recon. Verified: `resolve AAPL → BBG000B9XRY4` stamps
+      the master + writes the xref, cached on repeat. Old bridges + routing left intact.
+- [ ] **finish consolidation** — migrate order routing + the Python seeders (`seed_instruments.py`,
+      `broker_sync.py`) to read/write `instrument_xref` via the resolver, then retire
+      `provider_instrument`/`broker_instrument`; MIC→exchCode map (drop the US-only backfill
+      assumption); cockpit "Resolve" tool + `figi` in the instrument picker
 
 **Instrument Seeding**
 - [ ] cache Databento `definition` fetches to `.dbn` so resets replay offline (no refetch)

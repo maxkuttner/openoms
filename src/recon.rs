@@ -12,6 +12,9 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::adapters::BrokerRegistry;
+use crate::app_state::SymbologyEngine;
+use crate::symbology_resolver::{self, ResolveOutcome};
+use symbology::InstrumentQuery;
 
 const EPS: f64 = 1e-9;
 
@@ -150,6 +153,7 @@ impl From<sqlx::Error> for ReconError {
 pub async fn run_reconciliation(
     pool: &PgPool,
     registry: &BrokerRegistry,
+    engine: &SymbologyEngine,
     broker_connection_code: &str,
 ) -> Result<ReconSummary, ReconError> {
     let conn = sqlx::query("SELECT broker_code, environment FROM broker_connection WHERE code = $1")
@@ -175,7 +179,8 @@ pub async fn run_reconciliation(
     // Custodian side: resolve each holding to a master instrument via broker_instrument.
     let mut resolved = Vec::with_capacity(holdings.len());
     for h in &holdings {
-        let instrument_id: Option<i64> = sqlx::query_scalar(
+        // Fast path: the broker symbology bridge.
+        let mut instrument_id: Option<i64> = sqlx::query_scalar(
             "SELECT instrument_id FROM broker_instrument \
              WHERE broker_code = $1 AND (native_id = $2 OR broker_symbol = $3) \
              ORDER BY (native_id = $2) DESC NULLS LAST LIMIT 1",
@@ -185,6 +190,22 @@ pub async fn run_reconciliation(
         .bind(&h.symbol)
         .fetch_optional(pool)
         .await?;
+
+        // Fallback: identify via the symbology engine (OpenFIGI), which also caches an
+        // xref — so a security missing from broker_instrument still resolves.
+        if instrument_id.is_none() {
+            let query = InstrumentQuery {
+                ticker: Some(h.symbol.clone()),
+                exch_code: Some("US".to_string()),
+                ..Default::default()
+            };
+            if let Ok(ResolveOutcome::Resolved { instrument_id: Some(id), .. }) =
+                symbology_resolver::resolve(pool, engine, &query, "CUSTODIAN", &broker_code).await
+            {
+                instrument_id = Some(id);
+            }
+        }
+
         resolved.push(ResolvedHolding {
             instrument_id: instrument_id.map(|i| i.to_string()),
             symbol: h.symbol.clone(),

@@ -9,6 +9,7 @@ mod admin;
 mod risk_engine;
 mod positions;
 mod recon;
+mod symbology_resolver;
 
 use crate::adapters::BrokerRegistry;
 use crate::adapters::alpaca::AlpacaAdapter;
@@ -90,6 +91,8 @@ mod alpaca_stream;
         admin::run_recon,
         admin::list_recon_runs,
         admin::list_recon_breaks,
+        admin::resolve_symbology,
+        admin::backfill_symbology,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -106,6 +109,8 @@ mod alpaca_stream;
         admin::InstrumentSummary,
         admin::RunReconRequest, admin::ReconRunRow, admin::ReconBreakRow,
         crate::recon::ReconSummary, crate::recon::ReconBreak, crate::recon::BreakKind,
+        admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
+        crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -232,8 +237,21 @@ async fn main() {
         }
     }
 
+    // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
+    // (OPENFIGI_API_KEY) raises the limits and batch size.
+    let openfigi_key = env::var("OPENFIGI_API_KEY").ok();
+    if openfigi_key.is_some() {
+        info!("OpenFIGI: using API key");
+    } else {
+        info!("OPENFIGI_API_KEY not set — using unauthenticated OpenFIGI (lower limits)");
+    }
+    let symbology = symbology::Identifier::new(
+        symbology::OpenFigiClient::new(openfigi_key),
+        symbology::InMemoryCache::new(),
+    );
+
     // AppState
-    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client);
+    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client, symbology);
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -344,6 +362,8 @@ async fn main() {
         .route("/admin/recon/run", post(admin::run_recon))
         .route("/admin/recon/runs", get(admin::list_recon_runs))
         .route("/admin/recon/runs/:id/breaks", get(admin::list_recon_breaks))
+        .route("/admin/symbology/resolve", post(admin::resolve_symbology))
+        .route("/admin/symbology/backfill", post(admin::backfill_symbology))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let scalar_html = {

@@ -38,3 +38,6 @@ utoipa = { version = "4", features = ["uuid", "chrono"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
 domain = "0.12.1"
+
+# In-repo instrument identification (OpenFIGI symbology engine)
+symbology = { path = "crates/symbology" }

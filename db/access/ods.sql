@@ -9,6 +9,12 @@
 GRANT USAGE ON SCHEMA public TO oms_user;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO oms_user;
 
+-- Symbology: the OMS resolver (src/symbology_resolver.rs) stamps the FIGI/CUSIP
+-- anchors it discovers via OpenFIGI onto the master. A deliberately narrow write —
+-- only these two columns — since the OMS is the symbology authority. (Everything
+-- else in public stays read-only for oms_user; other catalog writes go via market_user.)
+GRANT UPDATE (figi, cusip) ON public.instrument TO oms_user;
+
 -- Every future master table mdm_master creates is readable by oms_user.
 ALTER DEFAULT PRIVILEGES FOR ROLE mdm_master IN SCHEMA public
     GRANT SELECT ON TABLES TO oms_user;

@@ -7,12 +7,15 @@ use axum::{
 use base64::engine::{general_purpose, Engine};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
 use crate::recon::{run_reconciliation, ReconError, ReconSummary};
+use crate::symbology_resolver::{self, ResolveError, ResolveOutcome};
+use symbology::InstrumentQuery;
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePrincipal {
@@ -1289,9 +1292,14 @@ pub async fn run_recon(
     Json(req): Json<RunReconRequest>,
 ) -> Result<Json<ReconSummary>, AdminError> {
     info!(broker_connection_code = %req.broker_connection_code, "admin run reconciliation");
-    let summary = run_reconciliation(state.pool(), state.registry().as_ref(), &req.broker_connection_code)
-        .await
-        .map_err(map_recon_error)?;
+    let summary = run_reconciliation(
+        state.pool(),
+        state.registry().as_ref(),
+        state.symbology().as_ref(),
+        &req.broker_connection_code,
+    )
+    .await
+    .map_err(map_recon_error)?;
     Ok(Json(summary))
 }
 
@@ -1332,6 +1340,123 @@ pub async fn list_recon_breaks(
     .await
     .map_err(map_db_error)?;
     Ok(Json(rows))
+}
+
+// ── Symbology (FIGI resolution) ───────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct ResolveRequest {
+    pub ticker: Option<String>,
+    pub isin: Option<String>,
+    pub cusip: Option<String>,
+    pub figi: Option<String>,
+    pub mic: Option<String>,
+    pub exch_code: Option<String>,
+    pub source_type: Option<String>,
+    pub source_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct BackfillRequest {
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct BackfillResult {
+    pub scanned: i64,
+    pub stamped: i64,
+    pub ambiguous: i64,
+    pub unresolved: i64,
+}
+
+fn map_resolve_error(err: ResolveError) -> AdminError {
+    match err {
+        ResolveError::Db(e) => AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("database error: {e}"),
+        },
+        ResolveError::Engine(e) => AdminError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("symbology engine error: {e}"),
+        },
+    }
+}
+
+#[utoipa::path(
+    post, path = "/admin/symbology/resolve", tag = "admin",
+    request_body = ResolveRequest,
+    responses((status = 200, description = "Resolution", body = ResolveOutcome)),
+    security(("bearer_token" = []))
+)]
+pub async fn resolve_symbology(
+    State(state): State<AppState>,
+    Json(req): Json<ResolveRequest>,
+) -> Result<Json<ResolveOutcome>, AdminError> {
+    let query = InstrumentQuery {
+        figi: req.figi,
+        isin: req.isin,
+        cusip: req.cusip,
+        ticker: req.ticker,
+        mic: req.mic,
+        exch_code: req.exch_code,
+        currency: None,
+        market_sec_des: None,
+    };
+    let source_type = req.source_type.unwrap_or_else(|| "MANUAL".to_string());
+    let source_code = req.source_code.unwrap_or_else(|| "MANUAL".to_string());
+    let outcome = symbology_resolver::resolve(
+        state.pool(),
+        state.symbology().as_ref(),
+        &query,
+        &source_type,
+        &source_code,
+    )
+    .await
+    .map_err(map_resolve_error)?;
+    Ok(Json(outcome))
+}
+
+#[utoipa::path(
+    post, path = "/admin/symbology/backfill", tag = "admin",
+    request_body = BackfillRequest,
+    responses((status = 200, description = "Backfill summary", body = BackfillResult)),
+    security(("bearer_token" = []))
+)]
+pub async fn backfill_symbology(
+    State(state): State<AppState>,
+    Json(req): Json<BackfillRequest>,
+) -> Result<Json<BackfillResult>, AdminError> {
+    let limit = req.limit.unwrap_or(50).clamp(1, 500);
+    info!(limit, "admin symbology backfill");
+    let rows = sqlx::query(
+        "SELECT id, symbol, venue FROM instrument \
+         WHERE figi IS NULL AND status = 'ACTIVE' ORDER BY id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    let mut result = BackfillResult { scanned: 0, stamped: 0, ambiguous: 0, unresolved: 0 };
+    for row in rows {
+        result.scanned += 1;
+        let symbol: String = row.get("symbol");
+        let venue: String = row.get("venue");
+        // exch_code "US" drives the OpenFIGI lookup (US-equity assumption for the current
+        // universe); mic = our venue is used to pin the master match.
+        let query = InstrumentQuery {
+            ticker: Some(symbol),
+            exch_code: Some("US".to_string()),
+            mic: Some(venue),
+            ..Default::default()
+        };
+        match symbology_resolver::resolve(state.pool(), state.symbology().as_ref(), &query, "OPENFIGI", "OPENFIGI").await {
+            Ok(ResolveOutcome::Resolved { instrument_id: Some(_), .. }) => result.stamped += 1,
+            Ok(ResolveOutcome::Ambiguous { .. }) => result.ambiguous += 1,
+            _ => result.unresolved += 1,
+        }
+    }
+    Ok(Json(result))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

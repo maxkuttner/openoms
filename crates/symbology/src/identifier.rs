@@ -96,11 +96,18 @@ pub fn build_job(q: &InstrumentQuery) -> Result<MappingJob, SymbologyError> {
     } else {
         return Err(SymbologyError::NoIdentifier);
     };
+    // Prefer exch_code for OpenFIGI; only fall back to mic_code when no exch_code is
+    // given (sending both can over-constrain and return no match).
+    let (exch_code, mic_code) = if q.exch_code.is_some() {
+        (q.exch_code.clone(), None)
+    } else {
+        (None, q.mic.clone())
+    };
     Ok(MappingJob {
         id_type: id_type.to_string(),
         id_value,
-        exch_code: q.exch_code.clone(),
-        mic_code: q.mic.clone(),
+        exch_code,
+        mic_code,
         currency: q.currency.clone(),
         market_sec_des: q.market_sec_des.clone(),
     })
