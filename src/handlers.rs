@@ -220,10 +220,12 @@ pub async fn orders_submit(
     }
 
     // Validate broker mapping exists and is tradeable; retrieve broker-specific symbol.
+    // Resolves through the unified instrument_xref (BROKER source).
     let broker_instrument_row = sqlx::query(
-        "SELECT broker_symbol, native_id, min_quantity::float8 AS min_quantity \
-         FROM broker_instrument \
-         WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
+        "SELECT external_symbol AS broker_symbol, external_native_id AS native_id, \
+                min_quantity::float8 AS min_quantity \
+         FROM instrument_xref \
+         WHERE instrument_id = $1 AND source_type = 'BROKER' AND source_code = $2 AND is_tradeable = true"
     )
     .bind(instrument_id_bigint)
     .bind(&broker_code)

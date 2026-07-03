@@ -306,20 +306,22 @@ def upsert(conn, instruments, derivatives):
         upserted = cur.fetchone()[0]
         skipped = len(instruments) - upserted
 
-        # provider_instrument: join staged rows back to instrument by (symbol, venue).
+        # provider symbology -> unified oms.instrument_xref (PROVIDER rows).
         cur.execute(
             """
             WITH ins AS (
-                INSERT INTO provider_instrument
-                    (instrument_id, provider_code, provider_symbol,
-                     provider_exchange, native_id)
-                SELECT i.id, %s, s.symbol, s.provider_exchange, s.native_id
+                INSERT INTO oms.instrument_xref
+                    (instrument_id, source_type, source_code, external_symbol,
+                     external_exchange, external_native_id, method, confidence)
+                SELECT i.id, 'PROVIDER', %s, s.symbol, s.provider_exchange, s.native_id,
+                       'seed_instruments', 'resolved'
                 FROM _stage_instrument s
                 JOIN instrument i ON i.symbol = s.symbol AND i.venue = s.venue
-                ON CONFLICT (instrument_id, provider_code) DO UPDATE SET
-                    provider_symbol = EXCLUDED.provider_symbol,
-                    provider_exchange = EXCLUDED.provider_exchange,
-                    native_id = EXCLUDED.native_id,
+                ON CONFLICT (source_type, source_code,
+                             COALESCE(external_native_id, ''), COALESCE(external_symbol, ''),
+                             COALESCE(external_exchange, ''))
+                DO UPDATE SET
+                    instrument_id = EXCLUDED.instrument_id,
                     updated_at = now()
                 RETURNING 1
             )

@@ -128,19 +128,19 @@ def upsert(conn: psycopg.Connection, rows: list[dict]) -> int:
     with conn.cursor() as cur:
         cur.executemany(
             """
-            INSERT INTO broker_instrument
-                (instrument_id, broker_code, broker_symbol, broker_exchange,
-                 native_id, is_tradeable, min_quantity)
+            INSERT INTO oms.instrument_xref
+                (instrument_id, source_type, source_code, external_symbol, external_exchange,
+                 external_native_id, is_tradeable, min_quantity, method, confidence)
             VALUES
-                (%(instrument_id)s, %(broker_code)s, %(broker_symbol)s, %(broker_exchange)s,
-                 %(native_id)s, %(is_tradeable)s, %(min_quantity)s)
-            ON CONFLICT (instrument_id, broker_code) DO UPDATE SET
-                broker_symbol = EXCLUDED.broker_symbol,
-                broker_exchange = EXCLUDED.broker_exchange,
-                native_id = EXCLUDED.native_id,
-                is_tradeable = EXCLUDED.is_tradeable,
-                min_quantity = EXCLUDED.min_quantity,
-                updated_at = now()
+                (%(instrument_id)s, 'BROKER', %(broker_code)s, %(broker_symbol)s, %(broker_exchange)s,
+                 %(native_id)s, %(is_tradeable)s, %(min_quantity)s, 'broker_sync', 'resolved')
+            ON CONFLICT (source_type, source_code,
+                         COALESCE(external_native_id, ''), COALESCE(external_symbol, ''), COALESCE(external_exchange, ''))
+            DO UPDATE SET
+                instrument_id = EXCLUDED.instrument_id,
+                is_tradeable  = EXCLUDED.is_tradeable,
+                min_quantity  = EXCLUDED.min_quantity,
+                updated_at    = now()
             """,
             rows,
         )

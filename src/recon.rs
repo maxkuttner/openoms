@@ -179,11 +179,12 @@ pub async fn run_reconciliation(
     // Custodian side: resolve each holding to a master instrument via broker_instrument.
     let mut resolved = Vec::with_capacity(holdings.len());
     for h in &holdings {
-        // Fast path: the broker symbology bridge.
+        // Fast path: the unified xref (BROKER source).
         let mut instrument_id: Option<i64> = sqlx::query_scalar(
-            "SELECT instrument_id FROM broker_instrument \
-             WHERE broker_code = $1 AND (native_id = $2 OR broker_symbol = $3) \
-             ORDER BY (native_id = $2) DESC NULLS LAST LIMIT 1",
+            "SELECT instrument_id FROM instrument_xref \
+             WHERE source_type = 'BROKER' AND source_code = $1 \
+               AND (external_native_id = $2 OR external_symbol = $3) \
+             ORDER BY (external_native_id = $2) DESC NULLS LAST LIMIT 1",
         )
         .bind(&broker_code)
         .bind(&h.native_id)

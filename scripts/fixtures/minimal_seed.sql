@@ -13,20 +13,23 @@ VALUES
      2, 0, 0.01, 1, 1)
 ON CONFLICT (symbol, venue) DO NOTHING;
 
--- Databento's view of it.
-INSERT INTO provider_instrument
-    (instrument_id, provider_code, provider_symbol, provider_exchange)
-SELECT id, 'DATABENTO', 'SPY', 'ARCX'
-FROM   instrument WHERE symbol = 'SPY' AND venue = 'ARCX'
-ON CONFLICT (instrument_id, provider_code) DO NOTHING;
-
--- Alpaca's view of it. native_id is SPY's Alpaca asset id (a global, account-
--- independent UUID), so the order path can route on it.
-INSERT INTO broker_instrument
-    (instrument_id, broker_code, broker_symbol, broker_exchange, native_id, is_tradeable)
-SELECT id, 'ALPACA', 'SPY', 'ARCA', 'b28f4066-5c6d-479b-a2af-85dc1a8f16fb', true
-FROM   instrument WHERE symbol = 'SPY' AND venue = 'ARCX'
-ON CONFLICT (instrument_id, broker_code) DO NOTHING;
+-- Symbology cross-reference (oms.instrument_xref): Databento's + Alpaca's view of SPY.
+-- native_id is SPY's Alpaca asset id (a global, account-independent UUID), so the
+-- order path can route on it.
+INSERT INTO oms.instrument_xref
+    (instrument_id, source_type, source_code, external_symbol, external_exchange,
+     external_native_id, is_tradeable, method, confidence)
+SELECT i.id, v.source_type, v.source_code, 'SPY', v.external_exchange, v.native_id,
+       v.is_tradeable, 'fixture', 'resolved'
+FROM   instrument i
+CROSS JOIN (VALUES
+    ('PROVIDER', 'DATABENTO', 'ARCX', NULL,                                   NULL::boolean),
+    ('BROKER',   'ALPACA',    'ARCA', 'b28f4066-5c6d-479b-a2af-85dc1a8f16fb', true)
+) AS v(source_type, source_code, external_exchange, native_id, is_tradeable)
+WHERE  i.symbol = 'SPY' AND i.venue = 'ARCX'
+ON CONFLICT (source_type, source_code,
+             COALESCE(external_native_id, ''), COALESCE(external_symbol, ''), COALESCE(external_exchange, ''))
+DO NOTHING;
 
 -- A test broker connection so an account can be created and orders can route.
 -- Creds are resolved from env by (broker_code, environment); this is just the
