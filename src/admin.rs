@@ -1442,11 +1442,10 @@ pub async fn backfill_symbology(
         result.scanned += 1;
         let symbol: String = row.get("symbol");
         let venue: String = row.get("venue");
-        // exch_code "US" drives the OpenFIGI lookup (US-equity assumption for the current
-        // universe); mic = our venue is used to pin the master match.
+        // Translate our MIC -> OpenFIGI exchCode for the lookup; mic pins the master match.
         let query = InstrumentQuery {
             ticker: Some(symbol),
-            exch_code: Some("US".to_string()),
+            exch_code: symbology::openfigi_exch_code(&venue).map(str::to_string),
             mic: Some(venue),
             ..Default::default()
         };

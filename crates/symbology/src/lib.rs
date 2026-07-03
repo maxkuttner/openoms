@@ -16,6 +16,7 @@
 
 mod cache;
 mod error;
+mod exchange;
 mod identifier;
 mod identity;
 mod openfigi;
@@ -24,6 +25,7 @@ mod query;
 
 pub use cache::{IdentityCache, InMemoryCache, NoCache};
 pub use error::SymbologyError;
+pub use exchange::openfigi_exch_code;
 pub use identifier::{build_job, disambiguate, interpret, DisambiguationPolicy, Identifier};
 pub use identity::{InstrumentIdentity, Resolution};
 pub use openfigi::OpenFigiClient;

@@ -21,8 +21,11 @@
       `seed_instruments` + the SPY fixture write it; **`broker_instrument`/`provider_instrument`
       dropped**. Verified: a SPY order routes with the legacy tables gone; xref carries broker
       order-config (is_tradeable/min_qty). One-time backfill in `db/scripts/backfill_xref.sql`.
-- [ ] polish: MIC→exchCode map (drop the US-only backfill assumption); cockpit "Resolve" tool +
-      `figi` in the instrument picker; refresh the stale `broker_instrument` doc-comments
+- [x] **MIC→exchCode map** — `symbology::openfigi_exch_code` translates our venue MIC to the
+      OpenFIGI exchCode (US venues → `US`; a starter set of intl); backfill/resolve no longer
+      assume US-only
+- [ ] polish: cockpit "Resolve" tool + `figi` in the instrument picker; refresh the stale
+      `broker_instrument` doc-comments/var-names
 
 **Instrument Seeding**
 - [ ] cache Databento `definition` fetches to `.dbn` so resets replay offline (no refetch)
