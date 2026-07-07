@@ -6,6 +6,7 @@ resolver = "2"
 name = "rustoms"
 version = "0.1.0"
 edition = "2021"
+default-run = "rustoms"
 
 [dependencies]
 axum = { version = "0.7", features = ["ws"] }
