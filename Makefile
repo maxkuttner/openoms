@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments sync-brokers
+.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments figi-backfill sync-brokers
 
 # Load .env into the recipe shell (one shell per recipe line, so chain with &&).
 ENV := set -a && . ./.env && set +a
@@ -45,6 +45,10 @@ seed-instruments: ## Seed instrument universes from Databento (interactive; UNIV
 	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
 		python3 scripts/seed_instruments.py \
 		$${UNIVERSE:+--universe $$UNIVERSE} $${UNIVERSE:---interactive}
+
+figi-backfill: ## Stamp FIGI onto FIGI-less master rows via OpenFIGI (run after seed-instruments; DRY_RUN=1, ARGS=... to pass flags)
+	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
+		cargo run --quiet --bin figi_backfill -- $${DRY_RUN:+--dry-run} $$ARGS
 
 sync-brokers: ## Sync broker_instrument from the broker catalog (needs ALPACA_PAPER_*)
 	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
