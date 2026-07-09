@@ -11,6 +11,7 @@ import { BrokerConnectionsPage } from "./pages/BrokerConnections";
 import { RiskLimitsPage } from "./pages/RiskLimits";
 import { BlotterPage } from "./pages/Blotter";
 import { ReconciliationPage } from "./pages/Reconciliation";
+import { UniversesPage } from "./pages/Universes";
 
 // Scalar's bundle is heavy — only load it when the API docs page is opened.
 const ApiDocsPage = lazy(() => import("./pages/ApiDocs").then((m) => ({ default: m.ApiDocsPage })));
@@ -22,6 +23,7 @@ const NAV = [
   { to: "/broker-connections", label: "Broker connections" },
   { to: "/risk-limits", label: "Risk limits" },
   { to: "/blotter", label: "Blotter" },
+  { to: "/universes", label: "Universes" },
   { to: "/reconciliation", label: "Reconciliation" },
   { to: "/api-docs", label: "API docs" },
 ];
@@ -100,6 +102,7 @@ export function App() {
           <Route path="/broker-connections" element={<BrokerConnectionsPage />} />
           <Route path="/risk-limits" element={<RiskLimitsPage />} />
           <Route path="/blotter" element={<BlotterPage />} />
+          <Route path="/universes" element={<UniversesPage />} />
           <Route path="/reconciliation" element={<ReconciliationPage />} />
           <Route
             path="/api-docs"

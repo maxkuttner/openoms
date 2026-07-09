@@ -112,3 +112,24 @@ export interface BlotterRow {
   created_at: string;
   updated_at: string;
 }
+
+export interface UniverseSummary {
+  code: string;
+  description: string | null;
+  provider_code: string;
+  category: string;
+  dataset: string;
+  option_dataset: string | null;
+  include_options: boolean;
+  enabled: boolean;
+  status: string;
+  last_seeded_at: string | null;
+  last_error: string | null;
+  instrument_count: number | null;
+}
+
+export interface EstimateResponse {
+  universe_code: string;
+  usd: number;
+  symbol_count: number | null;
+}

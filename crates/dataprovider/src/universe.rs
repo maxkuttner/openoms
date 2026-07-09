@@ -50,7 +50,7 @@ pub struct UniverseSpec {
     pub include_options: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostEstimate {
     pub universe_code: String,
     pub usd: f64,

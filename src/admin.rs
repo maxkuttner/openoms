@@ -1223,6 +1223,189 @@ pub async fn list_instruments(
     Ok(Json(records))
 }
 
+// ── Instrument universes ──────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct UniverseSummary {
+    pub code: String,
+    pub description: Option<String>,
+    pub provider_code: String,
+    pub category: String,
+    pub dataset: String,
+    pub option_dataset: Option<String>,
+    pub include_options: bool,
+    pub enabled: bool,
+    pub status: String,
+    pub last_seeded_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub instrument_count: Option<i32>,
+}
+
+/// List the instrument-universe catalog and its seed state (what is available,
+/// which are enabled, and when each was last loaded).
+#[utoipa::path(
+    get, path = "/admin/universes", tag = "admin",
+    responses((status = 200, description = "OK", body = [UniverseSummary])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_universes(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<UniverseSummary>>, AdminError> {
+    let records = sqlx::query_as::<_, UniverseSummary>(
+        "SELECT code, description, provider_code, category, dataset, option_dataset, \
+                include_options, enabled, status, last_seeded_at, last_error, instrument_count \
+         FROM instrument_universe \
+         ORDER BY category, code",
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(records))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct EstimateResponse {
+    pub universe_code: String,
+    pub usd: f64,
+    pub symbol_count: Option<i64>,
+}
+
+/// Free Databento cost estimate for seeding a single universe.
+#[utoipa::path(
+    get, path = "/admin/universes/{code}/estimate", tag = "admin",
+    params(("code" = String, Path, description = "Universe code")),
+    responses((status = 200, description = "OK", body = EstimateResponse)),
+    security(("bearer_token" = []))
+)]
+pub async fn estimate_universe(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<EstimateResponse>, AdminError> {
+    let est = crate::setup::universe::estimate(state.pool(), &code)
+        .await
+        .map_err(|e| AdminError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("estimate failed: {e}"),
+        })?
+        .ok_or_else(|| AdminError::not_found("universe"))?;
+    Ok(Json(EstimateResponse {
+        universe_code: est.universe_code,
+        usd: est.usd,
+        symbol_count: est.symbol_count.map(|n| n as i64),
+    }))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SeedRequest {
+    /// Abort if the estimated cost (USD) exceeds this. Omit to skip the gate.
+    pub max_cost: Option<f64>,
+    /// Run the enrichment pipeline (OpenFIGI). Defaults to true.
+    #[serde(default = "default_true")]
+    pub enrich: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SeedAccepted {
+    pub universe_code: String,
+    pub status: String,
+    pub estimate: EstimateResponse,
+}
+
+/// Seed a universe. Estimates + gates on `max_cost`, marks the universe
+/// `SEEDING`, and runs the fetch/upsert/enrich in the background. Poll
+/// `GET /admin/universes` for the terminal `SEEDED`/`ERROR` state.
+#[utoipa::path(
+    post, path = "/admin/universes/{code}/seed", tag = "admin",
+    params(("code" = String, Path, description = "Universe code")),
+    request_body = SeedRequest,
+    responses(
+        (status = 202, description = "Seeding started", body = SeedAccepted),
+        (status = 400, description = "Estimate exceeds max_cost"),
+        (status = 404, description = "Unknown universe"),
+        (status = 409, description = "Already seeding"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn seed_universe(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(req): Json<SeedRequest>,
+) -> Result<(StatusCode, Json<SeedAccepted>), AdminError> {
+    // Guard: universe exists and is not already mid-seed.
+    let current: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM instrument_universe WHERE code = $1")
+            .bind(&code)
+            .fetch_optional(state.pool())
+            .await
+            .map_err(map_db_error)?;
+    let Some((status,)) = current else {
+        return Err(AdminError::not_found("universe"));
+    };
+    if status == "SEEDING" {
+        return Err(AdminError {
+            status: StatusCode::CONFLICT,
+            message: "universe is already seeding".to_string(),
+        });
+    }
+
+    // Free estimate + cost gate before we commit to any billed fetch.
+    let est = crate::setup::universe::estimate(state.pool(), &code)
+        .await
+        .map_err(|e| AdminError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("estimate failed: {e}"),
+        })?
+        .ok_or_else(|| AdminError::not_found("universe"))?;
+    if let Some(max) = req.max_cost {
+        if est.usd > max {
+            return Err(AdminError {
+                status: StatusCode::BAD_REQUEST,
+                message: format!(
+                    "estimated ${:.4} exceeds max_cost ${max:.4}",
+                    est.usd
+                ),
+            });
+        }
+    }
+
+    // Mark SEEDING now so a poll sees it immediately, then run in the background.
+    sqlx::query(
+        "UPDATE instrument_universe \
+         SET status = 'SEEDING', last_error = NULL, updated_at = now() \
+         WHERE code = $1",
+    )
+    .bind(&code)
+    .execute(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    let pool = state.pool().clone();
+    let bg_code = code.clone();
+    let enrich = req.enrich;
+    tokio::spawn(async move {
+        if let Err(e) = crate::setup::universe::seed(&pool, &bg_code, enrich).await {
+            tracing::error!("background seed {bg_code} failed: {e}");
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SeedAccepted {
+            universe_code: code,
+            status: "SEEDING".to_string(),
+            estimate: EstimateResponse {
+                universe_code: est.universe_code,
+                usd: est.usd,
+                symbol_count: est.symbol_count.map(|n| n as i64),
+            },
+        }),
+    ))
+}
+
 // ── Custodian reconciliation ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

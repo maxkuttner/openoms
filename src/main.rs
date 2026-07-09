@@ -89,6 +89,9 @@ mod alpaca_stream;
         admin::update_risk_limit,
         admin::delete_risk_limit,
         admin::list_instruments,
+        admin::list_universes,
+        admin::estimate_universe,
+        admin::seed_universe,
         admin::run_recon,
         admin::list_recon_runs,
         admin::list_recon_breaks,
@@ -108,6 +111,7 @@ mod alpaca_stream;
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary,
+        admin::UniverseSummary, admin::EstimateResponse, admin::SeedRequest, admin::SeedAccepted,
         admin::RunReconRequest, admin::ReconRunRow, admin::ReconBreakRow,
         crate::recon::ReconSummary, crate::recon::ReconBreak, crate::recon::BreakKind,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
@@ -396,6 +400,9 @@ async fn serve() {
                 .delete(admin::delete_risk_limit),
         )
         .route("/admin/instruments", get(admin::list_instruments))
+        .route("/admin/universes", get(admin::list_universes))
+        .route("/admin/universes/:code/estimate", get(admin::estimate_universe))
+        .route("/admin/universes/:code/seed", post(admin::seed_universe))
         .route("/admin/recon/run", post(admin::run_recon))
         .route("/admin/recon/runs", get(admin::list_recon_runs))
         .route("/admin/recon/runs/:id/breaks", get(admin::list_recon_breaks))

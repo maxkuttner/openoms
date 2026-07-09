@@ -121,6 +121,75 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ------------------------------------------------------------------------
+// Reusable core (shared by the CLI above and the admin API)
+// ------------------------------------------------------------------------
+
+/// Free cost estimate for a single universe. `Ok(None)` if the code is unknown.
+pub async fn estimate(
+    pool: &PgPool,
+    code: &str,
+) -> Result<Option<CostEstimate>, Box<dyn std::error::Error>> {
+    let mut universes = load_universes(pool, Some(code), false).await?;
+    let Some(spec) = universes.pop() else {
+        return Ok(None);
+    };
+    let db = DatabentoClient::from_env()?;
+    db.set_catalog(vec![spec.clone()]).await;
+    Ok(Some(db.estimate_cost(&spec).await?))
+}
+
+/// Seed a single universe end to end: fetch → upsert → enrich, writing the
+/// universe's seed-state (`SEEDING` → `SEEDED`/`ERROR`) as it goes. Intended for
+/// the admin API's background task; the caller has already gated on cost.
+/// Runs in a spawned task, so the returned error must be `Send` — use `String`
+/// rather than a `Box<dyn Error>` that would poison the future's `Send` bound.
+pub async fn seed(pool: &PgPool, code: &str, enrich: bool) -> Result<(), String> {
+    let mut universes = load_universes(pool, Some(code), false)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(spec) = universes.pop() else {
+        return Err(format!("unknown universe: {code}"));
+    };
+
+    let db = DatabentoClient::from_env().map_err(|e| e.to_string())?;
+    db.set_catalog(vec![spec.clone()]).await;
+
+    let enrichers: Vec<Box<dyn Enricher>> = if enrich {
+        vec![Box::new(OpenFigiEnricher::new(env::var("OPENFIGI_API_KEY").ok()))]
+    } else {
+        Vec::new()
+    };
+
+    set_status(pool, &spec.code, "SEEDING", None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match seed_one(pool, &db, &spec, &enrichers).await.map_err(|e| e.to_string()) {
+        Ok(summary) => {
+            info!(
+                "{}: upserted={} skipped_fk={} derivatives={} provider_xref={} enriched={}",
+                spec.code,
+                summary.upserted,
+                summary.skipped_fk,
+                summary.derivatives,
+                summary.provider_xref,
+                summary.enriched
+            );
+            set_status(pool, &spec.code, "SEEDED", Some(summary.upserted as i32), None)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(msg) => {
+            warn!("{} failed: {msg}", spec.code);
+            set_status(pool, &spec.code, "ERROR", None, Some(&msg))
+                .await
+                .map_err(|e| e.to_string())?;
+            Err(msg)
+        }
+    }
+}
+
+// ------------------------------------------------------------------------
 // Per-universe work
 // ------------------------------------------------------------------------
 
