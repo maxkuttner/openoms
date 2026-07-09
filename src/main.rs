@@ -10,6 +10,7 @@ mod risk_engine;
 mod positions;
 mod recon;
 mod symbology_resolver;
+mod setup;
 
 use crate::adapters::BrokerRegistry;
 use crate::adapters::alpaca::AlpacaAdapter;
@@ -138,12 +139,48 @@ impl utoipa::Modify for SecurityAddon {
 
 
 
-// Main async entry point
+/// OMS command-line entry point. With no subcommand it runs the server (the
+/// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
+/// maintenance/seeding subcommand.
+#[derive(clap::Parser)]
+#[command(name = "oms", about = "OMS server + setup CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Setup / seeding subcommands.
+    #[command(subcommand)]
+    Setup(SetupCmd),
+}
+
+#[derive(clap::Subcommand)]
+enum SetupCmd {
+    /// Seed the master instrument universe from the configured providers.
+    Universe(setup::universe::Args),
+}
+
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+
+    let cli = <Cli as clap::Parser>::parse();
+    match cli.command {
+        Some(Command::Setup(SetupCmd::Universe(args))) => {
+            if let Err(e) = setup::universe::run(args).await {
+                error!("setup universe failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        None => serve().await,
+    }
+}
+
+// Server entry point (default when no subcommand is given).
+async fn serve() {
 
     // parse db config or panic
     let db_user = env::var("DB_USER").expect("DB_USER must be set");
