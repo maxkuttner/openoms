@@ -229,13 +229,22 @@ async fn seed_one(
         .into_iter()
         .collect();
 
+    // FK-filter, then dedup by the instrument conflict key (symbol, venue): a
+    // multi-day definition range can return the same instrument more than once,
+    // which would make a bulk `ON CONFLICT` statement touch a row twice
+    // ("cannot affect row a second time"). Last write wins. This key also covers
+    // the xref and derivative statements, whose conflict keys derive from it.
+    let mut dedup: HashMap<(&str, &str), &InstrumentDef> = HashMap::with_capacity(defs.len());
+    for d in &defs {
+        if !(venues.contains(&d.venue) && currencies.contains(&d.currency)) {
+            summary.skipped_fk += 1;
+            continue;
+        }
+        dedup.insert((d.symbol.as_str(), d.venue.as_str()), d);
+    }
     // Upsert equities before options so the underlying SPOT row is visible to the
     // derivative join (same transaction sees its own writes).
-    let mut valid: Vec<&InstrumentDef> = defs
-        .iter()
-        .filter(|d| venues.contains(&d.venue) && currencies.contains(&d.currency))
-        .collect();
-    summary.skipped_fk = (defs.len() - valid.len()) as u64;
+    let mut valid: Vec<&InstrumentDef> = dedup.into_values().collect();
     valid.sort_by_key(|d| d.derivative.is_some());
 
     let mut tx = pool.begin().await?;
