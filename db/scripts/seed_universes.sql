@@ -32,13 +32,8 @@ VALUES
     -- Futures
     ('GLBX_MDP3',      'CME Globex (MDP 3.0)',                  'FUTURE', 'GLBX.MDP3',      NULL, 'raw_symbol', false, false),
     ('IFEU_IMPACT',    'ICE Futures Europe (iMpact)',           'FUTURE', 'IFEU.IMPACT',    NULL, 'raw_symbol', false, false),
-    ('NDEX_IMPACT',    'ICE Endex (iMpact)',                    'FUTURE', 'NDEX.IMPACT',    NULL, 'raw_symbol', false, false),
-    -- Curated example: a single underlying + its OPRA option chain
-    ('SPY_OPTIONS',    'SPY equity + its OPRA option chain',    'EQUITY', 'ARCX.PILLAR', 'OPRA.PILLAR', 'raw_symbol', true, false)
+    ('NDEX_IMPACT',    'ICE Endex (iMpact)',                    'FUTURE', 'NDEX.IMPACT',    NULL, 'raw_symbol', false, false)
 ON CONFLICT (code) DO NOTHING;
 
--- Constituent symbols. Universes absent here are whole-dataset (ALL_SYMBOLS).
-INSERT INTO instrument_universe_symbol (universe_code, symbol)
-VALUES
-    ('SPY_OPTIONS', 'SPY')
-ON CONFLICT (universe_code, symbol) DO NOTHING;
+-- Option universes (e.g. OPRA_PILLAR) get their underlyings from the cockpit
+-- picker at seed time, written to instrument_universe_symbol; none are seeded here.
