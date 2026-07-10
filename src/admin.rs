@@ -1342,7 +1342,6 @@ fn default_true() -> bool {
 pub struct SeedAccepted {
     pub universe_code: String,
     pub status: String,
-    pub estimate: EstimateResponse,
 }
 
 /// Seed a universe. Estimates + gates on `max_cost`, marks the universe
@@ -1353,8 +1352,8 @@ pub struct SeedAccepted {
     params(("code" = String, Path, description = "Universe code")),
     request_body = SeedRequest,
     responses(
-        (status = 202, description = "Seeding started", body = SeedAccepted),
-        (status = 400, description = "Estimate exceeds max_cost"),
+        (status = 202, description = "Seeding started (cost gate + errors surface async as ERROR)", body = SeedAccepted),
+        (status = 400, description = "OPTION universe has no underlyings"),
         (status = 404, description = "Unknown universe"),
         (status = 409, description = "Already seeding"),
     ),
@@ -1382,30 +1381,13 @@ pub async fn seed_universe(
         });
     }
 
-    // OPTION universes must have underlyings — reject with 400 before any provider call.
+    // OPTION universes must have underlyings — reject with 400 before spawning.
     ensure_seedable(&state, &code).await?;
 
-    // Free estimate + cost gate before we commit to any billed fetch.
-    let est = crate::setup::universe::estimate(state.pool(), &code)
-        .await
-        .map_err(|e| AdminError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("estimate failed: {e}"),
-        })?
-        .ok_or_else(|| AdminError::not_found("universe"))?;
-    if let Some(max) = req.max_cost {
-        if est.usd > max {
-            return Err(AdminError {
-                status: StatusCode::BAD_REQUEST,
-                message: format!(
-                    "estimated ${:.4} exceeds max_cost ${max:.4}",
-                    est.usd
-                ),
-            });
-        }
-    }
-
-    // Mark SEEDING now so a poll sees it immediately, then run in the background.
+    // Mark SEEDING now so a poll sees it immediately, then run everything —
+    // including the cost estimate/gate — in the background so this request
+    // returns at once (the estimate can be slow, and Databento's get_cost is
+    // flaky). Over-budget or fetch failure lands as ERROR + last_error.
     sqlx::query(
         "UPDATE instrument_universe \
          SET status = 'SEEDING', last_error = NULL, updated_at = now() \
@@ -1419,8 +1401,9 @@ pub async fn seed_universe(
     let pool = state.pool().clone();
     let bg_code = code.clone();
     let enrich = req.enrich;
+    let max_cost = req.max_cost;
     tokio::spawn(async move {
-        if let Err(e) = crate::setup::universe::seed(&pool, &bg_code, enrich).await {
+        if let Err(e) = crate::setup::universe::seed(&pool, &bg_code, enrich, max_cost).await {
             tracing::error!("background seed {bg_code} failed: {e}");
         }
     });
@@ -1430,11 +1413,6 @@ pub async fn seed_universe(
         Json(SeedAccepted {
             universe_code: code,
             status: "SEEDING".to_string(),
-            estimate: EstimateResponse {
-                universe_code: est.universe_code,
-                usd: est.usd,
-                symbol_count: est.symbol_count.map(|n| n as i64),
-            },
         }),
     ))
 }

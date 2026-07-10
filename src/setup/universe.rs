@@ -160,12 +160,18 @@ fn require_underlyings(spec: &UniverseSpec) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Seed a single universe end to end: fetch → upsert → enrich, writing the
-/// universe's seed-state (`SEEDING` → `SEEDED`/`ERROR`) as it goes. Intended for
-/// the admin API's background task; the caller has already gated on cost.
+/// Seed a single universe end to end: (optionally) gate on cost → fetch → upsert
+/// → enrich, writing the universe's seed-state (`SEEDING` → `SEEDED`/`ERROR`) as
+/// it goes. Intended for the admin API's background task — everything, including
+/// the cost estimate/gate, runs here so the HTTP request returns immediately.
 /// Runs in a spawned task, so the returned error must be `Send` — use `String`
 /// rather than a `Box<dyn Error>` that would poison the future's `Send` bound.
-pub async fn seed(pool: &PgPool, code: &str, enrich: bool) -> Result<(), String> {
+pub async fn seed(
+    pool: &PgPool,
+    code: &str,
+    enrich: bool,
+    max_cost: Option<f64>,
+) -> Result<(), String> {
     let mut universes = load_universes(pool, Some(code), false)
         .await
         .map_err(|e| e.to_string())?;
@@ -176,6 +182,20 @@ pub async fn seed(pool: &PgPool, code: &str, enrich: bool) -> Result<(), String>
 
     let db = DatabentoClient::from_env().map_err(|e| e.to_string())?;
     db.set_catalog(vec![spec.clone()]).await;
+
+    // Cost gate — only estimate when there is a budget to enforce. Skipping it
+    // otherwise avoids a dependency on Databento's flaky metadata.get_cost and
+    // keeps the definition-schema seed (≈$0) fast.
+    if let Some(max) = max_cost {
+        let est = db.estimate_cost(&spec).await.map_err(|e| e.to_string())?;
+        if est.usd > max {
+            let msg = format!("estimated ${:.4} exceeds max_cost ${max:.4}", est.usd);
+            set_status(pool, &spec.code, "ERROR", None, Some(&msg))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Err(msg);
+        }
+    }
 
     let enrichers: Vec<Box<dyn Enricher>> = if enrich {
         vec![Box::new(OpenFigiEnricher::new(env::var("OPENFIGI_API_KEY").ok()))]
