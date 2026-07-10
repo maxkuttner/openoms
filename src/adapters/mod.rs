@@ -1,4 +1,5 @@
 pub mod alpaca;
+pub mod binance;
 pub mod ibkr;
 
 use std::collections::HashMap;
@@ -61,7 +62,17 @@ impl std::fmt::Display for BrokerError {
 #[async_trait::async_trait]
 pub trait BrokerAdapter: Send + Sync {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError>;
-    async fn cancel_order(&self, external_order_id: &str) -> Result<(), BrokerError>;
+    /// `symbol` is the broker-native symbol for the order — required by venues
+    /// (e.g. Binance) that scope cancels by symbol; ignored by those that don't
+    /// (e.g. Alpaca).
+    async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError>;
+    /// Custodian-side holdings for reconciliation. Adapters that don't support it
+    /// return `NotConfigured` (the default) and are skipped by recon.
+    async fn get_positions(&self) -> Result<Vec<BrokerHolding>, BrokerError> {
+        Err(BrokerError::NotConfigured(
+            "positions not supported by this adapter".to_string(),
+        ))
+    }
 }
 
 /// Registry keyed by (broker_code, environment) — e.g. ("ALPACA", "PAPER").

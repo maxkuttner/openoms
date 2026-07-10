@@ -39,7 +39,7 @@ impl BrokerAdapter for IbkrAdapter {
         ))
     }
 
-    async fn cancel_order(&self, _external_order_id: &str) -> Result<(), BrokerError> {
+    async fn cancel_order(&self, _external_order_id: &str, _symbol: &str) -> Result<(), BrokerError> {
         // TODO: implement session auth and order cancellation
         Err(BrokerError::NotConfigured(
             "IBKR adapter not yet implemented".to_string(),

@@ -705,7 +705,26 @@ pub async fn orders_cancel(
                 message: format!("no adapter configured for {broker_code}/{environment}"),
             })?;
 
-        adapter.cancel_order(&ext).await.map_err(|err| ApiError {
+        // The broker-native symbol — required by venues that scope cancels by
+        // symbol (Binance). Resolve from the same BROKER xref the submit used.
+        // order_state.instrument_id is TEXT (stringified bigint); the xref key is BIGINT.
+        let instrument_id_num: i64 = row.get::<String, _>("instrument_id").parse().unwrap_or_default();
+        let broker_symbol: String = sqlx::query_scalar(
+            "SELECT external_symbol FROM oms.instrument_xref \
+             WHERE instrument_id = $1 AND source_type = 'BROKER' AND source_code = $2 \
+             LIMIT 1",
+        )
+        .bind(instrument_id_num)
+        .bind(&broker_code)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to resolve broker symbol: {:?}", err),
+        })?
+        .unwrap_or_default();
+
+        adapter.cancel_order(&ext, &broker_symbol).await.map_err(|err| ApiError {
             status: StatusCode::BAD_GATEWAY,
             message: format!("broker rejected cancel: {err}"),
         })?;

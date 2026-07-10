@@ -14,6 +14,7 @@ mod setup;
 
 use crate::adapters::BrokerRegistry;
 use crate::adapters::alpaca::AlpacaAdapter;
+use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
@@ -46,7 +47,9 @@ use tracing_subscriber;
 use utoipa::OpenApi;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 mod kafka;
+mod execution;
 mod alpaca_stream;
+mod binance_stream;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -282,6 +285,40 @@ async fn serve() {
         }
     }
 
+    // Binance Spot Testnet → BINANCE/PAPER. Ed25519 key: an API key id plus the
+    // path to its PKCS#8 PEM private key (required for the WS-API user-data stream,
+    // and used for REST signing too). Keep the concrete Arc for the stream.
+    let binance_paper: Option<std::sync::Arc<BinanceAdapter>> = match (
+        env::var("BINANCE_PAPER_API_KEY"),
+        env::var("BINANCE_PAPER_PRIVATE_KEY_PATH"),
+    ) {
+        (Ok(key), Ok(path)) if !key.is_empty() && !path.is_empty() => {
+            use std::sync::Arc;
+            match std::fs::read_to_string(&path) {
+                Ok(pem) => match BinanceAdapter::new(key, &pem, "PAPER") {
+                    Ok(adapter) => {
+                        let adapter = Arc::new(adapter);
+                        registry.register("BINANCE", "PAPER", adapter.clone());
+                        info!("registered BINANCE/PAPER adapter");
+                        Some(adapter)
+                    }
+                    Err(e) => {
+                        error!("BINANCE/PAPER adapter not registered: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    error!("BINANCE/PAPER adapter not registered: cannot read {path}: {e}");
+                    None
+                }
+            }
+        }
+        _ => {
+            info!("BINANCE_PAPER_API_KEY / BINANCE_PAPER_PRIVATE_KEY_PATH not set — BINANCE/PAPER adapter not registered");
+            None
+        }
+    };
+
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
     // (OPENFIGI_API_KEY) raises the limits and batch size.
     let openfigi_key = env::var("OPENFIGI_API_KEY").ok();
@@ -326,6 +363,11 @@ async fn serve() {
                 tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter));
             }
         }
+    }
+
+    // Spawn the Binance user-data stream when configured.
+    if let Some(adapter) = binance_paper {
+        tokio::spawn(binance_stream::run("PAPER", String::new(), String::new(), state.pool().clone(), state.kafka().cloned(), adapter));
     }
 
     // Register routes

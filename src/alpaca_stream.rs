@@ -1,4 +1,3 @@
-use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sqlx::{PgPool, Row};
 use tokio::time::{sleep, Duration};
@@ -9,16 +8,9 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use crate::adapters::alpaca::AlpacaAdapter;
-use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
-use crate::domain::orders::commands::{ExecutionReport, OrderCommand, ReceiveExecutionReport};
-use crate::domain::orders::events::OrderEventPayload;
-use crate::domain::orders::state::OrderAggregateState;
-use crate::event_store::{NewOrderEvent, OrderEventStore};
-use crate::positions;
-use crate::handlers::{
-    parse_order_side, parse_order_status, parse_order_type, parse_time_in_force,
-};
-use crate::kafka::{publish_events, KafkaClient};
+use crate::domain::orders::commands::ExecutionReport;
+use crate::execution::process_execution_report;
+use crate::kafka::KafkaClient;
 
 pub async fn run(
     environment: &'static str,
@@ -124,7 +116,7 @@ async fn reconcile_routed_orders(pool: &PgPool, kafka: &Option<KafkaClient>, ada
             }
         };
 
-        match process_execution_report(pool, kafka, order_id, report).await {
+        match process_execution_report(pool, kafka, order_id, report, "alpaca").await {
             Ok(()) => info!(order_id = %order_id, alpaca_status = status, "reconciliation: applied missed fill"),
             Err(e) => error!(order_id = %order_id, error = %e, "reconciliation: failed to apply execution report"),
         }
@@ -270,7 +262,7 @@ async fn handle_trade_update(
         }
     };
 
-    match process_execution_report(pool, kafka, order_id, report).await {
+    match process_execution_report(pool, kafka, order_id, report, "alpaca").await {
         Ok(()) => {}
         Err(e) => {
             error!(order_id = %order_id, error = %e, "Alpaca stream: failed to process execution report");
@@ -280,175 +272,3 @@ async fn handle_trade_update(
     Ok(())
 }
 
-async fn process_execution_report(
-    pool: &PgPool,
-    kafka: &Option<KafkaClient>,
-    order_id: Uuid,
-    report: ExecutionReport,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let event_store = OrderEventStore::new(pool.clone());
-    let mut tx = pool.begin().await?;
-
-    let row = sqlx::query(
-        r#"
-        SELECT
-            order_id, client_order_id, portfolio_id, account_id, instrument_id,
-            side, order_type, time_in_force,
-            limit_price::double precision AS limit_price,
-            original_qty::double precision AS original_qty,
-            leaves_qty::double precision AS leaves_qty,
-            cum_qty::double precision AS cum_qty,
-            avg_px::double precision AS avg_px,
-            status, resume_to_status, version
-        FROM order_state
-        WHERE order_id = $1
-        "#,
-    )
-    .bind(order_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let row = match row {
-        Some(r) => r,
-        None => {
-            warn!(order_id = %order_id, "Alpaca stream: order not found in DB, skipping");
-            return Ok(());
-        }
-    };
-
-    let current_status: &str = row.get("status");
-    if matches!(current_status, "filled" | "rejected" | "canceled" | "expired") {
-        warn!(order_id = %order_id, status = current_status, "Alpaca stream: order already in terminal state, skipping duplicate event");
-        return Ok(());
-    }
-
-    // Reuse parse helpers from handlers — map errors to strings for the boxed error type
-    let side = parse_order_side(row.get("side")).map_err(|e| e.message.clone())?;
-    let order_type = parse_order_type(row.get("order_type")).map_err(|e| e.message.clone())?;
-    let time_in_force = parse_time_in_force(row.get("time_in_force")).map_err(|e| e.message.clone())?;
-    let status = parse_order_status(row.get("status")).map_err(|e| e.message.clone())?;
-    let resume_to_status = row
-        .get::<Option<String>, _>("resume_to_status")
-        .map(parse_order_status)
-        .transpose()
-        .map_err(|e| e.message.clone())?;
-
-    let state = OrderAggregateState {
-        order_id: row.get::<Uuid, _>("order_id").to_string(),
-        client_order_id: row.get("client_order_id"),
-        portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
-        account_id: row.get::<Uuid, _>("account_id").to_string(),
-        instrument_id: row.get("instrument_id"),
-        side,
-        order_type,
-        time_in_force,
-        limit_price: row.get("limit_price"),
-        original_qty: row.get("original_qty"),
-        leaves_qty: row.get("leaves_qty"),
-        cum_qty: row.get("cum_qty"),
-        avg_px: row.get("avg_px"),
-        status,
-        resume_to_status,
-        version: row.get("version"),
-    };
-
-    let expected_version = state.version;
-    let aggregate = OrderAggregate::from_state(state);
-    let metadata = EventMetadata {
-        event_id: Uuid::new_v4().to_string(),
-        timestamp: Utc::now(),
-        actor: "alpaca".to_string(),
-    };
-
-    let cmd = ReceiveExecutionReport {
-        order_id: order_id.to_string(),
-        report,
-    };
-
-    let events = match aggregate.decide(OrderCommand::ReceiveExecutionReport(cmd), metadata) {
-        Ok(evts) => evts,
-        Err(rejection) => {
-            warn!(order_id = %order_id, reason = %rejection.message, "Alpaca stream: state machine rejected execution report, skipping");
-            return Ok(());
-        }
-    };
-
-    let mut applied = aggregate;
-    for event in &events {
-        applied.apply(event).map_err(|e| format!("apply failed: {e:?}"))?;
-    }
-
-    let new_state = applied.state.ok_or("missing aggregate state after apply")?;
-
-    sqlx::query(
-        r#"
-        UPDATE order_state
-        SET
-            status          = $2,
-            leaves_qty      = $3,
-            cum_qty         = $4,
-            avg_px          = $5,
-            version         = $6,
-            updated_at      = now()
-        WHERE order_id = $1 AND version = $7
-        "#,
-    )
-    .bind(order_id)
-    .bind(new_state.status.as_str())
-    .bind(new_state.leaves_qty)
-    .bind(new_state.cum_qty)
-    .bind(new_state.avg_px)
-    .bind(new_state.version)
-    .bind(expected_version)
-    .execute(&mut *tx)
-    .await?;
-
-    // Maintain the position projection from any fill events, in the same tx so it
-    // commits atomically with the order_state update + event append below.
-    let portfolio_uuid = Uuid::parse_str(&new_state.portfolio_id)?;
-    for event in &events {
-        let (fill_qty, fill_price) = match &event.payload {
-            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (*fill_qty, *fill_price),
-            _ => continue,
-        };
-        positions::persist_fill(
-            &mut *tx,
-            portfolio_uuid,
-            &new_state.instrument_id,
-            new_state.side,
-            fill_qty,
-            fill_price,
-        )
-        .await?;
-    }
-
-    let new_events: Vec<NewOrderEvent> = events
-        .iter()
-        .map(|e| {
-            let payload = serde_json::to_value(e).unwrap_or_default();
-            NewOrderEvent {
-                event_id: e.event_id.clone(),
-                event_type: e.event_type.as_str().to_string(),
-                actor: e.actor.clone(),
-                payload,
-                correlation_id: None,
-                causation_id: None,
-                schema_version: 0,
-            }
-        })
-        .collect();
-
-    event_store
-        .append_events_in_tx(&mut tx, order_id, expected_version, &new_events)
-        .await
-        .map_err(|e| format!("event store error: {e:?}"))?;
-
-    tx.commit().await?;
-
-    info!(order_id = %order_id, status = new_state.status.as_str(), "execution report applied");
-
-    publish_events(kafka.as_ref(), &order_id.to_string(), &events).await;
-
-    Ok(())
-}
