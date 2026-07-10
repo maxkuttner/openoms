@@ -203,6 +203,12 @@ pub async fn seed(
         Vec::new()
     };
 
+    info!(
+        "seeding universe {} (enrich={}, {} underlying(s)) …",
+        spec.code,
+        enrich,
+        spec.symbols.len()
+    );
     set_status(pool, &spec.code, "SEEDING", None, None)
         .await
         .map_err(|e| e.to_string())?;
@@ -253,7 +259,14 @@ async fn seed_one(
     spec: &UniverseSpec,
     enrichers: &[Box<dyn Enricher>],
 ) -> Result<SeedSummary, Box<dyn std::error::Error>> {
+    let t_fetch = std::time::Instant::now();
     let defs = db.fetch_definitions(spec).await?;
+    info!(
+        "{}: fetched {} definitions in {:.1}s",
+        spec.code,
+        defs.len(),
+        t_fetch.elapsed().as_secs_f64()
+    );
     if defs.is_empty() {
         info!("{}: no mappable instruments.", spec.code);
         return Ok(SeedSummary::default());
@@ -301,6 +314,14 @@ async fn seed_one(
     let mut valid: Vec<&InstrumentDef> = dedup.into_values().collect();
     valid.sort_by_key(|d| d.derivative.is_some());
 
+    info!(
+        "{}: upserting {} instruments ({} skipped_fk, {} expired) …",
+        spec.code,
+        valid.len(),
+        summary.skipped_fk,
+        summary.skipped_expired
+    );
+    let t_upsert = std::time::Instant::now();
     let mut tx = pool.begin().await?;
 
     // 1. Bulk-upsert instruments, chunked; collect the (symbol, venue) -> id map.
@@ -325,10 +346,25 @@ async fn seed_one(
     }
 
     tx.commit().await?;
+    info!(
+        "{}: upserted {} instruments ({} derivatives, {} xref) in {:.1}s",
+        spec.code,
+        summary.upserted,
+        summary.derivatives,
+        summary.provider_xref,
+        t_upsert.elapsed().as_secs_f64()
+    );
 
     // Enricher pipeline (fills Identifiers, persists figi/cusip/isin + xref).
     if !enrichers.is_empty() {
+        let t_enrich = std::time::Instant::now();
         summary.enriched = run_enrichers(pool, enrichers, &defs).await?;
+        info!(
+            "{}: enriched {} instruments in {:.1}s",
+            spec.code,
+            summary.enriched,
+            t_enrich.elapsed().as_secs_f64()
+        );
     }
 
     Ok(summary)
@@ -532,14 +568,23 @@ async fn run_enrichers(
     if working.is_empty() {
         return Ok(0);
     }
+    info!(
+        "enriching {} SPOT symbol(s) via {} enricher(s) — this is the slow phase (external lookups + per-row writes)",
+        working.len(),
+        enrichers.len()
+    );
 
     let mut stamped = 0u64;
     for enricher in enrichers {
         let report = enricher.enrich(&mut working).await?;
-        for (symbol, venue) in &report.resolved {
+        let total = report.resolved.len();
+        for (i, (symbol, venue)) in report.resolved.iter().enumerate() {
             if let Some(d) = working.iter().find(|d| &d.symbol == symbol && &d.venue == venue) {
                 persist_identifiers(pool, d, enricher.code()).await?;
                 stamped += 1;
+            }
+            if (i + 1) % 500 == 0 {
+                info!("  {} enrich: persisted {}/{}", enricher.code(), i + 1, total);
             }
         }
     }
