@@ -35,16 +35,22 @@ function SeedModal({
   const opened = universe !== null;
   const code = universe?.code;
 
-  // Fetch the free estimate whenever the modal opens for a universe.
+  const [estimateFailed, setEstimateFailed] = useState(false);
+
+  // Fetch the free estimate whenever the modal opens. Best-effort: Databento's
+  // get_cost is flaky for definition schema, and the estimate is informational
+  // (definitions are ~free; the seed doesn't need it unless a max_cost is set).
+  // So on failure we degrade to "unavailable" rather than a blocking error toast.
   useEffect(() => {
     if (!code) return;
     let live = true;
     setEstimate(null);
+    setEstimateFailed(false);
     setEstimating(true);
     api
       .get<EstimateResponse>(`/admin/universes/${code}/estimate`)
       .then((e) => { if (live) setEstimate(e); })
-      .catch((err) => { if (live) notifyError(err); })
+      .catch(() => { if (live) setEstimateFailed(true); })
       .finally(() => { if (live) setEstimating(false); });
     return () => { live = false; };
   }, [code]);
@@ -74,12 +80,17 @@ function SeedModal({
       <Stack>
         <Text size="sm" c="dimmed">{universe?.description}</Text>
 
-        <Alert color="blue" variant="light" title="Estimated cost (Databento)">
+        <Alert color={estimateFailed ? "gray" : "blue"} variant="light" title="Estimated cost (Databento)">
           {estimating && <Loader size="xs" />}
           {estimate && (
             <Text size="sm">
               <b>${estimate.usd.toFixed(4)}</b>
               {estimate.symbol_count != null && ` · ${estimate.symbol_count} symbol(s)`}
+            </Text>
+          )}
+          {estimateFailed && (
+            <Text size="sm" c="dimmed">
+              Estimate unavailable (Databento cost API). Definition data is ~free; seeding is unaffected.
             </Text>
           )}
         </Alert>
