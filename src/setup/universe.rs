@@ -2,7 +2,7 @@
 //!
 //! The seeding framework: it is provider- and enricher-agnostic. It drives a
 //! [`UniverseSource`] (Databento) and a `Vec<Box<dyn Enricher>>` (OpenFIGI today):
-//!   1. Load enabled universes from `public.instrument_universe` (+ child symbols).
+//!   1. Load universes from `public.instrument_universe` (+ child symbols).
 //!   2. Ask the provider for a free cost estimate per universe.
 //!   3. Print a cost table + interactive y/N confirm.
 //!   4. Fetch definitions, upsert `instrument` + `instrument_derivative` +
@@ -27,12 +27,9 @@ use tracing::{info, warn};
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
-    /// Seed exactly this universe code (skips the enabled filter).
+    /// Seed exactly this universe code. Omit to operate on every universe.
     #[arg(long)]
     pub universe: Option<String>,
-    /// Seed every universe with `enabled = true` in the catalog.
-    #[arg(long)]
-    pub all_enabled: bool,
     /// Estimate + print cost table only; no fetch, no writes.
     #[arg(long)]
     pub dry_run: bool,
@@ -49,9 +46,9 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&database_url()?).await?;
-    let universes = load_universes(&pool, args.universe.as_deref(), args.all_enabled).await?;
+    let universes = load_universes(&pool, args.universe.as_deref()).await?;
     if universes.is_empty() {
-        info!("no universes to seed (use --universe CODE or --all-enabled).");
+        info!("no universes to seed.");
         return Ok(());
     }
 
@@ -90,21 +87,30 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut failures: Vec<String> = Vec::new();
     for u in &universes {
+        if let Err(e) = require_underlyings(u) {
+            warn!("skipping {}: {e}", u.code);
+            set_status(&pool, &u.code, "ERROR", None, Some(&e.to_string())).await?;
+            failures.push(u.code.clone());
+            continue;
+        }
         info!("seeding universe {} …", u.code);
         set_status(&pool, &u.code, "SEEDING", None, None).await?;
 
         match seed_one(&pool, &db, u, &enrichers).await {
             Ok(summary) => {
                 info!(
-                    "{}: upserted={} skipped_fk={} derivatives={} provider_xref={} enriched={}",
+                    "{}: upserted={} skipped_fk={} skipped_expired={} derivatives={} provider_xref={} enriched={}",
                     u.code,
                     summary.upserted,
                     summary.skipped_fk,
+                    summary.skipped_expired,
                     summary.derivatives,
                     summary.provider_xref,
                     summary.enriched
                 );
-                set_status(&pool, &u.code, "SEEDED", Some(summary.upserted as i32), None).await?;
+                let (status, note) = terminal_status(&pool, u).await;
+                set_status(&pool, &u.code, status, Some(summary.upserted as i32), note.as_deref())
+                    .await?;
             }
             Err(e) => {
                 warn!("{} failed: {e}", u.code);
@@ -121,6 +127,170 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ------------------------------------------------------------------------
+// Reusable core (shared by the CLI above and the admin API)
+// ------------------------------------------------------------------------
+
+/// Free cost estimate for a single universe. `Ok(None)` if the code is unknown.
+pub async fn estimate(
+    pool: &PgPool,
+    code: &str,
+) -> Result<Option<CostEstimate>, Box<dyn std::error::Error>> {
+    let mut universes = load_universes(pool, Some(code)).await?;
+    let Some(spec) = universes.pop() else {
+        return Ok(None);
+    };
+    require_underlyings(&spec)?;
+    // OPTION universes: Databento's get_cost over OPRA parent symbols is
+    // pathologically slow (~12s for one underlying, 504 gateway timeout for 2+),
+    // and definition-schema cost is effectively $0 anyway. Skip the call and
+    // report a symbolic zero rather than hang/504.
+    if matches!(spec.category, Category::Option) {
+        return Ok(Some(CostEstimate {
+            universe_code: spec.code.clone(),
+            usd: 0.0,
+            symbol_count: Some(spec.symbols.len()),
+        }));
+    }
+    let db = DatabentoClient::from_env()?;
+    db.set_catalog(vec![spec.clone()]).await;
+    Ok(Some(db.estimate_cost(&spec).await?))
+}
+
+/// OPTION universes must name their underlyings — seeding the whole OPRA tape
+/// (`ALL`) is ~1.5M contracts and not allowed. Equity/future universes may be
+/// whole-dataset.
+fn require_underlyings(spec: &UniverseSpec) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(spec.category, Category::Option) && spec.symbols.is_empty() {
+        return Err(format!(
+            "OPTION universe {} has no underlyings — pick underlyings before seeding (ALL is not allowed for options)",
+            spec.code
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Seed a single universe end to end: (optionally) gate on cost → fetch → upsert
+/// → enrich, writing the universe's seed-state (`SEEDING` → `SEEDED`/`ERROR`) as
+/// it goes. Intended for the admin API's background task — everything, including
+/// the cost estimate/gate, runs here so the HTTP request returns immediately.
+/// Runs in a spawned task, so the returned error must be `Send` — use `String`
+/// rather than a `Box<dyn Error>` that would poison the future's `Send` bound.
+pub async fn seed(
+    pool: &PgPool,
+    code: &str,
+    enrich: bool,
+    max_cost: Option<f64>,
+) -> Result<(), String> {
+    let mut universes = load_universes(pool, Some(code))
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(spec) = universes.pop() else {
+        return Err(format!("unknown universe: {code}"));
+    };
+    require_underlyings(&spec).map_err(|e| e.to_string())?;
+
+    let db = DatabentoClient::from_env().map_err(|e| e.to_string())?;
+    db.set_catalog(vec![spec.clone()]).await;
+
+    // Cost gate — only estimate when there is a budget to enforce, and never for
+    // OPTION universes (get_cost 504s on OPRA parents; definitions are ≈$0).
+    // Skipping otherwise avoids a dependency on Databento's flaky metadata.get_cost.
+    if let (Some(max), false) = (max_cost, matches!(spec.category, Category::Option)) {
+        let est = db.estimate_cost(&spec).await.map_err(|e| e.to_string())?;
+        if est.usd > max {
+            let msg = format!("estimated ${:.4} exceeds max_cost ${max:.4}", est.usd);
+            set_status(pool, &spec.code, "ERROR", None, Some(&msg))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Err(msg);
+        }
+    }
+
+    let enrichers: Vec<Box<dyn Enricher>> = if enrich {
+        vec![Box::new(OpenFigiEnricher::new(env::var("OPENFIGI_API_KEY").ok()))]
+    } else {
+        Vec::new()
+    };
+
+    info!(
+        "seeding universe {} (enrich={}, {} underlying(s)) …",
+        spec.code,
+        enrich,
+        spec.symbols.len()
+    );
+    set_status(pool, &spec.code, "SEEDING", None, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match seed_one(pool, &db, &spec, &enrichers).await.map_err(|e| e.to_string()) {
+        Ok(summary) => {
+            info!(
+                "{}: upserted={} skipped_fk={} skipped_expired={} derivatives={} provider_xref={} enriched={}",
+                spec.code,
+                summary.upserted,
+                summary.skipped_fk,
+                summary.skipped_expired,
+                summary.derivatives,
+                summary.provider_xref,
+                summary.enriched
+            );
+            let (status, note) = terminal_status(pool, &spec).await;
+            set_status(pool, &spec.code, status, Some(summary.upserted as i32), note.as_deref())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(msg) => {
+            warn!("{} failed: {msg}", spec.code);
+            set_status(pool, &spec.code, "ERROR", None, Some(&msg))
+                .await
+                .map_err(|e| e.to_string())?;
+            Err(msg)
+        }
+    }
+}
+
+/// Terminal status for a just-seeded universe. For OPTION universes, `SEEDED`
+/// only if every chosen underlying actually produced option rows; otherwise
+/// `PARTIAL` with a note listing the underlyings whose chains didn't land (their
+/// SPOT equity isn't seeded, or the provider returned no chain). Equity/future
+/// universes are always `SEEDED` on success.
+async fn terminal_status(pool: &PgPool, spec: &UniverseSpec) -> (&'static str, Option<String>) {
+    if !matches!(spec.category, Category::Option) || spec.symbols.is_empty() {
+        return ("SEEDED", None);
+    }
+    // Which chosen underlyings ended up with at least one derivative row.
+    let seeded: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT ius.symbol \
+         FROM instrument_universe_symbol ius \
+         JOIN instrument_derivative d ON d.underlying_symbol = ius.symbol \
+         WHERE ius.universe_code = $1",
+    )
+    .bind(&spec.code)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let missing: Vec<&str> = spec
+        .symbols
+        .iter()
+        .filter(|s| !seeded.iter().any(|x| x == *s))
+        .map(|s| s.as_str())
+        .collect();
+    if missing.is_empty() {
+        ("SEEDED", None)
+    } else {
+        let note = format!(
+            "{}/{} underlyings seeded; no chain for: {}",
+            spec.symbols.len() - missing.len(),
+            spec.symbols.len(),
+            missing.join(", ")
+        );
+        ("PARTIAL", Some(note))
+    }
+}
+
+// ------------------------------------------------------------------------
 // Per-universe work
 // ------------------------------------------------------------------------
 
@@ -128,6 +298,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 struct SeedSummary {
     upserted: u64,
     skipped_fk: u64,
+    skipped_expired: u64,
     derivatives: u64,
     provider_xref: u64,
     enriched: u64,
@@ -139,7 +310,14 @@ async fn seed_one(
     spec: &UniverseSpec,
     enrichers: &[Box<dyn Enricher>],
 ) -> Result<SeedSummary, Box<dyn std::error::Error>> {
+    let t_fetch = std::time::Instant::now();
     let defs = db.fetch_definitions(spec).await?;
+    info!(
+        "{}: fetched {} definitions in {:.1}s",
+        spec.code,
+        defs.len(),
+        t_fetch.elapsed().as_secs_f64()
+    );
     if defs.is_empty() {
         info!("{}: no mappable instruments.", spec.code);
         return Ok(SeedSummary::default());
@@ -160,15 +338,41 @@ async fn seed_one(
         .into_iter()
         .collect();
 
+    // FK-filter, then dedup by the instrument conflict key (symbol, venue): a
+    // multi-day definition range can return the same instrument more than once,
+    // which would make a bulk `ON CONFLICT` statement touch a row twice
+    // ("cannot affect row a second time"). Last write wins. This key also covers
+    // the xref and derivative statements, whose conflict keys derive from it.
+    let today = chrono::Utc::now().date_naive();
+    let mut dedup: HashMap<(&str, &str), &InstrumentDef> = HashMap::with_capacity(defs.len());
+    for d in &defs {
+        if !(venues.contains(&d.venue) && currencies.contains(&d.currency)) {
+            summary.skipped_fk += 1;
+            continue;
+        }
+        // Skip already-expired options — dead contracts, not worth seeding. Only
+        // drops when an expiry is present and in the past; missing expiry is kept.
+        if let Some(exp) = d.derivative.as_ref().and_then(|dv| dv.expiry_date) {
+            if exp < today {
+                summary.skipped_expired += 1;
+                continue;
+            }
+        }
+        dedup.insert((d.symbol.as_str(), d.venue.as_str()), d);
+    }
     // Upsert equities before options so the underlying SPOT row is visible to the
     // derivative join (same transaction sees its own writes).
-    let mut valid: Vec<&InstrumentDef> = defs
-        .iter()
-        .filter(|d| venues.contains(&d.venue) && currencies.contains(&d.currency))
-        .collect();
-    summary.skipped_fk = (defs.len() - valid.len()) as u64;
+    let mut valid: Vec<&InstrumentDef> = dedup.into_values().collect();
     valid.sort_by_key(|d| d.derivative.is_some());
 
+    info!(
+        "{}: upserting {} instruments ({} skipped_fk, {} expired) …",
+        spec.code,
+        valid.len(),
+        summary.skipped_fk,
+        summary.skipped_expired
+    );
+    let t_upsert = std::time::Instant::now();
     let mut tx = pool.begin().await?;
 
     // 1. Bulk-upsert instruments, chunked; collect the (symbol, venue) -> id map.
@@ -193,10 +397,25 @@ async fn seed_one(
     }
 
     tx.commit().await?;
+    info!(
+        "{}: upserted {} instruments ({} derivatives, {} xref) in {:.1}s",
+        spec.code,
+        summary.upserted,
+        summary.derivatives,
+        summary.provider_xref,
+        t_upsert.elapsed().as_secs_f64()
+    );
 
     // Enricher pipeline (fills Identifiers, persists figi/cusip/isin + xref).
     if !enrichers.is_empty() {
+        let t_enrich = std::time::Instant::now();
         summary.enriched = run_enrichers(pool, enrichers, &defs).await?;
+        info!(
+            "{}: enriched {} instruments in {:.1}s",
+            spec.code,
+            summary.enriched,
+            t_enrich.elapsed().as_secs_f64()
+        );
     }
 
     Ok(summary)
@@ -400,14 +619,23 @@ async fn run_enrichers(
     if working.is_empty() {
         return Ok(0);
     }
+    info!(
+        "enriching {} SPOT symbol(s) via {} enricher(s) — this is the slow phase (external lookups + per-row writes)",
+        working.len(),
+        enrichers.len()
+    );
 
     let mut stamped = 0u64;
     for enricher in enrichers {
         let report = enricher.enrich(&mut working).await?;
-        for (symbol, venue) in &report.resolved {
+        let total = report.resolved.len();
+        for (i, (symbol, venue)) in report.resolved.iter().enumerate() {
             if let Some(d) = working.iter().find(|d| &d.symbol == symbol && &d.venue == venue) {
                 persist_identifiers(pool, d, enricher.code()).await?;
                 stamped += 1;
+            }
+            if (i + 1) % 500 == 0 {
+                info!("  {} enrich: persisted {}/{}", enricher.code(), i + 1, total);
             }
         }
     }
@@ -465,7 +693,6 @@ async fn persist_identifiers(
 async fn load_universes(
     pool: &PgPool,
     code: Option<&str>,
-    all_enabled: bool,
 ) -> Result<Vec<UniverseSpec>, Box<dyn std::error::Error>> {
     let rows = if let Some(code) = code {
         sqlx::query(
@@ -474,15 +701,6 @@ async fn load_universes(
              FROM instrument_universe WHERE code = $1",
         )
         .bind(code)
-        .fetch_all(pool)
-        .await?
-    } else if all_enabled {
-        sqlx::query(
-            "SELECT code, description, category, dataset, option_dataset, stype_in, \
-                    include_options \
-             FROM instrument_universe WHERE enabled = true \
-             ORDER BY category, code",
-        )
         .fetch_all(pool)
         .await?
     } else {

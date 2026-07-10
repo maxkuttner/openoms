@@ -9,11 +9,19 @@
 GRANT USAGE ON SCHEMA public TO oms_user;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO oms_user;
 
--- Symbology: the OMS resolver (src/symbology_resolver.rs) stamps the FIGI/CUSIP
--- anchors it discovers via OpenFIGI onto the master. A deliberately narrow write —
--- only these two columns — since the OMS is the symbology authority. (Everything
--- else in public stays read-only for oms_user; other catalog writes go via market_user.)
-GRANT UPDATE (figi, cusip) ON public.instrument TO oms_user;
+-- Instrument seeding + symbology: the OMS app now seeds the master instrument
+-- universe itself (`oms setup universe` CLI and the POST /admin/universes/{code}/seed
+-- endpoint, src/setup/universe.rs), and its resolver stamps FIGI/CUSIP anchors from
+-- OpenFIGI. It fetches definitions from the provider, upserts instrument +
+-- instrument_derivative, and writes the universe seed-state (status, last_seeded_at,
+-- instrument_count) back on the catalog. So oms_user needs write on those tables.
+-- (SELECT on the FK targets venue/currency and the catalog is covered by the
+--  blanket public SELECT above; oms.instrument_xref lives in oms_user's own schema.)
+GRANT INSERT, UPDATE ON public.instrument, public.instrument_derivative TO oms_user;
+GRANT UPDATE ON public.instrument_universe TO oms_user;
+-- Editing a universe's underlying/child symbol set (the cockpit checkbox picker)
+-- rewrites instrument_universe_symbol.
+GRANT INSERT, DELETE ON public.instrument_universe_symbol TO oms_user;
 
 -- Every future master table mdm_master creates is readable by oms_user.
 ALTER DEFAULT PRIVILEGES FOR ROLE mdm_master IN SCHEMA public
