@@ -12,6 +12,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
 use crate::recon::{run_reconciliation, ReconError, ReconSummary};
 use crate::symbology_resolver::{self, ResolveError, ResolveOutcome};
@@ -560,6 +561,11 @@ pub async fn create_broker_connection(
     .map_err(map_db_error)?;
 
     Ok(Json(record))
+}
+
+/// Live health of the broker/exchange WebSocket streams (in-memory, ephemeral).
+pub async fn list_stream_health(State(state): State<AppState>) -> Json<Vec<StreamHealth>> {
+    Json(state.stream_health().snapshot())
 }
 
 #[utoipa::path(

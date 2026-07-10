@@ -22,8 +22,14 @@ use crate::adapters::binance::BinanceAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
 use crate::kafka::KafkaClient;
+use crate::stream_health::StreamHandle;
 
 const VENUE: &str = "BINANCE";
+
+/// How often to ping the socket and sweep for missed terminal reports. A stalled
+/// user-data subscription (fills stop arriving without a Close frame) is otherwise
+/// invisible; the ping surfaces a dead socket and the sweep recovers the fill.
+const HEARTBEAT_SECS: u64 = 30;
 
 pub async fn run(
     environment: &'static str,
@@ -32,6 +38,7 @@ pub async fn run(
     pool: PgPool,
     kafka: Option<KafkaClient>,
     adapter: Arc<BinanceAdapter>,
+    health: StreamHandle,
 ) {
     info!(env = environment, "starting Binance user-data stream");
     // Catch up on anything missed while disconnected, then stream live.
@@ -39,10 +46,17 @@ pub async fn run(
 
     let mut backoff_secs: u64 = 1;
     loop {
+        health.set_connecting();
         info!(env = environment, "Binance WS-API connecting");
-        match connect_and_run(&adapter, &pool, &kafka).await {
-            Ok(()) => warn!(env = environment, "Binance stream closed, reconnecting in {backoff_secs}s"),
-            Err(e) => warn!(env = environment, error = %e, "Binance stream error, reconnecting in {backoff_secs}s"),
+        match connect_and_run(&adapter, &pool, &kafka, &health).await {
+            Ok(()) => {
+                warn!(env = environment, "Binance stream closed, reconnecting in {backoff_secs}s");
+                health.set_down("stream closed");
+            }
+            Err(e) => {
+                warn!(env = environment, error = %e, "Binance stream error, reconnecting in {backoff_secs}s");
+                health.set_down(e.to_string());
+            }
         }
         sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
@@ -53,6 +67,7 @@ async fn connect_and_run(
     adapter: &BinanceAdapter,
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
+    health: &StreamHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.ws_url()).await?;
     info!("Binance WS-API connected");
@@ -67,16 +82,31 @@ async fn connect_and_run(
     });
     ws.send(Message::Text(logon.to_string())).await?;
 
-    while let Some(msg) = ws.next().await {
-        let text = match msg? {
-            Message::Text(t) => t,
-            Message::Binary(b) => match String::from_utf8(b) {
-                Ok(s) => s,
-                Err(_) => continue,
-            },
-            Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
-            Message::Close(_) => break,
-            _ => continue,
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    heartbeat.tick().await; // consume the immediate first tick
+
+    loop {
+        let text = tokio::select! {
+            // Periodic liveness probe + catch-up sweep for missed terminal reports.
+            _ = heartbeat.tick() => {
+                ws.send(Message::Ping(Vec::new())).await?;
+                reconcile_routed_orders(pool, kafka, adapter).await;
+                continue;
+            }
+            msg = ws.next() => {
+                let Some(msg) = msg else { break };
+                health.record_event();
+                match msg? {
+                    Message::Text(t) => t,
+                    Message::Binary(b) => match String::from_utf8(b) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    },
+                    Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
+                    Message::Close(_) => break,
+                    _ => continue,
+                }
+            }
         };
 
         let v: serde_json::Value = match serde_json::from_str(&text) {
@@ -108,6 +138,7 @@ async fn connect_and_run(
             Some("sub") => {
                 if v["status"].as_i64() == Some(200) {
                     info!("Binance WS-API subscribed to user-data stream");
+                    health.set_live();
                 } else {
                     return Err(format!("userDataStream.subscribe failed: {}", v).into());
                 }

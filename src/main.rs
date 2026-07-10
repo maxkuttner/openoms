@@ -50,6 +50,7 @@ mod kafka;
 mod execution;
 mod alpaca_stream;
 mod binance_stream;
+mod stream_health;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -353,21 +354,24 @@ async fn serve() {
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
             if let Some(adapter) = state.registry().get_alpaca("PAPER") {
-                tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned(), adapter));
+                let health = state.stream_health().handle("ALPACA", "PAPER");
+                tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health));
             }
         }
     }
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_LIVE_API_KEY"), env::var("ALPACA_LIVE_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
             if let Some(adapter) = state.registry().get_alpaca("LIVE") {
-                tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter));
+                let health = state.stream_health().handle("ALPACA", "LIVE");
+                tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health));
             }
         }
     }
 
     // Spawn the Binance user-data stream when configured.
     if let Some(adapter) = binance_paper {
-        tokio::spawn(binance_stream::run("PAPER", String::new(), String::new(), state.pool().clone(), state.kafka().cloned(), adapter));
+        let health = state.stream_health().handle("BINANCE", "PAPER");
+        tokio::spawn(binance_stream::run("PAPER", String::new(), String::new(), state.pool().clone(), state.kafka().cloned(), adapter, health));
     }
 
     // Register routes
@@ -419,6 +423,7 @@ async fn serve() {
             "/admin/accounts/:id",
             axum::routing::patch(admin::update_account).get(admin::get_account),
         )
+        .route("/admin/stream-health", get(admin::list_stream_health))
         .route(
             "/admin/broker-connections",
             post(admin::create_broker_connection).get(admin::list_broker_connections),

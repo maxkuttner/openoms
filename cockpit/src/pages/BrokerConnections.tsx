@@ -1,4 +1,6 @@
+import { Stack } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
+import { StreamHealthStrip } from "../components/StreamHealthStrip";
 
 const STATUS = [
   { value: "ACTIVE", label: "ACTIVE" },
@@ -7,7 +9,9 @@ const STATUS = [
 
 export function BrokerConnectionsPage() {
   return (
-    <CrudResource
+    <Stack gap="lg">
+      <StreamHealthStrip />
+      <CrudResource
       title="Broker connections"
       path="/admin/broker-connections"
       idKey="code"
@@ -33,6 +37,7 @@ export function BrokerConnectionsPage() {
         },
         { name: "status", label: "Status", type: "select", required: true, options: STATUS },
       ]}
-    />
+      />
+    </Stack>
   );
 }

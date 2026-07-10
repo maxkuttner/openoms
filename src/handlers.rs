@@ -1221,6 +1221,8 @@ pub struct BlotterRow {
     pub account_id: Uuid,
     pub broker_connection_code: String,
     pub instrument_id: String,
+    pub instrument_symbol: Option<String>,
+    pub instrument_name: Option<String>,
     pub side: String,
     pub order_type: String,
     pub status: String,
@@ -1245,7 +1247,9 @@ pub async fn get_orders_blotter(
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT os.order_id, os.principal_id, p.code AS principal_code, \
                 os.portfolio_id, pf.code AS portfolio_code, os.account_id, \
-                os.broker_connection_code, os.instrument_id, os.side, os.order_type, os.status, \
+                os.broker_connection_code, os.instrument_id, \
+                i.symbol AS instrument_symbol, i.name AS instrument_name, \
+                os.side, os.order_type, os.status, \
                 os.original_qty::double precision AS original_qty, \
                 os.leaves_qty::double precision   AS leaves_qty, \
                 os.cum_qty::double precision      AS cum_qty, \
@@ -1254,6 +1258,7 @@ pub async fn get_orders_blotter(
          FROM order_state os \
          JOIN principal p  ON p.id  = os.principal_id \
          JOIN portfolio pf ON pf.id = os.portfolio_id \
+         LEFT JOIN instrument i ON i.id::text = os.instrument_id \
          WHERE TRUE",
     );
     if let Some(v) = &f.status { qb.push(" AND os.status = ").push_bind(v.clone()); }
@@ -1287,6 +1292,8 @@ pub async fn get_orders_blotter(
             account_id: r.get("account_id"),
             broker_connection_code: r.get("broker_connection_code"),
             instrument_id: r.get("instrument_id"),
+            instrument_symbol: r.get("instrument_symbol"),
+            instrument_name: r.get("instrument_name"),
             side: r.get("side"),
             order_type: r.get("order_type"),
             status: r.get("status"),

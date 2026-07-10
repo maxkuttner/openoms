@@ -11,6 +11,10 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
 use crate::kafka::KafkaClient;
+use crate::stream_health::StreamHandle;
+
+/// Ping + missed-fill sweep cadence; see the Binance stream for the rationale.
+const HEARTBEAT_SECS: u64 = 30;
 
 pub async fn run(
     environment: &'static str,
@@ -19,6 +23,7 @@ pub async fn run(
     pool: PgPool,
     kafka: Option<KafkaClient>,
     adapter: Arc<AlpacaAdapter>,
+    health: StreamHandle,
 ) {
     info!(env = environment, "starting Alpaca trade-update stream");
     reconcile_routed_orders(&pool, &kafka, &adapter).await;
@@ -32,13 +37,16 @@ pub async fn run(
     let mut backoff_secs: u64 = 1;
 
     loop {
+        health.set_connecting();
         info!(env = environment, attempt = backoff_secs, "Alpaca stream connecting");
-        match connect_and_run(ws_url, &api_key, &api_secret, &pool, &kafka).await {
+        match connect_and_run(ws_url, &api_key, &api_secret, &pool, &kafka, &adapter, &health).await {
             Ok(()) => {
                 warn!(env = environment, "Alpaca stream closed cleanly, reconnecting in {backoff_secs}s");
+                health.set_down("stream closed");
             }
             Err(e) => {
                 warn!(env = environment, error = %e, "Alpaca stream error, reconnecting in {backoff_secs}s");
+                health.set_down(e.to_string());
             }
         }
         sleep(Duration::from_secs(backoff_secs)).await;
@@ -131,6 +139,8 @@ async fn connect_and_run(
     api_secret: &str,
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
+    adapter: &AlpacaAdapter,
+    health: &StreamHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(ws_url).await?;
     info!("Alpaca stream connected url={ws_url}");
@@ -149,19 +159,32 @@ async fn connect_and_run(
     });
     ws.send(Message::Text(listen.to_string())).await?;
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg?;
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Binary(b) => {
-                match String::from_utf8(b) {
-                    Ok(s) => s,
-                    Err(_) => { warn!("Alpaca stream: received non-UTF8 binary frame, skipping"); continue; }
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    heartbeat.tick().await; // consume the immediate first tick
+
+    loop {
+        let text = tokio::select! {
+            _ = heartbeat.tick() => {
+                ws.send(Message::Ping(Vec::new())).await?;
+                reconcile_routed_orders(pool, kafka, adapter).await;
+                continue;
+            }
+            msg = ws.next() => {
+                let Some(msg) = msg else { break };
+                health.record_event();
+                match msg? {
+                    Message::Text(t) => t,
+                    Message::Binary(b) => {
+                        match String::from_utf8(b) {
+                            Ok(s) => s,
+                            Err(_) => { warn!("Alpaca stream: received non-UTF8 binary frame, skipping"); continue; }
+                        }
+                    }
+                    Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
+                    Message::Close(_) => break,
+                    _ => continue,
                 }
             }
-            Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
-            Message::Close(_) => break,
-            _ => continue,
         };
 
         let v: serde_json::Value = match serde_json::from_str(&text) {
@@ -185,7 +208,7 @@ async fn connect_and_run(
             }
             "listening" => {
                 info!("Alpaca stream subscribed to trade_updates");
-                // reset backoff on successful connection
+                health.set_live();
             }
             "trade_updates" => {
                 if let Err(e) = handle_trade_update(data, pool, kafka).await {
