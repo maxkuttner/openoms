@@ -96,10 +96,11 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         match seed_one(&pool, &db, u, &enrichers).await {
             Ok(summary) => {
                 info!(
-                    "{}: upserted={} skipped_fk={} derivatives={} provider_xref={} enriched={}",
+                    "{}: upserted={} skipped_fk={} skipped_expired={} derivatives={} provider_xref={} enriched={}",
                     u.code,
                     summary.upserted,
                     summary.skipped_fk,
+                    summary.skipped_expired,
                     summary.derivatives,
                     summary.provider_xref,
                     summary.enriched
@@ -166,10 +167,11 @@ pub async fn seed(pool: &PgPool, code: &str, enrich: bool) -> Result<(), String>
     match seed_one(pool, &db, &spec, &enrichers).await.map_err(|e| e.to_string()) {
         Ok(summary) => {
             info!(
-                "{}: upserted={} skipped_fk={} derivatives={} provider_xref={} enriched={}",
+                "{}: upserted={} skipped_fk={} skipped_expired={} derivatives={} provider_xref={} enriched={}",
                 spec.code,
                 summary.upserted,
                 summary.skipped_fk,
+                summary.skipped_expired,
                 summary.derivatives,
                 summary.provider_xref,
                 summary.enriched
@@ -197,6 +199,7 @@ pub async fn seed(pool: &PgPool, code: &str, enrich: bool) -> Result<(), String>
 struct SeedSummary {
     upserted: u64,
     skipped_fk: u64,
+    skipped_expired: u64,
     derivatives: u64,
     provider_xref: u64,
     enriched: u64,
@@ -234,11 +237,20 @@ async fn seed_one(
     // which would make a bulk `ON CONFLICT` statement touch a row twice
     // ("cannot affect row a second time"). Last write wins. This key also covers
     // the xref and derivative statements, whose conflict keys derive from it.
+    let today = chrono::Utc::now().date_naive();
     let mut dedup: HashMap<(&str, &str), &InstrumentDef> = HashMap::with_capacity(defs.len());
     for d in &defs {
         if !(venues.contains(&d.venue) && currencies.contains(&d.currency)) {
             summary.skipped_fk += 1;
             continue;
+        }
+        // Skip already-expired options — dead contracts, not worth seeding. Only
+        // drops when an expiry is present and in the past; missing expiry is kept.
+        if let Some(exp) = d.derivative.as_ref().and_then(|dv| dv.expiry_date) {
+            if exp < today {
+                summary.skipped_expired += 1;
+                continue;
+            }
         }
         dedup.insert((d.symbol.as_str(), d.venue.as_str()), d);
     }
