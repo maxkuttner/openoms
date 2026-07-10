@@ -90,6 +90,9 @@ mod alpaca_stream;
         admin::delete_risk_limit,
         admin::list_instruments,
         admin::list_universes,
+        admin::list_underlyings,
+        admin::list_universe_symbols,
+        admin::set_universe_symbols,
         admin::estimate_universe,
         admin::seed_universe,
         admin::run_recon,
@@ -112,6 +115,7 @@ mod alpaca_stream;
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary,
         admin::UniverseSummary, admin::EstimateResponse, admin::SeedRequest, admin::SeedAccepted,
+        admin::UnderlyingCandidate, admin::SetSymbolsRequest, admin::SetSymbolsResponse,
         admin::RunReconRequest, admin::ReconRunRow, admin::ReconBreakRow,
         crate::recon::ReconSummary, crate::recon::ReconBreak, crate::recon::BreakKind,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
@@ -401,6 +405,11 @@ async fn serve() {
         )
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/universes", get(admin::list_universes))
+        .route("/admin/underlyings", get(admin::list_underlyings))
+        .route(
+            "/admin/universes/:code/symbols",
+            get(admin::list_universe_symbols).put(admin::set_universe_symbols),
+        )
         .route("/admin/universes/:code/estimate", get(admin::estimate_universe))
         .route("/admin/universes/:code/seed", post(admin::seed_universe))
         .route("/admin/recon/run", post(admin::run_recon))

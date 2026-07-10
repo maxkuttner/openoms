@@ -133,3 +133,9 @@ export interface EstimateResponse {
   usd: number;
   symbol_count: number | null;
 }
+
+export interface UnderlyingCandidate {
+  symbol: string;
+  name: string;
+  venue: string;
+}

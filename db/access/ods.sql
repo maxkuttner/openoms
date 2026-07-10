@@ -19,6 +19,9 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO oms_user;
 --  blanket public SELECT above; oms.instrument_xref lives in oms_user's own schema.)
 GRANT INSERT, UPDATE ON public.instrument, public.instrument_derivative TO oms_user;
 GRANT UPDATE ON public.instrument_universe TO oms_user;
+-- Editing a universe's underlying/child symbol set (the cockpit checkbox picker)
+-- rewrites instrument_universe_symbol.
+GRANT INSERT, DELETE ON public.instrument_universe_symbol TO oms_user;
 
 -- Every future master table mdm_master creates is readable by oms_user.
 ALTER DEFAULT PRIVILEGES FOR ROLE mdm_master IN SCHEMA public

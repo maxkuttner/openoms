@@ -1,12 +1,12 @@
 import { useState, useEffect } from "react";
 import {
   Stack, Title, Text, Table, Badge, Loader, Group, Button, Modal,
-  NumberInput, Switch, Alert, Code,
+  NumberInput, Switch, Alert, Code, TextInput, Checkbox, Pill, ScrollArea,
 } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useApiMutation, notifyError } from "../api/hooks";
-import type { UniverseSummary, EstimateResponse } from "../api/types";
+import type { UniverseSummary, EstimateResponse, UnderlyingCandidate } from "../api/types";
 
 const STATUS_COLOR: Record<string, string> = {
   SEEDED: "green",
@@ -117,8 +117,122 @@ function SeedModal({
   );
 }
 
+function EditUnderlyingsModal({
+  universe,
+  onClose,
+}: {
+  universe: UniverseSummary | null;
+  onClose: () => void;
+}) {
+  const code = universe?.code;
+  const opened = universe !== null;
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [search, setSearch] = useState("");
+  const [candidates, setCandidates] = useState<UnderlyingCandidate[]>([]);
+  const [loadingSel, setLoadingSel] = useState(false);
+  const [searching, setSearching] = useState(false);
+
+  // Load the current selection when the modal opens.
+  useEffect(() => {
+    if (!code) return;
+    let live = true;
+    setSearch("");
+    setCandidates([]);
+    setLoadingSel(true);
+    api
+      .get<string[]>(`/admin/universes/${code}/symbols`)
+      .then((s) => { if (live) setSelected(new Set(s)); })
+      .catch((e) => { if (live) notifyError(e); })
+      .finally(() => { if (live) setLoadingSel(false); });
+    return () => { live = false; };
+  }, [code]);
+
+  // Debounced candidate search.
+  useEffect(() => {
+    if (!opened) return;
+    let live = true;
+    const q = search.trim();
+    const t = setTimeout(() => {
+      setSearching(true);
+      api
+        .get<UnderlyingCandidate[]>(`/admin/underlyings?limit=50${q ? `&search=${encodeURIComponent(q)}` : ""}`)
+        .then((c) => { if (live) setCandidates(c); })
+        .catch((e) => { if (live) notifyError(e); })
+        .finally(() => { if (live) setSearching(false); });
+    }, 250);
+    return () => { live = false; clearTimeout(t); };
+  }, [search, opened]);
+
+  const save = useApiMutation(
+    () => api.put(`/admin/universes/${code}/symbols`, { symbols: [...selected] }),
+    { invalidate: ["/admin/universes"], success: "Underlyings saved", onDone: onClose },
+  );
+
+  function toggle(sym: string, on: boolean) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(sym); else next.delete(sym);
+      return next;
+    });
+  }
+
+  return (
+    <Modal opened={opened} onClose={onClose} title={`Underlyings — ${code ?? ""}`} size="lg" centered>
+      <Stack>
+        <Text size="sm" c="dimmed">
+          Pick the underlyings whose option chains to seed. Candidates are equities
+          already in the master. Only the chosen chains are loaded — never the whole tape.
+        </Text>
+
+        <div>
+          <Text size="xs" fw={600} mb={4}>Selected ({selected.size})</Text>
+          {loadingSel ? <Loader size="xs" /> : selected.size === 0 ? (
+            <Text size="xs" c="dimmed">None selected — this OPTION universe can't be seeded until you pick at least one.</Text>
+          ) : (
+            <Group gap={6}>
+              {[...selected].sort().map((s) => (
+                <Pill key={s} withRemoveButton onRemove={() => toggle(s, false)}>{s}</Pill>
+              ))}
+            </Group>
+          )}
+        </div>
+
+        <TextInput
+          label="Search equities"
+          placeholder="ticker or name…"
+          value={search}
+          onChange={(e) => setSearch(e.currentTarget.value)}
+          rightSection={searching ? <Loader size="xs" /> : null}
+        />
+
+        <ScrollArea.Autosize mah={280}>
+          <Stack gap={4}>
+            {candidates.map((c) => (
+              <Checkbox
+                key={`${c.symbol}/${c.venue}`}
+                checked={selected.has(c.symbol)}
+                onChange={(e) => toggle(c.symbol, e.currentTarget.checked)}
+                label={<Text size="sm">{c.symbol} <Text span c="dimmed" size="xs">· {c.venue} · {c.name}</Text></Text>}
+              />
+            ))}
+            {candidates.length === 0 && !searching && (
+              <Text size="xs" c="dimmed" py="sm">No matches.</Text>
+            )}
+          </Stack>
+        </ScrollArea.Autosize>
+
+        <Group justify="flex-end">
+          <Button variant="default" onClick={onClose}>Cancel</Button>
+          <Button loading={save.isPending} onClick={() => save.mutate(undefined)}>Save underlyings</Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
+
 export function UniversesPage() {
   const [target, setTarget] = useState<UniverseSummary | null>(null);
+  const [editing, setEditing] = useState<UniverseSummary | null>(null);
   const { data, isLoading, error } = useQuery<UniverseSummary[]>({
     queryKey: ["/admin/universes"],
     queryFn: () => api.get<UniverseSummary[]>("/admin/universes"),
@@ -190,14 +304,21 @@ export function UniversesPage() {
                 </Table.Td>
                 <Table.Td><Text size="sm">{fmtDate(u.last_seeded_at)}</Text></Table.Td>
                 <Table.Td ta="right">
-                  <Button
-                    size="xs"
-                    variant="light"
-                    loading={u.status === "SEEDING"}
-                    onClick={() => setTarget(u)}
-                  >
-                    Seed
-                  </Button>
+                  <Group gap={6} justify="flex-end">
+                    {u.category === "OPTION" && (
+                      <Button size="xs" variant="default" onClick={() => setEditing(u)}>
+                        Underlyings
+                      </Button>
+                    )}
+                    <Button
+                      size="xs"
+                      variant="light"
+                      loading={u.status === "SEEDING"}
+                      onClick={() => setTarget(u)}
+                    >
+                      Seed
+                    </Button>
+                  </Group>
                 </Table.Td>
               </Table.Tr>
             ))}
@@ -213,6 +334,7 @@ export function UniversesPage() {
       )}
 
       <SeedModal universe={target} onClose={() => setTarget(null)} />
+      <EditUnderlyingsModal universe={editing} onClose={() => setEditing(null)} />
     </Stack>
   );
 }

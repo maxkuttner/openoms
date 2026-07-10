@@ -1270,6 +1270,33 @@ pub struct EstimateResponse {
     pub symbol_count: Option<i64>,
 }
 
+/// Reject seeding/estimating an OPTION universe with no underlyings before any
+/// provider call — 400, not a 502 from the downstream estimate. `Ok(None)` if the
+/// universe is unknown (caller maps to 404).
+async fn ensure_seedable(state: &AppState, code: &str) -> Result<Option<()>, AdminError> {
+    let row: Option<(String, i64)> = sqlx::query_as(
+        "SELECT u.category, count(s.symbol) \
+         FROM instrument_universe u \
+         LEFT JOIN instrument_universe_symbol s ON s.universe_code = u.code \
+         WHERE u.code = $1 \
+         GROUP BY u.category",
+    )
+    .bind(code)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    let Some((category, symbol_count)) = row else {
+        return Ok(None);
+    };
+    if category == "OPTION" && symbol_count == 0 {
+        return Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: "OPTION universe has no underlyings — pick underlyings before seeding (ALL is not allowed for options)".to_string(),
+        });
+    }
+    Ok(Some(()))
+}
+
 /// Free Databento cost estimate for seeding a single universe.
 #[utoipa::path(
     get, path = "/admin/universes/{code}/estimate", tag = "admin",
@@ -1281,6 +1308,9 @@ pub async fn estimate_universe(
     State(state): State<AppState>,
     Path(code): Path<String>,
 ) -> Result<Json<EstimateResponse>, AdminError> {
+    if ensure_seedable(&state, &code).await?.is_none() {
+        return Err(AdminError::not_found("universe"));
+    }
     let est = crate::setup::universe::estimate(state.pool(), &code)
         .await
         .map_err(|e| AdminError {
@@ -1352,6 +1382,9 @@ pub async fn seed_universe(
         });
     }
 
+    // OPTION universes must have underlyings — reject with 400 before any provider call.
+    ensure_seedable(&state, &code).await?;
+
     // Free estimate + cost gate before we commit to any billed fetch.
     let est = crate::setup::universe::estimate(state.pool(), &code)
         .await
@@ -1404,6 +1437,153 @@ pub async fn seed_universe(
             },
         }),
     ))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct UnderlyingCandidate {
+    pub symbol: String,
+    pub name: String,
+    pub venue: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct UnderlyingSearch {
+    pub search: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// Candidate option underlyings: the equities (SPOT) already seeded in the
+/// master. Pick from these to build an OPTION universe's underlying list.
+#[utoipa::path(
+    get, path = "/admin/underlyings", tag = "admin",
+    params(UnderlyingSearch),
+    responses((status = 200, description = "OK", body = [UnderlyingCandidate])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_underlyings(
+    State(state): State<AppState>,
+    Query(params): Query<UnderlyingSearch>,
+) -> Result<Json<Vec<UnderlyingCandidate>>, AdminError> {
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let pattern = params.search.as_deref().map(|s| format!("%{s}%"));
+    let rows = sqlx::query_as::<_, UnderlyingCandidate>(
+        "SELECT symbol, name, venue \
+         FROM instrument \
+         WHERE instrument_class = 'SPOT' AND status = 'ACTIVE' \
+           AND ($1::text IS NULL OR symbol ILIKE $1 OR name ILIKE $1) \
+         ORDER BY symbol \
+         LIMIT $2",
+    )
+    .bind(pattern)
+    .bind(limit)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(rows))
+}
+
+/// The current underlying/child symbols of a universe.
+#[utoipa::path(
+    get, path = "/admin/universes/{code}/symbols", tag = "admin",
+    params(("code" = String, Path, description = "Universe code")),
+    responses((status = 200, description = "OK", body = [String])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_universe_symbols(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<Vec<String>>, AdminError> {
+    // 404 if the universe itself is unknown (empty set is otherwise ambiguous).
+    let exists: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM instrument_universe WHERE code = $1")
+            .bind(&code)
+            .fetch_optional(state.pool())
+            .await
+            .map_err(map_db_error)?;
+    if exists.is_none() {
+        return Err(AdminError::not_found("universe"));
+    }
+    let symbols: Vec<String> = sqlx::query_scalar(
+        "SELECT symbol FROM instrument_universe_symbol \
+         WHERE universe_code = $1 ORDER BY symbol",
+    )
+    .bind(&code)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(symbols))
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct SetSymbolsRequest {
+    pub symbols: Vec<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SetSymbolsResponse {
+    pub universe_code: String,
+    pub count: usize,
+}
+
+/// Replace a universe's underlying/child symbol set (the checkbox selection).
+#[utoipa::path(
+    put, path = "/admin/universes/{code}/symbols", tag = "admin",
+    params(("code" = String, Path, description = "Universe code")),
+    request_body = SetSymbolsRequest,
+    responses(
+        (status = 200, description = "OK", body = SetSymbolsResponse),
+        (status = 404, description = "Unknown universe"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn set_universe_symbols(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(req): Json<SetSymbolsRequest>,
+) -> Result<Json<SetSymbolsResponse>, AdminError> {
+    let exists: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM instrument_universe WHERE code = $1")
+            .bind(&code)
+            .fetch_optional(state.pool())
+            .await
+            .map_err(map_db_error)?;
+    if exists.is_none() {
+        return Err(AdminError::not_found("universe"));
+    }
+
+    // Normalize: trim, uppercase, dedup, drop blanks.
+    let mut symbols: Vec<String> = req
+        .symbols
+        .iter()
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    symbols.sort();
+    symbols.dedup();
+
+    let mut tx = state.pool().begin().await.map_err(map_db_error)?;
+    sqlx::query("DELETE FROM instrument_universe_symbol WHERE universe_code = $1")
+        .bind(&code)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+    if !symbols.is_empty() {
+        sqlx::query(
+            "INSERT INTO instrument_universe_symbol (universe_code, symbol) \
+             SELECT $1, s FROM UNNEST($2::text[]) AS s",
+        )
+        .bind(&code)
+        .bind(&symbols)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+    }
+    tx.commit().await.map_err(map_db_error)?;
+
+    Ok(Json(SetSymbolsResponse {
+        universe_code: code,
+        count: symbols.len(),
+    }))
 }
 
 // ── Custodian reconciliation ──────────────────────────────────────────────────

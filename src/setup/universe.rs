@@ -90,6 +90,12 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut failures: Vec<String> = Vec::new();
     for u in &universes {
+        if let Err(e) = require_underlyings(u) {
+            warn!("skipping {}: {e}", u.code);
+            set_status(&pool, &u.code, "ERROR", None, Some(&e.to_string())).await?;
+            failures.push(u.code.clone());
+            continue;
+        }
         info!("seeding universe {} …", u.code);
         set_status(&pool, &u.code, "SEEDING", None, None).await?;
 
@@ -134,9 +140,24 @@ pub async fn estimate(
     let Some(spec) = universes.pop() else {
         return Ok(None);
     };
+    require_underlyings(&spec)?;
     let db = DatabentoClient::from_env()?;
     db.set_catalog(vec![spec.clone()]).await;
     Ok(Some(db.estimate_cost(&spec).await?))
+}
+
+/// OPTION universes must name their underlyings — seeding the whole OPRA tape
+/// (`ALL`) is ~1.5M contracts and not allowed. Equity/future universes may be
+/// whole-dataset.
+fn require_underlyings(spec: &UniverseSpec) -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(spec.category, Category::Option) && spec.symbols.is_empty() {
+        return Err(format!(
+            "OPTION universe {} has no underlyings — pick underlyings before seeding (ALL is not allowed for options)",
+            spec.code
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Seed a single universe end to end: fetch → upsert → enrich, writing the
@@ -151,6 +172,7 @@ pub async fn seed(pool: &PgPool, code: &str, enrich: bool) -> Result<(), String>
     let Some(spec) = universes.pop() else {
         return Err(format!("unknown universe: {code}"));
     };
+    require_underlyings(&spec).map_err(|e| e.to_string())?;
 
     let db = DatabentoClient::from_env().map_err(|e| e.to_string())?;
     db.set_catalog(vec![spec.clone()]).await;
