@@ -11,6 +11,7 @@ import type { UniverseSummary, EstimateResponse, UnderlyingCandidate } from "../
 const STATUS_COLOR: Record<string, string> = {
   SEEDED: "green",
   SEEDING: "blue",
+  PARTIAL: "orange",
   PENDING: "gray",
   ERROR: "red",
 };
@@ -254,8 +255,9 @@ export function UniversesPage() {
 
   const anySeeding = (data ?? []).some((u) => u.status === "SEEDING");
 
-  // Seeded/seeding universes first, then everything else; alphabetical within each.
-  const loaded = (s: string) => (s === "SEEDED" || s === "SEEDING" ? 0 : 1);
+  // Seeded/seeding/partial universes first, then everything else; alphabetical within each.
+  const loaded = (s: string) =>
+    s === "SEEDED" || s === "SEEDING" || s === "PARTIAL" ? 0 : 1;
   const sorted = [...(data ?? [])].sort(
     (a, b) => loaded(a.status) - loaded(b.status) || a.code.localeCompare(b.code),
   );
@@ -302,8 +304,14 @@ export function UniversesPage() {
                 <Table.Td>
                   <Group gap={6}>
                     <Badge color={STATUS_COLOR[u.status] ?? "gray"}>{u.status}</Badge>
-                    {u.status === "ERROR" && u.last_error && (
-                      <Text size="xs" c="red" lineClamp={1} maw={200} title={u.last_error}>
+                    {(u.status === "ERROR" || u.status === "PARTIAL") && u.last_error && (
+                      <Text
+                        size="xs"
+                        c={u.status === "ERROR" ? "red" : "orange"}
+                        lineClamp={1}
+                        maw={200}
+                        title={u.last_error}
+                      >
                         {u.last_error}
                       </Text>
                     )}

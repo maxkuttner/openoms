@@ -108,7 +108,9 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     summary.provider_xref,
                     summary.enriched
                 );
-                set_status(&pool, &u.code, "SEEDED", Some(summary.upserted as i32), None).await?;
+                let (status, note) = terminal_status(&pool, u).await;
+                set_status(&pool, &u.code, status, Some(summary.upserted as i32), note.as_deref())
+                    .await?;
             }
             Err(e) => {
                 warn!("{} failed: {e}", u.code);
@@ -232,7 +234,8 @@ pub async fn seed(
                 summary.provider_xref,
                 summary.enriched
             );
-            set_status(pool, &spec.code, "SEEDED", Some(summary.upserted as i32), None)
+            let (status, note) = terminal_status(pool, &spec).await;
+            set_status(pool, &spec.code, status, Some(summary.upserted as i32), note.as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(())
@@ -244,6 +247,46 @@ pub async fn seed(
                 .map_err(|e| e.to_string())?;
             Err(msg)
         }
+    }
+}
+
+/// Terminal status for a just-seeded universe. For OPTION universes, `SEEDED`
+/// only if every chosen underlying actually produced option rows; otherwise
+/// `PARTIAL` with a note listing the underlyings whose chains didn't land (their
+/// SPOT equity isn't seeded, or the provider returned no chain). Equity/future
+/// universes are always `SEEDED` on success.
+async fn terminal_status(pool: &PgPool, spec: &UniverseSpec) -> (&'static str, Option<String>) {
+    if !matches!(spec.category, Category::Option) || spec.symbols.is_empty() {
+        return ("SEEDED", None);
+    }
+    // Which chosen underlyings ended up with at least one derivative row.
+    let seeded: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT ius.symbol \
+         FROM instrument_universe_symbol ius \
+         JOIN instrument_derivative d ON d.underlying_symbol = ius.symbol \
+         WHERE ius.universe_code = $1",
+    )
+    .bind(&spec.code)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let missing: Vec<&str> = spec
+        .symbols
+        .iter()
+        .filter(|s| !seeded.iter().any(|x| x == *s))
+        .map(|s| s.as_str())
+        .collect();
+    if missing.is_empty() {
+        ("SEEDED", None)
+    } else {
+        let note = format!(
+            "{}/{} underlyings seeded; no chain for: {}",
+            spec.symbols.len() - missing.len(),
+            spec.symbols.len(),
+            missing.join(", ")
+        );
+        ("PARTIAL", Some(note))
     }
 }
 
