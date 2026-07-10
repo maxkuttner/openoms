@@ -243,6 +243,12 @@ export function UniversesPage() {
 
   const anySeeding = (data ?? []).some((u) => u.status === "SEEDING");
 
+  // Seeded/seeding universes first, then everything else; alphabetical within each.
+  const loaded = (s: string) => (s === "SEEDED" || s === "SEEDING" ? 0 : 1);
+  const sorted = [...(data ?? [])].sort(
+    (a, b) => loaded(a.status) - loaded(b.status) || a.code.localeCompare(b.code),
+  );
+
   return (
     <Stack>
       <Title order={3}>Instrument universes</Title>
@@ -273,7 +279,7 @@ export function UniversesPage() {
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
-            {data.map((u) => (
+            {sorted.map((u) => (
               <Table.Tr key={u.code}>
                 <Table.Td>
                   <Text fw={600} size="sm">{u.code}</Text>
@@ -322,7 +328,7 @@ export function UniversesPage() {
                 </Table.Td>
               </Table.Tr>
             ))}
-            {data.length === 0 && (
+            {sorted.length === 0 && (
               <Table.Tr>
                 <Table.Td colSpan={8}>
                   <Text c="dimmed" ta="center" py="md">No universes in the catalog.</Text>
