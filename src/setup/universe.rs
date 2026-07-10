@@ -141,6 +141,17 @@ pub async fn estimate(
         return Ok(None);
     };
     require_underlyings(&spec)?;
+    // OPTION universes: Databento's get_cost over OPRA parent symbols is
+    // pathologically slow (~12s for one underlying, 504 gateway timeout for 2+),
+    // and definition-schema cost is effectively $0 anyway. Skip the call and
+    // report a symbolic zero rather than hang/504.
+    if matches!(spec.category, Category::Option) {
+        return Ok(Some(CostEstimate {
+            universe_code: spec.code.clone(),
+            usd: 0.0,
+            symbol_count: Some(spec.symbols.len()),
+        }));
+    }
     let db = DatabentoClient::from_env()?;
     db.set_catalog(vec![spec.clone()]).await;
     Ok(Some(db.estimate_cost(&spec).await?))
@@ -183,10 +194,10 @@ pub async fn seed(
     let db = DatabentoClient::from_env().map_err(|e| e.to_string())?;
     db.set_catalog(vec![spec.clone()]).await;
 
-    // Cost gate — only estimate when there is a budget to enforce. Skipping it
-    // otherwise avoids a dependency on Databento's flaky metadata.get_cost and
-    // keeps the definition-schema seed (≈$0) fast.
-    if let Some(max) = max_cost {
+    // Cost gate — only estimate when there is a budget to enforce, and never for
+    // OPTION universes (get_cost 504s on OPRA parents; definitions are ≈$0).
+    // Skipping otherwise avoids a dependency on Databento's flaky metadata.get_cost.
+    if let (Some(max), false) = (max_cost, matches!(spec.category, Category::Option)) {
         let est = db.estimate_cost(&spec).await.map_err(|e| e.to_string())?;
         if est.usd > max {
             let msg = format!("estimated ${:.4} exceeds max_cost ${max:.4}", est.usd);
