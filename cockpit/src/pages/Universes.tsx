@@ -264,9 +264,8 @@ export function UniversesPage() {
     <Stack>
       <Title order={3}>Instrument universes</Title>
       <Text size="sm" c="dimmed">
-        The catalog of provider datasets available for seeding — which are enabled,
-        their seed status, and when each was last loaded. Seed one with the button
-        on its row.
+        The catalog of provider datasets available for seeding — their seed status
+        and when each was last loaded. Seed one with the button on its row.
       </Text>
       {anySeeding && (
         <Text size="xs" c="blue">A universe is seeding — this list refreshes automatically.</Text>
@@ -282,7 +281,6 @@ export function UniversesPage() {
               <Table.Th>Code</Table.Th>
               <Table.Th>Category</Table.Th>
               <Table.Th>Dataset</Table.Th>
-              <Table.Th>Enabled</Table.Th>
               <Table.Th>Status</Table.Th>
               <Table.Th ta="right">Instruments</Table.Th>
               <Table.Th>Last loaded</Table.Th>
@@ -300,11 +298,6 @@ export function UniversesPage() {
                 <Table.Td>
                   <Text size="sm">{u.dataset}</Text>
                   {u.option_dataset && <Text size="xs" c="dimmed">+ {u.option_dataset}</Text>}
-                </Table.Td>
-                <Table.Td>
-                  <Badge color={u.enabled ? "teal" : "gray"} variant={u.enabled ? "filled" : "light"}>
-                    {u.enabled ? "yes" : "no"}
-                  </Badge>
                 </Table.Td>
                 <Table.Td>
                   <Group gap={6}>
@@ -341,7 +334,7 @@ export function UniversesPage() {
             ))}
             {sorted.length === 0 && (
               <Table.Tr>
-                <Table.Td colSpan={8}>
+                <Table.Td colSpan={7}>
                   <Text c="dimmed" ta="center" py="md">No universes in the catalog.</Text>
                 </Table.Td>
               </Table.Tr>

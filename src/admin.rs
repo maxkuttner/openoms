@@ -1234,15 +1234,14 @@ pub struct UniverseSummary {
     pub dataset: String,
     pub option_dataset: Option<String>,
     pub include_options: bool,
-    pub enabled: bool,
     pub status: String,
     pub last_seeded_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub instrument_count: Option<i32>,
 }
 
-/// List the instrument-universe catalog and its seed state (what is available,
-/// which are enabled, and when each was last loaded).
+/// List the instrument-universe catalog and its seed state (what is available
+/// and when each was last loaded).
 #[utoipa::path(
     get, path = "/admin/universes", tag = "admin",
     responses((status = 200, description = "OK", body = [UniverseSummary])),
@@ -1253,7 +1252,7 @@ pub async fn list_universes(
 ) -> Result<Json<Vec<UniverseSummary>>, AdminError> {
     let records = sqlx::query_as::<_, UniverseSummary>(
         "SELECT code, description, provider_code, category, dataset, option_dataset, \
-                include_options, enabled, status, last_seeded_at, last_error, instrument_count \
+                include_options, status, last_seeded_at, last_error, instrument_count \
          FROM instrument_universe \
          ORDER BY category, code",
     )

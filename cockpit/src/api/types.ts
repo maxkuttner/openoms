@@ -121,7 +121,6 @@ export interface UniverseSummary {
   dataset: string;
   option_dataset: string | null;
   include_options: boolean;
-  enabled: boolean;
   status: string;
   last_seeded_at: string | null;
   last_error: string | null;

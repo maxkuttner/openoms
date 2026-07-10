@@ -2,7 +2,7 @@
 //!
 //! The seeding framework: it is provider- and enricher-agnostic. It drives a
 //! [`UniverseSource`] (Databento) and a `Vec<Box<dyn Enricher>>` (OpenFIGI today):
-//!   1. Load enabled universes from `public.instrument_universe` (+ child symbols).
+//!   1. Load universes from `public.instrument_universe` (+ child symbols).
 //!   2. Ask the provider for a free cost estimate per universe.
 //!   3. Print a cost table + interactive y/N confirm.
 //!   4. Fetch definitions, upsert `instrument` + `instrument_derivative` +
@@ -27,12 +27,9 @@ use tracing::{info, warn};
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
-    /// Seed exactly this universe code (skips the enabled filter).
+    /// Seed exactly this universe code. Omit to operate on every universe.
     #[arg(long)]
     pub universe: Option<String>,
-    /// Seed every universe with `enabled = true` in the catalog.
-    #[arg(long)]
-    pub all_enabled: bool,
     /// Estimate + print cost table only; no fetch, no writes.
     #[arg(long)]
     pub dry_run: bool,
@@ -49,9 +46,9 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&database_url()?).await?;
-    let universes = load_universes(&pool, args.universe.as_deref(), args.all_enabled).await?;
+    let universes = load_universes(&pool, args.universe.as_deref()).await?;
     if universes.is_empty() {
-        info!("no universes to seed (use --universe CODE or --all-enabled).");
+        info!("no universes to seed.");
         return Ok(());
     }
 
@@ -136,7 +133,7 @@ pub async fn estimate(
     pool: &PgPool,
     code: &str,
 ) -> Result<Option<CostEstimate>, Box<dyn std::error::Error>> {
-    let mut universes = load_universes(pool, Some(code), false).await?;
+    let mut universes = load_universes(pool, Some(code)).await?;
     let Some(spec) = universes.pop() else {
         return Ok(None);
     };
@@ -183,7 +180,7 @@ pub async fn seed(
     enrich: bool,
     max_cost: Option<f64>,
 ) -> Result<(), String> {
-    let mut universes = load_universes(pool, Some(code), false)
+    let mut universes = load_universes(pool, Some(code))
         .await
         .map_err(|e| e.to_string())?;
     let Some(spec) = universes.pop() else {
@@ -653,7 +650,6 @@ async fn persist_identifiers(
 async fn load_universes(
     pool: &PgPool,
     code: Option<&str>,
-    all_enabled: bool,
 ) -> Result<Vec<UniverseSpec>, Box<dyn std::error::Error>> {
     let rows = if let Some(code) = code {
         sqlx::query(
@@ -662,15 +658,6 @@ async fn load_universes(
              FROM instrument_universe WHERE code = $1",
         )
         .bind(code)
-        .fetch_all(pool)
-        .await?
-    } else if all_enabled {
-        sqlx::query(
-            "SELECT code, description, category, dataset, option_dataset, stype_in, \
-                    include_options \
-             FROM instrument_universe WHERE enabled = true \
-             ORDER BY category, code",
-        )
         .fetch_all(pool)
         .await?
     } else {
