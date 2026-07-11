@@ -57,33 +57,6 @@ impl AlpacaAdapter {
         }
     }
 
-    /// Custodian-side holdings for reconciliation: GET /v2/positions.
-    pub async fn get_positions(&self) -> Result<Vec<BrokerHolding>, BrokerError> {
-        let url = format!("{}/v2/positions", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .header("APCA-API-KEY-ID", &self.api_key)
-            .header("APCA-API-SECRET-KEY", &self.api_secret)
-            .send()
-            .await
-            .map_err(|e| BrokerError::Network(e.to_string()))?;
-        if !resp.status().is_success() {
-            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
-        }
-        let rows: Vec<serde_json::Value> =
-            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-        // Alpaca returns qty as a signed string ("-5" for a short).
-        let holdings = rows
-            .iter()
-            .map(|p| BrokerHolding {
-                symbol: p["symbol"].as_str().unwrap_or_default().to_string(),
-                native_id: p["asset_id"].as_str().map(|s| s.to_string()),
-                qty: p["qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
-            })
-            .collect();
-        Ok(holdings)
-    }
 }
 
 #[async_trait::async_trait]
@@ -139,7 +112,8 @@ impl BrokerAdapter for AlpacaAdapter {
         }
     }
 
-    async fn cancel_order(&self, external_order_id: &str) -> Result<(), BrokerError> {
+    // Alpaca cancels by order id alone; the symbol is unused.
+    async fn cancel_order(&self, external_order_id: &str, _symbol: &str) -> Result<(), BrokerError> {
         let url = format!("{}/v2/orders/{}", self.base_url, external_order_id);
 
         let response = self
@@ -157,5 +131,33 @@ impl BrokerAdapter for AlpacaAdapter {
             let err_body = response.text().await.unwrap_or_default();
             Err(BrokerError::BrokerRejected(err_body))
         }
+    }
+
+    /// Custodian-side holdings for reconciliation: GET /v2/positions.
+    async fn get_positions(&self) -> Result<Vec<BrokerHolding>, BrokerError> {
+        let url = format!("{}/v2/positions", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+        }
+        let rows: Vec<serde_json::Value> =
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        // Alpaca returns qty as a signed string ("-5" for a short).
+        let holdings = rows
+            .iter()
+            .map(|p| BrokerHolding {
+                symbol: p["symbol"].as_str().unwrap_or_default().to_string(),
+                native_id: p["asset_id"].as_str().map(|s| s.to_string()),
+                qty: p["qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            })
+            .collect();
+        Ok(holdings)
     }
 }

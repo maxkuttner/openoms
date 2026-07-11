@@ -26,6 +26,11 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13.1", features = ["json"] }
 base64 = "0.22"
 bcrypt = "0.15"
+
+# Binance request signing (Ed25519 over the query string; also for the WS-API
+# session.logon). Ed25519 is the only key type Binance supports for the WebSocket
+# user-data stream, so we use it for REST signing too — one credential.
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4", "serde"] }
 

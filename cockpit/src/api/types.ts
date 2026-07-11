@@ -33,6 +33,15 @@ export interface Account {
   updated_at: string;
 }
 
+export interface StreamHealth {
+  broker_code: string;
+  environment: string;
+  state: "connecting" | "live" | "down";
+  connected_since: string | null;
+  last_event_at: string | null;
+  last_error: string | null;
+}
+
 export interface BrokerConnection {
   code: string;
   broker_code: string;
@@ -102,6 +111,8 @@ export interface BlotterRow {
   account_id: string;
   broker_connection_code: string;
   instrument_id: string;
+  instrument_symbol: string | null;
+  instrument_name: string | null;
   side: string;
   order_type: string;
   status: string;

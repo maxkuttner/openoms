@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Group, Title, Table, Select, Loader, Text, Badge, Stack, Button } from "@mantine/core";
+import { Group, Title, Table, Select, Loader, Text, Badge, Stack, Button, Tooltip } from "@mantine/core";
 import { useList } from "../api/hooks";
 import { InstrumentSelect } from "../components/InstrumentSelect";
 import type { BlotterRow, Portfolio, Principal } from "../api/types";
@@ -80,7 +80,7 @@ export function BlotterPage() {
               <Table.Th>Time</Table.Th>
               <Table.Th>Principal</Table.Th>
               <Table.Th>Portfolio</Table.Th>
-              <Table.Th>Instr</Table.Th>
+              <Table.Th>Instrument</Table.Th>
               <Table.Th>Side</Table.Th>
               <Table.Th>Type</Table.Th>
               <Table.Th>Status</Table.Th>
@@ -96,7 +96,11 @@ export function BlotterPage() {
                 <Table.Td>{new Date(o.created_at).toLocaleString()}</Table.Td>
                 <Table.Td>{o.principal_code}</Table.Td>
                 <Table.Td>{o.portfolio_code}</Table.Td>
-                <Table.Td>{o.instrument_id}</Table.Td>
+                <Table.Td>
+                  <Tooltip label={o.instrument_name ?? `id ${o.instrument_id}`} disabled={!o.instrument_name}>
+                    <Text size="sm">{o.instrument_symbol ?? o.instrument_id}</Text>
+                  </Tooltip>
+                </Table.Td>
                 <Table.Td>
                   <Badge color={o.side === "buy" ? "green" : "red"} variant="light">{o.side}</Badge>
                 </Table.Td>
