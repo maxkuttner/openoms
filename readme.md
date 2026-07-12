@@ -10,8 +10,9 @@
   </a>
 </p>
 
-> *An* open source multi-client order management system.
+*An* open source multi-client order management system.
 
+![img.png](img.png)
 
 ## Install
 
