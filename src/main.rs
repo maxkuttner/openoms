@@ -172,6 +172,8 @@ enum Command {
 enum SetupCmd {
     /// Seed the master instrument universe from the configured providers.
     Universe(setup::universe::Args),
+    /// Sync broker symbology (instrument_xref BROKER rows) from a broker catalog.
+    SyncBrokers(setup::brokers::Args),
 }
 
 #[tokio::main]
@@ -184,6 +186,12 @@ async fn main() {
         Some(Command::Setup(SetupCmd::Universe(args))) => {
             if let Err(e) = setup::universe::run(args).await {
                 error!("setup universe failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Setup(SetupCmd::SyncBrokers(args))) => {
+            if let Err(e) = setup::brokers::run(args).await {
+                error!("setup sync-brokers failed: {e}");
                 std::process::exit(1);
             }
         }

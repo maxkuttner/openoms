@@ -2,7 +2,7 @@ use reqwest::Client;
 use serde::Serialize;
 use tracing::info;
 
-use super::{BrokerAdapter, BrokerError, BrokerHolding, BrokerOrderRequest, BrokerOrderResponse};
+use super::{BrokerAdapter, BrokerError, BrokerHolding, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse};
 
 #[derive(Serialize)]
 struct AlpacaOrderRequest {
@@ -57,6 +57,79 @@ impl AlpacaAdapter {
         }
     }
 
+    fn get_json(&self, url: &str) -> reqwest::RequestBuilder {
+        self.client
+            .get(url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+    }
+
+    /// Active, tradeable US-equity assets from Alpaca's catalog
+    /// (`GET /v2/assets`). Broker symbology, not market data.
+    pub async fn list_equity_instruments(&self) -> Result<Vec<BrokerInstrument>, BrokerError> {
+        let url = format!("{}/v2/assets?status=active&asset_class=us_equity", self.base_url);
+        let resp = self.get_json(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+        }
+        let assets: Vec<serde_json::Value> =
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(assets
+            .iter()
+            .filter_map(|a| {
+                Some(BrokerInstrument {
+                    symbol: a["symbol"].as_str()?.to_string(),
+                    exchange: a["exchange"].as_str().map(|s| s.to_string()),
+                    native_id: a["id"].as_str().map(|s| s.to_string()), // Alpaca asset UUID
+                    is_tradeable: a["tradable"].as_bool().unwrap_or(false),
+                    min_quantity: a["min_order_size"].as_str().and_then(|s| s.parse().ok()),
+                })
+            })
+            .collect())
+    }
+
+    /// Active option contracts for the given underlyings, following pagination
+    /// (`GET /v2/options/contracts`). `symbol` is the compact OSI Alpaca's order
+    /// API expects; options route by symbol so `native_id` is left None.
+    pub async fn list_option_contracts(
+        &self,
+        underlyings: &[String],
+    ) -> Result<Vec<BrokerInstrument>, BrokerError> {
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = format!(
+                "{}/v2/options/contracts?status=active&limit=10000&underlying_symbols={}",
+                self.base_url,
+                underlyings.join(",")
+            );
+            if let Some(tok) = &page_token {
+                url.push_str("&page_token=");
+                url.push_str(tok);
+            }
+            let resp = self.get_json(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+            }
+            let body: serde_json::Value =
+                resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+            for c in body["option_contracts"].as_array().unwrap_or(&Vec::new()) {
+                let Some(symbol) = c["symbol"].as_str() else { continue };
+                out.push(BrokerInstrument {
+                    symbol: symbol.to_string(),
+                    exchange: Some("OPRA".to_string()),
+                    native_id: None,
+                    is_tradeable: c["tradable"].as_bool().unwrap_or(false),
+                    min_quantity: Some(1.0), // options trade in whole contracts
+                });
+            }
+            page_token = body["next_page_token"].as_str().map(|s| s.to_string());
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait::async_trait]

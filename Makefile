@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments figi-backfill sync-brokers
+.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments figi-backfill sync-brokers sync-brokers-options
 
 # Load .env into the recipe shell (one shell per recipe line, so chain with &&).
 ENV := set -a && . ./.env && set +a
@@ -50,6 +50,8 @@ figi-backfill: ## Stamp FIGI onto FIGI-less master rows via OpenFIGI (run after 
 	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
 		cargo run --quiet --bin figi_backfill -- $${DRY_RUN:+--dry-run} $$ARGS
 
-sync-brokers: ## Sync broker_instrument from the broker catalog (needs ALPACA_PAPER_*)
-	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
-		python3 scripts/broker_sync.py
+sync-brokers: ## Sync broker symbology into instrument_xref (needs ALPACA_PAPER_*; ARGS=... e.g. --asset-class equity; DRY_RUN=1)
+	@$(ENV) && cargo run --quiet -- setup sync-brokers $${DRY_RUN:+--dry-run} $$ARGS
+
+sync-brokers-options: ## Sync Alpaca option-contract symbology into instrument_xref (UNDERLYINGS=SPY,QQQ; DRY_RUN=1)
+	@$(ENV) && cargo run --quiet -- setup sync-brokers --asset-class option --underlyings "$${UNDERLYINGS:-SPY,QQQ}" $${DRY_RUN:+--dry-run} $$ARGS

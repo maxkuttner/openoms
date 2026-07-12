@@ -1,7 +1,7 @@
 requests>=2.31.0
 psycopg2-binary>=2.9.0
 
-# seeders moved from marketbox (seed_instruments.py, broker_sync.py, seed_venues.py)
+# seeders moved from marketbox (seed_instruments.py, seed_venues.py); broker sync is now Rust (oms setup sync-brokers)
 databento>=0.77.0
 psycopg[binary]>=3.0
 python-dotenv>=1.0

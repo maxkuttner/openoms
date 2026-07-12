@@ -92,6 +92,9 @@ async fn apply_once(
 
     let row = match row {
         Some(r) => r,
+        // TODO: If the OMS is supposed to act as a projection for colocated quoting engines,
+        //  trading algorithms, etc., we should be able to handle the case where the order is
+        //  not found in the DB.
         None => {
             warn!(order_id = %order_id, "execution: order not found in DB, skipping");
             return Ok(());

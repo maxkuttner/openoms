@@ -41,6 +41,20 @@ pub struct BrokerHolding {
     pub qty: f64,
 }
 
+/// One row of a broker's tradeable-instrument catalog, as returned by the
+/// broker's symbology endpoints. Provider-neutral; consumed by the broker-sync
+/// setup task to populate `oms.instrument_xref` (source_type='BROKER'). The
+/// `symbol` is the broker's own handle (Alpaca ticker for equities, compact OSI
+/// for options); `native_id` is the immutable broker id when the broker exposes
+/// one (Alpaca asset UUID for equities; None for options, which route by symbol).
+pub struct BrokerInstrument {
+    pub symbol: String,
+    pub exchange: Option<String>,
+    pub native_id: Option<String>,
+    pub is_tradeable: bool,
+    pub min_quantity: Option<f64>,
+}
+
 #[derive(Debug)]
 pub enum BrokerError {
     Network(String),
@@ -57,6 +71,8 @@ impl std::fmt::Display for BrokerError {
         }
     }
 }
+
+impl std::error::Error for BrokerError {}
 
 /// Implemented by every broker adapter. Uses async-trait for dyn-compatibility.
 #[async_trait::async_trait]

@@ -45,7 +45,7 @@ pub struct Args {
 }
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let pool = PgPool::connect(&database_url()?).await?;
+    let pool = PgPool::connect(&super::database_url()?).await?;
     let universes = load_universes(&pool, args.universe.as_deref()).await?;
     if universes.is_empty() {
         info!("no universes to seed.");
@@ -807,14 +807,3 @@ fn confirm_prompt(n: usize, total: f64) -> io::Result<bool> {
     Ok(buf.trim().eq_ignore_ascii_case("y"))
 }
 
-fn database_url() -> Result<String, Box<dyn std::error::Error>> {
-    let var = |k: &str| env::var(k).map_err(|_| format!("{k} must be set"));
-    Ok(format!(
-        "postgres://{}:{}@{}:{}/{}?sslmode=disable",
-        var("DB_USER")?,
-        var("DB_PASSWORD")?,
-        var("DB_HOST")?,
-        var("DB_PORT")?,
-        var("DB_NAME")?,
-    ))
-}
