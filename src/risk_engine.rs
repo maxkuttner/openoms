@@ -70,10 +70,14 @@ impl<P: RiskDataProvider> RiskEngine<P> {
 
     /// Run all pre-trade checks for a submit command.
     /// `Ok(())` means the order may proceed; no configured limits means pass.
+    /// `contract_size` is the instrument's notional multiplier (100 for options,
+    /// 1 for equities/crypto). Quantity limits stay in native units (contracts),
+    /// while notional limits see `qty * price * contract_size`.
     pub async fn check_submit(
         &mut self,
         portfolio_id: Uuid,
         cmd: &SubmitOrder,
+        contract_size: f64,
     ) -> Result<(), RiskCheckError> {
         let scope = RiskScope {
             portfolio_id,
@@ -91,9 +95,11 @@ impl<P: RiskDataProvider> RiskEngine<P> {
         check_trading_state(config.trading_state, cmd.side, exposure.position_qty)
             .map_err(RiskCheckError::Rejected)?;
 
-        // est_price comes from the limit price; market orders carry None and
-        // intentionally skip the notional checks (documented in risk.rs tests).
-        check_limit(cmd.side, cmd.quantity, cmd.limit_price, config.limits, exposure)
+        // est_price comes from the limit price, scaled by the contract multiplier
+        // so option notional reflects the ×100 deliverable. Market orders carry
+        // None and intentionally skip the notional checks (documented in risk.rs).
+        let est_price = cmd.limit_price.map(|p| p * contract_size);
+        check_limit(cmd.side, cmd.quantity, est_price, config.limits, exposure)
             .map_err(RiskCheckError::Rejected)
     }
 }
@@ -222,8 +228,12 @@ mod tests {
     }
 
     async fn run(provider: StubProvider, cmd: &SubmitOrder) -> Result<(), RiskCheckError> {
+        run_with(provider, cmd, 1.0).await
+    }
+
+    async fn run_with(provider: StubProvider, cmd: &SubmitOrder, contract_size: f64) -> Result<(), RiskCheckError> {
         RiskEngine::new(provider)
-            .check_submit(Uuid::new_v4(), cmd)
+            .check_submit(Uuid::new_v4(), cmd, contract_size)
             .await
     }
 
@@ -291,6 +301,39 @@ mod tests {
         match err {
             RiskCheckError::Rejected(r) => assert_eq!(r.code, "max_position_quantity"),
             other => panic!("expected rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_size_scales_notional() {
+        // 1 option contract @ $3 limit. Bare notional $3 passes a $100 cap, but
+        // with contract_size 100 the notional is $300 and must breach.
+        let limits = RiskLimits { max_order_notional: Some(100.0), ..NO_LIMITS };
+
+        let pass = run_with(
+            StubProvider {
+                config: config(TradingState::Active, limits),
+                exposure: Exposure { position_qty: 0.0, working_qty: 0.0 },
+            },
+            &submit(OrderSide::Buy, 1.0, Some(3.0)),
+            1.0,
+        )
+        .await;
+        assert!(pass.is_ok(), "notional $3 should pass a $100 cap at multiplier 1");
+
+        let err = run_with(
+            StubProvider {
+                config: config(TradingState::Active, limits),
+                exposure: Exposure { position_qty: 0.0, working_qty: 0.0 },
+            },
+            &submit(OrderSide::Buy, 1.0, Some(3.0)),
+            100.0,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            RiskCheckError::Rejected(r) => assert_eq!(r.code, "max_order_notional"),
+            other => panic!("expected notional rejection, got {other:?}"),
         }
     }
 

@@ -201,21 +201,42 @@ pub async fn orders_submit(
     let external_account_ref: String = account_row_pre.get("external_account_ref");
 
     // Validate instrument is ACTIVE.
-    let instrument_ok: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM instrument WHERE id = $1 AND status = 'ACTIVE')"
+    // Fetch the instrument's status plus the metadata the risk/routing path needs:
+    // `contract_size` (the notional multiplier — 100 for options, 1 otherwise) and
+    // `instrument_class` (to apply option-specific order rules).
+    let instrument_row = sqlx::query(
+        "SELECT instrument_class, status, \
+                contract_size::double precision AS contract_size \
+         FROM instrument WHERE id = $1"
     )
     .bind(instrument_id_bigint)
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
     .map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: format!("failed to validate instrument: {:?}", err),
+    })?
+    .ok_or_else(|| ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        message: "instrument not found".to_string(),
     })?;
 
-    if !instrument_ok {
+    let instrument_status: String = instrument_row.get("status");
+    if instrument_status != "ACTIVE" {
         return Err(ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
-            message: "instrument not found or not active".to_string(),
+            message: "instrument not active".to_string(),
+        });
+    }
+    let instrument_class: String = instrument_row.get("instrument_class");
+    let contract_size: f64 = instrument_row.get("contract_size");
+
+    // Options route to Alpaca as single-leg contract orders, which only accept
+    // a `day` time-in-force. Reject anything else up front with a clear message.
+    if instrument_class == "OPTION" && !matches!(cmd.time_in_force, TimeInForce::Day) {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: "option orders require time_in_force=day".to_string(),
         });
     }
 
@@ -315,7 +336,7 @@ pub async fn orders_submit(
     // risk_limits row serializes concurrent submits for the same
     // portfolio/instrument scope until this transaction commits.
     RiskEngine::new(PgRiskDataProvider::new(&mut *tx))
-        .check_submit(portfolio_id, &cmd)
+        .check_submit(portfolio_id, &cmd, contract_size)
         .await
         .map_err(|err| match err {
             RiskCheckError::Rejected(rejection) => {
