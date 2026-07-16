@@ -7,6 +7,7 @@
 //! `order_state`, maintains the position projection, and appends the resulting
 //! events. On commit it publishes to Kafka.
 
+use tokio::sync::mpsc;
 use chrono::Utc;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
@@ -43,11 +44,23 @@ pub async fn process_execution_report(
     order_id: Uuid,
     report: ExecutionReport,
     actor: &str,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const MAX_ATTEMPTS: u32 = 5;
     for attempt in 1..=MAX_ATTEMPTS {
         match apply_once(pool, kafka, order_id, report.clone(), actor).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if matches!(report, ExecutionReport::Fill { .. }) {
+                    if let Some(tx) = position_changed_tx {
+                        // Signal that positions changed, so the market-data feed
+                        // can subscribe to newly-held instruments. try_send, not
+                        // send: never make the fill path wait on the marks feed —
+                        // a full channel already means "reload pending".
+                        let _ = tx.try_send(());
+                    }
+                }
+                return Ok(());
+            }
             Err(e) if e.downcast_ref::<ConcurrencyRetry>().is_some() => {
                 if attempt == MAX_ATTEMPTS {
                     return Err(e);

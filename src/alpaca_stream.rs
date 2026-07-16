@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::domain::orders::commands::ExecutionReport;
@@ -24,9 +25,10 @@ pub async fn run(
     kafka: Option<KafkaClient>,
     adapter: Arc<AlpacaAdapter>,
     health: StreamHandle,
+    position_changed_tx: Option<mpsc::Sender<()>>,
 ) {
     info!(env = environment, "starting Alpaca trade-update stream");
-    reconcile_routed_orders(&pool, &kafka, &adapter).await;
+    reconcile_routed_orders(&pool, &kafka, &adapter, position_changed_tx.as_ref()).await;
 
     let ws_url = if environment == "LIVE" {
         "wss://api.alpaca.markets/stream"
@@ -39,7 +41,7 @@ pub async fn run(
     loop {
         health.set_connecting();
         info!(env = environment, attempt = backoff_secs, "Alpaca stream connecting");
-        match connect_and_run(ws_url, &api_key, &api_secret, &pool, &kafka, &adapter, &health).await {
+        match connect_and_run(ws_url, &api_key, &api_secret, &pool, &kafka, &adapter, &health, position_changed_tx.as_ref()).await {
             Ok(()) => {
                 warn!(env = environment, "Alpaca stream closed cleanly, reconnecting in {backoff_secs}s");
                 health.set_down("stream closed");
@@ -54,7 +56,12 @@ pub async fn run(
     }
 }
 
-async fn reconcile_routed_orders(pool: &PgPool, kafka: &Option<KafkaClient>, adapter: &AlpacaAdapter) {
+async fn reconcile_routed_orders(
+    pool: &PgPool,
+    kafka: &Option<KafkaClient>,
+    adapter: &AlpacaAdapter,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
+) {
     info!("starting reconciliation of routed orders");
 
     let rows = match sqlx::query("SELECT order_id FROM order_state WHERE status = 'routed'")
@@ -124,7 +131,7 @@ async fn reconcile_routed_orders(pool: &PgPool, kafka: &Option<KafkaClient>, ada
             }
         };
 
-        match process_execution_report(pool, kafka, order_id, report, "alpaca").await {
+        match process_execution_report(pool, kafka, order_id, report, "alpaca", position_changed_tx).await {
             Ok(()) => info!(order_id = %order_id, alpaca_status = status, "reconciliation: applied missed fill"),
             Err(e) => error!(order_id = %order_id, error = %e, "reconciliation: failed to apply execution report"),
         }
@@ -141,6 +148,7 @@ async fn connect_and_run(
     kafka: &Option<KafkaClient>,
     adapter: &AlpacaAdapter,
     health: &StreamHandle,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(ws_url).await?;
     info!("Alpaca stream connected url={ws_url}");
@@ -166,7 +174,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                reconcile_routed_orders(pool, kafka, adapter).await;
+                reconcile_routed_orders(pool, kafka, adapter, position_changed_tx).await;
                 continue;
             }
             msg = ws.next() => {
@@ -211,7 +219,7 @@ async fn connect_and_run(
                 health.set_live();
             }
             "trade_updates" => {
-                if let Err(e) = handle_trade_update(data, pool, kafka).await {
+                if let Err(e) = handle_trade_update(data, pool, kafka, position_changed_tx).await {
                     error!(error = %e, "Alpaca stream: error processing trade update");
                 }
             }
@@ -228,6 +236,7 @@ async fn handle_trade_update(
     data: &serde_json::Value,
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let event = data["event"].as_str().unwrap_or("unknown");
     let order = &data["order"];
@@ -285,7 +294,7 @@ async fn handle_trade_update(
         }
     };
 
-    match process_execution_report(pool, kafka, order_id, report, "alpaca").await {
+    match process_execution_report(pool, kafka, order_id, report, "alpaca", position_changed_tx).await {
         Ok(()) => {}
         Err(e) => {
             error!(order_id = %order_id, error = %e, "Alpaca stream: failed to process execution report");

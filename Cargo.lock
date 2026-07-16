@@ -731,6 +731,7 @@ checksum = "69ee0c66839f827bfd25ee8455f49414cdde18863753451b0dff69268878a041"
 dependencies = [
  "async-compression",
  "bon",
+ "chrono",
  "dbn",
  "futures",
  "hex",
@@ -2553,6 +2554,7 @@ dependencies = [
  "bcrypt",
  "chrono",
  "clap",
+ "databento",
  "dataprovider",
  "domain",
  "dotenvy",
