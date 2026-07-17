@@ -517,10 +517,11 @@ async fn bulk_upsert_xref(
          FROM UNNEST($2::bigint[], $3::text[], $4::text[], $5::text[]) \
               AS t(iid, sym, exch, nid) \
          ON CONFLICT (source_type, source_code, \
-                      COALESCE(external_native_id, ''), \
                       COALESCE(external_symbol, ''), \
                       COALESCE(external_exchange, '')) \
-         DO UPDATE SET instrument_id = EXCLUDED.instrument_id, updated_at = now()",
+         DO UPDATE SET instrument_id = EXCLUDED.instrument_id, \
+                       external_native_id = EXCLUDED.external_native_id, \
+                       updated_at = now()",
     )
     .bind(source_code)
     .bind(&instrument_id)
@@ -671,7 +672,6 @@ async fn persist_identifiers(
          SELECT i.id, $3, $3, i.symbol, i.venue, $4, 'enrich', 'resolved' \
          FROM instrument i WHERE i.symbol = $1 AND i.venue = $2 \
          ON CONFLICT (source_type, source_code, \
-                      COALESCE(external_native_id, ''), \
                       COALESCE(external_symbol, ''), \
                       COALESCE(external_exchange, '')) \
          DO UPDATE SET instrument_id = EXCLUDED.instrument_id, \
