@@ -34,6 +34,12 @@ impl DataProvider for DatabentoOpraFeed {
 
 #[async_trait::async_trait]
 impl LiveQuoteFeed for DatabentoOpraFeed {
+    /// OPRA.PILLAR is an options dataset. Databento cross-references our equities
+    /// too, but this session cannot quote them.
+    fn covers(&self) -> &'static [&'static str] {
+        &["OPTION"]
+    }
+
     async fn run_session(
         &self,
         symbols: HashMap<String, i64>,

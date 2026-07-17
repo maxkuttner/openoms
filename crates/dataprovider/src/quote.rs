@@ -69,6 +69,16 @@ impl FeedHealth for NoFeedHealth {
 /// A source of live quotes.
 #[async_trait::async_trait]
 pub trait LiveQuoteFeed: DataProvider {
+    /// The `instrument_class` values this feed can quote.
+    ///
+    /// `code()` alone is not coverage: a vendor spans many datasets, and a feed is
+    /// one of them. Databento cross-references both equities and options, but the
+    /// OPRA.PILLAR session can only quote options — handing it an equity symbol
+    /// would at best return nothing and at worst have the gateway reject the whole
+    /// subscription. This is the minimum scope a driver needs to pick the right
+    /// held instruments; a per-feed dataset/schema config is the fuller answer when
+    /// one vendor runs several feeds.
+    fn covers(&self) -> &'static [&'static str];
     /// Connect, subscribe `symbols`, and emit quotes until the session ends.
     ///
     /// `Ok(())` means the venue closed the stream cleanly; the supervisor
