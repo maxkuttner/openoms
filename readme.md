@@ -35,8 +35,7 @@ make db-setup
 Optional live data (on-demand, needs vendor creds in `.env`):
 
 ```sh
-make seed-instruments      # instrument universe from Databento (DATABENTO_API_KEY)
-make figi-backfill         # stamp FIGI onto the master via OpenFIGI
+make seed-instruments      # instrument universe from Databento, FIGI-enriched (DATABENTO_API_KEY)
 make sync-brokers          # broker symbology from Alpaca (ALPACA_PAPER_*)
 ```
 
