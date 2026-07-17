@@ -54,6 +54,8 @@ mod stream_health;
 mod marks;
 mod opra_stream;
 mod stream_supervisor;
+mod quote_feed;
+mod mark_router;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -390,10 +392,21 @@ async fn serve() {
         tokio::spawn(binance_stream::run("PAPER", state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
     }
 
-    // Spawn the Databento OPRA marks stream when configured.
+    // Market data: feeds emit quotes onto one channel; the router is the sole
+    // writer to MarkStore. Adding a vendor means spawning another feed here —
+    // nothing downstream changes.
+    let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
+    tokio::spawn(mark_router::run(quote_rx, state.marks().clone()));
+
     if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
         let health = state.stream_health().handle("DATABENTO", "OPRA");
-        tokio::spawn(opra_stream::run(state.pool().clone(), state.marks().clone(), health, position_changed_rx));
+        let session = quote_feed::QuoteFeedSession::new(
+            opra_stream::DatabentoOpraFeed,
+            state.pool().clone(),
+            quote_tx.clone(),
+            position_changed_rx,
+        );
+        tokio::spawn(stream_supervisor::supervise("DATABENTO/OPRA", health, session));
     }
 
     // Register routes
