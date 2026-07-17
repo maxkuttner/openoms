@@ -17,7 +17,7 @@ use databento::{
     live::Subscription,
     LiveClient,
 };
-use dataprovider::{DataProvider, LiveQuoteFeed, ProviderError, Quote, SymbolAdds};
+use dataprovider::{DataProvider, FeedHealth, LiveQuoteFeed, ProviderError, Quote, SymbolAdds};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -39,6 +39,7 @@ impl LiveQuoteFeed for DatabentoOpraFeed {
         symbols: HashMap<String, i64>,
         out: &mpsc::Sender<Quote>,
         add_rx: &mut mpsc::Receiver<SymbolAdds>,
+        health: &dyn FeedHealth,
     ) -> Result<(), ProviderError> {
         // Databento's raw_symbol is the space-padded OSI, stored verbatim in
         // instrument.symbol, so the keys here need no transform.
@@ -57,6 +58,7 @@ impl LiveQuoteFeed for DatabentoOpraFeed {
             .start()
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
+        health.on_connected();
         info!("OPRA feed: live");
 
         // Databento's numeric instrument_id is scoped to (dataset, day) and rotates,
@@ -88,6 +90,7 @@ impl LiveQuoteFeed for DatabentoOpraFeed {
                 rec = client.next_record() => {
                     let rec = rec.map_err(|e| ProviderError::Request(e.to_string()))?;
                     let Some(rec) = rec else { break };
+                    health.on_event();
 
                     // Symbol mapping: the gateway's numeric id for this session.
                     // Handled in the loop, not once at startup, so symbols added

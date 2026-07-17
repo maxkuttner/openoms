@@ -405,6 +405,7 @@ async fn serve() {
             state.pool().clone(),
             quote_tx.clone(),
             position_changed_rx,
+            health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("DATABENTO/OPRA", health, session));
     }

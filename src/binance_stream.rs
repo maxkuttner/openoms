@@ -77,7 +77,8 @@ pub async fn run(
         health: health.clone(),
         position_changed_tx,
     };
-    supervise("BINANCE/PAPER", health, session).await
+    let name: &'static str = if environment == "LIVE" { "BINANCE/LIVE" } else { "BINANCE/PAPER" };
+    supervise(name, health, session).await
 }
 
 async fn connect_and_run(

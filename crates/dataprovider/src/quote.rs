@@ -44,6 +44,28 @@ impl Quote {
 /// Carries the id because the feed must map its own wire identity back to ours.
 pub type SymbolAdds = HashMap<String, i64>;
 
+/// Liveness reporting for a feed session.
+///
+/// A port, so this crate stays ignorant of how the host tracks health. Feeds must
+/// report both: `on_connected` is the only thing that can distinguish "subscribed
+/// and waiting on a quiet book" from "never got up", and `on_event` is the
+/// freshness clock a failover policy reads to decide a source has gone stale.
+pub trait FeedHealth: Send + Sync {
+    /// Subscribed and the venue accepted the session.
+    fn on_connected(&self);
+    /// A frame arrived. Called per record, including ones we discard.
+    fn on_event(&self);
+}
+
+/// A [`FeedHealth`] that reports nowhere — for tests and for hosts that don't
+/// track liveness.
+pub struct NoFeedHealth;
+
+impl FeedHealth for NoFeedHealth {
+    fn on_connected(&self) {}
+    fn on_event(&self) {}
+}
+
 /// A source of live quotes.
 #[async_trait::async_trait]
 pub trait LiveQuoteFeed: DataProvider {
@@ -58,5 +80,6 @@ pub trait LiveQuoteFeed: DataProvider {
         symbols: HashMap<String, i64>,
         out: &mpsc::Sender<Quote>,
         add_rx: &mut mpsc::Receiver<SymbolAdds>,
+        health: &dyn FeedHealth,
     ) -> Result<(), ProviderError>;
 }

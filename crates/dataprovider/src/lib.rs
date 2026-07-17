@@ -27,7 +27,7 @@ pub use enrich::{EnrichReport, Enricher};
 pub use error::ProviderError;
 pub use instrument::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
 pub use provider::DataProvider;
-pub use quote::{LiveQuoteFeed, Quote, SymbolAdds};
+pub use quote::{FeedHealth, LiveQuoteFeed, NoFeedHealth, Quote, SymbolAdds};
 pub use universe::{Category, CostEstimate, SType, UniverseSource, UniverseSpec};
 
 pub use enrichers::openfigi::OpenFigiEnricher;

@@ -1007,9 +1007,11 @@ pub async fn get_portfolio_positions(
         message: format!("failed to load positions: {:?}", err),
     })?;
 
-    // One snapshot for the whole response, so every row is valued against the same
-    // instant rather than racing the feed mid-loop.
-    let marks = state.marks().get_all();
+    // Look up per row rather than snapshotting the whole store: a portfolio holds a
+    // handful of instruments, while the store carries every marked instrument in the
+    // universe, so a clone would cost O(all marks) per request and hold the read
+    // lock against the router's writes for the duration.
+    let marks = state.marks();
 
     let positions = rows
         .iter()
@@ -1019,10 +1021,7 @@ pub async fn get_portfolio_positions(
             let avg_cost: f64 = r.get("avg_cost");
             let contract_size: f64 = r.get("contract_size");
 
-            let mark = instrument_id
-                .parse::<i64>()
-                .ok()
-                .and_then(|id| marks.get(&id).copied());
+            let mark = instrument_id.parse::<i64>().ok().and_then(|id| marks.get(id));
             let mid = mark.map(|m| m.mid());
             let valuation = mid.map(|mid| value_position(net_qty, avg_cost, contract_size, mid));
 

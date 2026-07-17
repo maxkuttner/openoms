@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tracing::info;
 
+use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{Session, StreamResult};
 
 /// How long to idle before re-checking when nothing is held. A reconnect re-runs
@@ -27,6 +28,7 @@ pub struct QuoteFeedSession<F: LiveQuoteFeed> {
     pool: PgPool,
     out: mpsc::Sender<Quote>,
     position_changed_rx: mpsc::Receiver<()>,
+    health: StreamHandle,
 }
 
 impl<F: LiveQuoteFeed> QuoteFeedSession<F> {
@@ -35,20 +37,36 @@ impl<F: LiveQuoteFeed> QuoteFeedSession<F> {
         pool: PgPool,
         out: mpsc::Sender<Quote>,
         position_changed_rx: mpsc::Receiver<()>,
+        health: StreamHandle,
     ) -> Self {
-        Self { feed, pool, out, position_changed_rx }
+        Self { feed, pool, out, position_changed_rx, health }
+    }
+
+    /// Block until there is something to subscribe to.
+    ///
+    /// Deliberately does *not* return to the supervisor when nothing is held: an
+    /// idle feed is not a closed stream, and reporting it as one would flap the
+    /// health badge and log a reconnect warning every minute for a feed behaving
+    /// exactly as designed. Waits on the doorbell so a fill is picked up at once,
+    /// with a timer as the backstop for positions this process didn't see.
+    async fn wait_for_subscribable(&mut self) -> Result<HashMap<String, i64>, sqlx::Error> {
+        loop {
+            let held = load_subscribable(&self.pool, self.feed.code()).await?;
+            if !held.is_empty() {
+                return Ok(held);
+            }
+            tokio::select! {
+                _ = self.position_changed_rx.recv() => {}
+                _ = sleep(Duration::from_secs(IDLE_RECHECK_SECS)) => {}
+            }
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl<F: LiveQuoteFeed> Session for QuoteFeedSession<F> {
     async fn run_once(&mut self) -> StreamResult {
-        let known = load_subscribable(&self.pool, self.feed.code()).await?;
-        if known.is_empty() {
-            info!(source = self.feed.code(), "quote feed: nothing held to subscribe, idling");
-            sleep(Duration::from_secs(IDLE_RECHECK_SECS)).await;
-            return Ok(());
-        }
+        let known = self.wait_for_subscribable().await?;
         info!(source = self.feed.code(), count = known.len(), "quote feed: subscribing held set");
 
         let (add_tx, mut add_rx) = mpsc::channel::<SymbolAdds>(8);
@@ -56,7 +74,7 @@ impl<F: LiveQuoteFeed> Session for QuoteFeedSession<F> {
         // The watcher never ends the session — only the feed decides that. Racing
         // them lets a fill be picked up without waiting for a reconnect.
         tokio::select! {
-            r = self.feed.run_session(known.clone(), &self.out, &mut add_rx) => r.map_err(Into::into),
+            r = self.feed.run_session(known.clone(), &self.out, &mut add_rx, &self.health) => r.map_err(Into::into),
             r = watch_held(&self.pool, self.feed.code(), &mut self.position_changed_rx, &add_tx, known) => r,
         }
     }
