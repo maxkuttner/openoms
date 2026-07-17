@@ -23,7 +23,7 @@ use crate::domain::orders::commands::{OrderCommand, RouteOrder, SubmitOrder};
 use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
-use crate::positions::Position;
+use crate::positions::{value as value_position, Position};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
 use crate::kafka::publish_events;
@@ -985,13 +985,19 @@ pub async fn get_portfolio_positions(
         });
     }
 
+    // contract_size scales the mark into money (x100 for options, 1 for spot).
+    // LEFT JOIN: a position whose master row is missing still returns, valued at 1x.
+    // position.instrument_id is TEXT holding the numeric instrument.id.
     let rows = sqlx::query(
-        "SELECT portfolio_id, instrument_id, \
-                net_qty::double precision      AS net_qty, \
-                avg_cost::double precision     AS avg_cost, \
-                realized_pnl::double precision AS realized_pnl, \
-                updated_at \
-         FROM position WHERE portfolio_id = $1 ORDER BY instrument_id",
+        "SELECT p.portfolio_id, p.instrument_id, \
+                p.net_qty::double precision      AS net_qty, \
+                p.avg_cost::double precision     AS avg_cost, \
+                p.realized_pnl::double precision AS realized_pnl, \
+                p.updated_at, \
+                COALESCE(i.contract_size, 1)::double precision AS contract_size \
+         FROM position p \
+         LEFT JOIN instrument i ON i.id::text = p.instrument_id \
+         WHERE p.portfolio_id = $1 ORDER BY p.instrument_id",
     )
     .bind(portfolio_id)
     .fetch_all(state.pool())
@@ -1001,15 +1007,37 @@ pub async fn get_portfolio_positions(
         message: format!("failed to load positions: {:?}", err),
     })?;
 
+    // One snapshot for the whole response, so every row is valued against the same
+    // instant rather than racing the feed mid-loop.
+    let marks = state.marks().get_all();
+
     let positions = rows
         .iter()
-        .map(|r| Position {
-            portfolio_id: r.get("portfolio_id"),
-            instrument_id: r.get("instrument_id"),
-            net_qty: r.get("net_qty"),
-            avg_cost: r.get("avg_cost"),
-            realized_pnl: r.get("realized_pnl"),
-            updated_at: r.get("updated_at"),
+        .map(|r| {
+            let instrument_id: String = r.get("instrument_id");
+            let net_qty: f64 = r.get("net_qty");
+            let avg_cost: f64 = r.get("avg_cost");
+            let contract_size: f64 = r.get("contract_size");
+
+            let mark = instrument_id
+                .parse::<i64>()
+                .ok()
+                .and_then(|id| marks.get(&id).copied());
+            let mid = mark.map(|m| m.mid());
+            let valuation = mid.map(|mid| value_position(net_qty, avg_cost, contract_size, mid));
+
+            Position {
+                portfolio_id: r.get("portfolio_id"),
+                instrument_id,
+                net_qty,
+                avg_cost,
+                realized_pnl: r.get("realized_pnl"),
+                updated_at: r.get("updated_at"),
+                mark: mid,
+                market_value: valuation.map(|v| v.market_value),
+                unrealized_pnl: valuation.map(|v| v.unrealized_pnl),
+                mark_ts: mark.map(|m| m.ts),
+            }
         })
         .collect();
     Ok(Json(positions))
