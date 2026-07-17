@@ -56,6 +56,7 @@ mod opra_stream;
 mod stream_supervisor;
 mod quote_feed;
 mod mark_router;
+mod binance_feed;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -363,10 +364,16 @@ async fn serve() {
         Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
-    // Doorbell from the fill path to the marks feed: a fill moved a position, so
+    // Doorbell from the fill path to the marks feeds: a fill moved a position, so
     // re-read the held set. bounded(1) — a queued signal already means "reload",
     // so extras are redundant and try_send never blocks the fill path.
-    let (position_changed_tx, position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
+    //
+    // The fill path rings once; an mpsc has exactly one consumer, so a fan-out task
+    // (spawned below, once every feed has registered) relays to each feed's own
+    // doorbell. Keeping the fill path on a single sender means execution.rs need
+    // not know how many feeds exist.
+    let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut marks_doorbells: Vec<tokio::sync::mpsc::Sender<()>> = Vec::new();
 
     // Spawn Alpaca trade-update stream tasks (one per configured environment)
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
@@ -399,16 +406,45 @@ async fn serve() {
     tokio::spawn(mark_router::run(quote_rx, state.marks().clone()));
 
     if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
+        let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
+        marks_doorbells.push(opra_pos_tx);
         let health = state.stream_health().handle("DATABENTO", "OPRA");
         let session = quote_feed::QuoteFeedSession::new(
             opra_stream::DatabentoOpraFeed,
             state.pool().clone(),
             quote_tx.clone(),
-            position_changed_rx,
+            opra_pos_rx,
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("DATABENTO/OPRA", health, session));
     }
+
+    // Binance public market data — no credentials, so it is always on. Each feed
+    // needs its own doorbell receiver (an mpsc has exactly one consumer), so the
+    // sender is cloned per feed rather than shared.
+    {
+        let (binance_pos_tx, binance_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
+        marks_doorbells.push(binance_pos_tx);
+        let health = state.stream_health().handle("BINANCE", "SPOT");
+        let session = quote_feed::QuoteFeedSession::new(
+            binance_feed::BinanceFeed,
+            state.pool().clone(),
+            quote_tx.clone(),
+            binance_pos_rx,
+            health.clone(),
+        );
+        tokio::spawn(stream_supervisor::supervise("BINANCE/SPOT", health, session));
+    }
+
+    // Relay the fill path's single doorbell to every feed. try_send: a full
+    // per-feed channel already means "reload pending", and this must never block.
+    tokio::spawn(async move {
+        while position_changed_rx.recv().await.is_some() {
+            for doorbell in &marks_doorbells {
+                let _ = doorbell.try_send(());
+            }
+        }
+    });
 
     // Register routes
 

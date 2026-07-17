@@ -43,6 +43,27 @@ FROM (VALUES
 JOIN instrument i ON i.symbol = x.base AND i.venue = 'BINANCE'
 ON CONFLICT DO NOTHING;
 
+-- PROVIDER xref: the same pair, but as a market-data identity rather than a
+-- routing one. Without these rows the crypto is tradable but unmarkable — the
+-- quote feed has no way to know Binance can price it, so /positions reports a
+-- null mark for a position we can freely trade.
+--
+-- external_symbol is the pair as Binance's market-data streams report it (the `s`
+-- field of bookTicker, uppercase); external_exchange is the venue, matching
+-- instrument.venue. No native_id: the feed resolves by symbol, and Binance's
+-- market data has no separate id worth storing.
+INSERT INTO oms.instrument_xref
+    (instrument_id, source_type, source_code, external_symbol, external_exchange,
+     method, confidence)
+SELECT i.id, 'PROVIDER', 'BINANCE', x.pair, 'BINANCE', 'manual', 'resolved'
+FROM (VALUES
+    ('BTC', 'BTCUSDT'),
+    ('ETH', 'ETHUSDT'),
+    ('SOL', 'SOLUSDT')
+) AS x(base, pair)
+JOIN instrument i ON i.symbol = x.base AND i.venue = 'BINANCE'
+ON CONFLICT DO NOTHING;
+
 -- Routing target. Credentials resolved from env (BINANCE_PAPER_API_KEY/SECRET).
 INSERT INTO oms.broker_connection (code, broker_code, environment, status)
 VALUES ('binance-paper', 'BINANCE', 'PAPER', 'ACTIVE')
