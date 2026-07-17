@@ -28,7 +28,7 @@ CROSS JOIN (VALUES
 ) AS v(source_type, source_code, external_exchange, native_id, is_tradeable)
 WHERE  i.symbol = 'SPY' AND i.venue = 'ARCX'
 ON CONFLICT (source_type, source_code,
-             COALESCE(external_native_id, ''), COALESCE(external_symbol, ''), COALESCE(external_exchange, ''))
+             COALESCE(external_symbol, ''), COALESCE(external_exchange, ''))
 DO NOTHING;
 
 -- A test broker connection so an account can be created and orders can route.

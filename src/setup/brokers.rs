@@ -210,13 +210,13 @@ async fn bulk_upsert_broker_xref(
          FROM UNNEST($2::bigint[], $3::text[], $4::text[], $5::text[], $6::bool[], $7::float8[]) \
               AS t(iid, sym, exch, nid, trad, minq) \
          ON CONFLICT (source_type, source_code, \
-                      COALESCE(external_native_id, ''), \
                       COALESCE(external_symbol, ''), \
                       COALESCE(external_exchange, '')) \
-         DO UPDATE SET instrument_id = EXCLUDED.instrument_id, \
-                       is_tradeable  = EXCLUDED.is_tradeable, \
-                       min_quantity  = EXCLUDED.min_quantity, \
-                       updated_at    = now()",
+         DO UPDATE SET instrument_id      = EXCLUDED.instrument_id, \
+                       external_native_id = EXCLUDED.external_native_id, \
+                       is_tradeable       = EXCLUDED.is_tradeable, \
+                       min_quantity       = EXCLUDED.min_quantity, \
+                       updated_at         = now()",
     )
     .bind(BROKER_CODE)
     .bind(&instrument_id)

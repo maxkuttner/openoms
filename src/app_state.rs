@@ -4,6 +4,7 @@ use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
 use crate::adapters::BrokerRegistry;
 use crate::kafka::KafkaClient;
+use crate::marks::MarkStore;
 use crate::stream_health::StreamHealthRegistry;
 
 /// The OpenFIGI-backed instrument identification engine, with an in-memory cache.
@@ -19,6 +20,7 @@ pub struct AppState {
     kafka: Option<KafkaClient>,
     symbology: Arc<SymbologyEngine>,
     stream_health: StreamHealthRegistry,
+    marks: MarkStore,
 }
 
 impl AppState {
@@ -38,6 +40,7 @@ impl AppState {
             kafka,
             symbology: Arc::new(symbology),
             stream_health: StreamHealthRegistry::new(),
+            marks: MarkStore::new(),
         }
     }
 
@@ -60,4 +63,6 @@ impl AppState {
     pub fn stream_health(&self) -> &StreamHealthRegistry {
         &self.stream_health
     }
+
+    pub fn marks(&self) -> &MarkStore { &self.marks }
 }

@@ -51,6 +51,8 @@ mod execution;
 mod alpaca_stream;
 mod binance_stream;
 mod stream_health;
+mod marks;
+mod opra_stream;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -358,12 +360,17 @@ async fn serve() {
         Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
+    // Doorbell from the fill path to the marks feed: a fill moved a position, so
+    // re-read the held set. bounded(1) — a queued signal already means "reload",
+    // so extras are redundant and try_send never blocks the fill path.
+    let (position_changed_tx, position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
+
     // Spawn Alpaca trade-update stream tasks (one per configured environment)
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
             if let Some(adapter) = state.registry().get_alpaca("PAPER") {
                 let health = state.stream_health().handle("ALPACA", "PAPER");
-                tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health));
+                tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
             }
         }
     }
@@ -371,7 +378,7 @@ async fn serve() {
         if !key.is_empty() && !secret.is_empty() {
             if let Some(adapter) = state.registry().get_alpaca("LIVE") {
                 let health = state.stream_health().handle("ALPACA", "LIVE");
-                tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health));
+                tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
             }
         }
     }
@@ -379,7 +386,13 @@ async fn serve() {
     // Spawn the Binance user-data stream when configured.
     if let Some(adapter) = binance_paper {
         let health = state.stream_health().handle("BINANCE", "PAPER");
-        tokio::spawn(binance_stream::run("PAPER", String::new(), String::new(), state.pool().clone(), state.kafka().cloned(), adapter, health));
+        tokio::spawn(binance_stream::run("PAPER", String::new(), String::new(), state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
+    }
+
+    // Spawn the Databento OPRA marks stream when configured.
+    if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
+        let health = state.stream_health().handle("DATABENTO", "OPRA");
+        tokio::spawn(opra_stream::run(state.pool().clone(), state.marks().clone(), health, position_changed_rx));
     }
 
     // Register routes

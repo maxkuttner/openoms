@@ -26,6 +26,7 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13.1", features = ["json"] }
 base64 = "0.22"
 bcrypt = "0.15"
+databento = { version = "0.54.0", default-features = false, features = ["live", "chrono"]}
 
 # Binance request signing (Ed25519 over the query string; also for the WS-API
 # session.logon). Ed25519 is the only key type Binance supports for the WebSocket

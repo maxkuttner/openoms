@@ -27,19 +27,23 @@ GRANT INSERT, DELETE ON public.instrument_universe_symbol TO oms_user;
 ALTER DEFAULT PRIVILEGES FOR ROLE mdm_master IN SCHEMA public
     GRANT SELECT ON TABLES TO oms_user;
 
--- Reference-data ingestion: marketbox seeds the instrument universe from
--- Databento (see marketbox/seed_instruments.py), writing the master-data
--- instrument tables and the Databento provider_instrument symbology, and syncs
--- broker symbology (marketbox/broker_sync.py) into broker_instrument. It connects
--- as market_user and needs to *write* instruments + provider_instrument +
--- broker_instrument and *read* the FK targets (venue, currency).
--- (Long-term, a dedicated least-privilege `refdata_user` is cleaner; reusing
---  market_user avoids an infra/ansible role change for now.)
-GRANT CONNECT ON DATABASE ods TO market_user;
-GRANT USAGE ON SCHEMA public TO market_user;
-GRANT SELECT ON public.venue, public.currency TO market_user;
-GRANT SELECT, INSERT, UPDATE ON public.instrument, public.instrument_derivative TO market_user;
--- Instrument-universe catalog: the seeder reads enabled universes + their symbols
--- and writes the seed-state columns (status, last_seeded_at, …) back on the parent.
-GRANT SELECT ON public.instrument_universe, public.instrument_universe_symbol TO market_user;
-GRANT UPDATE ON public.instrument_universe TO market_user;
+-- Reference-data ingestion runs in-process as oms_user (`oms setup universe` /
+-- `oms setup sync-brokers`), using the grants above — no separate role needed.
+--
+-- market_user previously held write grants here for the marketbox seeders
+-- (seed_instruments.py / broker_sync.py), both now gone. db-provision never creates
+-- this role, so a fresh install skips the block entirely; it exists only to converge
+-- databases provisioned back when the seeders were external. Revoking (not merely
+-- deleting the GRANTs) is what actually removes the stale access. Dropping the role
+-- is a one-off admin action — it is cluster-wide and may serve other databases, so
+-- it is deliberately not done here.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'market_user') THEN
+        REVOKE ALL ON public.instrument, public.instrument_derivative FROM market_user;
+        REVOKE ALL ON public.instrument_universe, public.instrument_universe_symbol FROM market_user;
+        REVOKE ALL ON public.venue, public.currency FROM market_user;
+        REVOKE USAGE ON SCHEMA public FROM market_user;
+        EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM market_user', current_database());
+    END IF;
+END $$;

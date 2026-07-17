@@ -1,8 +1,5 @@
+# Only send_test_order.py needs a third-party package now; db/scripts/seed_venues.py
+# is stdlib-only. Instrument seeding and broker sync are Rust:
+#   oms setup universe      (was scripts/seed_instruments.py)
+#   oms setup sync-brokers  (was scripts/broker_sync.py)
 requests>=2.31.0
-psycopg2-binary>=2.9.0
-
-# seeders moved from marketbox (seed_instruments.py, seed_venues.py); broker sync is now Rust (oms setup sync-brokers)
-databento>=0.77.0
-psycopg[binary]>=3.0
-python-dotenv>=1.0
-questionary>=2.0

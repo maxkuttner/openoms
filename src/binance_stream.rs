@@ -13,6 +13,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sqlx::{PgPool, Row};
+use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -39,16 +40,17 @@ pub async fn run(
     kafka: Option<KafkaClient>,
     adapter: Arc<BinanceAdapter>,
     health: StreamHandle,
+    position_changed_tx: Option<mpsc::Sender<()>>,
 ) {
     info!(env = environment, "starting Binance user-data stream");
     // Catch up on anything missed while disconnected, then stream live.
-    reconcile_routed_orders(&pool, &kafka, &adapter).await;
+    reconcile_routed_orders(&pool, &kafka, &adapter, position_changed_tx.as_ref()).await;
 
     let mut backoff_secs: u64 = 1;
     loop {
         health.set_connecting();
         info!(env = environment, "Binance WS-API connecting");
-        match connect_and_run(&adapter, &pool, &kafka, &health).await {
+        match connect_and_run(&adapter, &pool, &kafka, &health, position_changed_tx.as_ref()).await {
             Ok(()) => {
                 warn!(env = environment, "Binance stream closed, reconnecting in {backoff_secs}s");
                 health.set_down("stream closed");
@@ -68,6 +70,7 @@ async fn connect_and_run(
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
     health: &StreamHandle,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.ws_url()).await?;
     info!("Binance WS-API connected");
@@ -90,7 +93,7 @@ async fn connect_and_run(
             // Periodic liveness probe + catch-up sweep for missed terminal reports.
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                reconcile_routed_orders(pool, kafka, adapter).await;
+                reconcile_routed_orders(pool, kafka, adapter, position_changed_tx).await;
                 continue;
             }
             msg = ws.next() => {
@@ -117,7 +120,7 @@ async fn connect_and_run(
         // Pushed user-data event: {"subscriptionId":N,"event":{...}}
         if v.get("event").is_some() {
             if v["event"]["e"].as_str() == Some("executionReport") {
-                if let Err(e) = handle_execution_report(&v["event"], pool, kafka).await {
+                if let Err(e) = handle_execution_report(&v["event"], pool, kafka, position_changed_tx).await {
                     error!(error = %e, "Binance WS: error processing executionReport");
                 }
             }
@@ -153,6 +156,7 @@ async fn handle_execution_report(
     event: &serde_json::Value,
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let exec_type = event["x"].as_str().unwrap_or("");
     // On a cancel, Binance puts the cancel-request's id in `c` and the original
@@ -191,7 +195,7 @@ async fn handle_execution_report(
         }
     };
 
-    if let Err(e) = process_execution_report(pool, kafka, order_id, report, "binance").await {
+    if let Err(e) = process_execution_report(pool, kafka, order_id, report, "binance", position_changed_tx).await {
         error!(order_id = %order_id, error = %e, "Binance WS: failed to apply execution report");
     }
     Ok(())
@@ -199,7 +203,12 @@ async fn handle_execution_report(
 
 /// One-time startup catch-up: for each `routed` Binance order, fetch its state via
 /// REST and apply the terminal report if it already resolved while we were down.
-async fn reconcile_routed_orders(pool: &PgPool, kafka: &Option<KafkaClient>, adapter: &BinanceAdapter) {
+async fn reconcile_routed_orders(
+    pool: &PgPool,
+    kafka: &Option<KafkaClient>,
+    adapter: &BinanceAdapter,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
+) {
     let rows = match sqlx::query(
         "SELECT os.order_id, os.instrument_id \
          FROM order_state os \
@@ -261,7 +270,7 @@ async fn reconcile_routed_orders(pool: &PgPool, kafka: &Option<KafkaClient>, ada
             _ => continue,
         };
 
-        match process_execution_report(pool, kafka, order_id, report, "binance").await {
+        match process_execution_report(pool, kafka, order_id, report, "binance", position_changed_tx).await {
             Ok(()) => info!(order_id = %order_id, binance_status = status, "Binance reconcile: applied missed report"),
             Err(e) => error!(order_id = %order_id, error = %e, "Binance reconcile: apply failed"),
         }

@@ -194,7 +194,7 @@ async fn upsert_xref(
            (instrument_id, source_type, source_code, external_symbol, external_exchange, figi, method, confidence) \
          VALUES ($1, $2, $3, $4, $5, $6, 'openfigi', 'resolved') \
          ON CONFLICT (source_type, source_code, \
-                      COALESCE(external_native_id, ''), COALESCE(external_symbol, ''), COALESCE(external_exchange, '')) \
+                      COALESCE(external_symbol, ''), COALESCE(external_exchange, '')) \
          DO UPDATE SET instrument_id = EXCLUDED.instrument_id, figi = EXCLUDED.figi, updated_at = now()",
     )
     .bind(instrument_id)

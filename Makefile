@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments figi-backfill sync-brokers sync-brokers-options
+.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments sync-brokers sync-brokers-options
 
 # Load .env into the recipe shell (one shell per recipe line, so chain with &&).
 ENV := set -a && . ./.env && set +a
@@ -37,18 +37,11 @@ db-fixtures: ## Load the minimal no-creds fixture (SPY)
 		-f scripts/fixtures/minimal_seed.sql
 
 # --- live universe (on-demand, NOT scheduled) ---
-# Default to the admin role (like every other seeder) so standalone works out of
-# the box. Note .env sets DB_USER=oms_user for the app (read-only on public), so we
-# use a separate SEED_DB_USER var: a managed deployment can export it to point the
-# seeders at a least-privilege write role (e.g. market_user) without touching DB_USER.
-seed-instruments: ## Seed instrument universes from Databento (interactive; UNIVERSE=CODE for one)
-	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
-		python3 scripts/seed_instruments.py \
-		$${UNIVERSE:+--universe $$UNIVERSE} $${UNIVERSE:---interactive}
-
-figi-backfill: ## Stamp FIGI onto FIGI-less master rows via OpenFIGI (run after seed-instruments; DRY_RUN=1, ARGS=... to pass flags)
-	@$(ENV) && DB_USER="$${SEED_DB_USER:-$$ADMIN_USER}" DB_PASSWORD="$${SEED_DB_PASSWORD:-$$ADMIN_PASSWORD}" \
-		cargo run --quiet --bin figi_backfill -- $${DRY_RUN:+--dry-run} $$ARGS
+# Seeding runs in-process as DB_USER (oms_user) — it holds the INSERT/UPDATE grants
+# on the master catalog (db/access/ods.sql), so no admin or separate write role.
+seed-instruments: ## Seed instrument universes from Databento (interactive; UNIVERSE=CODE for one; DRY_RUN=1 for a cost estimate; ARGS=... e.g. --no-enrich --max-cost 5)
+	@$(ENV) && cargo run --quiet -- setup universe \
+		$${UNIVERSE:+--universe $$UNIVERSE} $${DRY_RUN:+--dry-run} $$ARGS
 
 sync-brokers: ## Sync broker symbology into instrument_xref (needs ALPACA_PAPER_*; ARGS=... e.g. --asset-class equity; DRY_RUN=1)
 	@$(ENV) && cargo run --quiet -- setup sync-brokers $${DRY_RUN:+--dry-run} $$ARGS
