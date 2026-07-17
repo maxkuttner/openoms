@@ -53,6 +53,7 @@ mod binance_stream;
 mod stream_health;
 mod marks;
 mod opra_stream;
+mod stream_supervisor;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -386,7 +387,7 @@ async fn serve() {
     // Spawn the Binance user-data stream when configured.
     if let Some(adapter) = binance_paper {
         let health = state.stream_health().handle("BINANCE", "PAPER");
-        tokio::spawn(binance_stream::run("PAPER", String::new(), String::new(), state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
+        tokio::spawn(binance_stream::run("PAPER", state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
     }
 
     // Spawn the Databento OPRA marks stream when configured.

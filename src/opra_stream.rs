@@ -22,41 +22,51 @@ use databento::{
 use sqlx::{PgPool, Row};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::marks::MarkStore;
 use crate::stream_health::StreamHandle;
+use crate::stream_supervisor::{supervise, Session, StreamResult};
 
 const OPRA_DATASET: &str = "OPRA.PILLAR";
 
-/// `position_changed_rx` is owned here and borrowed into each session: the
-/// doorbell outlives reconnects, since it has nothing to do with the Databento
-/// session.
+/// Holds what one OPRA session needs. `position_changed_rx` lives here rather than
+/// inside a session body: the doorbell outlives reconnects, since it has nothing to
+/// do with the Databento session.
+struct OpraSession {
+    pool: PgPool,
+    marks: MarkStore,
+    health: StreamHandle,
+    position_changed_rx: mpsc::Receiver<()>,
+}
+
+#[async_trait::async_trait]
+impl Session for OpraSession {
+    async fn run_once(&mut self) -> StreamResult {
+        connect_and_run(
+            &self.pool,
+            &self.marks,
+            &self.health,
+            &mut self.position_changed_rx,
+        )
+        .await
+    }
+}
+
 pub async fn run(
     pool: PgPool,
     marks: MarkStore,
     health: StreamHandle,
-    mut position_changed_rx: mpsc::Receiver<()>,
+    position_changed_rx: mpsc::Receiver<()>,
 ) {
     info!("starting Databento OPRA marks stream");
-
-    let mut backoff_secs: u64 = 1;
-    loop {
-        // Set the health status to `connecting`, then reset it to live on `success`.
-        health.set_connecting();
-        match connect_and_run(&pool, &marks, &health, &mut position_changed_rx).await {
-            Ok(()) => {
-                warn!("OPRA stream closed, reconnecting in {backoff_secs}s");
-                health.set_down("stream closed");
-            }
-            Err(e) => {
-                warn!(error = %e, "OPRA stream error, reconnecting in {backoff_secs}s");
-                health.set_down(e.to_string());
-            }
-        }
-        sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(30);
-    }
+    let session = OpraSession {
+        pool,
+        marks,
+        health: health.clone(),
+        position_changed_rx,
+    };
+    supervise("DATABENTO/OPRA", health, session).await
 }
 
 async fn connect_and_run(
