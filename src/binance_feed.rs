@@ -24,6 +24,14 @@ use tracing::{info, warn};
 const WS_URL: &str = "wss://stream.binance.com:9443/ws";
 const SOURCE_CODE: &str = "BINANCE";
 
+/// Override the endpoint — for pointing at a mock, or at testnet's book if you ever
+/// want marks consistent with testnet fills rather than with the real market.
+/// Setting it to an unreachable host is also how the failover path gets exercised
+/// without unplugging anything.
+fn ws_url() -> String {
+    std::env::var("BINANCE_FEED_WS_URL").unwrap_or_else(|_| WS_URL.to_string())
+}
+
 pub struct BinanceFeed;
 
 impl DataProvider for BinanceFeed {
@@ -48,10 +56,11 @@ impl LiveQuoteFeed for BinanceFeed {
         // Keys are the pair as Binance reports it in `s` (uppercase, e.g. SOLUSDT).
         let mut sym_to_id = symbols;
 
-        let (mut ws, _) = connect_async(WS_URL)
+        let url = ws_url();
+        let (mut ws, _) = connect_async(&url)
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
-        info!(url = WS_URL, "Binance feed: connected");
+        info!(url = %url, "Binance feed: connected");
 
         let mut req_id: u64 = 1;
         subscribe(&mut ws, sym_to_id.keys().cloned().collect(), &mut req_id).await?;

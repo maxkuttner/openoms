@@ -2,10 +2,13 @@
 -- quote currency, a few spot pairs as instruments, their BROKER xref rows (order
 -- routing + recon), and the broker_connection. Idempotent.
 --
--- Crypto instrument model: symbol = base asset (BTC), currency = quote (USDT),
--- venue = BINANCE. The xref carries the Binance pair as external_symbol (BTCUSDT,
--- used to route orders) and the base asset as external_native_id (BTC, what
--- account balances report and reconciliation matches on).
+-- Crypto instrument model: symbol = the PAIR (BTCUSDT), currency = quote (USDT),
+-- venue = BINANCE. The symbol names the pair because that is what the instrument
+-- is -- symbol = base alone cannot represent BTC/USDT and BTC/BTC-quote variants
+-- at once under UNIQUE (symbol, venue), and every venue calls it BTCUSDT anyway.
+-- The xref carries that pair as external_symbol (order routing + market data) and
+-- the base asset as external_native_id (BTC, what account balances report and
+-- reconciliation matches on).
 --
 -- Account creation (principal/portfolio/account routing to binance-paper) is left
 -- to the admin/cockpit — this seeds only the shared reference data.
@@ -24,9 +27,9 @@ INSERT INTO instrument
     (symbol, venue, name, asset_class, instrument_class, currency, status,
      price_precision, size_precision, price_increment, size_increment)
 VALUES
-    ('BTC', 'BINANCE', 'Bitcoin',  'CRYPTO', 'SPOT', 'USDT', 'ACTIVE', 2, 5, 0.01,  0.00001),
-    ('ETH', 'BINANCE', 'Ethereum', 'CRYPTO', 'SPOT', 'USDT', 'ACTIVE', 2, 4, 0.01,  0.0001),
-    ('SOL', 'BINANCE', 'Solana',   'CRYPTO', 'SPOT', 'USDT', 'ACTIVE', 2, 3, 0.01,  0.001)
+    ('BTCUSDT', 'BINANCE', 'Bitcoin',  'CRYPTO', 'SPOT', 'USDT', 'ACTIVE', 2, 5, 0.01,  0.00001),
+    ('ETHUSDT', 'BINANCE', 'Ethereum', 'CRYPTO', 'SPOT', 'USDT', 'ACTIVE', 2, 4, 0.01,  0.0001),
+    ('SOLUSDT', 'BINANCE', 'Solana',   'CRYPTO', 'SPOT', 'USDT', 'ACTIVE', 2, 3, 0.01,  0.001)
 ON CONFLICT (symbol, venue) DO NOTHING;
 
 -- BROKER xref: external_symbol = Binance pair (order routing);
@@ -40,7 +43,7 @@ FROM (VALUES
     ('ETH', 'ETHUSDT', 0.0001),
     ('SOL', 'SOLUSDT', 0.001)
 ) AS x(base, pair, min_qty)
-JOIN instrument i ON i.symbol = x.base AND i.venue = 'BINANCE'
+JOIN instrument i ON i.symbol = x.pair AND i.venue = 'BINANCE'
 ON CONFLICT DO NOTHING;
 
 -- PROVIDER xref: the same pair, but as a market-data identity rather than a
@@ -61,7 +64,7 @@ FROM (VALUES
     ('ETH', 'ETHUSDT'),
     ('SOL', 'SOLUSDT')
 ) AS x(base, pair)
-JOIN instrument i ON i.symbol = x.base AND i.venue = 'BINANCE'
+JOIN instrument i ON i.symbol = x.pair AND i.venue = 'BINANCE'
 ON CONFLICT DO NOTHING;
 
 -- Routing target. Credentials resolved from env (BINANCE_PAPER_API_KEY/SECRET).

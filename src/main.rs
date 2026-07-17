@@ -57,6 +57,7 @@ mod stream_supervisor;
 mod quote_feed;
 mod mark_router;
 mod binance_feed;
+mod bybit_feed;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -403,7 +404,7 @@ async fn serve() {
     // writer to MarkStore. Adding a vendor means spawning another feed here —
     // nothing downstream changes.
     let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
-    tokio::spawn(mark_router::run(quote_rx, state.marks().clone()));
+    tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
 
     if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
         let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -434,6 +435,23 @@ async fn serve() {
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("BINANCE/SPOT", health, session));
+    }
+
+    // Bybit public market data — a second source for the same crypto pairs, so a
+    // Binance outage does not leave positions unmarked. Ranked below Binance in
+    // provider_feed_policy; the router decides which one owns the mark.
+    {
+        let (bybit_pos_tx, bybit_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
+        marks_doorbells.push(bybit_pos_tx);
+        let health = state.stream_health().handle("BYBIT", "SPOT");
+        let session = quote_feed::QuoteFeedSession::new(
+            bybit_feed::BybitFeed,
+            state.pool().clone(),
+            quote_tx.clone(),
+            bybit_pos_rx,
+            health.clone(),
+        );
+        tokio::spawn(stream_supervisor::supervise("BYBIT/SPOT", health, session));
     }
 
     // Relay the fill path's single doorbell to every feed. try_send: a full
