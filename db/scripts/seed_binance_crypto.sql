@@ -67,6 +67,19 @@ FROM (VALUES
 JOIN instrument i ON i.symbol = x.pair AND i.venue = 'BINANCE'
 ON CONFLICT DO NOTHING;
 
+-- A SECOND market-data source for the same pairs. Bybit quotes the identical
+-- symbol; ranked below Binance in provider_feed_policy, it is the failover feed
+-- when Binance goes quiet. external_symbol is the same pair string (Bybit's v5
+-- orderbook.1 reports it identically); external_exchange = BYBIT so the two
+-- PROVIDER rows are distinct identities for one instrument.
+INSERT INTO oms.instrument_xref
+    (instrument_id, source_type, source_code, external_symbol, external_exchange,
+     method, confidence)
+SELECT i.id, 'PROVIDER', 'BYBIT', i.symbol, 'BYBIT', 'manual', 'resolved'
+FROM instrument i
+WHERE i.asset_class = 'CRYPTO' AND i.instrument_class = 'SPOT'
+ON CONFLICT DO NOTHING;
+
 -- Routing target. Credentials resolved from env (BINANCE_PAPER_API_KEY/SECRET).
 INSERT INTO oms.broker_connection (code, broker_code, environment, status)
 VALUES ('binance-paper', 'BINANCE', 'PAPER', 'ACTIVE')
