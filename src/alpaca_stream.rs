@@ -1,6 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use sqlx::{PgPool, Row};
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -13,9 +13,38 @@ use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
 use crate::kafka::KafkaClient;
 use crate::stream_health::StreamHandle;
+use crate::stream_supervisor::{supervise, Session, StreamResult};
 
 /// Ping + missed-fill sweep cadence; see the Binance stream for the rationale.
 const HEARTBEAT_SECS: u64 = 30;
+
+struct AlpacaSession {
+    ws_url: &'static str,
+    api_key: String,
+    api_secret: String,
+    pool: PgPool,
+    kafka: Option<KafkaClient>,
+    adapter: Arc<AlpacaAdapter>,
+    health: StreamHandle,
+    position_changed_tx: Option<mpsc::Sender<()>>,
+}
+
+#[async_trait::async_trait]
+impl Session for AlpacaSession {
+    async fn run_once(&mut self) -> StreamResult {
+        connect_and_run(
+            self.ws_url,
+            &self.api_key,
+            &self.api_secret,
+            &self.pool,
+            &self.kafka,
+            &self.adapter,
+            &self.health,
+            self.position_changed_tx.as_ref(),
+        )
+        .await
+    }
+}
 
 pub async fn run(
     environment: &'static str,
@@ -36,24 +65,18 @@ pub async fn run(
         "wss://paper-api.alpaca.markets/stream"
     };
 
-    let mut backoff_secs: u64 = 1;
-
-    loop {
-        health.set_connecting();
-        info!(env = environment, attempt = backoff_secs, "Alpaca stream connecting");
-        match connect_and_run(ws_url, &api_key, &api_secret, &pool, &kafka, &adapter, &health, position_changed_tx.as_ref()).await {
-            Ok(()) => {
-                warn!(env = environment, "Alpaca stream closed cleanly, reconnecting in {backoff_secs}s");
-                health.set_down("stream closed");
-            }
-            Err(e) => {
-                warn!(env = environment, error = %e, "Alpaca stream error, reconnecting in {backoff_secs}s");
-                health.set_down(e.to_string());
-            }
-        }
-        sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(30);
-    }
+    let name: &'static str = if environment == "LIVE" { "ALPACA/LIVE" } else { "ALPACA/PAPER" };
+    let session = AlpacaSession {
+        ws_url,
+        api_key,
+        api_secret,
+        pool,
+        kafka,
+        adapter,
+        health: health.clone(),
+        position_changed_tx,
+    };
+    supervise(name, health, session).await
 }
 
 async fn reconcile_routed_orders(

@@ -4,6 +4,7 @@
 //!   - [`DataProvider`]   — base identity (`code()`).
 //!   - [`UniverseSource`] — discover + price + fetch instrument definitions.
 //!   - [`Enricher`]       — fill the [`Identifiers`] bag from a metadata endpoint.
+//!   - [`LiveQuoteFeed`]  — stream normalized top-of-book [`Quote`]s.
 //!
 //! The seeder (in the `rustoms` app) drives a set of providers and a
 //! `Vec<Box<dyn Enricher>>`. Adding a vendor = new `impl UniverseSource`; adding
@@ -16,6 +17,7 @@ mod enrich;
 mod error;
 mod instrument;
 mod provider;
+mod quote;
 mod universe;
 
 pub mod enrichers;
@@ -25,6 +27,7 @@ pub use enrich::{EnrichReport, Enricher};
 pub use error::ProviderError;
 pub use instrument::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
 pub use provider::DataProvider;
+pub use quote::{FeedHealth, LiveQuoteFeed, NoFeedHealth, Quote, SymbolAdds};
 pub use universe::{Category, CostEstimate, SType, UniverseSource, UniverseSpec};
 
 pub use enrichers::openfigi::OpenFigiEnricher;

@@ -132,3 +132,15 @@ impl StreamHandle {
         self.mutate(|h| h.last_event_at = Some(now));
     }
 }
+
+/// Lets a `dataprovider` feed report liveness without that crate knowing about
+/// this registry.
+impl dataprovider::FeedHealth for StreamHandle {
+    fn on_connected(&self) {
+        self.set_live();
+    }
+
+    fn on_event(&self) {
+        self.record_event();
+    }
+}

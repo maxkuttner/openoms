@@ -82,7 +82,31 @@ impl PositionMath {
     }
 }
 
+/// Mark-to-market valuation of an open position.
+///
+/// Both figures are signed through `net_qty`, so a short (`net_qty < 0`) yields a
+/// negative market value and profits when the mark falls below `avg_cost`.
+/// `contract_size` scales into money — 100 for an option, 1 for spot.
+pub fn value(net_qty: f64, avg_cost: f64, contract_size: f64, mid: f64) -> Valuation {
+    Valuation {
+        market_value: net_qty * mid * contract_size,
+        unrealized_pnl: (mid - avg_cost) * net_qty * contract_size,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Valuation {
+    pub market_value: f64,
+    pub unrealized_pnl: f64,
+}
+
 /// A position row as returned by the API.
+///
+/// `realized_pnl` comes from the projection; the mark-dependent fields are joined
+/// in from the in-memory [`crate::marks::MarkStore`] at request time. They are
+/// `None` when no live mark exists for the instrument — a position we can hold but
+/// not value (no market-data source, or the feed is down) is a first-class state,
+/// not an error, so it renders as a gap rather than a misleading zero.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Position {
     pub portfolio_id: Uuid,
@@ -91,6 +115,14 @@ pub struct Position {
     pub avg_cost: f64,
     pub realized_pnl: f64,
     pub updated_at: DateTime<Utc>,
+    /// Mid of the current top-of-book quote.
+    pub mark: Option<f64>,
+    /// `net_qty * mark * contract_size` — signed, so shorts are negative.
+    pub market_value: Option<f64>,
+    /// `(mark - avg_cost) * net_qty * contract_size` — signed-correct for shorts.
+    pub unrealized_pnl: Option<f64>,
+    /// When the mark was received; lets a caller judge staleness.
+    pub mark_ts: Option<DateTime<Utc>>,
 }
 
 /// Read the current position (FOR UPDATE), or FLAT if none.
@@ -245,6 +277,42 @@ mod tests {
         approx(p.net_qty, 100.0);
         approx(p.avg_cost, 10.0);
         approx(p.realized_pnl, 0.0);
+    }
+
+    #[test]
+    fn value_long_option_scales_by_contract_size() {
+        // 1 contract, paid 2.00, now marked 3.28 -> +1.28 x 100.
+        let v = value(1.0, 2.00, 100.0, 3.28);
+        approx(v.market_value, 328.0);
+        approx(v.unrealized_pnl, 128.0);
+    }
+
+    #[test]
+    fn value_short_is_signed_correct() {
+        // Short 1 contract at 3.00; mark falls to 2.00 -> the short PROFITS.
+        let v = value(-1.0, 3.00, 100.0, 2.00);
+        approx(v.market_value, -200.0); // liability
+        approx(v.unrealized_pnl, 100.0); // gain
+    }
+
+    #[test]
+    fn value_short_loses_when_mark_rises() {
+        let v = value(-1.0, 3.00, 100.0, 4.00);
+        approx(v.unrealized_pnl, -100.0);
+    }
+
+    #[test]
+    fn value_spot_uses_unit_contract_size() {
+        // 0.1 SOL bought at 100, marked 150.
+        let v = value(0.1, 100.0, 1.0, 150.0);
+        approx(v.market_value, 15.0);
+        approx(v.unrealized_pnl, 5.0);
+    }
+
+    #[test]
+    fn value_at_cost_is_flat() {
+        let v = value(10.0, 42.0, 1.0, 42.0);
+        approx(v.unrealized_pnl, 0.0);
     }
 
     #[test]

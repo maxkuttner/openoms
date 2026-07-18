@@ -14,7 +14,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sqlx::{PgPool, Row};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -24,6 +24,7 @@ use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
 use crate::kafka::KafkaClient;
 use crate::stream_health::StreamHandle;
+use crate::stream_supervisor::{supervise, Session, StreamResult};
 
 const VENUE: &str = "BINANCE";
 
@@ -32,10 +33,33 @@ const VENUE: &str = "BINANCE";
 /// invisible; the ping surfaces a dead socket and the sweep recovers the fill.
 const HEARTBEAT_SECS: u64 = 30;
 
+struct BinanceSession {
+    pool: PgPool,
+    kafka: Option<KafkaClient>,
+    adapter: Arc<BinanceAdapter>,
+    health: StreamHandle,
+    position_changed_tx: Option<mpsc::Sender<()>>,
+}
+
+#[async_trait::async_trait]
+impl Session for BinanceSession {
+    async fn run_once(&mut self) -> StreamResult {
+        connect_and_run(
+            &self.adapter,
+            &self.pool,
+            &self.kafka,
+            &self.health,
+            self.position_changed_tx.as_ref(),
+        )
+        .await
+    }
+}
+
+/// Credentials are not taken here: the adapter already holds them (it signs with
+/// an Ed25519 key loaded at construction), which is why the old `_api_key` /
+/// `_api_secret` parameters were unused.
 pub async fn run(
     environment: &'static str,
-    _api_key: String,
-    _api_secret: String,
     pool: PgPool,
     kafka: Option<KafkaClient>,
     adapter: Arc<BinanceAdapter>,
@@ -46,23 +70,15 @@ pub async fn run(
     // Catch up on anything missed while disconnected, then stream live.
     reconcile_routed_orders(&pool, &kafka, &adapter, position_changed_tx.as_ref()).await;
 
-    let mut backoff_secs: u64 = 1;
-    loop {
-        health.set_connecting();
-        info!(env = environment, "Binance WS-API connecting");
-        match connect_and_run(&adapter, &pool, &kafka, &health, position_changed_tx.as_ref()).await {
-            Ok(()) => {
-                warn!(env = environment, "Binance stream closed, reconnecting in {backoff_secs}s");
-                health.set_down("stream closed");
-            }
-            Err(e) => {
-                warn!(env = environment, error = %e, "Binance stream error, reconnecting in {backoff_secs}s");
-                health.set_down(e.to_string());
-            }
-        }
-        sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(30);
-    }
+    let session = BinanceSession {
+        pool,
+        kafka,
+        adapter,
+        health: health.clone(),
+        position_changed_tx,
+    };
+    let name: &'static str = if environment == "LIVE" { "BINANCE/LIVE" } else { "BINANCE/PAPER" };
+    supervise(name, health, session).await
 }
 
 async fn connect_and_run(
