@@ -11,12 +11,25 @@
 //! balances report and reconciliation matches on.
 
 use base64::Engine;
+use dataprovider::{Identifiers, InstrumentDef};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::{Client, Method};
 use tracing::info;
 
-use super::{BrokerAdapter, BrokerError, BrokerHolding, BrokerOrderRequest, BrokerOrderResponse};
+use super::{
+    BrokerAdapter, BrokerError, BrokerHolding, BrokerInstrument, BrokerOrderRequest,
+    BrokerOrderResponse, InstrumentProvider,
+};
+
+/// Read a Binance symbol filter's numeric field (e.g. LOT_SIZE.stepSize).
+fn filter_val(filters: &[serde_json::Value], filter_type: &str, field: &str) -> Option<f64> {
+    filters
+        .iter()
+        .find(|f| f["filterType"].as_str() == Some(filter_type))
+        .and_then(|f| f[field].as_str())
+        .and_then(|s| s.parse().ok())
+}
 
 /// Percent-encode the non-unreserved characters of a base64 string (`+`, `/`, `=`)
 /// so an Ed25519 signature is safe inside a URL query string.
@@ -103,6 +116,69 @@ impl BinanceAdapter {
             .send()
             .await
             .map_err(|e| BrokerError::Network(e.to_string()))
+    }
+
+    /// GET /api/v3/exchangeInfo — the full spot catalog as canonical instrument
+    /// records + routing handles. Public (unsigned). Binance is the source of the
+    /// master crypto instrument: the pair is the Symbol@Venue symbol, venue =
+    /// BINANCE, currency = the quote asset, and the base asset is the routing native
+    /// id (what account balances / recon match on). Only `TRADING` spot pairs.
+    pub async fn list_spot_instruments(&self) -> Result<Vec<BrokerInstrument>, BrokerError> {
+        let url = format!("{}/api/v3/exchangeInfo", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value =
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        let symbols = body["symbols"].as_array().cloned().unwrap_or_default();
+        Ok(symbols
+            .iter()
+            .filter_map(|s| {
+                let pair = s["symbol"].as_str()?.to_string();
+                let base = s["baseAsset"].as_str()?.to_string();
+                let quote = s["quoteAsset"].as_str()?.to_string();
+                let is_spot = s["isSpotTradingAllowed"].as_bool().unwrap_or(true);
+                if !is_spot {
+                    return None;
+                }
+                let filters: Vec<serde_json::Value> =
+                    s["filters"].as_array().cloned().unwrap_or_default();
+                let definition = InstrumentDef {
+                    symbol: pair.clone(),
+                    venue: "BINANCE".to_string(),
+                    currency: quote,
+                    asset_class: "CRYPTO".to_string(),
+                    instrument_class: "SPOT".to_string(),
+                    name: None,
+                    price_precision: s["quoteAssetPrecision"].as_i64().unwrap_or(8) as i32,
+                    price_increment: filter_val(&filters, "PRICE_FILTER", "tickSize").unwrap_or(0.0),
+                    size_increment: filter_val(&filters, "LOT_SIZE", "stepSize").unwrap_or(0.0),
+                    lot_size: None,
+                    contract_size: 1.0,
+                    native_id: Some(base), // base asset — what recon matches balances on
+                    provider_exchange: Some("BINANCE".to_string()),
+                    derivative: None,
+                    identifiers: Identifiers::default(),
+                };
+                Some(BrokerInstrument {
+                    broker_symbol: pair,
+                    broker_exchange: Some("BINANCE".to_string()),
+                    is_tradeable: s["status"].as_str() == Some("TRADING"),
+                    min_quantity: filter_val(&filters, "LOT_SIZE", "minQty"),
+                    max_quantity: filter_val(&filters, "LOT_SIZE", "maxQty"),
+                    min_notional: filter_val(&filters, "NOTIONAL", "minNotional")
+                        .or_else(|| filter_val(&filters, "MIN_NOTIONAL", "minNotional")),
+                    max_notional: None,
+                    definition,
+                })
+            })
+            .collect())
     }
 
     /// GET /api/v3/order — fetch one order's state (for startup reconciliation of
@@ -214,5 +290,17 @@ impl BrokerAdapter for BinanceAdapter {
             })
             .collect();
         Ok(holdings)
+    }
+}
+
+#[async_trait::async_trait]
+impl InstrumentProvider for BinanceAdapter {
+    /// Binance has no separate option catalog on the spot venue; `option_underlyings`
+    /// is ignored — it always returns the spot pairs.
+    async fn list_instruments(
+        &self,
+        _option_underlyings: &[String],
+    ) -> Result<Vec<BrokerInstrument>, BrokerError> {
+        self.list_spot_instruments().await
     }
 }

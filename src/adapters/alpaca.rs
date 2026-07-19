@@ -1,8 +1,32 @@
+use std::collections::BTreeSet;
+
+use dataprovider::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
 use reqwest::Client;
 use serde::Serialize;
-use tracing::info;
+use tracing::{info, warn};
 
-use super::{BrokerAdapter, BrokerError, BrokerHolding, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse};
+use super::{
+    BrokerAdapter, BrokerError, BrokerHolding, BrokerInstrument, BrokerOrderRequest,
+    BrokerOrderResponse, InstrumentProvider,
+};
+
+/// Map Alpaca's `exchange` label to the ISO 10383 MIC used by `public.venue`.
+///
+/// `None` means we have no MIC for that label. The caller drops the instrument and
+/// names the label, rather than passing the raw string through as a venue code — a
+/// passthrough only fails later, anonymously, inside the catalog's FK filter.
+fn alpaca_exchange_to_mic(exchange: &str) -> Option<&'static str> {
+    Some(match exchange {
+        "NASDAQ" => "XNAS",
+        "NYSE" => "XNYS",
+        "ARCA" | "NYSEARCA" => "ARCX",
+        "AMEX" => "XASE",
+        "BATS" => "BATS",
+        "IEX" => "IEXG",
+        "OTC" => "OTCM",
+        _ => return None,
+    })
+}
 
 #[derive(Serialize)]
 struct AlpacaOrderRequest {
@@ -64,8 +88,10 @@ impl AlpacaAdapter {
             .header("APCA-API-SECRET-KEY", &self.api_secret)
     }
 
-    /// Active, tradeable US-equity assets from Alpaca's catalog
-    /// (`GET /v2/assets`). Broker symbology, not market data.
+    /// Active US-equity assets from Alpaca's catalog (`GET /v2/assets`) as canonical
+    /// instrument records + routing handles. Alpaca is the source of the master
+    /// instrument here: the ticker is the Symbol@Venue symbol, the exchange maps to
+    /// the venue MIC, and the asset UUID is the routing native id.
     pub async fn list_equity_instruments(&self) -> Result<Vec<BrokerInstrument>, BrokerError> {
         let url = format!("{}/v2/assets?status=active&asset_class=us_equity", self.base_url);
         let resp = self.get_json(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
@@ -74,23 +100,66 @@ impl AlpacaAdapter {
         }
         let assets: Vec<serde_json::Value> =
             resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-        Ok(assets
+
+        // Exchange labels we have no MIC for. Collected as distinct values so an
+        // unmapped venue is reported by name once, not buried in a skip counter.
+        let mut unresolved: BTreeSet<String> = BTreeSet::new();
+        let instruments: Vec<BrokerInstrument> = assets
             .iter()
             .filter_map(|a| {
-                Some(BrokerInstrument {
-                    symbol: a["symbol"].as_str()?.to_string(),
-                    exchange: a["exchange"].as_str().map(|s| s.to_string()),
+                let symbol = a["symbol"].as_str()?.to_string();
+                let raw_exchange = a["exchange"].as_str();
+                let venue = match raw_exchange.and_then(alpaca_exchange_to_mic) {
+                    Some(mic) => mic.to_string(),
+                    None => {
+                        unresolved.insert(raw_exchange.unwrap_or("<missing>").to_string());
+                        return None;
+                    }
+                };
+                let definition = InstrumentDef {
+                    symbol: symbol.clone(),
+                    venue,
+                    currency: "USD".to_string(),
+                    asset_class: "EQUITY".to_string(),
+                    instrument_class: "SPOT".to_string(),
+                    name: a["name"].as_str().map(|s| s.to_string()),
+                    price_precision: 2,
+                    price_increment: 0.01,
+                    size_increment: if a["fractionable"].as_bool().unwrap_or(false) { 0.001 } else { 1.0 },
+                    lot_size: None,
+                    contract_size: 1.0,
                     native_id: a["id"].as_str().map(|s| s.to_string()), // Alpaca asset UUID
+                    provider_exchange: raw_exchange.map(|s| s.to_string()),
+                    derivative: None,
+                    identifiers: Identifiers::default(),
+                };
+                Some(BrokerInstrument {
+                    broker_symbol: symbol,
+                    broker_exchange: raw_exchange.map(|s| s.to_string()),
                     is_tradeable: a["tradable"].as_bool().unwrap_or(false),
                     min_quantity: a["min_order_size"].as_str().and_then(|s| s.parse().ok()),
+                    max_quantity: None,
+                    min_notional: None,
+                    max_notional: None,
+                    definition,
                 })
             })
-            .collect())
+            .collect();
+
+        if !unresolved.is_empty() {
+            warn!(
+                "alpaca: no venue MIC for exchange label(s) {unresolved:?} — {} asset(s) skipped; \
+                 add the mapping in `alpaca_exchange_to_mic` or seed the venue",
+                assets.len() - instruments.len()
+            );
+        }
+        Ok(instruments)
     }
 
     /// Active option contracts for the given underlyings, following pagination
-    /// (`GET /v2/options/contracts`). `symbol` is the compact OSI Alpaca's order
-    /// API expects; options route by symbol so `native_id` is left None.
+    /// (`GET /v2/options/contracts`). The compact OSI is both the master symbol and
+    /// the order-entry handle; options route by symbol, so the routing native id is
+    /// left None. Strike/expiry/kind come straight from Alpaca's contract fields.
     pub async fn list_option_contracts(
         &self,
         underlyings: &[String],
@@ -115,18 +184,67 @@ impl AlpacaAdapter {
                 resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
             for c in body["option_contracts"].as_array().unwrap_or(&Vec::new()) {
                 let Some(symbol) = c["symbol"].as_str() else { continue };
-                out.push(BrokerInstrument {
+                let Some(underlying) = c["underlying_symbol"].as_str() else { continue };
+                let option_kind = match c["type"].as_str() {
+                    Some("call") => Some(OptionKind::Call),
+                    Some("put") => Some(OptionKind::Put),
+                    _ => None,
+                };
+                let derivative = DerivativeDef {
+                    underlying_symbol: underlying.to_string(),
+                    option_kind,
+                    strike_price: c["strike_price"].as_str().and_then(|s| s.parse().ok()),
+                    expiry_date: c["expiration_date"]
+                        .as_str()
+                        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+                    activation_date: None,
+                };
+                let definition = InstrumentDef {
                     symbol: symbol.to_string(),
-                    exchange: Some("OPRA".to_string()),
+                    venue: "OPRA".to_string(),
+                    currency: "USD".to_string(),
+                    asset_class: "EQUITY".to_string(),
+                    instrument_class: "OPTION".to_string(),
+                    name: c["name"].as_str().map(|s| s.to_string()),
+                    price_precision: 2,
+                    price_increment: 0.01,
+                    size_increment: 1.0,
+                    lot_size: None,
+                    contract_size: c["size"].as_str().and_then(|s| s.parse().ok()).unwrap_or(100.0),
                     native_id: None,
+                    provider_exchange: Some("OPRA".to_string()),
+                    derivative: Some(derivative),
+                    identifiers: Identifiers::default(),
+                };
+                out.push(BrokerInstrument {
+                    broker_symbol: symbol.to_string(),
+                    broker_exchange: Some("OPRA".to_string()),
                     is_tradeable: c["tradable"].as_bool().unwrap_or(false),
                     min_quantity: Some(1.0), // options trade in whole contracts
+                    max_quantity: None,
+                    min_notional: None,
+                    max_notional: None,
+                    definition,
                 });
             }
             page_token = body["next_page_token"].as_str().map(|s| s.to_string());
             if page_token.is_none() {
                 break;
             }
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait::async_trait]
+impl InstrumentProvider for AlpacaAdapter {
+    async fn list_instruments(
+        &self,
+        option_underlyings: &[String],
+    ) -> Result<Vec<BrokerInstrument>, BrokerError> {
+        let mut out = self.list_equity_instruments().await?;
+        if !option_underlyings.is_empty() {
+            out.extend(self.list_option_contracts(option_underlyings).await?);
         }
         Ok(out)
     }
@@ -232,5 +350,44 @@ impl BrokerAdapter for AlpacaAdapter {
             })
             .collect();
         Ok(holdings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every exchange label Alpaca actually returns must map. If this fails, the
+    /// catalog silently loses that venue's whole listing.
+    #[test]
+    fn maps_every_live_alpaca_exchange() {
+        for label in ["NASDAQ", "NYSE", "ARCA", "AMEX", "BATS", "IEX", "OTC"] {
+            assert!(
+                alpaca_exchange_to_mic(label).is_some(),
+                "no MIC for live Alpaca exchange {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_to_iso_mics() {
+        assert_eq!(alpaca_exchange_to_mic("NASDAQ"), Some("XNAS"));
+        assert_eq!(alpaca_exchange_to_mic("NYSEARCA"), Some("ARCX"));
+        assert_eq!(alpaca_exchange_to_mic("ARCA"), Some("ARCX"));
+    }
+
+    /// An unknown label is declined, not passed through. The old behaviour returned
+    /// it verbatim, which then failed the venue FK anonymously inside the catalog.
+    #[test]
+    fn declines_unknown_exchange() {
+        assert_eq!(alpaca_exchange_to_mic("MOONBASE"), None);
+        assert_eq!(alpaca_exchange_to_mic(""), None);
+    }
+
+    /// A MIC is not an Alpaca label — it is declined too. Guards against assuming
+    /// the passthrough was load-bearing for already-MIC inputs.
+    #[test]
+    fn declines_a_bare_mic() {
+        assert_eq!(alpaca_exchange_to_mic("XNAS"), None);
     }
 }

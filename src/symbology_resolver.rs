@@ -1,12 +1,15 @@
-//! OMS-side instrument resolution: the `symbology` (OpenFIGI) engine + the DB.
+//! OMS-side symbology resolution: identify an external instrument via the
+//! `symbology` (OpenFIGI) engine and stamp the FIGI/CUSIP anchor onto the master
+//! `public.instrument`.
 //!
-//! `resolve` is xref-first (a local `oms.instrument_xref` hit avoids OpenFIGI), then
-//! falls back to the engine; on a hit it matches the FIGI identity to a master
-//! `public.instrument`, stamps `figi`/`cusip`, and upserts the xref. Additive: it does
-//! not touch the legacy `broker_instrument`/`provider_instrument` bridges or routing.
+//! This is enrichment, not mapping. The two mapping tables are owned elsewhere —
+//! `broker_instrument` by broker sync, `feed_instrument` by feed mapping. The
+//! resolver only answers "which master instrument is this, and what is its FIGI",
+//! and records the FIGI anchor so later lookups are cheap. Off the order/quote hot
+//! path.
 
 use serde::Serialize;
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use symbology::{InstrumentIdentity, InstrumentQuery, Resolution, SymbologyError};
 
 use crate::app_state::SymbologyEngine;
@@ -70,41 +73,13 @@ impl From<SymbologyError> for ResolveError {
     }
 }
 
-/// Resolve one query to a master instrument + FIGI, persisting the result.
+/// Identify one query via OpenFIGI, match it to a master instrument, and stamp the
+/// FIGI/CUSIP anchor onto that master (only where still empty).
 pub async fn resolve(
     pool: &PgPool,
     engine: &SymbologyEngine,
     query: &InstrumentQuery,
-    source_type: &str,
-    source_code: &str,
 ) -> Result<ResolveOutcome, ResolveError> {
-    let ext_symbol = query.ticker.as_deref();
-    let ext_exchange = query.exch_code.as_deref().or(query.mic.as_deref());
-
-    // 1) xref-first: a prior resolution for this (source, symbol, exchange).
-    if let Some(row) = sqlx::query(
-        "SELECT instrument_id, figi FROM instrument_xref \
-         WHERE source_code = $1 \
-           AND external_symbol IS NOT DISTINCT FROM $2 \
-           AND external_exchange IS NOT DISTINCT FROM $3 \
-         ORDER BY updated_at DESC LIMIT 1",
-    )
-    .bind(source_code)
-    .bind(ext_symbol)
-    .bind(ext_exchange)
-    .fetch_optional(pool)
-    .await?
-    {
-        if let Some(figi) = row.get::<Option<String>, _>("figi") {
-            return Ok(ResolveOutcome::Resolved {
-                instrument_id: row.get("instrument_id"),
-                figi,
-                identity: None, // cache hit — minimal
-            });
-        }
-    }
-
-    // 2) engine (OpenFIGI, cached in-process).
     let identity = match engine.identify(query).await? {
         Resolution::Resolved(i) => i,
         Resolution::Ambiguous(cands) => {
@@ -118,7 +93,7 @@ pub async fn resolve(
     let instrument_id = find_master(pool, &identity, query).await?;
 
     if let Some(id) = instrument_id {
-        // stamp the FIGI/CUSIP anchor on the master (narrow grant; only if empty).
+        // Stamp the FIGI/CUSIP anchor on the master (narrow grant; only if empty).
         // NB: only figi/cusip are granted to the app role — do NOT touch updated_at.
         sqlx::query(
             "UPDATE instrument SET figi = COALESCE(figi, $2), cusip = COALESCE(cusip, $3) \
@@ -130,8 +105,6 @@ pub async fn resolve(
         .execute(pool)
         .await?;
     }
-
-    upsert_xref(pool, source_type, source_code, ext_symbol, ext_exchange, &identity, instrument_id).await?;
 
     Ok(ResolveOutcome::Resolved {
         instrument_id,
@@ -178,32 +151,4 @@ async fn find_master(
     }
 
     Ok(None)
-}
-
-async fn upsert_xref(
-    pool: &PgPool,
-    source_type: &str,
-    source_code: &str,
-    symbol: Option<&str>,
-    exchange: Option<&str>,
-    identity: &InstrumentIdentity,
-    instrument_id: Option<i64>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO instrument_xref \
-           (instrument_id, source_type, source_code, external_symbol, external_exchange, figi, method, confidence) \
-         VALUES ($1, $2, $3, $4, $5, $6, 'openfigi', 'resolved') \
-         ON CONFLICT (source_type, source_code, \
-                      COALESCE(external_symbol, ''), COALESCE(external_exchange, '')) \
-         DO UPDATE SET instrument_id = EXCLUDED.instrument_id, figi = EXCLUDED.figi, updated_at = now()",
-    )
-    .bind(instrument_id)
-    .bind(source_type)
-    .bind(source_code)
-    .bind(symbol)
-    .bind(exchange)
-    .bind(&identity.figi)
-    .execute(pool)
-    .await?;
-    Ok(())
 }

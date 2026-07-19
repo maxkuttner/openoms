@@ -247,8 +247,8 @@ async fn reconcile_routed_orders(
         let instrument_id_num: i64 = row.get::<String, _>("instrument_id").parse().unwrap_or_default();
 
         let symbol: Option<String> = sqlx::query_scalar(
-            "SELECT external_symbol FROM oms.instrument_xref \
-             WHERE instrument_id = $1 AND source_type = 'BROKER' AND source_code = 'BINANCE' LIMIT 1",
+            "SELECT broker_symbol FROM broker_instrument \
+             WHERE instrument_id = $1 AND broker_code = 'BINANCE' LIMIT 1",
         )
         .bind(instrument_id_num)
         .fetch_optional(pool)

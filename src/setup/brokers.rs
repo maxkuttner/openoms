@@ -1,41 +1,55 @@
-//! `oms setup sync-brokers` — sync a broker's instrument catalog into
-//! `oms.instrument_xref` (source_type='BROKER'), the map the order path resolves
-//! `instrument_id -> broker handle` through at routing time.
+//! `oms setup sync-broker` — the instrument seeding path.
 //!
-//! Ports the former `scripts/broker_sync.py` into Rust: it reuses the Alpaca
-//! adapter's HTTP/auth (`AlpacaAdapter::list_equity_instruments` /
-//! `list_option_contracts`) and the universe seeder's UNNEST bulk-upsert idiom.
-//! Runs as the ordinary `DB_USER` (oms_user owns the `oms` schema), so unlike the
-//! Python script it needs no superuser.
+//! Broker-first: an adapter's [`InstrumentProvider`] enumerates the
+//! broker's tradeable catalog; we create the master `public.instrument` (+
+//! `instrument_derivative`) rows and the `public.broker_instrument` routing mapping
+//! in one pass. The broker is the authoritative source of the instrument — there is
+//! no separate dataset catalog and no priceable-but-not-tradeable path.
+//!
+//! Runs as the ordinary `DB_USER` (oms_user), which holds write on the master
+//! catalog and both mapping tables (see `db/access/ods.sql`).
 
-use std::collections::HashMap;
 use std::env;
 
 use clap::{Args as ClapArgs, ValueEnum};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use dataprovider::{Enricher, InstrumentDef, OpenFigiEnricher};
+use sqlx::{PgPool, Postgres, Transaction};
 use tracing::{info, warn};
 
 use crate::adapters::alpaca::AlpacaAdapter;
-use crate::adapters::BrokerInstrument;
+use crate::adapters::binance::BinanceAdapter;
+use crate::adapters::{BrokerInstrument, InstrumentProvider};
+use crate::setup::catalog;
 
-const BROKER_CODE: &str = "ALPACA";
 const BATCH: usize = 4000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum AssetClass {
-    Equity,
-    Option,
-    All,
+pub enum Broker {
+    Alpaca,
+    Binance,
+}
+
+impl Broker {
+    fn code(self) -> &'static str {
+        match self {
+            Broker::Alpaca => "ALPACA",
+            Broker::Binance => "BINANCE",
+        }
+    }
 }
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
-    /// Which broker catalog to sync.
-    #[arg(long, value_enum, default_value_t = AssetClass::All)]
-    pub asset_class: AssetClass,
-    /// Comma-separated option underlyings (only used for the option leg).
-    #[arg(long, default_value = "SPY,QQQ")]
+    /// Which broker's catalog to sync (also the instrument source).
+    #[arg(long, value_enum, default_value_t = Broker::Alpaca)]
+    pub broker: Broker,
+    /// Comma-separated option underlyings to seed the option chain for (Alpaca only).
+    /// Empty seeds equities/spot only — the full option tape is not seeded wholesale.
+    #[arg(long, default_value = "")]
     pub underlyings: String,
+    /// Skip the enricher pipeline (FIGI via OpenFIGI).
+    #[arg(long)]
+    pub no_enrich: bool,
     /// Fetch + match + print counts, but write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -43,7 +57,6 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&super::database_url()?).await?;
-    let adapter = build_alpaca()?;
     let underlyings: Vec<String> = args
         .underlyings
         .split(',')
@@ -51,17 +64,65 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    if matches!(args.asset_class, AssetClass::Equity | AssetClass::All) {
-        sync_equities(&pool, &adapter, args.dry_run).await?;
+    let provider: Box<dyn InstrumentProvider> = match args.broker {
+        Broker::Alpaca => Box::new(build_alpaca()?),
+        Broker::Binance => Box::new(build_binance()?),
+    };
+
+    info!("fetching {} catalog …", args.broker.code());
+    let catalog = provider.list_instruments(&underlyings).await?;
+    info!("fetched {} tradeable instrument(s) from {}", catalog.len(), args.broker.code());
+
+    if args.dry_run {
+        for bi in catalog.iter().take(20) {
+            info!(
+                "  {}@{} -> broker_symbol={} tradeable={}",
+                bi.definition.symbol, bi.definition.venue, bi.broker_symbol, bi.is_tradeable
+            );
+        }
+        info!("dry run complete: {} instrument(s), no write", catalog.len());
+        return Ok(());
     }
-    if matches!(args.asset_class, AssetClass::Option | AssetClass::All) {
-        sync_options(&pool, &adapter, &underlyings, args.dry_run).await?;
+    if catalog.is_empty() {
+        warn!("empty catalog; nothing to seed");
+        return Ok(());
     }
+
+    // 1) Create/refresh the master instrument catalog from the broker's definitions.
+    let defs: Vec<InstrumentDef> = catalog.iter().map(|bi| bi.definition.clone()).collect();
+    let enrichers: Vec<Box<dyn Enricher>> = if args.no_enrich {
+        Vec::new()
+    } else {
+        vec![Box::new(OpenFigiEnricher::new(env::var("OPENFIGI_API_KEY").ok()))]
+    };
+    let (summary, ids) = catalog::upsert_catalog(&pool, &defs, &enrichers).await?;
+    info!(
+        "master: upserted={} skipped_fk={} skipped_expired={} derivatives={} enriched={}",
+        summary.upserted, summary.skipped_fk(), summary.skipped_expired, summary.derivatives, summary.enriched
+    );
+
+    // 2) Attach the broker routing mapping for every instrument that landed.
+    let broker_code = args.broker.code();
+    let rows: Vec<BrokerRow> = catalog
+        .iter()
+        .filter_map(|bi| {
+            let key = (bi.definition.symbol.clone(), bi.definition.venue.clone());
+            ids.get(&key).map(|&id| BrokerRow::from(id, bi))
+        })
+        .collect();
+    info!("mapping {} instrument(s) to {broker_code}", rows.len());
+
+    let mut tx = pool.begin().await?;
+    let mut n = 0usize;
+    for chunk in rows.chunks(BATCH) {
+        n += bulk_upsert_broker_instrument(&mut tx, broker_code, chunk).await?;
+    }
+    tx.commit().await?;
+    info!("sync-broker done: upserted {n} {broker_code} broker_instrument row(s)");
     Ok(())
 }
 
-/// Build an `AlpacaAdapter` standalone from env, matching the server's wiring
-/// (`ALPACA_ENV` + `ALPACA_{ENV}_API_KEY/SECRET`).
+/// Build an `AlpacaAdapter` standalone from env (`ALPACA_ENV` + `ALPACA_{ENV}_API_KEY/SECRET`).
 fn build_alpaca() -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
     let env_name = env::var("ALPACA_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase();
     let key = env::var(format!("ALPACA_{env_name}_API_KEY"))
@@ -71,178 +132,97 @@ fn build_alpaca() -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
     Ok(AlpacaAdapter::new(key, secret, &env_name))
 }
 
-/// A catalog row matched to a master instrument, ready to upsert.
-struct BrokerXrefRow {
+/// Build a `BinanceAdapter` from env. The catalog endpoint (exchangeInfo) is
+/// public, but the adapter constructor needs a valid key pair; reuse the server
+/// wiring (`BINANCE_{ENV}_API_KEY` + `BINANCE_{ENV}_PRIVATE_KEY_PATH`).
+fn build_binance() -> Result<BinanceAdapter, Box<dyn std::error::Error>> {
+    let env_name = env::var("BINANCE_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase();
+    let key = env::var(format!("BINANCE_{env_name}_API_KEY"))
+        .map_err(|_| format!("BINANCE_{env_name}_API_KEY must be set"))?;
+    let pem_path = env::var(format!("BINANCE_{env_name}_PRIVATE_KEY_PATH"))
+        .map_err(|_| format!("BINANCE_{env_name}_PRIVATE_KEY_PATH must be set"))?;
+    let pem = std::fs::read_to_string(&pem_path)
+        .map_err(|e| format!("reading {pem_path}: {e}"))?;
+    BinanceAdapter::new(key, &pem, &env_name).map_err(Into::into)
+}
+
+/// A broker mapping row ready to upsert into `broker_instrument`.
+struct BrokerRow {
     instrument_id: i64,
-    symbol: String,
-    exchange: Option<String>,
+    broker_symbol: String,
+    broker_exchange: Option<String>,
     native_id: Option<String>,
     is_tradeable: bool,
     min_quantity: Option<f64>,
+    max_quantity: Option<f64>,
+    min_notional: Option<f64>,
+    max_notional: Option<f64>,
 }
 
-fn to_row(instrument_id: i64, bi: &BrokerInstrument) -> BrokerXrefRow {
-    BrokerXrefRow {
-        instrument_id,
-        symbol: bi.symbol.clone(),
-        exchange: bi.exchange.clone(),
-        native_id: bi.native_id.clone(),
-        is_tradeable: bi.is_tradeable,
-        min_quantity: bi.min_quantity,
-    }
-}
-
-/// Databento OPRA `raw_symbol` (21-char OCC OSI, root right-padded with spaces)
-/// -> Alpaca's compact OSI. The only spaces are the root padding, so stripping
-/// them yields Alpaca's `symbol` (`SPY   260713P00775000` -> `SPY260713P00775000`).
-fn compact_osi(sym: &str) -> String {
-    sym.replace(' ', "")
-}
-
-async fn sync_equities(
-    pool: &PgPool,
-    adapter: &AlpacaAdapter,
-    dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // symbol -> master id for the equity (SPOT) universe; Alpaca tickers match 1:1.
-    let id_map: HashMap<String, i64> = sqlx::query(
-        "SELECT symbol, id FROM instrument WHERE instrument_class = 'SPOT'",
-    )
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|r| (r.get::<String, _>("symbol"), r.get::<i64, _>("id")))
-    .collect();
-    info!("loaded {} SPOT instrument(s) from master", id_map.len());
-
-    let catalog = adapter.list_equity_instruments().await?;
-    info!("fetched {} active {BROKER_CODE} equity asset(s)", catalog.len());
-
-    let rows: Vec<BrokerXrefRow> = catalog
-        .iter()
-        .filter_map(|bi| id_map.get(&bi.symbol).map(|&id| to_row(id, bi)))
-        .collect();
-    info!("matched {} equity asset(s) to master ({} unmatched)", rows.len(), catalog.len() - rows.len());
-
-    write_rows(pool, &rows, dry_run, "equity").await
-}
-
-async fn sync_options(
-    pool: &PgPool,
-    adapter: &AlpacaAdapter,
-    underlyings: &[String],
-    dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // compact OSI -> master id, scoped to the requested underlyings.
-    let id_map: HashMap<String, i64> = sqlx::query(
-        "SELECT i.id, i.symbol \
-         FROM instrument i \
-         JOIN instrument_derivative d ON d.instrument_id = i.id \
-         WHERE i.instrument_class = 'OPTION' AND d.underlying_symbol = ANY($1)",
-    )
-    .bind(underlyings)
-    .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|r| (compact_osi(&r.get::<String, _>("symbol")), r.get::<i64, _>("id")))
-    .collect();
-    info!("loaded {} OPTION instrument(s) for {underlyings:?}", id_map.len());
-
-    let catalog = adapter.list_option_contracts(underlyings).await?;
-    info!("fetched {} active {BROKER_CODE} option contract(s)", catalog.len());
-
-    let rows: Vec<BrokerXrefRow> = catalog
-        .iter()
-        .filter_map(|bi| id_map.get(&bi.symbol).map(|&id| to_row(id, bi)))
-        .collect();
-    info!("matched {} contract(s) to master ({} unmatched)", rows.len(), catalog.len() - rows.len());
-
-    write_rows(pool, &rows, dry_run, "option").await
-}
-
-async fn write_rows(
-    pool: &PgPool,
-    rows: &[BrokerXrefRow],
-    dry_run: bool,
-    label: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if dry_run {
-        for r in rows.iter().take(20) {
-            info!("  {} -> instrument_id={} tradeable={}", r.symbol, r.instrument_id, r.is_tradeable);
+impl BrokerRow {
+    fn from(instrument_id: i64, bi: &BrokerInstrument) -> Self {
+        Self {
+            instrument_id,
+            broker_symbol: bi.broker_symbol.clone(),
+            broker_exchange: bi.broker_exchange.clone(),
+            native_id: bi.definition.native_id.clone(),
+            is_tradeable: bi.is_tradeable,
+            min_quantity: bi.min_quantity,
+            max_quantity: bi.max_quantity,
+            min_notional: bi.min_notional,
+            max_notional: bi.max_notional,
         }
-        info!("dry run complete ({label}): {} row(s), no write", rows.len());
-        return Ok(());
     }
-    if rows.is_empty() {
-        warn!("no {label} rows matched; nothing to upsert");
-        return Ok(());
-    }
-
-    let mut tx = pool.begin().await?;
-    let mut n = 0usize;
-    for chunk in rows.chunks(BATCH) {
-        n += bulk_upsert_broker_xref(&mut tx, chunk).await?;
-    }
-    tx.commit().await?;
-    info!("broker sync done: upserted {n} {BROKER_CODE} {label} xref row(s)");
-    Ok(())
 }
 
-/// Bulk-upsert BROKER xref rows via UNNEST — mirrors `universe::bulk_upsert_xref`
-/// but writes source_type='BROKER' plus the broker-routing columns
-/// (`is_tradeable`, `min_quantity`). Same ON CONFLICT key.
-async fn bulk_upsert_broker_xref(
+/// Bulk-upsert `broker_instrument` rows via UNNEST, one row per instrument per
+/// broker. Conflict key is (instrument_id, broker_code).
+async fn bulk_upsert_broker_instrument(
     tx: &mut Transaction<'_, Postgres>,
-    chunk: &[BrokerXrefRow],
+    broker_code: &str,
+    chunk: &[BrokerRow],
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let instrument_id: Vec<i64> = chunk.iter().map(|r| r.instrument_id).collect();
-    let symbol: Vec<String> = chunk.iter().map(|r| r.symbol.clone()).collect();
-    let exchange: Vec<Option<String>> = chunk.iter().map(|r| r.exchange.clone()).collect();
+    let broker_symbol: Vec<String> = chunk.iter().map(|r| r.broker_symbol.clone()).collect();
+    let broker_exchange: Vec<Option<String>> = chunk.iter().map(|r| r.broker_exchange.clone()).collect();
     let native_id: Vec<Option<String>> = chunk.iter().map(|r| r.native_id.clone()).collect();
     let is_tradeable: Vec<bool> = chunk.iter().map(|r| r.is_tradeable).collect();
     let min_quantity: Vec<Option<f64>> = chunk.iter().map(|r| r.min_quantity).collect();
+    let max_quantity: Vec<Option<f64>> = chunk.iter().map(|r| r.max_quantity).collect();
+    let min_notional: Vec<Option<f64>> = chunk.iter().map(|r| r.min_notional).collect();
+    let max_notional: Vec<Option<f64>> = chunk.iter().map(|r| r.max_notional).collect();
 
     sqlx::query(
-        "INSERT INTO oms.instrument_xref \
-            (instrument_id, source_type, source_code, external_symbol, external_exchange, \
-             external_native_id, is_tradeable, min_quantity, method, confidence) \
-         SELECT t.iid, 'BROKER', $1, t.sym, t.exch, t.nid, t.trad, t.minq, 'broker_sync', 'resolved' \
-         FROM UNNEST($2::bigint[], $3::text[], $4::text[], $5::text[], $6::bool[], $7::float8[]) \
-              AS t(iid, sym, exch, nid, trad, minq) \
-         ON CONFLICT (source_type, source_code, \
-                      COALESCE(external_symbol, ''), \
-                      COALESCE(external_exchange, '')) \
-         DO UPDATE SET instrument_id      = EXCLUDED.instrument_id, \
-                       external_native_id = EXCLUDED.external_native_id, \
-                       is_tradeable       = EXCLUDED.is_tradeable, \
-                       min_quantity       = EXCLUDED.min_quantity, \
-                       updated_at         = now()",
+        "INSERT INTO broker_instrument \
+            (instrument_id, broker_code, broker_symbol, broker_exchange, native_id, \
+             is_tradeable, min_quantity, max_quantity, min_notional, max_notional) \
+         SELECT t.iid, $1, t.sym, t.exch, t.nid, t.trad, t.minq, t.maxq, t.minn, t.maxn \
+         FROM UNNEST($2::bigint[], $3::text[], $4::text[], $5::text[], $6::bool[], \
+                     $7::float8[], $8::float8[], $9::float8[], $10::float8[]) \
+              AS t(iid, sym, exch, nid, trad, minq, maxq, minn, maxn) \
+         ON CONFLICT (instrument_id, broker_code) \
+         DO UPDATE SET broker_symbol   = EXCLUDED.broker_symbol, \
+                       broker_exchange = EXCLUDED.broker_exchange, \
+                       native_id       = EXCLUDED.native_id, \
+                       is_tradeable    = EXCLUDED.is_tradeable, \
+                       min_quantity    = EXCLUDED.min_quantity, \
+                       max_quantity    = EXCLUDED.max_quantity, \
+                       min_notional    = EXCLUDED.min_notional, \
+                       max_notional    = EXCLUDED.max_notional, \
+                       updated_at      = now()",
     )
-    .bind(BROKER_CODE)
+    .bind(broker_code)
     .bind(&instrument_id)
-    .bind(&symbol)
-    .bind(&exchange)
+    .bind(&broker_symbol)
+    .bind(&broker_exchange)
     .bind(&native_id)
     .bind(&is_tradeable)
     .bind(&min_quantity)
+    .bind(&max_quantity)
+    .bind(&min_notional)
+    .bind(&max_notional)
     .execute(&mut **tx)
     .await?;
 
     Ok(chunk.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::compact_osi;
-
-    #[test]
-    fn compact_osi_strips_root_padding() {
-        // Databento space-padded OSI -> Alpaca compact OSI.
-        assert_eq!(compact_osi("SPY   260713P00775000"), "SPY260713P00775000");
-        assert_eq!(compact_osi("QQQ   260713C00495000"), "QQQ260713C00495000");
-        // 6-char root has no padding — unchanged.
-        assert_eq!(compact_osi("SPXW  260713C05000000"), "SPXW260713C05000000");
-        // Already compact is idempotent.
-        assert_eq!(compact_osi("SPY260713P00775000"), "SPY260713P00775000");
-    }
 }

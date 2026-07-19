@@ -13,7 +13,10 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use dataprovider::{DataProvider, FeedHealth, LiveQuoteFeed, ProviderError, Quote, SymbolAdds};
+use dataprovider::{
+    DataProvider, FeedHealth, FeedSymbology, InstrumentFilter, LiveQuoteFeed, ProviderError, Quote,
+    SymbolAdds,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
@@ -48,12 +51,27 @@ impl DataProvider for BybitFeed {
     }
 }
 
-#[async_trait::async_trait]
-impl LiveQuoteFeed for BybitFeed {
-    fn covers(&self) -> &'static [&'static str] {
-        &["SPOT"]
+impl FeedSymbology for BybitFeed {
+    /// Every crypto pair we know, on any venue — the 1:n case. Bybit is a data-only
+    /// source here: under broker-first seeding it lists no instruments of its own,
+    /// so its price for `BTCUSDT` marks the Binance-seeded `BTCUSDT`. Leaving
+    /// `venue` open is what lets one feed symbol map to the pair on several venues.
+    fn candidates(&self) -> InstrumentFilter {
+        InstrumentFilter {
+            instrument_class: Some("SPOT"),
+            asset_class: Some("CRYPTO"),
+            venue: None,
+        }
     }
 
+    /// Identity: the master symbol is the pair, matching the `s` field verbatim.
+    fn to_feed_symbol(&self, symbol: &str) -> Option<String> {
+        Some(symbol.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl LiveQuoteFeed for BybitFeed {
     async fn run_session(
         &self,
         symbols: HashMap<String, i64>,

@@ -1,37 +1,38 @@
 //! `dataprovider` — the extensible data-provider abstraction for instrument seeding.
 //!
 //! Composable capability traits, so a provider opts into exactly what it supports:
-//!   - [`DataProvider`]   — base identity (`code()`).
-//!   - [`UniverseSource`] — discover + price + fetch instrument definitions.
-//!   - [`Enricher`]       — fill the [`Identifiers`] bag from a metadata endpoint.
-//!   - [`LiveQuoteFeed`]  — stream normalized top-of-book [`Quote`]s.
+//!   - [`DataProvider`]    — base identity (`code()`).
+//!   - [`Enricher`]        — fill the [`Identifiers`] bag from a metadata endpoint.
+//!   - [`LiveQuoteFeed`]   — stream normalized top-of-book [`Quote`]s.
+//!   - [`FeedSymbology`]   — translate a feed's own symbols to/from the master catalog.
 //!
-//! The seeder (in the `rustoms` app) drives a set of providers and a
-//! `Vec<Box<dyn Enricher>>`. Adding a vendor = new `impl UniverseSource`; adding
-//! an identifier/metadata source = new `impl Enricher`. The framework is untouched.
+//! Instruments are seeded broker-first (a `BrokerAdapter`'s `InstrumentProvider` in
+//! the `rustoms` app), not from a vendor definition feed, so this crate no longer
+//! discovers instruments — it supplies the shapes ([`InstrumentDef`]) that seeding
+//! produces, enrichment for identifiers, and the live quote/symbology traits the
+//! feeds implement.
 //!
-//! First provider: [`DatabentoClient`] (definition schema for equities +
-//! OPRA.PILLAR listed options). First enricher: [`OpenFigiEnricher`] (FIGI).
+//! Feeds live in the app (`opra_stream.rs`, `binance_feed.rs`, `bybit_feed.rs`) and
+//! implement [`LiveQuoteFeed`] + [`FeedSymbology`] there, keeping each vendor's wire
+//! format and naming rules together. Enricher: [`OpenFigiEnricher`] (FIGI).
 
 mod enrich;
 mod error;
 mod instrument;
 mod provider;
 mod quote;
-mod universe;
 
 pub mod enrichers;
-pub mod providers;
 
 pub use enrich::{EnrichReport, Enricher};
 pub use error::ProviderError;
 pub use instrument::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
 pub use provider::DataProvider;
-pub use quote::{FeedHealth, LiveQuoteFeed, NoFeedHealth, Quote, SymbolAdds};
-pub use universe::{Category, CostEstimate, SType, UniverseSource, UniverseSpec};
+pub use quote::{
+    FeedHealth, FeedSymbology, InstrumentFilter, LiveQuoteFeed, NoFeedHealth, Quote, SymbolAdds,
+};
 
 pub use enrichers::openfigi::OpenFigiEnricher;
-pub use providers::databento::{DatabentoClient, DatabentoError};
 
 // Re-export the `symbology` surface the seeder needs so the app depends only on
 // `dataprovider`.

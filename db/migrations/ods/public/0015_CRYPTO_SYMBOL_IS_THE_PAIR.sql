@@ -10,9 +10,9 @@
 -- Name the pair, as the venues do. Binance and Bybit both call it SOLUSDT, and our
 -- own xref already stores SOLUSDT as external_symbol on the BROKER and PROVIDER
 -- rows -- instrument.symbol was the only place in the system calling it SOL.
--- Matches NautilusTrader's raw_symbol convention (SOLUSDT.BINANCE) and CCXT's
--- rationale for putting base/quote in the symbol: contracts that differ must have
--- distinct symbols.
+-- Matches the raw-symbol convention used across the ecosystem (SOLUSDT.BINANCE)
+-- and CCXT's rationale for putting base/quote in the symbol: contracts that differ
+-- must have distinct symbols.
 --
 -- currency stays USDT, so the pair remains decomposable and the quote asset is
 -- still first-class for settlement/valuation. The base asset is unchanged on the
