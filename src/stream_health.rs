@@ -23,11 +23,22 @@ pub enum StreamState {
     Down,
 }
 
+/// What a stream is for — the axis the cockpit splits on. A data `Feed` delivers
+/// market data (quotes); an `Execution` stream carries a broker's order/fill
+/// updates. The same vendor can run both (Binance feed + Binance execution).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamKind {
+    Feed,
+    Execution,
+}
+
 /// A point-in-time snapshot of one stream's health, returned by the API.
 #[derive(Clone, Serialize)]
 pub struct StreamHealth {
     pub broker_code: String,
     pub environment: String,
+    pub kind: StreamKind,
     pub state: StreamState,
     /// When the current live session was established (cleared on disconnect).
     pub connected_since: Option<DateTime<Utc>>,
@@ -51,13 +62,14 @@ impl StreamHealthRegistry {
     }
 
     /// Hand a stream task its own updater. Seeds a `Connecting` entry so the
-    /// broker shows up in the API from the moment the task starts.
-    pub fn handle(&self, broker_code: &str, environment: &str) -> StreamHandle {
+    /// stream shows up in the API from the moment the task starts.
+    pub fn handle(&self, broker_code: &str, environment: &str, kind: StreamKind) -> StreamHandle {
         let key = (broker_code.to_string(), environment.to_string());
         if let Ok(mut map) = self.inner.write() {
             map.entry(key.clone()).or_insert_with(|| StreamHealth {
                 broker_code: broker_code.to_string(),
                 environment: environment.to_string(),
+                kind,
                 state: StreamState::Connecting,
                 connected_since: None,
                 last_event_at: None,

@@ -51,7 +51,7 @@ impl<F: LiveQuoteFeed> QuoteFeedSession<F> {
     /// with a timer as the backstop for positions this process didn't see.
     async fn wait_for_subscribable(&mut self) -> Result<HashMap<String, i64>, sqlx::Error> {
         loop {
-            let held = load_subscribable(&self.pool, self.feed.code(), self.feed.covers()).await?;
+            let held = load_subscribable(&self.pool, self.feed.code()).await?;
             if !held.is_empty() {
                 return Ok(held);
             }
@@ -75,7 +75,7 @@ impl<F: LiveQuoteFeed> Session for QuoteFeedSession<F> {
         // them lets a fill be picked up without waiting for a reconnect.
         tokio::select! {
             r = self.feed.run_session(known.clone(), &self.out, &mut add_rx, &self.health) => r.map_err(Into::into),
-            r = watch_held(&self.pool, self.feed.code(), self.feed.covers(), &mut self.position_changed_rx, &add_tx, known) => r,
+            r = watch_held(&self.pool, self.feed.code(), &mut self.position_changed_rx, &add_tx, known) => r,
         }
     }
 }
@@ -87,7 +87,6 @@ impl<F: LiveQuoteFeed> Session for QuoteFeedSession<F> {
 async fn watch_held(
     pool: &PgPool,
     source_code: &'static str,
-    covers: &'static [&'static str],
     doorbell: &mut mpsc::Receiver<()>,
     add_tx: &mpsc::Sender<SymbolAdds>,
     mut known: HashMap<String, i64>,
@@ -95,7 +94,7 @@ async fn watch_held(
     loop {
         match doorbell.recv().await {
             Some(()) => {
-                let latest = load_subscribable(pool, source_code, covers).await?;
+                let latest = load_subscribable(pool, source_code).await?;
                 let adds: SymbolAdds = latest
                     .into_iter()
                     .filter(|(sym, _)| !known.contains_key(sym))
@@ -123,45 +122,36 @@ async fn watch_held(
     }
 }
 
-/// The held instruments this feed can cover, as `external_symbol -> instrument_id`.
+/// The held instruments this feed can price, as `feed_symbol -> instrument_id`.
 ///
-/// Driven by `instrument_xref`, which is the point: the *provider's own* symbol
-/// drives the subscription, so a feed is no longer required to use strings that
-/// happen to match ours. The previous query read `instrument.symbol` directly and
-/// worked only by the coincidence that Databento's raw symbol is byte-identical to
-/// our master symbol — a coincidence that holds for OSI options and for nothing
-/// else. Binance calls it `SOLUSDT` where we call it `SOL`.
+/// Driven by `feed_instrument`: the feed's *own* symbol drives the subscription,
+/// and the mapping is the single source of what this feed covers. An instrument
+/// with no `feed_instrument` row for this feed is silently absent — that is the
+/// "held but this feed can't price it" state, not an error; another feed may.
 ///
-/// Coverage is `(source_code, instrument_class)`. Both halves are load-bearing:
-/// source_code alone would hand this feed the held SPY *equity*, which is
-/// cross-referenced to DATABENTO but not quotable on OPRA.PILLAR.
-///
-/// An instrument with no xref row for this source is silently absent — that is the
-/// "tradable but unmarkable" state, not an error.
+/// `feed_instrument` is 1:n (one feed symbol may price instruments on several
+/// venues), so a `feed_symbol` collision keeps the last instrument id. In practice
+/// held sets don't collide today (one venue per crypto pair); true fan-out to
+/// multiple held instruments from one quote is a later change in the mark path.
 async fn load_subscribable(
     pool: &PgPool,
-    source_code: &str,
-    covers: &[&str],
+    feed_code: &str,
 ) -> Result<HashMap<String, i64>, sqlx::Error> {
-    let classes: Vec<String> = covers.iter().map(|c| c.to_string()).collect();
     let rows = sqlx::query(
         // position.instrument_id is text holding the numeric instrument.id.
-        "SELECT DISTINCT x.external_symbol, i.id \
+        "SELECT DISTINCT fi.feed_symbol, i.id \
          FROM position p \
          JOIN instrument i ON i.id::text = p.instrument_id \
-         JOIN oms.instrument_xref x ON x.instrument_id = i.id \
-              AND x.source_type = 'PROVIDER' AND x.source_code = $1 \
-         WHERE p.net_qty <> 0 \
-           AND i.instrument_class = ANY($2) \
-           AND x.external_symbol IS NOT NULL",
+         JOIN feed_instrument fi ON fi.instrument_id = i.id \
+              AND fi.feed_code = $1 AND fi.is_active \
+         WHERE p.net_qty <> 0",
     )
-    .bind(source_code)
-    .bind(&classes)
+    .bind(feed_code)
     .fetch_all(pool)
     .await?;
 
     Ok(rows
         .iter()
-        .map(|r| (r.get::<String, _>("external_symbol"), r.get::<i64, _>("id")))
+        .map(|r| (r.get::<String, _>("feed_symbol"), r.get::<i64, _>("id")))
         .collect())
 }

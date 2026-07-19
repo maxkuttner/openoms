@@ -20,10 +20,19 @@ function ago(iso: string | null): string {
 }
 
 /**
- * Live WebSocket connection health for the broker/exchange streams. Polls every
- * 5s; state is process-local to the OMS (empty when no streams are configured).
+ * Live WebSocket connection health, filtered to one stream kind. Polls every 5s;
+ * state is process-local to the OMS (empty when no streams of that kind run).
+ * `kind` = "execution" for broker order/fill streams, "feed" for market data.
  */
-export function StreamHealthStrip() {
+export function StreamHealthStrip({
+  kind,
+  title = "Live connections",
+  emptyText = "No live streams in this process.",
+}: {
+  kind: StreamHealth["kind"];
+  title?: string;
+  emptyText?: string;
+}) {
   const { data, isLoading, isError } = useQuery<StreamHealth[]>({
     queryKey: [PATH],
     queryFn: () => api.get<StreamHealth[]>(PATH),
@@ -32,10 +41,11 @@ export function StreamHealthStrip() {
 
   if (isLoading) return <Loader size="sm" />;
   if (isError) return null;
-  if (!data || data.length === 0) {
+  const streams = (data ?? []).filter((s) => s.kind === kind);
+  if (streams.length === 0) {
     return (
       <Text size="sm" c="dimmed">
-        No live streams — no broker connections configured in this process.
+        {emptyText}
       </Text>
     );
   }
@@ -43,10 +53,10 @@ export function StreamHealthStrip() {
   return (
     <Stack gap="xs">
       <Text size="sm" fw={600}>
-        Live connections
+        {title}
       </Text>
       <Group gap="sm">
-        {data.map((s) => (
+        {streams.map((s) => (
           <Tooltip
             key={`${s.broker_code}/${s.environment}`}
             label={

@@ -241,12 +241,11 @@ pub async fn orders_submit(
     }
 
     // Validate broker mapping exists and is tradeable; retrieve broker-specific symbol.
-    // Resolves through the unified instrument_xref (BROKER source).
+    // Resolves through broker_instrument (the broker routing mapping).
     let broker_instrument_row = sqlx::query(
-        "SELECT external_symbol AS broker_symbol, external_native_id AS native_id, \
-                min_quantity::float8 AS min_quantity \
-         FROM instrument_xref \
-         WHERE instrument_id = $1 AND source_type = 'BROKER' AND source_code = $2 AND is_tradeable = true"
+        "SELECT broker_symbol, native_id, min_quantity::float8 AS min_quantity \
+         FROM broker_instrument \
+         WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true"
     )
     .bind(instrument_id_bigint)
     .bind(&broker_code)
@@ -727,12 +726,12 @@ pub async fn orders_cancel(
             })?;
 
         // The broker-native symbol — required by venues that scope cancels by
-        // symbol (Binance). Resolve from the same BROKER xref the submit used.
-        // order_state.instrument_id is TEXT (stringified bigint); the xref key is BIGINT.
+        // symbol (Binance). Resolve from the same broker_instrument the submit used.
+        // order_state.instrument_id is TEXT (stringified bigint); the mapping key is BIGINT.
         let instrument_id_num: i64 = row.get::<String, _>("instrument_id").parse().unwrap_or_default();
         let broker_symbol: String = sqlx::query_scalar(
-            "SELECT external_symbol FROM oms.instrument_xref \
-             WHERE instrument_id = $1 AND source_type = 'BROKER' AND source_code = $2 \
+            "SELECT broker_symbol FROM broker_instrument \
+             WHERE instrument_id = $1 AND broker_code = $2 \
              LIMIT 1",
         )
         .bind(instrument_id_num)

@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset seed-instruments sync-brokers sync-brokers-options
+.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset sync-broker map-feed seed-live
 
 # Load .env into the recipe shell (one shell per recipe line, so chain with &&).
 ENV := set -a && . ./.env && set +a
@@ -36,15 +36,17 @@ db-fixtures: ## Load the minimal no-creds fixture (SPY)
 		-h "$$DB_HOST" -p "$$DB_PORT" -U "$$ADMIN_USER" -d "$${ODS_DB:-ods}" \
 		-f scripts/fixtures/minimal_seed.sql
 
-# --- live universe (on-demand, NOT scheduled) ---
+# --- instrument seeding (on-demand, NOT scheduled) ---
 # Seeding runs in-process as DB_USER (oms_user) — it holds the INSERT/UPDATE grants
-# on the master catalog (db/access/ods.sql), so no admin or separate write role.
-seed-instruments: ## Seed instrument universes from Databento (interactive; UNIVERSE=CODE for one; DRY_RUN=1 for a cost estimate; ARGS=... e.g. --no-enrich --max-cost 5)
-	@$(ENV) && cargo run --quiet -- setup universe \
-		$${UNIVERSE:+--universe $$UNIVERSE} $${DRY_RUN:+--dry-run} $$ARGS
+# on the master catalog + mapping tables (db/access/ods.sql), so no admin role.
+# The broker is the instrument source: sync-broker creates the master instrument +
+# broker_instrument rows; option chains come per-underlying (UNDERLYINGS=SPY,QQQ).
+sync-broker: ## Seed instruments + broker mapping from a broker (BROKER=alpaca|binance; UNDERLYINGS=SPY,QQQ for options; DRY_RUN=1)
+	@$(ENV) && cargo run --quiet -- setup sync-broker \
+		--broker "$${BROKER:-alpaca}" $${UNDERLYINGS:+--underlyings $$UNDERLYINGS} $${DRY_RUN:+--dry-run} $$ARGS
 
-sync-brokers: ## Sync broker symbology into instrument_xref (needs ALPACA_PAPER_*; ARGS=... e.g. --asset-class equity; DRY_RUN=1)
-	@$(ENV) && cargo run --quiet -- setup sync-brokers $${DRY_RUN:+--dry-run} $$ARGS
+map-feed: ## Map a data feed's symbols onto seeded instruments (FEED=databento|binance|bybit; DRY_RUN=1)
+	@$(ENV) && cargo run --quiet -- setup map-feed --feed "$${FEED:?set FEED=databento|binance|bybit}" $${DRY_RUN:+--dry-run} $$ARGS
 
-sync-brokers-options: ## Sync Alpaca option-contract symbology into instrument_xref (UNDERLYINGS=SPY,QQQ; DRY_RUN=1)
-	@$(ENV) && cargo run --quiet -- setup sync-brokers --asset-class option --underlyings "$${UNDERLYINGS:-SPY,QQQ}" $${DRY_RUN:+--dry-run} $$ARGS
+seed-live: ## Sync every configured broker + map every feed in one idempotent pass (OPTION_UNDERLYINGS=SPY,QQQ)
+	@./db/scripts/seed_live.sh

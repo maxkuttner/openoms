@@ -1,7 +1,8 @@
 //! Setup / seeding subcommands invoked via `oms setup …`.
 
 pub mod brokers;
-pub mod universe;
+pub mod catalog;
+pub mod feeds;
 
 use std::env;
 

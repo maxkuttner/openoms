@@ -22,4 +22,20 @@ INSERT INTO currency (code, name, numeric_code, minor_units) VALUES
     ('DKK', 'Danish Krone',         '208', 2)
 ON CONFLICT (code) DO NOTHING;
 
+-- Crypto quote assets (not ISO 4217). Binance/Bybit pairs quote in these, so they
+-- must exist for a crypto pair's currency FK. numeric_code is NULL (no ISO code).
+INSERT INTO currency (code, name, numeric_code, minor_units) VALUES
+    ('USDT', 'Tether USD',          NULL,  8),
+    ('USDC', 'USD Coin',            NULL,  8),
+    ('BUSD', 'Binance USD',         NULL,  8),
+    ('FDUSD','First Digital USD',   NULL,  8),
+    ('TUSD', 'TrueUSD',             NULL,  8),
+    ('DAI',  'Dai',                 NULL,  8),
+    ('BTC',  'Bitcoin',             NULL,  8),
+    ('ETH',  'Ether',               NULL,  8),
+    ('BNB',  'BNB',                 NULL,  8),
+    ('TRY',  'Turkish Lira',        '949', 2),
+    ('BRL',  'Brazilian Real',      '986', 2)
+ON CONFLICT (code) DO NOTHING;
+
 RESET ROLE;

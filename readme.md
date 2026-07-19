@@ -35,8 +35,9 @@ make db-setup
 Optional live data (on-demand, needs vendor creds in `.env`):
 
 ```sh
-make seed-instruments      # instrument universe from Databento, FIGI-enriched (DATABENTO_API_KEY)
-make sync-brokers          # broker symbology from Alpaca (ALPACA_PAPER_*)
+make sync-broker BROKER=alpaca               # seed instruments + broker mapping from Alpaca (ALPACA_PAPER_*)
+make sync-broker BROKER=alpaca UNDERLYINGS=SPY,QQQ  # also seed those option chains
+make map-feed FEED=databento                 # price the seeded options via Databento OPRA (DATABENTO_API_KEY)
 ```
 
 ## Run

@@ -177,25 +177,24 @@ pub async fn run_reconciliation(
     })?;
 
     // Custodian side: resolve each holding to a master instrument via broker_instrument.
-    // Load every BROKER xref for this source once, into a lookup keyed by both the
-    // native id and the external symbol — avoids a round-trip per holding (a crypto
-    // testnet account can report hundreds of balances).
-    let xref_rows = sqlx::query(
-        "SELECT instrument_id, external_native_id, external_symbol FROM instrument_xref \
-         WHERE source_type = 'BROKER' AND source_code = $1 AND instrument_id IS NOT NULL",
+    // Load every mapping for this broker once, into a lookup keyed by both the native
+    // id and the broker symbol — avoids a round-trip per holding (a crypto testnet
+    // account can report hundreds of balances).
+    let mapping_rows = sqlx::query(
+        "SELECT instrument_id, native_id, broker_symbol FROM broker_instrument \
+         WHERE broker_code = $1",
     )
     .bind(&broker_code)
     .fetch_all(pool)
     .await?;
     let mut xref: HashMap<String, i64> = HashMap::new();
-    for r in &xref_rows {
+    for r in &mapping_rows {
         let id: i64 = r.get("instrument_id");
-        if let Some(n) = r.get::<Option<String>, _>("external_native_id") {
+        if let Some(n) = r.get::<Option<String>, _>("native_id") {
             xref.entry(n).or_insert(id);
         }
-        if let Some(s) = r.get::<Option<String>, _>("external_symbol") {
-            xref.entry(s).or_insert(id);
-        }
+        let s: String = r.get("broker_symbol");
+        xref.entry(s).or_insert(id);
     }
 
     let mut resolved = Vec::with_capacity(holdings.len());
@@ -208,7 +207,7 @@ pub async fn run_reconciliation(
 
         // Fallback: identify via the symbology engine (OpenFIGI). A US-equity
         // affordance (FIGI + exch_code "US") — only meaningful for Alpaca. Other
-        // venues resolve via their seeded BROKER xref only.
+        // venues resolve via their seeded broker_instrument mapping only.
         if instrument_id.is_none() && broker_code == "ALPACA" {
             let query = InstrumentQuery {
                 ticker: Some(h.symbol.clone()),
@@ -216,15 +215,15 @@ pub async fn run_reconciliation(
                 ..Default::default()
             };
             if let Ok(ResolveOutcome::Resolved { instrument_id: Some(id), .. }) =
-                symbology_resolver::resolve(pool, engine, &query, "CUSTODIAN", &broker_code).await
+                symbology_resolver::resolve(pool, engine, &query).await
             {
                 instrument_id = Some(id);
             }
         }
 
         // For non-equity venues, only reconcile assets we actually track (have a
-        // BROKER xref). A crypto exchange account carries many untracked balances
-        // (testnet pre-funds hundreds) that aren't real breaks — skip them.
+        // broker_instrument mapping). A crypto exchange account carries many
+        // untracked balances (testnet pre-funds hundreds) that aren't real breaks.
         if instrument_id.is_none() && broker_code != "ALPACA" {
             continue;
         }

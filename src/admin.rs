@@ -568,6 +568,43 @@ pub async fn list_stream_health(State(state): State<AppState>) -> Json<Vec<Strea
     Json(state.stream_health().snapshot())
 }
 
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FeedSummary {
+    pub feed_code: String,
+    pub instrument_class: String,
+    /// Ranked failover preference within the class; lower wins.
+    pub rank: i32,
+    pub enabled: bool,
+    /// How many instruments this feed currently maps (feed_instrument), for the class.
+    pub mapped_instruments: i64,
+}
+
+/// The configured data feeds: the ranked market-data source policy plus how many
+/// instruments each currently prices. Distinct from broker connections (execution).
+#[utoipa::path(
+    get, path = "/admin/feeds", tag = "admin",
+    responses((status = 200, description = "OK", body = [FeedSummary])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_feeds(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<FeedSummary>>, AdminError> {
+    let rows = sqlx::query_as::<_, FeedSummary>(
+        "SELECT p.source_code AS feed_code, p.instrument_class, p.rank, p.enabled, \
+                count(i.id) AS mapped_instruments \
+         FROM oms.provider_feed_policy p \
+         LEFT JOIN feed_instrument fi ON fi.feed_code = p.source_code AND fi.is_active \
+         LEFT JOIN instrument i ON i.id = fi.instrument_id \
+              AND i.instrument_class = p.instrument_class \
+         GROUP BY p.source_code, p.instrument_class, p.rank, p.enabled \
+         ORDER BY p.source_code, p.rank",
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(rows))
+}
+
 #[utoipa::path(
     get, path = "/admin/broker-connections", tag = "admin",
     responses(
@@ -1229,346 +1266,6 @@ pub async fn list_instruments(
     Ok(Json(records))
 }
 
-// ── Instrument universes ──────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct UniverseSummary {
-    pub code: String,
-    pub description: Option<String>,
-    pub provider_code: String,
-    pub category: String,
-    pub dataset: String,
-    pub option_dataset: Option<String>,
-    pub include_options: bool,
-    pub status: String,
-    pub last_seeded_at: Option<DateTime<Utc>>,
-    pub last_error: Option<String>,
-    pub instrument_count: Option<i32>,
-}
-
-/// List the instrument-universe catalog and its seed state (what is available
-/// and when each was last loaded).
-#[utoipa::path(
-    get, path = "/admin/universes", tag = "admin",
-    responses((status = 200, description = "OK", body = [UniverseSummary])),
-    security(("bearer_token" = []))
-)]
-pub async fn list_universes(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<UniverseSummary>>, AdminError> {
-    let records = sqlx::query_as::<_, UniverseSummary>(
-        "SELECT code, description, provider_code, category, dataset, option_dataset, \
-                include_options, status, last_seeded_at, last_error, instrument_count \
-         FROM instrument_universe \
-         ORDER BY category, code",
-    )
-    .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
-    Ok(Json(records))
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct EstimateResponse {
-    pub universe_code: String,
-    pub usd: f64,
-    pub symbol_count: Option<i64>,
-}
-
-/// Reject seeding/estimating an OPTION universe with no underlyings before any
-/// provider call — 400, not a 502 from the downstream estimate. `Ok(None)` if the
-/// universe is unknown (caller maps to 404).
-async fn ensure_seedable(state: &AppState, code: &str) -> Result<Option<()>, AdminError> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT u.category, count(s.symbol) \
-         FROM instrument_universe u \
-         LEFT JOIN instrument_universe_symbol s ON s.universe_code = u.code \
-         WHERE u.code = $1 \
-         GROUP BY u.category",
-    )
-    .bind(code)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(map_db_error)?;
-    let Some((category, symbol_count)) = row else {
-        return Ok(None);
-    };
-    if category == "OPTION" && symbol_count == 0 {
-        return Err(AdminError {
-            status: StatusCode::BAD_REQUEST,
-            message: "OPTION universe has no underlyings — pick underlyings before seeding (ALL is not allowed for options)".to_string(),
-        });
-    }
-    Ok(Some(()))
-}
-
-/// Free Databento cost estimate for seeding a single universe.
-#[utoipa::path(
-    get, path = "/admin/universes/{code}/estimate", tag = "admin",
-    params(("code" = String, Path, description = "Universe code")),
-    responses((status = 200, description = "OK", body = EstimateResponse)),
-    security(("bearer_token" = []))
-)]
-pub async fn estimate_universe(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-) -> Result<Json<EstimateResponse>, AdminError> {
-    if ensure_seedable(&state, &code).await?.is_none() {
-        return Err(AdminError::not_found("universe"));
-    }
-    let est = crate::setup::universe::estimate(state.pool(), &code)
-        .await
-        .map_err(|e| AdminError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("estimate failed: {e}"),
-        })?
-        .ok_or_else(|| AdminError::not_found("universe"))?;
-    Ok(Json(EstimateResponse {
-        universe_code: est.universe_code,
-        usd: est.usd,
-        symbol_count: est.symbol_count.map(|n| n as i64),
-    }))
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct SeedRequest {
-    /// Abort if the estimated cost (USD) exceeds this. Omit to skip the gate.
-    pub max_cost: Option<f64>,
-    /// Run the enrichment pipeline (OpenFIGI). Defaults to true.
-    #[serde(default = "default_true")]
-    pub enrich: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct SeedAccepted {
-    pub universe_code: String,
-    pub status: String,
-}
-
-/// Seed a universe. Estimates + gates on `max_cost`, marks the universe
-/// `SEEDING`, and runs the fetch/upsert/enrich in the background. Poll
-/// `GET /admin/universes` for the terminal `SEEDED`/`ERROR` state.
-#[utoipa::path(
-    post, path = "/admin/universes/{code}/seed", tag = "admin",
-    params(("code" = String, Path, description = "Universe code")),
-    request_body = SeedRequest,
-    responses(
-        (status = 202, description = "Seeding started (cost gate + errors surface async as ERROR)", body = SeedAccepted),
-        (status = 400, description = "OPTION universe has no underlyings"),
-        (status = 404, description = "Unknown universe"),
-        (status = 409, description = "Already seeding"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn seed_universe(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-    Json(req): Json<SeedRequest>,
-) -> Result<(StatusCode, Json<SeedAccepted>), AdminError> {
-    // Guard: universe exists and is not already mid-seed.
-    let current: Option<(String,)> =
-        sqlx::query_as("SELECT status FROM instrument_universe WHERE code = $1")
-            .bind(&code)
-            .fetch_optional(state.pool())
-            .await
-            .map_err(map_db_error)?;
-    let Some((status,)) = current else {
-        return Err(AdminError::not_found("universe"));
-    };
-    if status == "SEEDING" {
-        return Err(AdminError {
-            status: StatusCode::CONFLICT,
-            message: "universe is already seeding".to_string(),
-        });
-    }
-
-    // OPTION universes must have underlyings — reject with 400 before spawning.
-    ensure_seedable(&state, &code).await?;
-
-    // Mark SEEDING now so a poll sees it immediately, then run everything —
-    // including the cost estimate/gate — in the background so this request
-    // returns at once (the estimate can be slow, and Databento's get_cost is
-    // flaky). Over-budget or fetch failure lands as ERROR + last_error.
-    sqlx::query(
-        "UPDATE instrument_universe \
-         SET status = 'SEEDING', last_error = NULL, updated_at = now() \
-         WHERE code = $1",
-    )
-    .bind(&code)
-    .execute(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    let pool = state.pool().clone();
-    let bg_code = code.clone();
-    let enrich = req.enrich;
-    let max_cost = req.max_cost;
-    tokio::spawn(async move {
-        if let Err(e) = crate::setup::universe::seed(&pool, &bg_code, enrich, max_cost).await {
-            tracing::error!("background seed {bg_code} failed: {e}");
-        }
-    });
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SeedAccepted {
-            universe_code: code,
-            status: "SEEDING".to_string(),
-        }),
-    ))
-}
-
-#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct UnderlyingCandidate {
-    pub symbol: String,
-    pub name: String,
-    pub venue: String,
-}
-
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct UnderlyingSearch {
-    pub search: Option<String>,
-    pub limit: Option<i64>,
-}
-
-/// Candidate option underlyings: the equities (SPOT) already seeded in the
-/// master. Pick from these to build an OPTION universe's underlying list.
-#[utoipa::path(
-    get, path = "/admin/underlyings", tag = "admin",
-    params(UnderlyingSearch),
-    responses((status = 200, description = "OK", body = [UnderlyingCandidate])),
-    security(("bearer_token" = []))
-)]
-pub async fn list_underlyings(
-    State(state): State<AppState>,
-    Query(params): Query<UnderlyingSearch>,
-) -> Result<Json<Vec<UnderlyingCandidate>>, AdminError> {
-    let limit = params.limit.unwrap_or(100).clamp(1, 500);
-    let pattern = params.search.as_deref().map(|s| format!("%{s}%"));
-    let rows = sqlx::query_as::<_, UnderlyingCandidate>(
-        "SELECT symbol, name, venue \
-         FROM instrument \
-         WHERE instrument_class = 'SPOT' AND status = 'ACTIVE' \
-           AND ($1::text IS NULL OR symbol ILIKE $1 OR name ILIKE $1) \
-         ORDER BY symbol \
-         LIMIT $2",
-    )
-    .bind(pattern)
-    .bind(limit)
-    .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
-    Ok(Json(rows))
-}
-
-/// The current underlying/child symbols of a universe.
-#[utoipa::path(
-    get, path = "/admin/universes/{code}/symbols", tag = "admin",
-    params(("code" = String, Path, description = "Universe code")),
-    responses((status = 200, description = "OK", body = [String])),
-    security(("bearer_token" = []))
-)]
-pub async fn list_universe_symbols(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-) -> Result<Json<Vec<String>>, AdminError> {
-    // 404 if the universe itself is unknown (empty set is otherwise ambiguous).
-    let exists: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM instrument_universe WHERE code = $1")
-            .bind(&code)
-            .fetch_optional(state.pool())
-            .await
-            .map_err(map_db_error)?;
-    if exists.is_none() {
-        return Err(AdminError::not_found("universe"));
-    }
-    let symbols: Vec<String> = sqlx::query_scalar(
-        "SELECT symbol FROM instrument_universe_symbol \
-         WHERE universe_code = $1 ORDER BY symbol",
-    )
-    .bind(&code)
-    .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
-    Ok(Json(symbols))
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct SetSymbolsRequest {
-    pub symbols: Vec<String>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct SetSymbolsResponse {
-    pub universe_code: String,
-    pub count: usize,
-}
-
-/// Replace a universe's underlying/child symbol set (the checkbox selection).
-#[utoipa::path(
-    put, path = "/admin/universes/{code}/symbols", tag = "admin",
-    params(("code" = String, Path, description = "Universe code")),
-    request_body = SetSymbolsRequest,
-    responses(
-        (status = 200, description = "OK", body = SetSymbolsResponse),
-        (status = 404, description = "Unknown universe"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn set_universe_symbols(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-    Json(req): Json<SetSymbolsRequest>,
-) -> Result<Json<SetSymbolsResponse>, AdminError> {
-    let exists: Option<(i32,)> =
-        sqlx::query_as("SELECT 1 FROM instrument_universe WHERE code = $1")
-            .bind(&code)
-            .fetch_optional(state.pool())
-            .await
-            .map_err(map_db_error)?;
-    if exists.is_none() {
-        return Err(AdminError::not_found("universe"));
-    }
-
-    // Normalize: trim, uppercase, dedup, drop blanks.
-    let mut symbols: Vec<String> = req
-        .symbols
-        .iter()
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    symbols.sort();
-    symbols.dedup();
-
-    let mut tx = state.pool().begin().await.map_err(map_db_error)?;
-    sqlx::query("DELETE FROM instrument_universe_symbol WHERE universe_code = $1")
-        .bind(&code)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_db_error)?;
-    if !symbols.is_empty() {
-        sqlx::query(
-            "INSERT INTO instrument_universe_symbol (universe_code, symbol) \
-             SELECT $1, s FROM UNNEST($2::text[]) AS s",
-        )
-        .bind(&code)
-        .bind(&symbols)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_db_error)?;
-    }
-    tx.commit().await.map_err(map_db_error)?;
-
-    Ok(Json(SetSymbolsResponse {
-        universe_code: code,
-        count: symbols.len(),
-    }))
-}
-
 // ── Custodian reconciliation ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -1698,8 +1395,6 @@ pub struct ResolveRequest {
     pub figi: Option<String>,
     pub mic: Option<String>,
     pub exch_code: Option<String>,
-    pub source_type: Option<String>,
-    pub source_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -1748,17 +1443,9 @@ pub async fn resolve_symbology(
         currency: None,
         market_sec_des: None,
     };
-    let source_type = req.source_type.unwrap_or_else(|| "MANUAL".to_string());
-    let source_code = req.source_code.unwrap_or_else(|| "MANUAL".to_string());
-    let outcome = symbology_resolver::resolve(
-        state.pool(),
-        state.symbology().as_ref(),
-        &query,
-        &source_type,
-        &source_code,
-    )
-    .await
-    .map_err(map_resolve_error)?;
+    let outcome = symbology_resolver::resolve(state.pool(), state.symbology().as_ref(), &query)
+        .await
+        .map_err(map_resolve_error)?;
     Ok(Json(outcome))
 }
 
@@ -1795,7 +1482,7 @@ pub async fn backfill_symbology(
             mic: Some(venue),
             ..Default::default()
         };
-        match symbology_resolver::resolve(state.pool(), state.symbology().as_ref(), &query, "OPENFIGI", "OPENFIGI").await {
+        match symbology_resolver::resolve(state.pool(), state.symbology().as_ref(), &query).await {
             Ok(ResolveOutcome::Resolved { instrument_id: Some(_), .. }) => result.stamped += 1,
             Ok(ResolveOutcome::Ambiguous { .. }) => result.ambiguous += 1,
             _ => result.unresolved += 1,

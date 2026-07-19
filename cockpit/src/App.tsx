@@ -11,20 +11,30 @@ import { BrokerConnectionsPage } from "./pages/BrokerConnections";
 import { RiskLimitsPage } from "./pages/RiskLimits";
 import { BlotterPage } from "./pages/Blotter";
 import { ReconciliationPage } from "./pages/Reconciliation";
-import { UniversesPage } from "./pages/Universes";
+import { InstrumentsPage } from "./pages/Instruments";
+import { DataFeedsPage } from "./pages/DataFeeds";
 
-// Scalar's bundle is heavy — only load it when the API docs page is opened.
+// Heavy bundles (Scalar, Mermaid) — only load when their doc page is opened.
 const ApiDocsPage = lazy(() => import("./pages/ApiDocs").then((m) => ({ default: m.ApiDocsPage })));
+const ArchitecturePage = lazy(() =>
+  import("./pages/Architecture").then((m) => ({ default: m.ArchitecturePage })),
+);
 
 const NAV = [
   { to: "/principals", label: "Principals" },
   { to: "/portfolios", label: "Portfolios" },
   { to: "/accounts", label: "Accounts" },
   { to: "/broker-connections", label: "Broker connections" },
+  { to: "/data-feeds", label: "Data feeds" },
   { to: "/risk-limits", label: "Risk limits" },
   { to: "/blotter", label: "Blotter" },
-  { to: "/universes", label: "Universes" },
+  { to: "/instruments", label: "Instruments" },
   { to: "/reconciliation", label: "Reconciliation" },
+];
+
+// Grouped under a "Docs" section in the navbar.
+const DOCS_NAV = [
+  { to: "/docs/architecture", label: "Architecture" },
   { to: "/api-docs", label: "API docs" },
 ];
 
@@ -92,6 +102,17 @@ export function App() {
             active={pathname.startsWith(n.to)}
           />
         ))}
+        <NavLink label="Docs" defaultOpened childrenOffset={16}>
+          {DOCS_NAV.map((n) => (
+            <NavLink
+              key={n.to}
+              component={RouterNavLink}
+              to={n.to}
+              label={n.label}
+              active={pathname.startsWith(n.to)}
+            />
+          ))}
+        </NavLink>
       </AppShell.Navbar>
       <AppShell.Main>
         <Routes>
@@ -100,10 +121,19 @@ export function App() {
           <Route path="/portfolios" element={<PortfoliosPage />} />
           <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/broker-connections" element={<BrokerConnectionsPage />} />
+          <Route path="/data-feeds" element={<DataFeedsPage />} />
           <Route path="/risk-limits" element={<RiskLimitsPage />} />
           <Route path="/blotter" element={<BlotterPage />} />
-          <Route path="/universes" element={<UniversesPage />} />
+          <Route path="/instruments" element={<InstrumentsPage />} />
           <Route path="/reconciliation" element={<ReconciliationPage />} />
+          <Route
+            path="/docs/architecture"
+            element={
+              <Suspense fallback={<Loader />}>
+                <ArchitecturePage />
+              </Suspense>
+            }
+          />
           <Route
             path="/api-docs"
             element={

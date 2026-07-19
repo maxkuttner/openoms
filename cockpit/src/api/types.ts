@@ -36,10 +36,19 @@ export interface Account {
 export interface StreamHealth {
   broker_code: string;
   environment: string;
+  kind: "feed" | "execution";
   state: "connecting" | "live" | "down";
   connected_since: string | null;
   last_event_at: string | null;
   last_error: string | null;
+}
+
+export interface FeedSummary {
+  feed_code: string;
+  instrument_class: string;
+  rank: number;
+  enabled: boolean;
+  mapped_instruments: number;
 }
 
 export interface BrokerConnection {
@@ -124,28 +133,11 @@ export interface BlotterRow {
   updated_at: string;
 }
 
-export interface UniverseSummary {
-  code: string;
-  description: string | null;
-  provider_code: string;
-  category: string;
-  dataset: string;
-  option_dataset: string | null;
-  include_options: boolean;
-  status: string;
-  last_seeded_at: string | null;
-  last_error: string | null;
-  instrument_count: number | null;
-}
-
-export interface EstimateResponse {
-  universe_code: string;
-  usd: number;
-  symbol_count: number | null;
-}
-
-export interface UnderlyingCandidate {
+export interface InstrumentSummary {
+  id: number;
   symbol: string;
-  name: string;
+  name: string | null;
   venue: string;
+  asset_class: string;
+  status: string;
 }
