@@ -17,12 +17,18 @@ use databento::{
     live::Subscription,
     LiveClient,
 };
-use dataprovider::{DataProvider, FeedHealth, LiveQuoteFeed, ProviderError, Quote, SymbolAdds};
+use dataprovider::{
+    DataProvider, FeedHealth, FeedSymbology, InstrumentFilter, LiveQuoteFeed, ProviderError, Quote,
+    SymbolAdds,
+};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 const OPRA_DATASET: &str = "OPRA.PILLAR";
 const SOURCE_CODE: &str = "DATABENTO";
+
+/// Fixed tail of an OSI symbol: 6 date + 1 kind + 8 strike.
+const OSI_TAIL: usize = 15;
 
 pub struct DatabentoOpraFeed;
 
@@ -32,14 +38,30 @@ impl DataProvider for DatabentoOpraFeed {
     }
 }
 
-#[async_trait::async_trait]
-impl LiveQuoteFeed for DatabentoOpraFeed {
-    /// OPRA.PILLAR is an options dataset. Databento cross-references our equities
-    /// too, but this session cannot quote them.
-    fn covers(&self) -> &'static [&'static str] {
-        &["OPTION"]
+impl FeedSymbology for DatabentoOpraFeed {
+    fn candidates(&self) -> InstrumentFilter {
+        InstrumentFilter {
+            instrument_class: Some("OPTION"),
+            venue: Some("OPRA"),
+            ..Default::default()
+        }
     }
 
+    /// Compact OSI (how the master stores it, and how Alpaca reports it) → the
+    /// space-padded form Databento puts on the wire: root left-justified in 6.
+    ///
+    /// `SPY260724P00739000` → `SPY   260724P00739000`
+    fn to_feed_symbol(&self, symbol: &str) -> Option<String> {
+        // A symbol with no room for a root is not an OSI symbol. Guards the
+        // underflow the equivalent SQL (`left(symbol, length(symbol) - 15)`) had.
+        let split = symbol.len().checked_sub(OSI_TAIL).filter(|&n| n > 0)?;
+        let (root, tail) = symbol.split_at(split);
+        Some(format!("{root:<6}{tail}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl LiveQuoteFeed for DatabentoOpraFeed {
     async fn run_session(
         &self,
         symbols: HashMap<String, i64>,
@@ -156,4 +178,55 @@ async fn subscribe(client: &mut LiveClient, symbols: Vec<String>) -> Result<(), 
 /// Fixed-point Databento price → f64, or `None` when undefined.
 fn px(v: i64) -> Option<f64> {
     (v != UNDEF_PRICE).then_some(v as f64 / 1e9)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The case that motivates the whole transform: a 3-char root gets padded to 6
+    /// so the wire symbol matches what Databento publishes.
+    #[test]
+    fn pads_short_root_to_six() {
+        assert_eq!(
+            DatabentoOpraFeed.to_feed_symbol("SPY260724P00739000").as_deref(),
+            Some("SPY   260724P00739000")
+        );
+    }
+
+    /// A root already 6 wide is unchanged — no padding, no truncation.
+    #[test]
+    fn leaves_full_width_root_alone() {
+        assert_eq!(
+            DatabentoOpraFeed.to_feed_symbol("BRKB  260116C00500000").as_deref(),
+            Some("BRKB  260116C00500000")
+        );
+    }
+
+    /// Output is always root(6) + tail(15). Anything else would silently fail to
+    /// match on the wire rather than erroring.
+    #[test]
+    fn output_is_always_21_chars() {
+        for s in ["A260724P00739000", "SPY260724P00739000", "SPXW  260724C05000000"] {
+            let out = DatabentoOpraFeed.to_feed_symbol(s).expect("valid OSI");
+            assert_eq!(out.len(), 6 + OSI_TAIL, "{s} → {out:?}");
+        }
+    }
+
+    /// Too short to carry a root: declined, not padded into nonsense. The SQL this
+    /// replaced would have underflowed on `length(symbol) - 15`.
+    #[test]
+    fn declines_symbol_with_no_room_for_root() {
+        assert_eq!(DatabentoOpraFeed.to_feed_symbol("260724P00739000"), None);
+        assert_eq!(DatabentoOpraFeed.to_feed_symbol("SPY"), None);
+        assert_eq!(DatabentoOpraFeed.to_feed_symbol(""), None);
+    }
+
+    #[test]
+    fn candidates_scope_to_opra_options() {
+        let f = DatabentoOpraFeed.candidates();
+        assert_eq!(f.instrument_class, Some("OPTION"));
+        assert_eq!(f.venue, Some("OPRA"));
+        assert_eq!(f.asset_class, None);
+    }
 }

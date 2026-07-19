@@ -66,19 +66,44 @@ impl FeedHealth for NoFeedHealth {
     fn on_event(&self) {}
 }
 
+/// Which instruments a feed is capable of pricing.
+///
+/// Declarative rather than a predicate so the seeding side can push it down into a
+/// `WHERE` clause instead of scanning the whole catalog. Every `None` means "don't
+/// constrain on this" — a feed that leaves `venue` open prices its symbol on every
+/// venue that lists it, which is the 1:n case (one crypto pair, several exchanges).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstrumentFilter {
+    pub instrument_class: Option<&'static str>,
+    pub asset_class: Option<&'static str>,
+    pub venue: Option<&'static str>,
+}
+
+/// How a feed names the instruments it prices.
+///
+/// The counterpart to [`LiveQuoteFeed`]: that trait moves a vendor's *data*, this one
+/// translates its *symbology*. Both live on the same struct so a vendor's naming rules
+/// sit next to the code that speaks its protocol, rather than in a central table of
+/// every feed's quirks.
+///
+/// [`to_feed_symbol`](FeedSymbology::to_feed_symbol) is deliberately pure — no I/O, no
+/// database — so the fiddly cases (OSI padding, suffixes, case) are unit-testable.
+pub trait FeedSymbology: DataProvider {
+    /// The subset of the master catalog this feed can price.
+    fn candidates(&self) -> InstrumentFilter;
+
+    /// Translate a master `instrument.symbol` into what this feed calls it.
+    ///
+    /// `None` means the feed cannot express that instrument; the caller skips it.
+    /// Returning `None` is not an error — it is how a feed declines a symbol that
+    /// passed [`candidates`](FeedSymbology::candidates) but is malformed for its
+    /// symbology.
+    fn to_feed_symbol(&self, symbol: &str) -> Option<String>;
+}
+
 /// A source of live quotes.
 #[async_trait::async_trait]
 pub trait LiveQuoteFeed: DataProvider {
-    /// The `instrument_class` values this feed can quote.
-    ///
-    /// `code()` alone is not coverage: a vendor spans many datasets, and a feed is
-    /// one of them. Databento cross-references both equities and options, but the
-    /// OPRA.PILLAR session can only quote options — handing it an equity symbol
-    /// would at best return nothing and at worst have the gateway reject the whole
-    /// subscription. This is the minimum scope a driver needs to pick the right
-    /// held instruments; a per-feed dataset/schema config is the fuller answer when
-    /// one vendor runs several feeds.
-    fn covers(&self) -> &'static [&'static str];
     /// Connect, subscribe `symbols`, and emit quotes until the session ends.
     ///
     /// `Ok(())` means the venue closed the stream cleanly; the supervisor

@@ -5,6 +5,8 @@ pub mod ibkr;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dataprovider::InstrumentDef;
+
 use crate::adapters::alpaca::AlpacaAdapter;
 
 /// Broker-agnostic order request passed to any adapter.
@@ -41,18 +43,42 @@ pub struct BrokerHolding {
     pub qty: f64,
 }
 
-/// One row of a broker's tradeable-instrument catalog, as returned by the
-/// broker's symbology endpoints. Provider-neutral; consumed by the broker-sync
-/// setup task to populate `oms.instrument_xref` (source_type='BROKER'). The
-/// `symbol` is the broker's own handle (Alpaca ticker for equities, compact OSI
-/// for options); `native_id` is the immutable broker id when the broker exposes
-/// one (Alpaca asset UUID for equities; None for options, which route by symbol).
+/// One entry of a broker's tradeable catalog: the canonical Symbol@Venue
+/// instrument record (→ `public.instrument` / `instrument_derivative`) plus the
+/// broker's own routing handle (→ `public.broker_instrument`). Returned by an
+/// adapter's [`InstrumentProvider`] impl; broker sync creates both rows from it in
+/// one pass, so the broker is the authoritative source of the instrument.
+///
+/// `definition.native_id` carries the broker's immutable id when it exposes one
+/// (Alpaca asset UUID for equities; None for options, which route by symbol).
 pub struct BrokerInstrument {
-    pub symbol: String,
-    pub exchange: Option<String>,
-    pub native_id: Option<String>,
+    /// Canonical instrument definition — master catalog fields.
+    pub definition: InstrumentDef,
+    /// The broker's order-entry handle. Usually equals `definition.symbol`; kept
+    /// separate for brokers whose routing symbol differs from the canonical symbol.
+    pub broker_symbol: String,
+    /// The broker's own exchange label for the routing handle, when it exposes one.
+    pub broker_exchange: Option<String>,
     pub is_tradeable: bool,
     pub min_quantity: Option<f64>,
+    pub max_quantity: Option<f64>,
+    pub min_notional: Option<f64>,
+    pub max_notional: Option<f64>,
+}
+
+/// A broker/exchange adapter that can enumerate its own tradeable catalog. Broker
+/// sync (`oms setup sync-broker`) drives this to seed the master instrument catalog
+/// broker-first. Adapters without a catalog endpoint (e.g. the IBKR stub) simply
+/// don't implement it.
+#[async_trait::async_trait]
+pub trait InstrumentProvider: Send + Sync {
+    /// The broker's tradeable catalog as canonical instrument records + routing
+    /// handles. `option_underlyings` scopes the (very large) option chain; empty =
+    /// list equities / spot pairs only.
+    async fn list_instruments(
+        &self,
+        option_underlyings: &[String],
+    ) -> Result<Vec<BrokerInstrument>, BrokerError>;
 }
 
 #[derive(Debug)]

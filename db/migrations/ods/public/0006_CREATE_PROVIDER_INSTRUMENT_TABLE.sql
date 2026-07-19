@@ -26,7 +26,7 @@ CREATE TABLE provider_instrument (
     -- The stable resolver key. A provider symbol resolves to one master instrument
     -- per exchange — a consolidated provider lists the same symbol across venues
     -- (SPY on ARCX, XNAS, …), each a distinct (symbol, venue) master instrument,
-    -- so the exchange is part of the key. Mirrors Nautilus's Symbol@Venue identity.
+    -- so the exchange is part of the key, mirroring Symbol@Venue identity.
     CONSTRAINT provider_instrument_provider_symbol_uq
         UNIQUE (provider_code, provider_symbol, provider_exchange)
 );

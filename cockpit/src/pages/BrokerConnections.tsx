@@ -10,7 +10,11 @@ const STATUS = [
 export function BrokerConnectionsPage() {
   return (
     <Stack gap="lg">
-      <StreamHealthStrip />
+      <StreamHealthStrip
+        kind="execution"
+        title="Live execution streams"
+        emptyText="No execution streams — no broker credentials configured in this process."
+      />
       <CrudResource
       title="Broker connections"
       path="/admin/broker-connections"

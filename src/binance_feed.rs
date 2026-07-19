@@ -13,7 +13,10 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use dataprovider::{DataProvider, FeedHealth, LiveQuoteFeed, ProviderError, Quote, SymbolAdds};
+use dataprovider::{
+    DataProvider, FeedHealth, FeedSymbology, InstrumentFilter, LiveQuoteFeed, ProviderError, Quote,
+    SymbolAdds,
+};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -40,12 +43,28 @@ impl DataProvider for BinanceFeed {
     }
 }
 
-#[async_trait::async_trait]
-impl LiveQuoteFeed for BinanceFeed {
-    fn covers(&self) -> &'static [&'static str] {
-        &["SPOT"]
+impl FeedSymbology for BinanceFeed {
+    /// Only the pairs Binance itself lists. Scoped to the venue because this feed
+    /// is the exchange's own book — unlike Bybit, it has no claim on a pair listed
+    /// somewhere else.
+    fn candidates(&self) -> InstrumentFilter {
+        InstrumentFilter {
+            instrument_class: Some("SPOT"),
+            asset_class: Some("CRYPTO"),
+            venue: Some("BINANCE"),
+        }
     }
 
+    /// Identity: the master symbol *is* the pair, and matches the uppercase `s`
+    /// field Binance sends. (The lowercasing for the subscribe frame happens at
+    /// subscribe time in `run_session` — it is wire framing, not identity.)
+    fn to_feed_symbol(&self, symbol: &str) -> Option<String> {
+        Some(symbol.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl LiveQuoteFeed for BinanceFeed {
     async fn run_session(
         &self,
         symbols: HashMap<String, i64>,

@@ -9,19 +9,15 @@
 GRANT USAGE ON SCHEMA public TO oms_user;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO oms_user;
 
--- Instrument seeding + symbology: the OMS app now seeds the master instrument
--- universe itself (`oms setup universe` CLI and the POST /admin/universes/{code}/seed
--- endpoint, src/setup/universe.rs), and its resolver stamps FIGI/CUSIP anchors from
--- OpenFIGI. It fetches definitions from the provider, upserts instrument +
--- instrument_derivative, and writes the universe seed-state (status, last_seeded_at,
--- instrument_count) back on the catalog. So oms_user needs write on those tables.
--- (SELECT on the FK targets venue/currency and the catalog is covered by the
---  blanket public SELECT above; oms.instrument_xref lives in oms_user's own schema.)
+-- Instrument seeding + symbology: the OMS app seeds the master instrument catalog
+-- itself, broker-first. Broker sync (`oms setup sync-broker`) creates the master
+-- public.instrument (+ instrument_derivative) rows and the broker_instrument mapping
+-- in one pass; feed mapping (`oms setup map-feed`) writes feed_instrument; the
+-- resolver stamps FIGI/CUSIP anchors from OpenFIGI. So oms_user needs write on the
+-- master catalog and both mapping tables. (SELECT on the FK targets venue/currency
+-- is covered by the blanket public SELECT above.)
 GRANT INSERT, UPDATE ON public.instrument, public.instrument_derivative TO oms_user;
-GRANT UPDATE ON public.instrument_universe TO oms_user;
--- Editing a universe's underlying/child symbol set (the cockpit checkbox picker)
--- rewrites instrument_universe_symbol.
-GRANT INSERT, DELETE ON public.instrument_universe_symbol TO oms_user;
+GRANT INSERT, UPDATE, DELETE ON public.broker_instrument, public.feed_instrument TO oms_user;
 
 -- Every future master table mdm_master creates is readable by oms_user.
 ALTER DEFAULT PRIVILEGES FOR ROLE mdm_master IN SCHEMA public
@@ -41,7 +37,6 @@ DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'market_user') THEN
         REVOKE ALL ON public.instrument, public.instrument_derivative FROM market_user;
-        REVOKE ALL ON public.instrument_universe, public.instrument_universe_symbol FROM market_user;
         REVOKE ALL ON public.venue, public.currency FROM market_user;
         REVOKE USAGE ON SCHEMA public FROM market_user;
         EXECUTE format('REVOKE CONNECT ON DATABASE %I FROM market_user', current_database());

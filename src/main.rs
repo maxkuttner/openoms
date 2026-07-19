@@ -100,12 +100,7 @@ mod bybit_feed;
         admin::update_risk_limit,
         admin::delete_risk_limit,
         admin::list_instruments,
-        admin::list_universes,
-        admin::list_underlyings,
-        admin::list_universe_symbols,
-        admin::set_universe_symbols,
-        admin::estimate_universe,
-        admin::seed_universe,
+        admin::list_feeds,
         admin::run_recon,
         admin::list_recon_runs,
         admin::list_recon_breaks,
@@ -124,9 +119,7 @@ mod bybit_feed;
         CreateKey, ApiKeyRecord,
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
-        admin::InstrumentSummary,
-        admin::UniverseSummary, admin::EstimateResponse, admin::SeedRequest, admin::SeedAccepted,
-        admin::UnderlyingCandidate, admin::SetSymbolsRequest, admin::SetSymbolsResponse,
+        admin::InstrumentSummary, admin::FeedSummary,
         admin::RunReconRequest, admin::ReconRunRow, admin::ReconBreakRow,
         crate::recon::ReconSummary, crate::recon::ReconBreak, crate::recon::BreakKind,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
@@ -177,10 +170,10 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum SetupCmd {
-    /// Seed the master instrument universe from the configured providers.
-    Universe(setup::universe::Args),
-    /// Sync broker symbology (instrument_xref BROKER rows) from a broker catalog.
-    SyncBrokers(setup::brokers::Args),
+    /// Seed the master instrument catalog + broker_instrument mapping from a broker.
+    SyncBroker(setup::brokers::Args),
+    /// Map a data feed's symbols onto seeded instruments (feed_instrument rows).
+    MapFeed(setup::feeds::Args),
 }
 
 #[tokio::main]
@@ -190,15 +183,15 @@ async fn main() {
 
     let cli = <Cli as clap::Parser>::parse();
     match cli.command {
-        Some(Command::Setup(SetupCmd::Universe(args))) => {
-            if let Err(e) = setup::universe::run(args).await {
-                error!("setup universe failed: {e}");
+        Some(Command::Setup(SetupCmd::SyncBroker(args))) => {
+            if let Err(e) = setup::brokers::run(args).await {
+                error!("setup sync-broker failed: {e}");
                 std::process::exit(1);
             }
         }
-        Some(Command::Setup(SetupCmd::SyncBrokers(args))) => {
-            if let Err(e) = setup::brokers::run(args).await {
-                error!("setup sync-brokers failed: {e}");
+        Some(Command::Setup(SetupCmd::MapFeed(args))) => {
+            if let Err(e) = setup::feeds::run(args).await {
+                error!("setup map-feed failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -380,7 +373,7 @@ async fn serve() {
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
             if let Some(adapter) = state.registry().get_alpaca("PAPER") {
-                let health = state.stream_health().handle("ALPACA", "PAPER");
+                let health = state.stream_health().handle("ALPACA", "PAPER", stream_health::StreamKind::Execution);
                 tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
             }
         }
@@ -388,7 +381,7 @@ async fn serve() {
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_LIVE_API_KEY"), env::var("ALPACA_LIVE_API_SECRET")) {
         if !key.is_empty() && !secret.is_empty() {
             if let Some(adapter) = state.registry().get_alpaca("LIVE") {
-                let health = state.stream_health().handle("ALPACA", "LIVE");
+                let health = state.stream_health().handle("ALPACA", "LIVE", stream_health::StreamKind::Execution);
                 tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
             }
         }
@@ -396,7 +389,7 @@ async fn serve() {
 
     // Spawn the Binance user-data stream when configured.
     if let Some(adapter) = binance_paper {
-        let health = state.stream_health().handle("BINANCE", "PAPER");
+        let health = state.stream_health().handle("BINANCE", "PAPER", stream_health::StreamKind::Execution);
         tokio::spawn(binance_stream::run("PAPER", state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
     }
 
@@ -409,7 +402,7 @@ async fn serve() {
     if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
         let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
         marks_doorbells.push(opra_pos_tx);
-        let health = state.stream_health().handle("DATABENTO", "OPRA");
+        let health = state.stream_health().handle("DATABENTO", "OPRA", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             opra_stream::DatabentoOpraFeed,
             state.pool().clone(),
@@ -426,7 +419,7 @@ async fn serve() {
     {
         let (binance_pos_tx, binance_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
         marks_doorbells.push(binance_pos_tx);
-        let health = state.stream_health().handle("BINANCE", "SPOT");
+        let health = state.stream_health().handle("BINANCE", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             binance_feed::BinanceFeed,
             state.pool().clone(),
@@ -443,7 +436,7 @@ async fn serve() {
     {
         let (bybit_pos_tx, bybit_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
         marks_doorbells.push(bybit_pos_tx);
-        let health = state.stream_health().handle("BYBIT", "SPOT");
+        let health = state.stream_health().handle("BYBIT", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             bybit_feed::BybitFeed,
             state.pool().clone(),
@@ -541,14 +534,7 @@ async fn serve() {
                 .delete(admin::delete_risk_limit),
         )
         .route("/admin/instruments", get(admin::list_instruments))
-        .route("/admin/universes", get(admin::list_universes))
-        .route("/admin/underlyings", get(admin::list_underlyings))
-        .route(
-            "/admin/universes/:code/symbols",
-            get(admin::list_universe_symbols).put(admin::set_universe_symbols),
-        )
-        .route("/admin/universes/:code/estimate", get(admin::estimate_universe))
-        .route("/admin/universes/:code/seed", post(admin::seed_universe))
+        .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/recon/run", post(admin::run_recon))
         .route("/admin/recon/runs", get(admin::list_recon_runs))
         .route("/admin/recon/runs/:id/breaks", get(admin::list_recon_breaks))

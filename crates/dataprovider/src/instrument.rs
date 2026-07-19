@@ -1,5 +1,6 @@
-//! Provider-neutral instrument records produced by a [`crate::UniverseSource`]
-//! and mutated in place by [`crate::Enricher`]s.
+//! Provider-neutral instrument records, produced by a broker adapter's
+//! `InstrumentProvider` during broker-first seeding and mutated in place by
+//! [`crate::Enricher`]s before the catalog upsert persists them.
 
 use serde::{Deserialize, Serialize};
 
