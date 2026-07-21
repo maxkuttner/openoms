@@ -6,8 +6,8 @@ import type { FeedSummary } from "../api/types";
 
 // Market-data feeds — distinct from broker connections (execution). Shows live
 // feed stream health plus the configured ranked-failover policy and how many
-// instruments each feed currently prices. Feeds are seeded/mapped from the CLI
-// (`make map-feed FEED=…`), so this view is read-only.
+// instruments each feed currently prices. The policy is configuration and the
+// coverage count is derived from each feed's symbology, so this view is read-only.
 export function DataFeedsPage() {
   const { data, isLoading, error } = useQuery<FeedSummary[]>({
     queryKey: ["/admin/feeds"],
@@ -29,7 +29,7 @@ export function DataFeedsPage() {
         </Group>
         <Text size="sm" c="dimmed">
           Ranked market-data sources per instrument class; lower rank wins, higher ranks are
-          failover. Mapped via <code>make map-feed FEED=…</code>.
+          failover. Coverage is derived from each feed's own symbology — there is no mapping table.
         </Text>
         {error && <Text c="red">Failed to load feeds.</Text>}
         <Table striped highlightOnHover>

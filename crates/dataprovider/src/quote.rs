@@ -79,6 +79,35 @@ pub struct InstrumentFilter {
     pub venue: Option<&'static str>,
 }
 
+impl InstrumentFilter {
+    /// Append this filter to a `WHERE` clause already in progress, returning the
+    /// values to bind in the order they must be bound.
+    ///
+    /// Placeholders are numbered from `first_placeholder`, so a caller that already
+    /// binds parameters can append after them. Values are bound, never interpolated
+    /// — the column names are the only thing written into the SQL, and those are
+    /// `&'static str` chosen here rather than anything caller-supplied.
+    ///
+    /// Every condition is `AND`-ed, so the caller must supply a leading predicate
+    /// (`WHERE true`, or a real one) for the SQL to be well-formed.
+    pub fn push_conditions(&self, sql: &mut String, first_placeholder: usize) -> Vec<&'static str> {
+        use std::fmt::Write;
+
+        let mut binds = Vec::new();
+        for (column, value) in [
+            ("instrument_class", self.instrument_class),
+            ("asset_class", self.asset_class),
+            ("venue", self.venue),
+        ] {
+            if let Some(v) = value {
+                binds.push(v);
+                let _ = write!(sql, " AND {column} = ${}", first_placeholder + binds.len() - 1);
+            }
+        }
+        binds
+    }
+}
+
 /// How a feed names the instruments it prices.
 ///
 /// The counterpart to [`LiveQuoteFeed`]: that trait moves a vendor's *data*, this one
@@ -117,4 +146,43 @@ pub trait LiveQuoteFeed: DataProvider {
         add_rx: &mut mpsc::Receiver<SymbolAdds>,
         health: &dyn FeedHealth,
     ) -> Result<(), ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_filter_adds_nothing() {
+        let mut sql = String::from("WHERE true");
+        let binds = InstrumentFilter::default().push_conditions(&mut sql, 1);
+        assert_eq!(sql, "WHERE true");
+        assert!(binds.is_empty());
+    }
+
+    /// Placeholders must count only the conditions actually emitted, so a filter
+    /// that skips `asset_class` still numbers `venue` as `$2`, not `$3`.
+    #[test]
+    fn placeholders_are_contiguous_across_skipped_fields() {
+        let f = InstrumentFilter {
+            instrument_class: Some("OPTION"),
+            asset_class: None,
+            venue: Some("OPRA"),
+        };
+        let mut sql = String::from("WHERE true");
+        let binds = f.push_conditions(&mut sql, 1);
+        assert_eq!(sql, "WHERE true AND instrument_class = $1 AND venue = $2");
+        assert_eq!(binds, vec!["OPTION", "OPRA"]);
+    }
+
+    /// A caller that already bound `$1` appends starting at `$2`; bind order must
+    /// still match the returned vec.
+    #[test]
+    fn honours_a_placeholder_offset() {
+        let f = InstrumentFilter { instrument_class: Some("SPOT"), asset_class: Some("CRYPTO"), venue: None };
+        let mut sql = String::from("WHERE x = $1");
+        let binds = f.push_conditions(&mut sql, 2);
+        assert_eq!(sql, "WHERE x = $1 AND instrument_class = $2 AND asset_class = $3");
+        assert_eq!(binds, vec!["SPOT", "CRYPTO"]);
+    }
 }

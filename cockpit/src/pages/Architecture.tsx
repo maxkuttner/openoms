@@ -10,8 +10,7 @@ const OVERVIEW = `flowchart LR
   BNF["Binance<br/>spot book"]:::feed
   BYF["Bybit<br/>spot book"]:::feed
 
-  FS["FeedSymbology<br/>to_feed_symbol()"]:::feed
-  FI[("feed_instrument")]:::feed
+  FS["FeedSymbology<br/>candidates() + to_feed_symbol()"]:::feed
 
   INST[("instrument<br/><b>symbol @ venue</b>")]:::core
 
@@ -24,8 +23,7 @@ const OVERVIEW = `flowchart LR
   DBN --> FS
   BNF --> FS
   BYF --> FS
-  FS -- "map-feed" --> FI
-  FI -- "n:1" --> INST
+  FS -- "derived at startup<br/>(nothing stored)" --> INST
   INST -- "1:n" --> BI
   BI -- "sync-broker" --> IP
   IP --> ALP
@@ -40,7 +38,6 @@ const ER = `erDiagram
   CURRENCY ||--o{ INSTRUMENT : "quoted in"
   INSTRUMENT ||--o| INSTRUMENT_DERIVATIVE : "option legs"
   INSTRUMENT ||--o{ BROKER_INSTRUMENT : "tradable via"
-  INSTRUMENT ||--o{ FEED_INSTRUMENT : "priced by"
   BROKER_CONNECTION ||--o{ ACCOUNT : "routing target"
   INSTRUMENT {
     bigint id PK
@@ -66,12 +63,6 @@ const ER = `erDiagram
     bool   is_tradeable
     numeric min_quantity
   }
-  FEED_INSTRUMENT {
-    text   feed_code "DATABENTO|BINANCE|BYBIT"
-    text   feed_symbol
-    bigint instrument_id FK
-    bool   is_active
-  }
   VENUE { text code PK "XNAS, OPRA, BINANCE" }
   CURRENCY { text code PK "USD, USDT" }
   BROKER_CONNECTION {
@@ -82,16 +73,28 @@ const ER = `erDiagram
   ACCOUNT { text code PK }`;
 
 const SEED = `flowchart LR
-  ALP["Alpaca adapter"]:::exec
-  BIN["Binance adapter"]:::exec
-  INST[("instrument<br/>+ derivative")]:::core
-  BI[("broker_instrument")]:::exec
-  FI[("feed_instrument")]:::feed
-  ALP -- "sync-broker" --> INST
-  BIN -- "sync-broker" --> INST
-  ALP -- "sync-broker" --> BI
-  BIN -- "sync-broker" --> BI
-  INST -- "map-feed" --> FI
+  subgraph S0["Step 0 — make db-seed"]
+    direction TB
+    CUR[("currency")]:::ref
+    VEN[("venue")]:::ref
+  end
+
+  subgraph S1["Step 1 — make sync-broker"]
+    direction TB
+    INST[("instrument<br/>+ derivative")]:::core
+    BI[("broker_instrument")]:::exec
+  end
+
+  subgraph S2["At every startup — no seeding step"]
+    FI["each feed derives<br/>what it can price"]:::feed
+  end
+
+  CUR -- "FK" --> INST
+  VEN -- "FK" --> INST
+  INST --> BI
+  INST -- "read, never written" --> FI
+
+  classDef ref  fill:#eceff2,stroke:#6b7885,color:#1d262e;
   classDef core fill:#e7edf3,stroke:#3a4a5a,color:#16202b;
   classDef exec fill:#f7ecd6,stroke:#b4700e,color:#3a2a06;
   classDef feed fill:#dcf0f6,stroke:#0e7490,color:#05323d;`;
@@ -100,7 +103,7 @@ const RUNTIME = `flowchart TB
   subgraph PRICE["Pricing path (market data)"]
     direction LR
     LF["Live feeds<br/>Databento · Binance · Bybit"]:::feed
-    QF["subscribe held<br/>via feed_instrument"]:::feed
+    QF["subscribe held<br/>via FeedSymbology"]:::feed
     MR["mark_router<br/>ranked by provider_feed_policy"]:::feed
     MS[("MarkStore")]:::feed
     PL["positions · M2M P/L"]:::core
@@ -171,6 +174,44 @@ function Diagram({ chart }: { chart: string }) {
   );
 }
 
+// Genuinely ordered — each step reads what the previous one wrote, so the numbering
+// carries information rather than decorating.
+const STEPS = [
+  {
+    cmd: "make db-seed",
+    color: "#6b7885",
+    body: (
+      <>
+        Reference data: ISO 4217 <Code>currency</Code>, the ISO 10383 MIC <Code>venue</Code> registry,
+        plus crypto exchange venues (<Code>BINANCE</Code>, <Code>BYBIT</Code>) that have no MIC. Both
+        are foreign-key targets for <Code>instrument</Code>.
+      </>
+    ),
+  },
+  {
+    cmd: "make sync-broker BROKER=…",
+    color: "#b4700e",
+    body: (
+      <>
+        The broker's catalog becomes the instrument set. Writes <Code>instrument</Code> (+{" "}
+        <Code>instrument_derivative</Code>) and the <Code>broker_instrument</Code> routing handle in
+        one pass. Anything the broker doesn't list, we don't know about.
+      </>
+    ),
+  },
+  {
+    cmd: "(nothing — feeds derive)",
+    color: "#0e7490",
+    body: (
+      <>
+        There is no third step. At startup each feed reads the catalog step 2 built and works out what
+        it calls those instruments, in memory. Nothing is written, so nothing can go stale or be
+        forgotten after the next <Code>sync-broker</Code>.
+      </>
+    ),
+  },
+];
+
 const CARDS = [
   {
     tag: "Master",
@@ -198,12 +239,12 @@ const CARDS = [
   {
     tag: "Market data",
     color: "#0e7490",
-    title: "feed_instrument",
+    title: "FeedSymbology",
     body: (
       <>
-        Pricing mapping, 1:n. A feed's <Code>feed_symbol</Code> → instrument(s); one symbol can price
-        the pair on several venues. Built by <Code>map-feed</Code>, using each feed's own{" "}
-        <Code>FeedSymbology</Code>.
+        Pricing mapping, 1:n — and a pure function, not a table. <Code>candidates()</Code> picks the
+        catalog slice a feed covers, <Code>to_feed_symbol()</Code> renames it; one symbol can price the
+        pair on several venues. Evaluated at subscribe time.
       </>
     ),
   },
@@ -217,9 +258,9 @@ export function ArchitecturePage() {
           <Title order={2}>Instrument model</Title>
           <Text c="dimmed" mt={6} maw={680}>
             One canonical <b>instrument</b> catalog in the middle, two independent mappings off it: a
-            broker's tradable handle (<Code>broker_instrument</Code>) and a data feed's pricing symbol (
-            <Code>feed_instrument</Code>). Priceable and tradable are independent — each is just the
-            existence of a row.
+            broker's tradable handle (<Code>broker_instrument</Code>, a table) and a data feed's
+            pricing symbol (<Code>FeedSymbology</Code>, derived in code). Priceable and tradable are
+            independent.
           </Text>
         </div>
 
@@ -262,9 +303,9 @@ export function ArchitecturePage() {
             Tables &amp; relationships
           </Title>
           <Text c="dimmed" fz="sm" mb="sm" maw={680}>
-            Foreign keys shown. <Code>broker_instrument</Code> and <Code>feed_instrument</Code> each
-            reference the master instrument; neither references the other. Two soft links by code (no
-            FK): <Code>broker_code</Code> → <Code>broker_connection</Code>, and <Code>feed_code</Code>{" "}
+            Foreign keys shown. <Code>broker_instrument</Code> references the master instrument. There
+            is no feed table: the pricing mapping is derived in code. Two soft links by code (no FK):
+            <Code>broker_code</Code> → <Code>broker_connection</Code>, and <Code>feed_code</Code>{" "}
             is ranked for failover in <Code>provider_feed_policy</Code>.
           </Text>
           <Diagram chart={ER} />
@@ -272,14 +313,51 @@ export function ArchitecturePage() {
 
         <div>
           <Title order={4} mb={4}>
-            Seeding — where rows come from
+            Seeding — the order matters
           </Title>
           <Text c="dimmed" fz="sm" mb="sm" maw={680}>
-            Broker-first: <Code>sync-broker</Code> creates the master catalog + broker mapping;{" "}
-            <Code>map-feed</Code> then maps feeds onto it. <Code>make seed-live</Code> runs the whole
-            chain idempotently.
+            Two steps, and the order is a hard dependency rather than a convention. Each reads what the
+            one before it wrote, and nothing ever points backwards — a data feed never creates an
+            instrument, and an instrument never creates a venue. <Code>make seed-live</Code> runs the
+            chain idempotently. Feeds are not part of it: they derive their mapping at startup.
           </Text>
           <Diagram chart={SEED} />
+
+          <Stack gap="xs" mt="md">
+            {STEPS.map((s, i) => (
+              <Card key={s.cmd} withBorder padding="sm" radius="md">
+                <div style={{ display: "flex", gap: "0.9rem", alignItems: "baseline" }}>
+                  <Text
+                    fz={12}
+                    fw={700}
+                    style={{ fontFamily: "ui-monospace, monospace", color: s.color, minWidth: "1.2rem" }}
+                  >
+                    {i}
+                  </Text>
+                  <div>
+                    <Text fw={600} fz="sm" style={{ fontFamily: "ui-monospace, monospace" }}>
+                      {s.cmd}
+                    </Text>
+                    <Text fz="sm" c="dimmed" mt={2}>
+                      {s.body}
+                    </Text>
+                  </div>
+                </div>
+              </Card>
+            ))}
+          </Stack>
+
+          <Text fz="sm" c="dimmed" mt="md" maw={680} style={{ borderLeft: "2px solid #b4700e", paddingLeft: "0.9rem" }}>
+            <b>How this used to bite.</b> A missing <Code>venue</Code> or <Code>currency</Code> row
+            silently dropped every instrument referencing it, so a broker sync could
+            &ldquo;succeed&rdquo; with thousands of rows missing — <Code>sync-broker</Code> now exits
+            non-zero instead (pass <Code>--allow-skips</Code> to accept a partial catalog). And the
+            old <Code>map-feed</Code> step was not retroactive: instruments added by a later sync had
+            no feed mapping until someone re-ran it. Deriving the mapping removed that failure rather
+            than fixing it. What remains is checked at startup by <Code>preflight</Code>, which
+            refuses to boot on an empty catalog and names any held position it cannot price or
+            route.
+          </Text>
         </div>
 
         <div>
@@ -287,14 +365,15 @@ export function ArchitecturePage() {
             Runtime — the two paths
           </Title>
           <Text c="dimmed" fz="sm" mb="sm" maw={680}>
-            Pricing reads <Code>feed_instrument</Code>; order routing reads <Code>broker_instrument</Code>.
-            They never cross — a feed can price an instrument no broker trades, and vice versa.
+            Pricing derives its symbols through <Code>FeedSymbology</Code>; order routing reads{" "}
+            <Code>broker_instrument</Code>. They never cross — a feed can price an instrument no
+            broker trades, and vice versa.
           </Text>
           <Diagram chart={RUNTIME} />
         </div>
 
         <Text fz="xs" c="dimmed">
-          Reflects migrations 0016–0019 and the <Code>sync-broker</Code> / <Code>map-feed</Code> flow.
+          Reflects migrations 0016–0020 and the <Code>sync-broker</Code> flow.
           See also{" "}
           <Anchor href="/api-docs" fz="xs">
             API docs

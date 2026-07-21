@@ -58,6 +58,8 @@ mod quote_feed;
 mod mark_router;
 mod binance_feed;
 mod bybit_feed;
+mod feeds;
+mod preflight;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -172,8 +174,6 @@ enum Command {
 enum SetupCmd {
     /// Seed the master instrument catalog + broker_instrument mapping from a broker.
     SyncBroker(setup::brokers::Args),
-    /// Map a data feed's symbols onto seeded instruments (feed_instrument rows).
-    MapFeed(setup::feeds::Args),
 }
 
 #[tokio::main]
@@ -186,12 +186,6 @@ async fn main() {
         Some(Command::Setup(SetupCmd::SyncBroker(args))) => {
             if let Err(e) = setup::brokers::run(args).await {
                 error!("setup sync-broker failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Command::Setup(SetupCmd::MapFeed(args))) => {
-            if let Err(e) = setup::feeds::run(args).await {
-                error!("setup map-feed failed: {e}");
                 std::process::exit(1);
             }
         }
@@ -213,7 +207,7 @@ async fn serve() {
         db_user, db_password, db_host, db_port, db_name
     );
 
-    info!("Connecting to the database at {}", database_url);
+    info!("Connecting to the database at {}:{}/{} as {}", db_host, db_port, db_name, db_user);
     let pool = match PgPool::connect(&database_url).await {
         Ok(pool) => pool,
         Err(e) => {
@@ -222,7 +216,13 @@ async fn serve() {
         }
     };
 
-    // Schema is owned and migrated by the `mdm` repo; OMS only connects.
+    // Refuse to start on a catalog that cannot work, and name what is merely
+    // degraded. Before any feed spawns, so a broken catalog surfaces here rather
+    // than as a feed that quietly subscribes to nothing.
+    if let Err(e) = preflight::run(&pool).await {
+        error!("preflight failed: {e}");
+        return;
+    }
 
     // Init kafka client from .env (optional — publishing is disabled if not configured)
     let kafka_client: Option<kafka::KafkaClient> = match kafka::KafkaConfig::from_env() {

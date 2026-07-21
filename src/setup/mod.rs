@@ -2,7 +2,6 @@
 
 pub mod brokers;
 pub mod catalog;
-pub mod feeds;
 
 use std::env;
 

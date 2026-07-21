@@ -3,7 +3,7 @@
 //! `public.instrument`.
 //!
 //! This is enrichment, not mapping. The two mapping tables are owned elsewhere —
-//! `broker_instrument` by broker sync, `feed_instrument` by feed mapping. The
+//! `broker_instrument` by broker sync; feed symbology is derived, not stored. The
 //! resolver only answers "which master instrument is this, and what is its FIGI",
 //! and records the FIGI anchor so later lookups are cheap. Off the order/quote hot
 //! path.

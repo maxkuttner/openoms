@@ -1,0 +1,26 @@
+-- Drop feed_instrument: it was a persisted cache of a pure function.
+--
+-- 0017 created it to hold "which feed prices this instrument, and what does that
+-- feed call it". Both halves are now answered by the feed itself — `candidates()`
+-- selects the catalog slice, `to_feed_symbol()` renames it — and both are pure
+-- Rust with no I/O (see `crates/dataprovider/src/quote.rs`). The table's contents
+-- were therefore fully determined by `instrument` plus those two functions.
+--
+-- A cache of a pure function can only add failure modes, and it added two:
+--
+--   * stale rows — a delisted instrument's mapping stayed forever, nothing
+--     deactivated it;
+--   * not retroactive — instruments seeded by a later `sync-broker` had no
+--     mapping until someone remembered to re-run `map-feed`, and the symptom was
+--     silence: no error, no prices.
+--
+-- Deriving the mapping at subscribe time removes both states rather than managing
+-- them, and removes the ordering rule (`sync-broker` *then* `map-feed`) that made
+-- them possible. `oms setup map-feed` is gone with it.
+--
+-- Irreversible in the sense that the rows are not recoverable, but nothing is
+-- lost: re-deriving from the catalog reproduces them exactly. This was verified
+-- against the live catalog before the drop — the derived subscription set matched
+-- the stored one for all three feeds.
+
+DROP TABLE IF EXISTS feed_instrument;

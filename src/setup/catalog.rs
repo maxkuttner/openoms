@@ -6,7 +6,8 @@
 //! `InstrumentProvider` yields the definitions, this module writes the master rows
 //! and hands back the `(symbol, venue) -> id` map so the caller can attach the
 //! `broker_instrument` mapping. It does not touch any symbology bridge table —
-//! broker mapping lives in `broker_instrument`, feed mapping in `feed_instrument`.
+//! broker mapping lives in `broker_instrument`; feed mapping is derived at runtime
+//! from each feed's own symbology, not stored.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 

@@ -43,7 +43,7 @@ psql_db "$ODS_DB" -f scripts/seed_crypto_venues.sql
 
 # Instruments are seeded on demand, broker-first (not here, not scheduled):
 # `make sync-broker BROKER=alpaca` creates the master instrument + broker_instrument
-# rows, then `make map-feed FEED=databento` maps a data feed onto them. Or
+# rows; data feeds then derive what they can price from the catalog. Or
 # `make db-fixtures` for the no-creds minimal set. All depend on currency + venue.
 
 echo "post-deployment seeding complete."

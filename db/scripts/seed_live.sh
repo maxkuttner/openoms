@@ -51,15 +51,7 @@ else
   echo "· skip binance sync-broker (BINANCE_${binance_env}_API_KEY/PRIVATE_KEY_PATH not set)"
 fi
 
-# --- Feeds: map onto the seeded instruments (no external creds needed). ---
-# Databento only prices options that were seeded above; skip if no key was ever
-# configured (the feed itself won't run without it either).
-if have DATABENTO_API_KEY; then
-  run map-feed --feed databento
-else
-  echo "· skip databento map-feed (DATABENTO_API_KEY not set)"
-fi
-run map-feed --feed binance
-run map-feed --feed bybit
+# Feeds need no seeding step: each feed derives the instruments it can price from
+# the catalog above, at startup, from its own symbology. Nothing to run here.
 
 echo "✅ live seeding complete."
