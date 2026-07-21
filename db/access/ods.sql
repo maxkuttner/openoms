@@ -12,12 +12,12 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO oms_user;
 -- Instrument seeding + symbology: the OMS app seeds the master instrument catalog
 -- itself, broker-first. Broker sync (`oms setup sync-broker`) creates the master
 -- public.instrument (+ instrument_derivative) rows and the broker_instrument mapping
--- in one pass; feed mapping (`oms setup map-feed`) writes feed_instrument; the
+-- in one pass. Feed mapping is derived at runtime, not stored; the
 -- resolver stamps FIGI/CUSIP anchors from OpenFIGI. So oms_user needs write on the
 -- master catalog and both mapping tables. (SELECT on the FK targets venue/currency
 -- is covered by the blanket public SELECT above.)
 GRANT INSERT, UPDATE ON public.instrument, public.instrument_derivative TO oms_user;
-GRANT INSERT, UPDATE, DELETE ON public.broker_instrument, public.feed_instrument TO oms_user;
+GRANT INSERT, UPDATE, DELETE ON public.broker_instrument TO oms_user;
 
 -- Every future master table mdm_master creates is readable by oms_user.
 ALTER DEFAULT PRIVILEGES FOR ROLE mdm_master IN SCHEMA public

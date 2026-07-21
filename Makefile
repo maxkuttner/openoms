@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset sync-broker map-feed seed-live
+.PHONY: help db-provision db-migrate db-access db-seed db-fixtures db-setup db-reset sync-broker seed-live
 
 # Load .env into the recipe shell (one shell per recipe line, so chain with &&).
 ENV := set -a && . ./.env && set +a
@@ -45,8 +45,6 @@ sync-broker: ## Seed instruments + broker mapping from a broker (BROKER=alpaca|b
 	@$(ENV) && cargo run --quiet -- setup sync-broker \
 		--broker "$${BROKER:-alpaca}" $${UNDERLYINGS:+--underlyings $$UNDERLYINGS} $${DRY_RUN:+--dry-run} $$ARGS
 
-map-feed: ## Map a data feed's symbols onto seeded instruments (FEED=databento|binance|bybit; DRY_RUN=1)
-	@$(ENV) && cargo run --quiet -- setup map-feed --feed "$${FEED:?set FEED=databento|binance|bybit}" $${DRY_RUN:+--dry-run} $$ARGS
 
 seed-live: ## Sync every configured broker + map every feed in one idempotent pass (OPTION_UNDERLYINGS=SPY,QQQ)
 	@./db/scripts/seed_live.sh

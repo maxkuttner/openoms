@@ -575,7 +575,8 @@ pub struct FeedSummary {
     /// Ranked failover preference within the class; lower wins.
     pub rank: i32,
     pub enabled: bool,
-    /// How many instruments this feed currently maps (feed_instrument), for the class.
+    /// How many active instruments this feed's symbology covers, for the class.
+    /// Derived from the feed's own `candidates()` filter at request time.
     pub mapped_instruments: i64,
 }
 
@@ -589,20 +590,51 @@ pub struct FeedSummary {
 pub async fn list_feeds(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<FeedSummary>>, AdminError> {
-    let rows = sqlx::query_as::<_, FeedSummary>(
-        "SELECT p.source_code AS feed_code, p.instrument_class, p.rank, p.enabled, \
-                count(i.id) AS mapped_instruments \
-         FROM oms.provider_feed_policy p \
-         LEFT JOIN feed_instrument fi ON fi.feed_code = p.source_code AND fi.is_active \
-         LEFT JOIN instrument i ON i.id = fi.instrument_id \
-              AND i.instrument_class = p.instrument_class \
-         GROUP BY p.source_code, p.instrument_class, p.rank, p.enabled \
-         ORDER BY p.source_code, p.rank",
+    let policies = sqlx::query_as::<_, (String, String, i32, bool)>(
+        "SELECT source_code, instrument_class, rank, enabled \
+         FROM oms.provider_feed_policy \
+         ORDER BY source_code, rank",
     )
     .fetch_all(state.pool())
     .await
     .map_err(map_db_error)?;
+
+    // `mapped_instruments` is derived, not stored: count the catalog slice this
+    // feed's symbology covers, narrowed to the policy row's instrument_class. A
+    // policy naming a feed this build doesn't ship counts zero rather than 404ing —
+    // the row is still real and the operator should see it.
+    let mut rows = Vec::with_capacity(policies.len());
+    for (feed_code, instrument_class, rank, enabled) in policies {
+        let mapped_instruments = match crate::feeds::by_code(&feed_code) {
+            Some(feed) => count_priceable(state.pool(), feed, &instrument_class)
+                .await
+                .map_err(map_db_error)?,
+            None => 0,
+        };
+        rows.push(FeedSummary { feed_code, instrument_class, rank, enabled, mapped_instruments });
+    }
     Ok(Json(rows))
+}
+
+/// How many active instruments of `instrument_class` this feed's symbology covers.
+///
+/// Counts what `candidates()` selects; it does not run `to_feed_symbol` over the
+/// catalog, so an instrument the feed would decline is still counted. That keeps
+/// this a single `COUNT` rather than a full scan into Rust, and the two only differ
+/// for malformed symbols — which `preflight` reports separately.
+async fn count_priceable(
+    pool: &sqlx::PgPool,
+    feed: &dyn dataprovider::FeedSymbology,
+    instrument_class: &str,
+) -> Result<i64, sqlx::Error> {
+    let mut sql = String::from("SELECT count(*) FROM instrument WHERE status = 'ACTIVE' AND instrument_class = $1");
+    let binds = feed.candidates().push_conditions(&mut sql, 2);
+
+    let mut query = sqlx::query_scalar::<_, i64>(&sql).bind(instrument_class);
+    for b in &binds {
+        query = query.bind(*b);
+    }
+    query.fetch_one(pool).await
 }
 
 #[utoipa::path(

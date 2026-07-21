@@ -53,6 +53,11 @@ pub struct Args {
     /// Fetch + match + print counts, but write nothing.
     #[arg(long)]
     pub dry_run: bool,
+    /// Exit 0 even when instruments were skipped on a missing venue/currency.
+    /// Without this, any FK skip fails the run: a partial catalog that reports
+    /// success is how a seeding gap survives to become a missing price.
+    #[arg(long)]
+    pub allow_skips: bool,
 }
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -119,6 +124,18 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
     tx.commit().await?;
     info!("sync-broker done: upserted {n} {broker_code} broker_instrument row(s)");
+
+    // Loud by default. `upsert_catalog` already named the offending venues and
+    // currencies; make them consequential so a half-seeded catalog cannot pass for
+    // a finished one in a script or CI step.
+    let skipped = summary.skipped_fk();
+    if skipped > 0 && !args.allow_skips {
+        return Err(format!(
+            "{skipped} instrument(s) skipped on a missing venue/currency — see the warnings above. \
+             Seed the missing rows, or pass --allow-skips to accept a partial catalog."
+        )
+        .into());
+    }
     Ok(())
 }
 

@@ -6,8 +6,8 @@ import { api } from "../api/client";
 import type { InstrumentSummary } from "../api/types";
 
 // Read-only browser over the seeded master catalog. Instruments are seeded
-// broker-first (`oms setup sync-broker`) and priced via feed mapping
-// (`oms setup map-feed`) — there is no in-UI seeding flow. Server-side search
+// broker-first (`oms setup sync-broker`); pricing coverage is derived per feed at
+// startup, not seeded — there is no in-UI seeding flow. Server-side search
 // (debounced) against /admin/instruments.
 export function InstrumentsPage() {
   const [search, setSearch] = useState("");
@@ -27,8 +27,8 @@ export function InstrumentsPage() {
         {isLoading && <Loader size="sm" />}
       </Group>
       <Text size="sm" c="dimmed" mb="md">
-        Seeded from a broker's catalog (<code>make sync-broker BROKER=alpaca</code>) and priced via
-        a data feed (<code>make map-feed FEED=databento</code>).
+        Seeded from a broker's catalog (<code>make sync-broker BROKER=alpaca</code>). Which of these
+        a data feed can price is derived from the feed's own symbology at startup.
       </Text>
       <TextInput
         placeholder="Search symbol or name…"

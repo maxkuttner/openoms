@@ -10,8 +10,8 @@
 
 use std::collections::HashMap;
 
-use dataprovider::{LiveQuoteFeed, Quote, SymbolAdds};
-use sqlx::{PgPool, Row};
+use dataprovider::{FeedSymbology, LiveQuoteFeed, Quote, SymbolAdds};
+use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tracing::info;
@@ -23,7 +23,7 @@ use crate::stream_supervisor::{Session, StreamResult};
 /// the query, so this is just the poll interval for "did we buy anything yet".
 const IDLE_RECHECK_SECS: u64 = 60;
 
-pub struct QuoteFeedSession<F: LiveQuoteFeed> {
+pub struct QuoteFeedSession<F: LiveQuoteFeed + FeedSymbology> {
     feed: F,
     pool: PgPool,
     out: mpsc::Sender<Quote>,
@@ -31,7 +31,7 @@ pub struct QuoteFeedSession<F: LiveQuoteFeed> {
     health: StreamHandle,
 }
 
-impl<F: LiveQuoteFeed> QuoteFeedSession<F> {
+impl<F: LiveQuoteFeed + FeedSymbology> QuoteFeedSession<F> {
     pub fn new(
         feed: F,
         pool: PgPool,
@@ -51,7 +51,7 @@ impl<F: LiveQuoteFeed> QuoteFeedSession<F> {
     /// with a timer as the backstop for positions this process didn't see.
     async fn wait_for_subscribable(&mut self) -> Result<HashMap<String, i64>, sqlx::Error> {
         loop {
-            let held = load_subscribable(&self.pool, self.feed.code()).await?;
+            let held = load_subscribable(&self.pool, &self.feed).await?;
             if !held.is_empty() {
                 return Ok(held);
             }
@@ -64,7 +64,7 @@ impl<F: LiveQuoteFeed> QuoteFeedSession<F> {
 }
 
 #[async_trait::async_trait]
-impl<F: LiveQuoteFeed> Session for QuoteFeedSession<F> {
+impl<F: LiveQuoteFeed + FeedSymbology> Session for QuoteFeedSession<F> {
     async fn run_once(&mut self) -> StreamResult {
         let known = self.wait_for_subscribable().await?;
         info!(source = self.feed.code(), count = known.len(), "quote feed: subscribing held set");
@@ -75,7 +75,7 @@ impl<F: LiveQuoteFeed> Session for QuoteFeedSession<F> {
         // them lets a fill be picked up without waiting for a reconnect.
         tokio::select! {
             r = self.feed.run_session(known.clone(), &self.out, &mut add_rx, &self.health) => r.map_err(Into::into),
-            r = watch_held(&self.pool, self.feed.code(), &mut self.position_changed_rx, &add_tx, known) => r,
+            r = watch_held(&self.pool, &self.feed, &mut self.position_changed_rx, &add_tx, known) => r,
         }
     }
 }
@@ -86,7 +86,7 @@ impl<F: LiveQuoteFeed> Session for QuoteFeedSession<F> {
 /// carries no data cannot carry stale data.
 async fn watch_held(
     pool: &PgPool,
-    source_code: &'static str,
+    feed: &dyn FeedSymbology,
     doorbell: &mut mpsc::Receiver<()>,
     add_tx: &mpsc::Sender<SymbolAdds>,
     mut known: HashMap<String, i64>,
@@ -94,7 +94,7 @@ async fn watch_held(
     loop {
         match doorbell.recv().await {
             Some(()) => {
-                let latest = load_subscribable(pool, source_code).await?;
+                let latest = load_subscribable(pool, feed).await?;
                 let adds: SymbolAdds = latest
                     .into_iter()
                     .filter(|(sym, _)| !known.contains_key(sym))
@@ -103,7 +103,7 @@ async fn watch_held(
                     continue;
                 }
                 info!(
-                    source = source_code,
+                    source = feed.code(),
                     count = adds.len(),
                     "quote feed: subscribing newly-held instruments"
                 );
@@ -124,34 +124,42 @@ async fn watch_held(
 
 /// The held instruments this feed can price, as `feed_symbol -> instrument_id`.
 ///
-/// Driven by `feed_instrument`: the feed's *own* symbol drives the subscription,
-/// and the mapping is the single source of what this feed covers. An instrument
-/// with no `feed_instrument` row for this feed is silently absent — that is the
-/// "held but this feed can't price it" state, not an error; another feed may.
+/// Derived, not stored. The feed declares the slice of the catalog it covers
+/// ([`FeedSymbology::candidates`]) and how it names it
+/// ([`FeedSymbology::to_feed_symbol`]); both are pure, so the mapping is a function
+/// of the catalog and cannot go stale or miss instruments seeded later. A held
+/// instrument outside `candidates`, or one `to_feed_symbol` declines, is silently
+/// absent — that is the "held but this feed can't price it" state, not an error;
+/// another feed may. [`crate::preflight`] is what makes it visible.
 ///
-/// `feed_instrument` is 1:n (one feed symbol may price instruments on several
-/// venues), so a `feed_symbol` collision keeps the last instrument id. In practice
-/// held sets don't collide today (one venue per crypto pair); true fan-out to
-/// multiple held instruments from one quote is a later change in the mark path.
-async fn load_subscribable(
+/// The mapping is 1:n (one feed symbol may price instruments on several venues), so
+/// a `feed_symbol` collision keeps the last instrument id. In practice held sets
+/// don't collide today (one venue per crypto pair); true fan-out to multiple held
+/// instruments from one quote is a later change in the mark path.
+pub(crate) async fn load_subscribable(
     pool: &PgPool,
-    feed_code: &str,
+    feed: &dyn FeedSymbology,
 ) -> Result<HashMap<String, i64>, sqlx::Error> {
-    let rows = sqlx::query(
-        // position.instrument_id is text holding the numeric instrument.id.
-        "SELECT DISTINCT fi.feed_symbol, i.id \
+    // Held only: this is the subscription set, not the catalog. Push the feed's
+    // filter down rather than scanning every instrument.
+    // position.instrument_id is text holding the numeric instrument.id.
+    let mut sql = String::from(
+        "SELECT DISTINCT i.id, i.symbol \
          FROM position p \
          JOIN instrument i ON i.id::text = p.instrument_id \
-         JOIN feed_instrument fi ON fi.instrument_id = i.id \
-              AND fi.feed_code = $1 AND fi.is_active \
-         WHERE p.net_qty <> 0",
-    )
-    .bind(feed_code)
-    .fetch_all(pool)
-    .await?;
+         WHERE p.net_qty <> 0 AND i.status = 'ACTIVE'",
+    );
+    let binds = feed.candidates().push_conditions(&mut sql, 1);
 
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<String, _>("feed_symbol"), r.get::<i64, _>("id")))
+    let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
+    for b in &binds {
+        query = query.bind(*b);
+    }
+
+    Ok(query
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .filter_map(|(id, symbol)| feed.to_feed_symbol(&symbol).map(|s| (s, id)))
         .collect())
 }
