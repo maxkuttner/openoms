@@ -318,8 +318,11 @@ export function ArchitecturePage() {
           <Text c="dimmed" fz="sm" mb="sm" maw={680}>
             Two steps, and the order is a hard dependency rather than a convention. Each reads what the
             one before it wrote, and nothing ever points backwards — a data feed never creates an
-            instrument, and an instrument never creates a venue. <Code>make seed-live</Code> runs the
-            chain idempotently. Feeds are not part of it: they derive their mapping at startup.
+            instrument, and an instrument never creates a venue. Feeds are not part of it: they derive
+            their mapping at startup. You rarely run these by hand: the app self-provisions on boot
+            (roles, schema, ref-data via the admin role) and background-syncs instruments when the
+            catalog is empty — the make targets are the manual equivalent, kept as an escape hatch
+            (<Code>OMS_BOOTSTRAP=off</Code>).
           </Text>
           <Diagram chart={SEED} />
 

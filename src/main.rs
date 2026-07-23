@@ -196,6 +196,15 @@ async fn main() {
 // Server entry point (default when no subcommand is given).
 async fn serve() {
 
+    // Self-provision before the runtime pool connects: create roles/db, apply
+    // migrations, seed reference data — all idempotent, all as the admin role. Skips
+    // itself when OMS_BOOTSTRAP=off or no admin creds are present. This is what makes
+    // a fresh checkout `run the app` with no ordered setup commands.
+    if let Err(e) = setup::bootstrap::ensure_ready().await {
+        error!("{e}");
+        return;
+    }
+
     // parse db config or panic
     let db_user = env::var("DB_USER").expect("DB_USER must be set");
     let db_host = env::var("DB_HOST").expect("DB_HOST must be set");
@@ -216,10 +225,22 @@ async fn serve() {
         }
     };
 
+    // On a no-creds fresh install, drop in the SPY fixture so there is one tradeable
+    // instrument even when no broker will populate the catalog. Best-effort.
+    setup::bootstrap::ensure_fixture_if_no_brokers(&pool).await;
+
+    // Routing config for every credentialed broker — without a broker_connection a
+    // configured broker still cannot take an order. Then the optional dev identity
+    // chain (OMS_DEV_IDENTITY), so a fresh install can trade immediately.
+    setup::bootstrap::ensure_broker_connections(&pool).await;
+    setup::bootstrap::ensure_dev_identity(&pool).await;
+
     // Refuse to start on a catalog that cannot work, and name what is merely
     // degraded. Before any feed spawns, so a broken catalog surfaces here rather
-    // than as a feed that quietly subscribes to nothing.
-    if let Err(e) = preflight::run(&pool).await {
+    // than as a feed that quietly subscribes to nothing. An empty catalog is not
+    // fatal when a background sync is about to fill it.
+    let auto_sync_pending = setup::bootstrap::will_sync_on_boot(&pool).await;
+    if let Err(e) = preflight::run(&pool, auto_sync_pending).await {
         error!("preflight failed: {e}");
         return;
     }
@@ -456,6 +477,13 @@ async fn serve() {
             }
         }
     });
+
+    // Populate an empty catalog from brokers in the background, so the minutes-long
+    // option-chain fetch never delays the server binding below. `auto_sync_pending`
+    // was computed above (catalog empty + a broker has creds).
+    if auto_sync_pending {
+        setup::bootstrap::spawn_sync();
+    }
 
     // Register routes
 

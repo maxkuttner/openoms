@@ -30,12 +30,58 @@ pub enum Broker {
 }
 
 impl Broker {
-    fn code(self) -> &'static str {
+    /// Every broker the app can sync — the set boot-time auto-sync iterates.
+    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance];
+
+    pub fn code(self) -> &'static str {
         match self {
             Broker::Alpaca => "ALPACA",
             Broker::Binance => "BINANCE",
         }
     }
+
+    /// The configured environment for this broker (`PAPER` | `LIVE`), from
+    /// `{BROKER}_ENV`, defaulting to `PAPER`. Together with [`code`](Self::code) this
+    /// is the `(broker_code, environment)` pair a `broker_connection` routes on.
+    pub fn environment(self) -> String {
+        match self {
+            Broker::Alpaca => alpaca_env(),
+            Broker::Binance => binance_env(),
+        }
+    }
+
+    /// The conventional `broker_connection.code` for this broker+env, e.g.
+    /// `alpaca-paper`. Matches the code the dev-identity fixture references.
+    pub fn connection_code(self) -> String {
+        format!("{}-{}", self.code().to_lowercase(), self.environment().to_lowercase())
+    }
+
+    /// Whether this broker's credentials are present in the environment.
+    ///
+    /// The single source of truth for "can we sync this broker": the same env vars
+    /// `build_alpaca`/`build_binance` require, so cred *detection* (boot-time
+    /// auto-sync) and cred *use* (constructing the adapter) can never disagree.
+    pub fn has_creds(self) -> bool {
+        let set = |k: &str| env::var(k).is_ok_and(|v| !v.is_empty());
+        match self {
+            Broker::Alpaca => {
+                let e = alpaca_env();
+                set(&format!("ALPACA_{e}_API_KEY")) && set(&format!("ALPACA_{e}_API_SECRET"))
+            }
+            Broker::Binance => {
+                let e = binance_env();
+                set(&format!("BINANCE_{e}_API_KEY")) && set(&format!("BINANCE_{e}_PRIVATE_KEY_PATH"))
+            }
+        }
+    }
+}
+
+fn alpaca_env() -> String {
+    env::var("ALPACA_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
+}
+
+fn binance_env() -> String {
+    env::var("BINANCE_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -141,7 +187,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Build an `AlpacaAdapter` standalone from env (`ALPACA_ENV` + `ALPACA_{ENV}_API_KEY/SECRET`).
 fn build_alpaca() -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
-    let env_name = env::var("ALPACA_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase();
+    let env_name = alpaca_env();
     let key = env::var(format!("ALPACA_{env_name}_API_KEY"))
         .map_err(|_| format!("ALPACA_{env_name}_API_KEY must be set"))?;
     let secret = env::var(format!("ALPACA_{env_name}_API_SECRET"))
@@ -153,7 +199,7 @@ fn build_alpaca() -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
 /// public, but the adapter constructor needs a valid key pair; reuse the server
 /// wiring (`BINANCE_{ENV}_API_KEY` + `BINANCE_{ENV}_PRIVATE_KEY_PATH`).
 fn build_binance() -> Result<BinanceAdapter, Box<dyn std::error::Error>> {
-    let env_name = env::var("BINANCE_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase();
+    let env_name = binance_env();
     let key = env::var(format!("BINANCE_{env_name}_API_KEY"))
         .map_err(|_| format!("BINANCE_{env_name}_API_KEY must be set"))?;
     let pem_path = env::var(format!("BINANCE_{env_name}_PRIVATE_KEY_PATH"))

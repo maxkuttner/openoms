@@ -32,22 +32,27 @@ impl std::fmt::Display for Fatal {
 }
 
 /// Run every check. `Err` means do not start.
-pub async fn run(pool: &PgPool) -> Result<(), Fatal> {
-    check_catalog(pool).await?;
+///
+/// `auto_sync_pending` is true when a background broker sync is about to populate an
+/// empty catalog (see `setup::bootstrap`); it downgrades an empty `instrument` table
+/// from fatal to expected.
+pub async fn run(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fatal> {
+    check_catalog(pool, auto_sync_pending).await?;
     report_held(pool).await;
     Ok(())
 }
 
 /// Fatal checks: the master catalog and the FK targets it depends on.
 ///
-/// An empty `venue` or `currency` table is the signature of a half-run `make
-/// db-seed`; every subsequent `sync-broker` would skip every instrument on an FK
-/// miss and report success over an empty catalog.
-async fn check_catalog(pool: &PgPool) -> Result<(), Fatal> {
+/// An empty `venue` or `currency` table is the signature of a DB that never got
+/// seeded; with bootstrap on these are seeded before we ever get here, so a failure
+/// now means `OMS_BOOTSTRAP=off` over an unprepared DB. An empty `instrument` is only
+/// fatal when nothing is about to fill it — a pending background sync makes it
+/// expected, not broken.
+async fn check_catalog(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fatal> {
     for (table, hint) in [
-        ("venue", "run `make db-seed`"),
-        ("currency", "run `make db-seed`"),
-        ("instrument", "run `make sync-broker BROKER=alpaca`"),
+        ("venue", "run `make db-seed` (or enable bootstrap)"),
+        ("currency", "run `make db-seed` (or enable bootstrap)"),
     ] {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(pool)
@@ -55,6 +60,22 @@ async fn check_catalog(pool: &PgPool) -> Result<(), Fatal> {
             .map_err(|e| Fatal(format!("preflight: reading {table} failed: {e}")))?;
         if n == 0 {
             return Err(Fatal(format!("{table} is empty — {hint}")));
+        }
+    }
+
+    let instruments: i64 = sqlx::query_scalar("SELECT count(*) FROM instrument")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| Fatal(format!("preflight: reading instrument failed: {e}")))?;
+    if instruments == 0 {
+        if auto_sync_pending {
+            info!("preflight: catalog empty — a background broker sync will populate it");
+        } else {
+            return Err(Fatal(
+                "instrument is empty — set broker creds (auto-sync), run \
+                 `make sync-broker BROKER=alpaca`, or `make db-fixtures` for the SPY-only set"
+                    .to_string(),
+            ));
         }
     }
     Ok(())

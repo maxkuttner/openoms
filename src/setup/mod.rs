@@ -1,5 +1,6 @@
 //! Setup / seeding subcommands invoked via `oms setup …`.
 
+pub mod bootstrap;
 pub mod brokers;
 pub mod catalog;
 
