@@ -13,9 +13,9 @@ mod symbology_resolver;
 mod setup;
 
 use crate::adapters::BrokerRegistry;
+use crate::adapters::Transport;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
-use crate::adapters::ibkr::IbkrAdapter;
 use crate::app_state::AppState;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit, BlotterRow};
@@ -60,6 +60,7 @@ mod binance_feed;
 mod bybit_feed;
 mod feeds;
 mod preflight;
+mod fix;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -271,6 +272,20 @@ async fn serve() {
             })
     };
 
+    // Stream health + the fill→marks doorbell are created here (before the broker
+    // registry) because FIX sessions register their adapter *and* start their
+    // session in one step, so they need both up front. The same StreamHealthRegistry
+    // is handed to AppState so REST/WS streams spawned later share it.
+    let stream_health = stream_health::StreamHealthRegistry::new();
+
+    // Doorbell from the fill path to the marks feeds: a fill moved a position, so
+    // re-read the held set. bounded(1) — a queued signal already means "reload",
+    // so extras are redundant and try_send never blocks the fill path. A fan-out
+    // task (spawned below, once every feed has registered) relays to each feed's
+    // own doorbell, so execution.rs need not know how many feeds exist.
+    let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let mut marks_doorbells: Vec<tokio::sync::mpsc::Sender<()>> = Vec::new();
+
     // Build broker registry — adapters are registered only when credentials are present.
     // Env vars follow the pattern {BROKER}_{ENVIRONMENT}_{KEY}.
     let mut registry = BrokerRegistry::new();
@@ -299,55 +314,68 @@ async fn serve() {
         _ => info!("ALPACA_LIVE_API_KEY / ALPACA_LIVE_API_SECRET not set — ALPACA/LIVE adapter not registered"),
     }
 
-    if let Ok(base_url) = env::var("IBKR_PAPER_BASE_URL") {
-        if !base_url.is_empty() {
-            use std::sync::Arc;
-            registry.register("IBKR", "PAPER", Arc::new(IbkrAdapter::new(base_url, "PAPER")));
-            info!("registered IBKR/PAPER adapter (stub)");
+    // IBKR over FIX (4.2). One session per configured environment; the FIX session
+    // both routes orders and delivers execution reports. Gated on IBKR_{ENV}_FIX_HOST.
+    for env_name in ["PAPER", "LIVE"] {
+        if let Some(adapter) = fix::start_ibkr(
+            env_name,
+            &stream_health,
+            pool.clone(),
+            kafka_client.clone(),
+            Some(position_changed_tx.clone()),
+        ) {
+            registry.register("IBKR", env_name, adapter);
         }
     }
 
-    if let Ok(base_url) = env::var("IBKR_LIVE_BASE_URL") {
-        if !base_url.is_empty() {
-            use std::sync::Arc;
-            registry.register("IBKR", "LIVE", Arc::new(IbkrAdapter::new(base_url, "LIVE")));
-            info!("registered IBKR/LIVE adapter (stub)");
-        }
-    }
-
-    // Binance Spot Testnet → BINANCE/PAPER. Ed25519 key: an API key id plus the
-    // path to its PKCS#8 PEM private key (required for the WS-API user-data stream,
-    // and used for REST signing too). Keep the concrete Arc for the stream.
-    let binance_paper: Option<std::sync::Arc<BinanceAdapter>> = match (
-        env::var("BINANCE_PAPER_API_KEY"),
-        env::var("BINANCE_PAPER_PRIVATE_KEY_PATH"),
-    ) {
-        (Ok(key), Ok(path)) if !key.is_empty() && !path.is_empty() => {
-            use std::sync::Arc;
-            match std::fs::read_to_string(&path) {
-                Ok(pem) => match BinanceAdapter::new(key, &pem, "PAPER") {
-                    Ok(adapter) => {
-                        let adapter = Arc::new(adapter);
-                        registry.register("BINANCE", "PAPER", adapter.clone());
-                        info!("registered BINANCE/PAPER adapter");
-                        Some(adapter)
+    // Binance Spot → BINANCE/PAPER. Transport is an explicit choice via
+    // BINANCE_PAPER_TRANSPORT=fix|rest (default rest): `fix` runs one FIX session for
+    // order entry + execution reports; `rest` runs the REST adapter + WS user-data
+    // stream. The Ed25519 key (API key id + PKCS#8 PEM path) is shared by both.
+    // `binance_paper` is the concrete Arc the WS stream needs — Some only under REST.
+    let binance_paper: Option<std::sync::Arc<BinanceAdapter>> =
+        match Transport::from_env("BINANCE_PAPER", Transport::Rest) {
+            Transport::Fix => {
+                match fix::start_binance(
+                    "PAPER",
+                    &stream_health,
+                    pool.clone(),
+                    kafka_client.clone(),
+                    Some(position_changed_tx.clone()),
+                ) {
+                    Some(fix_adapter) => registry.register("BINANCE", "PAPER", fix_adapter),
+                    None => error!(
+                        "BINANCE_PAPER_TRANSPORT=fix but the FIX session could not start — \
+                         check BINANCE_PAPER_FIX_HOST / API_KEY / PRIVATE_KEY_PATH"
+                    ),
+                }
+                None // FIX owns fills; no WS user-data stream
+            }
+            Transport::Rest => match (
+                env::var("BINANCE_PAPER_API_KEY"),
+                env::var("BINANCE_PAPER_PRIVATE_KEY_PATH"),
+            ) {
+                (Ok(key), Ok(path)) if !key.is_empty() && !path.is_empty() => {
+                    use std::sync::Arc;
+                    match std::fs::read_to_string(&path) {
+                        Ok(pem) => match BinanceAdapter::new(key, &pem, "PAPER") {
+                            Ok(adapter) => {
+                                let adapter = Arc::new(adapter);
+                                registry.register("BINANCE", "PAPER", adapter.clone());
+                                info!("registered BINANCE/PAPER adapter (REST/WS)");
+                                Some(adapter)
+                            }
+                            Err(e) => { error!("BINANCE/PAPER adapter not registered: {e}"); None }
+                        },
+                        Err(e) => { error!("BINANCE/PAPER adapter not registered: cannot read {path}: {e}"); None }
                     }
-                    Err(e) => {
-                        error!("BINANCE/PAPER adapter not registered: {e}");
-                        None
-                    }
-                },
-                Err(e) => {
-                    error!("BINANCE/PAPER adapter not registered: cannot read {path}: {e}");
+                }
+                _ => {
+                    info!("BINANCE_PAPER_API_KEY / BINANCE_PAPER_PRIVATE_KEY_PATH not set — BINANCE/PAPER adapter not registered");
                     None
                 }
-            }
-        }
-        _ => {
-            info!("BINANCE_PAPER_API_KEY / BINANCE_PAPER_PRIVATE_KEY_PATH not set — BINANCE/PAPER adapter not registered");
-            None
-        }
-    };
+            },
+        };
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
     // (OPENFIGI_API_KEY) raises the limits and batch size.
@@ -363,7 +391,7 @@ async fn serve() {
     );
 
     // AppState
-    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client, symbology);
+    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client, symbology, stream_health);
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -379,16 +407,8 @@ async fn serve() {
         Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
-    // Doorbell from the fill path to the marks feeds: a fill moved a position, so
-    // re-read the held set. bounded(1) — a queued signal already means "reload",
-    // so extras are redundant and try_send never blocks the fill path.
-    //
-    // The fill path rings once; an mpsc has exactly one consumer, so a fan-out task
-    // (spawned below, once every feed has registered) relays to each feed's own
-    // doorbell. Keeping the fill path on a single sender means execution.rs need
-    // not know how many feeds exist.
-    let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let mut marks_doorbells: Vec<tokio::sync::mpsc::Sender<()>> = Vec::new();
+    // (stream_health, position_changed_tx/rx and marks_doorbells were created
+    // before the broker registry so FIX sessions could use them.)
 
     // Spawn Alpaca trade-update stream tasks (one per configured environment)
     if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {

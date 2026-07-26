@@ -73,6 +73,11 @@ export function StreamHealthStrip({
                 <Text size="sm" fw={500}>
                   {s.broker_code}
                 </Text>
+                {s.transport === "fix" && (
+                  <Badge color="grape" variant="light" size="sm">
+                    FIX
+                  </Badge>
+                )}
                 <Text size="sm" c="dimmed">
                   {s.environment}
                 </Text>

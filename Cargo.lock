@@ -2103,6 +2103,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "quickfix"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91473684dcab1f5a93f6d6cc0a5fdf9ded69c21b238b80ce6b232ef56e4e5c2b"
+dependencies = [
+ "log",
+ "quickfix-ffi",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "quickfix-ffi"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef4df7afb8421f65acb7cea8cbd218a1fc48d701c0b5d92c2963193e7224ce75"
+dependencies = [
+ "cmake",
+ "fs_extra",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2530,6 +2551,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek",
  "futures-util",
+ "quickfix",
  "rdkafka",
  "reqwest",
  "scalar_api_reference",

@@ -37,6 +37,7 @@ export interface StreamHealth {
   broker_code: string;
   environment: string;
   kind: "feed" | "execution";
+  transport: "websocket" | "fix";
   state: "connecting" | "live" | "down";
   connected_since: string | null;
   last_event_at: string | null;

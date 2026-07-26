@@ -33,12 +33,22 @@ pub enum StreamKind {
     Execution,
 }
 
+/// The wire protocol a stream runs over. Lets the cockpit distinguish a FIX
+/// order-entry session from a WebSocket one at a glance.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamTransport {
+    WebSocket,
+    Fix,
+}
+
 /// A point-in-time snapshot of one stream's health, returned by the API.
 #[derive(Clone, Serialize)]
 pub struct StreamHealth {
     pub broker_code: String,
     pub environment: String,
     pub kind: StreamKind,
+    pub transport: StreamTransport,
     pub state: StreamState,
     /// When the current live session was established (cleared on disconnect).
     pub connected_since: Option<DateTime<Utc>>,
@@ -61,15 +71,33 @@ impl StreamHealthRegistry {
         Self::default()
     }
 
-    /// Hand a stream task its own updater. Seeds a `Connecting` entry so the
-    /// stream shows up in the API from the moment the task starts.
+    /// Hand a WebSocket stream task its own updater. Seeds a `Connecting` entry so
+    /// the stream shows up in the API from the moment the task starts.
     pub fn handle(&self, broker_code: &str, environment: &str, kind: StreamKind) -> StreamHandle {
+        self.handle_with_transport(broker_code, environment, kind, StreamTransport::WebSocket)
+    }
+
+    /// Hand a FIX order-entry session its updater (always an `Execution` stream).
+    /// Call this only once the session is actually starting, so an unconfigured
+    /// broker doesn't leave a phantom `Connecting` entry.
+    pub fn fix_handle(&self, broker_code: &str, environment: &str) -> StreamHandle {
+        self.handle_with_transport(broker_code, environment, StreamKind::Execution, StreamTransport::Fix)
+    }
+
+    fn handle_with_transport(
+        &self,
+        broker_code: &str,
+        environment: &str,
+        kind: StreamKind,
+        transport: StreamTransport,
+    ) -> StreamHandle {
         let key = (broker_code.to_string(), environment.to_string());
         if let Ok(mut map) = self.inner.write() {
             map.entry(key.clone()).or_insert_with(|| StreamHealth {
                 broker_code: broker_code.to_string(),
                 environment: environment.to_string(),
                 kind,
+                transport,
                 state: StreamState::Connecting,
                 connected_since: None,
                 last_event_at: None,

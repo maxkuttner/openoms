@@ -1,6 +1,5 @@
 pub mod alpaca;
 pub mod binance;
-pub mod ibkr;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,6 +98,33 @@ impl std::fmt::Display for BrokerError {
 }
 
 impl std::error::Error for BrokerError {}
+
+/// Which wire protocol a broker connection should use. Chosen explicitly per
+/// `(broker, environment)` via `{BROKER}_{ENV}_TRANSPORT=fix|rest`, rather than
+/// inferred from which credentials happen to be present.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transport {
+    /// REST order entry + WebSocket fill stream (Alpaca, Binance-WS).
+    Rest,
+    /// A single FIX session for order entry and execution reports.
+    Fix,
+}
+
+impl Transport {
+    /// Read `{prefix}_TRANSPORT` (e.g. `BINANCE_PAPER_TRANSPORT`), falling back to
+    /// `default` when unset. `rest`/`ws`/`websocket` → Rest, `fix` → Fix.
+    pub fn from_env(prefix: &str, default: Transport) -> Transport {
+        match std::env::var(format!("{prefix}_TRANSPORT"))
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("fix") => Transport::Fix,
+            Some("rest") | Some("ws") | Some("websocket") => Transport::Rest,
+            _ => default,
+        }
+    }
+}
 
 /// Implemented by every broker adapter. Uses async-trait for dyn-compatibility.
 #[async_trait::async_trait]

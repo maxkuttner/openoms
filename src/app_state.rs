@@ -31,6 +31,7 @@ impl AppState {
         registry: BrokerRegistry,
         kafka: Option<KafkaClient>,
         symbology: SymbologyEngine,
+        stream_health: StreamHealthRegistry,
     ) -> Self {
         Self {
             pool,
@@ -39,7 +40,7 @@ impl AppState {
             registry: Arc::new(registry),
             kafka,
             symbology: Arc::new(symbology),
-            stream_health: StreamHealthRegistry::new(),
+            stream_health,
             marks: MarkStore::new(),
         }
     }

@@ -59,3 +59,8 @@ dataprovider = { path = "crates/dataprovider" }
 
 # CLI (oms setup universe …)
 clap = { version = "4", features = ["derive"] }
+
+# FIX connectivity (IBKR 4.2, Binance 4.4) — Rust bindings over the QuickFIX C++
+# engine. It owns the session layer (logon/heartbeat/seqnum/resend+gap-fill) and
+# TLS; we implement its ApplicationCallback. Needs cmake + a C++ compiler to build.
+quickfix = { version = "0.2", features = ["build-with-ssl"] }
