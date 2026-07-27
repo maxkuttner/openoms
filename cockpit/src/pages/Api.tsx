@@ -5,13 +5,13 @@ import {
   CopyButton,
   Group,
   Loader,
-  SegmentedControl,
   Select,
   Stack,
   Text,
   TextInput,
   Tooltip,
 } from "@mantine/core";
+import { Link } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useList, notifyError, notifyOk } from "../api/hooks";
@@ -79,9 +79,7 @@ export function ApiPage() {
   const { data: principals } = useList<Principal>("/admin/principals");
   const { data: portfolios } = useList<Portfolio>("/admin/portfolios");
 
-  const [mode, setMode] = useState<"existing" | "new">("existing");
   const [principalId, setPrincipalId] = useState<string | null>(null);
-  const [principalName, setPrincipalName] = useState("");
   const [portfolioId, setPortfolioId] = useState<string | null>(null);
   const [label, setLabel] = useState("");
   const [creating, setCreating] = useState(false);
@@ -96,22 +94,19 @@ export function ApiPage() {
     label: p.name ? `${p.name} · ${p.code}` : p.code,
   }));
 
-  const canGenerate = mode === "existing" ? !!principalId : principalName.trim().length > 0;
+  const canGenerate = !!principalId;
 
   async function generate() {
     setCreating(true);
     try {
       const res = await api.post<TradingTokenCreated>(PATH, {
-        principal_id: mode === "existing" ? principalId : null,
-        principal_name: mode === "new" ? principalName.trim() : null,
+        principal_id: principalId,
         portfolio_id: portfolioId,
         label: label.trim() || null,
       });
       setCreated(res);
       setLabel("");
-      setPrincipalName("");
       qc.invalidateQueries({ queryKey: [PATH] });
-      qc.invalidateQueries({ queryKey: ["/admin/principals"] });
       notifyOk("Token created");
     } catch (e) {
       notifyError(e);
@@ -161,21 +156,14 @@ export function ApiPage() {
           <Eyebrow>Create token</Eyebrow>
         </Box>
         <Stack gap={14} p={16}>
-          <Group justify="space-between" align="center">
-            <Text fz={12} c={C.muted}>Owner</Text>
-            <SegmentedControl
-              size="xs"
-              value={mode}
-              onChange={(v) => setMode(v as "existing" | "new")}
-              data={[
-                { label: "Existing principal", value: "existing" },
-                { label: "New principal", value: "new" },
-              ]}
-              styles={{ root: { background: C.inset, border: `1px solid ${C.border}` } }}
-            />
-          </Group>
-          <Group grow align="flex-start">
-            {mode === "existing" ? (
+          {principalOpts.length === 0 ? (
+            <Text fz={12.5} c={C.muted}>
+              No principals yet. Create one on the{" "}
+              <Text component={Link} to="/principals" c={C.green} inherit>Principals</Text> tab,
+              then mint its tokens here.
+            </Text>
+          ) : (
+            <Group grow align="flex-start">
               <Select
                 label="Principal"
                 placeholder="trader / strategy / service"
@@ -185,26 +173,18 @@ export function ApiPage() {
                 searchable
                 styles={inputStyles}
               />
-            ) : (
-              <TextInput
-                label="New principal name"
-                placeholder="e.g. momentum-bot"
-                value={principalName}
-                onChange={(e) => setPrincipalName(e.currentTarget.value)}
+              <Select
+                label="Grant portfolio (optional)"
+                placeholder="no grant"
+                data={portfolioOpts}
+                value={portfolioId}
+                onChange={setPortfolioId}
+                clearable
+                searchable
                 styles={inputStyles}
               />
-            )}
-            <Select
-              label="Grant portfolio (optional)"
-              placeholder="no grant"
-              data={portfolioOpts}
-              value={portfolioId}
-              onChange={setPortfolioId}
-              clearable
-              searchable
-              styles={inputStyles}
-            />
-          </Group>
+            </Group>
+          )}
           <Group align="flex-end" justify="space-between">
             <TextInput
               label="Label (optional)"

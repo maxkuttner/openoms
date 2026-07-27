@@ -897,10 +897,8 @@ async fn generate_key_material() -> Result<KeyMaterial, AdminError> {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateTradingToken {
     /// Mint the token under this existing principal (the trader/strategy/service it
-    /// belongs to). Provide this OR `principal_name`.
-    pub principal_id: Option<Uuid>,
-    /// Quick-create a new SERVICE principal with this display name and mint under it.
-    pub principal_name: Option<String>,
+    /// belongs to). Create principals on the Principals admin surface first.
+    pub principal_id: Uuid,
     /// Optionally entitle the principal to trade this portfolio (adds a `can_trade`
     /// grant). Omit if the principal is already granted, or to grant separately.
     pub portfolio_id: Option<Uuid>,
@@ -942,50 +940,14 @@ pub async fn create_trading_token(
     Json(payload): Json<CreateTradingToken>,
 ) -> Result<Json<TradingTokenCreated>, AdminError> {
     let label = payload.label.clone();
-    info!(
-        principal_id = ?payload.principal_id,
-        principal_name = ?payload.principal_name,
-        portfolio_id = ?payload.portfolio_id,
-        "admin create trading token"
-    );
+    let principal_id = payload.principal_id;
+    info!(%principal_id, portfolio_id = ?payload.portfolio_id, "admin create trading token");
 
     let material = generate_key_material().await?;
     let mut tx = state.pool().begin().await.map_err(map_db_error)?;
 
-    // The token belongs to a principal (its trader/strategy/service). Use the one
-    // given, or quick-create a SERVICE principal from a name. Grants/portfolios live
-    // on the principal, so its other tokens share the same trading rights.
-    let principal_id = match (payload.principal_id, payload.principal_name.as_deref()) {
-        (Some(pid), _) => pid,
-        (None, Some(name)) => {
-            let short = Uuid::new_v4().simple().to_string()[..8].to_string();
-            let slug: String = name
-                .to_lowercase()
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-                .collect();
-            let pid = Uuid::new_v4();
-            sqlx::query(
-                "INSERT INTO principal (id, code, principal_type, display_name, status) \
-                 VALUES ($1, $2, 'SERVICE', $3, 'ACTIVE')",
-            )
-            .bind(pid)
-            .bind(format!("{slug}-{short}"))
-            .bind(name)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_db_error)?;
-            pid
-        }
-        (None, None) => {
-            return Err(AdminError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: "provide principal_id or principal_name".to_string(),
-            });
-        }
-    };
-
-    // Optionally entitle the principal to trade a portfolio.
+    // Optionally entitle the principal to trade a portfolio. (The token belongs to
+    // this principal; its grants decide what the token can trade.)
     if let Some(portfolio_id) = payload.portfolio_id {
         sqlx::query(
             "INSERT INTO principal_portfolio_grant \
