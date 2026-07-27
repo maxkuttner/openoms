@@ -81,6 +81,24 @@ export interface Grant {
   updated_at: string;
 }
 
+// A single bearer token (Databento-style) minted under a principal. `token` once.
+export interface TradingTokenCreated {
+  token: string;
+  key_id: string;
+  principal_id: string;
+  portfolio_id: string | null;
+  label: string | null;
+}
+
+export interface TradingTokenRow {
+  key_id: string;
+  label: string | null;
+  principal_id: string;
+  principal_code: string;
+  principal_name: string | null;
+  created_at: string;
+}
+
 export interface RiskLimit {
   id: string;
   portfolio_id: string;

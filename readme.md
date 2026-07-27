@@ -43,6 +43,20 @@ skip auto-sync, or `OMS_BOOTSTRAP=off` when infrastructure is provisioned elsewh
 The SPY fixture seeds `alpaca-paper` + a test user (`test-trader-key` : `test-secret`),
 so you can place a paper order immediately. Admin webapp: `cd cockpit && npm install && npm run dev`.
 
+## Auth
+
+- **Cockpit login** — the console is gated by a single password: `OMS_ADMIN_TOKEN`
+  (enabled via `OMS_ADMIN_AUTH_ENABLED=true`). Enter it on the login screen; it's sent
+  as a bearer to `/admin`. Set a strong random value for any real deployment.
+- **Trading tokens** — generate one on the cockpit's *Trading tokens* page (or
+  `POST /admin/trading-tokens`). A token belongs to a **principal** (a trader /
+  strategy / service) and is a single copy-once bearer string used by API clients as
+  `Authorization: Bearer <token>`. What it can trade comes from the principal's
+  portfolio grants (`can_trade`), so you can mint several tokens under one principal
+  to rotate credentials without re-permissioning. Revoke any token anytime.
+- The legacy HTTP Basic form (`key_id:secret`, e.g. the `test-trader` dev user) still
+  works on the trading routes.
+
 ### Manual setup (optional)
 
 The bootstrap just orchestrates the same idempotent make targets, if you'd rather run

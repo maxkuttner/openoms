@@ -81,6 +81,9 @@ mod fix;
         admin::register_principal_key,
         admin::list_principal_keys,
         admin::revoke_principal_key,
+        admin::create_trading_token,
+        admin::list_trading_tokens,
+        admin::revoke_trading_token,
         admin::create_grant,
         admin::list_grants,
         admin::update_grant,
@@ -120,6 +123,7 @@ mod fix;
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
         CreateKey, ApiKeyRecord,
+        admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary, admin::FeedSummary,
@@ -260,14 +264,17 @@ async fn serve() {
         .map(|v| v.to_lowercase() != "false")
         .unwrap_or(true);
 
+    // The admin console login password. `OMS_ADMIN_PASSWORD` is the canonical name;
+    // `OMS_ADMIN_TOKEN` is still accepted for back-compat.
     let admin_token = if !admin_auth_enabled {
         String::new()
     } else {
-        env::var("OMS_ADMIN_TOKEN")
+        env::var("OMS_ADMIN_PASSWORD")
             .ok()
             .filter(|v| !v.is_empty())
+            .or_else(|| env::var("OMS_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()))
             .unwrap_or_else(|| {
-                error!("OMS_ADMIN_TOKEN is not set");
+                error!("OMS_ADMIN_PASSWORD is not set");
                 std::process::exit(1);
             })
     };
@@ -537,6 +544,14 @@ async fn serve() {
         .route(
             "/admin/principals/:id/keys/:key_id",
             axum::routing::delete(admin::revoke_principal_key),
+        )
+        .route(
+            "/admin/trading-tokens",
+            post(admin::create_trading_token).get(admin::list_trading_tokens),
+        )
+        .route(
+            "/admin/trading-tokens/:key_id",
+            axum::routing::delete(admin::revoke_trading_token),
         )
         .route(
             "/admin/portfolios",

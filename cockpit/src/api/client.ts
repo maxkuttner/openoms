@@ -32,6 +32,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   });
 
   if (!res.ok) {
+    // Auth failed/expired: drop the stored token and let the app fall back to the
+    // login gate (which listens for this event).
+    if (res.status === 401 || res.status === 403) {
+      setToken("");
+      window.dispatchEvent(new Event("oms:unauthorized"));
+    }
     const text = await res.text().catch(() => "");
     throw new ApiError(res.status, text || `${method} ${path} failed (${res.status})`);
   }
