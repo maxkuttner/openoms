@@ -803,26 +803,8 @@ pub async fn register_principal_key(
     Path(principal_id): Path<Uuid>,
     Json(payload): Json<CreateKey>,
 ) -> Result<Json<ApiKeyRecord>, AdminError> {
-    let key_id = format!("ak_{}", Uuid::new_v4().simple());
-
-    let mut raw = [0u8; 32];
-    raw[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-    raw[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-    let plaintext_secret = format!("sk_{}", general_purpose::URL_SAFE_NO_PAD.encode(raw));
-
-    info!(principal_id = %principal_id, key_id = %key_id, "admin register key");
-
-    let secret_to_hash = plaintext_secret.clone();
-    let secret_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&secret_to_hash, 12))
-        .await
-        .map_err(|_| AdminError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "hash task failed".to_string(),
-        })?
-        .map_err(|_| AdminError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "failed to hash secret".to_string(),
-        })?;
+    info!(principal_id = %principal_id, "admin register key");
+    let KeyMaterial { key_id, plaintext_secret, secret_hash } = generate_key_material().await?;
 
     let mut record = sqlx::query_as::<_, ApiKeyRecord>(
         r#"
@@ -877,6 +859,211 @@ pub async fn revoke_principal_key(
         return Err(AdminError::not_found("key"));
     }
 
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Trading tokens ────────────────────────────────────────────────────────────
+//
+// A "trading token" is an ordinary `api_key` presented to the trading routes as a
+// single bearer string `"{key_id}.{secret}"` (see `auth::extract_trading_credentials`).
+// The endpoints here make it a one-click, ready-to-trade credential: generating one
+// can auto-provision the principal + portfolio + `can_trade` grant it needs.
+
+/// Freshly generated key material, before it's persisted.
+struct KeyMaterial {
+    key_id: String,
+    plaintext_secret: String,
+    secret_hash: String,
+}
+
+/// Generate a new `(key_id, secret)` and its bcrypt hash. `key_id` = `ak_<uuid>`,
+/// secret = `sk_<base64url(32 bytes)>`. Hashing runs off the async pool.
+async fn generate_key_material() -> Result<KeyMaterial, AdminError> {
+    let key_id = format!("ak_{}", Uuid::new_v4().simple());
+    let mut raw = [0u8; 32];
+    raw[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    raw[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let plaintext_secret = format!("sk_{}", general_purpose::URL_SAFE_NO_PAD.encode(raw));
+
+    let to_hash = plaintext_secret.clone();
+    let secret_hash = tokio::task::spawn_blocking(move || bcrypt::hash(&to_hash, 12))
+        .await
+        .map_err(|_| AdminError { status: StatusCode::INTERNAL_SERVER_ERROR, message: "hash task failed".to_string() })?
+        .map_err(|_| AdminError { status: StatusCode::INTERNAL_SERVER_ERROR, message: "failed to hash secret".to_string() })?;
+
+    Ok(KeyMaterial { key_id, plaintext_secret, secret_hash })
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct CreateTradingToken {
+    /// Mint the token under this existing principal (the trader/strategy/service it
+    /// belongs to). Provide this OR `principal_name`.
+    pub principal_id: Option<Uuid>,
+    /// Quick-create a new SERVICE principal with this display name and mint under it.
+    pub principal_name: Option<String>,
+    /// Optionally entitle the principal to trade this portfolio (adds a `can_trade`
+    /// grant). Omit if the principal is already granted, or to grant separately.
+    pub portfolio_id: Option<Uuid>,
+    /// Human label for this key (shown in the token list). Optional.
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TradingTokenCreated {
+    /// The single bearer token — `Authorization: Bearer <token>`. Shown once.
+    pub token: String,
+    pub key_id: String,
+    pub principal_id: Uuid,
+    pub portfolio_id: Option<Uuid>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct TradingTokenRow {
+    pub key_id: String,
+    pub label: Option<String>,
+    pub principal_id: Uuid,
+    pub principal_code: String,
+    pub principal_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[utoipa::path(
+    post, path = "/admin/trading-tokens", tag = "admin",
+    request_body = CreateTradingToken,
+    responses(
+        (status = 200, description = "Created — single bearer token included once", body = TradingTokenCreated),
+        (status = 422, description = "Auto-provision needs an active broker connection"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn create_trading_token(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateTradingToken>,
+) -> Result<Json<TradingTokenCreated>, AdminError> {
+    let label = payload.label.clone();
+    info!(
+        principal_id = ?payload.principal_id,
+        principal_name = ?payload.principal_name,
+        portfolio_id = ?payload.portfolio_id,
+        "admin create trading token"
+    );
+
+    let material = generate_key_material().await?;
+    let mut tx = state.pool().begin().await.map_err(map_db_error)?;
+
+    // The token belongs to a principal (its trader/strategy/service). Use the one
+    // given, or quick-create a SERVICE principal from a name. Grants/portfolios live
+    // on the principal, so its other tokens share the same trading rights.
+    let principal_id = match (payload.principal_id, payload.principal_name.as_deref()) {
+        (Some(pid), _) => pid,
+        (None, Some(name)) => {
+            let short = Uuid::new_v4().simple().to_string()[..8].to_string();
+            let slug: String = name
+                .to_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            let pid = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO principal (id, code, principal_type, display_name, status) \
+                 VALUES ($1, $2, 'SERVICE', $3, 'ACTIVE')",
+            )
+            .bind(pid)
+            .bind(format!("{slug}-{short}"))
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+            pid
+        }
+        (None, None) => {
+            return Err(AdminError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: "provide principal_id or principal_name".to_string(),
+            });
+        }
+    };
+
+    // Optionally entitle the principal to trade a portfolio.
+    if let Some(portfolio_id) = payload.portfolio_id {
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant \
+                (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
+             VALUES ($1, $2, $3, true, true, false) \
+             ON CONFLICT (principal_id, portfolio_id) DO NOTHING",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+    }
+
+    // Persist the api key under the principal.
+    sqlx::query("INSERT INTO api_key (principal_id, key_id, secret_hash, name) VALUES ($1, $2, $3, $4)")
+        .bind(principal_id)
+        .bind(&material.key_id)
+        .bind(&material.secret_hash)
+        .bind(label.clone())
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
+    tx.commit().await.map_err(map_db_error)?;
+
+    Ok(Json(TradingTokenCreated {
+        token: format!("{}.{}", material.key_id, material.plaintext_secret),
+        key_id: material.key_id,
+        principal_id,
+        portfolio_id: payload.portfolio_id,
+        label,
+    }))
+}
+
+#[utoipa::path(
+    get, path = "/admin/trading-tokens", tag = "admin",
+    responses((status = 200, description = "Active trading tokens", body = [TradingTokenRow])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_trading_tokens(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<TradingTokenRow>>, AdminError> {
+    // Every api key is a trading credential (auth_middleware accepts it); list them
+    // with the principal they belong to.
+    let rows = sqlx::query_as::<_, TradingTokenRow>(
+        "SELECT k.key_id, k.name AS label, k.principal_id, \
+                p.code AS principal_code, p.display_name AS principal_name, k.created_at \
+         FROM api_key k JOIN principal p ON p.id = k.principal_id \
+         WHERE k.revoked_at IS NULL \
+         ORDER BY k.created_at DESC",
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(rows))
+}
+
+#[utoipa::path(
+    delete, path = "/admin/trading-tokens/{key_id}", tag = "admin",
+    params(("key_id" = String, Path, description = "Token key id")),
+    responses((status = 204, description = "Revoked"), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
+pub async fn revoke_trading_token(
+    State(state): State<AppState>,
+    Path(key_id): Path<String>,
+) -> Result<StatusCode, AdminError> {
+    info!(key_id = %key_id, "admin revoke trading token");
+    let result = sqlx::query("UPDATE api_key SET revoked_at = now() WHERE key_id = $1 AND revoked_at IS NULL")
+        .bind(&key_id)
+        .execute(state.pool())
+        .await
+        .map_err(map_db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("token"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
