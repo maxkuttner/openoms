@@ -83,15 +83,28 @@ pub async fn health() -> &'static str {
 /// resolved from the portfolio's `default_account_id`; when present it overrides.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SubmitOrderRequest {
+    /// Client-generated UUID; also the idempotency key (a repeat is a 409).
+    #[schema(example = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b")]
     pub order_id: String,
+    /// Your own reference string, echoed back on updates.
+    #[schema(example = "my-ref-001")]
     pub client_order_id: String,
+    /// Portfolio UUID the order books against.
+    #[schema(example = "b2c3d4e5-6f70-4812-93a4-556677889900")]
     pub portfolio_id: String,
+    /// Optional account UUID; omit to use the portfolio's default account.
+    #[schema(example = json!(null))]
     pub account_id: Option<String>,
+    /// Instrument surrogate key (BIGINT as string), not a UUID.
+    #[schema(example = "42")]
     pub instrument_id: String,
     pub side: OrderSide,
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
+    /// Required for `limit` orders; omit for `market`.
+    #[schema(example = json!(null))]
     pub limit_price: Option<f64>,
+    #[schema(example = 1.0)]
     pub quantity: f64,
 }
 
@@ -124,7 +137,7 @@ impl SubmitOrderRequest {
         (status = 502, description = "Broker rejected the order"),
         (status = 503, description = "No broker adapter configured"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn orders_submit(
     State(state): State<AppState>,
@@ -624,7 +637,7 @@ pub async fn orders_submit(
         (status = 404, description = "Order not found"),
         (status = 409, description = "Order state version mismatch"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn orders_cancel(
     State(app_state): State<AppState>,
@@ -888,7 +901,7 @@ pub async fn orders_cancel(
         (status = 400, description = "Invalid UUID"),
         (status = 404, description = "Order not found"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn get_order(
     State(state): State<AppState>,
@@ -958,7 +971,7 @@ pub async fn get_order(
         (status = 200, description = "OK", body = [Position]),
         (status = 403, description = "No view grant for principal/portfolio"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn get_portfolio_positions(
     State(state): State<AppState>,
@@ -1076,7 +1089,7 @@ pub struct Allocation {
         (status = 404, description = "Order not found"),
         (status = 422, description = "Nothing filled, over-allocation, or invalid target"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn create_allocations(
     State(state): State<AppState>,
@@ -1206,7 +1219,7 @@ pub async fn create_allocations(
     get, path = "/orders/{id}/allocations", tag = "orders",
     params(("id" = Uuid, Path, description = "Order ID")),
     responses((status = 200, description = "OK", body = [Allocation])),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn list_allocations(
     State(state): State<AppState>,

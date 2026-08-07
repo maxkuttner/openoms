@@ -45,7 +45,7 @@ use dotenvy::dotenv;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber;
 use utoipa::OpenApi;
-use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 mod kafka;
 mod execution;
 mod alpaca_stream;
@@ -141,11 +141,24 @@ impl utoipa::Modify for SecurityAddon {
         let components = openapi.components.get_or_insert_default();
         components.add_security_scheme(
             "basic_auth",
-            SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Basic)
+                    .description(Some("Username = key_id, password = secret."))
+                    .build(),
+            ),
         );
         components.add_security_scheme(
             "bearer_token",
-            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "User endpoints: a trading token, `key_id.secret` (Databento-style). \
+                         Admin endpoints (/admin/*): the static admin token.",
+                    ))
+                    .build(),
+            ),
         );
     }
 }
