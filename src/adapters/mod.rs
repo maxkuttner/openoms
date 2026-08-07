@@ -32,16 +32,6 @@ pub struct BrokerOrderResponse {
     pub external_order_id: String,
 }
 
-/// A position as reported by a broker/custodian — the custodian side of reconciliation.
-pub struct BrokerHolding {
-    /// Broker symbol (e.g. "SPY").
-    pub symbol: String,
-    /// Broker-native instrument id (Alpaca asset UUID), when present.
-    pub native_id: Option<String>,
-    /// Signed quantity: + long, - short.
-    pub qty: f64,
-}
-
 /// One entry of a broker's tradeable catalog: the canonical Symbol@Venue
 /// instrument record (→ `public.instrument` / `instrument_derivative`) plus the
 /// broker's own routing handle (→ `public.broker_instrument`). Returned by an
@@ -134,11 +124,28 @@ pub trait BrokerAdapter: Send + Sync {
     /// (e.g. Binance) that scope cancels by symbol; ignored by those that don't
     /// (e.g. Alpaca).
     async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError>;
-    /// Custodian-side holdings for reconciliation. Adapters that don't support it
-    /// return `NotConfigured` (the default) and are skipped by recon.
-    async fn get_positions(&self) -> Result<Vec<BrokerHolding>, BrokerError> {
+    /// The broker's currently-open orders — the snapshot side of order
+    /// reconciliation ([`crate::recon_orders`]). Adapters that don't support it
+    /// return `NotConfigured` (the default) and are skipped.
+    async fn open_orders(&self) -> Result<Vec<crate::recon_orders::BrokerOpenOrder>, BrokerError> {
         Err(BrokerError::NotConfigured(
-            "positions not supported by this adapter".to_string(),
+            "open-order snapshot not supported by this adapter".to_string(),
+        ))
+    }
+
+    /// One order's current state at the broker. Used to resolve an OMS order that
+    /// dropped out of the open-order snapshot. `client_order_id` is our order UUID
+    /// (FIX correlates the status reply on `ClOrdID`); `external_order_id` is the
+    /// broker's id (REST venues look up by it); `symbol` is required by venues that
+    /// scope order lookups by symbol (e.g. Binance).
+    async fn order_status(
+        &self,
+        _client_order_id: &str,
+        _external_order_id: &str,
+        _symbol: &str,
+    ) -> Result<crate::recon_orders::BrokerOrderState, BrokerError> {
+        Err(BrokerError::NotConfigured(
+            "order status not supported by this adapter".to_string(),
         ))
     }
 }

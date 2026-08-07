@@ -8,7 +8,7 @@ mod auth;
 mod admin;
 mod risk_engine;
 mod positions;
-mod recon;
+mod recon_orders;
 mod symbology_resolver;
 mod setup;
 
@@ -107,9 +107,6 @@ mod fix;
         admin::delete_risk_limit,
         admin::list_instruments,
         admin::list_feeds,
-        admin::run_recon,
-        admin::list_recon_runs,
-        admin::list_recon_breaks,
         admin::resolve_symbology,
         admin::backfill_symbology,
     ),
@@ -127,8 +124,6 @@ mod fix;
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary, admin::FeedSummary,
-        admin::RunReconRequest, admin::ReconRunRow, admin::ReconBreakRow,
-        crate::recon::ReconSummary, crate::recon::ReconBreak, crate::recon::BreakKind,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
     )),
@@ -598,9 +593,6 @@ async fn serve() {
         )
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/feeds", get(admin::list_feeds))
-        .route("/admin/recon/run", post(admin::run_recon))
-        .route("/admin/recon/runs", get(admin::list_recon_runs))
-        .route("/admin/recon/runs/:id/breaks", get(admin::list_recon_breaks))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
         .route("/admin/symbology/backfill", post(admin::backfill_symbology))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));

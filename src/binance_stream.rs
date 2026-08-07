@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -23,6 +23,7 @@ use crate::adapters::binance::BinanceAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
 use crate::kafka::KafkaClient;
+use crate::recon_orders::run_order_reconcile;
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -67,8 +68,8 @@ pub async fn run(
     position_changed_tx: Option<mpsc::Sender<()>>,
 ) {
     info!(env = environment, "starting Binance user-data stream");
-    // Catch up on anything missed while disconnected, then stream live.
-    reconcile_routed_orders(&pool, &kafka, &adapter, position_changed_tx.as_ref()).await;
+    // The catch-up sweep runs on every (re)connect from the subscribe-success path in
+    // connect_and_run, so it covers the initial catch-up too — no separate call here.
 
     let session = BinanceSession {
         pool,
@@ -109,7 +110,7 @@ async fn connect_and_run(
             // Periodic liveness probe + catch-up sweep for missed terminal reports.
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                reconcile_routed_orders(pool, kafka, adapter, position_changed_tx).await;
+                run_order_reconcile(pool, kafka, adapter, VENUE, "binance", position_changed_tx).await;
                 continue;
             }
             msg = ws.next() => {
@@ -158,6 +159,10 @@ async fn connect_and_run(
                 if v["status"].as_i64() == Some(200) {
                     info!("Binance WS-API subscribed to user-data stream");
                     health.set_live();
+                    // Snapshot-on-(re)connect: diff the broker's open orders against
+                    // the OMS working set now that the live stream is up, so anything
+                    // that resolved during the outage is healed immediately.
+                    run_order_reconcile(pool, kafka, adapter, VENUE, "binance", position_changed_tx).await;
                 } else {
                     return Err(format!("userDataStream.subscribe failed: {}", v).into());
                 }
@@ -217,78 +222,3 @@ async fn handle_execution_report(
     Ok(())
 }
 
-/// One-time startup catch-up: for each `routed` Binance order, fetch its state via
-/// REST and apply the terminal report if it already resolved while we were down.
-async fn reconcile_routed_orders(
-    pool: &PgPool,
-    kafka: &Option<KafkaClient>,
-    adapter: &BinanceAdapter,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
-) {
-    let rows = match sqlx::query(
-        "SELECT os.order_id, os.instrument_id \
-         FROM order_state os \
-         JOIN broker_connection bc ON bc.code = os.broker_connection_code \
-         WHERE os.status = 'routed' AND bc.broker_code = 'BINANCE'",
-    )
-    .fetch_all(pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => { error!(error = %e, "Binance reconcile: query failed"); return; }
-    };
-    if rows.is_empty() {
-        info!("Binance reconcile: no routed orders");
-        return;
-    }
-
-    for row in rows {
-        let order_id: Uuid = row.get("order_id");
-        let instrument_id_num: i64 = row.get::<String, _>("instrument_id").parse().unwrap_or_default();
-
-        let symbol: Option<String> = sqlx::query_scalar(
-            "SELECT broker_symbol FROM broker_instrument \
-             WHERE instrument_id = $1 AND broker_code = 'BINANCE' LIMIT 1",
-        )
-        .bind(instrument_id_num)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-        let Some(symbol) = symbol else { continue };
-
-        let ext_id: Option<String> = sqlx::query_scalar(
-            "SELECT payload_json->'payload'->>'external_order_id' \
-             FROM order_event WHERE order_id = $1 AND event_type = 'order_routed' LIMIT 1",
-        )
-        .bind(order_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-        let Some(ext_id) = ext_id.filter(|s| !s.is_empty()) else { continue };
-
-        let order = match adapter.get_order(&symbol, &ext_id).await {
-            Ok(o) => o,
-            Err(e) => { warn!(order_id = %order_id, error = %e, "Binance reconcile: get_order failed"); continue; }
-        };
-
-        let status = order["status"].as_str().unwrap_or("");
-        let report = match status {
-            "FILLED" => {
-                let executed: f64 = order["executedQty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                let quote: f64 = order["cummulativeQuoteQty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                let avg_price = if executed > 0.0 { quote / executed } else { 0.0 };
-                ExecutionReport::Fill { execution_id: ext_id.clone(), fill_qty: executed, fill_price: avg_price, venue: VENUE.to_string() }
-            }
-            "CANCELED" => ExecutionReport::Canceled { reason: None, venue: Some(VENUE.to_string()) },
-            "REJECTED" | "EXPIRED" => ExecutionReport::Reject { reason: status.to_string(), venue: Some(VENUE.to_string()) },
-            _ => continue,
-        };
-
-        match process_execution_report(pool, kafka, order_id, report, "binance", position_changed_tx).await {
-            Ok(()) => info!(order_id = %order_id, binance_status = status, "Binance reconcile: applied missed report"),
-            Err(e) => error!(order_id = %order_id, error = %e, "Binance reconcile: apply failed"),
-        }
-    }
-}

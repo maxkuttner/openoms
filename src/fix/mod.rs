@@ -23,6 +23,7 @@ use quickfix::{
 };
 use sqlx::PgPool;
 use tokio::sync::mpsc;
+use tokio::time::Duration;
 use tracing::{error, info};
 
 /// Routes QuickFIX's session log (raw messages + admin events) into `tracing` so
@@ -50,6 +51,7 @@ use crate::fix::binance::BinanceDialect;
 use crate::fix::dialect::FixDialect;
 use crate::fix::ibkr::IbkrDialect;
 use crate::kafka::KafkaClient;
+use crate::recon_orders::run_order_reconcile;
 use crate::stream_health::{StreamHandle, StreamHealthRegistry};
 
 /// Connection parameters for one FIX session. Credentials live on the dialect;
@@ -109,6 +111,7 @@ pub fn start_session(
     pool: PgPool,
     kafka: Option<KafkaClient>,
     position_changed_tx: Option<mpsc::Sender<()>>,
+    recon_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>>,
 ) -> Result<Arc<FixBrokerAdapter>, BrokerError> {
     let begin_string = dialect.begin_string();
     // Validate settings eagerly so a misconfiguration surfaces at startup; the
@@ -117,32 +120,82 @@ pub fn start_session(
     build_settings(&cfg, begin_string)?;
 
     let pending = Arc::new(Mutex::new(HashMap::new()));
+    let snapshots = Arc::new(Mutex::new(HashMap::new()));
+    let statuses = Arc::new(Mutex::new(HashMap::new()));
     let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+    // Logon nudges (bounded, coalescing) for the order-reconcile driver.
+    let (logon_tx, mut logon_rx) = mpsc::channel::<()>(4);
+
+    // Venue/registry code (e.g. "IBKR"), captured before `dialect` moves onto the
+    // session thread — used as the broker_code for reconciliation queries.
+    let broker_code = dialect.venue();
 
     // Drain inbound execution reports into the shared apply path.
-    tokio::spawn(async move {
-        while let Some((order_id, report)) = report_rx.recv().await {
-            if let Err(e) = process_execution_report(
-                &pool,
-                &kafka,
-                order_id,
-                report,
-                actor,
-                position_changed_tx.as_ref(),
-            )
-            .await
-            {
-                error!(order_id = %order_id, error = %e, "FIX: failed to apply execution report");
+    {
+        let pool = pool.clone();
+        let kafka = kafka.clone();
+        let position_changed_tx = position_changed_tx.clone();
+        tokio::spawn(async move {
+            while let Some((order_id, report)) = report_rx.recv().await {
+                if let Err(e) = process_execution_report(
+                    &pool,
+                    &kafka,
+                    order_id,
+                    report,
+                    actor,
+                    position_changed_tx.as_ref(),
+                )
+                .await
+                {
+                    error!(order_id = %order_id, error = %e, "FIX: failed to apply execution report");
+                }
             }
-        }
-    });
+        });
+    }
 
     let adapter = Arc::new(FixBrokerAdapter::new(
         dialect.clone(),
         pending.clone(),
+        snapshots.clone(),
+        statuses.clone(),
+        recon_delegate,
         cfg.sender_comp_id.clone(),
         cfg.target_comp_id.clone(),
     ));
+
+    // Order-reconcile driver: mass-status snapshot on each (re)logon and every 30s,
+    // diffing the broker's open orders against the OMS working set. This is FIX's
+    // snapshot-on-reconnect — necessary because `ResetOnLogon=Y` disables QuickFIX's
+    // own resend of anything missed during an outage.
+    {
+        let pool = pool.clone();
+        let kafka = kafka.clone();
+        let position_changed_tx = position_changed_tx.clone();
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.tick().await; // consume the immediate first tick
+            loop {
+                tokio::select! {
+                    recv = logon_rx.recv() => {
+                        if recv.is_none() {
+                            break; // session gone — stop the driver
+                        }
+                    }
+                    _ = interval.tick() => {}
+                }
+                run_order_reconcile(
+                    &pool,
+                    &kafka,
+                    &*adapter,
+                    broker_code,
+                    actor,
+                    position_changed_tx.as_ref(),
+                )
+                .await;
+            }
+        });
+    }
 
     let server_kind = if cfg.ssl {
         FixSocketServerKind::SslSingleThreaded
@@ -161,7 +214,8 @@ pub fn start_session(
                 Ok((s, _)) => s,
                 Err(e) => { error!(venue, error = %e, "FIX: settings build failed"); return; }
             };
-            let app_cb = FixApplication::new(dialect, health, pending, report_tx);
+            let app_cb =
+                FixApplication::new(dialect, health, pending, snapshots, statuses, report_tx, logon_tx);
             let application = match Application::try_new(&app_cb) {
                 Ok(a) => a,
                 Err(e) => { error!(venue, error = %e, "FIX: application init failed"); return; }
@@ -220,7 +274,8 @@ pub fn start_ibkr(
     let health = stream_health.fix_handle("IBKR", env_name);
     let password = env_opt(&prefix, "FIX_PASSWORD").unwrap_or_default();
     let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password));
-    match start_session(dialect, cfg, "ibkr", health, pool, kafka, position_changed_tx) {
+    // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
+    match start_session(dialect, cfg, "ibkr", health, pool, kafka, position_changed_tx, None) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "IBKR FIX session not started"); None }
     }
@@ -245,10 +300,21 @@ pub fn start_binance(
         Ok(p) => p,
         Err(e) => { error!(env = env_name, "Binance FIX: cannot read {pem_path}: {e}"); return None; }
     };
-    let dialect = match BinanceDialect::new(api_key, &pem) {
+    let dialect = match BinanceDialect::new(api_key.clone(), &pem) {
         Ok(d) => Arc::new(d) as Arc<dyn FixDialect>,
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX dialect init failed"); return None; }
     };
+    // Binance Spot FIX has no open-orders / order-status message, so route the
+    // order-reconciliation reads through the same credential's REST API. Orders still
+    // go over FIX; only the recon snapshot/status reads use REST.
+    let recon_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>> =
+        match crate::adapters::binance::BinanceAdapter::new(api_key, &pem, env_name) {
+            Ok(a) => Some(Arc::new(a)),
+            Err(e) => {
+                error!(env = env_name, error = %e, "Binance FIX: REST recon delegate init failed; recon disabled");
+                None
+            }
+        };
     let cfg = FixConfig {
         host,
         port: env_opt(&prefix, "FIX_PORT").and_then(|s| s.parse().ok()).unwrap_or(9000),
@@ -259,7 +325,7 @@ pub fn start_binance(
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("BINANCE", env_name);
-    match start_session(dialect, cfg, "binance", health, pool, kafka, position_changed_tx) {
+    match start_session(dialect, cfg, "binance", health, pool, kafka, position_changed_tx, recon_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
     }

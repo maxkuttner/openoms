@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::adapters::{BrokerError, BrokerOrderRequest};
 use crate::domain::orders::commands::ExecutionReport;
+use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// FIX field tags used across dialects. Named so the message-building code reads
 /// like the spec rather than a wall of integers. A few are kept for completeness
@@ -41,6 +42,12 @@ pub mod tag {
     pub const RAW_DATA: i32 = 96;
     pub const USERNAME: i32 = 553;
     pub const PASSWORD: i32 = 554;
+    // Order Mass Status Request (35=AF) / Order Status Request (35=H) and the
+    // status-report fields they draw back.
+    pub const MASS_STATUS_REQ_ID: i32 = 584;
+    pub const MASS_STATUS_REQ_TYPE: i32 = 585;
+    pub const TOT_NUM_REPORTS: i32 = 911;
+    pub const LAST_RPT_REQUESTED: i32 = 912;
 }
 
 /// A parsed inbound `ExecutionReport` (35=8), addressed to one of our orders.
@@ -86,6 +93,120 @@ pub trait FixDialect: Send + Sync {
     /// `None` when the message isn't an execution report or its `ClOrdID` isn't a
     /// UUID we issued. Most dialects delegate to [`parse_standard_exec_report`].
     fn parse_execution_report(&self, msg: &Message) -> Option<ParsedExecReport>;
+
+    /// Build an `Order Mass Status Request` (35=AF) for the snapshot side of order
+    /// reconciliation — `MassStatusReqType`(585)=7 (all orders). The broker replies
+    /// with one `ExecutionReport` (`ExecType=I`) per order, echoing
+    /// `MassStatusReqID`(584), the last carrying `LastRptRequested`(912)=Y. Standard
+    /// FIX 4.3+; on a venue that doesn't answer it (e.g. an older gateway) the
+    /// caller's wait simply times out and reconciliation is skipped.
+    fn build_mass_status_request(&self, req_id: &str) -> Result<Message, BrokerError> {
+        let mut msg = Message::new();
+        msg.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "AF"))
+            .map_err(|e| BrokerError::Network(format!("set MsgType: {e}")))?;
+        msg.set_field(tag::MASS_STATUS_REQ_ID, req_id)
+            .map_err(|e| BrokerError::Network(format!("set MassStatusReqID: {e}")))?;
+        msg.set_field(tag::MASS_STATUS_REQ_TYPE, "7")
+            .map_err(|e| BrokerError::Network(format!("set MassStatusReqType: {e}")))?;
+        Ok(msg)
+    }
+
+    /// Build an `Order Status Request` (35=H) for one resting order, correlated on
+    /// `ClOrdID`(11) (our order UUID) so the reply routes back to the waiter.
+    fn build_order_status_request(
+        &self,
+        client_order_id: &str,
+        external_order_id: &str,
+        symbol: &str,
+    ) -> Result<Message, BrokerError> {
+        let mut msg = Message::new();
+        msg.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "H"))
+            .map_err(|e| BrokerError::Network(format!("set MsgType: {e}")))?;
+        let set = |m: &mut Message, t: i32, v: &str| -> Result<(), BrokerError> {
+            m.set_field(t, v).map_err(|e| BrokerError::Network(format!("set {t}: {e}")))
+        };
+        set(&mut msg, tag::CL_ORD_ID, client_order_id)?;
+        if !external_order_id.is_empty() {
+            set(&mut msg, tag::ORDER_ID, external_order_id)?;
+        }
+        set(&mut msg, tag::SYMBOL, symbol)?;
+        Ok(msg)
+    }
+}
+
+/// A solicited order-status `ExecutionReport` (`ExecType=I`), the reply to a 35=AF /
+/// 35=H. Carries the order's cumulative state rather than a single fill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusReport {
+    /// Echoed `MassStatusReqID`(584) when this is one of a mass-status batch.
+    pub mass_status_req_id: Option<String>,
+    /// `ClOrdID`(11) — our order UUID (may be empty on an empty mass-status reply).
+    pub client_order_id: String,
+    pub symbol: String,
+    /// `CumQty`(14) — total executed quantity for the order.
+    pub cum_qty: f64,
+    /// `AvgPx`(6) — average fill price.
+    pub avg_px: f64,
+    /// `OrdStatus`(39): `0`=New `1`=PartiallyFilled `2`=Filled `4`=Canceled
+    /// `8`=Rejected `C`=Expired.
+    pub ord_status: String,
+    /// `LastRptRequested`(912)=Y — the final report of a mass-status batch.
+    pub last_rpt_requested: bool,
+    /// `TotNumReports`(911)=0 — the venue's "no open orders" empty-batch reply.
+    pub empty_batch: bool,
+}
+
+impl StatusReport {
+    /// Terminal `OrdStatus` — the order is no longer open.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.ord_status.as_str(), "2" | "4" | "8" | "C")
+    }
+
+    /// As a broker open-order snapshot row (for the mass-status path). `None` when
+    /// terminal (a terminal order isn't "open") or unidentified.
+    pub fn to_open_order(&self) -> Option<BrokerOpenOrder> {
+        if self.is_terminal() || self.client_order_id.is_empty() {
+            return None;
+        }
+        Some(BrokerOpenOrder {
+            client_order_id: self.client_order_id.clone(),
+            symbol: self.symbol.clone(),
+            executed_qty: self.cum_qty,
+        })
+    }
+
+    /// As a resolved order state (for the single 35=H path).
+    pub fn to_order_state(&self) -> BrokerOrderState {
+        let outcome = match self.ord_status.as_str() {
+            "2" => BrokerOrderOutcome::Filled,
+            "4" => BrokerOrderOutcome::Canceled,
+            "8" | "C" => BrokerOrderOutcome::Rejected,
+            _ => BrokerOrderOutcome::Working,
+        };
+        BrokerOrderState { outcome, executed_qty: self.cum_qty, avg_px: self.avg_px }
+    }
+}
+
+/// Parse a solicited order-status `ExecutionReport` (35=8 with `ExecType`(150)=`I`).
+/// Returns `None` for anything else — including live fills/acks, which stay on the
+/// existing execution path.
+pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
+    if msg.with_header(|h| h.get_field(tag::MSG_TYPE)).as_deref() != Some("8") {
+        return None;
+    }
+    if msg.get_field(tag::EXEC_TYPE).as_deref() != Some("I") {
+        return None;
+    }
+    Some(StatusReport {
+        mass_status_req_id: msg.get_field(tag::MASS_STATUS_REQ_ID).filter(|s| !s.is_empty()),
+        client_order_id: msg.get_field(tag::CL_ORD_ID).unwrap_or_default(),
+        symbol: msg.get_field(tag::SYMBOL).unwrap_or_default(),
+        cum_qty: msg.get_field(tag::CUM_QTY).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        avg_px: msg.get_field(tag::AVG_PX).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        ord_status: msg.get_field(tag::ORD_STATUS).unwrap_or_default(),
+        last_rpt_requested: msg.get_field(tag::LAST_RPT_REQUESTED).as_deref() == Some("Y"),
+        empty_batch: msg.get_field(tag::TOT_NUM_REPORTS).and_then(|s| s.parse::<i64>().ok()) == Some(0),
+    })
 }
 
 #[cfg(test)]
@@ -232,6 +353,53 @@ mod tests {
         let mut m = Message::new();
         m.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "0")).unwrap();
         assert!(parse_standard_exec_report(&m, "IBKR").is_none());
+    }
+
+    #[test]
+    fn status_report_only_matches_exec_type_i() {
+        // A live fill (ExecType=F) must NOT be picked up as a status report.
+        let fill = exec_report(&[(tag::CL_ORD_ID, "x"), (tag::EXEC_TYPE, "F")]);
+        assert!(parse_order_status_report(&fill).is_none());
+    }
+
+    #[test]
+    fn parses_mass_status_open_order() {
+        let id = Uuid::new_v4();
+        let msg = exec_report(&[
+            (tag::MASS_STATUS_REQ_ID, "req-1"),
+            (tag::CL_ORD_ID, &id.to_string()),
+            (tag::EXEC_TYPE, "I"),
+            (tag::ORD_STATUS, "1"), // partially filled → still open
+            (tag::SYMBOL, "BTCUSDT"),
+            (tag::CUM_QTY, "0.5"),
+            (tag::AVG_PX, "101.0"),
+            (tag::LAST_RPT_REQUESTED, "Y"),
+        ]);
+        let sr = parse_order_status_report(&msg).expect("status report");
+        assert_eq!(sr.mass_status_req_id.as_deref(), Some("req-1"));
+        assert!(sr.last_rpt_requested);
+        assert!(!sr.is_terminal());
+        let open = sr.to_open_order().expect("open order");
+        assert_eq!(open.client_order_id, id.to_string());
+        assert_eq!(open.executed_qty, 0.5);
+        // avg_px is retained on to_order_state for terminal fill pricing.
+        assert_eq!(sr.to_order_state().avg_px, 101.0);
+    }
+
+    #[test]
+    fn terminal_status_is_not_an_open_order() {
+        let id = Uuid::new_v4();
+        let msg = exec_report(&[
+            (tag::CL_ORD_ID, &id.to_string()),
+            (tag::EXEC_TYPE, "I"),
+            (tag::ORD_STATUS, "2"), // filled
+            (tag::CUM_QTY, "1.0"),
+            (tag::AVG_PX, "100.0"),
+        ]);
+        let sr = parse_order_status_report(&msg).unwrap();
+        assert!(sr.is_terminal());
+        assert!(sr.to_open_order().is_none());
+        assert_eq!(sr.to_order_state().outcome, BrokerOrderOutcome::Filled);
     }
 }
 

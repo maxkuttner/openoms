@@ -18,9 +18,10 @@ use reqwest::{Client, Method};
 use tracing::info;
 
 use super::{
-    BrokerAdapter, BrokerError, BrokerHolding, BrokerInstrument, BrokerOrderRequest,
+    BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest,
     BrokerOrderResponse, InstrumentProvider,
 };
+use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Read a Binance symbol filter's numeric field (e.g. LOT_SIZE.stepSize).
 fn filter_val(filters: &[serde_json::Value], filter_type: &str, field: &str) -> Option<f64> {
@@ -263,34 +264,56 @@ impl BrokerAdapter for BinanceAdapter {
         }
     }
 
-    /// GET /api/v3/account — spot balances. Each non-zero asset becomes a holding
-    /// keyed by the asset code (the base-asset used in the broker xref), so
-    /// reconciliation resolves it to the instrument. Spot is long-only, so qty is
-    /// always positive.
-    async fn get_positions(&self) -> Result<Vec<BrokerHolding>, BrokerError> {
-        let resp = self.signed(Method::GET, "/api/v3/account", &[]).await?;
+    /// GET /api/v3/openOrders — every currently-open order across all symbols in one
+    /// signed call (the snapshot side of order reconciliation).
+    async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+        let resp = self.signed(Method::GET, "/api/v3/openOrders", &[]).await?;
         if !resp.status().is_success() {
             return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
         }
         let body: serde_json::Value =
             resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-        let balances = body["balances"].as_array().cloned().unwrap_or_default();
-        let holdings = balances
+        let orders = body.as_array().cloned().unwrap_or_default();
+        Ok(orders
             .iter()
-            .filter_map(|b| {
-                let asset = b["asset"].as_str()?.to_string();
-                let free: f64 = b["free"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                let locked: f64 = b["locked"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                let qty = free + locked;
-                if qty > 0.0 {
-                    Some(BrokerHolding { symbol: asset.clone(), native_id: Some(asset), qty })
-                } else {
-                    None
-                }
+            .filter_map(|o| {
+                let client_order_id = o["clientOrderId"].as_str()?.to_string();
+                let symbol = o["symbol"].as_str()?.to_string();
+                let (executed_qty, _) = exec_stats(o);
+                Some(BrokerOpenOrder { client_order_id, symbol, executed_qty })
             })
-            .collect();
-        Ok(holdings)
+            .collect())
     }
+
+    /// One order's current state via GET /api/v3/order, normalized to a
+    /// [`BrokerOrderState`] for the reconcile shell.
+    async fn order_status(
+        &self,
+        _client_order_id: &str,
+        external_order_id: &str,
+        symbol: &str,
+    ) -> Result<BrokerOrderState, BrokerError> {
+        let order = self.get_order(symbol, external_order_id).await?;
+        let (executed_qty, avg_px) = exec_stats(&order);
+        let outcome = match order["status"].as_str().unwrap_or("") {
+            "FILLED" => BrokerOrderOutcome::Filled,
+            "CANCELED" => BrokerOrderOutcome::Canceled,
+            "REJECTED" | "EXPIRED" => BrokerOrderOutcome::Rejected,
+            _ => BrokerOrderOutcome::Working, // NEW / PARTIALLY_FILLED — still live
+        };
+        Ok(BrokerOrderState { outcome, executed_qty, avg_px })
+    }
+}
+
+/// Parse `(executed_qty, avg_px)` from a Binance order JSON. `avg_px` is the executed
+/// volume-weighted price (`cummulativeQuoteQty / executedQty`), 0 when nothing filled.
+fn exec_stats(order: &serde_json::Value) -> (f64, f64) {
+    let executed_qty: f64 =
+        order["executedQty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let quote: f64 =
+        order["cummulativeQuoteQty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let avg_px = if executed_qty > 0.0 { quote / executed_qty } else { 0.0 };
+    (executed_qty, avg_px)
 }
 
 #[async_trait::async_trait]

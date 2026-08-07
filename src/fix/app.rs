@@ -16,7 +16,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::domain::orders::commands::ExecutionReport;
-use crate::fix::dialect::{tag, FixDialect};
+use crate::fix::dialect::{parse_order_status_report, tag, FixDialect, StatusReport};
+use crate::recon_orders::{BrokerOpenOrder, BrokerOrderState};
 use crate::stream_health::StreamHandle;
 
 /// Result handed back to a waiting `submit_order`: the broker `OrderID` on accept,
@@ -27,6 +28,20 @@ pub type AckResult = Result<String, String>;
 /// adapter (which inserts) and the callback thread (which resolves).
 pub type PendingAcks = Arc<Mutex<HashMap<String, oneshot::Sender<AckResult>>>>;
 
+/// An in-flight `open_orders` (35=AF) call: the mass-status reports accumulate in
+/// `acc` on the callback thread until the batch's final report, then `tx` delivers
+/// them to the awaiting adapter.
+pub struct SnapshotWaiter {
+    pub acc: Vec<BrokerOpenOrder>,
+    pub tx: oneshot::Sender<Vec<BrokerOpenOrder>>,
+}
+
+/// MassStatusReqID → the mass-status collector for an `open_orders` call.
+pub type PendingSnapshots = Arc<Mutex<HashMap<String, SnapshotWaiter>>>;
+
+/// ClOrdID → the oneshot an `order_status` (35=H) call is blocked on.
+pub type PendingStatus = Arc<Mutex<HashMap<String, oneshot::Sender<BrokerOrderState>>>>;
+
 /// A normalized inbound report addressed to one of our orders, carried from the
 /// callback thread to the async drain task.
 pub type InboundReport = (Uuid, ExecutionReport);
@@ -36,7 +51,11 @@ pub struct FixApplication {
     dialect: Arc<dyn FixDialect>,
     health: StreamHandle,
     pending: PendingAcks,
+    snapshots: PendingSnapshots,
+    statuses: PendingStatus,
     report_tx: mpsc::UnboundedSender<InboundReport>,
+    /// Nudges the order-reconcile driver to snapshot on each (re)logon.
+    logon_tx: mpsc::Sender<()>,
 }
 
 impl FixApplication {
@@ -44,9 +63,12 @@ impl FixApplication {
         dialect: Arc<dyn FixDialect>,
         health: StreamHandle,
         pending: PendingAcks,
+        snapshots: PendingSnapshots,
+        statuses: PendingStatus,
         report_tx: mpsc::UnboundedSender<InboundReport>,
+        logon_tx: mpsc::Sender<()>,
     ) -> Self {
-        Self { dialect, health, pending, report_tx }
+        Self { dialect, health, pending, snapshots, statuses, report_tx, logon_tx }
     }
 
     /// Resolve a pending `submit_order` for `cl_ord_id`, if one is waiting.
@@ -55,6 +77,38 @@ impl FixApplication {
             if let Some(tx) = map.remove(cl_ord_id) {
                 let _ = tx.send(result);
             }
+        }
+    }
+
+    /// Accumulate one mass-status report into its `open_orders` waiter; on the
+    /// batch's final report (or an empty batch) deliver the collected snapshot.
+    fn collect_snapshot(&self, sr: &StatusReport) {
+        let Some(reqid) = sr.mass_status_req_id.clone() else { return };
+        let Ok(mut map) = self.snapshots.lock() else { return };
+        if let Some(w) = map.get_mut(&reqid) {
+            if let Some(open) = sr.to_open_order() {
+                w.acc.push(open);
+            }
+        }
+        if sr.last_rpt_requested || sr.empty_batch {
+            if let Some(w) = map.remove(&reqid) {
+                let _ = w.tx.send(w.acc);
+            }
+        }
+    }
+
+    /// Deliver a single 35=H reply to a waiting `order_status`. Returns whether one
+    /// was waiting (so an unsolicited status can be ignored).
+    fn resolve_status(&self, sr: &StatusReport) -> bool {
+        if sr.client_order_id.is_empty() {
+            return false;
+        }
+        let Ok(mut map) = self.statuses.lock() else { return false };
+        if let Some(tx) = map.remove(&sr.client_order_id) {
+            let _ = tx.send(sr.to_order_state());
+            true
+        } else {
+            false
         }
     }
 }
@@ -68,6 +122,10 @@ impl ApplicationCallback for FixApplication {
     fn on_logon(&self, session: &SessionId) {
         info!(venue = self.dialect.venue(), ?session, "FIX logon");
         self.health.set_live();
+        // Snapshot-on-(re)logon: nudge the recon driver. `ResetOnLogon=Y` means
+        // QuickFIX won't resend messages missed during the outage, so a mass-status
+        // diff here is how we recover them.
+        let _ = self.logon_tx.try_send(());
     }
 
     fn on_logout(&self, session: &SessionId) {
@@ -114,6 +172,18 @@ impl ApplicationCallback for FixApplication {
     /// Inbound application messages — execution reports live here.
     fn on_msg_from_app(&self, msg: &Message, _session: &SessionId) -> Result<(), MsgFromAppError> {
         self.health.record_event();
+
+        // Solicited order-status replies (35=AF mass status / 35=H) carry
+        // `ExecType=I` and are collected for reconciliation, not applied as fills.
+        if let Some(sr) = parse_order_status_report(msg) {
+            if sr.mass_status_req_id.is_some() {
+                self.collect_snapshot(&sr);
+            } else {
+                // A single 35=H reply, or an unsolicited status we ignore.
+                self.resolve_status(&sr);
+            }
+            return Ok(());
+        }
 
         let Some(parsed) = self.dialect.parse_execution_report(msg) else {
             return Ok(());

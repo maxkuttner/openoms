@@ -11,7 +11,6 @@ import { AccountsPage } from "./pages/Accounts";
 import { BrokerConnectionsPage } from "./pages/BrokerConnections";
 import { RiskLimitsPage } from "./pages/RiskLimits";
 import { BlotterPage } from "./pages/Blotter";
-import { ReconciliationPage } from "./pages/Reconciliation";
 import { InstrumentsPage } from "./pages/Instruments";
 import { DataFeedsPage } from "./pages/DataFeeds";
 import { ApiPage } from "./pages/Api";
@@ -32,7 +31,6 @@ const NAV = [
   { to: "/risk-limits", label: "Risk limits" },
   { to: "/blotter", label: "Blotter" },
   { to: "/instruments", label: "Instruments" },
-  { to: "/reconciliation", label: "Reconciliation" },
 ];
 
 // Grouped under a "Docs" section in the navbar.
@@ -105,7 +103,6 @@ function Console({ onLogout }: { onLogout: () => void }) {
           <Route path="/risk-limits" element={<RiskLimitsPage />} />
           <Route path="/blotter" element={<BlotterPage />} />
           <Route path="/instruments" element={<InstrumentsPage />} />
-          <Route path="/reconciliation" element={<ReconciliationPage />} />
           <Route
             path="/docs/architecture"
             element={
