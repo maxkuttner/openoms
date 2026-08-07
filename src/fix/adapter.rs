@@ -39,12 +39,6 @@ pub struct FixBrokerAdapter {
     pending: PendingAcks,
     snapshots: PendingSnapshots,
     statuses: PendingStatus,
-    /// Optional REST adapter that owns the order-reconciliation reads (open orders,
-    /// order status). Some venues route orders over FIX but expose no reliable FIX
-    /// message for them — Binance Spot FIX being the case, where open orders come from
-    /// its REST API. When present, recon reads forward here; when absent (e.g. IBKR),
-    /// they use the native FIX 35=AF/35=H path.
-    recon_delegate: Option<Arc<dyn BrokerAdapter>>,
     // SessionId components — rebuilt per send rather than held, so no FFI handle
     // crosses threads.
     begin_string: String,
@@ -58,7 +52,6 @@ impl FixBrokerAdapter {
         pending: PendingAcks,
         snapshots: PendingSnapshots,
         statuses: PendingStatus,
-        recon_delegate: Option<Arc<dyn BrokerAdapter>>,
         sender_comp_id: String,
         target_comp_id: String,
     ) -> Self {
@@ -68,7 +61,6 @@ impl FixBrokerAdapter {
             pending,
             snapshots,
             statuses,
-            recon_delegate,
             sender_comp_id,
             target_comp_id,
         }
@@ -165,13 +157,11 @@ impl BrokerAdapter for FixBrokerAdapter {
         self.send_cancel(external_order_id, symbol)
     }
 
-    /// Snapshot open orders. Forwards to the REST recon delegate when present (Binance
-    /// FIX), else uses an Order Mass Status Request (35=AF). Register the collector
-    /// before sending so a fast reply can't race us, then await the batch.
+    /// Snapshot open orders via an Order Mass Status Request (35=AF). Register the
+    /// collector before sending so a fast reply can't race us, then await the batch.
+    /// (Venues with no FIX open-orders message are handled by composing a REST reader
+    /// via [`crate::adapters::SplitAdapter`], not by branching here.)
     async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
-        if let Some(d) = &self.recon_delegate {
-            return d.open_orders().await;
-        }
         let req_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         {
@@ -203,9 +193,6 @@ impl BrokerAdapter for FixBrokerAdapter {
         external_order_id: &str,
         symbol: &str,
     ) -> Result<BrokerOrderState, BrokerError> {
-        if let Some(d) = &self.recon_delegate {
-            return d.order_status(client_order_id, external_order_id, symbol).await;
-        }
         let (tx, rx) = oneshot::channel();
         {
             let mut map = self

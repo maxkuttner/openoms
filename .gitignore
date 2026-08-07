@@ -28,3 +28,6 @@ target
 .idea/
 TODO.md
 .DS_Store
+
+# FIX protocol spec PDFs kept locally for reference, not committed.
+FIX-*.pdf

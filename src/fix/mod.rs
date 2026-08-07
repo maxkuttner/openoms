@@ -111,7 +111,11 @@ pub fn start_session(
     pool: PgPool,
     kafka: Option<KafkaClient>,
     position_changed_tx: Option<mpsc::Sender<()>>,
-    recon_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>>,
+    // Optional REST adapter that owns the reconciliation reads (open orders / order
+    // status) for venues with no FIX equivalent (Binance Spot FIX). When present, the
+    // recon driver reconciles through a SplitAdapter — orders over FIX, reads over
+    // REST; when absent (IBKR) it uses the native 35=AF/35=H path.
+    read_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>>,
 ) -> Result<Arc<FixBrokerAdapter>, BrokerError> {
     let begin_string = dialect.begin_string();
     // Validate settings eagerly so a misconfiguration surfaces at startup; the
@@ -158,10 +162,17 @@ pub fn start_session(
         pending.clone(),
         snapshots.clone(),
         statuses.clone(),
-        recon_delegate,
         cfg.sender_comp_id.clone(),
         cfg.target_comp_id.clone(),
     ));
+
+    // The adapter the recon driver reconciles through: pure FIX by default, or a
+    // FIX-writer / REST-reader split when a read delegate is supplied. Order routing
+    // (the returned `adapter`) always stays pure FIX.
+    let recon_adapter: Arc<dyn crate::adapters::BrokerAdapter> = match read_delegate {
+        Some(reader) => Arc::new(crate::adapters::SplitAdapter { writer: adapter.clone(), reader }),
+        None => adapter.clone(),
+    };
 
     // Order-reconcile driver: mass-status snapshot on each (re)logon and every 30s,
     // diffing the broker's open orders against the OMS working set. This is FIX's
@@ -171,7 +182,6 @@ pub fn start_session(
         let pool = pool.clone();
         let kafka = kafka.clone();
         let position_changed_tx = position_changed_tx.clone();
-        let adapter = adapter.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.tick().await; // consume the immediate first tick
@@ -187,7 +197,7 @@ pub fn start_session(
                 run_order_reconcile(
                     &pool,
                     &kafka,
-                    &*adapter,
+                    &*recon_adapter,
                     broker_code,
                     actor,
                     position_changed_tx.as_ref(),
@@ -307,7 +317,7 @@ pub fn start_binance(
     // Binance Spot FIX has no open-orders / order-status message, so route the
     // order-reconciliation reads through the same credential's REST API. Orders still
     // go over FIX; only the recon snapshot/status reads use REST.
-    let recon_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>> =
+    let read_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>> =
         match crate::adapters::binance::BinanceAdapter::new(api_key, &pem, env_name) {
             Ok(a) => Some(Arc::new(a)),
             Err(e) => {
@@ -325,7 +335,7 @@ pub fn start_binance(
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("BINANCE", env_name);
-    match start_session(dialect, cfg, "binance", health, pool, kafka, position_changed_tx, recon_delegate) {
+    match start_session(dialect, cfg, "binance", health, pool, kafka, position_changed_tx, read_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
     }

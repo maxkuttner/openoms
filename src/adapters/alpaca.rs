@@ -9,6 +9,7 @@ use super::{
     BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest,
     BrokerOrderResponse, InstrumentProvider,
 };
+use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Map Alpaca's `exchange` label to the ISO 10383 MIC used by `public.venue`.
 ///
@@ -301,6 +302,49 @@ impl BrokerAdapter for AlpacaAdapter {
             let err_body = response.text().await.unwrap_or_default();
             Err(BrokerError::BrokerRejected(err_body))
         }
+    }
+
+    /// GET /v2/orders?status=open — the snapshot side of order reconciliation, every
+    /// open order in one call. `client_order_id` is the UUID we sent.
+    async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+        let url = format!("{}/v2/orders?status=open", self.base_url);
+        let resp = self.get_json(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+        }
+        let orders: Vec<serde_json::Value> =
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(orders
+            .iter()
+            .filter_map(|o| {
+                Some(BrokerOpenOrder {
+                    client_order_id: o["client_order_id"].as_str()?.to_string(),
+                    symbol: o["symbol"].as_str()?.to_string(),
+                    executed_qty: o["filled_qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                })
+            })
+            .collect())
+    }
+
+    /// One order's current state via GET /v2/orders/{id}, normalized for the shell.
+    async fn order_status(
+        &self,
+        _client_order_id: &str,
+        external_order_id: &str,
+        _symbol: &str,
+    ) -> Result<BrokerOrderState, BrokerError> {
+        let order = self.get_order(external_order_id).await?;
+        let executed_qty: f64 =
+            order["filled_qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let avg_px: f64 =
+            order["filled_avg_price"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+        let outcome = match order["status"].as_str().unwrap_or("") {
+            "filled" => BrokerOrderOutcome::Filled,
+            "canceled" => BrokerOrderOutcome::Canceled,
+            "rejected" | "expired" => BrokerOrderOutcome::Rejected,
+            _ => BrokerOrderOutcome::Working, // new / partially_filled / accepted — still live
+        };
+        Ok(BrokerOrderState { outcome, executed_qty, avg_px })
     }
 
     // Alpaca cancels by order id alone; the symbol is unused.

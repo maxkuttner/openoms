@@ -150,6 +150,37 @@ pub trait BrokerAdapter: Send + Sync {
     }
 }
 
+/// Composes two adapters: order routing (`writer`) over one transport, reconciliation
+/// reads (`reader`) over another. Binance-FIX uses this — orders go over FIX while the
+/// open-order / order-status reads go over REST, because Binance Spot FIX exposes no
+/// such message. Keeps each underlying adapter single-purpose; the split is a wiring
+/// decision, not a branch inside either one.
+pub struct SplitAdapter {
+    pub writer: Arc<dyn BrokerAdapter>,
+    pub reader: Arc<dyn BrokerAdapter>,
+}
+
+#[async_trait::async_trait]
+impl BrokerAdapter for SplitAdapter {
+    async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        self.writer.submit_order(req).await
+    }
+    async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError> {
+        self.writer.cancel_order(external_order_id, symbol).await
+    }
+    async fn open_orders(&self) -> Result<Vec<crate::recon_orders::BrokerOpenOrder>, BrokerError> {
+        self.reader.open_orders().await
+    }
+    async fn order_status(
+        &self,
+        client_order_id: &str,
+        external_order_id: &str,
+        symbol: &str,
+    ) -> Result<crate::recon_orders::BrokerOrderState, BrokerError> {
+        self.reader.order_status(client_order_id, external_order_id, symbol).await
+    }
+}
+
 /// Registry keyed by (broker_code, environment) — e.g. ("ALPACA", "PAPER").
 /// Built once at startup and shared read-only via Arc.
 pub struct BrokerRegistry {
