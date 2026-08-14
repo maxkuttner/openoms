@@ -161,15 +161,24 @@ impl AlpacaAdapter {
     /// (`GET /v2/options/contracts`). The compact OSI is both the master symbol and
     /// the order-entry handle; options route by symbol, so the routing native id is
     /// left None. Strike/expiry/kind come straight from Alpaca's contract fields.
+    ///
+    /// `expiration_date_gte` is not a filter here — it is what makes the endpoint
+    /// return the whole chain. Without it Alpaca answers with only the nearest one or
+    /// two expiries and no `next_page_token`, so the pagination loop below sees a
+    /// complete response and the far month/LEAPS contracts never arrive. Pinning it
+    /// to today asks for everything still live; already-expired contracts are dropped
+    /// again at ingest (`setup::catalog`), which uses the same UTC date.
     pub async fn list_option_contracts(
         &self,
         underlyings: &[String],
     ) -> Result<Vec<BrokerInstrument>, BrokerError> {
         let mut out = Vec::new();
         let mut page_token: Option<String> = None;
+        let today = chrono::Utc::now().date_naive();
         loop {
             let mut url = format!(
-                "{}/v2/options/contracts?status=active&limit=10000&underlying_symbols={}",
+                "{}/v2/options/contracts?status=active&limit=10000\
+                 &expiration_date_gte={today}&underlying_symbols={}",
                 self.base_url,
                 underlyings.join(",")
             );
