@@ -6,11 +6,19 @@
 //!   export DATABENTO_API_KEY=db-...      # your key
 //!   cargo run --example opra_playground
 //!
-//! Edit `SYMBOLS` below. These are OSI strings in Databento's space-padded
-//! form: 6-char root left-justified + space-padded, then YYMMDD, C/P, strike*1000
-//! zero-padded to 8. The expiries below WILL go stale — pick a live contract
-//! (e.g. from https://databento.com or the Alpaca option chain) or you'll just
-//! see the symbol mapping and no quotes.
+//! Symbols come from `OPRA_SYMBOLS` (comma-separated) or the `SYMBOLS` default
+//! below. These are OSI strings in Databento's space-padded form: 6-char root
+//! left-justified + space-padded, then YYMMDD, C/P, strike*1000 zero-padded to 8.
+//!
+//! The defaults WILL go stale: an expired contract is not in live symbology and
+//! the gateway answers `SymbolResolutionFailed` (non-fatal — the rest of the
+//! subscription still streams). To refresh, list what is actually listed:
+//!
+//!   curl -s -u "$DATABENTO_API_KEY:" \
+//!     -X POST https://hist.databento.com/v0/timeseries.get_range \
+//!     -d dataset=OPRA.PILLAR -d symbols=SPY.OPT -d stype_in=parent \
+//!     -d schema=definition -d encoding=csv -d start=$(date -v-1d +%F) \
+//!     | cut -d, -f6 | sort -u
 
 use databento::{
     dbn::{self, Record, Schema, SType, UNDEF_PRICE},
@@ -19,9 +27,11 @@ use databento::{
 };
 
 // Space-padded OSI. Root is 6 chars, so "SPY" → "SPY   " (3 trailing spaces).
+// ATM straddle on the Sep-2026 monthly; verified listed on 2026-08-13 with SPY
+// around 772. Overridable with OPRA_SYMBOLS.
 const SYMBOLS: &[&str] = &[
-    "SPY   260717C00750000",
-    "SPY   260717P00750000",
+    "SPY   260918C00770000",
+    "SPY   260918P00770000",
 ];
 
 const DATASET: &str = "OPRA.PILLAR";
@@ -29,6 +39,18 @@ const DATASET: &str = "OPRA.PILLAR";
 /// Fixed-point Databento price → f64, or None when undefined (i64::MAX).
 fn px(v: i64) -> Option<f64> {
     (v != UNDEF_PRICE).then_some(v as f64 / 1e9)
+}
+
+/// Left-justify the root in 6 so compact OSI matches Databento's wire form.
+/// Already-padded input is returned unchanged (tail is a fixed 15 chars).
+fn pad_osi(s: &str) -> String {
+    match s.len().checked_sub(15).filter(|&n| n > 0) {
+        Some(split) => {
+            let (root, tail) = s.split_at(split);
+            format!("{:<6}{tail}", root.trim_end())
+        }
+        None => s.to_string(),
+    }
 }
 
 /// Readable symbol for a dbn numeric instrument_id (falls back to the raw id).
@@ -48,7 +70,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    let symbols: Vec<String> = SYMBOLS.iter().map(|s| s.to_string()).collect();
+    // OPRA_SYMBOLS lets a stale default be swapped without a rebuild. Roots are
+    // padded here so a hand-typed "SPY260918C00770000" also resolves.
+    let symbols: Vec<String> = match std::env::var("OPRA_SYMBOLS") {
+        Ok(v) => v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(pad_osi).collect(),
+        Err(_) => SYMBOLS.iter().map(|s| s.to_string()).collect(),
+    };
     // OPRA is multi-venue; use the consolidated top-of-book (cmbp-1) rather than
     // per-publisher mbp-1. (tcbbo — quote-on-trade — decodes to the same Cmbp1Msg.)
     println!("subscribing {} symbols (cmbp-1):", symbols.len());
