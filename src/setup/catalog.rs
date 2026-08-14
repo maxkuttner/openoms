@@ -26,6 +26,10 @@ pub struct CatalogSummary {
     pub skipped_currency: u64,
     pub skipped_expired: u64,
     pub derivatives: u64,
+    /// Contracts whose UTC `expires_at` was derived from the venue calendar. Zero on
+    /// a re-sync that changed nothing, or when the venue has no calendar row —
+    /// preflight reports the latter.
+    pub dated: u64,
     pub enriched: u64,
     /// The distinct venue/currency codes that failed the FK check. Distinct rather
     /// than per-row: a skip count alone says something is wrong but not what, and
@@ -131,6 +135,12 @@ pub async fn upsert_catalog(
         summary.derivatives += bulk_upsert_derivatives(&mut tx, chunk, &ids).await? as u64;
     }
     tx.commit().await?;
+
+    // Derive the UTC expiry instant for whatever was just written, rather than
+    // leaving a freshly seeded chain without one until the hourly sweep catches up.
+    // Same function the sweep runs, so a contract cannot end up with an instant that
+    // depends on which path wrote it.
+    summary.dated = crate::expiry::recompute_expires_at(pool).await?;
 
     if !enrichers.is_empty() {
         summary.enriched = run_enrichers(pool, enrichers, defs).await?;

@@ -60,6 +60,7 @@ mod binance_feed;
 mod bybit_feed;
 mod feeds;
 mod preflight;
+mod expiry;
 mod fix;
 
 #[derive(OpenApi)]
@@ -109,6 +110,7 @@ mod fix;
         admin::list_feeds,
         admin::resolve_symbology,
         admin::backfill_symbology,
+        admin::expiry_sweep,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -125,6 +127,7 @@ mod fix;
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary, admin::FeedSummary,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
+        admin::ExpirySweepResult,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
     )),
     modifiers(&SecurityAddon),
@@ -455,6 +458,12 @@ async fn serve() {
     let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
     tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
 
+    // Retire dated contracts once their expiry instant passes, so the feeds below
+    // stop resubscribing to them and the order path stops accepting them. Not
+    // supervised: `stream_supervisor` exists to reconnect streams, and treats a clean
+    // return as a disconnect to back off from — wrong shape for a periodic job.
+    tokio::spawn(expiry::run(state.pool().clone()));
+
     if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
         let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
         marks_doorbells.push(opra_pos_tx);
@@ -608,6 +617,7 @@ async fn serve() {
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
         .route("/admin/symbology/backfill", post(admin::backfill_symbology))
+        .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let scalar_html = {

@@ -38,8 +38,72 @@ impl std::fmt::Display for Fatal {
 /// from fatal to expected.
 pub async fn run(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fatal> {
     check_catalog(pool, auto_sync_pending).await?;
+    report_expiry(pool).await;
     report_held(pool).await;
     Ok(())
+}
+
+/// Degraded checks around instrument expiry. Logs; never fails the boot.
+///
+/// Both conditions are silent by nature — one is a contract that will never be
+/// retired, the other a position in a contract that already was — so a boot-time line
+/// is the only thing that makes them visible.
+async fn report_expiry(pool: &PgPool) {
+    // An option whose venue has no calendar row (or whose calendar has no close_time)
+    // gets no `expires_at`, so `crate::expiry` can never sweep it: it stays ACTIVE
+    // past expiry, keeps being subscribed, and keeps being orderable. Naming it here
+    // is the difference between a missing seed row and a mystery in the feed logs.
+    let undated = sqlx::query_scalar::<_, String>(
+        "SELECT i.symbol \
+         FROM instrument i \
+         JOIN instrument_derivative d ON d.instrument_id = i.id \
+         WHERE i.status = 'ACTIVE' \
+           AND d.expiry_date IS NOT NULL \
+           AND d.expires_at IS NULL \
+         ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await;
+    match undated {
+        Ok(rows) if !rows.is_empty() => {
+            let names: Vec<&str> = rows.iter().map(String::as_str).collect();
+            error!(
+                "preflight: {} dated instrument(s) have no expiry instant — their venue \
+                 has no calendar (run `make db-seed`), so they will never expire: {}",
+                names.len(),
+                sample(&names)
+            );
+        }
+        Ok(_) => {}
+        Err(e) => error!("preflight: could not check instrument expiry: {e}"),
+    }
+
+    // A position left in an expired contract. The OMS is not the book of record and
+    // must not guess at how it resolved — expired worthless, or exercised into the
+    // underlying — so this reports and stops. It is also unpriceable and unorderable
+    // by then, which the checks below would otherwise blame on a feed or a mapping.
+    let stranded = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT i.symbol \
+         FROM position p \
+         JOIN instrument i ON i.id::text = p.instrument_id \
+         WHERE p.net_qty <> 0 AND i.status = 'EXPIRED' \
+         ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await;
+    match stranded {
+        Ok(rows) if !rows.is_empty() => {
+            let names: Vec<&str> = rows.iter().map(String::as_str).collect();
+            error!(
+                "preflight: {} held position(s) are in an expired instrument — the custodian \
+                 resolves these (expiry/assignment), the OMS does not: {}",
+                names.len(),
+                sample(&names)
+            );
+        }
+        Ok(_) => {}
+        Err(e) => error!("preflight: could not check held expired positions: {e}"),
+    }
 }
 
 /// Fatal checks: the master catalog and the FK targets it depends on.

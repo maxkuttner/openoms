@@ -41,6 +41,11 @@ python3 scripts/seed_venues.py --source data/ISO10383_MIC.csv
 echo "→ seeding crypto exchange venues (synthetic, non-MIC)"
 psql_db "$ODS_DB" -f scripts/seed_crypto_venues.sql
 
+# After both venue seeders: calendars FK to venue, and the MIC registry has no
+# timezone, so this is the hand-curated source for expiry/close-time conversion.
+echo "→ seeding venue calendars (timezone + close time)"
+psql_db "$ODS_DB" -f scripts/seed_calendars.sql
+
 # Instruments are seeded on demand, broker-first (not here, not scheduled):
 # `make sync-broker BROKER=alpaca` creates the master instrument + broker_instrument
 # rows; data feeds then derive what they can price from the catalog. Or
