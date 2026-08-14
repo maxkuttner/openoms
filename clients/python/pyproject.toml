@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oms-client"
+version = "0.1.0"
+description = "Python client for the OMS trading API"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.31.0"]
+
+[project.optional-dependencies]
+# pandas is deliberately optional: the client is usable in a plain script without
+# it, and only `.to_pandas()` needs it.
+pandas = ["pandas>=2.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+oms = "oms_client.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["oms_client*"]
