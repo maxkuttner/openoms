@@ -71,6 +71,8 @@ mod fix;
         handlers::orders_submit,
         handlers::orders_cancel,
         handlers::get_order,
+        handlers::list_orders,
+        handlers::list_portfolios,
         handlers::get_portfolio_positions,
         handlers::create_allocations,
         handlers::list_allocations,
@@ -116,6 +118,7 @@ mod fix;
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         crate::positions::Position,
         Allocation, CreateAllocations, AllocationSplit, BlotterRow,
+        handlers::GrantedPortfolio,
         Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
@@ -536,6 +539,8 @@ async fn serve() {
         .route("/orders/submit", post(handlers::orders_submit))
         .route("/orders/cancel", post(handlers::orders_cancel))
         .route("/orders/:id", get(handlers::get_order))
+        .route("/orders", get(handlers::list_orders))
+        .route("/portfolios", get(handlers::list_portfolios))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
         .route(
             "/orders/:id/allocations",
