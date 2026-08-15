@@ -97,7 +97,15 @@ pub async fn seed_venues(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mics: Vec<String> = rows.iter().map(|r| r.mic.clone()).collect();
     let statuses: Vec<String> = rows.iter().map(|r| r.status.clone()).collect();
 
-    sqlx::raw_sql("SET ROLE mdm_master; SET search_path TO public;").execute(pool).await?;
+    // SET ROLE, the INSERT and RESET ROLE must run on the same connection: a
+    // pooled `&PgPool` checks out a (possibly different) connection per call,
+    // which could run the INSERT without mdm_master active, or return a
+    // connection to the pool with mdm_master still set for the next borrower.
+    let mut tx = pool.begin().await?;
+
+    sqlx::raw_sql("SET ROLE mdm_master; SET search_path TO public;")
+        .execute(&mut *tx)
+        .await?;
     let affected = sqlx::query(
         "INSERT INTO venue (code, name, country, city, mic, status) \
          SELECT code, name, NULLIF(country, ''), NULLIF(city, ''), NULLIF(mic, ''), status \
@@ -108,10 +116,12 @@ pub async fn seed_venues(pool: &PgPool) -> Result<u64, sqlx::Error> {
             mic = EXCLUDED.mic, status = EXCLUDED.status, updated_at = now()",
     )
     .bind(&codes).bind(&names).bind(&countries).bind(&cities).bind(&mics).bind(&statuses)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
-    sqlx::raw_sql("RESET ROLE;").execute(pool).await?;
+    sqlx::raw_sql("RESET ROLE;").execute(&mut *tx).await?;
+
+    tx.commit().await?;
 
     Ok(affected)
 }
@@ -154,19 +164,25 @@ mod tests {
     use super::*;
     use crate::setup::database::assets::MIC_CSV;
 
+    // MIC and OPERATING MIC are deliberately different per row (a segment MIC's
+    // operating MIC is its parent market) so a code/mic column swap in
+    // `parse_mic_csv` would fail `maps_registry_columns_onto_venue` instead of
+    // passing unnoticed.
     const SAMPLE: &str = "\"MIC\",\"OPERATING MIC\",\"OPRT/SGMT\",\"MARKET NAME-INSTITUTION DESCRIPTION\",\"LEGAL ENTITY NAME\",\"LEI\",\"MARKET CATEGORY CODE\",\"ACRONYM\",\"ISO COUNTRY CODE (ISO 3166)\",\"CITY\",\"WEBSITE\",\"STATUS\",\"CREATION DATE\",\"LAST UPDATE DATE\",\"LAST VALIDATION DATE\",\"EXPIRY DATE\",\"COMMENTS\"
-\"XNAS\",\"XNAS\",\"OPRT\",\"NASDAQ\",\"\",\"\",\"NSPD\",\"\",\"US\",\"NEW YORK\",\"\",\"ACTIVE\",\"\",\"\",\"\",\"\",\"\"
+\"XBOS\",\"XNAS\",\"SGMT\",\"NASDAQ BOSTON\",\"\",\"\",\"NSPD\",\"\",\"US\",\"NEW YORK\",\"\",\"ACTIVE\",\"\",\"\",\"\",\"\",\"\"
 \"XOLD\",\"XOLD\",\"OPRT\",\"DEFUNCT EXCHANGE\",\"\",\"\",\"NSPD\",\"\",\"US\",\"CHICAGO\",\"\",\"DELETED\",\"\",\"\",\"\",\"\",\"\"
-\"XNAS\",\"XNAS\",\"OPRT\",\"NASDAQ DUPLICATE\",\"\",\"\",\"NSPD\",\"\",\"US\",\"NEW YORK\",\"\",\"ACTIVE\",\"\",\"\",\"\",\"\",\"\"";
+\"XBOS\",\"XNAS\",\"SGMT\",\"NASDAQ BOSTON DUPLICATE\",\"\",\"\",\"NSPD\",\"\",\"US\",\"NEW YORK\",\"\",\"ACTIVE\",\"\",\"\",\"\",\"\",\"\"
+\"XBLK\",\"XBLK\",\"OPRT\",\"\",\"\",\"\",\"NSPD\",\"\",\"US\",\"NEW YORK\",\"\",\"ACTIVE\",\"\",\"\",\"\",\"\",\"\"";
 
     #[test]
     fn maps_registry_columns_onto_venue() {
         let rows = parse_mic_csv(SAMPLE).expect("parse");
         let nasdaq = &rows[0];
-        assert_eq!(nasdaq.code, "XNAS");
-        assert_eq!(nasdaq.name, "NASDAQ");
+        assert_eq!(nasdaq.code, "XBOS");
+        assert_eq!(nasdaq.name, "NASDAQ BOSTON");
         assert_eq!(nasdaq.country, "US");
         assert_eq!(nasdaq.city, "NEW YORK");
+        assert_eq!(nasdaq.mic, "XNAS", "mic should hold the OPERATING MIC, not a copy of code");
     }
 
     /// The registry keeps historical entries. A DELETED or EXPIRED MIC is a real
@@ -185,8 +201,17 @@ mod tests {
     #[test]
     fn keeps_only_the_first_of_a_duplicate_mic() {
         let rows = parse_mic_csv(SAMPLE).expect("parse");
-        assert_eq!(rows.iter().filter(|r| r.code == "XNAS").count(), 1);
-        assert_eq!(rows[0].name, "NASDAQ", "first occurrence should win");
+        assert_eq!(rows.iter().filter(|r| r.code == "XBOS").count(), 1);
+        assert_eq!(rows[0].name, "NASDAQ BOSTON", "first occurrence should win");
+    }
+
+    /// A blank market name falls back to the MIC code, matching the Python
+    /// seeder — a venue must never have an empty display name.
+    #[test]
+    fn falls_back_to_the_code_when_name_is_blank() {
+        let rows = parse_mic_csv(SAMPLE).expect("parse");
+        let blank = rows.iter().find(|r| r.code == "XBLK").expect("XBLK present");
+        assert_eq!(blank.name, "XBLK");
     }
 
     /// A header change in a future ISO release must fail loudly at parse time,
