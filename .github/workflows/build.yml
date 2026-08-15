@@ -22,3 +22,56 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  database:
+    name: database init/migrate
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: ods
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --quiet
+
+      - name: init on an empty server succeeds
+        run: cargo run --quiet -- database init --fixtures
+
+      - name: init a second time fails loudly
+        run: |
+          if cargo run --quiet -- database init; then
+            echo "expected the second init to fail, but it succeeded"
+            exit 1
+          fi
+
+      - name: migrate is idempotent
+        run: |
+          cargo run --quiet -- database migrate
+          out=$(cargo run --quiet -- database migrate)
+          echo "$out"
+          echo "$out" | grep -q "applied 0 migration" \
+            || { echo "second migrate was not a no-op"; exit 1; }
+
+      - name: status reports no pending migrations
+        run: |
+          out=$(cargo run --quiet -- database status)
+          echo "$out"
+          echo "$out" | grep -q "0 pending" || { echo "unexpected pending"; exit 1; }
+
+      - name: database-backed tests
+        run: cargo test -- --ignored
