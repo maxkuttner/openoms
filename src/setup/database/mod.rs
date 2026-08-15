@@ -33,6 +33,22 @@ pub async fn init(
     let cfg = config::resolve(o);
     let roles = config::resolve_roles(mdm, oms);
 
+    // Same rule `serve()` enforces before connecting: a shipped default password
+    // is fine on a laptop and never anywhere else. `init` must check this too —
+    // otherwise it happily *creates* roles with the default password on a remote
+    // server, and the `serve()` guard only catches it after the fact.
+    if !cfg.is_loopback()
+        && (roles.mdm_password == config::DEFAULT_ROLE_PASSWORD
+            || roles.oms_password == config::DEFAULT_ROLE_PASSWORD)
+    {
+        return Err(format!(
+            "error: refusing to create roles with the built-in default password on non-loopback host {}:{}\n\
+             \x20        pass --mdm-password/--oms-password, or set MDM_MASTER_PASSWORD/OMS_USER_PASSWORD",
+            cfg.host, cfg.port
+        )
+        .into());
+    }
+
     let existing = provision::inspect(&cfg).await?;
     if !existing.is_empty() {
         return Err(already_initialized(&cfg, &existing).into());
@@ -74,8 +90,20 @@ pub async fn migrate(o: PostgresOverrides) -> Fallible {
 
 /// Destroy the database. Roles survive — they are cluster-wide and may own
 /// objects in other databases.
-pub async fn drop(o: PostgresOverrides) -> Fallible {
+///
+/// `yes` must be set to drop a non-loopback target: `DROP DATABASE … WITH
+/// (FORCE)` terminates live sessions, so this needs the same friction a
+/// destructive prod command always needs. Loopback stays frictionless — that is
+/// the whole point of a local dev database.
+pub async fn drop(o: PostgresOverrides, yes: bool) -> Fallible {
     let cfg = config::resolve(o);
+    if !cfg.is_loopback() && !yes {
+        return Err(format!(
+            "error: refusing to drop database '{}' on {}:{} without --yes",
+            cfg.database, cfg.host, cfg.port
+        )
+        .into());
+    }
     provision::drop_database(&cfg).await?;
     println!("dropped database {} (roles kept)", cfg.database);
     Ok(())
@@ -94,8 +122,15 @@ pub async fn status(o: PostgresOverrides) -> Fallible {
         return Ok(());
     }
 
+    // Read-only inspection must never create anything — unlike `init`/`migrate`,
+    // which both call `ensure_tracking`. Pointed at a stale POSTGRES_DATABASE,
+    // `ensure_tracking` would silently plant an `oms` schema in someone else's
+    // database; `status` just reports what it finds.
     let pool = PgPool::connect(&cfg.url()).await?;
-    migrate::ensure_tracking(&pool).await?;
+    if !migrate::is_migrated(&pool).await? {
+        println!("\nnot migrated — run `oms database init`");
+        return Ok(());
+    }
     let applied = migrate::applied_count(&pool).await?;
     let pending = migrate::pending(&pool).await?;
     println!("migrations: {applied} applied, {} pending", pending.len());

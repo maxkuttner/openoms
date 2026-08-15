@@ -86,10 +86,37 @@ impl PostgresConfig {
         )
     }
 
+    /// Connection URL for the runtime pool: always `oms_user`, host/port/database
+    /// taken from this config. This is the single place the runtime URL is built —
+    /// `serve()` and `oms setup sync-broker` (via `setup::database_url`) both call
+    /// it, so they cannot drift apart the way they did before. The password is
+    /// percent-encoded so a role password containing `@`, `/`, `:` or `#` cannot
+    /// corrupt the URL.
+    pub fn runtime_url(&self, oms_password: &str) -> String {
+        format!(
+            "postgres://oms_user:{}@{}:{}/{}?sslmode=disable",
+            percent_encode_userinfo(oms_password), self.host, self.port, self.database
+        )
+    }
+
     /// Is this server on the local machine? Gates the default-password check.
     pub fn is_loopback(&self) -> bool {
         matches!(self.host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
     }
+}
+
+/// Percent-encode a string for use as URL userinfo (RFC 3986). No dependency: the
+/// safe set is small and fixed, so a byte-for-byte match against it is simpler
+/// than pulling in a crate for it.
+fn percent_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Environment keys this change removed, each with what replaced it.
@@ -98,7 +125,7 @@ impl PostgresConfig {
 /// from before the rename would otherwise be ignored silently, the defaults would
 /// apply, and the failure would surface as an authentication error against the
 /// wrong credentials.
-const REMOVED_KEYS: [(&str, &str); 8] = [
+const REMOVED_KEYS: [(&str, &str); 9] = [
     ("DATABASE_URL", "the URL is built from POSTGRES_* now"),
     ("ODS_DB", "use POSTGRES_DATABASE"),
     ("DB_HOST", "use POSTGRES_HOST"),
@@ -107,6 +134,7 @@ const REMOVED_KEYS: [(&str, &str); 8] = [
     ("DB_USER", "the runtime pool always connects as oms_user"),
     ("DB_PASSWORD", "use OMS_USER_PASSWORD"),
     ("ADMIN_USER", "use POSTGRES_USERNAME"),
+    ("ADMIN_PASSWORD", "use POSTGRES_PASSWORD"),
 ];
 
 /// One message per obsolete key that is still set. Empty means the environment is
@@ -134,13 +162,19 @@ mod tests {
         ] {
             std::env::remove_var(k);
         }
+        // Also scrub the removed keys themselves — otherwise a developer's shell
+        // (e.g. one still exporting DB_HOST from before this change) makes these
+        // tests fail nondeterministically instead of testing the pure function.
+        for (k, _) in REMOVED_KEYS {
+            std::env::remove_var(k);
+        }
     }
 
     /// Nothing configured at all must still produce a usable localhost config —
     /// that is what makes `.env` optional.
     #[test]
     fn falls_back_to_defaults() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         let c = resolve(PostgresOverrides::default());
         assert_eq!(c.host, "localhost");
@@ -152,7 +186,7 @@ mod tests {
     /// Environment beats the built-in default.
     #[test]
     fn env_overrides_default() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         std::env::set_var("POSTGRES_HOST", "db.internal");
         std::env::set_var("POSTGRES_PORT", "6543");
@@ -165,7 +199,7 @@ mod tests {
     /// An explicit flag beats the environment — the whole point of the tier order.
     #[test]
     fn flag_overrides_env() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         std::env::set_var("POSTGRES_HOST", "from-env");
         let c = resolve(PostgresOverrides {
@@ -180,7 +214,7 @@ mod tests {
     /// somewhere unexpected.
     #[test]
     fn falls_back_on_unparseable_port() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         std::env::set_var("POSTGRES_PORT", "not-a-number");
         let c = resolve(PostgresOverrides::default());
@@ -190,7 +224,7 @@ mod tests {
 
     #[test]
     fn role_passwords_follow_the_same_tiers() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         assert_eq!(resolve_roles(None, None).oms_password, DEFAULT_ROLE_PASSWORD);
         std::env::set_var("OMS_USER_PASSWORD", "from-env");
@@ -220,6 +254,30 @@ mod tests {
         assert!(sample().url().ends_with("/ods?sslmode=disable"));
     }
 
+    /// The runtime URL is always oms_user, regardless of the configured
+    /// superuser — this is what lets `serve()` and `database_url()` share it.
+    #[test]
+    fn runtime_url_always_connects_as_oms_user() {
+        let url = sample().runtime_url("secret");
+        assert!(url.starts_with("postgres://oms_user:secret@"));
+        assert!(url.ends_with("/ods?sslmode=disable"));
+    }
+
+    /// A password containing URL-special characters must not corrupt the URL —
+    /// each such character is percent-encoded rather than passed through raw.
+    #[test]
+    fn runtime_url_percent_encodes_special_characters() {
+        let url = sample().runtime_url("p@ss/w:o#rd");
+        assert!(url.contains("oms_user:p%40ss%2Fw%3Ao%23rd@"), "got {url}");
+    }
+
+    /// ADMIN_USER's partner key must be listed too, or a stale .env with only
+    /// ADMIN_PASSWORD set goes undetected.
+    #[test]
+    fn removed_keys_include_admin_password() {
+        assert!(REMOVED_KEYS.iter().any(|(k, _)| *k == "ADMIN_PASSWORD"));
+    }
+
     fn sample() -> PostgresConfig {
         PostgresConfig {
             host: "localhost".into(),
@@ -235,7 +293,7 @@ mod tests {
     /// replacement turns that into one obvious line.
     #[test]
     fn reports_removed_keys_with_their_replacements() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         std::env::remove_var("DB_PASSWORD");
         assert!(check_removed_env_keys().is_empty());

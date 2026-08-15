@@ -256,6 +256,10 @@ enum DatabaseCmd {
     Drop {
         #[command(flatten)]
         db: DbArgs,
+        /// Required to drop a non-loopback target. Loopback (localhost/127.0.0.1)
+        /// needs no confirmation.
+        #[arg(long)]
+        yes: bool,
     },
     /// Show what exists and what is pending.
     Status {
@@ -283,7 +287,7 @@ async fn main() {
                     setup::database::init(db.into(), mdm_password, oms_password, fixtures).await
                 }
                 DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
-                DatabaseCmd::Drop { db } => setup::database::drop(db.into()).await,
+                DatabaseCmd::Drop { db, yes } => setup::database::drop(db.into(), yes).await,
                 DatabaseCmd::Status { db } => setup::database::status(db.into()).await,
             };
             if let Err(e) = result {
@@ -302,8 +306,19 @@ async fn serve() {
 
     // No provisioning here. `oms database init` is the only thing that creates or
     // migrates a database, so starting the server can never mutate one.
-    for problem in setup::database::config::check_removed_env_keys() {
-        error!("config: {problem}");
+    //
+    // Fatal, not advisory: this is the only mitigation against a stale `.env`
+    // silently connecting to the wrong database. A key that used to gate the
+    // connection (e.g. DB_HOST) can be set to something other than what
+    // POSTGRES_HOST resolves to, and logging-then-continuing means the server
+    // starts up looking healthy while talking to the wrong host.
+    let removed = setup::database::config::check_removed_env_keys();
+    if !removed.is_empty() {
+        for problem in &removed {
+            error!("config: {problem}");
+        }
+        error!("refusing to start with obsolete .env keys still set — remove them and retry");
+        std::process::exit(1);
     }
 
     let cfg = setup::database::config::resolve(Default::default());
@@ -318,15 +333,12 @@ async fn serve() {
              against non-loopback host {}",
             cfg.host
         );
-        return;
+        std::process::exit(1);
     }
 
     // The runtime pool is oms_user — least privilege, and it no longer has its own
     // host/port/database settings to drift from the ones init used.
-    let runtime_url = format!(
-        "postgres://oms_user:{}@{}:{}/{}?sslmode=disable",
-        roles.oms_password, cfg.host, cfg.port, cfg.database
-    );
+    let runtime_url = cfg.runtime_url(&roles.oms_password);
     info!("Connecting to {}:{}/{} as oms_user", cfg.host, cfg.port, cfg.database);
     let pool = match PgPool::connect(&runtime_url).await {
         Ok(pool) => pool,

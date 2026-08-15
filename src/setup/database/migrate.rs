@@ -46,6 +46,17 @@ pub async fn ensure_tracking(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Whether the tracking table exists, without creating it. `status` uses this —
+/// unlike `init`/`migrate`, a read-only inspection must never issue `CREATE
+/// SCHEMA`/`CREATE TABLE`.
+pub async fn is_migrated(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let found: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public._mdm_migrations')::text")
+            .fetch_one(pool)
+            .await?;
+    Ok(found.is_some())
+}
+
 async fn is_applied(pool: &PgPool, schema: &str, filename: &str) -> Result<bool, sqlx::Error> {
     let found: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM public._mdm_migrations WHERE target = $1 AND filename = $2",
