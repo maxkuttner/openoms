@@ -60,6 +60,9 @@ dataprovider = { path = "crates/dataprovider" }
 # CLI (oms setup universe …)
 clap = { version = "4", features = ["derive"] }
 
+# Embed SQL and CSV assets into the binary
+include_dir = "0.7"
+
 # FIX connectivity (IBKR 4.2, Binance 4.4) — Rust bindings over the QuickFIX C++
 # engine. It owns the session layer (logon/heartbeat/seqnum/resend+gap-fill) and
 # TLS; we implement its ApplicationCallback. Needs cmake + a C++ compiler to build.

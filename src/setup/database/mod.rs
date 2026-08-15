@@ -6,3 +6,4 @@
 //! from the install requirements.
 
 pub mod config;
+pub mod assets;
