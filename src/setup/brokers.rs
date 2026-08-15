@@ -148,8 +148,13 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     let (summary, ids) = catalog::upsert_catalog(&pool, &defs, &enrichers).await?;
     info!(
-        "master: upserted={} skipped_fk={} skipped_expired={} derivatives={} enriched={}",
-        summary.upserted, summary.skipped_fk(), summary.skipped_expired, summary.derivatives, summary.enriched
+        "master: upserted={} skipped_fk={} skipped_expired={} derivatives={} dated={} enriched={}",
+        summary.upserted,
+        summary.skipped_fk(),
+        summary.skipped_expired,
+        summary.derivatives,
+        summary.dated,
+        summary.enriched
     );
 
     // 2) Attach the broker routing mapping for every instrument that landed.

@@ -1,6 +1,6 @@
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
-use sqlx::{query_scalar, Postgres, QueryBuilder, Row};
+use sqlx::{query_scalar, PgPool, Postgres, QueryBuilder, Row};
 use axum::{
     extract::Extension,
     extract::Path,
@@ -83,32 +83,221 @@ pub async fn health() -> &'static str {
 /// resolved from the portfolio's `default_account_id`; when present it overrides.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SubmitOrderRequest {
+    /// Client-generated UUID; also the idempotency key (a repeat is a 409).
+    #[schema(example = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b")]
     pub order_id: String,
+    /// Your own reference string, echoed back on updates.
+    #[schema(example = "my-ref-001")]
     pub client_order_id: String,
+    /// Portfolio UUID the order books against.
+    #[schema(example = "b2c3d4e5-6f70-4812-93a4-556677889900")]
     pub portfolio_id: String,
+    /// Optional account UUID; omit to use the portfolio's default account.
+    #[schema(example = json!(null))]
     pub account_id: Option<String>,
-    pub instrument_id: String,
+    /// Instrument surrogate key (BIGINT as string), not a UUID. Omit when naming the
+    /// instrument by `symbol` instead.
+    #[schema(example = json!(null))]
+    pub instrument_id: Option<String>,
+    /// The instrument's venue-native symbol, as an alternative to `instrument_id`.
+    /// Accepts the `Symbol@Venue` shorthand (`SPY260918C00770000@OPRA`) or a bare
+    /// symbol qualified by the `venue` field.
+    #[schema(example = "SPY260918C00770000@OPRA")]
+    pub symbol: Option<String>,
+    /// Venue (MIC) qualifying `symbol`. Omit when `symbol` already carries `@VENUE`,
+    /// or when the symbol is unique across venues.
+    #[schema(example = json!(null))]
+    pub venue: Option<String>,
     pub side: OrderSide,
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
+    /// Required for `limit` orders; omit for `market`.
+    #[schema(example = json!(null))]
     pub limit_price: Option<f64>,
+    #[schema(example = 1.0)]
     pub quantity: f64,
 }
 
 impl SubmitOrderRequest {
-    fn into_command(self, account_id: String) -> SubmitOrder {
+    /// `instrument_id` is the already-resolved surrogate key: the request may have
+    /// named the instrument by symbol, so the caller resolves first and the command
+    /// only ever carries the id.
+    fn into_command(self, account_id: String, instrument_id: i64) -> SubmitOrder {
         SubmitOrder {
             order_id: self.order_id,
             client_order_id: self.client_order_id,
             portfolio_id: self.portfolio_id,
             account_id,
-            instrument_id: self.instrument_id,
+            instrument_id: instrument_id.to_string(),
             side: self.side,
             order_type: self.order_type,
             time_in_force: self.time_in_force,
             limit_price: self.limit_price,
             quantity: self.quantity,
         }
+    }
+}
+
+/// Which entitlement a route demands on the portfolio an order books against.
+#[derive(Clone, Copy)]
+enum OrderPermission {
+    View,
+    Trade,
+}
+
+impl OrderPermission {
+    /// The grant column. A fixed `&'static str` per variant — never caller input —
+    /// so interpolating it into SQL cannot carry anything injectable.
+    fn column(self) -> &'static str {
+        match self {
+            Self::View => "can_view",
+            Self::Trade => "can_trade",
+        }
+    }
+}
+
+/// Assert this principal may act on the given order, by way of its portfolio.
+///
+/// Orders are reachable by UUID alone, so without this any valid trading token could
+/// read or cancel any order in the system, including another principal's. The grant
+/// lives on the portfolio, matching `get_portfolio_positions`.
+///
+/// A missing order is 404 and an unentitled one is 403 — deliberately distinguished.
+/// Collapsing both to 404 would hide typos behind "not found"; order ids are UUIDs, so
+/// confirming one exists tells an attacker who already guessed it nothing new.
+async fn require_order_grant(
+    pool: &PgPool,
+    principal_id: Uuid,
+    order_id: Uuid,
+    permission: OrderPermission,
+) -> Result<(), ApiError> {
+    let granted: Option<bool> = query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant g \
+          WHERE g.portfolio_id = os.portfolio_id AND g.principal_id = $2 \
+            AND g.{} = true) \
+         FROM order_state os WHERE os.order_id = $1",
+        permission.column()
+    ))
+    .bind(order_id)
+    .bind(principal_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to check grant: {:?}", err),
+    })?;
+
+    match granted {
+        Some(true) => Ok(()),
+        Some(false) => Err(ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "unauthorized".to_string(),
+        }),
+        None => Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "order not found".to_string(),
+        }),
+    }
+}
+
+/// Split the `Symbol@Venue` shorthand into its parts. `None` when there is no `@`.
+///
+/// `Symbol@Venue` is already this codebase's name for instrument identity (see
+/// `adapters::BrokerInstrument` and migration 0017); this only makes it addressable
+/// on the wire. Splits on the last `@` so a symbol containing one is still reachable
+/// by qualifying it — no venue code contains `@`.
+fn split_symbol_at_venue(symbol: &str) -> Option<(&str, &str)> {
+    let (sym, venue) = symbol.rsplit_once('@')?;
+    (!sym.is_empty() && !venue.is_empty()).then_some((sym, venue))
+}
+
+/// Resolve whichever instrument reference the request carried into the surrogate key.
+///
+/// Three accepted forms — `instrument_id`, `symbol` + `venue`, or `symbol` as
+/// `Symbol@Venue` — because `instrument` is uniquely keyed on `(symbol, venue)`, so a
+/// symbol plus its venue is as precise as the id and far easier to write by hand.
+///
+/// Only ACTIVE rows resolve, matching `symbology_resolver`. That means an expired
+/// contract fails here with `instrument not found` rather than reaching the
+/// `instrument not active` check below — the same refusal, one step earlier.
+async fn resolve_instrument_ref(
+    pool: &PgPool,
+    req: &SubmitOrderRequest,
+) -> Result<i64, ApiError> {
+    let bad_request = |message: &str| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: message.to_string(),
+    };
+
+    // The id wins when given: it is unambiguous, and honouring it keeps every existing
+    // caller working unchanged.
+    if let Some(id) = req.instrument_id.as_deref().filter(|s| !s.is_empty()) {
+        return id.parse().map_err(|_| bad_request("instrument_id must be a BIGINT"));
+    }
+
+    let Some(symbol) = req.symbol.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(bad_request("one of instrument_id or symbol is required"));
+    };
+
+    // A venue in both places is a contradiction, not something to silently pick from —
+    // resolving one over the other would trade on a venue the caller did not name.
+    let (symbol, venue) = match (split_symbol_at_venue(symbol), req.venue.as_deref()) {
+        (Some(_), Some(v)) if !v.is_empty() => {
+            return Err(bad_request(
+                "venue given both in symbol (SYMBOL@VENUE) and in the venue field",
+            ))
+        }
+        (Some((s, v)), _) => (s, Some(v)),
+        (None, v) => (symbol, v.filter(|v| !v.is_empty())),
+    };
+
+    if let Some(venue) = venue {
+        return query_scalar::<_, i64>(
+            "SELECT id FROM instrument WHERE symbol = $1 AND venue = $2 AND status = 'ACTIVE'",
+        )
+        .bind(symbol)
+        .bind(venue)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to resolve instrument: {:?}", err),
+        })?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: "instrument not found".to_string(),
+        });
+    }
+
+    // Unqualified: usable only when the symbol names exactly one instrument. Options
+    // always do (one venue, OPRA); equities often do not, because the same ticker is
+    // listed under several exchange labels and each maps to a distinct MIC.
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, venue FROM instrument WHERE symbol = $1 AND status = 'ACTIVE' ORDER BY venue",
+    )
+    .bind(symbol)
+    .fetch_all(pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to resolve instrument: {:?}", err),
+    })?;
+
+    match rows.as_slice() {
+        [(id, _)] => Ok(*id),
+        [] => Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: "instrument not found".to_string(),
+        }),
+        // Name the candidates: the caller cannot guess which venues exist, and the fix
+        // is mechanical once they can see them.
+        many => Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!(
+                "symbol {symbol} is ambiguous across venues: [{}] — qualify it as {symbol}@VENUE",
+                many.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        }),
     }
 }
 
@@ -124,7 +313,7 @@ impl SubmitOrderRequest {
         (status = 502, description = "Broker rejected the order"),
         (status = 503, description = "No broker adapter configured"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn orders_submit(
     State(state): State<AppState>,
@@ -166,13 +355,12 @@ pub async fn orders_submit(
         })?,
     };
     // instrument.id is a BIGINT surrogate key (the mdm master instrument), not a UUID.
-    let instrument_id_bigint: i64 = req.instrument_id.parse().map_err(|_| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        message: "instrument_id must be a BIGINT".to_string(),
-    })?;
+    // The request may have named the instrument by symbol instead; either way the
+    // command below carries only the id.
+    let instrument_id_bigint = resolve_instrument_ref(&pool, &req).await?;
 
     // Boundary → domain: fold the resolved account into the pure SubmitOrder command.
-    let cmd = req.into_command(account_id.to_string());
+    let cmd = req.into_command(account_id.to_string(), instrument_id_bigint);
 
     // Pre-flight: resolve the account's routing coordinates from its broker_connection
     // (broker_code, environment) + the custodial ref, so we can validate the instrument
@@ -624,13 +812,14 @@ pub async fn orders_submit(
         (status = 404, description = "Order not found"),
         (status = 409, description = "Order state version mismatch"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn orders_cancel(
     State(app_state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Json(req): Json<commands::CancelOrder>
 ) -> Result<Response, ApiError>{
-    info!(?req, "cancel order received");
+    info!(?req, principal_id = %auth.principal_id, "cancel order received");
 
     let pool = app_state.pool().clone();
     let event_store = OrderEventStore::new(pool.clone());
@@ -639,6 +828,9 @@ pub async fn orders_cancel(
         status: StatusCode::BAD_REQUEST,
         message: "order_id must be a UUID".to_string(),
     })?;
+
+    // Cancelling is acting on the position, so it takes can_trade rather than can_view.
+    require_order_grant(&pool, auth.principal_id, order_id, OrderPermission::Trade).await?;
 
     // start transaction
     let mut tx = pool.begin().await.map_err(|err| ApiError {
@@ -888,16 +1080,19 @@ pub async fn orders_cancel(
         (status = 400, description = "Invalid UUID"),
         (status = 404, description = "Order not found"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn get_order(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(order_id_str): Path<String>,
 ) -> Result<Json<OrderAggregateState>, ApiError> {
     let order_id = Uuid::parse_str(&order_id_str).map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
         message: "id must be a UUID".to_string(),
     })?;
+
+    require_order_grant(state.pool(), auth.principal_id, order_id, OrderPermission::View).await?;
 
     let row = sqlx::query(
         r#"
@@ -951,6 +1146,69 @@ pub async fn get_order(
     Ok(Json(order))
 }
 
+/// One portfolio the caller is entitled to, with the entitlement itself.
+///
+/// The flags are returned rather than filtered on, so a client can grey out what it
+/// cannot do instead of discovering it from a 403 mid-order.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct GrantedPortfolio {
+    pub portfolio_id: String,
+    pub code: String,
+    pub name: String,
+    pub status: String,
+    pub base_currency: Option<String>,
+    pub can_trade: bool,
+    pub can_view: bool,
+    pub can_allocate: bool,
+}
+
+/// The portfolios this principal may act on.
+///
+/// Exists so a trading token is self-sufficient: every other trading route needs a
+/// portfolio UUID, and without this the caller has to be handed one out of band (or
+/// read the admin surface, which is exactly the authority a trading token must not
+/// have). Scope is the principal's own grants — there is no filter to widen it.
+#[utoipa::path(
+    get, path = "/portfolios", tag = "orders",
+    responses((status = 200, description = "OK", body = [GrantedPortfolio])),
+    security(("basic_auth" = []), ("bearer_token" = []))
+)]
+pub async fn list_portfolios(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<GrantedPortfolio>>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT p.id, p.code, p.name, p.status, p.base_currency, \
+                g.can_trade, g.can_view, g.can_allocate \
+         FROM principal_portfolio_grant g \
+         JOIN portfolio p ON p.id = g.portfolio_id \
+         WHERE g.principal_id = $1 \
+         ORDER BY p.code",
+    )
+    .bind(auth.principal_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to list portfolios: {:?}", err),
+    })?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| GrantedPortfolio {
+                portfolio_id: r.get::<Uuid, _>("id").to_string(),
+                code: r.get("code"),
+                name: r.get("name"),
+                status: r.get("status"),
+                base_currency: r.get("base_currency"),
+                can_trade: r.get("can_trade"),
+                can_view: r.get("can_view"),
+                can_allocate: r.get("can_allocate"),
+            })
+            .collect(),
+    ))
+}
+
 #[utoipa::path(
     get, path = "/portfolios/{id}/positions", tag = "orders",
     params(("id" = Uuid, Path, description = "Portfolio ID")),
@@ -958,7 +1216,7 @@ pub async fn get_order(
         (status = 200, description = "OK", body = [Position]),
         (status = 403, description = "No view grant for principal/portfolio"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn get_portfolio_positions(
     State(state): State<AppState>,
@@ -1076,7 +1334,7 @@ pub struct Allocation {
         (status = 404, description = "Order not found"),
         (status = 422, description = "Nothing filled, over-allocation, or invalid target"),
     ),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn create_allocations(
     State(state): State<AppState>,
@@ -1206,7 +1464,7 @@ pub async fn create_allocations(
     get, path = "/orders/{id}/allocations", tag = "orders",
     params(("id" = Uuid, Path, description = "Order ID")),
     responses((status = 200, description = "OK", body = [Allocation])),
-    security(("basic_auth" = []))
+    security(("basic_auth" = []), ("bearer_token" = []))
 )]
 pub async fn list_allocations(
     State(state): State<AppState>,
@@ -1281,16 +1539,24 @@ pub struct BlotterRow {
     pub updated_at: DateTime<Utc>,
 }
 
-#[utoipa::path(
-    get, path = "/admin/orders", tag = "admin",
-    params(BlotterFilter),
-    responses((status = 200, description = "OK", body = [BlotterRow])),
-    security(("bearer_token" = []))
-)]
-pub async fn get_orders_blotter(
-    State(state): State<AppState>,
-    Query(f): Query<BlotterFilter>,
-) -> Result<Json<Vec<BlotterRow>>, ApiError> {
+/// Who a blotter query is allowed to see.
+///
+/// The admin blotter sees everything and may filter by principal; a trading token
+/// sees only what its principal is granted. Making that a parameter of one query —
+/// rather than two similar queries — is what keeps the two views from drifting into
+/// disagreeing about the same order.
+enum BlotterScope {
+    /// Oversight: every order, `principal_id` usable as a filter.
+    All,
+    /// This principal's entitled portfolios only. Not a filter — a ceiling.
+    GrantedTo(Uuid),
+}
+
+async fn load_blotter(
+    state: &AppState,
+    f: &BlotterFilter,
+    scope: BlotterScope,
+) -> Result<Vec<BlotterRow>, ApiError> {
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT os.order_id, os.principal_id, p.code AS principal_code, \
                 os.portfolio_id, pf.code AS portfolio_code, os.account_id, \
@@ -1308,10 +1574,27 @@ pub async fn get_orders_blotter(
          LEFT JOIN instrument i ON i.id::text = os.instrument_id \
          WHERE TRUE",
     );
+    // Scope first, so it can never be widened by a filter appended after it.
+    match scope {
+        BlotterScope::All => {
+            if let Some(v) = f.principal_id { qb.push(" AND os.principal_id = ").push_bind(v); }
+        }
+        // EXISTS rather than a join: an order must sit in a portfolio this principal
+        // may view, and a join would duplicate rows if the grant model ever allows
+        // more than one matching grant per portfolio.
+        BlotterScope::GrantedTo(principal_id) => {
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM principal_portfolio_grant g \
+                   WHERE g.portfolio_id = os.portfolio_id AND g.can_view = true \
+                     AND g.principal_id = ",
+            )
+            .push_bind(principal_id)
+            .push(")");
+        }
+    }
     if let Some(v) = &f.status { qb.push(" AND os.status = ").push_bind(v.clone()); }
     if let Some(v) = f.portfolio_id { qb.push(" AND os.portfolio_id = ").push_bind(v); }
     if let Some(v) = &f.instrument_id { qb.push(" AND os.instrument_id = ").push_bind(v.clone()); }
-    if let Some(v) = f.principal_id { qb.push(" AND os.principal_id = ").push_bind(v); }
     if let Some(v) = &f.broker_connection_code {
         qb.push(" AND os.broker_connection_code = ").push_bind(v.clone());
     }
@@ -1352,7 +1635,40 @@ pub async fn get_orders_blotter(
             updated_at: r.get("updated_at"),
         })
         .collect();
-    Ok(Json(out))
+    Ok(out)
+}
+
+#[utoipa::path(
+    get, path = "/admin/orders", tag = "admin",
+    params(BlotterFilter),
+    responses((status = 200, description = "OK", body = [BlotterRow])),
+    security(("bearer_token" = []))
+)]
+pub async fn get_orders_blotter(
+    State(state): State<AppState>,
+    Query(f): Query<BlotterFilter>,
+) -> Result<Json<Vec<BlotterRow>>, ApiError> {
+    load_blotter(&state, &f, BlotterScope::All).await.map(Json)
+}
+
+/// The caller's own blotter.
+///
+/// Same rows and same filters as the admin blotter, bounded to the portfolios this
+/// principal may view. `principal_id` in the query string is ignored rather than
+/// honoured — the authenticated identity is the only thing that decides scope, so
+/// passing someone else's id does nothing.
+#[utoipa::path(
+    get, path = "/orders", tag = "orders",
+    params(BlotterFilter),
+    responses((status = 200, description = "OK", body = [BlotterRow])),
+    security(("basic_auth" = []), ("bearer_token" = []))
+)]
+pub async fn list_orders(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Query(f): Query<BlotterFilter>,
+) -> Result<Json<Vec<BlotterRow>>, ApiError> {
+    load_blotter(&state, &f, BlotterScope::GrantedTo(auth.principal_id)).await.map(Json)
 }
 
 // Function to issue an api error
@@ -1434,10 +1750,58 @@ fn domain_event_to_new_event(event: &OrderDomainEvent) -> Result<NewOrderEvent, 
         event_type: event.event_type.as_str().to_string(),
         actor: event.actor.clone(),
         payload,
-        correlation_id: None, // need to be defined 
+        correlation_id: None, // need to be defined
         causation_id: None,   // to be provided by the client -> why was command sent
         schema_version: 0,    // indicate the schema version of the payload
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The case the shorthand exists for: an OSI symbol qualified by its venue.
+    #[test]
+    fn splits_symbol_at_venue() {
+        assert_eq!(
+            split_symbol_at_venue("SPY260918C00770000@OPRA"),
+            Some(("SPY260918C00770000", "OPRA"))
+        );
+        assert_eq!(split_symbol_at_venue("AAPL@XNAS"), Some(("AAPL", "XNAS")));
+    }
+
+    /// No `@` means the whole string is the symbol — the caller either qualified it
+    /// with the `venue` field or is relying on it being unique.
+    #[test]
+    fn unqualified_symbol_does_not_split() {
+        assert_eq!(split_symbol_at_venue("SPY260918C00770000"), None);
+        assert_eq!(split_symbol_at_venue("BTCUSDT"), None);
+    }
+
+    /// Splitting on the *last* `@` keeps a symbol that itself contains one reachable:
+    /// no venue code contains `@`, so the trailing segment is always the venue.
+    #[test]
+    fn splits_on_the_last_at() {
+        assert_eq!(split_symbol_at_venue("WEIRD@SYM@XNAS"), Some(("WEIRD@SYM", "XNAS")));
+    }
+
+    /// A dangling `@` names neither a symbol nor a venue. Declining here means the
+    /// caller gets "one of instrument_id or symbol is required" or a not-found, rather
+    /// than a lookup on an empty string.
+    #[test]
+    fn declines_half_empty_forms() {
+        assert_eq!(split_symbol_at_venue("@OPRA"), None);
+        assert_eq!(split_symbol_at_venue("SPY@"), None);
+        assert_eq!(split_symbol_at_venue("@"), None);
+    }
+
+    /// The grant column is chosen by the route, never by the caller — these two fixed
+    /// strings are the only things ever interpolated into the grant query.
+    #[test]
+    fn order_permission_maps_to_grant_column() {
+        assert_eq!(OrderPermission::View.column(), "can_view");
+        assert_eq!(OrderPermission::Trade.column(), "can_trade");
+    }
 }
 
 

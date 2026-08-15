@@ -1471,6 +1471,16 @@ pub struct BackfillResult {
     pub unresolved: i64,
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ExpirySweepResult {
+    /// Contracts whose UTC `expires_at` was derived or corrected from the venue
+    /// calendar. Non-zero on the first run after seeding a calendar, or after
+    /// correcting one; zero on a steady-state run.
+    pub recomputed: u64,
+    /// Instruments moved from ACTIVE to EXPIRED.
+    pub expired: u64,
+}
+
 fn map_resolve_error(err: ResolveError) -> AdminError {
     match err {
         ResolveError::Db(e) => AdminError {
@@ -1550,6 +1560,24 @@ pub async fn backfill_symbology(
         }
     }
     Ok(Json(result))
+}
+
+/// Run the instrument expiry pass now, instead of waiting for the hourly tick.
+///
+/// Same function the background job calls, so an on-demand run and a scheduled one
+/// cannot diverge. Useful right after seeding a calendar (every dated contract gets
+/// its instant immediately) and for confirming a correction took effect.
+#[utoipa::path(
+    post, path = "/admin/instruments/expiry-sweep", tag = "admin",
+    responses((status = 200, description = "Expiry sweep summary", body = ExpirySweepResult)),
+    security(("bearer_token" = []))
+)]
+pub async fn expiry_sweep(
+    State(state): State<AppState>,
+) -> Result<Json<ExpirySweepResult>, AdminError> {
+    info!("admin expiry sweep");
+    let (recomputed, expired) = crate::expiry::run_once(state.pool()).await.map_err(map_db_error)?;
+    Ok(Json(ExpirySweepResult { recomputed, expired }))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: oms-client
+Version: 0.1.0
+Summary: Python client for the OMS trading API
+Requires-Python: >=3.9
+Requires-Dist: requests>=2.31.0
+Provides-Extra: pandas
+Requires-Dist: pandas>=2.0; extra == "pandas"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"

@@ -45,7 +45,7 @@ use dotenvy::dotenv;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber;
 use utoipa::OpenApi;
-use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 mod kafka;
 mod execution;
 mod alpaca_stream;
@@ -60,6 +60,7 @@ mod binance_feed;
 mod bybit_feed;
 mod feeds;
 mod preflight;
+mod expiry;
 mod fix;
 
 #[derive(OpenApi)]
@@ -70,6 +71,8 @@ mod fix;
         handlers::orders_submit,
         handlers::orders_cancel,
         handlers::get_order,
+        handlers::list_orders,
+        handlers::list_portfolios,
         handlers::get_portfolio_positions,
         handlers::create_allocations,
         handlers::list_allocations,
@@ -109,11 +112,13 @@ mod fix;
         admin::list_feeds,
         admin::resolve_symbology,
         admin::backfill_symbology,
+        admin::expiry_sweep,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         crate::positions::Position,
         Allocation, CreateAllocations, AllocationSplit, BlotterRow,
+        handlers::GrantedPortfolio,
         Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
@@ -125,6 +130,7 @@ mod fix;
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary, admin::FeedSummary,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
+        admin::ExpirySweepResult,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
     )),
     modifiers(&SecurityAddon),
@@ -141,11 +147,24 @@ impl utoipa::Modify for SecurityAddon {
         let components = openapi.components.get_or_insert_default();
         components.add_security_scheme(
             "basic_auth",
-            SecurityScheme::Http(Http::new(HttpAuthScheme::Basic)),
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Basic)
+                    .description(Some("Username = key_id, password = secret."))
+                    .build(),
+            ),
         );
         components.add_security_scheme(
             "bearer_token",
-            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .description(Some(
+                        "User endpoints: a trading token, `key_id.secret` (Databento-style). \
+                         Admin endpoints (/admin/*): the static admin token.",
+                    ))
+                    .build(),
+            ),
         );
     }
 }
@@ -442,6 +461,12 @@ async fn serve() {
     let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
     tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
 
+    // Retire dated contracts once their expiry instant passes, so the feeds below
+    // stop resubscribing to them and the order path stops accepting them. Not
+    // supervised: `stream_supervisor` exists to reconnect streams, and treats a clean
+    // return as a disconnect to back off from — wrong shape for a periodic job.
+    tokio::spawn(expiry::run(state.pool().clone()));
+
     if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
         let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
         marks_doorbells.push(opra_pos_tx);
@@ -514,6 +539,8 @@ async fn serve() {
         .route("/orders/submit", post(handlers::orders_submit))
         .route("/orders/cancel", post(handlers::orders_cancel))
         .route("/orders/:id", get(handlers::get_order))
+        .route("/orders", get(handlers::list_orders))
+        .route("/portfolios", get(handlers::list_portfolios))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
         .route(
             "/orders/:id/allocations",
@@ -595,6 +622,7 @@ async fn serve() {
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
         .route("/admin/symbology/backfill", post(admin::backfill_symbology))
+        .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let scalar_html = {

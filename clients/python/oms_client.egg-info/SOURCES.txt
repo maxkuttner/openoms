@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+oms_client/__init__.py
+oms_client/cli.py
+oms_client/client.py
+oms_client/errors.py
+oms_client/models.py
+oms_client.egg-info/PKG-INFO
+oms_client.egg-info/SOURCES.txt
+oms_client.egg-info/dependency_links.txt
+oms_client.egg-info/entry_points.txt
+oms_client.egg-info/requires.txt
+oms_client.egg-info/top_level.txt
+tests/test_client.py
