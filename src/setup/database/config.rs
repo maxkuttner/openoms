@@ -99,14 +99,14 @@ impl PostgresConfig {
 /// apply, and the failure would surface as an authentication error against the
 /// wrong credentials.
 const REMOVED_KEYS: [(&str, &str); 8] = [
-    ("DATABASE_URL", "removed — the URL is built from POSTGRES_* now"),
-    ("ODS_DB", "POSTGRES_DATABASE"),
-    ("DB_HOST", "POSTGRES_HOST"),
-    ("DB_PORT", "POSTGRES_PORT"),
-    ("DB_NAME", "POSTGRES_DATABASE"),
-    ("DB_USER", "removed — the runtime pool always connects as oms_user"),
-    ("DB_PASSWORD", "OMS_USER_PASSWORD"),
-    ("ADMIN_USER", "POSTGRES_USERNAME"),
+    ("DATABASE_URL", "the URL is built from POSTGRES_* now"),
+    ("ODS_DB", "use POSTGRES_DATABASE"),
+    ("DB_HOST", "use POSTGRES_HOST"),
+    ("DB_PORT", "use POSTGRES_PORT"),
+    ("DB_NAME", "use POSTGRES_DATABASE"),
+    ("DB_USER", "the runtime pool always connects as oms_user"),
+    ("DB_PASSWORD", "use OMS_USER_PASSWORD"),
+    ("ADMIN_USER", "use POSTGRES_USERNAME"),
 ];
 
 /// One message per obsolete key that is still set. Empty means the environment is
@@ -115,7 +115,7 @@ pub fn check_removed_env_keys() -> Vec<String> {
     REMOVED_KEYS
         .iter()
         .filter(|(key, _)| from_env(key).is_some())
-        .map(|(key, replacement)| format!("{key} is no longer read — use {replacement}"))
+        .map(|(key, clause)| format!("{key} is no longer read — {clause}"))
         .collect()
 }
 
@@ -245,7 +245,7 @@ mod tests {
         let found = check_removed_env_keys();
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|m| m.contains("DB_PASSWORD") && m.contains("OMS_USER_PASSWORD")));
-        assert!(found.iter().any(|m| m.contains("DATABASE_URL")));
+        assert!(found.iter().any(|m| m.contains("DATABASE_URL") && m.contains("POSTGRES_*")));
 
         std::env::remove_var("DB_PASSWORD");
         std::env::remove_var("DATABASE_URL");

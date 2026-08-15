@@ -131,11 +131,14 @@ mod tests {
     use crate::setup::database::config;
 
     /// Full round trip against a real server: applying twice must be a no-op the
-    /// second time. Idempotency is the whole contract of `migrate`, and it cannot
-    /// be tested without Postgres.
+    /// second time, regardless of how much was already applied before this test ran
+    /// (a fresh database, one already fully migrated by `oms database init`, or
+    /// anything in between). Idempotency is the whole contract of `migrate` — the
+    /// exact migration count is pinned separately by `embeds_every_migration` in
+    /// `assets.rs` — and idempotency cannot be tested without Postgres.
     ///
     /// Run with: cargo test -- --ignored
-    /// Requires: an empty database provisioned by `oms database init`.
+    /// Requires: a live Postgres reachable via the usual POSTGRES_* config.
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn applying_twice_is_a_no_op() {
@@ -143,11 +146,10 @@ mod tests {
         let pool = sqlx::PgPool::connect(&cfg.url()).await.expect("connect");
 
         ensure_tracking(&pool).await.expect("tracking table");
-        let first = apply_all(&pool).await.expect("first apply");
+        apply_all(&pool).await.expect("first apply");
         let second = apply_all(&pool).await.expect("second apply");
 
         assert_eq!(second, 0, "second run applied {second} migrations; expected 0");
-        assert!(first >= 43, "expected at least 43 migrations, applied {first}");
         assert!(pending(&pool).await.expect("pending").is_empty());
     }
 }
