@@ -1,5 +1,0 @@
-# Only send_test_order.py needs a third-party package now; db/scripts/seed_venues.py
-# is stdlib-only. Instrument seeding and broker sync are Rust:
-#   oms setup universe      (was scripts/seed_instruments.py)
-#   oms setup sync-brokers  (was scripts/broker_sync.py)
-requests>=2.31.0

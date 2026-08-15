@@ -69,7 +69,7 @@ async fn report_expiry(pool: &PgPool) {
             let names: Vec<&str> = rows.iter().map(String::as_str).collect();
             error!(
                 "preflight: {} dated instrument(s) have no expiry instant — their venue \
-                 has no calendar (run `make db-seed`), so they will never expire: {}",
+                 has no calendar (see db/scripts/seed_calendars.sql), so they will never expire: {}",
                 names.len(),
                 sample(&names)
             );
@@ -109,10 +109,9 @@ async fn report_expiry(pool: &PgPool) {
 /// Fatal checks: the master catalog and the FK targets it depends on.
 ///
 /// An empty `venue` or `currency` table is the signature of a DB that never got
-/// seeded; with bootstrap on these are seeded before we ever get here, so a failure
-/// now means `OMS_BOOTSTRAP=off` over an unprepared DB. An empty `instrument` is only
-/// fatal when nothing is about to fill it — a pending background sync makes it
-/// expected, not broken.
+/// seeded; a failure here means the database was never provisioned — `oms database
+/// init` is what provisions it. An empty `instrument` is only fatal when nothing is
+/// about to fill it — a pending background sync makes it expected, not broken.
 async fn check_catalog(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fatal> {
     for (table, hint) in [
         ("venue", "run `oms database init` (or `oms database migrate` if it exists)"),
@@ -137,7 +136,7 @@ async fn check_catalog(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fat
         } else {
             return Err(Fatal(
                 "instrument is empty — set broker creds (auto-sync), run \
-                 `make sync-broker BROKER=alpaca`, or `make db-fixtures` for the SPY-only set"
+                 `oms setup sync-broker --broker alpaca`, or `oms database init --fixtures` for the SPY-only set"
                     .to_string(),
             ));
         }

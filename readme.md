@@ -17,31 +17,71 @@
 
 ## Install
 
-Prerequisites: **Rust** (cargo), **PostgreSQL**. Optional: **Python 3** (live universe seeders), **Node** (cockpit).
+Prerequisites: **Rust** (cargo) and a running **PostgreSQL**. Optional: **Node** (cockpit).
 
 ```sh
 git clone git@github.com:maxkuttner/openoms.git && cd openoms
-cp .env.example .env        # then edit passwords / bind addr
+cargo run -- database init --fixtures
+cargo run
 ```
 
-## Run
+That is the whole setup. `database init` creates the roles, database, schema,
+grants and reference data; `--fixtures` adds the SPY instrument and a dev trading
+identity (`test-trader-key` : `test-secret`) so you can place a paper order
+immediately.
 
-With the `ADMIN_*` superuser + role passwords set in `.env`, just start the app — it
-self-provisions on boot (roles, schema, reference data) and, if broker creds are
-present, syncs that broker's instrument catalog in the background. No ordered setup
-commands.
+Defaults assume Postgres on `localhost:5432` with superuser `postgres`. Override
+per command or through the environment:
+
+```sh
+cargo run -- database init --host db.internal --username admin
+POSTGRES_HOST=db.internal cargo run -- database init
+```
+
+| Setting | Flag | Environment | Default |
+|---|---|---|---|
+| Host | `--host` | `POSTGRES_HOST` | `localhost` |
+| Port | `--port` | `POSTGRES_PORT` | `5432` |
+| Superuser | `--username` | `POSTGRES_USERNAME` | `postgres` |
+| Superuser password | `--password` | `POSTGRES_PASSWORD` | `postgres` |
+| Database | `--database` | `POSTGRES_DATABASE` | `ods` |
+| Catalog role password | `--mdm-password` | `MDM_MASTER_PASSWORD` | `openoms-dev` |
+| Runtime role password | `--oms-password` | `OMS_USER_PASSWORD` | `openoms-dev` |
+
+`.env` is optional — copy `.env.example` when you need broker credentials or an
+admin password. The server refuses to start with the default role password against
+a non-loopback host.
+
+## Database commands
+
+```sh
+cargo run -- database init       # create everything; fails if it already exists
+cargo run -- database migrate    # apply pending migrations (idempotent)
+cargo run -- database status     # what exists, what is pending
+cargo run -- database drop       # destroy the database (roles are kept)
+```
+
+`init` is deliberately strict: if the roles or database already exist it stops and
+tells you to use `migrate` instead, rather than silently skipping or resetting
+credentials.
+
+## Run
 
 ```sh
 cargo run                  # OMS on OMS_BIND_ADDR (default localhost:3001)
 ```
 
-First boot on an empty database runs provision → migrate → seed before listening (a
-few seconds), then the server binds immediately while instruments populate in the
-background. Subsequent boots are near-instant no-ops. Set `OMS_SYNC_ON_BOOT=never` to
-skip auto-sync, or `OMS_BOOTSTRAP=off` when infrastructure is provisioned elsewhere.
+Starting the server never creates or migrates anything. If the database is missing
+or out of date, it says so and names the command to run.
 
-The SPY fixture seeds `alpaca-paper` + a test user (`test-trader-key` : `test-secret`),
-so you can place a paper order immediately. Admin webapp: `cd cockpit && npm install && npm run dev`.
+Instruments come from brokers:
+
+```sh
+cargo run -- setup sync-broker --broker alpaca
+cargo run -- setup sync-broker --broker alpaca --underlyings SPY,QQQ
+```
+
+Admin webapp: `cd cockpit && npm install && npm run dev`.
 
 ## Auth
 
@@ -56,14 +96,3 @@ so you can place a paper order immediately. Admin webapp: `cd cockpit && npm ins
   to rotate credentials without re-permissioning. Revoke any token anytime.
 - The legacy HTTP Basic form (`key_id:secret`, e.g. the `test-trader` dev user) still
   works on the trading routes.
-
-### Manual setup (optional)
-
-The bootstrap just orchestrates the same idempotent make targets, if you'd rather run
-them yourself (or set `OMS_BOOTSTRAP=off`):
-
-```sh
-make db-setup                                 # roles, schema, ref-data, SPY fixture
-make sync-broker BROKER=alpaca               # instruments + broker mapping from Alpaca
-make sync-broker BROKER=alpaca UNDERLYINGS=SPY,QQQ  # also seed those option chains
-```
