@@ -115,8 +115,8 @@ async fn report_expiry(pool: &PgPool) {
 /// expected, not broken.
 async fn check_catalog(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fatal> {
     for (table, hint) in [
-        ("venue", "run `make db-seed` (or enable bootstrap)"),
-        ("currency", "run `make db-seed` (or enable bootstrap)"),
+        ("venue", "run `oms database init` (or `oms database migrate` if it exists)"),
+        ("currency", "run `oms database init` (or `oms database migrate` if it exists)"),
     ] {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(pool)

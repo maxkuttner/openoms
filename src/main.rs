@@ -300,44 +300,46 @@ async fn main() {
 // Server entry point (default when no subcommand is given).
 async fn serve() {
 
-    // Self-provision before the runtime pool connects: create roles/db, apply
-    // migrations, seed reference data — all idempotent, all as the admin role. Skips
-    // itself when OMS_BOOTSTRAP=off or no admin creds are present. This is what makes
-    // a fresh checkout `run the app` with no ordered setup commands.
-    if let Err(e) = setup::bootstrap::ensure_ready().await {
-        error!("{e}");
+    // No provisioning here. `oms database init` is the only thing that creates or
+    // migrates a database, so starting the server can never mutate one.
+    for problem in setup::database::config::check_removed_env_keys() {
+        error!("config: {problem}");
+    }
+
+    let cfg = setup::database::config::resolve(Default::default());
+    let roles = setup::database::config::resolve_roles(None, None);
+
+    // A shipped default password is fine on a laptop and never anywhere else.
+    if !cfg.is_loopback()
+        && roles.oms_password == setup::database::config::DEFAULT_ROLE_PASSWORD
+    {
+        error!(
+            "refusing to start: OMS_USER_PASSWORD is still the built-in default \
+             against non-loopback host {}",
+            cfg.host
+        );
         return;
     }
 
-    // parse db config or panic
-    let db_user = env::var("DB_USER").expect("DB_USER must be set");
-    let db_host = env::var("DB_HOST").expect("DB_HOST must be set");
-    let db_port = env::var("DB_PORT").expect("DB_PORT must bes set");
-    let db_password = env::var("DB_PASSWORD").expect("DB_PASSWORD must be set");
-    let db_name = env::var("DB_NAME").expect("DB_NAME must be set");
-    let database_url = format!(
-        "postgres://{}:{}@{}:{}/{}?sslmode=disable",
-        db_user, db_password, db_host, db_port, db_name
+    // The runtime pool is oms_user — least privilege, and it no longer has its own
+    // host/port/database settings to drift from the ones init used.
+    let runtime_url = format!(
+        "postgres://oms_user:{}@{}:{}/{}?sslmode=disable",
+        roles.oms_password, cfg.host, cfg.port, cfg.database
     );
-
-    info!("Connecting to the database at {}:{}/{} as {}", db_host, db_port, db_name, db_user);
-    let pool = match PgPool::connect(&database_url).await {
+    info!("Connecting to {}:{}/{} as oms_user", cfg.host, cfg.port, cfg.database);
+    let pool = match PgPool::connect(&runtime_url).await {
         Ok(pool) => pool,
         Err(e) => {
-            error!("Failed to connect to the database: {}", e);
+            error!("Failed to connect to the database: {e}");
+            error!("If this database has not been created yet, run: oms database init");
             return;
         }
     };
 
-    // On a no-creds fresh install, drop in the SPY fixture so there is one tradeable
-    // instrument even when no broker will populate the catalog. Best-effort.
-    setup::bootstrap::ensure_fixture_if_no_brokers(&pool).await;
-
     // Routing config for every credentialed broker — without a broker_connection a
-    // configured broker still cannot take an order. Then the optional dev identity
-    // chain (OMS_DEV_IDENTITY), so a fresh install can trade immediately.
+    // configured broker still cannot take an order.
     setup::bootstrap::ensure_broker_connections(&pool).await;
-    setup::bootstrap::ensure_dev_identity(&pool).await;
 
     // Refuse to start on a catalog that cannot work, and name what is merely
     // degraded. Before any feed spawns, so a broken catalog surfaces here rather

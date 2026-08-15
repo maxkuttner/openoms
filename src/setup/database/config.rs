@@ -92,6 +92,33 @@ impl PostgresConfig {
     }
 }
 
+/// Environment keys this change removed, each with what replaced it.
+///
+/// Kept as an explicit list rather than deleted quietly: a `.env` carried over
+/// from before the rename would otherwise be ignored silently, the defaults would
+/// apply, and the failure would surface as an authentication error against the
+/// wrong credentials.
+const REMOVED_KEYS: [(&str, &str); 8] = [
+    ("DATABASE_URL", "removed — the URL is built from POSTGRES_* now"),
+    ("ODS_DB", "POSTGRES_DATABASE"),
+    ("DB_HOST", "POSTGRES_HOST"),
+    ("DB_PORT", "POSTGRES_PORT"),
+    ("DB_NAME", "POSTGRES_DATABASE"),
+    ("DB_USER", "removed — the runtime pool always connects as oms_user"),
+    ("DB_PASSWORD", "OMS_USER_PASSWORD"),
+    ("ADMIN_USER", "POSTGRES_USERNAME"),
+];
+
+/// One message per obsolete key that is still set. Empty means the environment is
+/// clean.
+pub fn check_removed_env_keys() -> Vec<String> {
+    REMOVED_KEYS
+        .iter()
+        .filter(|(key, _)| from_env(key).is_some())
+        .map(|(key, replacement)| format!("{key} is no longer read — use {replacement}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +228,26 @@ mod tests {
             password: "postgres".into(),
             database: "ods".into(),
         }
+    }
+
+    /// A renamed key left in .env is silent otherwise: the value is ignored, the
+    /// default is used, and the connection fails somewhere confusing. Naming the
+    /// replacement turns that into one obvious line.
+    #[test]
+    fn reports_removed_keys_with_their_replacements() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        std::env::remove_var("DB_PASSWORD");
+        assert!(check_removed_env_keys().is_empty());
+
+        std::env::set_var("DB_PASSWORD", "x");
+        std::env::set_var("DATABASE_URL", "y");
+        let found = check_removed_env_keys();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|m| m.contains("DB_PASSWORD") && m.contains("OMS_USER_PASSWORD")));
+        assert!(found.iter().any(|m| m.contains("DATABASE_URL")));
+
+        std::env::remove_var("DB_PASSWORD");
+        std::env::remove_var("DATABASE_URL");
     }
 }
