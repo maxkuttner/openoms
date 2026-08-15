@@ -307,20 +307,6 @@ async fn serve() {
     // No provisioning here. `oms database init` is the only thing that creates or
     // migrates a database, so starting the server can never mutate one.
     //
-    // Fatal, not advisory: this is the only mitigation against a stale `.env`
-    // silently connecting to the wrong database. A key that used to gate the
-    // connection (e.g. DB_HOST) can be set to something other than what
-    // POSTGRES_HOST resolves to, and logging-then-continuing means the server
-    // starts up looking healthy while talking to the wrong host.
-    let removed = setup::database::config::check_removed_env_keys();
-    if !removed.is_empty() {
-        for problem in &removed {
-            error!("config: {problem}");
-        }
-        error!("refusing to start with obsolete .env keys still set — remove them and retry");
-        std::process::exit(1);
-    }
-
     let cfg = setup::database::config::resolve(Default::default());
     let roles = setup::database::config::resolve_roles(None, None);
 

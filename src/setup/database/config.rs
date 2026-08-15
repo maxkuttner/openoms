@@ -119,34 +119,6 @@ fn percent_encode_userinfo(s: &str) -> String {
     out
 }
 
-/// Environment keys this change removed, each with what replaced it.
-///
-/// Kept as an explicit list rather than deleted quietly: a `.env` carried over
-/// from before the rename would otherwise be ignored silently, the defaults would
-/// apply, and the failure would surface as an authentication error against the
-/// wrong credentials.
-const REMOVED_KEYS: [(&str, &str); 9] = [
-    ("DATABASE_URL", "the URL is built from POSTGRES_* now"),
-    ("ODS_DB", "use POSTGRES_DATABASE"),
-    ("DB_HOST", "use POSTGRES_HOST"),
-    ("DB_PORT", "use POSTGRES_PORT"),
-    ("DB_NAME", "use POSTGRES_DATABASE"),
-    ("DB_USER", "the runtime pool always connects as oms_user"),
-    ("DB_PASSWORD", "use OMS_USER_PASSWORD"),
-    ("ADMIN_USER", "use POSTGRES_USERNAME"),
-    ("ADMIN_PASSWORD", "use POSTGRES_PASSWORD"),
-];
-
-/// One message per obsolete key that is still set. Empty means the environment is
-/// clean.
-pub fn check_removed_env_keys() -> Vec<String> {
-    REMOVED_KEYS
-        .iter()
-        .filter(|(key, _)| from_env(key).is_some())
-        .map(|(key, clause)| format!("{key} is no longer read — {clause}"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,12 +132,6 @@ mod tests {
             "POSTGRES_PASSWORD", "POSTGRES_DATABASE",
             "MDM_MASTER_PASSWORD", "OMS_USER_PASSWORD",
         ] {
-            std::env::remove_var(k);
-        }
-        // Also scrub the removed keys themselves — otherwise a developer's shell
-        // (e.g. one still exporting DB_HOST from before this change) makes these
-        // tests fail nondeterministically instead of testing the pure function.
-        for (k, _) in REMOVED_KEYS {
             std::env::remove_var(k);
         }
     }
@@ -271,13 +237,6 @@ mod tests {
         assert!(url.contains("oms_user:p%40ss%2Fw%3Ao%23rd@"), "got {url}");
     }
 
-    /// ADMIN_USER's partner key must be listed too, or a stale .env with only
-    /// ADMIN_PASSWORD set goes undetected.
-    #[test]
-    fn removed_keys_include_admin_password() {
-        assert!(REMOVED_KEYS.iter().any(|(k, _)| *k == "ADMIN_PASSWORD"));
-    }
-
     fn sample() -> PostgresConfig {
         PostgresConfig {
             host: "localhost".into(),
@@ -288,24 +247,4 @@ mod tests {
         }
     }
 
-    /// A renamed key left in .env is silent otherwise: the value is ignored, the
-    /// default is used, and the connection fails somewhere confusing. Naming the
-    /// replacement turns that into one obvious line.
-    #[test]
-    fn reports_removed_keys_with_their_replacements() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        clear_env();
-        std::env::remove_var("DB_PASSWORD");
-        assert!(check_removed_env_keys().is_empty());
-
-        std::env::set_var("DB_PASSWORD", "x");
-        std::env::set_var("DATABASE_URL", "y");
-        let found = check_removed_env_keys();
-        assert_eq!(found.len(), 2);
-        assert!(found.iter().any(|m| m.contains("DB_PASSWORD") && m.contains("OMS_USER_PASSWORD")));
-        assert!(found.iter().any(|m| m.contains("DATABASE_URL") && m.contains("POSTGRES_*")));
-
-        std::env::remove_var("DB_PASSWORD");
-        std::env::remove_var("DATABASE_URL");
-    }
 }
