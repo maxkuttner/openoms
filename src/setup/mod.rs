@@ -3,6 +3,7 @@
 pub mod bootstrap;
 pub mod brokers;
 pub mod catalog;
+pub mod database;
 
 use std::env;
 
