@@ -187,12 +187,81 @@ enum Command {
     /// Setup / seeding subcommands.
     #[command(subcommand)]
     Setup(SetupCmd),
+    /// Database provisioning and migration.
+    #[command(subcommand)]
+    Database(DatabaseCmd),
 }
 
 #[derive(clap::Subcommand)]
 enum SetupCmd {
     /// Seed the master instrument catalog + broker_instrument mapping from a broker.
     SyncBroker(setup::brokers::Args),
+}
+
+/// Connection flags shared by every database subcommand. Each falls back to its
+/// `POSTGRES_*` environment variable, then to a localhost default.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct DbArgs {
+    /// Database server host [env: POSTGRES_HOST] [default: localhost]
+    #[arg(long)]
+    host: Option<String>,
+    /// Database server port [env: POSTGRES_PORT] [default: 5432]
+    #[arg(long)]
+    port: Option<u16>,
+    /// Superuser name [env: POSTGRES_USERNAME] [default: postgres]
+    #[arg(long)]
+    username: Option<String>,
+    /// Superuser password [env: POSTGRES_PASSWORD] [default: postgres]
+    #[arg(long)]
+    password: Option<String>,
+    /// Database name [env: POSTGRES_DATABASE] [default: ods]
+    #[arg(long)]
+    database: Option<String>,
+}
+
+impl From<DbArgs> for setup::database::config::PostgresOverrides {
+    fn from(a: DbArgs) -> Self {
+        Self {
+            host: a.host,
+            port: a.port,
+            username: a.username,
+            password: a.password,
+            database: a.database,
+        }
+    }
+}
+
+#[derive(clap::Subcommand)]
+enum DatabaseCmd {
+    /// Create roles, database, schema, grants and reference data. Fails if any exists.
+    Init {
+        #[command(flatten)]
+        db: DbArgs,
+        /// Password for the mdm_master role [env: MDM_MASTER_PASSWORD]
+        #[arg(long)]
+        mdm_password: Option<String>,
+        /// Password for the oms_user role [env: OMS_USER_PASSWORD]
+        #[arg(long)]
+        oms_password: Option<String>,
+        /// Also load the SPY fixture and the dev principal (test-trader-key : test-secret).
+        #[arg(long)]
+        fixtures: bool,
+    },
+    /// Apply pending migrations to an existing database.
+    Migrate {
+        #[command(flatten)]
+        db: DbArgs,
+    },
+    /// Drop the database. Roles are kept.
+    Drop {
+        #[command(flatten)]
+        db: DbArgs,
+    },
+    /// Show what exists and what is pending.
+    Status {
+        #[command(flatten)]
+        db: DbArgs,
+    },
 }
 
 #[tokio::main]
@@ -205,6 +274,22 @@ async fn main() {
         Some(Command::Setup(SetupCmd::SyncBroker(args))) => {
             if let Err(e) = setup::brokers::run(args).await {
                 error!("setup sync-broker failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Database(cmd)) => {
+            let result = match cmd {
+                DatabaseCmd::Init { db, mdm_password, oms_password, fixtures } => {
+                    setup::database::init(db.into(), mdm_password, oms_password, fixtures).await
+                }
+                DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
+                DatabaseCmd::Drop { db } => setup::database::drop(db.into()).await,
+                DatabaseCmd::Status { db } => setup::database::status(db.into()).await,
+            };
+            if let Err(e) = result {
+                // The error already reads as a user-facing message (see
+                // already_initialized); printing it bare avoids "Error: error:".
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         }
