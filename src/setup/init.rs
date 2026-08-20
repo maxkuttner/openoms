@@ -53,11 +53,42 @@ impl std::fmt::Debug for Prompts {
     }
 }
 
+/// Defaults the interactive prompts show, and what Enter takes. Seeded from
+/// `--host`/`--port`/etc. (and the environment, via the same precedence
+/// non-interactive mode uses) so a flag actually changes the prompt instead of
+/// being silently discarded until `--non-interactive` — `oms init --host
+/// db.internal` must show `Postgres host [db.internal]:`, not `[localhost]:`.
+///
+/// `password: Some(_)` skips the password prompt entirely and uses that value:
+/// a superuser password already given via `--password`/`POSTGRES_PASSWORD` must
+/// not be typed twice, and must not be the reason a value that already reached
+/// the process winds up in shell history for nothing.
+pub struct PromptDefaults {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub username: String,
+    pub password: Option<String>,
+}
+
+impl Default for PromptDefaults {
+    fn default() -> Self {
+        Self {
+            host: "localhost".into(),
+            port: 5432,
+            database: "ods".into(),
+            username: "postgres".into(),
+            password: None,
+        }
+    }
+}
+
 /// Prompt against arbitrary input, with the password read through a supplied
 /// closure. Split this way so the whole flow is testable — `rpassword` reads the
 /// tty directly and cannot be driven from a test.
 pub fn prompt_with<R: BufRead>(
     input: &mut R,
+    defaults: &PromptDefaults,
     read_password: impl FnOnce() -> std::io::Result<String>,
 ) -> std::io::Result<Prompts> {
     fn ask<R: BufRead>(input: &mut R, label: &str, default: &str) -> std::io::Result<String> {
@@ -75,21 +106,31 @@ pub fn prompt_with<R: BufRead>(
         Ok(if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() })
     }
 
-    let host = ask(input, "Postgres host     ", "localhost")?;
-    // A typo here should cost one field, not the whole session.
-    let port = ask(input, "Postgres port     ", "5432")?.parse().unwrap_or(5432);
-    let database = ask(input, "Database name     ", "ods")?;
-    let username = ask(input, "Superuser name    ", "postgres")?;
-    let password = read_password()?;
+    let host = ask(input, "Postgres host     ", &defaults.host)?;
+    let port_input = ask(input, "Postgres port     ", &defaults.port.to_string())?;
+    // A typo here should cost one field, not the whole session — but a silent
+    // fallback means the operator sees a connection failure against an address
+    // they never chose, so say so.
+    let port: u16 = port_input.parse().unwrap_or_else(|_| {
+        println!("  ({port_input:?} is not a valid port — using {})", defaults.port);
+        defaults.port
+    });
+    let database = ask(input, "Database name     ", &defaults.database)?;
+    let username = ask(input, "Superuser name    ", &defaults.username)?;
+    let password = match &defaults.password {
+        Some(p) => p.clone(),
+        None => read_password()?,
+    };
 
     Ok(Prompts { host, port, database, username, password })
 }
 
-/// The real thing: stdin plus a no-echo password read.
-pub fn prompt() -> std::io::Result<Prompts> {
+/// The real thing: stdin plus a no-echo password read (skipped when `defaults`
+/// already carries one).
+pub fn prompt(defaults: &PromptDefaults) -> std::io::Result<Prompts> {
     let stdin = std::io::stdin();
     let mut locked = stdin.lock();
-    prompt_with(&mut locked, || rpassword::prompt_password("Superuser password: "))
+    prompt_with(&mut locked, defaults, || rpassword::prompt_password("Superuser password: "))
 }
 
 /// Assemble the file from the prompts plus freshly generated secrets. Returns the
@@ -169,8 +210,11 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
     file_cfg.server.admin_password = Some(admin_password.clone());
 
     // Written before provisioning: if provisioning fails halfway, the generated
-    // secrets survive and `oms database init` can finish the job.
-    config::write_new(&cfg_path, &file_cfg)?;
+    // secrets survive and `oms database init --resume` can finish the job.
+    // Mapped to add the "error: " prefix every other failure path in this
+    // function already carries — `ConfigError`'s `Display` does not include it,
+    // since it is also used in contexts that add their own.
+    config::write_new(&cfg_path, &file_cfg).map_err(|e| format!("error: {e}"))?;
     println!("  wrote {} (mode 0600)", cfg_path.display());
     ensure_gitignored(&cfg_path);
 
@@ -185,12 +229,18 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
     // nothing was saved. That guarantee is the entire reason for the
     // write-before-provision ordering, so it has to reach the operator, not
     // just live in a comment.
-    crate::setup::database::init(overrides, Some(role_password)).await.map_err(|e| {
+    // `--resume` is what actually works here: `provision::provision` already ran
+    // (it's the first thing `database::init` does after this same strictness
+    // check), so a bare retry of `oms database init` would refuse on the role/
+    // database it just created. `--resume` skips that and re-runs the remaining
+    // steps, all of which tolerate re-application — see `database::init`'s doc
+    // comment for why.
+    crate::setup::database::init(overrides, Some(role_password), false).await.map_err(|e| {
         format!(
             "error: the database could not be created: {e}\n\n\
              \x20        {} was already written and holds your generated credentials —\n\
              \x20        it has not been lost. Fix the cause above, then finish with:\n\n\
-             \x20            oms database init",
+             \x20            oms database init --resume",
             cfg_path.display()
         )
     })?;
@@ -200,12 +250,16 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
     } else {
         "Cockpit login password: written to oms.toml".to_string()
     };
+    // Absolute, not just what was passed to `--config`/`OMS_CONFIG`: this message
+    // may be read after the operator has `cd`ed elsewhere, and a relative path
+    // then points at nothing.
+    let abs_path = config::path_abs();
     println!(
         "\nBack up {}. The master key in it is the only thing that can\n\
          decrypt stored broker credentials — lose it and they are gone.\n\n\
          {admin_line}\n\n\
          Start the server:  oms",
-        cfg_path.display()
+        abs_path.display()
     );
     Ok(())
 }
@@ -273,7 +327,7 @@ mod tests {
     #[test]
     fn empty_input_takes_every_default() {
         let mut input = BufReader::new(&b"\n\n\n\n"[..]);
-        let p = prompt_with(&mut input, || Ok("secret".into())).expect("prompt");
+        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("secret".into())).expect("prompt");
         assert_eq!(p.host, "localhost");
         assert_eq!(p.port, 5432);
         assert_eq!(p.database, "ods");
@@ -284,18 +338,49 @@ mod tests {
     #[test]
     fn typed_values_override_the_defaults() {
         let mut input = BufReader::new(&b"db.internal\n6543\ntrading\nadmin\n"[..]);
-        let p = prompt_with(&mut input, || Ok("pw".into())).expect("prompt");
+        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect("prompt");
         assert_eq!(p.host, "db.internal");
         assert_eq!(p.port, 6543);
         assert_eq!(p.database, "trading");
         assert_eq!(p.username, "admin");
     }
 
+    /// `oms init --host db.internal` must change what Enter takes, not just be
+    /// discarded until `--non-interactive` — the whole point of this parameter.
+    #[test]
+    fn defaults_seed_what_enter_takes() {
+        let defaults = PromptDefaults {
+            host: "db.internal".into(),
+            port: 6543,
+            database: "trading".into(),
+            username: "admin".into(),
+            password: None,
+        };
+        let mut input = BufReader::new(&b"\n\n\n\n"[..]);
+        let p = prompt_with(&mut input, &defaults, || Ok("pw".into())).expect("prompt");
+        assert_eq!(p.host, "db.internal");
+        assert_eq!(p.port, 6543);
+        assert_eq!(p.database, "trading");
+        assert_eq!(p.username, "admin");
+    }
+
+    /// A password already supplied (via `--password`/`POSTGRES_PASSWORD`) must
+    /// skip the prompt entirely — the closure must never be called, and the
+    /// value used must be the one from `defaults`, not stdin.
+    #[test]
+    fn a_supplied_password_skips_the_prompt() {
+        let defaults = PromptDefaults { password: Some("from-flag".into()), ..PromptDefaults::default() };
+        let mut input = BufReader::new(&b"\n\n\n\n"[..]);
+        let p = prompt_with(&mut input, &defaults, || panic!("password prompt must be skipped"))
+            .expect("prompt");
+        assert_eq!(p.password, "from-flag");
+    }
+
     /// Surrounding whitespace is a paste artefact, not part of a hostname.
     #[test]
     fn trims_surrounding_whitespace() {
         let mut input = BufReader::new(&b"  db.internal  \n\n\n\n"[..]);
-        let p = prompt_with(&mut input, || Ok("pw".into())).expect("prompt");
+        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect("prompt");
         assert_eq!(p.host, "db.internal");
     }
 
@@ -304,7 +389,7 @@ mod tests {
     #[test]
     fn unparseable_port_falls_back_to_the_default() {
         let mut input = BufReader::new(&b"\nnot-a-number\n\n\n"[..]);
-        let p = prompt_with(&mut input, || Ok("pw".into())).expect("prompt");
+        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect("prompt");
         assert_eq!(p.port, 5432);
     }
 
@@ -335,7 +420,7 @@ mod tests {
     #[test]
     fn eof_before_all_prompts_returns_error() {
         let mut input = BufReader::new(&b"\n\n"[..]);
-        let err = prompt_with(&mut input, || Ok("pw".into())).expect_err("should be an error");
+        let err = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect_err("should be an error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(err.to_string().contains("unexpected end of input"));
     }

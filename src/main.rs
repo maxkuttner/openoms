@@ -273,7 +273,7 @@ enum SetupCmd {
 
 /// Connection flags shared by every database subcommand. Each falls back to its
 /// `POSTGRES_*` environment variable, then to a localhost default.
-#[derive(clap::Args, Debug, Clone, Default)]
+#[derive(clap::Args, Clone, Default)]
 struct DbArgs {
     /// Database server host [env: POSTGRES_HOST] [default: localhost]
     #[arg(long)]
@@ -290,6 +290,21 @@ struct DbArgs {
     /// Database name [env: POSTGRES_DATABASE] [default: ods]
     #[arg(long)]
     database: Option<String>,
+}
+
+// Hand-written so a stray `{:?}` — in a log line, a panic message, a clap
+// debug-assert dump — cannot print the superuser password. Mirrors the
+// redacting impls in `src/config.rs` and `setup::init::Prompts`.
+impl std::fmt::Debug for DbArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbArgs")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("database", &self.database)
+            .finish()
+    }
 }
 
 impl From<DbArgs> for setup::database::config::PostgresOverrides {
@@ -314,6 +329,14 @@ enum DatabaseCmd {
         /// Distinct from --password, which is the superuser's.
         #[arg(long)]
         oms_password: Option<String>,
+        /// Finish an init that failed partway through: if the role and/or
+        /// database already exist, skip creating them and continue straight to
+        /// migrations, grants and seeding — all idempotent, so this is safe to
+        /// run even if some of them already happened. Without this flag, any
+        /// existing role or database is a hard refusal (unchanged default
+        /// behaviour).
+        #[arg(long)]
+        resume: bool,
     },
     /// Apply pending migrations to an existing database.
     Migrate {
@@ -351,8 +374,8 @@ async fn main() {
         }
         Some(Command::Database(cmd)) => {
             let result = match cmd {
-                DatabaseCmd::Init { db, oms_password } => {
-                    setup::database::init(db.into(), oms_password).await
+                DatabaseCmd::Init { db, oms_password, resume } => {
+                    setup::database::init(db.into(), oms_password, resume).await
                 }
                 DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
                 DatabaseCmd::Drop { db, yes } => setup::database::drop(db.into(), yes).await,
@@ -390,7 +413,27 @@ async fn main() {
                     password: cfg.password,
                 }
             } else {
-                match setup::init::prompt() {
+                // Seed the interactive prompts' defaults from whatever was passed
+                // on the command line (and the environment, via the same
+                // resolve() precedence non-interactive mode uses) — otherwise
+                // `oms init --host db.internal --password s3cret` still prompts
+                // for host and silently discards the password, which is what put
+                // it in shell history for nothing. A password sourced from a flag
+                // or the environment skips the prompt entirely rather than being
+                // asked for twice.
+                let password_override = db
+                    .password
+                    .clone()
+                    .or_else(|| std::env::var("POSTGRES_PASSWORD").ok().filter(|v| !v.is_empty()));
+                let cfg = setup::database::config::resolve(db.into());
+                let defaults = setup::init::PromptDefaults {
+                    host: cfg.host,
+                    port: cfg.port,
+                    database: cfg.database,
+                    username: cfg.username,
+                    password: password_override,
+                };
+                match setup::init::prompt(&defaults) {
                     Ok(p) => p,
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 }
@@ -436,6 +479,14 @@ async fn serve() {
         Ok(pool) => pool,
         Err(e) => {
             error!("Failed to connect to the database: {e}");
+            // `oms.toml` is resolved relative to the CWD, so a connection failure
+            // from a directory other than the one it was written in looks
+            // identical to "never initialized" unless the message names the path
+            // that was actually searched.
+            error!(
+                "config file searched: {} (set OMS_CONFIG to point elsewhere)",
+                config::path_abs().display()
+            );
             error!("If this database has not been created yet, run: oms database init");
             return;
         }
