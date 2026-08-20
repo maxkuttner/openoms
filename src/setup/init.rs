@@ -28,13 +28,27 @@ pub fn generate_password() -> String {
 
 /// What `oms init` asks for. Everything here describes the operator's existing
 /// Postgres; nothing generated appears in this struct.
-#[derive(Debug)]
 pub struct Prompts {
     pub host: String,
     pub port: u16,
     pub database: String,
     pub username: String,
     pub password: String,
+}
+
+// Hand-written so a stray `{:?}` — in a log line, a panic message, an
+// `expect` on a Result<Prompts, _> — cannot print the superuser password.
+// That credential can drop the database.
+impl std::fmt::Debug for Prompts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prompts")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Prompt against arbitrary input, with the password read through a supplied
@@ -48,7 +62,13 @@ pub fn prompt_with<R: BufRead>(
         print!("{label} [{default}]: ");
         std::io::stdout().flush()?;
         let mut line = String::new();
-        input.read_line(&mut line)?;
+        let n = input.read_line(&mut line)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("unexpected end of input while reading {label} — use `oms init --non-interactive` for scripted setup"),
+            ));
+        }
         let trimmed = line.trim();
         Ok(if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() })
     }
@@ -147,5 +167,37 @@ mod tests {
         let mut input = BufReader::new(&b"\nnot-a-number\n\n\n"[..]);
         let p = prompt_with(&mut input, || Ok("pw".into())).expect("prompt");
         assert_eq!(p.port, 5432);
+    }
+
+    /// Debug output must not print the superuser password. A stray `{:?}` in a log
+    /// line, panic message, or `expect` on a Result<Prompts, _> cannot reveal a
+    /// credential that can drop the database.
+    #[test]
+    fn debug_output_redacts_password() {
+        let p = Prompts {
+            host: "db.example.com".into(),
+            port: 5432,
+            database: "mydb".into(),
+            username: "superuser".into(),
+            password: "super-secret-password-12345".into(),
+        };
+        let rendered = format!("{p:?}");
+        assert!(!rendered.contains("super-secret-password-12345"), "password leaked into {rendered}");
+        // Verify other fields are present
+        assert!(rendered.contains("db.example.com"));
+        assert!(rendered.contains("5432"));
+        assert!(rendered.contains("mydb"));
+        assert!(rendered.contains("superuser"));
+    }
+
+    /// EOF (premature stdin closure) must be treated as an error, not as pressing
+    /// Enter. A script with closed stdin must not silently walk through all
+    /// prompts taking defaults — that would provision a database without asking.
+    #[test]
+    fn eof_before_all_prompts_returns_error() {
+        let mut input = BufReader::new(&b"\n\n"[..]);
+        let err = prompt_with(&mut input, || Ok("pw".into())).expect_err("should be an error");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("unexpected end of input"));
     }
 }
