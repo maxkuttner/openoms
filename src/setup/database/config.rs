@@ -7,8 +7,8 @@
 
 use std::env;
 
-/// Password given to both provisioned roles when nothing else is configured.
-/// Localhost-only by construction — `preflight` refuses to serve with this value
+/// Password given to the `oms` role when nothing else is configured.
+/// Localhost-only by construction — the server and `init` both refuse this value
 /// against a non-loopback host.
 pub const DEFAULT_ROLE_PASSWORD: &str = "openoms-dev";
 
@@ -23,7 +23,7 @@ pub struct PostgresOverrides {
 }
 
 /// A resolved superuser connection. Used only by provisioning and teardown; the
-/// runtime pool connects as `oms_user` instead.
+/// runtime pool connects as the `oms` role instead.
 #[derive(Debug, Clone)]
 pub struct PostgresConfig {
     pub host: String,
@@ -33,12 +33,7 @@ pub struct PostgresConfig {
     pub database: String,
 }
 
-/// Passwords for the two roles `init` creates.
-#[derive(Debug, Clone)]
-pub struct RoleConfig {
-    pub mdm_password: String,
-    pub oms_password: String,
-}
+
 
 fn from_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
@@ -60,15 +55,10 @@ pub fn resolve(o: PostgresOverrides) -> PostgresConfig {
     }
 }
 
-pub fn resolve_roles(mdm: Option<String>, oms: Option<String>) -> RoleConfig {
-    RoleConfig {
-        mdm_password: mdm
-            .or_else(|| from_env("MDM_MASTER_PASSWORD"))
-            .unwrap_or_else(|| DEFAULT_ROLE_PASSWORD.into()),
-        oms_password: oms
-            .or_else(|| from_env("OMS_USER_PASSWORD"))
-            .unwrap_or_else(|| DEFAULT_ROLE_PASSWORD.into()),
-    }
+/// The password for the `oms` role, on the same flag → env → default tiers as
+/// everything else.
+pub fn resolve_role_password(flag: Option<String>) -> String {
+    flag.or_else(|| from_env("OMS_PASSWORD")).unwrap_or_else(|| DEFAULT_ROLE_PASSWORD.into())
 }
 
 impl PostgresConfig {
@@ -86,16 +76,20 @@ impl PostgresConfig {
         )
     }
 
-    /// Connection URL for the runtime pool: always `oms_user`, host/port/database
+    /// Connection URL for the runtime pool: always the `oms` role, host/port/database
     /// taken from this config. This is the single place the runtime URL is built —
     /// `serve()` and `oms setup sync-broker` (via `setup::database_url`) both call
     /// it, so they cannot drift apart the way they did before. The password is
     /// percent-encoded so a role password containing `@`, `/`, `:` or `#` cannot
     /// corrupt the URL.
-    pub fn runtime_url(&self, oms_password: &str) -> String {
+    pub fn runtime_url(&self, role_password: &str) -> String {
         format!(
-            "postgres://oms_user:{}@{}:{}/{}?sslmode=disable",
-            percent_encode_userinfo(oms_password), self.host, self.port, self.database
+            "postgres://{}:{}@{}:{}/{}?sslmode=disable",
+            super::provision::ROLE,
+            percent_encode_userinfo(role_password),
+            self.host,
+            self.port,
+            self.database
         )
     }
 
@@ -104,23 +98,11 @@ impl PostgresConfig {
         is_loopback_host(&self.host)
     }
 
-    /// The one place that decides whether a shipped default password is acceptable
-    /// for this host: fine on a laptop, never anywhere else. Returns the names of
-    /// the offending variables, empty when fine.
-    ///
-    /// The caller passes only the passwords it actually uses, because the two call
-    /// sites legitimately differ — `init` creates both roles and checks both, while
-    /// `serve` only ever connects as `oms_user` and must not refuse to start over a
-    /// credential it never touches. What they share is this rule, not the list.
-    pub fn default_password_offenders(&self, checked: &[(&'static str, &str)]) -> Vec<&'static str> {
-        if self.is_loopback() {
-            return Vec::new();
-        }
-        checked
-            .iter()
-            .filter(|(_, password)| *password == DEFAULT_ROLE_PASSWORD)
-            .map(|(name, _)| *name)
-            .collect()
+    /// Whether the shipped default password is being used somewhere it must not be:
+    /// fine on a laptop, never against a host anything else can reach. Both `init`
+    /// (which creates the role) and `serve` (which connects as it) ask this.
+    pub fn refuses_default_password(&self, password: &str) -> bool {
+        !self.is_loopback() && password == DEFAULT_ROLE_PASSWORD
     }
 }
 
@@ -157,8 +139,7 @@ mod tests {
     fn clear_env() {
         for k in [
             "POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_USERNAME",
-            "POSTGRES_PASSWORD", "POSTGRES_DATABASE",
-            "MDM_MASTER_PASSWORD", "OMS_USER_PASSWORD",
+            "POSTGRES_PASSWORD", "POSTGRES_DATABASE", "OMS_PASSWORD",
         ] {
             std::env::remove_var(k);
         }
@@ -217,16 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn role_passwords_follow_the_same_tiers() {
+    fn role_password_follows_the_same_tiers() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
-        assert_eq!(resolve_roles(None, None).oms_password, DEFAULT_ROLE_PASSWORD);
-        std::env::set_var("OMS_USER_PASSWORD", "from-env");
-        assert_eq!(resolve_roles(None, None).oms_password, "from-env");
-        assert_eq!(
-            resolve_roles(None, Some("from-flag".into())).oms_password,
-            "from-flag"
-        );
+        assert_eq!(resolve_role_password(None), DEFAULT_ROLE_PASSWORD);
+        std::env::set_var("OMS_PASSWORD", "from-env");
+        assert_eq!(resolve_role_password(None), "from-env");
+        assert_eq!(resolve_role_password(Some("from-flag".into())), "from-flag");
         clear_env();
     }
 
@@ -248,12 +226,12 @@ mod tests {
         assert!(sample().url().ends_with("/ods?sslmode=disable"));
     }
 
-    /// The runtime URL is always oms_user, regardless of the configured
+    /// The runtime URL is always the `oms` role, regardless of the configured
     /// superuser — this is what lets `serve()` and `database_url()` share it.
     #[test]
-    fn runtime_url_always_connects_as_oms_user() {
+    fn runtime_url_always_connects_as_the_oms_role() {
         let url = sample().runtime_url("secret");
-        assert!(url.starts_with("postgres://oms_user:secret@"));
+        assert!(url.starts_with("postgres://oms:secret@"));
         assert!(url.ends_with("/ods?sslmode=disable"));
     }
 
@@ -262,54 +240,17 @@ mod tests {
     #[test]
     fn runtime_url_percent_encodes_special_characters() {
         let url = sample().runtime_url("p@ss/w:o#rd");
-        assert!(url.contains("oms_user:p%40ss%2Fw%3Ao%23rd@"), "got {url}");
+        assert!(url.contains("oms:p%40ss%2Fw%3Ao%23rd@"), "got {url}");
     }
 
-    /// Off-loopback, every default the caller names is reported — and only those.
+    /// The shipped default is refused against anything but a loopback host, and
+    /// accepted on one — that acceptance is what makes zero-config setup work.
     #[test]
-    fn default_passwords_are_refused_off_loopback() {
+    fn the_default_password_is_loopback_only() {
         let remote = PostgresConfig { host: "db.internal".into(), ..sample() };
-        let both: &[(&str, &str)] = &[
-            ("MDM_MASTER_PASSWORD", DEFAULT_ROLE_PASSWORD),
-            ("OMS_USER_PASSWORD", DEFAULT_ROLE_PASSWORD),
-        ];
-        assert_eq!(
-            remote.default_password_offenders(both),
-            vec!["MDM_MASTER_PASSWORD", "OMS_USER_PASSWORD"]
-        );
-
-        assert_eq!(
-            remote.default_password_offenders(&[
-                ("MDM_MASTER_PASSWORD", DEFAULT_ROLE_PASSWORD),
-                ("OMS_USER_PASSWORD", "a-real-password"),
-            ]),
-            vec!["MDM_MASTER_PASSWORD"]
-        );
-
-        assert!(remote
-            .default_password_offenders(&[("OMS_USER_PASSWORD", "a-real-password")])
-            .is_empty());
-    }
-
-    /// `serve` checks only the credential it connects with. A default `mdm_master`
-    /// password must never stop the server booting — it does not use that role.
-    #[test]
-    fn serve_scope_ignores_the_mdm_password() {
-        let remote = PostgresConfig { host: "db.internal".into(), ..sample() };
-        assert!(remote
-            .default_password_offenders(&[("OMS_USER_PASSWORD", "a-real-password")])
-            .is_empty());
-    }
-
-    /// The same defaults are fine on a laptop — that is what makes zero-config work.
-    #[test]
-    fn default_passwords_are_fine_on_loopback() {
-        assert!(sample()
-            .default_password_offenders(&[
-                ("MDM_MASTER_PASSWORD", DEFAULT_ROLE_PASSWORD),
-                ("OMS_USER_PASSWORD", DEFAULT_ROLE_PASSWORD),
-            ])
-            .is_empty());
+        assert!(remote.refuses_default_password(DEFAULT_ROLE_PASSWORD));
+        assert!(!remote.refuses_default_password("a-real-password"));
+        assert!(!sample().refuses_default_password(DEFAULT_ROLE_PASSWORD));
     }
 
     fn sample() -> PostgresConfig {

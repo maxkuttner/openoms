@@ -9,16 +9,16 @@ use include_dir::{include_dir, Dir};
 static MIGRATIONS_PUBLIC: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/db/migrations/ods/public");
 static MIGRATIONS_OMS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/db/migrations/ods/oms");
 
-/// One migration stream: a schema and the role that owns its objects.
+/// One migration stream. Every object ends up owned by `provision::ROLE`, so a
+/// target is just the schema its files build.
 pub struct MigrationTarget {
     pub schema: &'static str,
-    pub owner: &'static str,
 }
 
 /// Apply order matters — `oms` tables reference `public` ones.
 pub const TARGETS: [MigrationTarget; 2] = [
-    MigrationTarget { schema: "public", owner: "mdm_master" },
-    MigrationTarget { schema: "oms", owner: "oms_user" },
+    MigrationTarget { schema: "public" },
+    MigrationTarget { schema: "oms" },
 ];
 
 /// Every migration for a target as `(filename, sql)`, sorted by filename.
@@ -69,14 +69,12 @@ pub const MIC_CSV: &str = include_str!("../../../db/data/ISO10383_MIC.csv");
 mod tests {
     use super::*;
 
-    /// Both schemas must be present, each with its owning role — migrations run
-    /// as the owner so objects end up owned correctly.
+    /// Both schemas must be present, and `public` must come first — `oms` tables
+    /// carry foreign keys into it.
     #[test]
     fn declares_both_migration_targets() {
         assert_eq!(TARGETS[0].schema, "public");
-        assert_eq!(TARGETS[0].owner, "mdm_master");
         assert_eq!(TARGETS[1].schema, "oms");
-        assert_eq!(TARGETS[1].owner, "oms_user");
     }
 
     /// Filename order is apply order. 0021 must never run before 0003.

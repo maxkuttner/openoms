@@ -24,13 +24,14 @@ pub struct Pending {
 
 /// Create each schema and the shared tracking table.
 ///
-/// `AUTHORIZATION <owner>` matches the script: objects a migration creates end up
-/// owned by the role that owns the schema.
+/// `AUTHORIZATION` names the one role, so every object a migration creates ends up
+/// owned by it.
 pub async fn ensure_tracking(pool: &PgPool) -> Result<(), sqlx::Error> {
     for t in &TARGETS {
         sqlx::raw_sql(&format!(
             "CREATE SCHEMA IF NOT EXISTS {} AUTHORIZATION {};",
-            t.schema, t.owner
+            t.schema,
+            super::provision::ROLE
         ))
         .execute(pool)
         .await?;
@@ -125,7 +126,8 @@ async fn apply_one(
 
     sqlx::raw_sql(&format!(
         "SET ROLE {}; SET search_path TO {};",
-        target.owner, target.schema
+        super::provision::ROLE,
+        target.schema
     ))
     .execute(&mut *tx)
     .await?;

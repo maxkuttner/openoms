@@ -41,7 +41,7 @@ portfolios, accounts and trading identities in the cockpit.
 
 | Step | What happens |
 |---|---|
-| `database init` | Creates the two roles, the `ods` database, both schemas, all migrations, grants, and reference data (venues, calendars, MICs). |
+| `database init` | Creates the `oms` role, the `ods` database it owns, both schemas, all migrations, grants, and reference data (venues, calendars, MICs). |
 | `cargo run` | Starts the server. It never creates or migrates anything — if the database is missing or stale, it says so and names the command to run. |
 
 ## Prerequisites
@@ -75,21 +75,38 @@ POSTGRES_HOST=db.internal cargo run -- database init
 | Superuser | `--username` | `POSTGRES_USERNAME` | `postgres` |
 | Superuser password | `--password` | `POSTGRES_PASSWORD` | `postgres` |
 | Database | `--database` | `POSTGRES_DATABASE` | `ods` |
-| Catalog role password | `--mdm-password` | `MDM_MASTER_PASSWORD` | `openoms-dev` |
-| Runtime role password | `--oms-password` | `OMS_USER_PASSWORD` | `openoms-dev` |
+| `oms` role password | `--oms-password` | `OMS_PASSWORD` | `openoms-dev` |
 | Server bind address | — | `OMS_BIND_ADDR` | `localhost:3001` |
 | Cockpit admin password | — | `OMS_ADMIN_PASSWORD` | `openoms-dev` (loopback only) |
 
-The superuser is used **only** to provision and tear down. The running server
-connects as `oms_user` with the runtime role password.
+There is one application role, `oms`. It owns the database, both schemas and every
+table in them, and it is what the server connects as. The superuser is used **only**
+by `database init` and `database drop` to create and destroy it.
 
 `.env` is an override file, not a prerequisite — copy `.env.example` when you need
 broker credentials, a real admin password, or a non-local database.
 
-The built-in defaults are loopback-only by design, and the same rule applies in
-three places: the two database role passwords, and the cockpit admin password. Bind
-to anything but localhost, or point at a remote database, and a still-default
-password is refused rather than silently accepted.
+The built-in defaults are loopback-only by design, and the same rule applies to
+both: the `oms` role password and the cockpit admin password. Bind to anything but
+localhost, or point at a remote database, and a still-default password is refused
+rather than silently accepted.
+
+## Roles and schemas
+
+One role, `oms`, created by `database init`. It owns the database, both schemas and
+everything in them, and it is what the server connects as — so there is exactly one
+password to set. The superuser only creates and destroys it.
+
+```
+role  oms
+
+  schema public   instrument, instrument_derivative, broker_instrument,
+                  venue, currency, calendar, calendar_holiday
+  schema oms      orders, portfolios, principals, accounts, api_keys, …
+```
+
+The split is for consumers, not permissions: `public` holds master data another
+service can point at, `oms` holds this application's operational tables.
 
 ## Database commands
 
@@ -175,7 +192,7 @@ There is a CLI too — `oms orders list`, `oms positions`, `oms submit`. See
 | Symptom | Cause |
 |---|---|
 | `refusing to start: OMS_ADMIN_PASSWORD is not set` | `OMS_BIND_ADDR` is not loopback. Set a real admin password in `.env`. |
-| `password authentication failed for user "oms_user"` | `OMS_USER_PASSWORD` doesn't match the role. Fix the value, or `ALTER ROLE oms_user PASSWORD '…'`. |
-| `role "oms_user" already exists` on init | Something is already provisioned. Use `migrate`, or `drop` first. |
+| `password authentication failed for user "oms"` | `OMS_PASSWORD` doesn't match the role. Fix the value, or `ALTER ROLE oms PASSWORD '…'`. |
+| `role "oms" already exists` on init | Something is already provisioned. Use `migrate`, or `drop` first. |
 | Server exits naming a migration | Run `cargo run -- database migrate`. |
 | Link error mentioning `-lssl` on macOS | `brew install openssl@3`, or set `OPENSSL_DIR`. |

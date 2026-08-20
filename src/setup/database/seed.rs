@@ -99,11 +99,11 @@ pub async fn seed_venues(pool: &PgPool) -> Result<u64, sqlx::Error> {
 
     // SET ROLE, the INSERT and RESET ROLE must run on the same connection: a
     // pooled `&PgPool` checks out a (possibly different) connection per call,
-    // which could run the INSERT without mdm_master active, or return a
-    // connection to the pool with mdm_master still set for the next borrower.
+    // which could run the INSERT without the oms role active, or return a
+    // connection to the pool with it still set for the next borrower.
     let mut tx = pool.begin().await?;
 
-    sqlx::raw_sql("SET ROLE mdm_master; SET search_path TO public;")
+    sqlx::raw_sql("SET ROLE oms; SET search_path TO public;")
         .execute(&mut *tx)
         .await?;
     let affected = sqlx::query(

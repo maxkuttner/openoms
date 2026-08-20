@@ -1,4 +1,4 @@
-//! Runtime setup that runs after the pool connects, as `oms_user`.
+//! Runtime setup that runs after the pool connects, as the `oms` role.
 //!
 //! Provisioning moved to `oms database init` (see `setup::database`), so nothing
 //! here touches admin credentials or creates schema. What remains is
@@ -21,7 +21,7 @@ async fn catalog_nonempty(pool: &PgPool) -> Result<bool, sqlx::Error> {
 /// Ensure a `broker_connection` exists for every broker whose creds are present.
 ///
 /// This is routing config, not a fixture: a credentialed broker with no connection
-/// row cannot take an order at all. Runs as `oms_user` (the `oms` schema is its own),
+/// row cannot take an order at all. Runs as the `oms` role (which owns the schema),
 /// idempotent on `code`.
 pub async fn ensure_broker_connections(pool: &PgPool) {
     for broker in Broker::ALL.iter().copied().filter(|b| b.has_creds()) {
@@ -66,7 +66,7 @@ pub async fn will_sync_on_boot(pool: &PgPool) -> bool {
 /// sync path threads a non-`Send` boxed error across its awaits, and this keeps that
 /// contained instead of forcing `Send + Sync` through every adapter's error type.
 /// The job is genuinely independent — `setup::brokers::run` opens its own pool as
-/// `oms_user` — so nothing is shared with the server runtime. Caller checks
+/// the `oms` role — so nothing is shared with the server runtime. Caller checks
 /// [`will_sync_on_boot`] first.
 pub fn spawn_sync() {
     std::thread::spawn(|| {

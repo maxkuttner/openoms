@@ -24,26 +24,18 @@ type Fallible = Result<(), Box<dyn std::error::Error>>;
 /// pointed at the wrong server — and an automatic `ALTER ROLE … PASSWORD` would
 /// let a bare `init` reset a working install's credentials to the shipped
 /// default. `migrate` is the verb for a database that already exists.
-pub async fn init(o: PostgresOverrides, mdm: Option<String>, oms: Option<String>) -> Fallible {
+pub async fn init(o: PostgresOverrides, password: Option<String>) -> Fallible {
     let cfg = config::resolve(o);
-    let roles = config::resolve_roles(mdm, oms);
+    let password = config::resolve_role_password(password);
 
-    // Same rule `serve()` enforces before connecting, asked of the same helper so
-    // the two cannot drift. `init` must check this too — otherwise it happily
-    // *creates* roles with the default password on a remote server, and the
-    // `serve()` guard only catches it after the fact.
-    let offenders = cfg.default_password_offenders(&[
-        ("MDM_MASTER_PASSWORD", &roles.mdm_password),
-        ("OMS_USER_PASSWORD", &roles.oms_password),
-    ]);
-    if !offenders.is_empty() {
+    // Same rule `serve()` enforces before connecting. `init` must check it too —
+    // otherwise it happily *creates* the role with the default password on a remote
+    // server, and the `serve()` guard only catches it after the fact.
+    if cfg.refuses_default_password(&password) {
         return Err(format!(
-            "error: refusing to create roles with the built-in default password on non-loopback host {}:{}\n\
-             \x20        {} still {} the default — pass --mdm-password/--oms-password, or set them in the environment",
-            cfg.host,
-            cfg.port,
-            offenders.join(" and "),
-            if offenders.len() == 1 { "is" } else { "are" },
+            "error: refusing to create the {} role with the built-in default password on non-loopback host {}:{}\n\
+             \x20        pass --oms-password, or set OMS_PASSWORD",
+            provision::ROLE, cfg.host, cfg.port,
         )
         .into());
     }
@@ -53,8 +45,8 @@ pub async fn init(o: PostgresOverrides, mdm: Option<String>, oms: Option<String>
         return Err(already_initialized(&cfg, &existing).into());
     }
 
-    provision::provision(&cfg, &roles).await?;
-    println!("  created roles mdm_master, oms_user");
+    provision::provision(&cfg, &password).await?;
+    println!("  created role {}", provision::ROLE);
     println!("  created database {}", cfg.database);
 
     let pool = PgPool::connect(&cfg.url()).await?;
@@ -109,7 +101,7 @@ pub async fn status(o: PostgresOverrides) -> Fallible {
     let existing = provision::inspect(&cfg).await?;
     println!("server:   {}:{}", cfg.host, cfg.port);
     println!("database: {} ({})", cfg.database, if existing.database { "present" } else { "absent" });
-    println!("roles:    {}", if existing.roles.is_empty() { "none".into() } else { existing.roles.join(", ") });
+    println!("role:     {}", if existing.roles.is_empty() { "absent".into() } else { existing.roles.join(", ") });
 
     if !existing.database {
         println!("\nNot initialized. Run: oms database init");
@@ -140,7 +132,7 @@ fn already_initialized(cfg: &config::PostgresConfig, existing: &provision::Exist
     let mut msg = String::from("error: this server is already initialized\n");
     if !existing.roles.is_empty() {
         msg.push_str(&format!(
-            "       role(s) {} already exist on {}:{}\n",
+            "       role '{}' already exists on {}:{}\n",
             existing.roles.join(", "), cfg.host, cfg.port
         ));
     }

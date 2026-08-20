@@ -266,10 +266,8 @@ enum DatabaseCmd {
     Init {
         #[command(flatten)]
         db: DbArgs,
-        /// Password for the mdm_master role [env: MDM_MASTER_PASSWORD]
-        #[arg(long)]
-        mdm_password: Option<String>,
-        /// Password for the oms_user role [env: OMS_USER_PASSWORD]
+        /// Password for the `oms` role the server connects as [env: OMS_PASSWORD].
+        /// Distinct from --password, which is the superuser's.
         #[arg(long)]
         oms_password: Option<String>,
     },
@@ -309,8 +307,8 @@ async fn main() {
         }
         Some(Command::Database(cmd)) => {
             let result = match cmd {
-                DatabaseCmd::Init { db, mdm_password, oms_password } => {
-                    setup::database::init(db.into(), mdm_password, oms_password).await
+                DatabaseCmd::Init { db, oms_password } => {
+                    setup::database::init(db.into(), oms_password).await
                 }
                 DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
                 DatabaseCmd::Drop { db, yes } => setup::database::drop(db.into(), yes).await,
@@ -334,30 +332,27 @@ async fn serve() {
     // migrates a database, so starting the server can never mutate one.
     //
     let cfg = setup::database::config::resolve(Default::default());
-    let roles = setup::database::config::resolve_roles(None, None);
+    let role_password = setup::database::config::resolve_role_password(None);
 
     // A shipped default password is fine on a laptop and never anywhere else. Same
-    // rule `database init` applies, asked of the same helper. Only `oms_user` is
-    // checked here: that is the only credential the server connects with, and
-    // refusing to boot over `mdm_master` — which `init` owns and `serve` never uses
-    // — would block a perfectly good runtime configuration.
-    let offenders = cfg.default_password_offenders(&[(
-        "OMS_USER_PASSWORD",
-        &roles.oms_password,
-    )]);
-    if !offenders.is_empty() {
+    // rule `database init` applies, asked of the same helper.
+    if cfg.refuses_default_password(&role_password) {
         error!(
-            "refusing to start: {} still the built-in default against non-loopback host {}",
-            offenders.join(" and "),
+            "refusing to start: OMS_PASSWORD is still the built-in default against \
+             non-loopback host {}",
             cfg.host
         );
         std::process::exit(1);
     }
 
-    // The runtime pool is oms_user — least privilege, and it no longer has its own
+    // The runtime pool is the `oms` role — the same one that owns the schema, and it
+    // no longer has its own
     // host/port/database settings to drift from the ones init used.
-    let runtime_url = cfg.runtime_url(&roles.oms_password);
-    info!("Connecting to {}:{}/{} as oms_user", cfg.host, cfg.port, cfg.database);
+    let runtime_url = cfg.runtime_url(&role_password);
+    info!(
+        "Connecting to {}:{}/{} as {}",
+        cfg.host, cfg.port, cfg.database, setup::database::provision::ROLE
+    );
     let pool = match PgPool::connect(&runtime_url).await {
         Ok(pool) => pool,
         Err(e) => {
