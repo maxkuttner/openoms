@@ -220,6 +220,14 @@ enum Command {
     /// Database provisioning and migration.
     #[command(subcommand)]
     Database(DatabaseCmd),
+    /// First-run setup: generate oms.toml and create the database.
+    Init {
+        /// Take values from flags and the environment instead of prompting.
+        #[arg(long)]
+        non_interactive: bool,
+        #[command(flatten)]
+        db: DbArgs,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -318,6 +326,27 @@ async fn main() {
             if let Err(e) = result {
                 // The error already reads as a user-facing message (see
                 // already_initialized); printing it bare avoids "Error: error:".
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Init { non_interactive, db }) => {
+            let prompts = if non_interactive {
+                let cfg = setup::database::config::resolve(db.into());
+                setup::init::Prompts {
+                    host: cfg.host,
+                    port: cfg.port,
+                    database: cfg.database,
+                    username: cfg.username,
+                    password: cfg.password,
+                }
+            } else {
+                match setup::init::prompt() {
+                    Ok(p) => p,
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+                }
+            };
+            if let Err(e) = setup::init::run(prompts).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }

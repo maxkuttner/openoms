@@ -9,6 +9,8 @@ use base64::Engine;
 use rand::RngCore;
 use std::io::{BufRead, Write};
 
+use crate::config::{self, FileConfig};
+
 /// 32 bytes — the AES-256 key size the credential store expects.
 pub fn generate_master_key() -> String {
     let mut raw = [0u8; 32];
@@ -88,6 +90,102 @@ pub fn prompt() -> std::io::Result<Prompts> {
     let stdin = std::io::stdin();
     let mut locked = stdin.lock();
     prompt_with(&mut locked, || rpassword::prompt_password("Superuser password: "))
+}
+
+/// Assemble the file from the prompts plus freshly generated secrets. Returns the
+/// config and the generated role password, which the caller also needs to pass to
+/// `database init`.
+///
+/// The superuser password is deliberately absent: it was used to connect, and
+/// that is all. Persisting a credential that can `DROP DATABASE` is not worth
+/// saving one prompt on the rare `migrate`.
+pub fn build_file_config(p: &Prompts) -> (FileConfig, String) {
+    let role_password = generate_password();
+    let mut cfg = FileConfig::default();
+    cfg.database.host = Some(p.host.clone());
+    cfg.database.port = Some(p.port);
+    cfg.database.username = Some(p.username.clone());
+    cfg.database.database = Some(p.database.clone());
+    cfg.oms.password = Some(role_password.clone());
+    cfg.oms.master_key = Some(generate_master_key());
+    cfg.server.bind_addr = Some("localhost:3001".to_string());
+    cfg.server.admin_password = Some(generate_password());
+    (cfg, role_password)
+}
+
+/// The whole `oms init` flow.
+pub async fn run(prompts: Prompts) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = config::path();
+    if cfg_path.exists() {
+        return Err(format!(
+            "error: {} already exists\n\
+             \x20        This machine is already initialized. Use `oms database migrate`\n\
+             \x20        to upgrade it, or delete the file to start over — but note the\n\
+             \x20        master key in it decrypts your stored credentials.",
+            cfg_path.display()
+        )
+        .into());
+    }
+
+    // Test connectivity before writing anything: a wrong password should cost
+    // nothing, not leave a half-made install behind.
+    let probe = crate::setup::database::config::PostgresConfig {
+        host: prompts.host.clone(),
+        port: prompts.port,
+        username: prompts.username.clone(),
+        password: prompts.password.clone(),
+        database: "postgres".to_string(),
+    };
+    sqlx::PgPool::connect(&probe.url_for("postgres"))
+        .await
+        .map_err(|e| format!("error: could not connect to {}:{} — {e}", prompts.host, prompts.port))?;
+    println!("  connected to {}:{}", prompts.host, prompts.port);
+
+    let (file_cfg, role_password) = build_file_config(&prompts);
+    let admin_password = file_cfg.server.admin_password.clone().unwrap_or_default();
+
+    // Written before provisioning: if provisioning fails halfway, the generated
+    // secrets survive and `oms database init` can finish the job.
+    config::write_new(&cfg_path, &file_cfg)?;
+    println!("  wrote {} (mode 0600)", cfg_path.display());
+    ensure_gitignored(&cfg_path);
+
+    let overrides = crate::setup::database::config::PostgresOverrides {
+        host: Some(prompts.host.clone()),
+        port: Some(prompts.port),
+        username: Some(prompts.username.clone()),
+        password: Some(prompts.password.clone()),
+        database: Some(prompts.database.clone()),
+    };
+    crate::setup::database::init(overrides, Some(role_password)).await?;
+
+    println!(
+        "\nBack up {}. The master key in it is the only thing that can\n\
+         decrypt stored broker credentials — lose it and they are gone.\n\n\
+         Cockpit login password: {admin_password}\n\n\
+         Start the server:  oms",
+        cfg_path.display()
+    );
+    Ok(())
+}
+
+/// Append the config filename to `.gitignore` if it is not already covered.
+/// Best-effort: not being in a git repository is normal and not an error.
+fn ensure_gitignored(cfg_path: &std::path::Path) {
+    let Some(name) = cfg_path.file_name().and_then(|n| n.to_str()) else { return };
+    let gitignore = std::path::Path::new(".gitignore");
+    if !gitignore.exists() {
+        return;
+    }
+    let current = std::fs::read_to_string(gitignore).unwrap_or_default();
+    if current.lines().any(|l| l.trim() == name) {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(gitignore) {
+        use std::io::Write;
+        let _ = writeln!(f, "\n# openoms bootstrap config — holds the master key\n{name}");
+        println!("  added {name} to .gitignore");
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +297,35 @@ mod tests {
         let err = prompt_with(&mut input, || Ok("pw".into())).expect_err("should be an error");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(err.to_string().contains("unexpected end of input"));
+    }
+
+    /// The file we hand to `database init` must contain the generated secrets and
+    /// the prompted connection — and must NOT contain the superuser password,
+    /// which is the credential that can drop the database.
+    #[test]
+    fn builds_a_file_config_without_the_superuser_password() {
+        let p = Prompts {
+            host: "db.internal".into(),
+            port: 6543,
+            database: "trading".into(),
+            username: "admin".into(),
+            password: "super-secret".into(),
+        };
+        let (cfg, role_pw) = build_file_config(&p);
+
+        assert_eq!(cfg.database.host.as_deref(), Some("db.internal"));
+        assert_eq!(cfg.database.port, Some(6543));
+        assert_eq!(cfg.database.username.as_deref(), Some("admin"));
+        assert_eq!(cfg.database.database.as_deref(), Some("trading"));
+
+        assert_eq!(cfg.oms.password.as_deref(), Some(role_pw.as_str()));
+        assert!(cfg.oms.master_key.as_deref().unwrap().starts_with("base64:"));
+        assert_eq!(cfg.server.bind_addr.as_deref(), Some("localhost:3001"));
+
+        let rendered = toml::to_string_pretty(&cfg).expect("render");
+        assert!(
+            !rendered.contains("super-secret"),
+            "superuser password must never reach the file:\n{rendered}"
+        );
     }
 }
