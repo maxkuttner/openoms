@@ -176,9 +176,14 @@ pub fn write_new(path: &Path, cfg: &FileConfig) -> Result<(), ConfigError> {
         .open(path)
         .map_err(|e| ConfigError::Io(format!("could not create {}: {e}", path.display())))?;
 
-    f.write_all(header.as_bytes())
-        .and_then(|_| f.write_all(body.as_bytes()))
-        .map_err(|e| ConfigError::Io(format!("could not write {}: {e}", path.display())))
+    // A failed write must not leave a comment-only file behind: that parses as
+    // valid empty TOML, so the master key would vanish silently, and create_new
+    // would then refuse the retry. Remove what we made and report the failure.
+    if let Err(e) = f.write_all(header.as_bytes()).and_then(|_| f.write_all(body.as_bytes())) {
+        let _ = std::fs::remove_file(path);
+        return Err(ConfigError::Io(format!("could not write {}: {e}", path.display())));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -291,6 +296,23 @@ admin_password = "admin-pw"
 
         let mode = std::fs::metadata(&p).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// An all-None config serializes and deserializes correctly. The
+    /// skip_serializing_if = "Option::is_none" annotation means an empty config
+    /// writes as just a comment header and produces valid empty TOML.
+    #[test]
+    fn an_empty_config_round_trips() {
+        let p = temp_path("empty.toml");
+        let _ = std::fs::remove_file(&p);
+
+        write_new(&p, &FileConfig::default()).expect("write");
+
+        let back = parse(&std::fs::read_to_string(&p).expect("read")).expect("parse");
+        assert_eq!(back.database.host, None);
+        assert_eq!(back.oms.master_key, None);
+        assert_eq!(back.server.bind_addr, None);
         std::fs::remove_file(&p).ok();
     }
 
