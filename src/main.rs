@@ -60,6 +60,7 @@ mod binance_feed;
 mod bybit_feed;
 mod feeds;
 mod preflight;
+mod config;
 mod expiry;
 mod fix;
 

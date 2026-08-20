@@ -26,6 +26,9 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13.1", features = ["json"] }
 base64 = "0.22"
 bcrypt = "0.15"
+toml = "0.8"
+rpassword = "7"
+rand = "0.8"
 databento = { version = "0.54.0", default-features = false, features = ["live", "chrono"]}
 csv = "1"
 
