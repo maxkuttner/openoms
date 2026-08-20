@@ -172,6 +172,35 @@ impl utoipa::Modify for SecurityAddon {
 
 
 
+/// Where the server listens when `OMS_BIND_ADDR` says nothing. Loopback by
+/// design: a fresh clone should start and be reachable from a browser on the same
+/// machine, and nothing more, until the operator says otherwise.
+const DEFAULT_BIND_ADDR: &str = "localhost:3001";
+
+/// Admin console password used when `OMS_ADMIN_PASSWORD` is unset *and* the bind
+/// address is loopback. Mirrors `config::DEFAULT_ROLE_PASSWORD`: convenient on a
+/// laptop, refused the moment the server is reachable from anywhere else.
+const DEFAULT_ADMIN_PASSWORD: &str = "openoms-dev";
+
+/// Is this bind address reachable only from this machine?
+///
+/// Splits the host off a `host:port` pair before asking, and treats anything it
+/// cannot parse as non-loopback — an unrecognised address must not be what talks
+/// the server into accepting a default password.
+fn bind_is_loopback(addr: &str) -> bool {
+    // `[::1]:3001` — bracketed IPv6 literal, host is everything up to the bracket.
+    let host = if let Some(rest) = addr.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        // `localhost:3001` / `127.0.0.1:3001`, or a bare host with no port.
+        addr.rsplit_once(':').map_or(addr, |(h, _)| h)
+    };
+    setup::database::config::is_loopback_host(host)
+}
+
 /// OMS command-line entry point. With no subcommand it runs the server (the
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
@@ -307,13 +336,19 @@ async fn serve() {
     let cfg = setup::database::config::resolve(Default::default());
     let roles = setup::database::config::resolve_roles(None, None);
 
-    // A shipped default password is fine on a laptop and never anywhere else.
-    if !cfg.is_loopback()
-        && roles.oms_password == setup::database::config::DEFAULT_ROLE_PASSWORD
-    {
+    // A shipped default password is fine on a laptop and never anywhere else. Same
+    // rule `database init` applies, asked of the same helper. Only `oms_user` is
+    // checked here: that is the only credential the server connects with, and
+    // refusing to boot over `mdm_master` — which `init` owns and `serve` never uses
+    // — would block a perfectly good runtime configuration.
+    let offenders = cfg.default_password_offenders(&[(
+        "OMS_USER_PASSWORD",
+        &roles.oms_password,
+    )]);
+    if !offenders.is_empty() {
         error!(
-            "refusing to start: OMS_USER_PASSWORD is still the built-in default \
-             against non-loopback host {}",
+            "refusing to start: {} still the built-in default against non-loopback host {}",
+            offenders.join(" and "),
             cfg.host
         );
         std::process::exit(1);
@@ -356,23 +391,50 @@ async fn serve() {
     };
 
 
+    // Resolved here rather than at bind time because the admin-password rule below
+    // needs to know whether we are about to expose the server beyond this machine.
+    let bind_addr = env::var("OMS_BIND_ADDR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+
     let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
         .map(|v| v.to_lowercase() != "false")
         .unwrap_or(true);
 
     // The admin console login password. `OMS_ADMIN_PASSWORD` is the canonical name;
     // `OMS_ADMIN_TOKEN` is still accepted for back-compat.
+    //
+    // Unset is not fatal on a loopback bind: a fresh clone must be able to run
+    // `cargo run` and reach the console, the same way `database init` works with no
+    // configuration at all. The moment the bind address is reachable from anywhere
+    // else, the default is refused instead — identical to the role-password rule.
     let admin_token = if !admin_auth_enabled {
         String::new()
     } else {
-        env::var("OMS_ADMIN_PASSWORD")
+        match env::var("OMS_ADMIN_PASSWORD")
             .ok()
             .filter(|v| !v.is_empty())
             .or_else(|| env::var("OMS_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()))
-            .unwrap_or_else(|| {
-                error!("OMS_ADMIN_PASSWORD is not set");
+        {
+            Some(token) => token,
+            None if bind_is_loopback(&bind_addr) => {
+                warn!(
+                    "OMS_ADMIN_PASSWORD is not set — using the built-in default \
+                     '{DEFAULT_ADMIN_PASSWORD}' for the admin console. Set OMS_ADMIN_PASSWORD \
+                     in .env before binding anywhere but localhost."
+                );
+                DEFAULT_ADMIN_PASSWORD.to_string()
+            }
+            None => {
+                error!(
+                    "refusing to start: OMS_ADMIN_PASSWORD is not set and OMS_BIND_ADDR \
+                     ({bind_addr}) is reachable beyond this machine. Set OMS_ADMIN_PASSWORD \
+                     in .env, or set OMS_ADMIN_AUTH_ENABLED=false to disable the console login."
+                );
                 std::process::exit(1);
-            })
+            }
+        }
     };
 
     // Stream health + the fill→marks doorbell are created here (before the broker
@@ -723,14 +785,6 @@ async fn serve() {
         .fallback(handlers::handler_404)
         .with_state(state);
 
-        let bind_addr = match env::var("OMS_BIND_ADDR") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            error!("OMS_BIND_ADDR is not set");
-            std::process::exit(1);
-        }
-    };
-
     // Start TCP listener
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     let host_url = format!("http://{}", bind_addr);
@@ -738,4 +792,35 @@ async fn serve() {
     info!("Scalar UI: {}/scalar", host_url);
     info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_is_loopback;
+
+    /// The defaults-are-fine-on-a-laptop case: these must accept the built-in
+    /// admin password, with or without a port.
+    #[test]
+    fn loopback_binds_are_recognised() {
+        assert!(bind_is_loopback("localhost:3001"));
+        assert!(bind_is_loopback("127.0.0.1:3001"));
+        assert!(bind_is_loopback("[::1]:3001"));
+        assert!(bind_is_loopback("localhost"));
+    }
+
+    /// Anything reachable from another machine must refuse the default password.
+    /// `0.0.0.0` is the one that matters — it looks local and is not.
+    #[test]
+    fn exposed_binds_are_not_loopback() {
+        assert!(!bind_is_loopback("0.0.0.0:3001"));
+        assert!(!bind_is_loopback("192.168.1.10:3001"));
+        assert!(!bind_is_loopback("oms.internal:3001"));
+    }
+
+    /// An address we cannot parse must fail closed, never open.
+    #[test]
+    fn unparseable_binds_are_not_loopback() {
+        assert!(!bind_is_loopback("[::1:3001"), "unterminated IPv6 bracket");
+        assert!(!bind_is_loopback(""));
+    }
 }

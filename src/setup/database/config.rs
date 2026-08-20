@@ -101,8 +101,36 @@ impl PostgresConfig {
 
     /// Is this server on the local machine? Gates the default-password check.
     pub fn is_loopback(&self) -> bool {
-        matches!(self.host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        is_loopback_host(&self.host)
     }
+
+    /// The one place that decides whether a shipped default password is acceptable
+    /// for this host: fine on a laptop, never anywhere else. Returns the names of
+    /// the offending variables, empty when fine.
+    ///
+    /// The caller passes only the passwords it actually uses, because the two call
+    /// sites legitimately differ — `init` creates both roles and checks both, while
+    /// `serve` only ever connects as `oms_user` and must not refuse to start over a
+    /// credential it never touches. What they share is this rule, not the list.
+    pub fn default_password_offenders(&self, checked: &[(&'static str, &str)]) -> Vec<&'static str> {
+        if self.is_loopback() {
+            return Vec::new();
+        }
+        checked
+            .iter()
+            .filter(|(_, password)| *password == DEFAULT_ROLE_PASSWORD)
+            .map(|(name, _)| *name)
+            .collect()
+    }
+}
+
+/// Loopback test for a bare hostname. Shared with the server's bind-address
+/// check, which gates the default admin password the same way.
+///
+/// `0.0.0.0` is deliberately *not* loopback: binding it exposes the server to
+/// every interface, which is exactly when a shipped default must be refused.
+pub fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
 /// Percent-encode a string for use as URL userinfo (RFC 3986). No dependency: the
@@ -235,6 +263,53 @@ mod tests {
     fn runtime_url_percent_encodes_special_characters() {
         let url = sample().runtime_url("p@ss/w:o#rd");
         assert!(url.contains("oms_user:p%40ss%2Fw%3Ao%23rd@"), "got {url}");
+    }
+
+    /// Off-loopback, every default the caller names is reported — and only those.
+    #[test]
+    fn default_passwords_are_refused_off_loopback() {
+        let remote = PostgresConfig { host: "db.internal".into(), ..sample() };
+        let both: &[(&str, &str)] = &[
+            ("MDM_MASTER_PASSWORD", DEFAULT_ROLE_PASSWORD),
+            ("OMS_USER_PASSWORD", DEFAULT_ROLE_PASSWORD),
+        ];
+        assert_eq!(
+            remote.default_password_offenders(both),
+            vec!["MDM_MASTER_PASSWORD", "OMS_USER_PASSWORD"]
+        );
+
+        assert_eq!(
+            remote.default_password_offenders(&[
+                ("MDM_MASTER_PASSWORD", DEFAULT_ROLE_PASSWORD),
+                ("OMS_USER_PASSWORD", "a-real-password"),
+            ]),
+            vec!["MDM_MASTER_PASSWORD"]
+        );
+
+        assert!(remote
+            .default_password_offenders(&[("OMS_USER_PASSWORD", "a-real-password")])
+            .is_empty());
+    }
+
+    /// `serve` checks only the credential it connects with. A default `mdm_master`
+    /// password must never stop the server booting — it does not use that role.
+    #[test]
+    fn serve_scope_ignores_the_mdm_password() {
+        let remote = PostgresConfig { host: "db.internal".into(), ..sample() };
+        assert!(remote
+            .default_password_offenders(&[("OMS_USER_PASSWORD", "a-real-password")])
+            .is_empty());
+    }
+
+    /// The same defaults are fine on a laptop — that is what makes zero-config work.
+    #[test]
+    fn default_passwords_are_fine_on_loopback() {
+        assert!(sample()
+            .default_password_offenders(&[
+                ("MDM_MASTER_PASSWORD", DEFAULT_ROLE_PASSWORD),
+                ("OMS_USER_PASSWORD", DEFAULT_ROLE_PASSWORD),
+            ])
+            .is_empty());
     }
 
     fn sample() -> PostgresConfig {

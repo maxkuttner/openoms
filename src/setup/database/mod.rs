@@ -28,18 +28,22 @@ pub async fn init(o: PostgresOverrides, mdm: Option<String>, oms: Option<String>
     let cfg = config::resolve(o);
     let roles = config::resolve_roles(mdm, oms);
 
-    // Same rule `serve()` enforces before connecting: a shipped default password
-    // is fine on a laptop and never anywhere else. `init` must check this too —
-    // otherwise it happily *creates* roles with the default password on a remote
-    // server, and the `serve()` guard only catches it after the fact.
-    if !cfg.is_loopback()
-        && (roles.mdm_password == config::DEFAULT_ROLE_PASSWORD
-            || roles.oms_password == config::DEFAULT_ROLE_PASSWORD)
-    {
+    // Same rule `serve()` enforces before connecting, asked of the same helper so
+    // the two cannot drift. `init` must check this too — otherwise it happily
+    // *creates* roles with the default password on a remote server, and the
+    // `serve()` guard only catches it after the fact.
+    let offenders = cfg.default_password_offenders(&[
+        ("MDM_MASTER_PASSWORD", &roles.mdm_password),
+        ("OMS_USER_PASSWORD", &roles.oms_password),
+    ]);
+    if !offenders.is_empty() {
         return Err(format!(
             "error: refusing to create roles with the built-in default password on non-loopback host {}:{}\n\
-             \x20        pass --mdm-password/--oms-password, or set MDM_MASTER_PASSWORD/OMS_USER_PASSWORD",
-            cfg.host, cfg.port
+             \x20        {} still {} the default — pass --mdm-password/--oms-password, or set them in the environment",
+            cfg.host,
+            cfg.port,
+            offenders.join(" and "),
+            if offenders.len() == 1 { "is" } else { "are" },
         )
         .into());
     }

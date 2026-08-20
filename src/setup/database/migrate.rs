@@ -9,6 +9,8 @@
 //! simple query protocol runs happily alongside the rest of the file — which is
 //! what makes psql unnecessary.
 
+use std::collections::HashSet;
+
 use sqlx::PgPool;
 
 use super::assets::{self, MigrationTarget, TARGETS};
@@ -57,23 +59,28 @@ pub async fn is_migrated(pool: &PgPool) -> Result<bool, sqlx::Error> {
     Ok(found.is_some())
 }
 
-async fn is_applied(pool: &PgPool, schema: &str, filename: &str) -> Result<bool, sqlx::Error> {
-    let found: Option<i32> = sqlx::query_scalar(
-        "SELECT 1 FROM public._mdm_migrations WHERE target = $1 AND filename = $2",
-    )
-    .bind(schema)
-    .bind(filename)
-    .fetch_optional(pool)
-    .await?;
-    Ok(found.is_some())
+/// Every filename already recorded for one target, as a set.
+///
+/// Fetched once per target rather than asked per file: there are 40-odd embedded
+/// migrations, and the common case (`migrate` or `status` on an up-to-date
+/// database) answered "already applied" for every one of them, which cost one
+/// round-trip each.
+async fn applied_set(pool: &PgPool, schema: &str) -> Result<HashSet<String>, sqlx::Error> {
+    let rows: Vec<String> =
+        sqlx::query_scalar("SELECT filename FROM public._mdm_migrations WHERE target = $1")
+            .bind(schema)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
 }
 
 /// Everything not yet applied, in apply order.
 pub async fn pending(pool: &PgPool) -> Result<Vec<Pending>, sqlx::Error> {
     let mut out = Vec::new();
     for t in &TARGETS {
+        let applied = applied_set(pool, t.schema).await?;
         for (filename, _) in assets::migrations(t) {
-            if !is_applied(pool, t.schema, &filename).await? {
+            if !applied.contains(&filename) {
                 out.push(Pending { schema: t.schema, filename });
             }
         }
@@ -92,8 +99,9 @@ pub async fn applied_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
 pub async fn apply_all(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut applied = 0;
     for t in &TARGETS {
+        let already = applied_set(pool, t.schema).await?;
         for (filename, sql) in assets::migrations(t) {
-            if is_applied(pool, t.schema, &filename).await? {
+            if already.contains(&filename) {
                 continue;
             }
             apply_one(pool, t, &filename, sql).await?;

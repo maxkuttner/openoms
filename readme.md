@@ -30,8 +30,11 @@ Then, in a second terminal:
 cd cockpit && npm install && npm run dev  # admin console on localhost:5173
 ```
 
-That is the whole setup. The catalog starts empty — see
-[Loading instruments](#loading-instruments) for filling it, and create your
+That is the whole setup — no `.env`, no flags. The server binds `localhost:3001`
+and the cockpit login password defaults to `openoms-dev` until you set one.
+
+The instrument catalog starts empty. Put broker credentials in `.env` and it fills
+itself on the next boot; see [Loading instruments](#loading-instruments). Create
 portfolios, accounts and trading identities in the cockpit.
 
 ### What each step does
@@ -74,14 +77,19 @@ POSTGRES_HOST=db.internal cargo run -- database init
 | Database | `--database` | `POSTGRES_DATABASE` | `ods` |
 | Catalog role password | `--mdm-password` | `MDM_MASTER_PASSWORD` | `openoms-dev` |
 | Runtime role password | `--oms-password` | `OMS_USER_PASSWORD` | `openoms-dev` |
+| Server bind address | — | `OMS_BIND_ADDR` | `localhost:3001` |
+| Cockpit admin password | — | `OMS_ADMIN_PASSWORD` | `openoms-dev` (loopback only) |
 
 The superuser is used **only** to provision and tear down. The running server
 connects as `oms_user` with the runtime role password.
 
 `.env` is an override file, not a prerequisite — copy `.env.example` when you need
-broker credentials, a real admin password, or a non-local database. For any host
-that is not loopback, change both role passwords: the server refuses to start with
-the built-in default against a remote database.
+broker credentials, a real admin password, or a non-local database.
+
+The built-in defaults are loopback-only by design, and the same rule applies in
+three places: the two database role passwords, and the cockpit admin password. Bind
+to anything but localhost, or point at a remote database, and a still-default
+password is refused rather than silently accepted.
 
 ## Database commands
 
@@ -100,8 +108,19 @@ Upgrading an existing install is `git pull && cargo run -- database migrate`.
 
 ## Loading instruments
 
-The instrument catalog comes from brokers, not from a bundled list. With broker
-credentials in `.env`:
+The instrument catalog comes from brokers, not from a bundled list. There are two
+ways in, and they run the same code.
+
+**Automatic.** With broker credentials in `.env`, an empty catalog is populated in
+the background on boot. This is the normal path after `database init` — start the
+server, and instruments appear. The sync can take minutes for full option chains.
+
+```sh
+# OMS_SYNC_ON_BOOT=never       # opt out entirely
+# OMS_SYNC_UNDERLYINGS=SPY,QQQ # only these option chains, instead of all
+```
+
+**Explicit**, when you want to re-sync or see what would change:
 
 ```sh
 cargo run -- setup sync-broker --broker alpaca
@@ -155,6 +174,7 @@ There is a CLI too — `oms orders list`, `oms positions`, `oms submit`. See
 
 | Symptom | Cause |
 |---|---|
+| `refusing to start: OMS_ADMIN_PASSWORD is not set` | `OMS_BIND_ADDR` is not loopback. Set a real admin password in `.env`. |
 | `password authentication failed for user "oms_user"` | `OMS_USER_PASSWORD` doesn't match the role. Fix the value, or `ALTER ROLE oms_user PASSWORD '…'`. |
 | `role "oms_user" already exists` on init | Something is already provisioned. Use `migrate`, or `drop` first. |
 | Server exits naming a migration | Run `cargo run -- database migrate`. |
