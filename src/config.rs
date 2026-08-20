@@ -101,7 +101,15 @@ impl std::fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 pub fn parse(toml_str: &str) -> Result<FileConfig, ConfigError> {
-    toml::from_str(toml_str).map_err(|e| ConfigError::Parse(e.to_string()))
+    toml::from_str(toml_str).map_err(|e| {
+        // Deliberately NOT `e.to_string()`: the toml crate renders the offending
+        // source line, which prints the secret when the error lands on a password
+        // or the master key. Message plus location is enough to fix a typo.
+        match e.span() {
+            Some(s) => ConfigError::Parse(format!("{} (at bytes {}..{})", e.message(), s.start, s.end)),
+            None => ConfigError::Parse(e.message().to_string()),
+        }
+    })
 }
 
 /// The configured path: `--config` is threaded in as `OMS_CONFIG` by `main`, so
@@ -120,13 +128,19 @@ static LOADED: OnceLock<Option<FileConfig>> = OnceLock::new();
 ///
 /// A file that exists but does not parse is fatal: it means the operator wrote
 /// something they believe is in effect. Silently ignoring it could point the
-/// server at a different database than they intended.
+/// server at a different database than they intended. Same for any other read
+/// failure (e.g. permission denied) on a file that does exist — it may hold the
+/// master key, so falling back to defaults silently is not an option.
 pub fn load() -> Option<&'static FileConfig> {
     LOADED
         .get_or_init(|| {
             let p = path();
             match std::fs::read_to_string(&p) {
-                Err(_) => None,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    eprintln!("error: cannot read {}: {e}", p.display());
+                    std::process::exit(1);
+                }
                 Ok(text) => match parse(&text) {
                     Ok(cfg) => Some(cfg),
                     Err(e) => {
@@ -216,5 +230,18 @@ admin_password = "admin-pw"
         for secret in ["role-pw", "base64:KEYKEYKEY", "admin-pw"] {
             assert!(!rendered.contains(secret), "{secret} leaked into {rendered}");
         }
+    }
+
+    /// A syntax error on the line carrying a secret must not echo that secret
+    /// back in the error string — `toml::de::Error`'s `Display` renders the
+    /// offending source line, so `parse` must build the message from
+    /// `.message()`/`.span()` only, never `.to_string()`.
+    #[test]
+    fn parse_error_does_not_echo_a_broken_secret_line() {
+        let err = parse("[oms]\nmaster_key = \"base64:SUPERSECRETKEY\n")
+            .expect_err("should not parse");
+        let rendered = err.to_string();
+        assert!(!rendered.contains("SUPERSECRETKEY"), "leaked into {rendered}");
+        assert!(!rendered.contains("base64:SUPERSECRETKEY"), "leaked into {rendered}");
     }
 }
