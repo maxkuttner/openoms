@@ -7,6 +7,7 @@
 
 use base64::Engine;
 use rand::RngCore;
+use std::io::{BufRead, Write};
 
 /// 32 bytes — the AES-256 key size the credential store expects.
 pub fn generate_master_key() -> String {
@@ -23,6 +24,50 @@ pub fn generate_password() -> String {
     let mut raw = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut raw);
     raw.iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
+}
+
+/// What `oms init` asks for. Everything here describes the operator's existing
+/// Postgres; nothing generated appears in this struct.
+#[derive(Debug)]
+pub struct Prompts {
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub username: String,
+    pub password: String,
+}
+
+/// Prompt against arbitrary input, with the password read through a supplied
+/// closure. Split this way so the whole flow is testable — `rpassword` reads the
+/// tty directly and cannot be driven from a test.
+pub fn prompt_with<R: BufRead>(
+    input: &mut R,
+    read_password: impl FnOnce() -> std::io::Result<String>,
+) -> std::io::Result<Prompts> {
+    fn ask<R: BufRead>(input: &mut R, label: &str, default: &str) -> std::io::Result<String> {
+        print!("{label} [{default}]: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        input.read_line(&mut line)?;
+        let trimmed = line.trim();
+        Ok(if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() })
+    }
+
+    let host = ask(input, "Postgres host     ", "localhost")?;
+    // A typo here should cost one field, not the whole session.
+    let port = ask(input, "Postgres port     ", "5432")?.parse().unwrap_or(5432);
+    let database = ask(input, "Database name     ", "ods")?;
+    let username = ask(input, "Superuser name    ", "postgres")?;
+    let password = read_password()?;
+
+    Ok(Prompts { host, port, database, username, password })
+}
+
+/// The real thing: stdin plus a no-echo password read.
+pub fn prompt() -> std::io::Result<Prompts> {
+    let stdin = std::io::stdin();
+    let mut locked = stdin.lock();
+    prompt_with(&mut locked, || rpassword::prompt_password("Superuser password: "))
 }
 
 #[cfg(test)]
@@ -60,5 +105,47 @@ mod tests {
             p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
             "unexpected character in {p}"
         );
+    }
+
+    use std::io::BufReader;
+
+    /// Pressing Enter through every prompt must yield a working localhost setup —
+    /// that is what makes the happy path zero-decision.
+    #[test]
+    fn empty_input_takes_every_default() {
+        let mut input = BufReader::new(&b"\n\n\n\n"[..]);
+        let p = prompt_with(&mut input, || Ok("secret".into())).expect("prompt");
+        assert_eq!(p.host, "localhost");
+        assert_eq!(p.port, 5432);
+        assert_eq!(p.database, "ods");
+        assert_eq!(p.username, "postgres");
+        assert_eq!(p.password, "secret");
+    }
+
+    #[test]
+    fn typed_values_override_the_defaults() {
+        let mut input = BufReader::new(&b"db.internal\n6543\ntrading\nadmin\n"[..]);
+        let p = prompt_with(&mut input, || Ok("pw".into())).expect("prompt");
+        assert_eq!(p.host, "db.internal");
+        assert_eq!(p.port, 6543);
+        assert_eq!(p.database, "trading");
+        assert_eq!(p.username, "admin");
+    }
+
+    /// Surrounding whitespace is a paste artefact, not part of a hostname.
+    #[test]
+    fn trims_surrounding_whitespace() {
+        let mut input = BufReader::new(&b"  db.internal  \n\n\n\n"[..]);
+        let p = prompt_with(&mut input, || Ok("pw".into())).expect("prompt");
+        assert_eq!(p.host, "db.internal");
+    }
+
+    /// A non-numeric port falls back to the default rather than aborting the whole
+    /// interactive session over one typo.
+    #[test]
+    fn unparseable_port_falls_back_to_the_default() {
+        let mut input = BufReader::new(&b"\nnot-a-number\n\n\n"[..]);
+        let p = prompt_with(&mut input, || Ok("pw".into())).expect("prompt");
+        assert_eq!(p.port, 5432);
     }
 }
