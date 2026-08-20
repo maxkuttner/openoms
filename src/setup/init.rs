@@ -99,6 +99,11 @@ pub fn prompt() -> std::io::Result<Prompts> {
 /// The superuser password is deliberately absent: it was used to connect, and
 /// that is all. Persisting a credential that can `DROP DATABASE` is not worth
 /// saving one prompt on the rare `migrate`.
+///
+/// The cockpit admin password is deliberately NOT generated here: `run()` needs
+/// the raw value for its success message, and generating it there — then
+/// assigning it into the config — is one step, versus generating it here and
+/// making the caller claw it back out of an `Option` afterwards.
 pub fn build_file_config(p: &Prompts) -> (FileConfig, String) {
     let role_password = generate_password();
     let mut cfg = FileConfig::default();
@@ -109,26 +114,43 @@ pub fn build_file_config(p: &Prompts) -> (FileConfig, String) {
     cfg.oms.password = Some(role_password.clone());
     cfg.oms.master_key = Some(generate_master_key());
     cfg.server.bind_addr = Some("localhost:3001".to_string());
-    cfg.server.admin_password = Some(generate_password());
     (cfg, role_password)
 }
 
+/// The refusal shown when `oms init` finds a config already in place. Shared by
+/// `run()`'s own check and by the dispatch arm in `main.rs`, which checks the
+/// same thing earlier — before a superuser password is typed at a no-echo prompt,
+/// or `config::load()` has a chance to exit the process over a malformed file
+/// before this message ever gets printed.
+pub fn already_initialized_message(path: &std::path::Path) -> String {
+    format!(
+        "error: {} already exists\n\
+         \x20        This machine is already initialized. Use `oms database migrate`\n\
+         \x20        to upgrade it, or delete the file to start over — but note the\n\
+         \x20        master key in it decrypts your stored credentials.",
+        path.display()
+    )
+}
+
 /// The whole `oms init` flow.
-pub async fn run(prompts: Prompts) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// `interactive` controls only whether the generated cockpit password is printed:
+/// true (a human typed the prompts) is the sole way that value ever reaches the
+/// operator, so it must be shown; false (`--non-interactive`) is the mode most
+/// likely to run under CI/Ansible with stdout captured into a durable log, which
+/// is exactly what "secrets are never logged" rules out.
+pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = config::path();
     if cfg_path.exists() {
-        return Err(format!(
-            "error: {} already exists\n\
-             \x20        This machine is already initialized. Use `oms database migrate`\n\
-             \x20        to upgrade it, or delete the file to start over — but note the\n\
-             \x20        master key in it decrypts your stored credentials.",
-            cfg_path.display()
-        )
-        .into());
+        return Err(already_initialized_message(&cfg_path).into());
     }
 
     // Test connectivity before writing anything: a wrong password should cost
-    // nothing, not leave a half-made install behind.
+    // nothing, not leave a half-made install behind. `PgConnection` (a single
+    // connection, explicitly closed) rather than `PgPool` matches the idiom
+    // `provision::inspect`/`provision::provision` already use for this same
+    // one-shot probe against the `postgres` maintenance database.
+    use sqlx::Connection;
     let probe = crate::setup::database::config::PostgresConfig {
         host: prompts.host.clone(),
         port: prompts.port,
@@ -136,13 +158,15 @@ pub async fn run(prompts: Prompts) -> Result<(), Box<dyn std::error::Error>> {
         password: prompts.password.clone(),
         database: "postgres".to_string(),
     };
-    sqlx::PgPool::connect(&probe.url_for("postgres"))
+    let conn = sqlx::PgConnection::connect(&probe.url_for("postgres"))
         .await
         .map_err(|e| format!("error: could not connect to {}:{} — {e}", prompts.host, prompts.port))?;
+    conn.close().await.ok();
     println!("  connected to {}:{}", prompts.host, prompts.port);
 
-    let (file_cfg, role_password) = build_file_config(&prompts);
-    let admin_password = file_cfg.server.admin_password.clone().unwrap_or_default();
+    let (mut file_cfg, role_password) = build_file_config(&prompts);
+    let admin_password = generate_password();
+    file_cfg.server.admin_password = Some(admin_password.clone());
 
     // Written before provisioning: if provisioning fails halfway, the generated
     // secrets survive and `oms database init` can finish the job.
@@ -157,12 +181,29 @@ pub async fn run(prompts: Prompts) -> Result<(), Box<dyn std::error::Error>> {
         password: Some(prompts.password.clone()),
         database: Some(prompts.database.clone()),
     };
-    crate::setup::database::init(overrides, Some(role_password)).await?;
+    // The write above already happened: a failure here must not read as if
+    // nothing was saved. That guarantee is the entire reason for the
+    // write-before-provision ordering, so it has to reach the operator, not
+    // just live in a comment.
+    crate::setup::database::init(overrides, Some(role_password)).await.map_err(|e| {
+        format!(
+            "error: the database could not be created: {e}\n\n\
+             \x20        {} was already written and holds your generated credentials —\n\
+             \x20        it has not been lost. Fix the cause above, then finish with:\n\n\
+             \x20            oms database init",
+            cfg_path.display()
+        )
+    })?;
 
+    let admin_line = if interactive {
+        format!("Cockpit login password: {admin_password}")
+    } else {
+        "Cockpit login password: written to oms.toml".to_string()
+    };
     println!(
         "\nBack up {}. The master key in it is the only thing that can\n\
          decrypt stored broker credentials — lose it and they are gone.\n\n\
-         Cockpit login password: {admin_password}\n\n\
+         {admin_line}\n\n\
          Start the server:  oms",
         cfg_path.display()
     );

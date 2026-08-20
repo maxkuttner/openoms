@@ -331,6 +331,20 @@ async fn main() {
             }
         }
         Some(Command::Init { non_interactive, db }) => {
+            // Checked here too, not only inside `run()`: `resolve()` below calls
+            // `config::load()`, which exits the process over a *malformed*
+            // oms.toml before `run()`'s own check ever runs — and interactively,
+            // without this, the operator would type their superuser password at
+            // a no-echo prompt only to be refused a moment later. `run()` keeps
+            // its own check regardless; that one is the actual guarantee, this
+            // one just fails earlier and more kindly.
+            let cfg_path = config::path();
+            if cfg_path.exists() {
+                eprintln!("{}", setup::init::already_initialized_message(&cfg_path));
+                std::process::exit(1);
+            }
+
+            let interactive = !non_interactive;
             let prompts = if non_interactive {
                 let cfg = setup::database::config::resolve(db.into());
                 setup::init::Prompts {
@@ -346,7 +360,7 @@ async fn main() {
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 }
             };
-            if let Err(e) = setup::init::run(prompts).await {
+            if let Err(e) = setup::init::run(prompts, interactive).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
