@@ -39,26 +39,60 @@ fn from_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|v| !v.is_empty())
 }
 
+/// Flag → env → `oms.toml` → default.
 pub fn resolve(o: PostgresOverrides) -> PostgresConfig {
+    resolve_with(o, crate::config::load())
+}
+
+/// The tier chain with the file supplied explicitly. `resolve` passes the real
+/// one; tests pass their own, because `config::load` caches process-globally.
+pub fn resolve_with(o: PostgresOverrides, file: Option<&crate::config::FileConfig>) -> PostgresConfig {
+    let db = file.map(|f| &f.database);
     PostgresConfig {
-        host: o.host.or_else(|| from_env("POSTGRES_HOST")).unwrap_or_else(|| "localhost".into()),
+        host: o
+            .host
+            .or_else(|| from_env("POSTGRES_HOST"))
+            .or_else(|| db.and_then(|d| d.host.clone()))
+            .unwrap_or_else(|| "localhost".into()),
         // A malformed port falls back rather than panicking: the connection will
         // fail with a clear address anyway, and panicking in a config getter gives
         // a worse message than the connection error does.
         port: o
             .port
             .or_else(|| from_env("POSTGRES_PORT").and_then(|p| p.parse().ok()))
+            .or_else(|| db.and_then(|d| d.port))
             .unwrap_or(5432),
-        username: o.username.or_else(|| from_env("POSTGRES_USERNAME")).unwrap_or_else(|| "postgres".into()),
-        password: o.password.or_else(|| from_env("POSTGRES_PASSWORD")).unwrap_or_else(|| "postgres".into()),
-        database: o.database.or_else(|| from_env("POSTGRES_DATABASE")).unwrap_or_else(|| "ods".into()),
+        username: o
+            .username
+            .or_else(|| from_env("POSTGRES_USERNAME"))
+            .or_else(|| db.and_then(|d| d.username.clone()))
+            .unwrap_or_else(|| "postgres".into()),
+        // Deliberately no file tier: the superuser password is prompted, never
+        // stored. See the spec — that credential can drop the database.
+        password: o
+            .password
+            .or_else(|| from_env("POSTGRES_PASSWORD"))
+            .unwrap_or_else(|| "postgres".into()),
+        database: o
+            .database
+            .or_else(|| from_env("POSTGRES_DATABASE"))
+            .or_else(|| db.and_then(|d| d.database.clone()))
+            .unwrap_or_else(|| "ods".into()),
     }
 }
 
-/// The password for the `oms` role, on the same flag → env → default tiers as
-/// everything else.
+/// The password for the `oms` role, on the same tiers as everything else.
 pub fn resolve_role_password(flag: Option<String>) -> String {
-    flag.or_else(|| from_env("OMS_PASSWORD")).unwrap_or_else(|| DEFAULT_ROLE_PASSWORD.into())
+    resolve_role_password_with(flag, crate::config::load())
+}
+
+pub fn resolve_role_password_with(
+    flag: Option<String>,
+    file: Option<&crate::config::FileConfig>,
+) -> String {
+    flag.or_else(|| from_env("OMS_PASSWORD"))
+        .or_else(|| file.and_then(|f| f.oms.password.clone()))
+        .unwrap_or_else(|| DEFAULT_ROLE_PASSWORD.into())
 }
 
 impl PostgresConfig {
@@ -261,6 +295,68 @@ mod tests {
             password: "postgres".into(),
             database: "ods".into(),
         }
+    }
+
+    /// The file sits *below* env: a container injecting POSTGRES_HOST must win
+    /// over a file baked into the image.
+    #[test]
+    fn env_beats_the_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let file = crate::config::parse("[database]\nhost = \"from-file\"\n").expect("parse");
+        std::env::set_var("POSTGRES_HOST", "from-env");
+        assert_eq!(resolve_with(PostgresOverrides::default(), Some(&file)).host, "from-env");
+        clear_env();
+    }
+
+    /// The file sits *above* the built-in default.
+    #[test]
+    fn file_beats_the_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let file = crate::config::parse("[database]\nhost = \"from-file\"\nport = 6543\n")
+            .expect("parse");
+        let c = resolve_with(PostgresOverrides::default(), Some(&file));
+        assert_eq!(c.host, "from-file");
+        assert_eq!(c.port, 6543);
+        // Unset in the file, so still the default.
+        assert_eq!(c.database, "ods");
+        clear_env();
+    }
+
+    /// A flag still beats everything.
+    #[test]
+    fn flag_beats_the_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let file = crate::config::parse("[database]\nhost = \"from-file\"\n").expect("parse");
+        let o = PostgresOverrides { host: Some("from-flag".into()), ..Default::default() };
+        assert_eq!(resolve_with(o, Some(&file)).host, "from-flag");
+        clear_env();
+    }
+
+    /// The role password follows the identical chain.
+    #[test]
+    fn role_password_reads_the_file_tier() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let file = crate::config::parse("[oms]\npassword = \"from-file\"\n").expect("parse");
+        assert_eq!(resolve_role_password_with(None, Some(&file)), "from-file");
+
+        std::env::set_var("OMS_PASSWORD", "from-env");
+        assert_eq!(resolve_role_password_with(None, Some(&file)), "from-env");
+        clear_env();
+    }
+
+    /// No file at all must behave exactly as before this task.
+    #[test]
+    fn no_file_falls_back_to_env_and_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let c = resolve_with(PostgresOverrides::default(), None);
+        assert_eq!(c.host, "localhost");
+        assert_eq!(c.database, "ods");
+        assert_eq!(resolve_role_password_with(None, None), DEFAULT_ROLE_PASSWORD);
     }
 
 }
