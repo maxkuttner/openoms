@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod brokers;
 pub mod catalog;
 pub mod database;
+pub mod init;
 
 /// Postgres connection string for the runtime pool (the `oms` role), built the
 /// same way `serve()` builds it: host/port/database from `POSTGRES_*` (or their
