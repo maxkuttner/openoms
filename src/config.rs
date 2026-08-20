@@ -13,7 +13,8 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-/// Where the file lives when `--config`/`OMS_CONFIG` say nothing.
+/// Where the file lives when `OMS_CONFIG` says nothing. There is no `--config`
+/// flag — only the environment variable.
 pub const DEFAULT_FILENAME: &str = "oms.toml";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -112,14 +113,28 @@ pub fn parse(toml_str: &str) -> Result<FileConfig, ConfigError> {
     })
 }
 
-/// The configured path: `--config` is threaded in as `OMS_CONFIG` by `main`, so
-/// this single function serves both.
+/// The configured path: `OMS_CONFIG` if set, else `DEFAULT_FILENAME` in the
+/// current directory. This is the only way to relocate the file — there is no
+/// `--config` flag.
 pub fn path() -> PathBuf {
     std::env::var("OMS_CONFIG")
         .ok()
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_FILENAME))
+}
+
+/// Absolute form of `path()`, for messages that might be read after the process
+/// working directory has changed (a systemd unit, a different terminal tab) — a
+/// bare relative path in an error message gives no way to tell which `oms.toml`
+/// was actually searched for. Falls back to the relative path if the CWD cannot
+/// be read, which beats failing the message entirely over it.
+pub fn path_abs() -> PathBuf {
+    let p = path();
+    if p.is_absolute() {
+        return p;
+    }
+    std::env::current_dir().map(|cwd| cwd.join(&p)).unwrap_or(p)
 }
 
 static LOADED: OnceLock<Option<FileConfig>> = OnceLock::new();
