@@ -1,8 +1,8 @@
 -- Seed common ISO 4217 currencies (idempotent). Instruments FK to currency(code),
 -- so at minimum USD must exist before the instrument seeder runs.
--- Run as mdm_master (owner of public). Extend as new trading currencies appear.
+-- Run as oms (owner of public). Extend as new trading currencies appear.
 
-SET ROLE mdm_master;
+SET ROLE oms;
 SET search_path TO public;
 
 INSERT INTO currency (code, name, numeric_code, minor_units) VALUES

@@ -6,7 +6,7 @@
 //! in one pass. The broker is the authoritative source of the instrument — there is
 //! no separate dataset catalog and no priceable-but-not-tradeable path.
 //!
-//! Runs as the ordinary `DB_USER` (oms_user), which holds write on the master
+//! Runs as the ordinary runtime role (`oms`), which holds write on the master
 //! catalog and both mapping tables (see `db/access/ods.sql`).
 
 use std::env;
@@ -51,7 +51,7 @@ impl Broker {
     }
 
     /// The conventional `broker_connection.code` for this broker+env, e.g.
-    /// `alpaca-paper`. Matches the code the dev-identity fixture references.
+    /// `alpaca-paper`.
     pub fn connection_code(self) -> String {
         format!("{}-{}", self.code().to_lowercase(), self.environment().to_lowercase())
     }

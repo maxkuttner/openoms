@@ -1,6 +1,5 @@
 # OpenOMS
 
-
 <p align="center">
   <img alt="openOMS" src="cockpit/public/favicon.svg" width="72">
 </p>
@@ -15,55 +14,185 @@
 ![./assets/screenshot01.png](./assets/screenshot01.png)
 ![./assets/screenshot02.png](./assets/screenshot02.png)
 
-## Install
+---
 
-Prerequisites: **Rust** (cargo), **PostgreSQL**. Optional: **Python 3** (live universe seeders), **Node** (cockpit).
+## Setup
 
 ```sh
 git clone git@github.com:maxkuttner/openoms.git && cd openoms
-cp .env.example .env        # then edit passwords / bind addr
+cargo run -- database init     # create the database
+cargo run                      # start the OMS on localhost:3001
 ```
 
-## Run
-
-With the `ADMIN_*` superuser + role passwords set in `.env`, just start the app — it
-self-provisions on boot (roles, schema, reference data) and, if broker creds are
-present, syncs that broker's instrument catalog in the background. No ordered setup
-commands.
+Then, in a second terminal:
 
 ```sh
-cargo run                  # OMS on OMS_BIND_ADDR (default localhost:3001)
+cd cockpit && npm install && npm run dev  # admin console on localhost:5173
 ```
 
-First boot on an empty database runs provision → migrate → seed before listening (a
-few seconds), then the server binds immediately while instruments populate in the
-background. Subsequent boots are near-instant no-ops. Set `OMS_SYNC_ON_BOOT=never` to
-skip auto-sync, or `OMS_BOOTSTRAP=off` when infrastructure is provisioned elsewhere.
+That is the whole setup — no `.env`, no flags. The server binds `localhost:3001`
+and the cockpit login password defaults to `openoms-dev` until you set one.
 
-The SPY fixture seeds `alpaca-paper` + a test user (`test-trader-key` : `test-secret`),
-so you can place a paper order immediately. Admin webapp: `cd cockpit && npm install && npm run dev`.
+The instrument catalog starts empty. Put broker credentials in `.env` and it fills
+itself on the next boot; see [Loading instruments](#loading-instruments). Create
+portfolios, accounts and trading identities in the cockpit.
+
+### What each step does
+
+| Step | What happens |
+|---|---|
+| `database init` | Creates the `oms` role, the `ods` database it owns, both schemas, all migrations, grants, and reference data (venues, calendars, MICs). |
+| `cargo run` | Starts the server. It never creates or migrates anything — if the database is missing or stale, it says so and names the command to run. |
+
+## Prerequisites
+
+- **Rust** (stable) — `curl https://sh.rustup.rs -sSf \| sh`
+- **PostgreSQL** running somewhere, with a superuser you know the password of
+- **cmake** and a C++ compiler — the embedded FIX engine (`quickfix`) is C++
+- **OpenSSL 3** on macOS — `brew install openssl@3` (Linux uses the system one)
+- **Node** — only if you want the cockpit web UI
+
+```sh
+# macOS
+brew install cmake openssl@3 postgresql@16 node
+```
+
+## Configuration
+
+Nothing is required. A fresh clone works against a local Postgres with no config at
+all. Every setting has a flag, an environment variable, and a default, in that
+precedence order:
+
+```sh
+cargo run -- database init --host db.internal --username admin
+POSTGRES_HOST=db.internal cargo run -- database init
+```
+
+| Setting | Flag | Environment | Default |
+|---|---|---|---|
+| Host | `--host` | `POSTGRES_HOST` | `localhost` |
+| Port | `--port` | `POSTGRES_PORT` | `5432` |
+| Superuser | `--username` | `POSTGRES_USERNAME` | `postgres` |
+| Superuser password | `--password` | `POSTGRES_PASSWORD` | `postgres` |
+| Database | `--database` | `POSTGRES_DATABASE` | `ods` |
+| `oms` role password | `--oms-password` | `OMS_PASSWORD` | `openoms-dev` |
+| Server bind address | — | `OMS_BIND_ADDR` | `localhost:3001` |
+| Cockpit admin password | — | `OMS_ADMIN_PASSWORD` | `openoms-dev` (loopback only) |
+
+There is one application role, `oms`. It owns the database, both schemas and every
+table in them, and it is what the server connects as. The superuser is used **only**
+by `database init` and `database drop` to create and destroy it.
+
+`.env` is an override file, not a prerequisite — copy `.env.example` when you need
+broker credentials, a real admin password, or a non-local database.
+
+The built-in defaults are loopback-only by design, and the same rule applies to
+both: the `oms` role password and the cockpit admin password. Bind to anything but
+localhost, or point at a remote database, and a still-default password is refused
+rather than silently accepted.
+
+## Roles and schemas
+
+One role, `oms`, created by `database init`. It owns the database, both schemas and
+everything in them, and it is what the server connects as — so there is exactly one
+password to set. The superuser only creates and destroys it.
+
+```
+role  oms
+
+  schema public   instrument, instrument_derivative, broker_instrument,
+                  venue, currency, calendar, calendar_holiday
+  schema oms      orders, portfolios, principals, accounts, api_keys, …
+```
+
+The split is for consumers, not permissions: `public` holds master data another
+service can point at, `oms` holds this application's operational tables.
+
+## Database commands
+
+```sh
+cargo run -- database init       # create everything; fails if it already exists
+cargo run -- database migrate    # apply pending migrations (idempotent)
+cargo run -- database status     # what exists, what is pending
+cargo run -- database drop       # destroy the database (roles are kept)
+```
+
+`init` is deliberately strict. If the roles or database already exist it stops and
+tells you to run `migrate` instead, rather than silently skipping steps or resetting
+credentials on a database that already holds data.
+
+Upgrading an existing install is `git pull && cargo run -- database migrate`.
+
+## Loading instruments
+
+The instrument catalog comes from brokers, not from a bundled list. There are two
+ways in, and they run the same code.
+
+**Automatic.** With broker credentials in `.env`, an empty catalog is populated in
+the background on boot. This is the normal path after `database init` — start the
+server, and instruments appear. The sync can take minutes for full option chains.
+
+```sh
+# OMS_SYNC_ON_BOOT=never       # opt out entirely
+# OMS_SYNC_UNDERLYINGS=SPY,QQQ # only these option chains, instead of all
+```
+
+**Explicit**, when you want to re-sync or see what would change:
+
+```sh
+cargo run -- setup sync-broker --broker alpaca
+cargo run -- setup sync-broker --broker alpaca --underlyings SPY,QQQ
+cargo run -- setup sync-broker --broker alpaca --dry-run
+```
+
+## Trading
+
+Two ways in.
+
+**Cockpit** (`localhost:5173`) — configuration, monitoring, minting tokens.
+
+**Python** — for actually sending orders:
+
+```sh
+pip install -e clients/python
+```
+
+```python
+from oms_client import OMS
+
+oms = OMS("http://localhost:3001", token=os.environ["OMS_TRADING_TOKEN"])
+
+pf  = oms.portfolios()[0]
+oid = oms.submit(portfolio=pf.portfolio_id,
+                 symbol="SPY260918C00770000@OPRA",
+                 side="buy", quantity=1)
+print(oms.wait_for(oid).status)
+
+for row in oms.orders(status="routed"):
+    print(row.order_id, row.instrument_symbol, row.cum_qty)
+```
+
+There is a CLI too — `oms orders list`, `oms positions`, `oms submit`. See
+[`clients/python/README.md`](clients/python/README.md).
 
 ## Auth
 
-- **Cockpit login** — the console is gated by a single password: `OMS_ADMIN_TOKEN`
-  (enabled via `OMS_ADMIN_AUTH_ENABLED=true`). Enter it on the login screen; it's sent
-  as a bearer to `/admin`. Set a strong random value for any real deployment.
-- **Trading tokens** — generate one on the cockpit's *Trading tokens* page (or
-  `POST /admin/trading-tokens`). A token belongs to a **principal** (a trader /
-  strategy / service) and is a single copy-once bearer string used by API clients as
-  `Authorization: Bearer <token>`. What it can trade comes from the principal's
-  portfolio grants (`can_trade`), so you can mint several tokens under one principal
-  to rotate credentials without re-permissioning. Revoke any token anytime.
-- The legacy HTTP Basic form (`key_id:secret`, e.g. the `test-trader` dev user) still
-  works on the trading routes.
+- **Cockpit login** — one password, `OMS_ADMIN_PASSWORD` (enable with
+  `OMS_ADMIN_AUTH_ENABLED=true`). Sent as a bearer to `/admin`. Use a strong random
+  value for anything real.
+- **Trading tokens** — minted on the cockpit's *Trading tokens* page or via
+  `POST /admin/trading-tokens`, shown once. A token belongs to a **principal** (a
+  trader, strategy or service); what it may trade comes from that principal's
+  portfolio grants (`can_trade` / `can_view` / `can_allocate`). Mint several tokens
+  under one principal to rotate credentials without re-permissioning. Revoke anytime.
+- Trading tokens can reach only the trading routes. They can never touch `/admin`.
 
-### Manual setup (optional)
+## Troubleshooting
 
-The bootstrap just orchestrates the same idempotent make targets, if you'd rather run
-them yourself (or set `OMS_BOOTSTRAP=off`):
-
-```sh
-make db-setup                                 # roles, schema, ref-data, SPY fixture
-make sync-broker BROKER=alpaca               # instruments + broker mapping from Alpaca
-make sync-broker BROKER=alpaca UNDERLYINGS=SPY,QQQ  # also seed those option chains
-```
+| Symptom | Cause |
+|---|---|
+| `refusing to start: OMS_ADMIN_PASSWORD is not set` | `OMS_BIND_ADDR` is not loopback. Set a real admin password in `.env`. |
+| `password authentication failed for user "oms"` | `OMS_PASSWORD` doesn't match the role. Fix the value, or `ALTER ROLE oms PASSWORD '…'`. |
+| `role "oms" already exists` on init | Something is already provisioned. Use `migrate`, or `drop` first. |
+| Server exits naming a migration | Run `cargo run -- database migrate`. |
+| Link error mentioning `-lssl` on macOS | `brew install openssl@3`, or set `OPENSSL_DIR`. |

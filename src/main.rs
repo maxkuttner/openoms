@@ -172,6 +172,35 @@ impl utoipa::Modify for SecurityAddon {
 
 
 
+/// Where the server listens when `OMS_BIND_ADDR` says nothing. Loopback by
+/// design: a fresh clone should start and be reachable from a browser on the same
+/// machine, and nothing more, until the operator says otherwise.
+const DEFAULT_BIND_ADDR: &str = "localhost:3001";
+
+/// Admin console password used when `OMS_ADMIN_PASSWORD` is unset *and* the bind
+/// address is loopback. Mirrors `config::DEFAULT_ROLE_PASSWORD`: convenient on a
+/// laptop, refused the moment the server is reachable from anywhere else.
+const DEFAULT_ADMIN_PASSWORD: &str = "openoms-dev";
+
+/// Is this bind address reachable only from this machine?
+///
+/// Splits the host off a `host:port` pair before asking, and treats anything it
+/// cannot parse as non-loopback — an unrecognised address must not be what talks
+/// the server into accepting a default password.
+fn bind_is_loopback(addr: &str) -> bool {
+    // `[::1]:3001` — bracketed IPv6 literal, host is everything up to the bracket.
+    let host = if let Some(rest) = addr.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        // `localhost:3001` / `127.0.0.1:3001`, or a bare host with no port.
+        addr.rsplit_once(':').map_or(addr, |(h, _)| h)
+    };
+    setup::database::config::is_loopback_host(host)
+}
+
 /// OMS command-line entry point. With no subcommand it runs the server (the
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
@@ -187,12 +216,80 @@ enum Command {
     /// Setup / seeding subcommands.
     #[command(subcommand)]
     Setup(SetupCmd),
+    /// Database provisioning and migration.
+    #[command(subcommand)]
+    Database(DatabaseCmd),
 }
 
 #[derive(clap::Subcommand)]
 enum SetupCmd {
     /// Seed the master instrument catalog + broker_instrument mapping from a broker.
     SyncBroker(setup::brokers::Args),
+}
+
+/// Connection flags shared by every database subcommand. Each falls back to its
+/// `POSTGRES_*` environment variable, then to a localhost default.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct DbArgs {
+    /// Database server host [env: POSTGRES_HOST] [default: localhost]
+    #[arg(long)]
+    host: Option<String>,
+    /// Database server port [env: POSTGRES_PORT] [default: 5432]
+    #[arg(long)]
+    port: Option<u16>,
+    /// Superuser name [env: POSTGRES_USERNAME] [default: postgres]
+    #[arg(long)]
+    username: Option<String>,
+    /// Superuser password [env: POSTGRES_PASSWORD] [default: postgres]
+    #[arg(long)]
+    password: Option<String>,
+    /// Database name [env: POSTGRES_DATABASE] [default: ods]
+    #[arg(long)]
+    database: Option<String>,
+}
+
+impl From<DbArgs> for setup::database::config::PostgresOverrides {
+    fn from(a: DbArgs) -> Self {
+        Self {
+            host: a.host,
+            port: a.port,
+            username: a.username,
+            password: a.password,
+            database: a.database,
+        }
+    }
+}
+
+#[derive(clap::Subcommand)]
+enum DatabaseCmd {
+    /// Create roles, database, schema, grants and reference data. Fails if any exists.
+    Init {
+        #[command(flatten)]
+        db: DbArgs,
+        /// Password for the `oms` role the server connects as [env: OMS_PASSWORD].
+        /// Distinct from --password, which is the superuser's.
+        #[arg(long)]
+        oms_password: Option<String>,
+    },
+    /// Apply pending migrations to an existing database.
+    Migrate {
+        #[command(flatten)]
+        db: DbArgs,
+    },
+    /// Drop the database. Roles are kept.
+    Drop {
+        #[command(flatten)]
+        db: DbArgs,
+        /// Required to drop a non-loopback target. Loopback (localhost/127.0.0.1)
+        /// needs no confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show what exists and what is pending.
+    Status {
+        #[command(flatten)]
+        db: DbArgs,
+    },
 }
 
 #[tokio::main]
@@ -208,6 +305,22 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::Database(cmd)) => {
+            let result = match cmd {
+                DatabaseCmd::Init { db, oms_password } => {
+                    setup::database::init(db.into(), oms_password).await
+                }
+                DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
+                DatabaseCmd::Drop { db, yes } => setup::database::drop(db.into(), yes).await,
+                DatabaseCmd::Status { db } => setup::database::status(db.into()).await,
+            };
+            if let Err(e) = result {
+                // The error already reads as a user-facing message (see
+                // already_initialized); printing it bare avoids "Error: error:".
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         None => serve().await,
     }
 }
@@ -215,44 +328,43 @@ async fn main() {
 // Server entry point (default when no subcommand is given).
 async fn serve() {
 
-    // Self-provision before the runtime pool connects: create roles/db, apply
-    // migrations, seed reference data — all idempotent, all as the admin role. Skips
-    // itself when OMS_BOOTSTRAP=off or no admin creds are present. This is what makes
-    // a fresh checkout `run the app` with no ordered setup commands.
-    if let Err(e) = setup::bootstrap::ensure_ready().await {
-        error!("{e}");
-        return;
+    // No provisioning here. `oms database init` is the only thing that creates or
+    // migrates a database, so starting the server can never mutate one.
+    //
+    let cfg = setup::database::config::resolve(Default::default());
+    let role_password = setup::database::config::resolve_role_password(None);
+
+    // A shipped default password is fine on a laptop and never anywhere else. Same
+    // rule `database init` applies, asked of the same helper.
+    if cfg.refuses_default_password(&role_password) {
+        error!(
+            "refusing to start: OMS_PASSWORD is still the built-in default against \
+             non-loopback host {}",
+            cfg.host
+        );
+        std::process::exit(1);
     }
 
-    // parse db config or panic
-    let db_user = env::var("DB_USER").expect("DB_USER must be set");
-    let db_host = env::var("DB_HOST").expect("DB_HOST must be set");
-    let db_port = env::var("DB_PORT").expect("DB_PORT must bes set");
-    let db_password = env::var("DB_PASSWORD").expect("DB_PASSWORD must be set");
-    let db_name = env::var("DB_NAME").expect("DB_NAME must be set");
-    let database_url = format!(
-        "postgres://{}:{}@{}:{}/{}?sslmode=disable",
-        db_user, db_password, db_host, db_port, db_name
+    // The runtime pool is the `oms` role — the same one that owns the schema, and it
+    // no longer has its own
+    // host/port/database settings to drift from the ones init used.
+    let runtime_url = cfg.runtime_url(&role_password);
+    info!(
+        "Connecting to {}:{}/{} as {}",
+        cfg.host, cfg.port, cfg.database, setup::database::provision::ROLE
     );
-
-    info!("Connecting to the database at {}:{}/{} as {}", db_host, db_port, db_name, db_user);
-    let pool = match PgPool::connect(&database_url).await {
+    let pool = match PgPool::connect(&runtime_url).await {
         Ok(pool) => pool,
         Err(e) => {
-            error!("Failed to connect to the database: {}", e);
+            error!("Failed to connect to the database: {e}");
+            error!("If this database has not been created yet, run: oms database init");
             return;
         }
     };
 
-    // On a no-creds fresh install, drop in the SPY fixture so there is one tradeable
-    // instrument even when no broker will populate the catalog. Best-effort.
-    setup::bootstrap::ensure_fixture_if_no_brokers(&pool).await;
-
     // Routing config for every credentialed broker — without a broker_connection a
-    // configured broker still cannot take an order. Then the optional dev identity
-    // chain (OMS_DEV_IDENTITY), so a fresh install can trade immediately.
+    // configured broker still cannot take an order.
     setup::bootstrap::ensure_broker_connections(&pool).await;
-    setup::bootstrap::ensure_dev_identity(&pool).await;
 
     // Refuse to start on a catalog that cannot work, and name what is merely
     // degraded. Before any feed spawns, so a broken catalog surfaces here rather
@@ -274,23 +386,50 @@ async fn serve() {
     };
 
 
+    // Resolved here rather than at bind time because the admin-password rule below
+    // needs to know whether we are about to expose the server beyond this machine.
+    let bind_addr = env::var("OMS_BIND_ADDR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+
     let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
         .map(|v| v.to_lowercase() != "false")
         .unwrap_or(true);
 
     // The admin console login password. `OMS_ADMIN_PASSWORD` is the canonical name;
     // `OMS_ADMIN_TOKEN` is still accepted for back-compat.
+    //
+    // Unset is not fatal on a loopback bind: a fresh clone must be able to run
+    // `cargo run` and reach the console, the same way `database init` works with no
+    // configuration at all. The moment the bind address is reachable from anywhere
+    // else, the default is refused instead — identical to the role-password rule.
     let admin_token = if !admin_auth_enabled {
         String::new()
     } else {
-        env::var("OMS_ADMIN_PASSWORD")
+        match env::var("OMS_ADMIN_PASSWORD")
             .ok()
             .filter(|v| !v.is_empty())
             .or_else(|| env::var("OMS_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()))
-            .unwrap_or_else(|| {
-                error!("OMS_ADMIN_PASSWORD is not set");
+        {
+            Some(token) => token,
+            None if bind_is_loopback(&bind_addr) => {
+                warn!(
+                    "OMS_ADMIN_PASSWORD is not set — using the built-in default \
+                     '{DEFAULT_ADMIN_PASSWORD}' for the admin console. Set OMS_ADMIN_PASSWORD \
+                     in .env before binding anywhere but localhost."
+                );
+                DEFAULT_ADMIN_PASSWORD.to_string()
+            }
+            None => {
+                error!(
+                    "refusing to start: OMS_ADMIN_PASSWORD is not set and OMS_BIND_ADDR \
+                     ({bind_addr}) is reachable beyond this machine. Set OMS_ADMIN_PASSWORD \
+                     in .env, or set OMS_ADMIN_AUTH_ENABLED=false to disable the console login."
+                );
                 std::process::exit(1);
-            })
+            }
+        }
     };
 
     // Stream health + the fill→marks doorbell are created here (before the broker
@@ -641,14 +780,6 @@ async fn serve() {
         .fallback(handlers::handler_404)
         .with_state(state);
 
-        let bind_addr = match env::var("OMS_BIND_ADDR") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            error!("OMS_BIND_ADDR is not set");
-            std::process::exit(1);
-        }
-    };
-
     // Start TCP listener
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     let host_url = format!("http://{}", bind_addr);
@@ -656,4 +787,35 @@ async fn serve() {
     info!("Scalar UI: {}/scalar", host_url);
     info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bind_is_loopback;
+
+    /// The defaults-are-fine-on-a-laptop case: these must accept the built-in
+    /// admin password, with or without a port.
+    #[test]
+    fn loopback_binds_are_recognised() {
+        assert!(bind_is_loopback("localhost:3001"));
+        assert!(bind_is_loopback("127.0.0.1:3001"));
+        assert!(bind_is_loopback("[::1]:3001"));
+        assert!(bind_is_loopback("localhost"));
+    }
+
+    /// Anything reachable from another machine must refuse the default password.
+    /// `0.0.0.0` is the one that matters — it looks local and is not.
+    #[test]
+    fn exposed_binds_are_not_loopback() {
+        assert!(!bind_is_loopback("0.0.0.0:3001"));
+        assert!(!bind_is_loopback("192.168.1.10:3001"));
+        assert!(!bind_is_loopback("oms.internal:3001"));
+    }
+
+    /// An address we cannot parse must fail closed, never open.
+    #[test]
+    fn unparseable_binds_are_not_loopback() {
+        assert!(!bind_is_loopback("[::1:3001"), "unterminated IPv6 bracket");
+        assert!(!bind_is_loopback(""));
+    }
 }

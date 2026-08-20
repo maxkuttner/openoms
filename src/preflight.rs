@@ -15,7 +15,7 @@
 //!   manage. Refusing to boot would be the worse failure.
 
 use sqlx::PgPool;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// How many offending symbols to name before truncating. The point is to notice a
 /// class of problem, not to dump the catalog into the log.
@@ -69,7 +69,7 @@ async fn report_expiry(pool: &PgPool) {
             let names: Vec<&str> = rows.iter().map(String::as_str).collect();
             error!(
                 "preflight: {} dated instrument(s) have no expiry instant — their venue \
-                 has no calendar (run `make db-seed`), so they will never expire: {}",
+                 has no calendar (see db/scripts/seed_calendars.sql), so they will never expire: {}",
                 names.len(),
                 sample(&names)
             );
@@ -109,14 +109,13 @@ async fn report_expiry(pool: &PgPool) {
 /// Fatal checks: the master catalog and the FK targets it depends on.
 ///
 /// An empty `venue` or `currency` table is the signature of a DB that never got
-/// seeded; with bootstrap on these are seeded before we ever get here, so a failure
-/// now means `OMS_BOOTSTRAP=off` over an unprepared DB. An empty `instrument` is only
-/// fatal when nothing is about to fill it — a pending background sync makes it
-/// expected, not broken.
+/// seeded; a failure here means the database was never provisioned — `oms database
+/// init` is what provisions it. An empty `instrument` is only fatal when nothing is
+/// about to fill it — a pending background sync makes it expected, not broken.
 async fn check_catalog(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fatal> {
     for (table, hint) in [
-        ("venue", "run `make db-seed` (or enable bootstrap)"),
-        ("currency", "run `make db-seed` (or enable bootstrap)"),
+        ("venue", "run `oms database init` (or `oms database migrate` if it exists)"),
+        ("currency", "run `oms database init` (or `oms database migrate` if it exists)"),
     ] {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(pool)
@@ -131,15 +130,19 @@ async fn check_catalog(pool: &PgPool, auto_sync_pending: bool) -> Result<(), Fat
         .fetch_one(pool)
         .await
         .map_err(|e| Fatal(format!("preflight: reading instrument failed: {e}")))?;
+    // An empty catalog is the state a fresh `database init` leaves behind, so it
+    // must not stop the server: the operator still needs the admin console up to
+    // enter broker credentials in the first place. Nothing can be traded until the
+    // catalog is filled, which is what the warning says.
     if instruments == 0 {
         if auto_sync_pending {
             info!("preflight: catalog empty — a background broker sync will populate it");
         } else {
-            return Err(Fatal(
-                "instrument is empty — set broker creds (auto-sync), run \
-                 `make sync-broker BROKER=alpaca`, or `make db-fixtures` for the SPY-only set"
-                    .to_string(),
-            ));
+            warn!(
+                "preflight: instrument is empty — nothing is tradeable. Set broker \
+                 credentials (auto-sync on boot) or run \
+                 `oms setup sync-broker --broker alpaca`"
+            );
         }
     }
     Ok(())
@@ -318,7 +321,7 @@ mod tests {
         }
     }
 
-    /// The case already live in the fixture: SPY equity on ARCX. It is *not*
+    /// The common case: SPY equity on ARCX. It is *not*
     /// priceable by the OPRA feed — that feed carries options only — so preflight
     /// must report it rather than let it sit silently unmarked.
     #[test]

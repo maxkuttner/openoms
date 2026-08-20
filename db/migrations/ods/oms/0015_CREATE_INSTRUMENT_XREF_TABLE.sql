@@ -2,7 +2,7 @@
 -- custodian / OpenFIGI) -> master instrument, anchored on FIGI. The consolidation
 -- target that generalises public.broker_instrument + public.provider_instrument.
 --
--- Lives in the `oms` schema (owned by oms_user) so the OMS resolver writes it at
+-- Lives in the `oms` schema (owned by the `oms` role) so the OMS resolver writes it at
 -- runtime. instrument_id references public.instrument(id) but carries no FK — the
 -- runtime role has SELECT, not REFERENCES, on the public catalog; the resolver only
 -- ever inserts ids it just read from public.instrument.

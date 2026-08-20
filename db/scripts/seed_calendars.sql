@@ -23,11 +23,11 @@
 -- (src/adapters/alpaca.rs), plus OPRA for the listed options themselves. All US,
 -- all 16:00 ET.
 --
--- Run as mdm_master (owner of public), matching seed_currencies.sql. Depends on
+-- Run as oms (owner of public), matching seed_currencies.sql. Depends on
 -- venue being seeded first — a missing venue silently seeds no calendar, which
 -- preflight then reports.
 
-SET ROLE mdm_master;
+SET ROLE oms;
 SET search_path TO public;
 
 INSERT INTO calendar (code, venue_id, timezone, close_time, description)

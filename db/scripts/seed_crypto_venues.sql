@@ -5,9 +5,9 @@
 -- (e.g. Binance pairs -> venue 'BINANCE'), so this venue must exist before
 -- `oms setup sync-broker --broker binance` runs, or every pair fails the venue FK.
 -- BYBIT is seeded too so a future Bybit broker (or venue-attributed feed) has a home.
--- Run as mdm_master (owner of public), matching seed_currencies.sql.
+-- Run as oms (owner of public), matching seed_currencies.sql.
 
-SET ROLE mdm_master;
+SET ROLE oms;
 SET search_path TO public;
 
 INSERT INTO venue (code, name, mic, status) VALUES
