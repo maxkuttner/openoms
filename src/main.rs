@@ -202,6 +202,27 @@ fn bind_is_loopback(addr: &str) -> bool {
     setup::database::config::is_loopback_host(host)
 }
 
+/// Bind address on the usual tiers. No CLI flag exists for this today, so the
+/// chain is env → file → default.
+fn resolve_bind_addr(from_env: Option<String>, file: Option<&config::FileConfig>) -> String {
+    from_env
+        .filter(|v| !v.is_empty())
+        .or_else(|| file.and_then(|f| f.server.bind_addr.clone()))
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string())
+}
+
+/// Cockpit login password: env → file. `None` means unset, which the caller
+/// turns into the loopback-only default or a refusal.
+fn resolve_admin_password(
+    from_env: Option<String>,
+    file: Option<&config::FileConfig>,
+) -> Option<String> {
+    from_env
+        .filter(|v| !v.is_empty())
+        .or_else(|| file.and_then(|f| f.server.admin_password.clone()))
+        .filter(|v| !v.is_empty())
+}
+
 /// OMS command-line entry point. With no subcommand it runs the server (the
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
@@ -432,10 +453,8 @@ async fn serve() {
 
     // Resolved here rather than at bind time because the admin-password rule below
     // needs to know whether we are about to expose the server beyond this machine.
-    let bind_addr = env::var("OMS_BIND_ADDR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+    let file_cfg = config::load();
+    let bind_addr = resolve_bind_addr(env::var("OMS_BIND_ADDR").ok(), file_cfg);
 
     let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
         .map(|v| v.to_lowercase() != "false")
@@ -451,11 +470,13 @@ async fn serve() {
     let admin_token = if !admin_auth_enabled {
         String::new()
     } else {
-        match env::var("OMS_ADMIN_PASSWORD")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| env::var("OMS_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()))
-        {
+        let configured = resolve_admin_password(
+            env::var("OMS_ADMIN_PASSWORD")
+                .ok()
+                .or_else(|| env::var("OMS_ADMIN_TOKEN").ok()),
+            file_cfg,
+        );
+        match configured {
             Some(token) => token,
             None if bind_is_loopback(&bind_addr) => {
                 warn!(
@@ -836,6 +857,8 @@ async fn serve() {
 #[cfg(test)]
 mod tests {
     use super::bind_is_loopback;
+    use super::{resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
+    use crate::config::FileConfig;
 
     /// The defaults-are-fine-on-a-laptop case: these must accept the built-in
     /// admin password, with or without a port.
@@ -861,5 +884,24 @@ mod tests {
     fn unparseable_binds_are_not_loopback() {
         assert!(!bind_is_loopback("[::1:3001"), "unterminated IPv6 bracket");
         assert!(!bind_is_loopback(""));
+    }
+
+    #[test]
+    fn bind_addr_prefers_env_then_file_then_default() {
+        let file = crate::config::parse("[server]\nbind_addr = \"1.2.3.4:9999\"\n").expect("parse");
+
+        assert_eq!(resolve_bind_addr(Some("0.0.0.0:1".into()), Some(&file)), "0.0.0.0:1");
+        assert_eq!(resolve_bind_addr(None, Some(&file)), "1.2.3.4:9999");
+        assert_eq!(resolve_bind_addr(None, None), DEFAULT_BIND_ADDR);
+    }
+
+    #[test]
+    fn admin_password_prefers_env_then_file() {
+        let file = crate::config::parse("[server]\nadmin_password = \"from-file\"\n").expect("parse");
+
+        assert_eq!(resolve_admin_password(Some("from-env".into()), Some(&file)).as_deref(), Some("from-env"));
+        assert_eq!(resolve_admin_password(None, Some(&file)).as_deref(), Some("from-file"));
+        assert_eq!(resolve_admin_password(None, Some(&FileConfig::default())), None);
+        assert_eq!(resolve_admin_password(None, None), None);
     }
 }
