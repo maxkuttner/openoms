@@ -1,9 +1,12 @@
-//! Connection settings, merged from the three places they can come from.
+//! Connection settings, merged from the four places they can come from.
 //!
-//! Precedence is CLI flag → environment variable → built-in default, so a fresh
-//! clone works against a local Postgres with no configuration at all and a real
-//! deployment overrides whatever it needs. This is why `.env` is an override file
-//! here rather than a prerequisite.
+//! Precedence is CLI flag → environment variable → `oms.toml` → built-in default,
+//! so a fresh clone works against a local Postgres with no configuration at all
+//! and a real deployment overrides whatever it needs. This is why `.env` is an
+//! override file here rather than a prerequisite.
+//!
+//! One deliberate exception: the superuser password has no file tier. That
+//! credential can drop the database, so it is prompted rather than stored.
 
 use std::env;
 
@@ -56,7 +59,9 @@ pub fn resolve_with(o: PostgresOverrides, file: Option<&crate::config::FileConfi
             .unwrap_or_else(|| "localhost".into()),
         // A malformed port falls back rather than panicking: the connection will
         // fail with a clear address anyway, and panicking in a config getter gives
-        // a worse message than the connection error does.
+        // a worse message than the connection error does. A malformed env value
+        // is treated as absent, so it falls through to the file tier before the
+        // default — same as an env var that was never set.
         port: o
             .port
             .or_else(|| from_env("POSTGRES_PORT").and_then(|p| p.parse().ok()))
@@ -309,18 +314,46 @@ mod tests {
         clear_env();
     }
 
-    /// The file sits *above* the built-in default.
+    /// The file sits *above* the built-in default, for every field that has a
+    /// file tier at all (all but the superuser password).
     #[test]
     fn file_beats_the_default() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
-        let file = crate::config::parse("[database]\nhost = \"from-file\"\nport = 6543\n")
-            .expect("parse");
+        let file = crate::config::parse(
+            "[database]\nhost = \"from-file\"\nport = 6543\nusername = \"file-user\"\ndatabase = \"file-db\"\n",
+        )
+        .expect("parse");
         let c = resolve_with(PostgresOverrides::default(), Some(&file));
         assert_eq!(c.host, "from-file");
         assert_eq!(c.port, 6543);
-        // Unset in the file, so still the default.
+        assert_eq!(c.username, "file-user");
+        assert_eq!(c.database, "file-db");
+        clear_env();
+    }
+
+    /// Unset in the file, so still the default.
+    #[test]
+    fn file_partial_leaves_the_rest_at_default() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let file = crate::config::parse("[database]\nhost = \"from-file\"\n").expect("parse");
+        let c = resolve_with(PostgresOverrides::default(), Some(&file));
         assert_eq!(c.database, "ods");
+        clear_env();
+    }
+
+    /// A malformed env value is treated as absent, so with a file tier present
+    /// it must fall through to the file's port rather than jumping straight to
+    /// the built-in default.
+    #[test]
+    fn malformed_env_port_falls_through_to_the_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let file = crate::config::parse("[database]\nport = 6543\n").expect("parse");
+        std::env::set_var("POSTGRES_PORT", "not-a-number");
+        let c = resolve_with(PostgresOverrides::default(), Some(&file));
+        assert_eq!(c.port, 6543, "malformed env should fall through to the file, not the default");
         clear_env();
     }
 
