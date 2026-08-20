@@ -62,14 +62,6 @@ pub fn seed_sql() -> [(&'static str, &'static str); 3] {
     ]
 }
 
-/// Development fixtures, loaded only by `init --fixtures`.
-pub fn fixture_sql() -> [(&'static str, &'static str); 2] {
-    [
-        ("minimal_seed.sql", include_str!("../../../scripts/fixtures/minimal_seed.sql")),
-        ("dev_identity.sql", include_str!("../../../scripts/fixtures/dev_identity.sql")),
-    ]
-}
-
 /// ISO 10383 Market Identifier Code registry, the source for `venue`.
 pub const MIC_CSV: &str = include_str!("../../../db/data/ISO10383_MIC.csv");
 
@@ -113,11 +105,10 @@ mod tests {
     }
 
     #[test]
-    fn embeds_access_seed_and_fixture_sql() {
+    fn embeds_access_and_seed_sql() {
         assert_eq!(access_sql().len(), 2);
         assert_eq!(seed_sql().len(), 3);
-        assert_eq!(fixture_sql().len(), 2);
-        for (name, sql) in access_sql().iter().chain(seed_sql().iter()).chain(fixture_sql().iter()) {
+        for (name, sql) in access_sql().iter().chain(seed_sql().iter()) {
             assert!(!sql.trim().is_empty(), "{name} is empty");
         }
     }

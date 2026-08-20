@@ -24,12 +24,7 @@ type Fallible = Result<(), Box<dyn std::error::Error>>;
 /// pointed at the wrong server — and an automatic `ALTER ROLE … PASSWORD` would
 /// let a bare `init` reset a working install's credentials to the shipped
 /// default. `migrate` is the verb for a database that already exists.
-pub async fn init(
-    o: PostgresOverrides,
-    mdm: Option<String>,
-    oms: Option<String>,
-    fixtures: bool,
-) -> Fallible {
+pub async fn init(o: PostgresOverrides, mdm: Option<String>, oms: Option<String>) -> Fallible {
     let cfg = config::resolve(o);
     let roles = config::resolve_roles(mdm, oms);
 
@@ -68,11 +63,6 @@ pub async fn init(
 
     let venues = seed::seed_reference_data(&pool).await?;
     println!("  seeded reference data ({venues} venues)");
-
-    if fixtures {
-        seed::load_fixtures(&pool).await?;
-        println!("  loaded dev fixtures (test-trader-key : test-secret)");
-    }
 
     println!("\n{} ready. Start the server with: cargo run", cfg.database);
     Ok(())

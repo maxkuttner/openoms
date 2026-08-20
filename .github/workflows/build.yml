@@ -50,7 +50,7 @@ jobs:
       - run: cargo build --quiet
 
       - name: init on an empty server succeeds
-        run: cargo run --quiet -- database init --fixtures
+        run: cargo run --quiet -- database init
 
       - name: init a second time fails loudly
         run: |

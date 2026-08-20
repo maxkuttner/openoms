@@ -243,9 +243,6 @@ enum DatabaseCmd {
         /// Password for the oms_user role [env: OMS_USER_PASSWORD]
         #[arg(long)]
         oms_password: Option<String>,
-        /// Also load the SPY fixture and the dev principal (test-trader-key : test-secret).
-        #[arg(long)]
-        fixtures: bool,
     },
     /// Apply pending migrations to an existing database.
     Migrate {
@@ -283,8 +280,8 @@ async fn main() {
         }
         Some(Command::Database(cmd)) => {
             let result = match cmd {
-                DatabaseCmd::Init { db, mdm_password, oms_password, fixtures } => {
-                    setup::database::init(db.into(), mdm_password, oms_password, fixtures).await
+                DatabaseCmd::Init { db, mdm_password, oms_password } => {
+                    setup::database::init(db.into(), mdm_password, oms_password).await
                 }
                 DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
                 DatabaseCmd::Drop { db, yes } => setup::database::drop(db.into(), yes).await,

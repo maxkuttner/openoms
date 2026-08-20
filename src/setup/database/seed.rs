@@ -148,17 +148,6 @@ pub async fn seed_reference_data(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(venues)
 }
 
-/// Development fixtures: the SPY instrument and the dev principal chain. Loaded
-/// only by `init --fixtures`, because `dev_identity.sql` creates a known API
-/// secret that must never appear in a real deployment by accident.
-pub async fn load_fixtures(pool: &PgPool) -> Result<(), sqlx::Error> {
-    for (name, sql) in assets::fixture_sql() {
-        tracing::info!("loading fixture {name}");
-        sqlx::raw_sql(sql).execute(pool).await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

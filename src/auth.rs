@@ -18,8 +18,7 @@ pub struct AuthContext {
 /// Authenticate a trading request and inject `AuthContext { principal_id }`.
 ///
 /// Accepts two equivalent credential forms carrying the same `(key_id, secret)`:
-/// - HTTP **Basic** `key_id:secret` — the original form (kept for back-compat, incl.
-///   the dev fixture and any existing callers).
+/// - HTTP **Basic** `key_id:secret` — the original form, kept for back-compat.
 /// - **Bearer** `key_id.secret` — a single copy-paste "trading token" (Databento
 ///   style). Split on the first `.` (neither `ak_…` key ids nor `sk_…` secrets
 ///   contain a dot).

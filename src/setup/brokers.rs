@@ -51,7 +51,7 @@ impl Broker {
     }
 
     /// The conventional `broker_connection.code` for this broker+env, e.g.
-    /// `alpaca-paper`. Matches the code the dev-identity fixture references.
+    /// `alpaca-paper`.
     pub fn connection_code(self) -> String {
         format!("{}-{}", self.code().to_lowercase(), self.environment().to_lowercase())
     }
