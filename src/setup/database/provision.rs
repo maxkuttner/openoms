@@ -55,8 +55,23 @@ pub async fn inspect(cfg: &PostgresConfig) -> Result<Existing, sqlx::Error> {
 /// Create the `oms` role and the database it owns.
 ///
 /// Assumes `inspect` already found nothing — the caller enforces strictness, so a
-/// conflict here is a genuine race and surfaces as a Postgres error.
+/// conflict here is a genuine race and surfaces as a Postgres error. This is the
+/// normal from-scratch path; `--resume`'s partial case (one of the two already
+/// exists) calls `create_role`/`create_database` individually instead, so it
+/// never re-creates the piece that is already there.
 pub async fn provision(cfg: &PostgresConfig, password: &str) -> Result<(), sqlx::Error> {
+    create_role(cfg, password).await?;
+    create_database(cfg).await?;
+    Ok(())
+}
+
+/// Create just the `oms` role, leaving the database untouched.
+///
+/// Split out from `provision` so `--resume` can create only the piece
+/// `provision::inspect` found missing. Never `ALTER ROLE`: if the role already
+/// exists this function is simply not called, so an existing role's password is
+/// never touched by either path.
+pub async fn create_role(cfg: &PostgresConfig, password: &str) -> Result<(), sqlx::Error> {
     let mut conn = PgConnection::connect(&cfg.url_for("postgres")).await?;
 
     // The identifier is the fixed constant above and the password is quoted by the
@@ -68,7 +83,17 @@ pub async fn provision(cfg: &PostgresConfig, password: &str) -> Result<(), sqlx:
         .await?;
     sqlx::raw_sql(&stmt).execute(&mut conn).await?;
 
-    // The role must exist before it can own the database.
+    conn.close().await?;
+    Ok(())
+}
+
+/// Create just the database, owned by the `oms` role. The role must already
+/// exist — guaranteed by call order in `provision`, and by definition in
+/// `--resume`'s role-exists/database-missing case, which is exactly the state
+/// this split exists to unblock (see `mod.rs`'s `plan_provisioning`).
+pub async fn create_database(cfg: &PostgresConfig) -> Result<(), sqlx::Error> {
+    let mut conn = PgConnection::connect(&cfg.url_for("postgres")).await?;
+
     let stmt: String = sqlx::query_scalar("SELECT format('CREATE DATABASE %I OWNER %I', $1, $2)")
         .bind(&cfg.database)
         .bind(ROLE)

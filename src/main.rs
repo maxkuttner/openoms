@@ -329,12 +329,15 @@ enum DatabaseCmd {
         /// Distinct from --password, which is the superuser's.
         #[arg(long)]
         oms_password: Option<String>,
-        /// Finish an init that failed partway through: if the role and/or
-        /// database already exist, skip creating them and continue straight to
+        /// Finish an init that failed partway through: creates only whichever
+        /// of the role/database is still missing, then continues straight to
         /// migrations, grants and seeding — all idempotent, so this is safe to
         /// run even if some of them already happened. Without this flag, any
         /// existing role or database is a hard refusal (unchanged default
-        /// behaviour).
+        /// behaviour). This bypasses the wrong-server guard plain `init`
+        /// provides: with `--resume` and a mistaken `--database`, migrations
+        /// (several of which are `DROP …`) would be applied to an unrelated
+        /// database.
         #[arg(long)]
         resume: bool,
     },
@@ -382,9 +385,19 @@ async fn main() {
                 DatabaseCmd::Status { db } => setup::database::status(db.into()).await,
             };
             if let Err(e) = result {
-                // The error already reads as a user-facing message (see
-                // already_initialized); printing it bare avoids "Error: error:".
-                eprintln!("{e}");
+                // Some of these errors already read as a user-facing message with
+                // their own "error: " prefix (see already_initialized) — printing
+                // that bare avoids "error: error: ...". Others (a bare sqlx error
+                // from a failed connection or query, e.g. mid-`--resume`) have no
+                // prefix of their own, so every other failure path in this binary
+                // adds one; add it here too rather than let this one path alone
+                // print unprefixed.
+                let msg = e.to_string();
+                if msg.starts_with("error: ") {
+                    eprintln!("{msg}");
+                } else {
+                    eprintln!("error: {msg}");
+                }
                 std::process::exit(1);
             }
         }

@@ -27,16 +27,17 @@ type Fallible = Result<(), Box<dyn std::error::Error>>;
 /// default. `migrate` is the verb for a database that already exists.
 ///
 /// `resume` exists for the failure path `oms init` cannot otherwise recover
-/// from: once provisioning has created the role and/or database, a plain
+/// from: once provisioning has created the role and/or the database, a plain
 /// `init` refuses (this function, strict by default) and `migrate` alone
-/// leaves grants/seeding undone. With `resume` set, a role/database that
-/// already exists is *not* an error — provisioning is skipped and the run
-/// continues straight into the steps below. That is safe because every one of
-/// those steps already tolerates being re-applied: migrations are tracked by
-/// filename (`ensure_tracking`/`apply_all` skip anything already recorded),
-/// `db/access/*.sql` are plain `GRANT`s (re-granting an existing privilege is a
-/// no-op), and the seed data is upserted with `ON CONFLICT`. So resuming a
-/// half-finished `init` is just running the idempotent tail again.
+/// leaves grants/seeding undone. With `resume` set, whichever of role/database
+/// already exists is left alone and whichever is still missing is created —
+/// see `plan_provisioning` — then the run continues into the steps below. That
+/// is safe because every one of those steps already tolerates being
+/// re-applied: migrations are tracked by filename (`ensure_tracking`/
+/// `apply_all` skip anything already recorded), `db/access/*.sql` are plain
+/// `GRANT`s (re-granting an existing privilege is a no-op), and the seed data
+/// is upserted with `ON CONFLICT`. So resuming a half-finished `init` is
+/// finishing provisioning and then running the idempotent tail again.
 pub async fn init(o: PostgresOverrides, password: Option<String>, resume: bool) -> Fallible {
     let cfg = config::resolve(o);
     let password = config::resolve_role_password(password);
@@ -54,14 +55,24 @@ pub async fn init(o: PostgresOverrides, password: Option<String>, resume: bool) 
     }
 
     let existing = provision::inspect(&cfg).await?;
-    match should_provision(resume, &existing) {
-        Ok(true) => {
+    match plan_provisioning(resume, &existing) {
+        Ok(Provisioning::Full) => {
             provision::provision(&cfg, &password).await?;
             println!("  created role {}", provision::ROLE);
             println!("  created database {}", cfg.database);
         }
-        Ok(false) => {
-            println!("  --resume: role/database already present, skipping provisioning");
+        Ok(Provisioning::Partial { role, database }) => {
+            if role {
+                provision::create_role(&cfg, &password).await?;
+                println!("  created role {}", provision::ROLE);
+            }
+            if database {
+                provision::create_database(&cfg).await?;
+                println!("  created database {}", cfg.database);
+            }
+            if !role && !database {
+                println!("  --resume: role/database already present, skipping provisioning");
+            }
         }
         Err(()) => return Err(already_initialized(&cfg, &existing).into()),
     }
@@ -185,23 +196,39 @@ pub async fn status(o: PostgresOverrides) -> Fallible {
     Ok(())
 }
 
-/// Whether `init` should attempt `provision::provision`, given what
-/// `provision::inspect` found and whether `--resume` was passed.
+/// What `init` should create, given what `provision::inspect` found and
+/// whether `--resume` was passed.
+#[derive(Debug, PartialEq, Eq)]
+enum Provisioning {
+    /// Nothing exists: create both, the normal from-scratch path. This is the
+    /// outcome regardless of `resume` — a `--resume` against a fresh server is
+    /// just a normal init.
+    Full,
+    /// `--resume` against a server where a role and/or the database already
+    /// exist: create only whichever piece is missing (`true` = create it).
+    /// `{ role: false, database: false }` means both are already present —
+    /// nothing to create, proceed straight to the idempotent tail.
+    Partial { role: bool, database: bool },
+}
+
+/// Decide what `init` should provision. Split out from `init` so this decision
+/// — the crux of the strict-vs-resume behaviour, and now of *which* piece
+/// `--resume` recreates — is unit-testable without a live Postgres; everything
+/// else in `init` needs a real connection.
 ///
-/// Split out from `init` so this decision — the crux of the strict-vs-resume
-/// behaviour — is unit-testable without a live Postgres; everything else in
-/// `init` needs a real connection.
+/// Per-piece rather than all-or-nothing: collapsing "something exists" into a
+/// single skip/provision choice left `--resume` unable to recover the most
+/// likely partial failure (role created, `CREATE DATABASE` failed) — it would
+/// skip provisioning entirely and then fail again with "database does not
+/// exist", a dead end `--resume` exists to prevent.
 ///
-/// `Ok(true)` — nothing exists, provision normally (true regardless of `resume`:
-/// a `--resume` against a fresh server is just a normal init).
-/// `Ok(false)` — something exists and `resume` was passed: skip provisioning,
-/// the caller proceeds straight to the idempotent tail.
-/// `Err(())` — something exists and `resume` was not passed: strict refusal.
-fn should_provision(resume: bool, existing: &provision::Existing) -> Result<bool, ()> {
+/// `Err(())` — something exists and `resume` was not passed: strict refusal,
+/// unchanged from before this split.
+fn plan_provisioning(resume: bool, existing: &provision::Existing) -> Result<Provisioning, ()> {
     if existing.is_empty() {
-        Ok(true)
+        Ok(Provisioning::Full)
     } else if resume {
-        Ok(false)
+        Ok(Provisioning::Partial { role: existing.roles.is_empty(), database: !existing.database })
     } else {
         Err(())
     }
@@ -235,41 +262,49 @@ fn already_initialized(cfg: &config::PostgresConfig, existing: &provision::Exist
 mod init_tests {
     use super::*;
 
-    /// A fresh server always provisions, whether or not `--resume` was passed —
-    /// `--resume` only changes behaviour when there is something to resume from.
+    /// A fresh server always provisions fully, whether or not `--resume` was
+    /// passed — `--resume` only changes behaviour when there is something to
+    /// resume from. Combination: role ✗ / db ✗.
     #[test]
-    fn fresh_server_always_provisions() {
-        assert_eq!(should_provision(false, &provision::Existing::default()), Ok(true));
-        assert_eq!(should_provision(true, &provision::Existing::default()), Ok(true));
+    fn fresh_server_always_provisions_fully() {
+        assert_eq!(plan_provisioning(false, &provision::Existing::default()), Ok(Provisioning::Full));
+        assert_eq!(plan_provisioning(true, &provision::Existing::default()), Ok(Provisioning::Full));
     }
 
     /// The default (no `--resume`) is unchanged: anything existing is a hard
-    /// refusal, never a silent skip.
+    /// refusal, never a silent skip — covers all three "something exists"
+    /// combinations: role ✓/db ✓, role ✓/db ✗, role ✗/db ✓.
     #[test]
     fn existing_without_resume_refuses() {
-        let existing = provision::Existing { roles: vec!["oms".into()], database: true };
-        assert_eq!(should_provision(false, &existing), Err(()));
+        let both = provision::Existing { roles: vec!["oms".into()], database: true };
+        assert_eq!(plan_provisioning(false, &both), Err(()));
 
         let role_only = provision::Existing { roles: vec!["oms".into()], database: false };
-        assert_eq!(should_provision(false, &role_only), Err(()));
+        assert_eq!(plan_provisioning(false, &role_only), Err(()));
 
         let db_only = provision::Existing { roles: vec![], database: true };
-        assert_eq!(should_provision(false, &db_only), Err(()));
+        assert_eq!(plan_provisioning(false, &db_only), Err(()));
     }
 
-    /// `--resume` against a server with a role and/or database already present
-    /// skips provisioning rather than erroring — this is what lets `init` recover
-    /// from a failure after `provision::provision` succeeded.
+    /// `--resume` decides per piece rather than skipping wholesale: role ✓/db ✓
+    /// has nothing left to create; role ✓/db ✗ and role ✗/db ✓ each create only
+    /// the missing half. This is the fix — before it, the latter two collapsed
+    /// into "skip provisioning" and then died connecting to a database (or
+    /// tracking a role) that was never created, the exact dead end `--resume`
+    /// exists to rescue.
     #[test]
-    fn existing_with_resume_skips_provisioning() {
-        let existing = provision::Existing { roles: vec!["oms".into()], database: true };
-        assert_eq!(should_provision(true, &existing), Ok(false));
+    fn resume_creates_only_the_missing_piece() {
+        let both = provision::Existing { roles: vec!["oms".into()], database: true };
+        assert_eq!(plan_provisioning(true, &both), Ok(Provisioning::Partial { role: false, database: false }));
 
         let role_only = provision::Existing { roles: vec!["oms".into()], database: false };
-        assert_eq!(should_provision(true, &role_only), Ok(false));
+        assert_eq!(
+            plan_provisioning(true, &role_only),
+            Ok(Provisioning::Partial { role: false, database: true })
+        );
 
         let db_only = provision::Existing { roles: vec![], database: true };
-        assert_eq!(should_provision(true, &db_only), Ok(false));
+        assert_eq!(plan_provisioning(true, &db_only), Ok(Provisioning::Partial { role: true, database: false }));
     }
 }
 

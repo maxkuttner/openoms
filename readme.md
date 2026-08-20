@@ -46,9 +46,10 @@ Run it once. If `oms.toml` already exists, `init` refuses and tells you to use
 `database migrate` to upgrade, or to delete the file to start over — but deleting it
 throws away the master key, and with it anything it decrypts. If provisioning
 itself fails partway (after `oms.toml` was written), fix the cause and run `oms
-database init --resume` — it skips the role/database creation that already
-happened and finishes migrations, grants and seeding, all of which are safe to
-re-run.
+database init --resume` — it creates only whichever of the role/database is
+still missing (the common case is the role existing but `CREATE DATABASE`
+having failed) and finishes migrations, grants and seeding, all of which are
+safe to re-run.
 
 The instrument catalog starts empty. Put broker credentials in `.env` and it fills
 itself on the next boot; see [Loading instruments](#loading-instruments). Create
@@ -153,8 +154,12 @@ cargo run -- database drop       # destroy the database (roles are kept)
 tells you to run `migrate` instead, rather than silently skipping steps or resetting
 credentials on a database that already holds data. The one exception is `--resume`:
 if a previous `init` created the role and/or database but failed before finishing
-migrations, grants or seeding, `oms database init --resume` skips the creation step
-and re-runs the rest — every one of those steps is safe to re-run.
+migrations, grants or seeding, `oms database init --resume` creates only whichever
+of the role/database is still missing — never touching the credentials of one that
+already exists — and re-runs the rest, every step of which is safe to re-run. Because
+it skips the wrong-server refusal, double-check `--host`/`--database` before passing
+it: pointed at the wrong database, resume's migrations (some of which are `DROP …`)
+would run there instead.
 
 `init`, `migrate` and `drop` connect as the superuser (`--password`/
 `POSTGRES_PASSWORD`, defaulting to `postgres` on loopback) because they create,
