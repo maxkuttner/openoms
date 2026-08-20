@@ -157,6 +157,12 @@ recoverable — fix the cause and run `oms database init`. `oms init` refuses if
 `oms init --non-interactive` takes the same values from flags or environment and
 generates the rest, so the existing CI job keeps working unchanged.
 
+**`oms init` wraps `oms database init`; it does not replace it.** The database verbs
+(`init`, `migrate`, `drop`, `status`) keep their current behaviour and flags — CI
+exercises them directly and they are proven. `oms init` is the first-run path that
+generates `oms.toml` and then calls `database init` with the values it just wrote.
+Two commands, one of which is a friendlier entry to the other.
+
 **Configuration precedence becomes flag → env → `oms.toml` → default**, extending
 the existing tiers in `setup/database/config.rs` rather than replacing them.
 
