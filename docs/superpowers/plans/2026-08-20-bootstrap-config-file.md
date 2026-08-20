@@ -804,13 +804,30 @@ Add to `src/setup/init.rs`, extending the `use` lines with
 ```rust
 /// What `oms init` asks for. Everything here describes the operator's existing
 /// Postgres; nothing generated appears in this struct.
-#[derive(Debug)]
+///
+/// No `#[derive(Debug)]` — see the hand-written impl below. This struct holds the
+/// superuser password.
 pub struct Prompts {
     pub host: String,
     pub port: u16,
     pub database: String,
     pub username: String,
     pub password: String,
+}
+
+// Hand-written so a stray `{:?}` — a log line, a panic message, an `expect` on a
+// `Result<Prompts, _>` — cannot print the superuser password. That credential can
+// drop the database. Mirrors the redacting impls in `src/config.rs`.
+impl std::fmt::Debug for Prompts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prompts")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Prompt against arbitrary input, with the password read through a supplied
@@ -1179,13 +1196,26 @@ And replace the body of the `admin_token` match arm — the part currently readi
 `env::var("OMS_ADMIN_PASSWORD").ok().filter(...).or_else(...)` — with:
 
 ```rust
-        let configured = resolve_admin_password(
-            env::var("OMS_ADMIN_PASSWORD")
-                .ok()
-                .or_else(|| env::var("OMS_ADMIN_TOKEN").ok()),
-            file_cfg,
-        );
+        let configured = resolve_admin_password(admin_password_from_env(), file_cfg);
         match configured {
+```
+
+with the env chain in its own helper, because the emptiness filter has to run
+**before** the fallback:
+
+```rust
+/// `OMS_ADMIN_PASSWORD`, falling back to the `OMS_ADMIN_TOKEN` alias.
+///
+/// The filter must precede the `or_else`: `Option::or_else` fires only on `None`,
+/// and `env::var("X").ok()` on an empty variable yields `Some("")`. Without the
+/// filter here, setting `OMS_ADMIN_PASSWORD=""` would swallow a perfectly good
+/// `OMS_ADMIN_TOKEN` instead of falling through to it.
+fn admin_password_from_env() -> Option<String> {
+    env::var("OMS_ADMIN_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
+}
 ```
 
 The three arms that follow (`Some(token)`, `None if bind_is_loopback(...)`,
@@ -1236,7 +1266,13 @@ Create `db/migrations/ods/public/0024_GRANT_MIGRATIONS_READ_TO_OMS.sql`:
 --
 -- The table is owned by the connecting admin (see migrate.rs: the tracking row is
 -- written after RESET ROLE), so this grant is what lets the ordinary role read it.
+--
+-- RESET ROLE first: apply_one wraps every migration body in `SET ROLE oms`, and
+-- only a table's owner or a superuser may GRANT on it. Without this, the statement
+-- below fails with "permission denied for table _mdm_migrations". apply_one's own
+-- RESET ROLE later in the transaction is then a harmless no-op.
 
+RESET ROLE;
 GRANT SELECT ON public._mdm_migrations TO oms;
 ```
 
@@ -1274,8 +1310,27 @@ with
     let pool = PgPool::connect(&cfg.runtime_url(&config::resolve_role_password(None))).await?;
 ```
 
-`provision::inspect` above it already connects to the `postgres` maintenance
-database and reads only public catalogs, so it is unaffected.
+`provision::inspect` above it is NOT unaffected, despite reading only public
+catalogs: it still has to *authenticate*, and it does so as the superuser via
+`cfg.url_for("postgres")`. Left alone, `status` fails at "password authentication
+failed" before ever reaching the line above, and this task delivers nothing.
+
+So `status` must also try `inspect` with the `oms` role's own credentials first,
+falling back to the superuser config only when that fails — the case on a server
+where the `oms` role does not exist yet, i.e. "not initialized", which is the one
+situation where the superuser is genuinely the only credential available:
+
+```rust
+    let role_cfg = PostgresConfig {
+        username: provision::ROLE.to_string(),
+        password: config::resolve_role_password(None),
+        ..cfg.clone()
+    };
+    let existing = match provision::inspect(&role_cfg).await {
+        Ok(e) => e,
+        Err(_) => provision::inspect(&cfg).await?,
+    };
+```
 
 - [ ] **Step 5: Verify against a real database**
 
