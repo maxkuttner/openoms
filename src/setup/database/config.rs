@@ -16,7 +16,7 @@ use std::env;
 pub const DEFAULT_ROLE_PASSWORD: &str = "openoms-dev";
 
 /// CLI-supplied values. `None` means "not given", which defers to env then default.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct PostgresOverrides {
     pub host: Option<String>,
     pub port: Option<u16>,
@@ -25,15 +25,46 @@ pub struct PostgresOverrides {
     pub database: Option<String>,
 }
 
+// Hand-written so a stray `{:?}` cannot print the superuser password — mirrors
+// the redacting impls in `src/config.rs`. This holds the flag-supplied value
+// before it has even been merged with env/file, so it is just as sensitive as
+// `PostgresConfig::password` below.
+impl std::fmt::Debug for PostgresOverrides {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresOverrides")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
 /// A resolved superuser connection. Used only by provisioning and teardown; the
 /// runtime pool connects as the `oms` role instead.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PostgresConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
     pub password: String,
     pub database: String,
+}
+
+// Hand-written so a stray `{:?}` — in a log line, a panic message, an `expect`
+// on a Result — cannot print the superuser password. That credential can drop
+// the database. Mirrors the redacting impls in `src/config.rs`.
+impl std::fmt::Debug for PostgresConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("database", &self.database)
+            .finish()
+    }
 }
 
 
@@ -108,10 +139,19 @@ impl PostgresConfig {
 
     /// Connection URL for an arbitrary database on the same server. Provisioning
     /// needs this: it connects to `postgres` to create `ods`.
+    ///
+    /// Username and password are percent-encoded, same as `runtime_url` below:
+    /// `oms init` now *prompts* for the superuser password interactively, so a
+    /// human-chosen value containing `@`, `/`, `:` or `#` is likely, not
+    /// hypothetical, and any of those would otherwise corrupt this URL.
     pub fn url_for(&self, database: &str) -> String {
         format!(
             "postgres://{}:{}@{}:{}/{}?sslmode=disable",
-            self.username, self.password, self.host, self.port, database
+            percent_encode_userinfo(&self.username),
+            percent_encode_userinfo(&self.password),
+            self.host,
+            self.port,
+            database
         )
     }
 
@@ -263,6 +303,37 @@ mod tests {
     fn builds_url_for_another_database() {
         assert!(sample().url_for("postgres").ends_with("/postgres?sslmode=disable"));
         assert!(sample().url().ends_with("/ods?sslmode=disable"));
+    }
+
+    /// A superuser password containing URL-special characters — likely now that
+    /// `oms init` prompts for it interactively — must not corrupt the URL.
+    /// Mirrors `runtime_url_percent_encodes_special_characters` below.
+    #[test]
+    fn url_for_percent_encodes_special_characters() {
+        let cfg = PostgresConfig { password: "p@ss/w:o#rd".into(), ..sample() };
+        let url = cfg.url_for("postgres");
+        assert!(url.contains("postgres:p%40ss%2Fw%3Ao%23rd@"), "got {url}");
+    }
+
+    /// `Debug` on `PostgresConfig` must never print the superuser password — the
+    /// credential that can drop the database.
+    #[test]
+    fn debug_redacts_the_superuser_password() {
+        let cfg = PostgresConfig { password: "super-secret-password".into(), ..sample() };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("super-secret-password"), "password leaked into {rendered}");
+        assert!(rendered.contains("localhost"));
+        assert!(rendered.contains("ods"));
+    }
+
+    /// `Debug` on `PostgresOverrides` must not print a flag-supplied password
+    /// either — it holds the same credential before it has been merged into a
+    /// `PostgresConfig`.
+    #[test]
+    fn overrides_debug_redacts_the_password() {
+        let o = PostgresOverrides { password: Some("super-secret-password".into()), ..Default::default() };
+        let rendered = format!("{o:?}");
+        assert!(!rendered.contains("super-secret-password"), "password leaked into {rendered}");
     }
 
     /// The runtime URL is always the `oms` role, regardless of the configured
