@@ -98,7 +98,25 @@ pub async fn drop(o: PostgresOverrides, yes: bool) -> Fallible {
 /// What exists and what is outstanding.
 pub async fn status(o: PostgresOverrides) -> Fallible {
     let cfg = config::resolve(o);
-    let existing = provision::inspect(&cfg).await?;
+
+    // `inspect` only reads pg_roles/pg_database — public catalogs any authenticated
+    // role can see — but *connecting* still needs a real credential, and the
+    // superuser one is what this task is trying to stop demanding. Try the oms
+    // role first, on the same maintenance database inspect always used; that
+    // authentication is only possible once `init` has already created the role,
+    // which is exactly the common case (a database that already exists and this
+    // command is being asked to describe). The one case it cannot cover is "has
+    // this server ever been initialized at all" — the oms role does not exist yet
+    // to authenticate as, so that check still falls back to the superuser cfg.
+    let role_cfg = config::PostgresConfig {
+        username: provision::ROLE.into(),
+        password: config::resolve_role_password(None),
+        ..cfg.clone()
+    };
+    let existing = match provision::inspect(&role_cfg).await {
+        Ok(existing) => existing,
+        Err(_) => provision::inspect(&cfg).await?,
+    };
     println!("server:   {}:{}", cfg.host, cfg.port);
     println!("database: {} ({})", cfg.database, if existing.database { "present" } else { "absent" });
     println!("role:     {}", if existing.roles.is_empty() { "absent".into() } else { existing.roles.join(", ") });
@@ -112,7 +130,11 @@ pub async fn status(o: PostgresOverrides) -> Fallible {
     // which both call `ensure_tracking`. Pointed at a stale POSTGRES_DATABASE,
     // `ensure_tracking` would silently plant an `oms` schema in someone else's
     // database; `status` just reports what it finds.
-    let pool = PgPool::connect(&cfg.url()).await?;
+    // Connect as the ordinary role, not the superuser: `status` is a read-only
+    // inspection, and requiring a database-dropping credential to ask "is this
+    // migrated?" would mean prompting for it constantly. Migration 0024 grants
+    // this role SELECT on the tracking table.
+    let pool = PgPool::connect(&cfg.runtime_url(&config::resolve_role_password(None))).await?;
     if !migrate::is_migrated(&pool).await? {
         println!("\nnot migrated — run `oms database init`");
         return Ok(());
