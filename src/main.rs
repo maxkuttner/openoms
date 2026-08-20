@@ -203,11 +203,13 @@ fn bind_is_loopback(addr: &str) -> bool {
 }
 
 /// Bind address on the usual tiers. No CLI flag exists for this today, so the
-/// chain is env → file → default.
+/// chain is env → file → default. Both sources are emptiness-filtered: a blank
+/// `bind_addr` in `oms.toml` must fall through to the default the same way a
+/// blank env var does, rather than reaching `TcpListener::bind` as `""`.
 fn resolve_bind_addr(from_env: Option<String>, file: Option<&config::FileConfig>) -> String {
     from_env
         .filter(|v| !v.is_empty())
-        .or_else(|| file.and_then(|f| f.server.bind_addr.clone()))
+        .or_else(|| file.and_then(|f| f.server.bind_addr.clone()).filter(|v| !v.is_empty()))
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string())
 }
 
@@ -221,6 +223,18 @@ fn resolve_admin_password(
         .filter(|v| !v.is_empty())
         .or_else(|| file.and_then(|f| f.server.admin_password.clone()))
         .filter(|v| !v.is_empty())
+}
+
+/// Merges the two admin-password env vars for `resolve_admin_password`'s `from_env`
+/// argument. `OMS_ADMIN_PASSWORD` must be emptiness-filtered *before* the
+/// `or_else`, not after: `Option::or_else` only runs on `None`, so an unfiltered
+/// `Some("")` from `OMS_ADMIN_PASSWORD=""` would short-circuit past a configured
+/// `OMS_ADMIN_TOKEN` instead of falling through to it.
+fn admin_password_from_env() -> Option<String> {
+    env::var("OMS_ADMIN_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
 }
 
 /// OMS command-line entry point. With no subcommand it runs the server (the
@@ -470,12 +484,7 @@ async fn serve() {
     let admin_token = if !admin_auth_enabled {
         String::new()
     } else {
-        let configured = resolve_admin_password(
-            env::var("OMS_ADMIN_PASSWORD")
-                .ok()
-                .or_else(|| env::var("OMS_ADMIN_TOKEN").ok()),
-            file_cfg,
-        );
+        let configured = resolve_admin_password(admin_password_from_env(), file_cfg);
         match configured {
             Some(token) => token,
             None if bind_is_loopback(&bind_addr) => {
@@ -857,8 +866,12 @@ async fn serve() {
 #[cfg(test)]
 mod tests {
     use super::bind_is_loopback;
-    use super::{resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
+    use super::{admin_password_from_env, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
     use crate::config::FileConfig;
+
+    /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares
+    /// process-global env state with every other test in the binary.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The defaults-are-fine-on-a-laptop case: these must accept the built-in
     /// admin password, with or without a port.
@@ -903,5 +916,30 @@ mod tests {
         assert_eq!(resolve_admin_password(None, Some(&file)).as_deref(), Some("from-file"));
         assert_eq!(resolve_admin_password(None, Some(&FileConfig::default())), None);
         assert_eq!(resolve_admin_password(None, None), None);
+    }
+
+    /// A blank `admin_password` in the file must not satisfy the off-loopback
+    /// refusal — it is treated the same as absent, not as a configured value.
+    #[test]
+    fn admin_password_blank_in_file_is_unconfigured() {
+        let file = crate::config::parse("[server]\nadmin_password = \"\"\n").expect("parse");
+        assert_eq!(resolve_admin_password(None, Some(&file)), None);
+    }
+
+    /// Regression: `OMS_ADMIN_PASSWORD=""` must fall through to `OMS_ADMIN_TOKEN`,
+    /// not swallow it. `Option::or_else` only fires on `None`, so the emptiness
+    /// filter on `OMS_ADMIN_PASSWORD` has to run before the `or_else`.
+    #[test]
+    fn admin_password_env_falls_through_to_token_when_password_is_empty() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("OMS_ADMIN_PASSWORD", "");
+        std::env::set_var("OMS_ADMIN_TOKEN", "from-token");
+
+        let result = admin_password_from_env();
+
+        std::env::remove_var("OMS_ADMIN_PASSWORD");
+        std::env::remove_var("OMS_ADMIN_TOKEN");
+
+        assert_eq!(result.as_deref(), Some("from-token"));
     }
 }
