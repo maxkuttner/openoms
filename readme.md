@@ -32,15 +32,23 @@ cd cockpit && npm install && npm run dev  # admin console on localhost:5173
 
 `init` asks for your Postgres host, port, database name, superuser name and
 password — pressing Enter through every prompt targets a default local Postgres
-(`localhost:5432`, superuser `postgres`, database `ods`). It then generates the
-`oms` role password, an encryption master key and a cockpit login password, writes
-them to `oms.toml` (mode 0600, and adds it to `.gitignore` if you're in a git repo),
-and creates the role, database, schemas, migrations, grants and reference data. The
-cockpit password is printed once at the end — it isn't shown again.
+(`localhost:5432`, superuser `postgres`, database `ods`). A passed `--host`,
+`--port`, etc. seeds what Enter takes instead of being ignored, and a passed
+`--password` skips that prompt entirely. `init` then generates the `oms` role
+password, an encryption master key and a cockpit login password, writes them to
+`oms.toml` (mode 0600, and appends the filename to `.gitignore` if one already
+exists in the current directory — it does not create a `.gitignore`), and creates
+the role, database, schemas, migrations, grants and reference data. The cockpit
+password is written to `oms.toml` either way; interactively it is also printed
+once at the end, as the only mode where a human is there to read it.
 
 Run it once. If `oms.toml` already exists, `init` refuses and tells you to use
 `database migrate` to upgrade, or to delete the file to start over — but deleting it
-throws away the master key, and with it anything it decrypts.
+throws away the master key, and with it anything it decrypts. If provisioning
+itself fails partway (after `oms.toml` was written), fix the cause and run `oms
+database init --resume` — it skips the role/database creation that already
+happened and finishes migrations, grants and seeding, all of which are safe to
+re-run.
 
 The instrument catalog starts empty. Put broker credentials in `.env` and it fills
 itself on the next boot; see [Loading instruments](#loading-instruments). Create
@@ -50,7 +58,7 @@ portfolios, accounts and trading identities in the cockpit.
 
 | Step | What happens |
 |---|---|
-| `init` | Prompts for the Postgres connection, generates the `oms` role password, the master key and a cockpit login password, writes `oms.toml` (mode 0600), then creates the role, database, schemas, migrations, grants and reference data. `--non-interactive` takes the connection from flags/env instead of prompting, and writes the generated cockpit password to `oms.toml` instead of printing it. |
+| `init` | Prompts for the Postgres connection, generates the `oms` role password, the master key and a cockpit login password, writes `oms.toml` (mode 0600), then creates the role, database, schemas, migrations, grants and reference data. `--non-interactive` takes the connection from flags/env instead of prompting. The cockpit password is written to `oms.toml` in both modes; `--non-interactive` just doesn't also print it. |
 | `cargo run` | Starts the server. It never creates or migrates anything — if the database is missing or stale, it says so and names the command to run. |
 
 ## Prerequisites
@@ -103,7 +111,9 @@ deliberately not in it: `oms init` prompts for it once, to provision the databas
 and never writes it down. `database init`, `database migrate` and `database drop`
 each still take it the same way as before, via `--password`/`POSTGRES_PASSWORD`.
 `database status` no longer needs it — it authenticates as the `oms` role instead,
-falling back to the superuser only when the server has never been initialized.
+falling back to the superuser whenever the `oms` role connection fails: the server
+has never been initialized, or an install from before this fallback existed has an
+`oms` role password this command has no way to reconstruct.
 
 `.env` is an override file, not a prerequisite — copy `.env.example` when you need
 broker credentials, a real admin password, or a non-local database.
@@ -133,6 +143,7 @@ non-interactive provisioning, or to inspect and maintain a database you already 
 
 ```sh
 cargo run -- database init       # create everything; fails if it already exists
+cargo run -- database init --resume   # finish an init that failed partway through
 cargo run -- database migrate    # apply pending migrations (idempotent)
 cargo run -- database status     # what exists, what is pending
 cargo run -- database drop       # destroy the database (roles are kept)
@@ -140,14 +151,19 @@ cargo run -- database drop       # destroy the database (roles are kept)
 
 `init` is deliberately strict. If the roles or database already exist it stops and
 tells you to run `migrate` instead, rather than silently skipping steps or resetting
-credentials on a database that already holds data.
+credentials on a database that already holds data. The one exception is `--resume`:
+if a previous `init` created the role and/or database but failed before finishing
+migrations, grants or seeding, `oms database init --resume` skips the creation step
+and re-runs the rest — every one of those steps is safe to re-run.
 
 `init`, `migrate` and `drop` connect as the superuser (`--password`/
 `POSTGRES_PASSWORD`, defaulting to `postgres` on loopback) because they create,
 alter or destroy the role and the database itself. `status` is read-only and
 connects as the `oms` role instead, so it needs no superuser credential in the
-normal case; it only falls back to the superuser when the server has never been
-initialized, to explain that.
+normal case; it falls back to the superuser whenever that connection fails — most
+commonly because the server has never been initialized, but also for an install
+whose `oms` role password predates this fallback and isn't recorded anywhere
+`status` can read it.
 
 Upgrading an existing install is `git pull && cargo run -- database migrate`.
 
