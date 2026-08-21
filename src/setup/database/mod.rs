@@ -18,13 +18,27 @@ use config::PostgresOverrides;
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 
-/// Create everything from scratch. Fails if any of it already exists.
+/// Create everything from scratch. Fails if any of it already exists, unless
+/// `resume` is set.
 ///
 /// Strict on purpose. A silent no-op hides the most common real mistake — being
 /// pointed at the wrong server — and an automatic `ALTER ROLE … PASSWORD` would
 /// let a bare `init` reset a working install's credentials to the shipped
 /// default. `migrate` is the verb for a database that already exists.
-pub async fn init(o: PostgresOverrides, password: Option<String>) -> Fallible {
+///
+/// `resume` exists for the failure path `oms init` cannot otherwise recover
+/// from: once provisioning has created the role and/or the database, a plain
+/// `init` refuses (this function, strict by default) and `migrate` alone
+/// leaves grants/seeding undone. With `resume` set, whichever of role/database
+/// already exists is left alone and whichever is still missing is created —
+/// see `plan_provisioning` — then the run continues into the steps below. That
+/// is safe because every one of those steps already tolerates being
+/// re-applied: migrations are tracked by filename (`ensure_tracking`/
+/// `apply_all` skip anything already recorded), `db/access/*.sql` are plain
+/// `GRANT`s (re-granting an existing privilege is a no-op), and the seed data
+/// is upserted with `ON CONFLICT`. So resuming a half-finished `init` is
+/// finishing provisioning and then running the idempotent tail again.
+pub async fn init(o: PostgresOverrides, password: Option<String>, resume: bool) -> Fallible {
     let cfg = config::resolve(o);
     let password = config::resolve_role_password(password);
 
@@ -41,13 +55,27 @@ pub async fn init(o: PostgresOverrides, password: Option<String>) -> Fallible {
     }
 
     let existing = provision::inspect(&cfg).await?;
-    if !existing.is_empty() {
-        return Err(already_initialized(&cfg, &existing).into());
+    match plan_provisioning(resume, &existing) {
+        Ok(Provisioning::Full) => {
+            provision::provision(&cfg, &password).await?;
+            println!("  created role {}", provision::ROLE);
+            println!("  created database {}", cfg.database);
+        }
+        Ok(Provisioning::Partial { role, database }) => {
+            if role {
+                provision::create_role(&cfg, &password).await?;
+                println!("  created role {}", provision::ROLE);
+            }
+            if database {
+                provision::create_database(&cfg).await?;
+                println!("  created database {}", cfg.database);
+            }
+            if !role && !database {
+                println!("  --resume: role/database already present, skipping provisioning");
+            }
+        }
+        Err(()) => return Err(already_initialized(&cfg, &existing).into()),
     }
-
-    provision::provision(&cfg, &password).await?;
-    println!("  created role {}", provision::ROLE);
-    println!("  created database {}", cfg.database);
 
     let pool = PgPool::connect(&cfg.url()).await?;
     migrate::ensure_tracking(&pool).await?;
@@ -98,7 +126,25 @@ pub async fn drop(o: PostgresOverrides, yes: bool) -> Fallible {
 /// What exists and what is outstanding.
 pub async fn status(o: PostgresOverrides) -> Fallible {
     let cfg = config::resolve(o);
-    let existing = provision::inspect(&cfg).await?;
+
+    // `inspect` only reads pg_roles/pg_database — public catalogs any authenticated
+    // role can see — but *connecting* still needs a real credential, and the
+    // superuser one is what this task is trying to stop demanding. Try the oms
+    // role first, on the same maintenance database inspect always used; that
+    // authentication is only possible once `init` has already created the role,
+    // which is exactly the common case (a database that already exists and this
+    // command is being asked to describe). The one case it cannot cover is "has
+    // this server ever been initialized at all" — the oms role does not exist yet
+    // to authenticate as, so that check still falls back to the superuser cfg.
+    let role_cfg = config::PostgresConfig {
+        username: provision::ROLE.into(),
+        password: config::resolve_role_password(None),
+        ..cfg.clone()
+    };
+    let existing = match provision::inspect(&role_cfg).await {
+        Ok(existing) => existing,
+        Err(_) => provision::inspect(&cfg).await?,
+    };
     println!("server:   {}:{}", cfg.host, cfg.port);
     println!("database: {} ({})", cfg.database, if existing.database { "present" } else { "absent" });
     println!("role:     {}", if existing.roles.is_empty() { "absent".into() } else { existing.roles.join(", ") });
@@ -112,7 +158,31 @@ pub async fn status(o: PostgresOverrides) -> Fallible {
     // which both call `ensure_tracking`. Pointed at a stale POSTGRES_DATABASE,
     // `ensure_tracking` would silently plant an `oms` schema in someone else's
     // database; `status` just reports what it finds.
-    let pool = PgPool::connect(&cfg.url()).await?;
+    // Connect as the ordinary role, not the superuser: `status` is a read-only
+    // inspection, and requiring a database-dropping credential to ask "is this
+    // migrated?" would mean prompting for it constantly. Migration 0024 grants
+    // this role SELECT on the tracking table.
+    //
+    // Falls back to the superuser the same way `inspect` above does: an install
+    // provisioned before this fallback existed may have an `oms` role password
+    // that was only ever given via `--oms-password` at provision time and never
+    // stored in the environment or `oms.toml` — nothing here can reconstruct it.
+    // Without the fallback that install's `status` would die on a credential this
+    // command was specifically changed to stop requiring in the common case.
+    let role_password = config::resolve_role_password(None);
+    let pool = match PgPool::connect(&cfg.runtime_url(&role_password)).await {
+        Ok(pool) => pool,
+        Err(role_err) => match PgPool::connect(&cfg.url()).await {
+            Ok(pool) => pool,
+            Err(super_err) => {
+                return Err(format!(
+                    "error: could not connect as the {} role ({role_err}) or as the superuser ({super_err})",
+                    provision::ROLE,
+                )
+                .into());
+            }
+        },
+    };
     if !migrate::is_migrated(&pool).await? {
         println!("\nnot migrated — run `oms database init`");
         return Ok(());
@@ -124,6 +194,44 @@ pub async fn status(o: PostgresOverrides) -> Fallible {
         println!("  pending  [{}] {}", p.schema, p.filename);
     }
     Ok(())
+}
+
+/// What `init` should create, given what `provision::inspect` found and
+/// whether `--resume` was passed.
+#[derive(Debug, PartialEq, Eq)]
+enum Provisioning {
+    /// Nothing exists: create both, the normal from-scratch path. This is the
+    /// outcome regardless of `resume` — a `--resume` against a fresh server is
+    /// just a normal init.
+    Full,
+    /// `--resume` against a server where a role and/or the database already
+    /// exist: create only whichever piece is missing (`true` = create it).
+    /// `{ role: false, database: false }` means both are already present —
+    /// nothing to create, proceed straight to the idempotent tail.
+    Partial { role: bool, database: bool },
+}
+
+/// Decide what `init` should provision. Split out from `init` so this decision
+/// — the crux of the strict-vs-resume behaviour, and now of *which* piece
+/// `--resume` recreates — is unit-testable without a live Postgres; everything
+/// else in `init` needs a real connection.
+///
+/// Per-piece rather than all-or-nothing: collapsing "something exists" into a
+/// single skip/provision choice left `--resume` unable to recover the most
+/// likely partial failure (role created, `CREATE DATABASE` failed) — it would
+/// skip provisioning entirely and then fail again with "database does not
+/// exist", a dead end `--resume` exists to prevent.
+///
+/// `Err(())` — something exists and `resume` was not passed: strict refusal,
+/// unchanged from before this split.
+fn plan_provisioning(resume: bool, existing: &provision::Existing) -> Result<Provisioning, ()> {
+    if existing.is_empty() {
+        Ok(Provisioning::Full)
+    } else if resume {
+        Ok(Provisioning::Partial { role: existing.roles.is_empty(), database: !existing.database })
+    } else {
+        Err(())
+    }
 }
 
 /// The strict-init error. Names what was found and what to run instead, because
@@ -141,11 +249,62 @@ fn already_initialized(cfg: &config::PostgresConfig, existing: &provision::Exist
     }
     msg.push_str(
         "\n       Did you mean:\n\
-         \x20        oms database migrate    apply pending migrations\n\
-         \x20        oms database status     show what is there\n\
-         \x20        oms database drop       destroy it and start over\n\
+         \x20        oms database migrate         apply pending migrations\n\
+         \x20        oms database status          show what is there\n\
+         \x20        oms database drop            destroy it and start over\n\
+         \x20        oms database init --resume   finish an init that failed partway through\n\
          \n       If you meant a different server, check POSTGRES_HOST / --host.",
     );
     msg
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    /// A fresh server always provisions fully, whether or not `--resume` was
+    /// passed — `--resume` only changes behaviour when there is something to
+    /// resume from. Combination: role ✗ / db ✗.
+    #[test]
+    fn fresh_server_always_provisions_fully() {
+        assert_eq!(plan_provisioning(false, &provision::Existing::default()), Ok(Provisioning::Full));
+        assert_eq!(plan_provisioning(true, &provision::Existing::default()), Ok(Provisioning::Full));
+    }
+
+    /// The default (no `--resume`) is unchanged: anything existing is a hard
+    /// refusal, never a silent skip — covers all three "something exists"
+    /// combinations: role ✓/db ✓, role ✓/db ✗, role ✗/db ✓.
+    #[test]
+    fn existing_without_resume_refuses() {
+        let both = provision::Existing { roles: vec!["oms".into()], database: true };
+        assert_eq!(plan_provisioning(false, &both), Err(()));
+
+        let role_only = provision::Existing { roles: vec!["oms".into()], database: false };
+        assert_eq!(plan_provisioning(false, &role_only), Err(()));
+
+        let db_only = provision::Existing { roles: vec![], database: true };
+        assert_eq!(plan_provisioning(false, &db_only), Err(()));
+    }
+
+    /// `--resume` decides per piece rather than skipping wholesale: role ✓/db ✓
+    /// has nothing left to create; role ✓/db ✗ and role ✗/db ✓ each create only
+    /// the missing half. This is the fix — before it, the latter two collapsed
+    /// into "skip provisioning" and then died connecting to a database (or
+    /// tracking a role) that was never created, the exact dead end `--resume`
+    /// exists to rescue.
+    #[test]
+    fn resume_creates_only_the_missing_piece() {
+        let both = provision::Existing { roles: vec!["oms".into()], database: true };
+        assert_eq!(plan_provisioning(true, &both), Ok(Provisioning::Partial { role: false, database: false }));
+
+        let role_only = provision::Existing { roles: vec!["oms".into()], database: false };
+        assert_eq!(
+            plan_provisioning(true, &role_only),
+            Ok(Provisioning::Partial { role: false, database: true })
+        );
+
+        let db_only = provision::Existing { roles: vec![], database: true };
+        assert_eq!(plan_provisioning(true, &db_only), Ok(Provisioning::Partial { role: true, database: false }));
+    }
 }
 

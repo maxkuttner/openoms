@@ -60,6 +60,7 @@ mod binance_feed;
 mod bybit_feed;
 mod feeds;
 mod preflight;
+mod config;
 mod expiry;
 mod fix;
 
@@ -201,6 +202,41 @@ fn bind_is_loopback(addr: &str) -> bool {
     setup::database::config::is_loopback_host(host)
 }
 
+/// Bind address on the usual tiers. No CLI flag exists for this today, so the
+/// chain is env → file → default. Both sources are emptiness-filtered: a blank
+/// `bind_addr` in `oms.toml` must fall through to the default the same way a
+/// blank env var does, rather than reaching `TcpListener::bind` as `""`.
+fn resolve_bind_addr(from_env: Option<String>, file: Option<&config::FileConfig>) -> String {
+    from_env
+        .filter(|v| !v.is_empty())
+        .or_else(|| file.and_then(|f| f.server.bind_addr.clone()).filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string())
+}
+
+/// Cockpit login password: env → file. `None` means unset, which the caller
+/// turns into the loopback-only default or a refusal.
+fn resolve_admin_password(
+    from_env: Option<String>,
+    file: Option<&config::FileConfig>,
+) -> Option<String> {
+    from_env
+        .filter(|v| !v.is_empty())
+        .or_else(|| file.and_then(|f| f.server.admin_password.clone()))
+        .filter(|v| !v.is_empty())
+}
+
+/// Merges the two admin-password env vars for `resolve_admin_password`'s `from_env`
+/// argument. `OMS_ADMIN_PASSWORD` must be emptiness-filtered *before* the
+/// `or_else`, not after: `Option::or_else` only runs on `None`, so an unfiltered
+/// `Some("")` from `OMS_ADMIN_PASSWORD=""` would short-circuit past a configured
+/// `OMS_ADMIN_TOKEN` instead of falling through to it.
+fn admin_password_from_env() -> Option<String> {
+    env::var("OMS_ADMIN_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
+}
+
 /// OMS command-line entry point. With no subcommand it runs the server (the
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
@@ -219,6 +255,14 @@ enum Command {
     /// Database provisioning and migration.
     #[command(subcommand)]
     Database(DatabaseCmd),
+    /// First-run setup: generate oms.toml and create the database.
+    Init {
+        /// Take values from flags and the environment instead of prompting.
+        #[arg(long)]
+        non_interactive: bool,
+        #[command(flatten)]
+        db: DbArgs,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -229,7 +273,7 @@ enum SetupCmd {
 
 /// Connection flags shared by every database subcommand. Each falls back to its
 /// `POSTGRES_*` environment variable, then to a localhost default.
-#[derive(clap::Args, Debug, Clone, Default)]
+#[derive(clap::Args, Clone, Default)]
 struct DbArgs {
     /// Database server host [env: POSTGRES_HOST] [default: localhost]
     #[arg(long)]
@@ -246,6 +290,21 @@ struct DbArgs {
     /// Database name [env: POSTGRES_DATABASE] [default: ods]
     #[arg(long)]
     database: Option<String>,
+}
+
+// Hand-written so a stray `{:?}` — in a log line, a panic message, a clap
+// debug-assert dump — cannot print the superuser password. Mirrors the
+// redacting impls in `src/config.rs` and `setup::init::Prompts`.
+impl std::fmt::Debug for DbArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbArgs")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("database", &self.database)
+            .finish()
+    }
 }
 
 impl From<DbArgs> for setup::database::config::PostgresOverrides {
@@ -270,6 +329,17 @@ enum DatabaseCmd {
         /// Distinct from --password, which is the superuser's.
         #[arg(long)]
         oms_password: Option<String>,
+        /// Finish an init that failed partway through: creates only whichever
+        /// of the role/database is still missing, then continues straight to
+        /// migrations, grants and seeding — all idempotent, so this is safe to
+        /// run even if some of them already happened. Without this flag, any
+        /// existing role or database is a hard refusal (unchanged default
+        /// behaviour). This bypasses the wrong-server guard plain `init`
+        /// provides: with `--resume` and a mistaken `--database`, migrations
+        /// (several of which are `DROP …`) would be applied to an unrelated
+        /// database.
+        #[arg(long)]
+        resume: bool,
     },
     /// Apply pending migrations to an existing database.
     Migrate {
@@ -307,16 +377,84 @@ async fn main() {
         }
         Some(Command::Database(cmd)) => {
             let result = match cmd {
-                DatabaseCmd::Init { db, oms_password } => {
-                    setup::database::init(db.into(), oms_password).await
+                DatabaseCmd::Init { db, oms_password, resume } => {
+                    setup::database::init(db.into(), oms_password, resume).await
                 }
                 DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
                 DatabaseCmd::Drop { db, yes } => setup::database::drop(db.into(), yes).await,
                 DatabaseCmd::Status { db } => setup::database::status(db.into()).await,
             };
             if let Err(e) = result {
-                // The error already reads as a user-facing message (see
-                // already_initialized); printing it bare avoids "Error: error:".
+                // Some of these errors already read as a user-facing message with
+                // their own "error: " prefix (see already_initialized) — printing
+                // that bare avoids "error: error: ...". Others (a bare sqlx error
+                // from a failed connection or query, e.g. mid-`--resume`) have no
+                // prefix of their own, so every other failure path in this binary
+                // adds one; add it here too rather than let this one path alone
+                // print unprefixed.
+                let msg = e.to_string();
+                if msg.starts_with("error: ") {
+                    eprintln!("{msg}");
+                } else {
+                    eprintln!("error: {msg}");
+                }
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Init { non_interactive, db }) => {
+            // Checked here too, not only inside `run()`: `resolve()` below calls
+            // `config::load()`, which exits the process over a *malformed*
+            // oms.toml before `run()`'s own check ever runs — and interactively,
+            // without this, the operator would type their superuser password at
+            // a no-echo prompt only to be refused a moment later. `run()` keeps
+            // its own check regardless; that one is the actual guarantee, this
+            // one just fails earlier and more kindly.
+            let cfg_path = config::path();
+            if cfg_path.exists() {
+                eprintln!("{}", setup::init::already_initialized_message(&cfg_path));
+                std::process::exit(1);
+            }
+
+            let interactive = !non_interactive;
+            let prompts = if non_interactive {
+                let cfg = setup::database::config::resolve(db.into());
+                setup::init::Prompts {
+                    host: cfg.host,
+                    port: cfg.port,
+                    database: cfg.database,
+                    username: cfg.username,
+                    password: cfg.password,
+                }
+            } else {
+                // Seed the interactive prompts' defaults from whatever was passed
+                // on the command line (and the environment, via the same
+                // resolve() precedence non-interactive mode uses) — otherwise
+                // `oms init --host db.internal` still prompts for host, which is
+                // what made those flags pointless.
+                //
+                // The password is the one exception: ONLY an explicit `--password`
+                // skips the prompt. `POSTGRES_PASSWORD` deliberately does not,
+                // because it describes the database the *application* connects to,
+                // not the one being provisioned. Honouring it here meant a repo
+                // with a .env silently authenticated against a different server
+                // with the wrong credential and never asked — the operator saw a
+                // bare auth failure for a password they were never given a chance
+                // to type.
+                let password_override = db.password.clone();
+                let cfg = setup::database::config::resolve(db.into());
+                let defaults = setup::init::PromptDefaults {
+                    host: cfg.host,
+                    port: cfg.port,
+                    database: cfg.database,
+                    username: cfg.username,
+                    password: password_override,
+                };
+                match setup::init::prompt(&defaults) {
+                    Ok(p) => p,
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+                }
+            };
+            if let Err(e) = setup::init::run(prompts, interactive).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -357,6 +495,14 @@ async fn serve() {
         Ok(pool) => pool,
         Err(e) => {
             error!("Failed to connect to the database: {e}");
+            // `oms.toml` is resolved relative to the CWD, so a connection failure
+            // from a directory other than the one it was written in looks
+            // identical to "never initialized" unless the message names the path
+            // that was actually searched.
+            error!(
+                "config file searched: {} (set OMS_CONFIG to point elsewhere)",
+                config::path_abs().display()
+            );
             error!("If this database has not been created yet, run: oms database init");
             return;
         }
@@ -388,10 +534,8 @@ async fn serve() {
 
     // Resolved here rather than at bind time because the admin-password rule below
     // needs to know whether we are about to expose the server beyond this machine.
-    let bind_addr = env::var("OMS_BIND_ADDR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+    let file_cfg = config::load();
+    let bind_addr = resolve_bind_addr(env::var("OMS_BIND_ADDR").ok(), file_cfg);
 
     let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
         .map(|v| v.to_lowercase() != "false")
@@ -407,11 +551,8 @@ async fn serve() {
     let admin_token = if !admin_auth_enabled {
         String::new()
     } else {
-        match env::var("OMS_ADMIN_PASSWORD")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .or_else(|| env::var("OMS_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()))
-        {
+        let configured = resolve_admin_password(admin_password_from_env(), file_cfg);
+        match configured {
             Some(token) => token,
             None if bind_is_loopback(&bind_addr) => {
                 warn!(
@@ -792,6 +933,12 @@ async fn serve() {
 #[cfg(test)]
 mod tests {
     use super::bind_is_loopback;
+    use super::{admin_password_from_env, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
+    use crate::config::FileConfig;
+
+    /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares
+    /// process-global env state with every other test in the binary.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The defaults-are-fine-on-a-laptop case: these must accept the built-in
     /// admin password, with or without a port.
@@ -817,5 +964,49 @@ mod tests {
     fn unparseable_binds_are_not_loopback() {
         assert!(!bind_is_loopback("[::1:3001"), "unterminated IPv6 bracket");
         assert!(!bind_is_loopback(""));
+    }
+
+    #[test]
+    fn bind_addr_prefers_env_then_file_then_default() {
+        let file = crate::config::parse("[server]\nbind_addr = \"1.2.3.4:9999\"\n").expect("parse");
+
+        assert_eq!(resolve_bind_addr(Some("0.0.0.0:1".into()), Some(&file)), "0.0.0.0:1");
+        assert_eq!(resolve_bind_addr(None, Some(&file)), "1.2.3.4:9999");
+        assert_eq!(resolve_bind_addr(None, None), DEFAULT_BIND_ADDR);
+    }
+
+    #[test]
+    fn admin_password_prefers_env_then_file() {
+        let file = crate::config::parse("[server]\nadmin_password = \"from-file\"\n").expect("parse");
+
+        assert_eq!(resolve_admin_password(Some("from-env".into()), Some(&file)).as_deref(), Some("from-env"));
+        assert_eq!(resolve_admin_password(None, Some(&file)).as_deref(), Some("from-file"));
+        assert_eq!(resolve_admin_password(None, Some(&FileConfig::default())), None);
+        assert_eq!(resolve_admin_password(None, None), None);
+    }
+
+    /// A blank `admin_password` in the file must not satisfy the off-loopback
+    /// refusal — it is treated the same as absent, not as a configured value.
+    #[test]
+    fn admin_password_blank_in_file_is_unconfigured() {
+        let file = crate::config::parse("[server]\nadmin_password = \"\"\n").expect("parse");
+        assert_eq!(resolve_admin_password(None, Some(&file)), None);
+    }
+
+    /// Regression: `OMS_ADMIN_PASSWORD=""` must fall through to `OMS_ADMIN_TOKEN`,
+    /// not swallow it. `Option::or_else` only fires on `None`, so the emptiness
+    /// filter on `OMS_ADMIN_PASSWORD` has to run before the `or_else`.
+    #[test]
+    fn admin_password_env_falls_through_to_token_when_password_is_empty() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("OMS_ADMIN_PASSWORD", "");
+        std::env::set_var("OMS_ADMIN_TOKEN", "from-token");
+
+        let result = admin_password_from_env();
+
+        std::env::remove_var("OMS_ADMIN_PASSWORD");
+        std::env::remove_var("OMS_ADMIN_TOKEN");
+
+        assert_eq!(result.as_deref(), Some("from-token"));
     }
 }

@@ -31,3 +31,6 @@ TODO.md
 
 # FIX protocol spec PDFs kept locally for reference, not committed.
 FIX-*.pdf
+
+# openoms bootstrap config — holds the master key
+oms.toml
