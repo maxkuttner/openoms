@@ -4,7 +4,11 @@
 //! the shapes, their JSON encoding, and the redacted view that is safe to put on
 //! the wire.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+
+use crate::secrets::{self, MasterKey};
 
 /// Credentials for one broker connection, tagged by broker so a blob read back
 /// from the database identifies itself.
@@ -125,6 +129,166 @@ impl std::fmt::Debug for FeedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FeedCredentials{:?}", self.redact().fields)
     }
+}
+
+/// What is known about a connection's credentials.
+#[derive(Debug)]
+pub enum CredentialState<T> {
+    Configured(T),
+    /// The row exists but nothing has been stored — "needs setup".
+    Unconfigured,
+    /// Stored, but unusable. Never collapsed into `Unconfigured`: that would
+    /// invite re-entry of a credential that is already there and hide a key
+    /// problem behind what looks like a fresh install.
+    Error(String),
+}
+
+#[derive(Debug)]
+pub struct Connection<T> {
+    pub code: String,
+    /// `broker_code` for brokers, `provider` for feeds.
+    pub kind: String,
+    pub environment: Option<String>,
+    pub status: String,
+    pub credentials: CredentialState<T>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// Decode is deliberately split from the SQL below: every failure case — no
+/// blob, no key, wrong key, another connection's blob, unparseable payload —
+/// is exercised in `mod tests` through the seal/open seam, with no database.
+fn decode<T: serde::de::DeserializeOwned>(
+    key: Option<&MasterKey>,
+    code: &str,
+    blob: Option<Vec<u8>>,
+) -> CredentialState<T> {
+    let Some(blob) = blob else { return CredentialState::Unconfigured };
+    let Some(key) = key else {
+        return CredentialState::Error(
+            "credentials are stored but no master key is configured (set oms.master_key in oms.toml)".into(),
+        );
+    };
+    match secrets::open(key, code, &blob) {
+        Err(e) => CredentialState::Error(e.to_string()),
+        Ok(plain) => match serde_json::from_slice(&plain) {
+            Ok(v) => CredentialState::Configured(v),
+            // Deliberately does not include the payload: it is a decrypted secret.
+            Err(_) => CredentialState::Error("stored credentials are not in a recognised format".into()),
+        },
+    }
+}
+
+pub fn decode_broker(
+    key: Option<&MasterKey>,
+    code: &str,
+    blob: Option<Vec<u8>>,
+) -> CredentialState<BrokerCredentials> {
+    decode(key, code, blob)
+}
+
+pub fn decode_feed(key: Option<&MasterKey>, code: &str, blob: Option<Vec<u8>>) -> CredentialState<FeedCredentials> {
+    decode(key, code, blob)
+}
+
+pub async fn load_brokers(
+    pool: &PgPool,
+    key: Option<&MasterKey>,
+) -> Result<Vec<Connection<BrokerCredentials>>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, Option<Vec<u8>>, Option<DateTime<Utc>>)>(
+        "SELECT code, broker_code, environment, status, credentials, credentials_updated_at \
+         FROM oms.broker_connection ORDER BY code",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(code, broker, env, status, blob, updated)| Connection {
+            credentials: decode_broker(key, &code, blob),
+            code,
+            kind: broker,
+            environment: Some(env),
+            status,
+            updated_at: updated,
+        })
+        .collect())
+}
+
+pub async fn load_feeds(
+    pool: &PgPool,
+    key: Option<&MasterKey>,
+) -> Result<Vec<Connection<FeedCredentials>>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String, String, String, Option<Vec<u8>>, Option<DateTime<Utc>>)>(
+        "SELECT code, provider, status, credentials, credentials_updated_at \
+         FROM oms.feed_connection ORDER BY code",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(code, provider, status, blob, updated)| Connection {
+            credentials: decode_feed(key, &code, blob),
+            code,
+            kind: provider,
+            environment: None,
+            status,
+            updated_at: updated,
+        })
+        .collect())
+}
+
+pub async fn save_broker(
+    pool: &PgPool,
+    key: &MasterKey,
+    code: &str,
+    c: &BrokerCredentials,
+) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_vec(c).expect("credentials always serialize");
+    let sealed = secrets::seal(key, code, &json);
+    sqlx::query(
+        "UPDATE oms.broker_connection \
+         SET credentials = $2, credentials_updated_at = now(), updated_at = now() \
+         WHERE code = $1",
+    )
+    .bind(code)
+    .bind(&sealed)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn save_feed(pool: &PgPool, key: &MasterKey, code: &str, c: &FeedCredentials) -> Result<(), sqlx::Error> {
+    let json = serde_json::to_vec(c).expect("credentials always serialize");
+    let sealed = secrets::seal(key, code, &json);
+    // Upserts on `code`, the primary key — feed_connection has no unique
+    // constraint on (provider, dataset), so this is the only conflict target
+    // that behaves.
+    sqlx::query(
+        "INSERT INTO oms.feed_connection (code, provider, credentials, credentials_updated_at) \
+         VALUES ($1, $2, $3, now()) \
+         ON CONFLICT (code) DO UPDATE \
+           SET credentials = EXCLUDED.credentials, \
+               credentials_updated_at = now(), updated_at = now()",
+    )
+    .bind(code)
+    .bind(match c { FeedCredentials::Databento { .. } => "DATABENTO" })
+    .bind(&sealed)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether anything is stored at all. `serve()` uses this to decide whether a
+/// missing master key is fatal.
+pub async fn any_credentials_stored(pool: &PgPool) -> Result<bool, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM oms.broker_connection WHERE credentials IS NOT NULL) \
+              + (SELECT count(*) FROM oms.feed_connection   WHERE credentials IS NOT NULL)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -273,5 +437,89 @@ mod tests {
         assert_eq!(tail4(""), "");
         assert_eq!(tail4("abc"), "");
         assert_eq!(tail4("AKTESTKEY123"), "Y123");
+    }
+
+    use crate::secrets::{parse_master_key, seal};
+
+    fn key() -> crate::secrets::MasterKey {
+        parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("key")
+    }
+
+    /// A row whose blob decrypts becomes Configured.
+    #[test]
+    fn a_good_blob_decodes_to_configured() {
+        let json = serde_json::to_vec(&alpaca()).expect("ser");
+        let sealed = seal(&key(), "alpaca-paper", &json);
+        match decode_broker(Some(&key()), "alpaca-paper", Some(sealed)) {
+            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, .. }) => {
+                assert_eq!(k, "AKTESTKEY123");
+            }
+            other => panic!("expected Configured, got {other:?}"),
+        }
+    }
+
+    /// A null blob is a connection that exists but has never been configured.
+    #[test]
+    fn a_null_blob_is_unconfigured() {
+        assert!(matches!(
+            decode_broker(Some(&key()), "alpaca-paper", None),
+            CredentialState::Unconfigured
+        ));
+    }
+
+    /// The wrong key must be reported, never silently downgraded to Unconfigured —
+    /// that would invite the operator to re-enter a credential that is already
+    /// there and mask a key-management problem.
+    #[test]
+    fn an_undecryptable_blob_is_an_error_not_unconfigured() {
+        let other = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("key");
+        let sealed = seal(&other, "alpaca-paper", b"{}");
+        assert!(matches!(
+            decode_broker(Some(&key()), "alpaca-paper", Some(sealed)),
+            CredentialState::Error(_)
+        ));
+    }
+
+    /// A blob sealed for a different connection must not decode here.
+    #[test]
+    fn a_blob_from_another_connection_is_an_error() {
+        let json = serde_json::to_vec(&alpaca()).expect("ser");
+        let sealed = seal(&key(), "alpaca-live", &json);
+        assert!(matches!(
+            decode_broker(Some(&key()), "alpaca-paper", Some(sealed)),
+            CredentialState::Error(_)
+        ));
+    }
+
+    /// Credentials present but no key configured is a distinct, nameable problem.
+    #[test]
+    fn stored_credentials_with_no_key_is_an_error() {
+        assert!(matches!(decode_broker(None, "alpaca-paper", Some(vec![0u8; 40])), CredentialState::Error(_)));
+    }
+
+    /// Decryptable but not parseable — a shape written by a newer version.
+    #[test]
+    fn undecodable_json_is_an_error() {
+        let sealed = seal(&key(), "alpaca-paper", b"not json at all");
+        assert!(matches!(
+            decode_broker(Some(&key()), "alpaca-paper", Some(sealed)),
+            CredentialState::Error(_)
+        ));
+    }
+
+    /// The error string is shown in the cockpit and logged — it must not carry
+    /// any part of the ciphertext or the key.
+    #[test]
+    fn error_strings_carry_no_secret_material() {
+        let sealed = seal(&key(), "alpaca-paper", b"not json at all");
+        // The plaintext here is "not json at all"; the message must not quote it,
+        // must not carry the key, and must not hex-dump the ciphertext.
+        if let CredentialState::Error(msg) = decode_broker(Some(&key()), "alpaca-paper", Some(sealed)) {
+            assert!(!msg.contains("not json at all"), "decrypted payload leaked: {msg}");
+            assert!(!msg.contains("AAAA"), "key material leaked: {msg}");
+            assert!(msg.len() < 120, "suspiciously long, likely dumping data: {msg}");
+        } else {
+            panic!("expected an error");
+        }
     }
 }
