@@ -12,6 +12,7 @@ use sqlx::PgPool;
 
 use crate::credentials::{save_broker, save_feed, BrokerCredentials, FeedCredentials};
 use crate::secrets::MasterKey;
+use crate::setup::brokers::Broker;
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -22,14 +23,14 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
     let mut out = Vec::new();
 
     for env_name in ["PAPER", "LIVE"] {
-        if let (Some(key), Some(secret)) = (
-            var(&format!("ALPACA_{env_name}_API_KEY")),
-            var(&format!("ALPACA_{env_name}_API_SECRET")),
-        ) {
-            out.push((
-                format!("alpaca-{}", env_name.to_lowercase()),
-                BrokerCredentials::Alpaca { key, secret },
-            ));
+        let key_var = format!("ALPACA_{env_name}_API_KEY");
+        let secret_var = format!("ALPACA_{env_name}_API_SECRET");
+        let code = format!("alpaca-{}", env_name.to_lowercase());
+        match (var(&key_var), var(&secret_var)) {
+            (Some(key), Some(secret)) => out.push((code, BrokerCredentials::Alpaca { key, secret })),
+            (Some(_), None) => eprintln!("  skipped {code}: {key_var} is set but {secret_var} is not"),
+            (None, Some(_)) => eprintln!("  skipped {code}: {secret_var} is set but {key_var} is not"),
+            (None, None) => {}
         }
 
         let p = format!("IBKR_{env_name}");
@@ -48,26 +49,46 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
         }
 
         let p = format!("BINANCE_{env_name}");
-        if let (Some(host), Some(api_key), Some(path)) = (
-            var(&format!("{p}_FIX_HOST")),
-            var(&format!("{p}_API_KEY")),
-            var(&format!("{p}_PRIVATE_KEY_PATH")),
-        ) {
-            // The store holds PEM bytes, not a path, so the file has to be read
-            // now — while the operator is present to fix it if it is missing.
-            match std::fs::read_to_string(&path) {
-                Ok(private_key) => out.push((
-                    format!("binance-{}", env_name.to_lowercase()),
-                    BrokerCredentials::BinanceFix {
-                        host,
-                        port: var(&format!("{p}_FIX_PORT")).and_then(|s| s.parse().ok()).unwrap_or(9000),
-                        sender_comp_id: var(&format!("{p}_SENDER_COMP_ID")).unwrap_or_else(|| "OMS".into()),
-                        target_comp_id: var(&format!("{p}_TARGET_COMP_ID")).unwrap_or_else(|| "SPOT".into()),
-                        api_key,
-                        private_key,
-                    },
-                )),
-                Err(e) => eprintln!("  skipped binance-{}: cannot read {path}: {e}", env_name.to_lowercase()),
+        let host_var = format!("{p}_FIX_HOST");
+        let apikey_var = format!("{p}_API_KEY");
+        let path_var = format!("{p}_PRIVATE_KEY_PATH");
+        let code = format!("binance-{}", env_name.to_lowercase());
+        let host = var(&host_var);
+        let api_key = var(&apikey_var);
+        let path = var(&path_var);
+        match (&host, &api_key, &path) {
+            (Some(_), Some(_), Some(path)) => {
+                // The store holds PEM bytes, not a path, so the file has to be
+                // read now — while the operator is present to fix it if it is
+                // missing.
+                match std::fs::read_to_string(path) {
+                    Ok(private_key) => out.push((
+                        code,
+                        BrokerCredentials::BinanceFix {
+                            host: host.unwrap(),
+                            port: var(&format!("{p}_FIX_PORT")).and_then(|s| s.parse().ok()).unwrap_or(9000),
+                            sender_comp_id: var(&format!("{p}_SENDER_COMP_ID")).unwrap_or_else(|| "OMS".into()),
+                            target_comp_id: var(&format!("{p}_TARGET_COMP_ID")).unwrap_or_else(|| "SPOT".into()),
+                            api_key: api_key.unwrap(),
+                            private_key,
+                        },
+                    )),
+                    Err(e) => eprintln!("  skipped {code}: cannot read {path}: {e}"),
+                }
+            }
+            (None, None, None) => {}
+            _ => {
+                let mut missing = Vec::new();
+                if host.is_none() {
+                    missing.push(host_var.as_str());
+                }
+                if api_key.is_none() {
+                    missing.push(apikey_var.as_str());
+                }
+                if path.is_none() {
+                    missing.push(path_var.as_str());
+                }
+                eprintln!("  skipped {code}: missing {}", missing.join(", "));
             }
         }
     }
@@ -92,6 +113,11 @@ pub async fn run(pool: &PgPool, key: &MasterKey) -> Result<usize, Box<dyn std::e
         return Ok(0);
     }
 
+    // Codes the app itself will create a row for at boot (`ensure_broker_connections`
+    // iterates `Broker::ALL` and creates exactly these). IBKR has no `Broker`
+    // variant, so its row is never auto-created — only Alpaca and Binance are.
+    let bootstrapped: Vec<String> = Broker::ALL.iter().map(|b| b.connection_code()).collect();
+
     let mut n = 0;
     for (code, cred) in &brokers {
         // The connection row must exist first: credentials attach to a configured
@@ -102,7 +128,11 @@ pub async fn run(pool: &PgPool, key: &MasterKey) -> Result<usize, Box<dyn std::e
                 .fetch_optional(pool)
                 .await?;
         if exists.is_none() {
-            println!("  skipped {code}: no broker_connection row (the app creates one at boot when credentials are present)");
+            if bootstrapped.contains(code) {
+                println!("  skipped {code}: no broker_connection row yet (the app creates one at boot when credentials are present — restart it)");
+            } else {
+                println!("  skipped {code}: no broker_connection row (create one first via POST /admin/broker-connections)");
+            }
             continue;
         }
         save_broker(pool, key, code, cred).await?;
@@ -128,12 +158,23 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Every variable `scan_env`/`scan_feed_env` read, both PAPER and LIVE, plus
+    /// the `*_ENV` variables `Broker::connection_code()` reads — otherwise a
+    /// developer machine exporting a LIVE or `*_ENV` variable could fail a test
+    /// for reasons unrelated to the code under test.
     fn clear() {
         for k in [
             "ALPACA_ENV", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_API_SECRET",
             "ALPACA_LIVE_API_KEY", "ALPACA_LIVE_API_SECRET",
+            "BINANCE_ENV",
             "BINANCE_PAPER_FIX_HOST", "BINANCE_PAPER_API_KEY", "BINANCE_PAPER_PRIVATE_KEY_PATH",
-            "IBKR_PAPER_FIX_HOST", "IBKR_PAPER_FIX_PASSWORD",
+            "BINANCE_PAPER_FIX_PORT", "BINANCE_PAPER_SENDER_COMP_ID", "BINANCE_PAPER_TARGET_COMP_ID",
+            "BINANCE_LIVE_FIX_HOST", "BINANCE_LIVE_API_KEY", "BINANCE_LIVE_PRIVATE_KEY_PATH",
+            "BINANCE_LIVE_FIX_PORT", "BINANCE_LIVE_SENDER_COMP_ID", "BINANCE_LIVE_TARGET_COMP_ID",
+            "IBKR_PAPER_FIX_HOST", "IBKR_PAPER_FIX_PORT", "IBKR_PAPER_SENDER_COMP_ID",
+            "IBKR_PAPER_TARGET_COMP_ID", "IBKR_PAPER_FIX_PASSWORD", "IBKR_PAPER_FIX_SSL",
+            "IBKR_LIVE_FIX_HOST", "IBKR_LIVE_FIX_PORT", "IBKR_LIVE_SENDER_COMP_ID",
+            "IBKR_LIVE_TARGET_COMP_ID", "IBKR_LIVE_FIX_PASSWORD", "IBKR_LIVE_FIX_SSL",
             "DATABENTO_API_KEY",
         ] {
             std::env::remove_var(k);
@@ -201,6 +242,23 @@ mod tests {
         clear();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "databento-opra");
+    }
+
+    /// The codes this module hand-builds for Alpaca and Binance must agree with
+    /// `Broker::connection_code()` byte-for-byte: a mismatch means every import
+    /// silently finds no `broker_connection` row. IBKR has no `Broker` variant,
+    /// so its code stays hand-built and isn't checked here.
+    #[test]
+    fn alpaca_and_binance_codes_match_broker_connection_code() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        // ALPACA_ENV / BINANCE_ENV are cleared, so both default to "PAPER" —
+        // matching the "PAPER" iteration of scan_env()'s loop.
+        let alpaca_code = Broker::Alpaca.connection_code();
+        let binance_code = Broker::Binance.connection_code();
+        clear();
+        assert_eq!(alpaca_code, "alpaca-paper");
+        assert_eq!(binance_code, "binance-paper");
     }
 
     /// Binance's private key lives at a path in the environment and as PEM bytes
