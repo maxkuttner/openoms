@@ -1418,6 +1418,15 @@ Where `serve()` currently reads `ALPACA_*` and calls `fix::start_*`, instead:
 
 In the `Configured` arm, match the variant: `Alpaca` → `registry.register_alpaca(env, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env)))`; `IbkrFix` → `fix::start_ibkr(...)`; `BinanceFix` → `fix::start_binance(...)`. Take the environment from `conn.environment`.
 
+- [ ] **Step 2b: The Alpaca trade-update streams read the environment a second time**
+
+`serve()` reads the `ALPACA_*` pairs again around `main.rs:750`/`:758` to spawn
+`alpaca_stream::run`, which delivers execution reports. That is a separate read from
+the adapter registration above. Leaving it on the environment means adapters come
+from the store while execution reports stop arriving for a store-only credential.
+Take the key and secret from the same `Configured` credential used to register the
+adapter.
+
 - [ ] **Step 3: Do the same for the Databento feed**
 
 The feed is gated on `env::var("DATABENTO_API_KEY")` in `serve()`. Gate it on a `Configured` `FeedCredentials::Databento` from `load_feeds` instead.
