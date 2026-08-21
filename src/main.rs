@@ -241,6 +241,22 @@ fn admin_password_from_env() -> Option<String> {
         .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
 }
 
+/// Whether `serve()` must refuse to start over the master-key/credential-store
+/// gate. Pulled out of `serve()` as a pure function so the four combinations are
+/// directly table-testable — this is the most consequential new behaviour in
+/// the credential-store plan (a wrong answer here either misrepresents the
+/// system's state by starting with no adapters, or refuses to start a perfectly
+/// fine fresh install) and it deserves more than incidental coverage via a live
+/// database.
+///
+/// `credentials_might_be_stored` is already the fail-safe answer computed by the
+/// caller (an `any_credentials_stored` query failure — e.g. a pre-migration-0021
+/// database — becomes `true`, not `false`; see `serve()`), so this function only
+/// has to combine the two: fatal iff there is no key AND credentials might exist.
+fn must_refuse_to_start(master_key_present: bool, credentials_might_be_stored: bool) -> bool {
+    !master_key_present && credentials_might_be_stored
+}
+
 /// OMS command-line entry point. With no subcommand it runs the server (the
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
@@ -577,7 +593,7 @@ async fn serve() {
             true
         }
     };
-    if master.is_none() && credentials_might_be_stored {
+    if must_refuse_to_start(master.is_some(), credentials_might_be_stored) {
         error!(
             "refusing to start: credentials are stored but no master key is configured. \
              Set oms.master_key in oms.toml (or OMS_MASTER_KEY)."
@@ -599,14 +615,27 @@ async fn serve() {
     // adapter registration, and by the Databento feed gate — one read of the
     // store, so nothing downstream can see a different answer than another part
     // of boot already acted on.
-    let broker_connections = credentials::load_brokers(&pool, master.as_ref()).await.unwrap_or_else(|e| {
-        error!("failed to load broker connections from the store: {e}");
-        Vec::new()
-    });
-    let feed_connections = credentials::load_feeds(&pool, master.as_ref()).await.unwrap_or_else(|e| {
-        error!("failed to load feed connections from the store: {e}");
-        Vec::new()
-    });
+    //
+    // A query failure here is fatal, not `unwrap_or_default()`'s empty `Vec`: an
+    // empty list is indistinguishable from "nothing configured", so a transient
+    // DB error at exactly this moment would silently produce a server that
+    // binds, passes `/health`, and 503s every order with zero adapters
+    // registered — precisely the misrepresented-state failure mode the
+    // master-key gate above exists to prevent, just reached a different way.
+    let broker_connections = match credentials::load_brokers(&pool, master.as_ref()).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("refusing to start: failed to load broker connections from the store: {e}");
+            std::process::exit(1);
+        }
+    };
+    let feed_connections = match credentials::load_feeds(&pool, master.as_ref()).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("refusing to start: failed to load feed connections from the store: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // Which of those brokers the *store* currently credentials — computed once so
     // `will_sync_on_boot` (below) and `spawn_sync` (near the end, once the catalog
@@ -727,7 +756,26 @@ async fn serve() {
             CredentialState::Error(e) => {
                 error!(code = %conn.code, kind = %conn.kind, "credentials unusable: {e}");
             }
-            CredentialState::Configured(creds) => match creds {
+            CredentialState::Configured(creds) => {
+                // `broker_code` and the stored credential's own variant tag are two
+                // independent sources of truth for "what kind of broker is this" —
+                // normally in lockstep, but nothing enforces it (e.g. a credential
+                // hand-imported into the wrong row). Registration below follows the
+                // credential's variant, not `conn.kind`, so this cannot mis-route an
+                // adapter — but the mismatch itself is a real misconfiguration worth
+                // surfacing rather than registering silently.
+                let expected_kind = match creds {
+                    BrokerCredentials::Alpaca { .. } => "ALPACA",
+                    BrokerCredentials::IbkrFix { .. } => "IBKR",
+                    BrokerCredentials::BinanceFix { .. } => "BINANCE",
+                };
+                if conn.kind != expected_kind {
+                    warn!(
+                        code = %conn.code, kind = %conn.kind, credential_kind = expected_kind,
+                        "broker_connection's broker_code does not match its stored credential's kind"
+                    );
+                }
+                match creds {
                 BrokerCredentials::Alpaca { key, secret } => {
                     registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env_name)));
                     alpaca_creds.insert(env_name, (key.clone(), secret.clone()));
@@ -778,7 +826,8 @@ async fn serve() {
                         },
                     }
                 }
-            },
+                }
+            }
         }
     }
 
@@ -864,6 +913,22 @@ async fn serve() {
                 error!(code = %conn.code, "credentials unusable: {e}");
             }
             CredentialState::Configured(FeedCredentials::Databento { api_key }) => {
+                // `DatabentoOpraFeed` is hardcoded to one dataset (OPRA.PILLAR) and
+                // one shared stream-health label ("DATABENTO"/"OPRA") — spawning it
+                // for more than one row would have two sessions silently racing to
+                // subscribe under the same health handle. `code` is the table's
+                // primary key, so it cannot duplicate; guarding on it here instead
+                // rejects a *different* Databento-provider row (e.g. a future
+                // non-OPRA dataset reusing this credential shape) rather than
+                // spawning an OPRA session for something that isn't OPRA.
+                if conn.code != "databento-opra" {
+                    error!(
+                        code = %conn.code,
+                        "unsupported Databento feed connection — only databento-opra \
+                         (OPRA options) is implemented; feed not started"
+                    );
+                    continue;
+                }
                 let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
                 marks_doorbells.push(opra_pos_tx);
                 let health = state.stream_health().handle("DATABENTO", "OPRA", stream_health::StreamKind::Feed);
@@ -1053,8 +1118,33 @@ async fn serve() {
 #[cfg(test)]
 mod tests {
     use super::bind_is_loopback;
-    use super::{admin_password_from_env, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
+    use super::{admin_password_from_env, must_refuse_to_start, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
     use crate::config::FileConfig;
+
+    /// The most consequential new behaviour in the credential-store plan, table-
+    /// tested directly: only "no key AND credentials might exist" refuses to
+    /// start. The pre-migration-0021 case (`any_credentials_stored` erroring)
+    /// is exercised by the caller in `serve()` turning that `Err` into `true`
+    /// before this function ever sees it — this table covers the boolean logic
+    /// that decision feeds, including that a query failure (mapped to `true`)
+    /// keeps a missing key fatal rather than being waved through.
+    #[test]
+    fn must_refuse_to_start_only_when_key_absent_and_creds_might_exist() {
+        // (master_key_present, credentials_might_be_stored) -> must_refuse
+        let cases = [
+            (true, true, false),   // key present: never fatal, regardless of storage
+            (true, false, false),
+            (false, false, false), // no key, nothing stored: normal fresh install
+            (false, true, true),   // no key, something stored (or unknown/Err → true): fatal
+        ];
+        for (key_present, might_be_stored, expected) in cases {
+            assert_eq!(
+                must_refuse_to_start(key_present, might_be_stored),
+                expected,
+                "key_present={key_present} might_be_stored={might_be_stored}"
+            );
+        }
+    }
 
     /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares
     /// process-global env state with every other test in the binary.

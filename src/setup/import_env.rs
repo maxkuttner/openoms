@@ -49,39 +49,53 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
         }
 
         let p = format!("BINANCE_{env_name}");
-        let host_var = format!("{p}_FIX_HOST");
         let apikey_var = format!("{p}_API_KEY");
         let path_var = format!("{p}_PRIVATE_KEY_PATH");
         let code = format!("binance-{}", env_name.to_lowercase());
-        let host = var(&host_var);
+        let host = var(&format!("{p}_FIX_HOST"));
         let api_key = var(&apikey_var);
         let path = var(&path_var);
-        match (&host, &api_key, &path) {
-            (Some(_), Some(_), Some(path)) => {
+        // The API key + PEM path are what every Binance transport needs — REST
+        // (the default: `BINANCE_{ENV}_TRANSPORT=rest`, unset, or absent) never
+        // reads a FIX host at all, so requiring one here would make a
+        // by-the-book REST setup un-importable. `BinanceFix` is the only stored
+        // shape (see its doc comment in credentials.rs), so an absent FIX host
+        // defaults the same way `start_binance` used to when nothing configured
+        // one: empty host, port 9000, SenderCompID "OMS", TargetCompID "SPOT" —
+        // fine for REST, and FIX transport will simply need a real host set
+        // before it can be used (noted below, not silently accepted as ready).
+        match (&api_key, &path) {
+            (Some(_), Some(path)) => {
                 // The store holds PEM bytes, not a path, so the file has to be
                 // read now — while the operator is present to fix it if it is
                 // missing.
                 match std::fs::read_to_string(path) {
-                    Ok(private_key) => out.push((
-                        code,
-                        BrokerCredentials::BinanceFix {
-                            host: host.unwrap(),
-                            port: var(&format!("{p}_FIX_PORT")).and_then(|s| s.parse().ok()).unwrap_or(9000),
-                            sender_comp_id: var(&format!("{p}_SENDER_COMP_ID")).unwrap_or_else(|| "OMS".into()),
-                            target_comp_id: var(&format!("{p}_TARGET_COMP_ID")).unwrap_or_else(|| "SPOT".into()),
-                            api_key: api_key.unwrap(),
-                            private_key,
-                        },
-                    )),
+                    Ok(private_key) => {
+                        if host.is_none() {
+                            println!(
+                                "  note: {code} imported without a FIX host — REST transport \
+                                 (the default) works as-is; set BINANCE_{env_name}_FIX_HOST \
+                                 before importing again if you intend to use FIX"
+                            );
+                        }
+                        out.push((
+                            code,
+                            BrokerCredentials::BinanceFix {
+                                host: host.unwrap_or_default(),
+                                port: var(&format!("{p}_FIX_PORT")).and_then(|s| s.parse().ok()).unwrap_or(9000),
+                                sender_comp_id: var(&format!("{p}_SENDER_COMP_ID")).unwrap_or_else(|| "OMS".into()),
+                                target_comp_id: var(&format!("{p}_TARGET_COMP_ID")).unwrap_or_else(|| "SPOT".into()),
+                                api_key: api_key.unwrap(),
+                                private_key,
+                            },
+                        ));
+                    }
                     Err(e) => eprintln!("  skipped {code}: cannot read {path}: {e}"),
                 }
             }
-            (None, None, None) => {}
+            (None, None) => {}
             _ => {
                 let mut missing = Vec::new();
-                if host.is_none() {
-                    missing.push(host_var.as_str());
-                }
                 if api_key.is_none() {
                     missing.push(apikey_var.as_str());
                 }
@@ -273,5 +287,41 @@ mod tests {
         let found = scan_env();
         clear();
         assert!(found.is_empty());
+    }
+
+    /// THE regression this round exists to fix: `.env.example` documents Binance
+    /// as `BINANCE_{ENV}_API_KEY` + `_PRIVATE_KEY_PATH` only — no FIX host,
+    /// because REST is the default transport. A by-the-book REST setup must
+    /// still import: the FIX-specific fields default (empty host, port 9000,
+    /// "OMS"/"SPOT" comp ids) exactly the way `start_binance` used to when
+    /// nothing configured them, rather than being refused for a field REST
+    /// never reads.
+    #[test]
+    fn binance_without_a_fix_host_still_imports_for_rest_transport() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let pem_path = std::env::temp_dir().join("oms-test-binance-rest.pem");
+        std::fs::write(&pem_path, "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----")
+            .expect("write pem");
+        std::env::set_var("BINANCE_PAPER_API_KEY", "K");
+        std::env::set_var("BINANCE_PAPER_PRIVATE_KEY_PATH", pem_path.to_str().unwrap());
+        let found = scan_env();
+        clear();
+        let _ = std::fs::remove_file(&pem_path);
+
+        assert_eq!(found.len(), 1);
+        let (code, cred) = &found[0];
+        assert_eq!(code, "binance-paper");
+        match cred {
+            BrokerCredentials::BinanceFix { host, port, sender_comp_id, target_comp_id, api_key, private_key } => {
+                assert_eq!(host, "", "no FIX host configured — must default empty, not be refused");
+                assert_eq!(*port, 9000);
+                assert_eq!(sender_comp_id, "OMS");
+                assert_eq!(target_comp_id, "SPOT");
+                assert_eq!(api_key, "K");
+                assert!(private_key.contains("test"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }

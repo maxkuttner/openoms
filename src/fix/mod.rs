@@ -316,6 +316,20 @@ pub fn start_binance(
         error!(env = env_name, "start_binance called with non-Binance credentials (programming error)");
         return None;
     };
+    // A REST-only Binance credential stores an empty host (see `import_env::scan_env`
+    // and `save_broker` from the cockpit-to-be — REST never reads a FIX host, so
+    // nothing requires one to be set). Asking for FIX transport on such a
+    // credential must fail clearly here, before ever touching the network, rather
+    // than attempting a QuickFIX connection to `SocketConnectHost = ""`.
+    if host.is_empty() {
+        error!(
+            env = env_name,
+            "start_binance: credential has no FIX host configured — set it (e.g. via \
+             BINANCE_{{ENV}}_FIX_HOST before `oms config import-env`, or the cockpit \
+             once it can edit credentials) before selecting FIX transport"
+        );
+        return None;
+    }
     let dialect = match BinanceDialect::new(api_key.clone(), private_key) {
         Ok(d) => Arc::new(d) as Arc<dyn FixDialect>,
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX dialect init failed"); return None; }
@@ -344,5 +358,74 @@ pub fn start_binance(
     match start_session(dialect, cfg, "binance", health, pool, kafka, position_changed_tx, read_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::BrokerCredentials;
+
+    /// `PgPool::connect_lazy` builds a pool without ever connecting — safe here
+    /// because every test below hits a guard that returns `None` before the
+    /// pool, network, or QuickFIX are touched at all.
+    fn lazy_pool() -> PgPool {
+        PgPool::connect_lazy("postgres://localhost/oms_test_never_connects")
+            .expect("connect_lazy never actually connects")
+    }
+
+    fn alpaca_cred() -> BrokerCredentials {
+        BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() }
+    }
+
+    fn ibkr_cred() -> BrokerCredentials {
+        BrokerCredentials::IbkrFix {
+            host: "h".into(),
+            port: 4001,
+            sender_comp_id: "S".into(),
+            target_comp_id: "T".into(),
+            password: "p".into(),
+            ssl: true,
+        }
+    }
+
+    /// A caller bug (the wrong credential variant reaching `start_ibkr`) must be
+    /// logged and refused, not panic or attempt a connection built from garbage
+    /// data — see the doc comment on `start_ibkr`. `#[tokio::test]`, not
+    /// `#[test]`: `PgPool::connect_lazy` spawns a background maintenance task at
+    /// construction even though it never actually connects, so it needs a Tokio
+    /// context to exist in.
+    #[tokio::test]
+    async fn start_ibkr_refuses_a_non_ibkr_credential() {
+        let health = StreamHealthRegistry::new();
+        let result = start_ibkr("PAPER", &alpaca_cred(), &health, lazy_pool(), None, None);
+        assert!(result.is_none());
+    }
+
+    /// Same guard, the other direction.
+    #[tokio::test]
+    async fn start_binance_refuses_a_non_binance_credential() {
+        let health = StreamHealthRegistry::new();
+        let result = start_binance("PAPER", &ibkr_cred(), &health, lazy_pool(), None, None);
+        assert!(result.is_none());
+    }
+
+    /// The empty-host guard added this round: a REST-only Binance credential
+    /// (empty `host`, per `import_env::scan_env` — REST never reads a FIX host)
+    /// must refuse FIX transport rather than attempt a QuickFIX connection to
+    /// `SocketConnectHost = ""`.
+    #[tokio::test]
+    async fn start_binance_refuses_an_empty_fix_host() {
+        let health = StreamHealthRegistry::new();
+        let creds = BrokerCredentials::BinanceFix {
+            host: "".into(),
+            port: 9000,
+            sender_comp_id: "OMS".into(),
+            target_comp_id: "SPOT".into(),
+            api_key: "k".into(),
+            private_key: "pem".into(),
+        };
+        let result = start_binance("PAPER", &creds, &health, lazy_pool(), None, None);
+        assert!(result.is_none());
     }
 }

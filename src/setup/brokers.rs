@@ -362,6 +362,21 @@ async fn bulk_upsert_broker_instrument(
 mod tests {
     use super::*;
 
+    /// `has_creds`/`brokers_with_creds` derive the connection code from
+    /// `ALPACA_ENV`/`BINANCE_ENV` (via `connection_code()`), so a hardcoded
+    /// `"alpaca-paper"`/`"binance-paper"` in a test only holds while those vars
+    /// are unset or `PAPER` — an ambient `ALPACA_ENV=LIVE` in the shell (or a
+    /// prior test in the same binary) would silently break the assertion. These
+    /// tests mutate process env, so they must not run concurrently with anything
+    /// else reading the same keys — serialized by `ENV_LOCK`, same pattern as
+    /// `setup::import_env::tests`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear() {
+        std::env::remove_var("ALPACA_ENV");
+        std::env::remove_var("BINANCE_ENV");
+    }
+
     fn connection(code: &str, credentials: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
         Connection {
             code: code.to_string(),
@@ -382,36 +397,59 @@ mod tests {
     /// look credentialed.
     #[test]
     fn has_creds_is_true_only_for_a_configured_row_with_the_matching_code() {
-        let connections = vec![connection("alpaca-paper", CredentialState::Configured(alpaca_cred()))];
-        assert!(Broker::Alpaca.has_creds(&connections));
-        assert!(!Broker::Binance.has_creds(&connections));
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let alpaca_code = Broker::Alpaca.connection_code();
+        let connections = vec![connection(&alpaca_code, CredentialState::Configured(alpaca_cred()))];
+        let alpaca_has = Broker::Alpaca.has_creds(&connections);
+        let binance_has = Broker::Binance.has_creds(&connections);
+        clear();
+
+        assert!(alpaca_has);
+        assert!(!binance_has);
     }
 
     /// `Unconfigured` and `Error` are both "not usable" — neither counts as having
     /// credentials, only `Configured` does.
     #[test]
     fn has_creds_is_false_for_unconfigured_and_error_rows() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
         let connections = vec![
-            connection("alpaca-paper", CredentialState::Unconfigured),
-            connection("binance-paper", CredentialState::Error("bad key".into())),
+            connection(&Broker::Alpaca.connection_code(), CredentialState::Unconfigured),
+            connection(&Broker::Binance.connection_code(), CredentialState::Error("bad key".into())),
         ];
-        assert!(!Broker::Alpaca.has_creds(&connections));
-        assert!(!Broker::Binance.has_creds(&connections));
+        let alpaca_has = Broker::Alpaca.has_creds(&connections);
+        let binance_has = Broker::Binance.has_creds(&connections);
+        clear();
+
+        assert!(!alpaca_has);
+        assert!(!binance_has);
     }
 
     /// A code that never appears in the list (no row at all) is indistinguishable
     /// from Unconfigured — no row means no credential either.
     #[test]
     fn has_creds_is_false_when_no_row_exists_for_the_code() {
-        assert!(!Broker::Alpaca.has_creds(&[]));
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let alpaca_has = Broker::Alpaca.has_creds(&[]);
+        clear();
+
+        assert!(!alpaca_has);
     }
 
     #[test]
     fn brokers_with_creds_returns_only_the_configured_subset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
         let connections = vec![
-            connection("alpaca-paper", CredentialState::Configured(alpaca_cred())),
-            connection("binance-paper", CredentialState::Unconfigured),
+            connection(&Broker::Alpaca.connection_code(), CredentialState::Configured(alpaca_cred())),
+            connection(&Broker::Binance.connection_code(), CredentialState::Unconfigured),
         ];
-        assert_eq!(brokers_with_creds(&connections), vec![Broker::Alpaca]);
+        let result = brokers_with_creds(&connections);
+        clear();
+
+        assert_eq!(result, vec![Broker::Alpaca]);
     }
 }

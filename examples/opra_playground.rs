@@ -2,8 +2,14 @@
 //! option symbols, and print the raw stream. No DB, no OMS wiring. Meant for
 //! poking at the live feed to get a feel for it.
 //!
+//! `DATABENTO_API_KEY` below is read ONLY by this standalone example binary —
+//! the OMS server (`oms`/`serve()`) does not consult it. Since the credential
+//! store landed, the running server reads the Databento key from
+//! `feed_connection` (via `oms config import-env` or the cockpit), sealed with
+//! the master key in `oms.toml`. This variable being set has no effect on it.
+//!
 //! Run:
-//!   export DATABENTO_API_KEY=db-...      # your key
+//!   export DATABENTO_API_KEY=db-...      # your key — this example only
 //!   cargo run --example opra_playground
 //!
 //! Symbols come from `OPRA_SYMBOLS` (comma-separated) or the `SYMBOLS` default
@@ -65,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("connecting to {DATASET} …");
     let mut client = LiveClient::builder()
-        .key_from_env()? // reads DATABENTO_API_KEY
+        .key_from_env()? // reads DATABENTO_API_KEY — this example only, see module doc
         .dataset(DATASET)
         .build()
         .await?;
