@@ -29,12 +29,23 @@ pub fn rewrap(old: &MasterKey, new: &MasterKey, code: &str, sealed: &[u8]) -> Re
 /// of it, which is worse than not rotating, so this must never return a partial
 /// result: the first row that fails to open aborts the whole call, and nothing
 /// rewrapped before it is returned either.
+///
+/// The error carries the failing row's `code` alongside the `SecretError`: when
+/// rotation aborts, "which connection" is the first thing an operator needs in
+/// order to fix it, and a bare "could not decrypt" with no row identity leaves
+/// them guessing at exactly the moment they are under the most pressure.
 fn rewrap_rows(
     old: &MasterKey,
     new: &MasterKey,
     rows: &[(String, Vec<u8>)],
-) -> Result<Vec<(String, Vec<u8>)>, SecretError> {
-    rows.iter().map(|(code, sealed)| Ok((code.clone(), rewrap(old, new, code, sealed)?))).collect()
+) -> Result<Vec<(String, Vec<u8>)>, (String, SecretError)> {
+    rows.iter()
+        .map(|(code, sealed)| {
+            rewrap(old, new, code, sealed)
+                .map(|out| (code.clone(), out))
+                .map_err(|e| (code.clone(), e))
+        })
+        .collect()
 }
 
 /// Re-wrap every non-null `credentials` blob in `oms.broker_connection` and
@@ -74,9 +85,16 @@ async fn rotate_table(
     // A row that will not open under `old` aborts the whole rotation — see the
     // module doc and `rewrap_rows`. Mapped into `sqlx::Error` only because that
     // is this function's error type; the underlying cause is a decrypt failure,
-    // not a database one, and the message names the table it happened in.
-    let rewrapped = rewrap_rows(old, new, &rows)
-        .map_err(|e| sqlx::Error::Protocol(format!("rotate-key: {table}: {e}")))?;
+    // not a database one. The message names the specific row so an operator
+    // knows exactly which connection's credential to check, not just that
+    // *something* in the table failed.
+    let rewrapped = rewrap_rows(old, new, &rows).map_err(|(code, e)| {
+        sqlx::Error::Protocol(format!(
+            "refusing to rotate: {table} row '{code}' will not open under the current master \
+             key ({e}). No rows were changed. Check that oms.master_key is the key these \
+             credentials were sealed with."
+        ))
+    })?;
 
     let n = rewrapped.len();
     for (code, sealed) in rewrapped {
@@ -139,11 +157,12 @@ mod tests {
 
     /// One row sealed under a different key, placed second so the bad row is
     /// not simply "the first one checked" — the whole batch must still be
-    /// refused, with nothing partial returned. A caller that received two of
-    /// three rewrapped rows here would have no way to tell the store is now
-    /// split across two keys.
+    /// refused, with nothing partial returned, AND the error must name the
+    /// row that actually failed ('binance-paper'), not merely report that
+    /// something did. An operator acting on a wrong-row message would go
+    /// investigate the wrong connection.
     #[test]
-    fn rewrap_rows_refuses_the_whole_batch_when_one_row_is_bad() {
+    fn rewrap_rows_refuses_the_whole_batch_and_names_the_bad_row() {
         let old = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("k");
         let new = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("k");
         let other = parse_master_key("base64:q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=").expect("k");
@@ -153,8 +172,9 @@ mod tests {
             ("databento-opra".to_string(), secrets::seal(&old, "databento-opra", b"good-two")),
         ];
 
-        let err = rewrap_rows(&old, &new, &rows);
+        let (code, _err) =
+            rewrap_rows(&old, &new, &rows).expect_err("the bad row must fail the whole batch, not just itself");
 
-        assert!(err.is_err(), "the bad row must fail the whole batch, not just itself");
+        assert_eq!(code, "binance-paper", "the error must name the row that actually failed to open");
     }
 }
