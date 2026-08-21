@@ -130,7 +130,23 @@ pub fn prompt_with<R: BufRead>(
 pub fn prompt(defaults: &PromptDefaults) -> std::io::Result<Prompts> {
     let stdin = std::io::stdin();
     let mut locked = stdin.lock();
-    prompt_with(&mut locked, defaults, || rpassword::prompt_password("Superuser password: "))
+    prompt_with(&mut locked, defaults, || {
+        // `rpassword` reads the terminal directly, so with no tty attached it
+        // fails with a bare "Device not configured" that names neither the cause
+        // nor the way out. Scripted callers land here, and they have two.
+        rpassword::prompt_password("Superuser password: ").map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "could not read the superuser password from the terminal ({e}).\n\
+                     \x20        With no terminal attached, pass it explicitly:\n\
+                     \x20          oms init --password '<superuser password>'\n\
+                     \x20        or take every value from flags and the environment:\n\
+                     \x20          oms init --non-interactive"
+                ),
+            )
+        })
+    })
 }
 
 /// Assemble the file from the prompts plus freshly generated secrets. Returns the

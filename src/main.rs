@@ -429,15 +429,18 @@ async fn main() {
                 // Seed the interactive prompts' defaults from whatever was passed
                 // on the command line (and the environment, via the same
                 // resolve() precedence non-interactive mode uses) — otherwise
-                // `oms init --host db.internal --password s3cret` still prompts
-                // for host and silently discards the password, which is what put
-                // it in shell history for nothing. A password sourced from a flag
-                // or the environment skips the prompt entirely rather than being
-                // asked for twice.
-                let password_override = db
-                    .password
-                    .clone()
-                    .or_else(|| std::env::var("POSTGRES_PASSWORD").ok().filter(|v| !v.is_empty()));
+                // `oms init --host db.internal` still prompts for host, which is
+                // what made those flags pointless.
+                //
+                // The password is the one exception: ONLY an explicit `--password`
+                // skips the prompt. `POSTGRES_PASSWORD` deliberately does not,
+                // because it describes the database the *application* connects to,
+                // not the one being provisioned. Honouring it here meant a repo
+                // with a .env silently authenticated against a different server
+                // with the wrong credential and never asked — the operator saw a
+                // bare auth failure for a password they were never given a chance
+                // to type.
+                let password_override = db.password.clone();
                 let cfg = setup::database::config::resolve(db.into());
                 let defaults = setup::init::PromptDefaults {
                     host: cfg.host,
