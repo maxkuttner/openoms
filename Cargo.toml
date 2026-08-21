@@ -29,6 +29,7 @@ bcrypt = "0.15"
 toml = "0.8"
 rpassword = "7"
 rand = "0.8"
+aes-gcm = "0.10"
 databento = { version = "0.54.0", default-features = false, features = ["live", "chrono"]}
 csv = "1"
 

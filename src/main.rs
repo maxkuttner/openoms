@@ -61,6 +61,7 @@ mod bybit_feed;
 mod feeds;
 mod preflight;
 mod config;
+mod secrets;
 mod expiry;
 mod fix;
 
