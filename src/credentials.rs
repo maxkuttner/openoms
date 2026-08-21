@@ -102,9 +102,15 @@ impl Redact for FeedCredentials {
     }
 }
 
+/// Last 4 characters of `s`, or nothing at all when `s` is too short for that to
+/// mean anything. Without this floor, a 1-4 character key would come back through
+/// `redact()` whole — the opposite of what "not enough to use it" promises.
 fn tail4(s: &str) -> String {
-    let n = s.chars().count();
-    s.chars().skip(n.saturating_sub(4)).collect()
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= 4 {
+        return String::new();
+    }
+    chars[chars.len() - 4..].iter().collect()
 }
 
 // Hand-written for both enums: deriving Debug would print every secret they hold
@@ -140,6 +146,19 @@ mod tests {
         }
     }
 
+    fn ibkr() -> BrokerCredentials {
+        BrokerCredentials::IbkrFix {
+            host: "ibkr-gateway.example.com".into(),
+            port: 4001,
+            sender_comp_id: "OMSIB".into(),
+            target_comp_id: "IBKRTARGET".into(),
+            password: "IBKRPASSWORD777".into(),
+            // Explicitly false so the round-trip test can catch the serde default
+            // silently overriding a stored value.
+            ssl: false,
+        }
+    }
+
     /// The tag is what tells us which broker a blob belongs to when it comes back
     /// out of the database, so it must survive the round trip exactly.
     #[test]
@@ -168,9 +187,36 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
 
+        let json = serde_json::to_vec(&ibkr()).expect("serialize");
+        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
+            BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } => {
+                assert_eq!(host, "ibkr-gateway.example.com");
+                assert_eq!(port, 4001);
+                assert_eq!(sender_comp_id, "OMSIB");
+                assert_eq!(target_comp_id, "IBKRTARGET");
+                assert_eq!(password, "IBKRPASSWORD777");
+                // The one that matters: an explicitly-stored false must NOT come back
+                // as true via the serde default.
+                assert!(!ssl, "explicit ssl:false must survive the round trip");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
         let f = FeedCredentials::Databento { api_key: "db-key".into() };
         match serde_json::from_slice::<FeedCredentials>(&serde_json::to_vec(&f).expect("ser")).expect("de") {
             FeedCredentials::Databento { api_key } => assert_eq!(api_key, "db-key"),
+        }
+    }
+
+    /// The other direction of the `ssl` default: a blob written before this field
+    /// existed (or one that simply omits it) must come back `true`, not fail to
+    /// parse or silently become `false`.
+    #[test]
+    fn ibkr_ssl_defaults_to_true_when_absent_from_the_blob() {
+        let json = br#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p"}"#;
+        match serde_json::from_slice::<BrokerCredentials>(json).expect("deserialize") {
+            BrokerCredentials::IbkrFix { ssl, .. } => assert!(ssl, "missing ssl must default to true"),
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -189,6 +235,14 @@ mod tests {
         assert!(r.contains("9000"), "port should be visible: {r}");
         assert!(r.contains("SPOT"), "target comp id should be visible: {r}");
 
+        let r = format!("{:?}", ibkr().redact());
+        assert!(!r.contains("IBKRPASSWORD777"), "ibkr password leaked: {r}");
+        assert!(r.contains("ibkr-gateway.example.com"), "host should be visible: {r}");
+        assert!(r.contains("4001"), "port should be visible: {r}");
+        assert!(r.contains("OMSIB"), "sender comp id should be visible: {r}");
+        assert!(r.contains("IBKRTARGET"), "target comp id should be visible: {r}");
+        assert!(r.contains("false"), "ssl should be visible: {r}");
+
         let r = format!("{:?}", FeedCredentials::Databento { api_key: "db-key".into() }.redact());
         assert!(!r.contains("db-key"), "feed key leaked: {r}");
     }
@@ -201,6 +255,8 @@ mod tests {
         assert!(!r.contains("SUPERSECRETVALUE"), "leaked in Debug: {r}");
         let r = format!("{:?}", binance());
         assert!(!r.contains("MIIBSECRET"), "leaked in Debug: {r}");
+        let r = format!("{:?}", ibkr());
+        assert!(!r.contains("IBKRPASSWORD777"), "leaked in Debug: {r}");
     }
 
     /// An unknown tag is data written by a newer version, not garbage to guess at.
@@ -208,5 +264,14 @@ mod tests {
     fn unknown_variant_is_an_error_not_a_panic() {
         let r: Result<BrokerCredentials, _> = serde_json::from_slice(br#"{"kind":"Nasdaq"}"#);
         assert!(r.is_err());
+    }
+
+    /// A key too short to usefully mask must not come back whole — that would
+    /// contradict the "not enough to use it" promise the redaction comment makes.
+    #[test]
+    fn tail4_masks_keys_too_short_to_redact_meaningfully() {
+        assert_eq!(tail4(""), "");
+        assert_eq!(tail4("abc"), "");
+        assert_eq!(tail4("AKTESTKEY123"), "Y123");
     }
 }
