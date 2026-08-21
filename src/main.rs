@@ -62,6 +62,7 @@ mod feeds;
 mod preflight;
 mod config;
 mod secrets;
+mod credentials;
 mod expiry;
 mod fix;
 
