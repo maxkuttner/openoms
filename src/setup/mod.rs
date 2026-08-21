@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod brokers;
 pub mod catalog;
 pub mod database;
+pub mod import_env;
 pub mod init;
 
 /// Postgres connection string for the runtime pool (the `oms` role), built the

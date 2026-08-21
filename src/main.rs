@@ -257,6 +257,9 @@ enum Command {
     /// Database provisioning and migration.
     #[command(subcommand)]
     Database(DatabaseCmd),
+    /// Credential store maintenance.
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// First-run setup: generate oms.toml and create the database.
     Init {
         /// Take values from flags and the environment instead of prompting.
@@ -271,6 +274,12 @@ enum Command {
 enum SetupCmd {
     /// Seed the master instrument catalog + broker_instrument mapping from a broker.
     SyncBroker(setup::brokers::Args),
+}
+
+#[derive(clap::Subcommand)]
+enum ConfigCmd {
+    /// Import broker and feed credentials from the environment into the store. Run once.
+    ImportEnv,
 }
 
 /// Connection flags shared by every database subcommand. Each falls back to its
@@ -374,6 +383,30 @@ async fn main() {
         Some(Command::Setup(SetupCmd::SyncBroker(args))) => {
             if let Err(e) = setup::brokers::run(args).await {
                 error!("setup sync-broker failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Config(ConfigCmd::ImportEnv)) => {
+            let key = match config::master_key(config::load()) {
+                Some(Ok(key)) => key,
+                Some(Err(e)) => {
+                    eprintln!("error: invalid master key: {e}");
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!(
+                        "error: no master key configured — run `oms init` first, or set OMS_MASTER_KEY"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let result = async {
+                let pool = PgPool::connect(&setup::database_url()?).await?;
+                setup::import_env::run(&pool, &key).await
+            }
+            .await;
+            if let Err(e) = result {
+                eprintln!("error: {e}");
                 std::process::exit(1);
             }
         }
