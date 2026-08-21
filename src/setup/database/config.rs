@@ -212,6 +212,13 @@ fn percent_encode_userinfo(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Every tier test passes its file tier explicitly via the `_with` variants.
+    /// The plain `resolve`/`resolve_role_password` read the real `oms.toml`
+    /// relative to the working directory, and a developer who has run `oms init`
+    /// has one in the repo root — which is the documented thing to have. Calling
+    /// them here made the suite fail on exactly the machines that followed the
+    /// README.
+    ///
     /// Serialise env mutation: these tests share process-global state.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -230,7 +237,7 @@ mod tests {
     fn falls_back_to_defaults() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
-        let c = resolve(PostgresOverrides::default());
+        let c = resolve_with(PostgresOverrides::default(), None);
         assert_eq!(c.host, "localhost");
         assert_eq!(c.port, 5432);
         assert_eq!(c.username, "postgres");
@@ -244,7 +251,7 @@ mod tests {
         clear_env();
         std::env::set_var("POSTGRES_HOST", "db.internal");
         std::env::set_var("POSTGRES_PORT", "6543");
-        let c = resolve(PostgresOverrides::default());
+        let c = resolve_with(PostgresOverrides::default(), None);
         assert_eq!(c.host, "db.internal");
         assert_eq!(c.port, 6543);
         clear_env();
@@ -256,10 +263,10 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         std::env::set_var("POSTGRES_HOST", "from-env");
-        let c = resolve(PostgresOverrides {
-            host: Some("from-flag".to_string()),
-            ..Default::default()
-        });
+        let c = resolve_with(
+            PostgresOverrides { host: Some("from-flag".to_string()), ..Default::default() },
+            None,
+        );
         assert_eq!(c.host, "from-flag");
         clear_env();
     }
@@ -271,7 +278,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         std::env::set_var("POSTGRES_PORT", "not-a-number");
-        let c = resolve(PostgresOverrides::default());
+        let c = resolve_with(PostgresOverrides::default(), None);
         assert_eq!(c.port, 5432, "falls back rather than panicking");
         clear_env();
     }
@@ -280,10 +287,10 @@ mod tests {
     fn role_password_follows_the_same_tiers() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
-        assert_eq!(resolve_role_password(None), DEFAULT_ROLE_PASSWORD);
+        assert_eq!(resolve_role_password_with(None, None), DEFAULT_ROLE_PASSWORD);
         std::env::set_var("OMS_PASSWORD", "from-env");
-        assert_eq!(resolve_role_password(None), "from-env");
-        assert_eq!(resolve_role_password(Some("from-flag".into())), "from-flag");
+        assert_eq!(resolve_role_password_with(None, None), "from-env");
+        assert_eq!(resolve_role_password_with(Some("from-flag".into()), None), "from-flag");
         clear_env();
     }
 
