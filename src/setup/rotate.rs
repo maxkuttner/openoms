@@ -22,6 +22,21 @@ pub fn rewrap(old: &MasterKey, new: &MasterKey, code: &str, sealed: &[u8]) -> Re
     Ok(secrets::seal(new, code, &plain))
 }
 
+/// Re-wrap a batch, refusing the whole batch if any row fails.
+///
+/// Split out of the database loop so the abort-on-first-failure rule is testable
+/// without Postgres — a partially rotated store has no single key that reads all
+/// of it, which is worse than not rotating, so this must never return a partial
+/// result: the first row that fails to open aborts the whole call, and nothing
+/// rewrapped before it is returned either.
+fn rewrap_rows(
+    old: &MasterKey,
+    new: &MasterKey,
+    rows: &[(String, Vec<u8>)],
+) -> Result<Vec<(String, Vec<u8>)>, SecretError> {
+    rows.iter().map(|(code, sealed)| Ok((code.clone(), rewrap(old, new, code, sealed)?))).collect()
+}
+
 /// Re-wrap every non-null `credentials` blob in `oms.broker_connection` and
 /// `oms.feed_connection` from `old` to `new`, inside a single transaction.
 ///
@@ -56,19 +71,19 @@ async fn rotate_table(
             .fetch_all(&mut **tx)
             .await?;
 
-    let n = rows.len();
-    for (code, sealed) in rows {
-        // A row that will not open under `old` aborts the whole rotation — see
-        // the module doc. Mapped into `sqlx::Error` only because that is this
-        // function's error type; the underlying cause is a decrypt failure, not
-        // a database one, and the message says so.
-        let rewrapped = rewrap(old, new, &code, &sealed)
-            .map_err(|e| sqlx::Error::Protocol(format!("rotate-key: {table} row '{code}': {e}")))?;
+    // A row that will not open under `old` aborts the whole rotation — see the
+    // module doc and `rewrap_rows`. Mapped into `sqlx::Error` only because that
+    // is this function's error type; the underlying cause is a decrypt failure,
+    // not a database one, and the message names the table it happened in.
+    let rewrapped = rewrap_rows(old, new, &rows)
+        .map_err(|e| sqlx::Error::Protocol(format!("rotate-key: {table}: {e}")))?;
 
+    let n = rewrapped.len();
+    for (code, sealed) in rewrapped {
         // credentials_updated_at is intentionally untouched — see module doc.
         sqlx::query(&format!("UPDATE {table} SET credentials = $2 WHERE code = $1"))
             .bind(&code)
-            .bind(&rewrapped)
+            .bind(&sealed)
             .execute(&mut **tx)
             .await?;
     }
@@ -102,5 +117,44 @@ mod tests {
         let old = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("k");
         let new = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("k");
         assert!(rewrap(&old, &new, "alpaca-paper", &[0u8; 40]).is_err());
+    }
+
+    /// A whole batch of good rows re-wraps and every one opens under the new
+    /// key — the happy path pinned at the batch level, not just per-row.
+    #[test]
+    fn rewrap_rows_re_wraps_every_row_when_all_open() {
+        let old = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("k");
+        let new = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("k");
+        let rows = vec![
+            ("alpaca-paper".to_string(), secrets::seal(&old, "alpaca-paper", b"one")),
+            ("databento-opra".to_string(), secrets::seal(&old, "databento-opra", b"two")),
+        ];
+
+        let out = rewrap_rows(&old, &new, &rows).expect("all rows open under old");
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(secrets::open(&new, "alpaca-paper", &out[0].1).expect("open"), b"one");
+        assert_eq!(secrets::open(&new, "databento-opra", &out[1].1).expect("open"), b"two");
+    }
+
+    /// One row sealed under a different key, placed second so the bad row is
+    /// not simply "the first one checked" — the whole batch must still be
+    /// refused, with nothing partial returned. A caller that received two of
+    /// three rewrapped rows here would have no way to tell the store is now
+    /// split across two keys.
+    #[test]
+    fn rewrap_rows_refuses_the_whole_batch_when_one_row_is_bad() {
+        let old = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("k");
+        let new = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("k");
+        let other = parse_master_key("base64:q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=").expect("k");
+        let rows = vec![
+            ("alpaca-paper".to_string(), secrets::seal(&old, "alpaca-paper", b"good-one")),
+            ("binance-paper".to_string(), secrets::seal(&other, "binance-paper", b"wrong-key")),
+            ("databento-opra".to_string(), secrets::seal(&old, "databento-opra", b"good-two")),
+        ];
+
+        let err = rewrap_rows(&old, &new, &rows);
+
+        assert!(err.is_err(), "the bad row must fail the whole batch, not just itself");
     }
 }
