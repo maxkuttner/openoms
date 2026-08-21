@@ -143,7 +143,12 @@ pub async fn run(pool: &PgPool, key: &MasterKey) -> Result<usize, Box<dyn std::e
                 .await?;
         if exists.is_none() {
             if bootstrapped.contains(code) {
-                println!("  skipped {code}: no broker_connection row yet (the app creates one at boot when credentials are present — restart it)");
+                // `ensure_broker_connections` creates a row for every `Broker::ALL`
+                // entry unconditionally at boot now (see its doc comment in
+                // bootstrap.rs) — the row's existence no longer depends on whether
+                // credentials are present, so this can only happen before the app
+                // has ever been started against this database.
+                println!("  skipped {code}: no broker_connection row yet (the app creates one at boot, regardless of credentials — start it once, then re-run this import)");
             } else {
                 println!("  skipped {code}: no broker_connection row (create one first via POST /admin/broker-connections)");
             }
