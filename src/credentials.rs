@@ -286,7 +286,12 @@ pub async fn save_broker(
 /// Seals `c` and upserts it by `code`, the primary key. Unlike
 /// `save_broker`, a feed connection has no separate bootstrap step that
 /// creates the row first, so this call is the thing that creates it.
-pub async fn save_feed(pool: &PgPool, key: &MasterKey, code: &str, c: &FeedCredentials) -> Result<(), sqlx::Error> {
+pub async fn save_feed(
+    pool: &PgPool,
+    key: &MasterKey,
+    code: &str,
+    c: &FeedCredentials,
+) -> Result<(), sqlx::Error> {
     let json = serde_json::to_vec(c).expect("credentials always serialize");
     let sealed = secrets::seal(key, code, &json);
     // Upserts on `code`, the primary key — feed_connection has no unique
