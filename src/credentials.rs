@@ -151,7 +151,9 @@ pub struct Connection<T> {
     pub environment: Option<String>,
     pub status: String,
     pub credentials: CredentialState<T>,
-    pub updated_at: Option<DateTime<Utc>>,
+    /// When `credentials` was last written — not the row's own `updated_at`,
+    /// which also moves on non-credential edits (status, environment, ...).
+    pub credentials_updated_at: Option<DateTime<Utc>>,
 }
 
 /// Decode is deliberately split from the SQL below: every failure case — no
@@ -178,6 +180,8 @@ fn decode<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// `decode` specialised to brokers — a thin wrapper so callers never have to
+/// name the generic parameter.
 pub fn decode_broker(
     key: Option<&MasterKey>,
     code: &str,
@@ -186,10 +190,18 @@ pub fn decode_broker(
     decode(key, code, blob)
 }
 
-pub fn decode_feed(key: Option<&MasterKey>, code: &str, blob: Option<Vec<u8>>) -> CredentialState<FeedCredentials> {
+/// `decode` specialised to feeds — see `decode_broker`.
+pub fn decode_feed(
+    key: Option<&MasterKey>,
+    code: &str,
+    blob: Option<Vec<u8>>,
+) -> CredentialState<FeedCredentials> {
     decode(key, code, blob)
 }
 
+/// Every configured broker connection, credentials decoded under `key`. A
+/// connection missing or unusable credentials is still returned — its state
+/// says why, rather than being silently dropped from the list.
 pub async fn load_brokers(
     pool: &PgPool,
     key: Option<&MasterKey>,
@@ -209,11 +221,13 @@ pub async fn load_brokers(
             kind: broker,
             environment: Some(env),
             status,
-            updated_at: updated,
+            credentials_updated_at: updated,
         })
         .collect())
 }
 
+/// Every configured feed connection, credentials decoded under `key`. See
+/// `load_brokers` — same shape, same reasoning.
 pub async fn load_feeds(
     pool: &PgPool,
     key: Option<&MasterKey>,
@@ -233,11 +247,19 @@ pub async fn load_feeds(
             kind: provider,
             environment: None,
             status,
-            updated_at: updated,
+            credentials_updated_at: updated,
         })
         .collect())
 }
 
+/// Seals `c` and writes it onto an existing row. Deliberately an `UPDATE`, not
+/// an upsert: broker rows are created at boot by
+/// `bootstrap::ensure_broker_connections` and are FK targets for `account`,
+/// `order_state` and `recon_run`, so inventing one here from a credential save
+/// would be wrong — the row must already exist. Returns `RowNotFound` if
+/// `code` does not match any row: an `UPDATE` that matches nothing still
+/// returns `Ok` from sqlx, so without this check a typo'd code would report
+/// success while storing nothing.
 pub async fn save_broker(
     pool: &PgPool,
     key: &MasterKey,
@@ -246,7 +268,7 @@ pub async fn save_broker(
 ) -> Result<(), sqlx::Error> {
     let json = serde_json::to_vec(c).expect("credentials always serialize");
     let sealed = secrets::seal(key, code, &json);
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE oms.broker_connection \
          SET credentials = $2, credentials_updated_at = now(), updated_at = now() \
          WHERE code = $1",
@@ -255,9 +277,15 @@ pub async fn save_broker(
     .bind(&sealed)
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        return Err(sqlx::Error::RowNotFound);
+    }
     Ok(())
 }
 
+/// Seals `c` and upserts it by `code`, the primary key. Unlike
+/// `save_broker`, a feed connection has no separate bootstrap step that
+/// creates the row first, so this call is the thing that creates it.
 pub async fn save_feed(pool: &PgPool, key: &MasterKey, code: &str, c: &FeedCredentials) -> Result<(), sqlx::Error> {
     let json = serde_json::to_vec(c).expect("credentials always serialize");
     let sealed = secrets::seal(key, code, &json);
@@ -268,7 +296,8 @@ pub async fn save_feed(pool: &PgPool, key: &MasterKey, code: &str, c: &FeedCrede
         "INSERT INTO oms.feed_connection (code, provider, credentials, credentials_updated_at) \
          VALUES ($1, $2, $3, now()) \
          ON CONFLICT (code) DO UPDATE \
-           SET credentials = EXCLUDED.credentials, \
+           SET provider = EXCLUDED.provider, \
+               credentials = EXCLUDED.credentials, \
                credentials_updated_at = now(), updated_at = now()",
     )
     .bind(code)
@@ -280,7 +309,11 @@ pub async fn save_feed(pool: &PgPool, key: &MasterKey, code: &str, c: &FeedCrede
 }
 
 /// Whether anything is stored at all. `serve()` uses this to decide whether a
-/// missing master key is fatal.
+/// missing master key is fatal. NOTE: on a database where migration 0021 has
+/// not been applied, this fails with `42P01 undefined_table` rather than
+/// returning `Ok(false)` — a caller must not fold that `Err` into `false`,
+/// since doing so would make a missing master key stop being fatal at exactly
+/// the moment the schema itself is broken.
 pub async fn any_credentials_stored(pool: &PgPool) -> Result<bool, sqlx::Error> {
     let n: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM oms.broker_connection WHERE credentials IS NOT NULL) \
@@ -294,6 +327,7 @@ pub async fn any_credentials_stored(pool: &PgPool) -> Result<bool, sqlx::Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::{parse_master_key, seal};
 
     fn alpaca() -> BrokerCredentials {
         BrokerCredentials::Alpaca { key: "AKTESTKEY123".into(), secret: "SUPERSECRETVALUE".into() }
@@ -439,8 +473,6 @@ mod tests {
         assert_eq!(tail4("AKTESTKEY123"), "Y123");
     }
 
-    use crate::secrets::{parse_master_key, seal};
-
     fn key() -> crate::secrets::MasterKey {
         parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("key")
     }
@@ -512,14 +544,33 @@ mod tests {
     #[test]
     fn error_strings_carry_no_secret_material() {
         let sealed = seal(&key(), "alpaca-paper", b"not json at all");
-        // The plaintext here is "not json at all"; the message must not quote it,
-        // must not carry the key, and must not hex-dump the ciphertext.
+        // The plaintext here is "not json at all"; the message must not quote it
+        // and must not hex-dump the ciphertext. (Not asserting on key material
+        // here: the error string is a fixed literal that never embeds the key
+        // in any case, so a `contains(<base64 of the key>)` check can never
+        // fail and would only assert that fact about `key()`, not about this
+        // code path.)
         if let CredentialState::Error(msg) = decode_broker(Some(&key()), "alpaca-paper", Some(sealed)) {
             assert!(!msg.contains("not json at all"), "decrypted payload leaked: {msg}");
-            assert!(!msg.contains("AAAA"), "key material leaked: {msg}");
             assert!(msg.len() < 120, "suspiciously long, likely dumping data: {msg}");
         } else {
             panic!("expected an error");
+        }
+    }
+
+    /// `decode_feed` shares `decode`'s implementation with `decode_broker`, but
+    /// is pinned separately so its AAD handling — sealed and opened under the
+    /// feed's own `code` — is exercised directly rather than only by proxy.
+    #[test]
+    fn a_good_feed_blob_decodes_to_configured() {
+        let creds = FeedCredentials::Databento { api_key: "db-key-123".into() };
+        let json = serde_json::to_vec(&creds).expect("ser");
+        let sealed = seal(&key(), "databento-opra", &json);
+        match decode_feed(Some(&key()), "databento-opra", Some(sealed)) {
+            CredentialState::Configured(FeedCredentials::Databento { api_key }) => {
+                assert_eq!(api_key, "db-key-123");
+            }
+            other => panic!("expected Configured, got {other:?}"),
         }
     }
 }
