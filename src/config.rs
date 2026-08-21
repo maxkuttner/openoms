@@ -201,9 +201,28 @@ pub fn write_new(path: &Path, cfg: &FileConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// The master key, on the usual env-over-file tiers.
+///
+/// Three-way return on purpose. `None` means no key is configured, which is
+/// normal for an install that has never stored a credential. `Some(Err(_))` means
+/// one was configured and is unusable — a typo must never be mistaken for
+/// "absent", because absent is survivable and a wrong key is not.
+pub fn master_key(
+    file: Option<&FileConfig>,
+) -> Option<Result<crate::secrets::MasterKey, crate::secrets::SecretError>> {
+    std::env::var("OMS_MASTER_KEY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| file.and_then(|f| f.oms.master_key.clone()))
+        .filter(|v| !v.is_empty())
+        .map(|raw| crate::secrets::parse_master_key(&raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Every field is optional: a partial file must parse, because the missing
     /// pieces fall through to env or the built-in defaults.
@@ -363,5 +382,43 @@ admin_password = "admin-pw"
         assert!(matches!(err, ConfigError::Io(_)));
         assert_eq!(std::fs::read_to_string(&p).expect("read"), "# already here\n");
         std::fs::remove_file(&p).ok();
+    }
+
+    /// The key follows the same env-over-file precedence as everything else, so a
+    /// container can inject it without shipping a config file.
+    #[test]
+    fn master_key_prefers_env_then_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("OMS_MASTER_KEY");
+
+        let file = parse(
+            "[oms]\nmaster_key = \"base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n",
+        )
+        .expect("parse");
+        assert!(master_key(Some(&file)).expect("configured").is_ok());
+
+        std::env::set_var("OMS_MASTER_KEY", "base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=");
+        assert!(master_key(Some(&file)).expect("configured").is_ok());
+        std::env::remove_var("OMS_MASTER_KEY");
+    }
+
+    /// Nothing configured is not an error — an install with no credentials yet is
+    /// perfectly valid. The caller decides whether that is fatal.
+    #[test]
+    fn master_key_absent_is_none_not_an_error() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("OMS_MASTER_KEY");
+        assert!(master_key(None).is_none());
+        assert!(master_key(Some(&FileConfig::default())).is_none());
+    }
+
+    /// A configured but unusable key must surface as an error, never as "absent" —
+    /// silently treating a typo'd key as "no credentials" would look like data loss.
+    #[test]
+    fn master_key_present_but_invalid_is_an_error() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("OMS_MASTER_KEY");
+        let file = parse("[oms]\nmaster_key = \"base64:AAAA\"\n").expect("parse");
+        assert!(master_key(Some(&file)).expect("configured").is_err());
     }
 }
