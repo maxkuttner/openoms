@@ -20,9 +20,17 @@
 
 ```sh
 git clone git@github.com:maxkuttner/openoms.git && cd openoms
+docker compose up -d  # a Postgres to run against; skip if you already have one
 cargo run -- init     # prompts for your Postgres, generates oms.toml, creates the database
 cargo run             # start the OMS on localhost:3001
 ```
+
+The bundled `docker-compose.yml` runs Postgres 16 on `127.0.0.1:5432` with the
+superuser `postgres` / `postgres`, which is exactly what `init` assumes — so with it
+running you can press Enter through every prompt and type `postgres` for the
+password. It deliberately does not pre-create the `ods` database: `init` creates
+that itself and refuses if it already exists. Data lives in a named volume, so
+`docker compose down` keeps it and `docker compose down -v` throws it away.
 
 Then, in a second terminal:
 
@@ -65,14 +73,18 @@ portfolios, accounts and trading identities in the cockpit.
 ## Prerequisites
 
 - **Rust** (stable) — `curl https://sh.rustup.rs -sSf \| sh`
-- **PostgreSQL** running somewhere, with a superuser you know the password of
 - **cmake** and a C++ compiler — the embedded FIX engine (`quickfix`) is C++
 - **OpenSSL 3** on macOS — `brew install openssl@3` (Linux uses the system one)
+- **PostgreSQL** — either Docker, for the bundled `docker-compose.yml`, or an
+  existing server with a superuser you know the password of
 - **Node** — only if you want the cockpit web UI
 
 ```sh
-# macOS
-brew install cmake openssl@3 postgresql@16 node
+# macOS, using the bundled Postgres
+brew install cmake openssl@3 node
+
+# macOS, bringing your own Postgres instead
+brew install cmake openssl@3 node postgresql@16
 ```
 
 ## Configuration

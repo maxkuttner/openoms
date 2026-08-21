@@ -1,0 +1,42 @@
+# A Postgres for openoms to run against, so "have a database somewhere" stops
+# being the hardest step of the install.
+#
+#     docker compose up -d
+#     cargo run -- init      # press Enter through every prompt
+#
+# Postgres only. The OMS talks to Kafka if you configure it and degrades quietly
+# if you don't, so there is nothing here to bundle; adding services nobody needs
+# would make this file a liability rather than a shortcut.
+
+services:
+  postgres:
+    container_name: oms-postgres
+    image: postgres:16
+    environment:
+      # Matches the built-in default so `oms init` needs no answers at all.
+      #
+      # The variable is OMS_DOCKER_* rather than POSTGRES_* on purpose: Compose
+      # auto-loads this repo's `.env`, which already defines POSTGRES_PASSWORD for
+      # the *application*. Reusing that name would silently provision this
+      # container with the credentials of whatever database the app points at.
+      POSTGRES_PASSWORD: ${OMS_DOCKER_POSTGRES_PASSWORD:-postgres}
+      # Deliberately no POSTGRES_DB. `oms database init` creates `ods` itself and
+      # refuses outright if it already exists — pre-creating it here would break
+      # the very command this file exists to make easy.
+    ports:
+      # Loopback only. Binding 0.0.0.0 would expose the database to the network
+      # *and* trip the guards that refuse the shipped default passwords off-localhost.
+      - "127.0.0.1:${OMS_DOCKER_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - oms-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  oms-postgres:
