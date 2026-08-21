@@ -17,6 +17,7 @@
 - **Rust edition 2021.** Doc comments explain *why*, not *what*.
 - **AES-256-GCM.** Stored bytes are `[12-byte nonce][ciphertext‖tag]`, nonce fresh per write from the OS RNG.
 - **The connection's `code` is the AAD**, binding each blob to its row so a copied `credentials` value cannot decrypt onto a different connection.
+- **Because the code is the AAD, renaming a connection orphans its credentials.** Any path that can change a `code` must decrypt under the old code and re-seal under the new one in the same transaction, or must refuse the rename. Nothing in this plan renames a connection; Plan 4's editing UI is where this bites, and it is called out in the spec's follow-ups.
 - **Secrets never reach a log, a `Debug`, an error message, or an HTTP response.** Every credential type gets a hand-written redacting `Debug`, matching the existing impls in `src/config.rs` and `src/setup/init.rs`.
 - **No plaintext credential is ever written to disk** — not to `oms.toml`, not to a temp file.
 - **After this plan, the environment is no longer consulted for broker or feed credentials.** No fallback, no precedence: the database is the only source. `import-env` is the one-shot bridge.
