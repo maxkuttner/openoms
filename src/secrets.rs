@@ -105,6 +105,12 @@ mod tests {
         parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("key")
     }
 
+    /// 32 bytes of `0xAB` — distinctive enough that its bytes would be
+    /// recognisable in a derived `Debug` output, unlike the all-zero `key()`.
+    fn distinctive_key() -> MasterKey {
+        parse_master_key("base64:q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s=").expect("key")
+    }
+
     #[test]
     fn round_trips() {
         let sealed = seal(&key(), "alpaca-paper", b"hello");
@@ -153,6 +159,21 @@ mod tests {
     fn truncated_input_is_malformed_not_a_panic() {
         assert!(matches!(open(&key(), "a", &[0u8; 4]), Err(SecretError::Malformed)));
         assert!(matches!(open(&key(), "a", &[]), Err(SecretError::Malformed)));
+        // One byte below the minimum: still malformed.
+        assert!(matches!(open(&key(), "a", &[0u8; 27]), Err(SecretError::Malformed)));
+        // Exactly the minimum: well-formed, so it must fail authentication rather
+        // than be rejected on length — this is what pins the constant.
+        assert!(matches!(open(&key(), "a", &[0u8; 28]), Err(SecretError::Decrypt)));
+    }
+
+    /// Empty plaintext seals to exactly nonce + tag (28 bytes) and round-trips —
+    /// the boundary case `truncated_input_is_malformed_not_a_panic` pins from
+    /// the other side.
+    #[test]
+    fn round_trips_empty_plaintext_at_the_minimum_length() {
+        let sealed = seal(&key(), "a", b"");
+        assert_eq!(sealed.len(), 28);
+        assert_eq!(open(&key(), "a", &sealed).expect("open"), b"");
     }
 
     #[test]
@@ -162,13 +183,18 @@ mod tests {
         assert!(matches!(parse_master_key("base64:AAAA"), Err(SecretError::BadKey(_))));
         assert!(matches!(parse_master_key("base64:!!!!"), Err(SecretError::BadKey(_))));
         assert!(matches!(parse_master_key("hunter2"), Err(SecretError::BadKey(_))));
+        // 33 decoded bytes: one too many for a 32-byte key.
+        assert!(matches!(
+            parse_master_key("base64:q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6ur"),
+            Err(SecretError::BadKey(_))
+        ));
     }
 
-    /// The key must never print itself, in any formatting context.
+    /// The key must never print itself, in any formatting context, in either
+    /// the compact or the alternate (`{:#?}`) form.
     #[test]
     fn debug_redacts_the_key() {
-        let rendered = format!("{:?}", key());
-        assert!(!rendered.contains("AAAA"), "key leaked into {rendered}");
-        assert!(rendered.contains("redacted"));
+        assert_eq!(format!("{:?}", distinctive_key()), "MasterKey(<redacted>)");
+        assert_eq!(format!("{:#?}", distinctive_key()), "MasterKey(<redacted>)");
     }
 }
