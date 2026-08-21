@@ -298,6 +298,13 @@ enum SetupCmd {
 enum ConfigCmd {
     /// Import broker and feed credentials from the environment into the store. Run once.
     ImportEnv,
+    /// Re-wrap every stored credential under a freshly generated master key.
+    ///
+    /// Prints the new key at the end — write it into `oms.toml` (`oms.master_key`)
+    /// before doing anything else. The rows are already re-wrapped when this
+    /// command returns, so losing the printed key before it is saved loses every
+    /// stored credential; keep the old key around until the new one is in place.
+    RotateKey,
 }
 
 /// Connection flags shared by every database subcommand. Each falls back to its
@@ -426,6 +433,52 @@ async fn main() {
             if let Err(e) = result {
                 eprintln!("error: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some(Command::Config(ConfigCmd::RotateKey)) => {
+            let old_key = match config::master_key(config::load()) {
+                Some(Ok(key)) => key,
+                Some(Err(e)) => {
+                    eprintln!("error: invalid master key: {e}");
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!(
+                        "error: no master key configured — run `oms init` first, or set OMS_MASTER_KEY"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let new_key_str = setup::init::generate_master_key();
+            let new_key = secrets::parse_master_key(&new_key_str)
+                .expect("generate_master_key always produces a value parse_master_key accepts");
+
+            let result = async {
+                let pool = PgPool::connect(&setup::database_url()?).await?;
+                setup::rotate::rotate(&pool, &old_key, &new_key).await.map_err(Box::<dyn std::error::Error>::from)
+            }
+            .await;
+
+            match result {
+                Ok(n) => {
+                    // The new key is deliberately printed — same trade `oms init` makes for
+                    // the key it generates: this is the one time it can be handed to the
+                    // operator at all. No credential is ever printed, only this key.
+                    println!("rotated {n} credential(s) to a new master key.\n");
+                    println!("new master key: {new_key_str}");
+                    println!(
+                        "\nPut this in {} as oms.master_key now — the credentials above are\n\
+                         already re-wrapped under it, so this is the only remaining copy outside\n\
+                         the database. Keep the OLD key somewhere safe until that edit is saved:\n\
+                         if this terminal is lost before then, the old key is the only thing\n\
+                         that still decrypts the store.",
+                        config::path_abs().display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Some(Command::Database(cmd)) => {
