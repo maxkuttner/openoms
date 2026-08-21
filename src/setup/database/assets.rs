@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn embeds_every_migration() {
         assert_eq!(migrations(&TARGETS[0]).len(), 24, "public migrations");
-        assert_eq!(migrations(&TARGETS[1]).len(), 20, "oms migrations");
+        assert_eq!(migrations(&TARGETS[1]).len(), 21, "oms migrations");
         for t in &TARGETS {
             for (name, sql) in migrations(t) {
                 assert!(name.ends_with(".sql"), "{name} is not .sql");
