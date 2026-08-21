@@ -253,37 +253,41 @@ pub fn start_session(
     Ok(adapter)
 }
 
-/// Read `{prefix}_{suffix}`, returning `None` when unset or empty.
-fn env_opt(prefix: &str, suffix: &str) -> Option<String> {
-    std::env::var(format!("{prefix}_{suffix}")).ok().filter(|s| !s.is_empty())
-}
-
-/// Wire an IBKR FIX order-entry session for `env_name` if `IBKR_{ENV}_FIX_HOST` is
-/// set. Returns the adapter to register in the broker registry, or `None` when not
-/// configured. Requires `_FIX_PORT`, `_SENDER_COMP_ID`, `_TARGET_COMP_ID`,
-/// `_FIX_PASSWORD`.
+/// Wire an IBKR FIX order-entry session for `env_name` from an already-decrypted
+/// credential (see `crate::credentials`). Returns the adapter to register in the
+/// broker registry, or `None` if the session failed to start.
+///
+/// `creds` must be `BrokerCredentials::IbkrFix` — the caller (`serve()`) only
+/// reaches this function after matching that variant out of the store, so a
+/// mismatch here means a caller bug, not bad operator input; it is logged and
+/// treated as "not started" rather than panicking, so one broken caller cannot
+/// take the process down.
 #[allow(clippy::too_many_arguments)]
 pub fn start_ibkr(
     env_name: &str,
+    creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
     kafka: Option<KafkaClient>,
     position_changed_tx: Option<mpsc::Sender<()>>,
 ) -> Option<Arc<FixBrokerAdapter>> {
-    let prefix = format!("IBKR_{env_name}");
-    let host = env_opt(&prefix, "FIX_HOST")?;
+    let crate::credentials::BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } =
+        creds
+    else {
+        error!(env = env_name, "start_ibkr called with non-IBKR credentials (programming error)");
+        return None;
+    };
     let cfg = FixConfig {
-        host,
-        port: env_opt(&prefix, "FIX_PORT").and_then(|s| s.parse().ok()).unwrap_or(4001),
-        sender_comp_id: env_opt(&prefix, "SENDER_COMP_ID").unwrap_or_else(|| "OMS".into()),
-        target_comp_id: env_opt(&prefix, "TARGET_COMP_ID").unwrap_or_else(|| "IBKR".into()),
-        ssl: env_opt(&prefix, "FIX_SSL").map(|s| s != "N").unwrap_or(true),
+        host: host.clone(),
+        port: *port,
+        sender_comp_id: sender_comp_id.clone(),
+        target_comp_id: target_comp_id.clone(),
+        ssl: *ssl,
         heartbeat_secs: 30,
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("IBKR", env_name);
-    let password = env_opt(&prefix, "FIX_PASSWORD").unwrap_or_default();
-    let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password));
+    let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password.clone()));
     // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
     match start_session(dialect, cfg, "ibkr", health, pool, kafka, position_changed_tx, None) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
@@ -291,26 +295,28 @@ pub fn start_ibkr(
     }
 }
 
-/// Wire a Binance Spot FIX order-entry session for `env_name` if
-/// `BINANCE_{ENV}_FIX_HOST` is set. Reuses the existing `BINANCE_{ENV}_API_KEY` +
-/// `_PRIVATE_KEY_PATH` credential for Ed25519 logon signing.
+/// Wire a Binance Spot FIX order-entry session for `env_name` from an
+/// already-decrypted credential. `creds` must be `BrokerCredentials::BinanceFix`
+/// — see `start_ibkr`'s doc comment for why a mismatch is logged, not panicked.
+/// `private_key` is PEM contents (not a path) — the store holds the key material
+/// itself, so there is nothing to read from disk here.
 #[allow(clippy::too_many_arguments)]
 pub fn start_binance(
     env_name: &str,
+    creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
     kafka: Option<KafkaClient>,
     position_changed_tx: Option<mpsc::Sender<()>>,
 ) -> Option<Arc<FixBrokerAdapter>> {
-    let prefix = format!("BINANCE_{env_name}");
-    let host = env_opt(&prefix, "FIX_HOST")?;
-    let api_key = env_opt(&prefix, "API_KEY")?;
-    let pem_path = env_opt(&prefix, "PRIVATE_KEY_PATH")?;
-    let pem = match std::fs::read_to_string(&pem_path) {
-        Ok(p) => p,
-        Err(e) => { error!(env = env_name, "Binance FIX: cannot read {pem_path}: {e}"); return None; }
+    let crate::credentials::BrokerCredentials::BinanceFix {
+        host, port, sender_comp_id, target_comp_id, api_key, private_key,
+    } = creds
+    else {
+        error!(env = env_name, "start_binance called with non-Binance credentials (programming error)");
+        return None;
     };
-    let dialect = match BinanceDialect::new(api_key.clone(), &pem) {
+    let dialect = match BinanceDialect::new(api_key.clone(), private_key) {
         Ok(d) => Arc::new(d) as Arc<dyn FixDialect>,
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX dialect init failed"); return None; }
     };
@@ -318,7 +324,7 @@ pub fn start_binance(
     // order-reconciliation reads through the same credential's REST API. Orders still
     // go over FIX; only the recon snapshot/status reads use REST.
     let read_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>> =
-        match crate::adapters::binance::BinanceAdapter::new(api_key, &pem, env_name) {
+        match crate::adapters::binance::BinanceAdapter::new(api_key.clone(), private_key, env_name) {
             Ok(a) => Some(Arc::new(a)),
             Err(e) => {
                 error!(env = env_name, error = %e, "Binance FIX: REST recon delegate init failed; recon disabled");
@@ -326,10 +332,10 @@ pub fn start_binance(
             }
         };
     let cfg = FixConfig {
-        host,
-        port: env_opt(&prefix, "FIX_PORT").and_then(|s| s.parse().ok()).unwrap_or(9000),
-        sender_comp_id: env_opt(&prefix, "SENDER_COMP_ID").unwrap_or_else(|| "OMS".into()),
-        target_comp_id: env_opt(&prefix, "TARGET_COMP_ID").unwrap_or_else(|| "SPOT".into()),
+        host: host.clone(),
+        port: *port,
+        sender_comp_id: sender_comp_id.clone(),
+        target_comp_id: target_comp_id.clone(),
         ssl: true, // Binance FIX requires TLS.
         heartbeat_secs: 30,
     };

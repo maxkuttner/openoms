@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::{BrokerInstrument, InstrumentProvider};
+use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::setup::catalog;
 
 const BATCH: usize = 4000;
@@ -56,12 +57,32 @@ impl Broker {
         format!("{}-{}", self.code().to_lowercase(), self.environment().to_lowercase())
     }
 
-    /// Whether this broker's credentials are present in the environment.
+    /// Whether this broker has a usable credential in the store — its
+    /// conventional `broker_connection.code` (e.g. "alpaca-paper") appears in
+    /// `connections` with a `Configured` credential.
     ///
-    /// The single source of truth for "can we sync this broker": the same env vars
-    /// `build_alpaca`/`build_binance` require, so cred *detection* (boot-time
-    /// auto-sync) and cred *use* (constructing the adapter) can never disagree.
-    pub fn has_creds(self) -> bool {
+    /// This governs `bootstrap::will_sync_on_boot`/`spawn_sync`: whether the
+    /// boot-time catalog auto-sync should run for this broker. It is distinct
+    /// from [`has_env_creds`](Self::has_env_creds) — see that method's doc
+    /// comment for why the two can (narrowly, and non-silently) disagree.
+    pub fn has_creds(self, connections: &[Connection<BrokerCredentials>]) -> bool {
+        connections
+            .iter()
+            .any(|c| c.code == self.connection_code() && matches!(c.credentials, CredentialState::Configured(_)))
+    }
+
+    /// Whether this broker's credentials are present in the *environment*.
+    ///
+    /// Kept for `bootstrap::sync_all_brokers`'s own use: `build_alpaca` /
+    /// `build_binance` below still construct their adapter directly from the
+    /// environment — that code path predates the credential store and Task 7
+    /// (boot-time adapter registration) deliberately does not touch it — so the
+    /// background catalog sync has to keep asking the question `build_alpaca` /
+    /// `build_binance` will actually answer. A broker credentialed only in the
+    /// store (no matching env vars) passes [`has_creds`](Self::has_creds) but
+    /// fails this — `sync_all_brokers` reports that gap explicitly rather than
+    /// silently doing nothing.
+    pub(crate) fn has_env_creds(self) -> bool {
         let set = |k: &str| env::var(k).is_ok_and(|v| !v.is_empty());
         match self {
             Broker::Alpaca => {
@@ -74,6 +95,13 @@ impl Broker {
             }
         }
     }
+}
+
+/// Every broker in `Broker::ALL` whose store credential is `Configured`.
+/// Computed once by `serve()` and reused for both `will_sync_on_boot` and
+/// `spawn_sync`, so the two cannot disagree about which brokers are eligible.
+pub fn brokers_with_creds(connections: &[Connection<BrokerCredentials>]) -> Vec<Broker> {
+    Broker::ALL.iter().copied().filter(|b| b.has_creds(connections)).collect()
 }
 
 fn alpaca_env() -> String {
@@ -293,4 +321,62 @@ async fn bulk_upsert_broker_instrument(
     .await?;
 
     Ok(chunk.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(code: &str, credentials: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
+        Connection {
+            code: code.to_string(),
+            kind: "TEST".to_string(),
+            environment: Some("PAPER".to_string()),
+            status: "ACTIVE".to_string(),
+            credentials,
+            credentials_updated_at: None,
+        }
+    }
+
+    fn alpaca_cred() -> BrokerCredentials {
+        BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() }
+    }
+
+    /// `has_creds` must key off the connection code, not just "is anything
+    /// Configured somewhere in the list" — a Binance row must not make Alpaca
+    /// look credentialed.
+    #[test]
+    fn has_creds_is_true_only_for_a_configured_row_with_the_matching_code() {
+        let connections = vec![connection("alpaca-paper", CredentialState::Configured(alpaca_cred()))];
+        assert!(Broker::Alpaca.has_creds(&connections));
+        assert!(!Broker::Binance.has_creds(&connections));
+    }
+
+    /// `Unconfigured` and `Error` are both "not usable" — neither counts as having
+    /// credentials, only `Configured` does.
+    #[test]
+    fn has_creds_is_false_for_unconfigured_and_error_rows() {
+        let connections = vec![
+            connection("alpaca-paper", CredentialState::Unconfigured),
+            connection("binance-paper", CredentialState::Error("bad key".into())),
+        ];
+        assert!(!Broker::Alpaca.has_creds(&connections));
+        assert!(!Broker::Binance.has_creds(&connections));
+    }
+
+    /// A code that never appears in the list (no row at all) is indistinguishable
+    /// from Unconfigured — no row means no credential either.
+    #[test]
+    fn has_creds_is_false_when_no_row_exists_for_the_code() {
+        assert!(!Broker::Alpaca.has_creds(&[]));
+    }
+
+    #[test]
+    fn brokers_with_creds_returns_only_the_configured_subset() {
+        let connections = vec![
+            connection("alpaca-paper", CredentialState::Configured(alpaca_cred())),
+            connection("binance-paper", CredentialState::Unconfigured),
+        ];
+        assert_eq!(brokers_with_creds(&connections), vec![Broker::Alpaca]);
+    }
 }

@@ -30,7 +30,22 @@ const SOURCE_CODE: &str = "DATABENTO";
 /// Fixed tail of an OSI symbol: 6 date + 1 kind + 8 strike.
 const OSI_TAIL: usize = 15;
 
-pub struct DatabentoOpraFeed;
+/// `api_key` comes from the credential store (`FeedCredentials::Databento`), not
+/// the environment — `LiveClient::builder()` reads `DATABENTO_API_KEY` itself via
+/// `.key_from_env()`, so gating the feed's spawn in `serve()` alone would leave it
+/// still authenticating from the environment underneath. Threading the key through
+/// here and calling `.key(...)` explicitly closes that gap.
+pub struct DatabentoOpraFeed {
+    api_key: String,
+}
+
+impl DatabentoOpraFeed {
+    // `const fn` so `feeds::ALL` (symbology-only, never runs a session) can build
+    // one with a placeholder key as a promoted `'static` value.
+    pub const fn new(api_key: String) -> Self {
+        Self { api_key }
+    }
+}
 
 impl DataProvider for DatabentoOpraFeed {
     fn code(&self) -> &'static str {
@@ -74,7 +89,7 @@ impl LiveQuoteFeed for DatabentoOpraFeed {
         let mut sym_to_id = symbols;
 
         let mut client = LiveClient::builder()
-            .key_from_env()
+            .key(self.api_key.clone())
             .map_err(|e| ProviderError::Config(e.to_string()))?
             .dataset(OPRA_DATASET)
             .build()
@@ -184,12 +199,18 @@ fn px(v: i64) -> Option<f64> {
 mod tests {
     use super::*;
 
+    /// The api_key is irrelevant to symbol/candidate logic — a fixed placeholder
+    /// keeps every test below focused on what it actually checks.
+    fn feed() -> DatabentoOpraFeed {
+        DatabentoOpraFeed::new("test-key".to_string())
+    }
+
     /// The case that motivates the whole transform: a 3-char root gets padded to 6
     /// so the wire symbol matches what Databento publishes.
     #[test]
     fn pads_short_root_to_six() {
         assert_eq!(
-            DatabentoOpraFeed.to_feed_symbol("SPY260724P00739000").as_deref(),
+            feed().to_feed_symbol("SPY260724P00739000").as_deref(),
             Some("SPY   260724P00739000")
         );
     }
@@ -198,7 +219,7 @@ mod tests {
     #[test]
     fn leaves_full_width_root_alone() {
         assert_eq!(
-            DatabentoOpraFeed.to_feed_symbol("BRKB  260116C00500000").as_deref(),
+            feed().to_feed_symbol("BRKB  260116C00500000").as_deref(),
             Some("BRKB  260116C00500000")
         );
     }
@@ -208,7 +229,7 @@ mod tests {
     #[test]
     fn output_is_always_21_chars() {
         for s in ["A260724P00739000", "SPY260724P00739000", "SPXW  260724C05000000"] {
-            let out = DatabentoOpraFeed.to_feed_symbol(s).expect("valid OSI");
+            let out = feed().to_feed_symbol(s).expect("valid OSI");
             assert_eq!(out.len(), 6 + OSI_TAIL, "{s} → {out:?}");
         }
     }
@@ -217,14 +238,14 @@ mod tests {
     /// replaced would have underflowed on `length(symbol) - 15`.
     #[test]
     fn declines_symbol_with_no_room_for_root() {
-        assert_eq!(DatabentoOpraFeed.to_feed_symbol("260724P00739000"), None);
-        assert_eq!(DatabentoOpraFeed.to_feed_symbol("SPY"), None);
-        assert_eq!(DatabentoOpraFeed.to_feed_symbol(""), None);
+        assert_eq!(feed().to_feed_symbol("260724P00739000"), None);
+        assert_eq!(feed().to_feed_symbol("SPY"), None);
+        assert_eq!(feed().to_feed_symbol(""), None);
     }
 
     #[test]
     fn candidates_scope_to_opra_options() {
-        let f = DatabentoOpraFeed.candidates();
+        let f = feed().candidates();
         assert_eq!(f.instrument_class, Some("OPTION"));
         assert_eq!(f.venue, Some("OPRA"));
         assert_eq!(f.asset_class, None);
