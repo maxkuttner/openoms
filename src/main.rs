@@ -44,8 +44,8 @@ use sqlx::PgPool;
 use std::env;
 use std::sync::Arc;
 use dotenvy::dotenv;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber;
+use tracing::{error, info, warn};
+use tracing_subscriber::{self, EnvFilter};
 use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 mod kafka;
@@ -408,7 +408,12 @@ enum DatabaseCmd {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    // `RUST_LOG` is honoured when set (e.g. `RUST_LOG=fix::wire=debug` to see
+    // the redacted FIX wire log — see `fix::mod`'s doc comment); with no
+    // `RUST_LOG` at all this falls back to plain `info`, so anyone who sets
+    // nothing sees exactly what they saw before this filter existed.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cli = <Cli as clap::Parser>::parse();
     match cli.command {

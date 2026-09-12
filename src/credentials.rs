@@ -313,12 +313,16 @@ pub async fn save_feed(
     Ok(())
 }
 
-/// Whether anything is stored at all. `serve()` uses this to decide whether a
-/// missing master key is fatal. NOTE: on a database where migration 0021 has
-/// not been applied, this fails with `42P01 undefined_table` rather than
-/// returning `Ok(false)` — a caller must not fold that `Err` into `false`,
-/// since doing so would make a missing master key stop being fatal at exactly
-/// the moment the schema itself is broken.
+/// Whether anything is stored at all. `setup::brokers::run` (`sync-broker`)
+/// uses this when no master key is configured, to tell a normal fresh install
+/// (nothing stored, absent key is fine) apart from a database that already
+/// holds credentials it can no longer decode (absent key is fatal) — the same
+/// three-way key handling `serve()` does from the decoded `CredentialState`s
+/// directly, without needing this helper. NOTE: on a database where migration
+/// 0021 has not been applied, this fails with `42P01 undefined_table` rather
+/// than returning `Ok(false)` — a caller must not fold that `Err` into
+/// `false`, since doing so would make a missing master key stop being fatal
+/// at exactly the moment the schema itself is broken.
 pub async fn any_credentials_stored(pool: &PgPool) -> Result<bool, sqlx::Error> {
     let n: i64 = sqlx::query_scalar(
         "SELECT (SELECT count(*) FROM oms.broker_connection WHERE credentials IS NOT NULL) \
@@ -622,6 +626,28 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup feed row before");
+
+        // Refuse to run against a database that holds anyone else's
+        // credentials. This test seals its two rows under a hardcoded
+        // all-zero master key and then calls `rotate` over the *whole* store
+        // (every non-null row in both tables, not just these two). Against a
+        // database with real credentials, `rotate` correctly aborts and rolls
+        // back — a real row won't open under the all-zero key — but that
+        // abort happens only after this test has already inserted and sealed
+        // its own rows, and `.expect("rotate")` below panics on that error
+        // before the "leave the table as we found it" cleanup at the bottom
+        // of this test can run. The leftover zero-key rows then make
+        // `rotate-key` refuse for *everyone* until a human deletes them by
+        // hand. Checking here means a non-throwaway database fails loudly
+        // before this test writes anything to it at all.
+        assert!(
+            !any_credentials_stored(&pool).await.expect("any_credentials_stored (pre-check)"),
+            "refusing to run credential_store_round_trips_through_save_load_and_rotate: \
+             the target database already has stored credentials. This test rotates the \
+             ENTIRE credential store under a throwaway all-zero key, which is only safe on \
+             a disposable database. Point POSTGRES_*/.env at a throwaway Postgres instance \
+             to run this test."
+        );
 
         // `save_broker` is an UPDATE, not an upsert (see its doc comment) — the
         // row has to exist first, same as `ensure_broker_connections` provides

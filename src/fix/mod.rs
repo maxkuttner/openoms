@@ -50,10 +50,11 @@ fn redact_fix_secrets(msg: &str) -> String {
 
 /// Routes QuickFIX's session log (raw messages + admin events) into `tracing` so
 /// the FIX wire is visible alongside the rest of the OMS logs. SOH is rendered as
-/// `|`. Messages log at debug (with `main.rs`'s global `Level::INFO`, this keeps
-/// the wire off stdout by default while `RUST_LOG=oms::fix=debug` still shows
-/// it); session events at info. Secret tags are redacted in both directions
-/// regardless of level — see `redact_fix_secrets`.
+/// `|`. Messages log at debug under the `fix::wire` target (with `main.rs`'s
+/// default `EnvFilter` of `info`, this keeps the wire off stdout unless
+/// `RUST_LOG=fix::wire=debug` is set, which shows it); session events at info.
+/// Secret tags are redacted in both directions regardless of level — see
+/// `redact_fix_secrets`.
 struct TracingFixLog;
 
 impl LogCallback for TracingFixLog {
