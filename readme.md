@@ -167,9 +167,11 @@ that doesn't involve re-entering them. Back it up, and back it up again after
 
 With no master key at all: a fresh install with nothing stored yet still starts
 (there is nothing to decrypt). Once any credential has been imported, starting
-without a master key — or with one that doesn't decrypt what's stored — is
+without a master key — or with one that decrypts *none* of what's stored — is
 refused, naming the problem, rather than starting with adapters silently
-unregistered.
+unregistered. A key that decrypts some rows but not others still starts: one
+stale or wrong credential must not be able to disarm every other one — the
+unusable rows are logged (`credentials unusable: ...`) so they can be fixed.
 
 A credential change needs a restart to take effect; the store is read once at
 boot, not watched for changes.

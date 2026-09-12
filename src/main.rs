@@ -241,20 +241,27 @@ fn admin_password_from_env() -> Option<String> {
         .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
 }
 
-/// Whether `serve()` must refuse to start over the master-key/credential-store
-/// gate. Pulled out of `serve()` as a pure function so the four combinations are
-/// directly table-testable — this is the most consequential new behaviour in
-/// the credential-store plan (a wrong answer here either misrepresents the
-/// system's state by starting with no adapters, or refuses to start a perfectly
-/// fine fresh install) and it deserves more than incidental coverage via a live
-/// database.
+/// Whether `serve()` must refuse to start over the credential-decrypt gate.
+/// Pulled out of `serve()` as a pure function so the combinations are directly
+/// table-testable — this is the most consequential new behaviour in the
+/// credential-store plan (a wrong answer here either misrepresents the
+/// system's state by starting with no working adapters, or refuses to start a
+/// perfectly fine partially-configured install) and it deserves more than
+/// incidental coverage via a live database.
 ///
-/// `credentials_might_be_stored` is already the fail-safe answer computed by the
-/// caller (an `any_credentials_stored` query failure — e.g. a pre-migration-0021
-/// database — becomes `true`, not `false`; see `serve()`), so this function only
-/// has to combine the two: fatal iff there is no key AND credentials might exist.
-fn must_refuse_to_start(master_key_present: bool, credentials_might_be_stored: bool) -> bool {
-    !master_key_present && credentials_might_be_stored
+/// `any_configured` and `any_error` summarise every broker + feed connection's
+/// decoded `CredentialState` (`Configured`/`Error`/`Unconfigured` — see
+/// `credentials.rs`) after `serve()` has loaded them under the resolved master
+/// key: `any_configured` is true iff at least one row decoded successfully,
+/// `any_error` iff at least one row has a blob that did not. Fatal iff
+/// something is stored and unusable AND *nothing at all* decoded — a missing
+/// master key falls out of this for free, since with no key every row that
+/// has a blob decodes straight to `Error` (see `decode`), never `Configured`.
+/// A partial failure (some rows open, some do not) must still start: one bad
+/// or stale credential must not be able to disarm every other one, so this
+/// is deliberately NOT `any_error` alone.
+fn must_refuse_to_start(any_configured: bool, any_error: bool) -> bool {
+    any_error && !any_configured
 }
 
 /// OMS command-line entry point. With no subcommand it runs the server (the
@@ -631,29 +638,6 @@ async fn serve() {
         None => None,
     };
 
-    // A missing master key with credentials stored is fatal: starting
-    // "successfully" with no adapters registered would misrepresent the system's
-    // state. `any_credentials_stored` itself errors on a pre-migration-0021
-    // database (its doc comment says so, since the `credentials` column does not
-    // exist yet there) — that `Err` is deliberately NOT folded into `false`: doing
-    // so would make a missing master key stop being fatal at exactly the moment
-    // the schema itself is broken, which is backwards. An unknown answer is
-    // treated as "assume stored" so the gate below still fires.
-    let credentials_might_be_stored = match credentials::any_credentials_stored(&pool).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("could not determine whether credentials are stored, assuming they may be: {e}");
-            true
-        }
-    };
-    if must_refuse_to_start(master.is_some(), credentials_might_be_stored) {
-        error!(
-            "refusing to start: credentials are stored but no master key is configured. \
-             Set oms.master_key in oms.toml (or OMS_MASTER_KEY)."
-        );
-        std::process::exit(1);
-    }
-
     // Routing config for every broker OMS natively supports — without a
     // broker_connection row a credential has nowhere to attach, whether or not
     // one is configured yet. Must run BEFORE `load_brokers` below: on a fresh
@@ -674,7 +658,7 @@ async fn serve() {
     // DB error at exactly this moment would silently produce a server that
     // binds, passes `/health`, and 503s every order with zero adapters
     // registered — precisely the misrepresented-state failure mode the
-    // master-key gate above exists to prevent, just reached a different way.
+    // decrypt-gate just below exists to prevent, just reached a different way.
     let broker_connections = match credentials::load_brokers(&pool, master.as_ref()).await {
         Ok(c) => c,
         Err(e) => {
@@ -689,6 +673,41 @@ async fn serve() {
             std::process::exit(1);
         }
     };
+
+    // A master key that decrypts NONE of what is stored is fatal: starting
+    // "successfully" with no adapters registered would misrepresent the system's
+    // state — the same failure mode a missing key entirely produces (a missing
+    // key decodes every row with a blob to this same `Error` state, see `decode`
+    // in credentials.rs, so that case needs no separate check here). A key that
+    // opens SOME rows but not others must still start: one bad or stale
+    // credential must not be able to disarm every other one, so this only fires
+    // when literally nothing usable came back — see `must_refuse_to_start`.
+    let any_configured = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)))
+        || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)));
+    let any_error = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)))
+        || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)));
+    if must_refuse_to_start(any_configured, any_error) {
+        // Named per-connection first, immediately above the summary, so an
+        // operator sees exactly which rows failed rather than just the count.
+        for conn in &broker_connections {
+            if let CredentialState::Error(e) = &conn.credentials {
+                error!(code = %conn.code, "credentials unusable: {e}");
+            }
+        }
+        for conn in &feed_connections {
+            if let CredentialState::Error(e) = &conn.credentials {
+                error!(code = %conn.code, "credentials unusable: {e}");
+            }
+        }
+        error!(
+            "refusing to start: credentials are stored but none of them could be decrypted \
+             under the configured master key (see the per-connection errors above). The likely \
+             cause is that oms.master_key (or OMS_MASTER_KEY) does not match the key these \
+             credentials were sealed with. Restore the correct key in oms.toml, or — if it is \
+             truly gone — re-import/re-enter the credentials under the current key."
+        );
+        std::process::exit(1);
+    }
 
     // Which of those brokers the *store* currently credentials — computed once so
     // `will_sync_on_boot` (below) and `spawn_sync` (near the end, once the catalog
@@ -1174,27 +1193,27 @@ mod tests {
     use super::{admin_password_from_env, must_refuse_to_start, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
     use crate::config::FileConfig;
 
-    /// The most consequential new behaviour in the credential-store plan, table-
-    /// tested directly: only "no key AND credentials might exist" refuses to
-    /// start. The pre-migration-0021 case (`any_credentials_stored` erroring)
-    /// is exercised by the caller in `serve()` turning that `Err` into `true`
-    /// before this function ever sees it — this table covers the boolean logic
-    /// that decision feeds, including that a query failure (mapped to `true`)
-    /// keeps a missing key fatal rather than being waved through.
+    /// The most consequential new behaviour in the credential-store plan,
+    /// table-tested directly: refuse iff at least one stored credential is
+    /// unusable AND *none at all* decoded successfully. A missing master key
+    /// is not a separate case — every row with a blob decodes to `Error` with
+    /// no key at all, so it falls under "all fail" for free (last row).
+    /// The load-bearing property this guards is the "some fail" row: a single
+    /// bad or stale credential must never be able to disarm every other one.
     #[test]
-    fn must_refuse_to_start_only_when_key_absent_and_creds_might_exist() {
-        // (master_key_present, credentials_might_be_stored) -> must_refuse
+    fn must_refuse_to_start_only_when_nothing_at_all_decoded() {
+        // (any_configured, any_error) -> must_refuse
         let cases = [
-            (true, true, false),   // key present: never fatal, regardless of storage
-            (true, false, false),
-            (false, false, false), // no key, nothing stored: normal fresh install
-            (false, true, true),   // no key, something stored (or unknown/Err → true): fatal
+            (false, false, false), // none stored: normal fresh install
+            (true, false, false),  // all decrypt: normal running system
+            (true, true, false),   // some fail: one bad row must not disarm the rest
+            (false, true, true),   // all fail (includes "no key configured" — see decode()): refuse
         ];
-        for (key_present, might_be_stored, expected) in cases {
+        for (any_configured, any_error, expected) in cases {
             assert_eq!(
-                must_refuse_to_start(key_present, might_be_stored),
+                must_refuse_to_start(any_configured, any_error),
                 expected,
-                "key_present={key_present} might_be_stored={might_be_stored}"
+                "any_configured={any_configured} any_error={any_error}"
             );
         }
     }
