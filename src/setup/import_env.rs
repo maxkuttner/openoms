@@ -11,8 +11,7 @@
 use sqlx::PgPool;
 
 use crate::credentials::{save_broker, save_feed, BrokerCredentials, FeedCredentials};
-use crate::secrets::MasterKey;
-use crate::setup::brokers::Broker;
+use crate::secrets::{self, MasterKey};
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
@@ -52,7 +51,8 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
         let apikey_var = format!("{p}_API_KEY");
         let path_var = format!("{p}_PRIVATE_KEY_PATH");
         let code = format!("binance-{}", env_name.to_lowercase());
-        let host = var(&format!("{p}_FIX_HOST"));
+        let host_var = format!("{p}_FIX_HOST");
+        let host = var(&host_var);
         let api_key = var(&apikey_var);
         let path = var(&path_var);
         // The API key + PEM path are what every Binance transport needs — REST
@@ -93,6 +93,14 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
                     Err(e) => eprintln!("  skipped {code}: cannot read {path}: {e}"),
                 }
             }
+            // A FIX host with neither credential set is the same kind of typo as
+            // every other partial configuration below — it must be reported, not
+            // fall through this arm silently just because it happens to be the
+            // one field REST doesn't need. Truly nothing set (the common case:
+            // this broker/environment isn't configured at all) stays silent.
+            (None, None) if host.is_some() => {
+                eprintln!("  skipped {code}: {host_var} is set but {apikey_var} and {path_var} are not");
+            }
             (None, None) => {}
             _ => {
                 let mut missing = Vec::new();
@@ -118,6 +126,56 @@ pub fn scan_feed_env() -> Vec<(String, FeedCredentials)> {
     }
 }
 
+/// Refuse the whole import if `key` cannot open something already sealed in
+/// the store. Checked once, before any row is written: an operator who
+/// resolves the wrong key (say, `rotate-key` printed a new one that was never
+/// saved into `oms.toml`, and a restart under the stale key happened to
+/// succeed — see BLOCKING 2/4 in the credential-store review) would otherwise
+/// have this command seal freshly-imported `.env` credentials under a
+/// *different* key than what is already stored, splitting the store across
+/// two keys that no single master key can then open — not even `rotate-key`,
+/// which needs one key that opens everything to re-wrap it.
+///
+/// Looking at exactly one existing blob is enough: every row is sealed under
+/// the same master key (rotation re-wraps them all together, see rotate.rs),
+/// so one row answers "is this the right key" for the whole store. `None`
+/// means nothing is stored yet — a first import, nothing to conflict with.
+async fn refuse_if_key_does_not_match_existing_store(
+    pool: &PgPool,
+    key: &MasterKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let existing: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT code, credentials FROM oms.broker_connection WHERE credentials IS NOT NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let existing = match existing {
+        Some(row) => Some(row),
+        None => {
+            sqlx::query_as(
+                "SELECT code, credentials FROM oms.feed_connection WHERE credentials IS NOT NULL LIMIT 1",
+            )
+            .fetch_optional(pool)
+            .await?
+        }
+    };
+    let Some((code, blob)) = existing else {
+        return Ok(());
+    };
+    if secrets::open(key, &code, &blob).is_err() {
+        return Err(format!(
+            "refusing to import: the configured master key does not decrypt the existing \
+             credential store (checked row '{code}'). Importing now would seal these new \
+             credentials under a different key than what is already there, splitting the store \
+             across two keys that no single master key can then read — not even `rotate-key`. \
+             Fix oms.master_key (or OMS_MASTER_KEY) to match what the store was actually sealed \
+             with before importing."
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Import everything found. Returns how many credentials were stored.
 pub async fn run(pool: &PgPool, key: &MasterKey) -> Result<usize, Box<dyn std::error::Error>> {
     let brokers = scan_env();
@@ -127,31 +185,36 @@ pub async fn run(pool: &PgPool, key: &MasterKey) -> Result<usize, Box<dyn std::e
         return Ok(0);
     }
 
-    // Codes the app itself will create a row for at boot (`ensure_broker_connections`
-    // iterates `Broker::ALL` and creates exactly these). IBKR has no `Broker`
-    // variant, so its row is never auto-created — only Alpaca and Binance are.
-    let bootstrapped: Vec<String> = Broker::ALL.iter().map(|b| b.connection_code()).collect();
+    // Before writing anything: a wrong-but-configured key must not be allowed
+    // to split the store across two keys. See the function doc for the chain
+    // that makes this reachable in practice.
+    refuse_if_key_does_not_match_existing_store(pool, key).await?;
+
+    // Seed `broker_connection` for the currently active `{BROKER}_ENV` routing
+    // target before scanning existence below. On a fresh install this is the
+    // *only* thing that creates these rows before the app has ever been
+    // started — and `oms config import-env` is exactly the command the README
+    // tells a new user to run right after `oms init`, before ever booting the
+    // server. Idempotent, and the identical call `serve()` makes at boot (see
+    // its doc comment in bootstrap.rs), so this cannot create anything a
+    // normal boot wouldn't have.
+    crate::setup::bootstrap::ensure_broker_connections(pool).await;
 
     let mut n = 0;
     for (code, cred) in &brokers {
         // The connection row must exist first: credentials attach to a configured
-        // routing target, they do not create one.
+        // routing target, they do not create one. Past the `ensure_broker_connections`
+        // call above, a missing row can only be IBKR (no `Broker` variant, so
+        // never auto-created) or the *other* `{BROKER}_ENV` — e.g. `alpaca-paper`
+        // when `ALPACA_ENV=LIVE` — which legitimately has no row until that
+        // environment is the active one.
         let exists: Option<i32> =
             sqlx::query_scalar("SELECT 1 FROM oms.broker_connection WHERE code = $1")
                 .bind(code)
                 .fetch_optional(pool)
                 .await?;
         if exists.is_none() {
-            if bootstrapped.contains(code) {
-                // `ensure_broker_connections` creates a row for every `Broker::ALL`
-                // entry unconditionally at boot now (see its doc comment in
-                // bootstrap.rs) — the row's existence no longer depends on whether
-                // credentials are present, so this can only happen before the app
-                // has ever been started against this database.
-                println!("  skipped {code}: no broker_connection row yet (the app creates one at boot, regardless of credentials — start it once, then re-run this import)");
-            } else {
-                println!("  skipped {code}: no broker_connection row (create one first via POST /admin/broker-connections)");
-            }
+            println!("  skipped {code}: no broker_connection row (create one first via POST /admin/broker-connections, or switch *_ENV to it and re-run this import)");
             continue;
         }
         save_broker(pool, key, code, cred).await?;
@@ -174,6 +237,7 @@ pub async fn run(pool: &PgPool, key: &MasterKey) -> Result<usize, Box<dyn std::e
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::brokers::Broker;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -278,6 +342,23 @@ mod tests {
         clear();
         assert_eq!(alpaca_code, "alpaca-paper");
         assert_eq!(binance_code, "binance-paper");
+    }
+
+    /// `BINANCE_{ENV}_FIX_HOST` set alone, with neither the API key nor the PEM
+    /// path, used to fall into an empty `(None, None)` match arm and vanish
+    /// with no message at all — every other partial Binance/Alpaca
+    /// configuration reports a skip, this one alone didn't. The returned list
+    /// was already empty either way (nothing here is enough to build a
+    /// credential); what this pins is that the case is still recognised as a
+    /// mistake worth naming — run with `-- --nocapture` to see the message.
+    #[test]
+    fn binance_fix_host_alone_is_still_skipped() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        std::env::set_var("BINANCE_PAPER_FIX_HOST", "fix.example.com");
+        let found = scan_env();
+        clear();
+        assert!(found.is_empty(), "a FIX host alone cannot build a credential");
     }
 
     /// Binance's private key lives at a path in the environment and as PEM bytes
