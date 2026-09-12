@@ -24,22 +24,91 @@ use quickfix::{
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info};
+
+/// FIX tags whose value is authentication material and must never reach a log
+/// line: 553 (Username — the Binance API key, `binance.rs`), 554 (Password —
+/// the IBKR account password, `ibkr.rs`), and 96 (RawData — the Binance Ed25519
+/// logon signature). Every other tag is left alone: the wire log is a real
+/// debugging tool and must stay useful.
+const SECRET_FIX_TAGS: [&str; 3] = ["553", "554", "96"];
+
+/// Redact the value of every [`SECRET_FIX_TAGS`] field in a raw, SOH-delimited
+/// FIX message. Splitting on SOH first (rather than a substring search for
+/// `"554="` etc.) is what keeps this from mangling a value that merely
+/// *contains* those characters elsewhere in the message — only a field whose
+/// own tag matches is touched.
+fn redact_fix_secrets(msg: &str) -> String {
+    msg.split('\x01')
+        .map(|field| match field.split_once('=') {
+            Some((tag, _)) if SECRET_FIX_TAGS.contains(&tag) => format!("{tag}=<redacted>"),
+            _ => field.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\x01")
+}
 
 /// Routes QuickFIX's session log (raw messages + admin events) into `tracing` so
 /// the FIX wire is visible alongside the rest of the OMS logs. SOH is rendered as
-/// `|`. Messages log at debug; session events at info.
+/// `|`. Messages log at debug (with `main.rs`'s global `Level::INFO`, this keeps
+/// the wire off stdout by default while `RUST_LOG=oms::fix=debug` still shows
+/// it); session events at info. Secret tags are redacted in both directions
+/// regardless of level — see `redact_fix_secrets`.
 struct TracingFixLog;
 
 impl LogCallback for TracingFixLog {
     fn on_incoming(&self, _session: Option<&SessionId>, msg: &str) {
-        info!(target: "fix::wire", dir = "in", "{}", msg.replace('\x01', "|"));
+        debug!(target: "fix::wire", dir = "in", "{}", redact_fix_secrets(msg).replace('\x01', "|"));
     }
     fn on_outgoing(&self, _session: Option<&SessionId>, msg: &str) {
-        info!(target: "fix::wire", dir = "out", "{}", msg.replace('\x01', "|"));
+        debug!(target: "fix::wire", dir = "out", "{}", redact_fix_secrets(msg).replace('\x01', "|"));
     }
     fn on_event(&self, _session: Option<&SessionId>, msg: &str) {
         info!(target: "fix::wire", "{}", msg);
+    }
+}
+
+#[cfg(test)]
+mod tracing_fix_log_tests {
+    use super::redact_fix_secrets;
+
+    /// The IBKR logon: tag 554 carries the account password. Everything else
+    /// (message type, sender, target) must survive so the log stays useful.
+    #[test]
+    fn redacts_ibkr_password_and_keeps_other_tags() {
+        let msg = "8=FIX.4.2\x019=70\x0135=A\x0149=OMS\x0156=IBKR\x01554=MYPASSWORD\x0110=001\x01";
+        let out = redact_fix_secrets(msg);
+        assert!(!out.contains("MYPASSWORD"), "password leaked: {out}");
+        assert!(out.contains("554=<redacted>"), "tag 554 should show as redacted: {out}");
+        assert!(out.contains("35=A"), "message type must survive: {out}");
+        assert!(out.contains("49=OMS"), "sender comp id must survive: {out}");
+    }
+
+    /// The Binance logon: tag 553 carries the API key, tag 96 the Ed25519
+    /// signature. Both must be gone; the rest of the logon stays intact.
+    #[test]
+    fn redacts_binance_api_key_and_signature() {
+        let msg = "8=FIX.4.4\x019=90\x0135=A\x0149=OMS\x0156=SPOT\x01553=MYAPIKEY\x0196=SIGNATUREBASE64\x0110=002\x01";
+        let out = redact_fix_secrets(msg);
+        assert!(!out.contains("MYAPIKEY"), "api key leaked: {out}");
+        assert!(!out.contains("SIGNATUREBASE64"), "signature leaked: {out}");
+        assert!(out.contains("553=<redacted>"), "tag 553 should show as redacted: {out}");
+        assert!(out.contains("96=<redacted>"), "tag 96 should show as redacted: {out}");
+        assert!(out.contains("35=A"));
+        assert!(out.contains("49=OMS"));
+    }
+
+    /// A value that merely *contains* "554=" as text — not the tag itself —
+    /// must not be mangled. Splitting on SOH field boundaries is what makes
+    /// this safe: only a field whose own tag is exactly "554" is touched.
+    #[test]
+    fn does_not_mangle_a_substring_that_merely_looks_like_a_secret_tag() {
+        let msg = "35=A\x0149=OMS\x0158=note: contains 554=999 as literal text\x0110=003\x01";
+        let out = redact_fix_secrets(msg);
+        assert!(
+            out.contains("58=note: contains 554=999 as literal text"),
+            "unrelated field must survive untouched: {out}"
+        );
     }
 }
 
