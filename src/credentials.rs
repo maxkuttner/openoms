@@ -578,4 +578,140 @@ mod tests {
             other => panic!("expected Configured, got {other:?}"),
         }
     }
+
+    /// The one piece of this module that is pure SQL and had never once
+    /// executed: `save_broker`, `save_feed`, `load_brokers`, `load_feeds`,
+    /// `any_credentials_stored`, and (via `setup::rotate::rotate`)
+    /// `rotate_table`. Everything above this point tests the seal/decode seam
+    /// with no database at all — this is the seam that actually touches
+    /// Postgres, and a typo in any of that hand-written SQL would only ever
+    /// surface at runtime without a test like this one.
+    ///
+    /// Round trip: insert a bare `broker_connection` row (the row `save_broker`
+    /// requires but does not create), seal + save a broker credential and a
+    /// feed credential, load both back and confirm they decode, rotate to a
+    /// new key, load both back again under the new key, and confirm the old
+    /// key no longer opens what was just rewrapped.
+    ///
+    /// Run with: cargo test -- --ignored
+    /// Requires: a live, migrated Postgres reachable via the usual POSTGRES_*
+    /// config — same connection pattern as
+    /// `setup::database::migrate::tests::applying_twice_is_a_no_op`.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn credential_store_round_trips_through_save_load_and_rotate() {
+        use crate::setup::database::config;
+
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        let pool = sqlx::PgPool::connect(&cfg.url()).await.expect("connect");
+
+        let broker_code = "test-credential-roundtrip-broker";
+        let feed_code = "test-credential-roundtrip-feed";
+
+        // Clean slate: a previous run that panicked mid-test may have left
+        // these behind, possibly sealed under a key this run no longer has —
+        // which would otherwise fail `rotate`'s all-or-nothing check on a row
+        // that has nothing to do with this run.
+        sqlx::query("DELETE FROM oms.broker_connection WHERE code = $1")
+            .bind(broker_code)
+            .execute(&pool)
+            .await
+            .expect("cleanup broker row before");
+        sqlx::query("DELETE FROM oms.feed_connection WHERE code = $1")
+            .bind(feed_code)
+            .execute(&pool)
+            .await
+            .expect("cleanup feed row before");
+
+        // `save_broker` is an UPDATE, not an upsert (see its doc comment) — the
+        // row has to exist first, same as `ensure_broker_connections` provides
+        // at boot.
+        sqlx::query(
+            "INSERT INTO oms.broker_connection (code, broker_code, environment, status) \
+             VALUES ($1, 'ALPACA', 'PAPER', 'ACTIVE')",
+        )
+        .bind(broker_code)
+        .execute(&pool)
+        .await
+        .expect("insert test broker_connection row");
+
+        let old_key = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("key");
+        let new_key = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("key");
+
+        let broker_creds =
+            BrokerCredentials::Alpaca { key: "AKROUNDTRIP".into(), secret: "ROUNDTRIPSECRET".into() };
+        let feed_creds = FeedCredentials::Databento { api_key: "db-roundtrip-key".into() };
+
+        save_broker(&pool, &old_key, broker_code, &broker_creds).await.expect("save_broker");
+        // Unlike save_broker, save_feed creates the row itself (see its doc
+        // comment) — no INSERT needed first.
+        save_feed(&pool, &old_key, feed_code, &feed_creds).await.expect("save_feed");
+
+        assert!(
+            any_credentials_stored(&pool).await.expect("any_credentials_stored"),
+            "at least one credential is now stored"
+        );
+
+        let brokers = load_brokers(&pool, Some(&old_key)).await.expect("load_brokers");
+        match &brokers.iter().find(|c| c.code == broker_code).expect("broker row present").credentials {
+            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, secret: s }) => {
+                assert_eq!(k, "AKROUNDTRIP");
+                assert_eq!(s, "ROUNDTRIPSECRET");
+            }
+            other => panic!("expected Configured Alpaca, got {other:?}"),
+        }
+
+        let feeds = load_feeds(&pool, Some(&old_key)).await.expect("load_feeds");
+        match &feeds.iter().find(|c| c.code == feed_code).expect("feed row present").credentials {
+            CredentialState::Configured(FeedCredentials::Databento { api_key }) => {
+                assert_eq!(api_key, "db-roundtrip-key");
+            }
+            other => panic!("expected Configured Databento, got {other:?}"),
+        }
+
+        // `rotate` re-wraps both tables in one transaction — the SQL text in
+        // `rotate_table` that has never executed against a real database.
+        let n = crate::setup::rotate::rotate(&pool, &old_key, &new_key).await.expect("rotate");
+        assert!(n >= 2, "expected at least our 2 rows to be rotated, got {n}");
+
+        let brokers_after = load_brokers(&pool, Some(&new_key)).await.expect("load_brokers after rotate");
+        match &brokers_after.iter().find(|c| c.code == broker_code).expect("broker row present").credentials {
+            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, secret: s }) => {
+                assert_eq!(k, "AKROUNDTRIP");
+                assert_eq!(s, "ROUNDTRIPSECRET");
+            }
+            other => panic!("expected Configured Alpaca after rotate, got {other:?}"),
+        }
+
+        let feeds_after = load_feeds(&pool, Some(&new_key)).await.expect("load_feeds after rotate");
+        match &feeds_after.iter().find(|c| c.code == feed_code).expect("feed row present").credentials {
+            CredentialState::Configured(FeedCredentials::Databento { api_key }) => {
+                assert_eq!(api_key, "db-roundtrip-key");
+            }
+            other => panic!("expected Configured Databento after rotate, got {other:?}"),
+        }
+
+        // Proof the row was actually rewrapped, not merely left readable under
+        // both keys: the old key must stop working.
+        let brokers_old_key = load_brokers(&pool, Some(&old_key)).await.expect("load_brokers under old key");
+        assert!(
+            matches!(
+                brokers_old_key.iter().find(|c| c.code == broker_code).expect("broker row present").credentials,
+                CredentialState::Error(_)
+            ),
+            "old key must stop opening the broker row after rotation"
+        );
+
+        // Leave the table as we found it.
+        sqlx::query("DELETE FROM oms.broker_connection WHERE code = $1")
+            .bind(broker_code)
+            .execute(&pool)
+            .await
+            .expect("cleanup broker row after");
+        sqlx::query("DELETE FROM oms.feed_connection WHERE code = $1")
+            .bind(feed_code)
+            .execute(&pool)
+            .await
+            .expect("cleanup feed row after");
+    }
 }
