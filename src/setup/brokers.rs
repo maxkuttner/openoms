@@ -369,7 +369,13 @@ mod tests {
     /// prior test in the same binary) would silently break the assertion. These
     /// tests mutate process env, so they must not run concurrently with anything
     /// else reading the same keys — serialized by `ENV_LOCK`, same pattern as
-    /// `setup::import_env::tests`.
+    /// `setup::import_env::tests`, which has its own separate `ENV_LOCK`
+    /// instance. The two don't coordinate with each other, and don't need to
+    /// today: every test on both sides only ever *clears*
+    /// `ALPACA_ENV`/`BINANCE_ENV`, never sets them. If a test in either module
+    /// starts *setting* one of those vars instead, the two locks must be
+    /// merged into one shared lock first — otherwise tests in the two modules
+    /// could interleave and see each other's env mutations.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn clear() {

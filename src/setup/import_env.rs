@@ -239,6 +239,14 @@ mod tests {
     use super::*;
     use crate::setup::brokers::Broker;
 
+    /// Serialises env mutation across this module's tests. `setup::brokers::tests`
+    /// has its own, separate `ENV_LOCK` — the two don't coordinate, and don't
+    /// need to today, because every test on both sides only ever *clears*
+    /// `ALPACA_ENV`/`BINANCE_ENV` (via `clear()` here, similarly there), never
+    /// sets them. The moment a test in either module starts *setting* one of
+    /// those vars rather than clearing it, that stops being safe — the two
+    /// locks must be merged into one shared lock first, or tests in the two
+    /// modules could interleave and see each other's env mutations.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Every variable `scan_env`/`scan_feed_env` read, both PAPER and LIVE, plus

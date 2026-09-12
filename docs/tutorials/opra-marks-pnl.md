@@ -142,8 +142,10 @@ use databento::{
     LiveClient,
 };
 
+// `api_key` is a parameter now, not read from the environment: the caller
+// (`serve()`) already loaded it from the credential store — see Step 5.
 let mut client = LiveClient::builder()
-    .key_from_env()?              // DATABENTO_API_KEY
+    .key(&api_key)?
     .dataset("OPRA.PILLAR")
     .build().await?;
 
@@ -207,12 +209,15 @@ error — copy `binance_stream.rs::run` almost verbatim.
 
 ## Step 5 — Spawn it
 
-In `src/main.rs`, next to the Binance spawn, guarded by the key:
+In `src/main.rs`, next to the Binance spawn, guarded by the store rather than
+the environment — credentials live encrypted in `oms.feed_connection` now (see
+"Broker and feed credentials" in the README); `oms config import-env` is the
+one-shot migration off `DATABENTO_API_KEY`:
 
 ```rust
-if env::var("DATABENTO_API_KEY").is_ok() {
+if let Some(api_key) = databento_api_key(&feed_connections) {
     let health = state.stream_health().handle("DATABENTO", "OPRA");
-    tokio::spawn(opra_stream::run(state.pool().clone(), state.marks().clone(), health));
+    tokio::spawn(opra_stream::run(state.pool().clone(), state.marks().clone(), health, api_key));
 }
 ```
 
@@ -305,9 +310,15 @@ let (marks_tx, marks_rx) = tokio::sync::mpsc::channel::<()>(1);
 
 // … each fill-stream spawn gets `Some(marks_tx.clone())` …
 
-if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
+// Feed credentials come from the store now, not the environment — see
+// "Broker and feed credentials" in the README. `feed_connections` was already
+// loaded (once, under the resolved master key) earlier in `serve()`; the OPRA
+// feed spawns only when the `databento-opra` row decoded to `Configured`
+// (`Unconfigured`/`Error` both skip it, logged separately — no more falling
+// back to reading `DATABENTO_API_KEY` itself).
+if let Some(api_key) = databento_api_key(&feed_connections) {
     let health = state.stream_health().handle("DATABENTO", "OPRA");
-    tokio::spawn(opra_stream::run(state.pool().clone(), state.marks().clone(), health, marks_rx));
+    tokio::spawn(opra_stream::run(state.pool().clone(), state.marks().clone(), health, marks_rx, api_key));
 }
 ```
 
@@ -437,8 +448,10 @@ orders too.
 ## Step 9 — Verify
 
 1. Open a small option position (limit order, RTH or resting).
-2. Start the OMS with `DATABENTO_API_KEY` set → logs show `OPRA live` +
-   `SymbolMappingMsg` then quotes.
+2. Store the Databento credential once (`DATABENTO_API_KEY=... cargo run --
+   config import-env`, or seal it directly with `save_feed`), then start the
+   OMS with no `DATABENTO_API_KEY` in the environment at all → logs show
+   `OPRA live` + `SymbolMappingMsg` then quotes.
 3. Poke the store: log `marks.all().len()` or add a tiny `GET /admin/marks`
    debug endpoint.
 4. Hit `/portfolios/:id/positions` → confirm `mark`, `market_value`,
