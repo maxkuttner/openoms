@@ -17,6 +17,7 @@ use crate::adapters::Transport;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
 use crate::app_state::AppState;
+use crate::credentials::{BrokerCredentials, CredentialState, FeedCredentials};
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit, BlotterRow};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
@@ -41,9 +42,10 @@ use axum::{
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
+use std::sync::Arc;
 use dotenvy::dotenv;
-use tracing::{error, info, warn, Level};
-use tracing_subscriber;
+use tracing::{error, info, warn};
+use tracing_subscriber::{self, EnvFilter};
 use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 mod kafka;
@@ -61,6 +63,8 @@ mod bybit_feed;
 mod feeds;
 mod preflight;
 mod config;
+mod secrets;
+mod credentials;
 mod expiry;
 mod fix;
 
@@ -237,6 +241,29 @@ fn admin_password_from_env() -> Option<String> {
         .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
 }
 
+/// Whether `serve()` must refuse to start over the credential-decrypt gate.
+/// Pulled out of `serve()` as a pure function so the combinations are directly
+/// table-testable — this is the most consequential new behaviour in the
+/// credential-store plan (a wrong answer here either misrepresents the
+/// system's state by starting with no working adapters, or refuses to start a
+/// perfectly fine partially-configured install) and it deserves more than
+/// incidental coverage via a live database.
+///
+/// `any_configured` and `any_error` summarise every broker + feed connection's
+/// decoded `CredentialState` (`Configured`/`Error`/`Unconfigured` — see
+/// `credentials.rs`) after `serve()` has loaded them under the resolved master
+/// key: `any_configured` is true iff at least one row decoded successfully,
+/// `any_error` iff at least one row has a blob that did not. Fatal iff
+/// something is stored and unusable AND *nothing at all* decoded — a missing
+/// master key falls out of this for free, since with no key every row that
+/// has a blob decodes straight to `Error` (see `decode`), never `Configured`.
+/// A partial failure (some rows open, some do not) must still start: one bad
+/// or stale credential must not be able to disarm every other one, so this
+/// is deliberately NOT `any_error` alone.
+fn must_refuse_to_start(any_configured: bool, any_error: bool) -> bool {
+    any_error && !any_configured
+}
+
 /// OMS command-line entry point. With no subcommand it runs the server (the
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
@@ -255,6 +282,9 @@ enum Command {
     /// Database provisioning and migration.
     #[command(subcommand)]
     Database(DatabaseCmd),
+    /// Credential store maintenance.
+    #[command(subcommand)]
+    Config(ConfigCmd),
     /// First-run setup: generate oms.toml and create the database.
     Init {
         /// Take values from flags and the environment instead of prompting.
@@ -269,6 +299,19 @@ enum Command {
 enum SetupCmd {
     /// Seed the master instrument catalog + broker_instrument mapping from a broker.
     SyncBroker(setup::brokers::Args),
+}
+
+#[derive(clap::Subcommand)]
+enum ConfigCmd {
+    /// Import broker and feed credentials from the environment into the store. Run once.
+    ImportEnv,
+    /// Re-wrap every stored credential under a freshly generated master key.
+    ///
+    /// Prints the new key at the end — write it into `oms.toml` (`oms.master_key`)
+    /// before doing anything else. The rows are already re-wrapped when this
+    /// command returns, so losing the printed key before it is saved loses every
+    /// stored credential; keep the old key around until the new one is in place.
+    RotateKey,
 }
 
 /// Connection flags shared by every database subcommand. Each falls back to its
@@ -365,7 +408,12 @@ enum DatabaseCmd {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    // `RUST_LOG` is honoured when set (e.g. `RUST_LOG=fix::wire=debug` to see
+    // the redacted FIX wire log — see `fix::mod`'s doc comment); with no
+    // `RUST_LOG` at all this falls back to plain `info`, so anyone who sets
+    // nothing sees exactly what they saw before this filter existed.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cli = <Cli as clap::Parser>::parse();
     match cli.command {
@@ -373,6 +421,76 @@ async fn main() {
             if let Err(e) = setup::brokers::run(args).await {
                 error!("setup sync-broker failed: {e}");
                 std::process::exit(1);
+            }
+        }
+        Some(Command::Config(ConfigCmd::ImportEnv)) => {
+            let key = match config::master_key(config::load()) {
+                Some(Ok(key)) => key,
+                Some(Err(e)) => {
+                    eprintln!("error: invalid master key: {e}");
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!(
+                        "error: no master key configured — run `oms init` first, or set OMS_MASTER_KEY"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let result = async {
+                let pool = PgPool::connect(&setup::database_url()?).await?;
+                setup::import_env::run(&pool, &key).await
+            }
+            .await;
+            if let Err(e) = result {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Config(ConfigCmd::RotateKey)) => {
+            let old_key = match config::master_key(config::load()) {
+                Some(Ok(key)) => key,
+                Some(Err(e)) => {
+                    eprintln!("error: invalid master key: {e}");
+                    std::process::exit(1);
+                }
+                None => {
+                    eprintln!(
+                        "error: no master key configured — run `oms init` first, or set OMS_MASTER_KEY"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let new_key_str = setup::init::generate_master_key();
+            let new_key = secrets::parse_master_key(&new_key_str)
+                .expect("generate_master_key always produces a value parse_master_key accepts");
+
+            let result = async {
+                let pool = PgPool::connect(&setup::database_url()?).await?;
+                setup::rotate::rotate(&pool, &old_key, &new_key).await.map_err(Box::<dyn std::error::Error>::from)
+            }
+            .await;
+
+            match result {
+                Ok(n) => {
+                    // The new key is deliberately printed — same trade `oms init` makes for
+                    // the key it generates: this is the one time it can be handed to the
+                    // operator at all. No credential is ever printed, only this key.
+                    println!("rotated {n} credential(s) to a new master key.\n");
+                    println!("new master key: {new_key_str}");
+                    println!(
+                        "\nPut this in {} as oms.master_key now — the credentials above are\n\
+                         already re-wrapped under it, so this is the only remaining copy outside\n\
+                         the database. Keep the OLD key somewhere safe until that edit is saved:\n\
+                         if this terminal is lost before then, the old key is the only thing\n\
+                         that still decrypts the store.",
+                        config::path_abs().display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Some(Command::Database(cmd)) => {
@@ -508,15 +626,104 @@ async fn serve() {
         }
     };
 
-    // Routing config for every credentialed broker — without a broker_connection a
-    // configured broker still cannot take an order.
+    // Master key + credential store. Resolved before anything else touches broker
+    // or feed configuration, so a fatal key problem is reported before any other
+    // setup work runs, and every consumer below (catalog auto-sync eligibility,
+    // adapter registration, the feed gate) reads the same load rather than each
+    // re-deriving its own view of "what is configured". `config::load()` is
+    // memoized, so calling it again later in this function (for bind_addr /
+    // admin_password) is cheap.
+    let file_cfg = config::load();
+    let master = match config::master_key(file_cfg) {
+        Some(Ok(k)) => Some(k),
+        Some(Err(e)) => {
+            error!("refusing to start: {e}");
+            std::process::exit(1);
+        }
+        None => None,
+    };
+
+    // Routing config for every broker OMS natively supports — without a
+    // broker_connection row a credential has nowhere to attach, whether or not
+    // one is configured yet. Must run BEFORE `load_brokers` below: on a fresh
+    // install this is what creates the alpaca-paper/binance-paper rows in the
+    // first place, and `load_brokers` needs to see them to report them (even as
+    // `Unconfigured`) rather than silently loading an empty list.
     setup::bootstrap::ensure_broker_connections(&pool).await;
+
+    // Every broker/feed connection, credentials decoded under `master` (or left
+    // `Unconfigured`/`Error` when there is none — see `decode` in credentials.rs).
+    // Loaded once, here, and reused by catalog auto-sync eligibility below, by
+    // adapter registration, and by the Databento feed gate — one read of the
+    // store, so nothing downstream can see a different answer than another part
+    // of boot already acted on.
+    //
+    // A query failure here is fatal, not `unwrap_or_default()`'s empty `Vec`: an
+    // empty list is indistinguishable from "nothing configured", so a transient
+    // DB error at exactly this moment would silently produce a server that
+    // binds, passes `/health`, and 503s every order with zero adapters
+    // registered — precisely the misrepresented-state failure mode the
+    // decrypt-gate just below exists to prevent, just reached a different way.
+    let broker_connections = match credentials::load_brokers(&pool, master.as_ref()).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("refusing to start: failed to load broker connections from the store: {e}");
+            std::process::exit(1);
+        }
+    };
+    let feed_connections = match credentials::load_feeds(&pool, master.as_ref()).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("refusing to start: failed to load feed connections from the store: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // A master key that decrypts NONE of what is stored is fatal: starting
+    // "successfully" with no adapters registered would misrepresent the system's
+    // state — the same failure mode a missing key entirely produces (a missing
+    // key decodes every row with a blob to this same `Error` state, see `decode`
+    // in credentials.rs, so that case needs no separate check here). A key that
+    // opens SOME rows but not others must still start: one bad or stale
+    // credential must not be able to disarm every other one, so this only fires
+    // when literally nothing usable came back — see `must_refuse_to_start`.
+    let any_configured = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)))
+        || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)));
+    let any_error = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)))
+        || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)));
+    if must_refuse_to_start(any_configured, any_error) {
+        // Named per-connection first, immediately above the summary, so an
+        // operator sees exactly which rows failed rather than just the count.
+        for conn in &broker_connections {
+            if let CredentialState::Error(e) = &conn.credentials {
+                error!(code = %conn.code, "credentials unusable: {e}");
+            }
+        }
+        for conn in &feed_connections {
+            if let CredentialState::Error(e) = &conn.credentials {
+                error!(code = %conn.code, "credentials unusable: {e}");
+            }
+        }
+        error!(
+            "refusing to start: credentials are stored but none of them could be decrypted \
+             under the configured master key (see the per-connection errors above). The likely \
+             cause is that oms.master_key (or OMS_MASTER_KEY) does not match the key these \
+             credentials were sealed with. Restore the correct key in oms.toml, or — if it is \
+             truly gone — re-import/re-enter the credentials under the current key."
+        );
+        std::process::exit(1);
+    }
+
+    // Which of those brokers the *store* currently credentials — computed once so
+    // `will_sync_on_boot` (below) and `spawn_sync` (near the end, once the catalog
+    // is confirmed empty) cannot disagree about who is eligible.
+    let synced_brokers = setup::brokers::brokers_with_creds(&broker_connections);
 
     // Refuse to start on a catalog that cannot work, and name what is merely
     // degraded. Before any feed spawns, so a broken catalog surfaces here rather
     // than as a feed that quietly subscribes to nothing. An empty catalog is not
     // fatal when a background sync is about to fill it.
-    let auto_sync_pending = setup::bootstrap::will_sync_on_boot(&pool).await;
+    let auto_sync_pending = setup::bootstrap::will_sync_on_boot(&pool, &synced_brokers).await;
     if let Err(e) = preflight::run(&pool, auto_sync_pending).await {
         error!("preflight failed: {e}");
         return;
@@ -532,9 +739,10 @@ async fn serve() {
     };
 
 
-    // Resolved here rather than at bind time because the admin-password rule below
-    // needs to know whether we are about to expose the server beyond this machine.
-    let file_cfg = config::load();
+    // `file_cfg` was already loaded above (for the master key); `config::load()`
+    // is memoized, so re-deriving `bind_addr` here — where the admin-password rule
+    // below needs to know whether we are about to expose the server beyond this
+    // machine — costs nothing extra.
     let bind_addr = resolve_bind_addr(env::var("OMS_BIND_ADDR").ok(), file_cfg);
 
     let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
@@ -587,96 +795,118 @@ async fn serve() {
     let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut marks_doorbells: Vec<tokio::sync::mpsc::Sender<()>> = Vec::new();
 
-    // Build broker registry — adapters are registered only when credentials are present.
-    // Env vars follow the pattern {BROKER}_{ENVIRONMENT}_{KEY}.
+    // Adapters come from the store, not the environment. One code path builds an
+    // adapter, so a credential saved at runtime (Plan 3) and one loaded at boot
+    // cannot diverge. `broker_connections` was loaded once, above, alongside the
+    // master-key resolution.
     let mut registry = BrokerRegistry::new();
+    // Stashed while registering so the Alpaca trade-update stream spawn further
+    // down (execution reports) reuses the exact credential each adapter was built
+    // from, rather than re-reading the store — let alone the environment — a
+    // second time.
+    let mut alpaca_creds: std::collections::HashMap<&'static str, (String, String)> =
+        std::collections::HashMap::new();
+    // Binance REST adapters (BINANCE_{ENV}_TRANSPORT=rest, the default), kept so
+    // the WS user-data stream can be spawned below. FIX owns its own execution
+    // reports, so nothing is stashed for that case.
+    let mut binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)> = Vec::new();
 
-    match (
-        env::var("ALPACA_PAPER_API_KEY"),
-        env::var("ALPACA_PAPER_API_SECRET"),
-    ) {
-        (Ok(key), Ok(secret)) if !key.is_empty() && !secret.is_empty() => {
-            use std::sync::Arc;
-            registry.register_alpaca("PAPER", Arc::new(AlpacaAdapter::new(key, secret, "PAPER")));
-            info!("registered ALPACA/PAPER adapter");
+    for conn in &broker_connections {
+        if conn.status != "ACTIVE" {
+            info!(code = %conn.code, kind = %conn.kind, "broker connection disabled, skipping");
+            continue;
         }
-        _ => info!("ALPACA_PAPER_API_KEY / ALPACA_PAPER_API_SECRET not set — ALPACA/PAPER adapter not registered"),
-    }
-
-    match (
-        env::var("ALPACA_LIVE_API_KEY"),
-        env::var("ALPACA_LIVE_API_SECRET"),
-    ) {
-        (Ok(key), Ok(secret)) if !key.is_empty() && !secret.is_empty() => {
-            use std::sync::Arc;
-            registry.register_alpaca("LIVE", Arc::new(AlpacaAdapter::new(key, secret, "LIVE")));
-            info!("registered ALPACA/LIVE adapter");
-        }
-        _ => info!("ALPACA_LIVE_API_KEY / ALPACA_LIVE_API_SECRET not set — ALPACA/LIVE adapter not registered"),
-    }
-
-    // IBKR over FIX (4.2). One session per configured environment; the FIX session
-    // both routes orders and delivers execution reports. Gated on IBKR_{ENV}_FIX_HOST.
-    for env_name in ["PAPER", "LIVE"] {
-        if let Some(adapter) = fix::start_ibkr(
-            env_name,
-            &stream_health,
-            pool.clone(),
-            kafka_client.clone(),
-            Some(position_changed_tx.clone()),
-        ) {
-            registry.register("IBKR", env_name, adapter);
-        }
-    }
-
-    // Binance Spot → BINANCE/PAPER. Transport is an explicit choice via
-    // BINANCE_PAPER_TRANSPORT=fix|rest (default rest): `fix` runs one FIX session for
-    // order entry + execution reports; `rest` runs the REST adapter + WS user-data
-    // stream. The Ed25519 key (API key id + PKCS#8 PEM path) is shared by both.
-    // `binance_paper` is the concrete Arc the WS stream needs — Some only under REST.
-    let binance_paper: Option<std::sync::Arc<BinanceAdapter>> =
-        match Transport::from_env("BINANCE_PAPER", Transport::Rest) {
-            Transport::Fix => {
-                match fix::start_binance(
-                    "PAPER",
-                    &stream_health,
-                    pool.clone(),
-                    kafka_client.clone(),
-                    Some(position_changed_tx.clone()),
-                ) {
-                    Some(fix_adapter) => registry.register("BINANCE", "PAPER", fix_adapter),
-                    None => error!(
-                        "BINANCE_PAPER_TRANSPORT=fix but the FIX session could not start — \
-                         check BINANCE_PAPER_FIX_HOST / API_KEY / PRIVATE_KEY_PATH"
-                    ),
-                }
-                None // FIX owns fills; no WS user-data stream
+        // broker_connection.environment is DB-checked to ('PAPER'|'LIVE'); anything
+        // else would be a schema mismatch, not operator input to gently degrade.
+        let env_name: &'static str = match conn.environment.as_deref() {
+            Some("PAPER") => "PAPER",
+            Some("LIVE") => "LIVE",
+            other => {
+                error!(code = %conn.code, kind = %conn.kind, environment = ?other, "broker connection has an unrecognised environment, skipping");
+                continue;
             }
-            Transport::Rest => match (
-                env::var("BINANCE_PAPER_API_KEY"),
-                env::var("BINANCE_PAPER_PRIVATE_KEY_PATH"),
-            ) {
-                (Ok(key), Ok(path)) if !key.is_empty() && !path.is_empty() => {
-                    use std::sync::Arc;
-                    match std::fs::read_to_string(&path) {
-                        Ok(pem) => match BinanceAdapter::new(key, &pem, "PAPER") {
-                            Ok(adapter) => {
-                                let adapter = Arc::new(adapter);
-                                registry.register("BINANCE", "PAPER", adapter.clone());
-                                info!("registered BINANCE/PAPER adapter (REST/WS)");
-                                Some(adapter)
-                            }
-                            Err(e) => { error!("BINANCE/PAPER adapter not registered: {e}"); None }
-                        },
-                        Err(e) => { error!("BINANCE/PAPER adapter not registered: cannot read {path}: {e}"); None }
+        };
+        match &conn.credentials {
+            CredentialState::Unconfigured => {
+                info!(code = %conn.code, kind = %conn.kind, "no credentials stored, adapter not registered");
+            }
+            CredentialState::Error(e) => {
+                error!(code = %conn.code, kind = %conn.kind, "credentials unusable: {e}");
+            }
+            CredentialState::Configured(creds) => {
+                // `broker_code` and the stored credential's own variant tag are two
+                // independent sources of truth for "what kind of broker is this" —
+                // normally in lockstep, but nothing enforces it (e.g. a credential
+                // hand-imported into the wrong row). Registration below follows the
+                // credential's variant, not `conn.kind`, so this cannot mis-route an
+                // adapter — but the mismatch itself is a real misconfiguration worth
+                // surfacing rather than registering silently.
+                let expected_kind = match creds {
+                    BrokerCredentials::Alpaca { .. } => "ALPACA",
+                    BrokerCredentials::IbkrFix { .. } => "IBKR",
+                    BrokerCredentials::BinanceFix { .. } => "BINANCE",
+                };
+                if conn.kind != expected_kind {
+                    warn!(
+                        code = %conn.code, kind = %conn.kind, credential_kind = expected_kind,
+                        "broker_connection's broker_code does not match its stored credential's kind"
+                    );
+                }
+                match creds {
+                BrokerCredentials::Alpaca { key, secret } => {
+                    registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env_name)));
+                    alpaca_creds.insert(env_name, (key.clone(), secret.clone()));
+                    info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered ALPACA/{env_name} adapter");
+                }
+                BrokerCredentials::IbkrFix { .. } => {
+                    // IBKR is FIX-only — the FIX session both routes orders and
+                    // delivers execution reports.
+                    if let Some(adapter) = fix::start_ibkr(
+                        env_name,
+                        creds,
+                        &stream_health,
+                        pool.clone(),
+                        kafka_client.clone(),
+                        Some(position_changed_tx.clone()),
+                    ) {
+                        registry.register("IBKR", env_name, adapter);
                     }
                 }
-                _ => {
-                    info!("BINANCE_PAPER_API_KEY / BINANCE_PAPER_PRIVATE_KEY_PATH not set — BINANCE/PAPER adapter not registered");
-                    None
+                BrokerCredentials::BinanceFix { api_key, private_key, .. } => {
+                    // Transport is an explicit choice via BINANCE_{ENV}_TRANSPORT=fix|rest
+                    // (default rest) — a wire-protocol setting, not a secret, so it stays
+                    // on the environment. `fix` runs one FIX session for order entry +
+                    // execution reports; `rest` runs the REST adapter + WS user-data stream,
+                    // built from the same store credential (no more PEM file read).
+                    match Transport::from_env(&format!("BINANCE_{env_name}"), Transport::Rest) {
+                        Transport::Fix => {
+                            match fix::start_binance(
+                                env_name,
+                                creds,
+                                &stream_health,
+                                pool.clone(),
+                                kafka_client.clone(),
+                                Some(position_changed_tx.clone()),
+                            ) {
+                                Some(adapter) => registry.register("BINANCE", env_name, adapter),
+                                None => error!(code = %conn.code, "Binance FIX session could not start"),
+                            }
+                        }
+                        Transport::Rest => match BinanceAdapter::new(api_key.clone(), private_key, env_name) {
+                            Ok(adapter) => {
+                                let adapter = Arc::new(adapter);
+                                registry.register("BINANCE", env_name, adapter.clone());
+                                binance_rest_adapters.push((env_name, adapter));
+                                info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BINANCE/{env_name} adapter (REST/WS)");
+                            }
+                            Err(e) => error!(code = %conn.code, "Binance adapter not registered: {e}"),
+                        },
+                    }
                 }
-            },
-        };
+                }
+            }
+        }
+    }
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
     // (OPENFIGI_API_KEY) raises the limits and batch size.
@@ -711,28 +941,24 @@ async fn serve() {
     // (stream_health, position_changed_tx/rx and marks_doorbells were created
     // before the broker registry so FIX sessions could use them.)
 
-    // Spawn Alpaca trade-update stream tasks (one per configured environment)
-    if let (Ok(key), Ok(secret)) = (env::var("ALPACA_PAPER_API_KEY"), env::var("ALPACA_PAPER_API_SECRET")) {
-        if !key.is_empty() && !secret.is_empty() {
-            if let Some(adapter) = state.registry().get_alpaca("PAPER") {
-                let health = state.stream_health().handle("ALPACA", "PAPER", stream_health::StreamKind::Execution);
-                tokio::spawn(alpaca_stream::run("PAPER", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
-            }
-        }
-    }
-    if let (Ok(key), Ok(secret)) = (env::var("ALPACA_LIVE_API_KEY"), env::var("ALPACA_LIVE_API_SECRET")) {
-        if !key.is_empty() && !secret.is_empty() {
-            if let Some(adapter) = state.registry().get_alpaca("LIVE") {
-                let health = state.stream_health().handle("ALPACA", "LIVE", stream_health::StreamKind::Execution);
-                tokio::spawn(alpaca_stream::run("LIVE", key, secret, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
-            }
+    // Spawn Alpaca trade-update stream tasks (one per configured environment).
+    // Credentials come from `alpaca_creds`, stashed when the adapter was
+    // registered above — a second read of the store (let alone the environment)
+    // here could in principle see a different answer than what was just
+    // registered; reusing the same values makes that impossible by construction.
+    for env_name in ["PAPER", "LIVE"] {
+        if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), state.registry().get_alpaca(env_name)) {
+            let health = state.stream_health().handle("ALPACA", env_name, stream_health::StreamKind::Execution);
+            tokio::spawn(alpaca_stream::run(env_name, key.clone(), secret.clone(), state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
         }
     }
 
-    // Spawn the Binance user-data stream when configured.
-    if let Some(adapter) = binance_paper {
-        let health = state.stream_health().handle("BINANCE", "PAPER", stream_health::StreamKind::Execution);
-        tokio::spawn(binance_stream::run("PAPER", state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
+    // Spawn the Binance user-data stream for every REST-transport adapter
+    // registered above (`binance_stream::run` needs no credentials of its own —
+    // the adapter already holds them).
+    for (env_name, adapter) in binance_rest_adapters {
+        let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
+        tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
     }
 
     // Market data: feeds emit quotes onto one channel; the router is the sole
@@ -747,18 +973,53 @@ async fn serve() {
     // return as a disconnect to back off from — wrong shape for a periodic job.
     tokio::spawn(expiry::run(state.pool().clone()));
 
-    if env::var("DATABENTO_API_KEY").map(|k| !k.is_empty()).unwrap_or(false) {
-        let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        marks_doorbells.push(opra_pos_tx);
-        let health = state.stream_health().handle("DATABENTO", "OPRA", stream_health::StreamKind::Feed);
-        let session = quote_feed::QuoteFeedSession::new(
-            opra_stream::DatabentoOpraFeed,
-            state.pool().clone(),
-            quote_tx.clone(),
-            opra_pos_rx,
-            health.clone(),
-        );
-        tokio::spawn(stream_supervisor::supervise("DATABENTO/OPRA", health, session));
+    // Feed credentials come from the store, same as brokers above. Gating the
+    // spawn here is not enough on its own — `DatabentoOpraFeed` takes the key
+    // explicitly and passes it to the `databento` client's `.key(...)` builder, so
+    // nothing downstream falls back to reading `DATABENTO_API_KEY` itself.
+    for conn in &feed_connections {
+        if conn.status != "ACTIVE" {
+            info!(code = %conn.code, "feed connection disabled, skipping");
+            continue;
+        }
+        match &conn.credentials {
+            CredentialState::Unconfigured => {
+                info!(code = %conn.code, "no credentials stored, feed not started");
+            }
+            CredentialState::Error(e) => {
+                error!(code = %conn.code, "credentials unusable: {e}");
+            }
+            CredentialState::Configured(FeedCredentials::Databento { api_key }) => {
+                // `DatabentoOpraFeed` is hardcoded to one dataset (OPRA.PILLAR) and
+                // one shared stream-health label ("DATABENTO"/"OPRA") — spawning it
+                // for more than one row would have two sessions silently racing to
+                // subscribe under the same health handle. `code` is the table's
+                // primary key, so it cannot duplicate; guarding on it here instead
+                // rejects a *different* Databento-provider row (e.g. a future
+                // non-OPRA dataset reusing this credential shape) rather than
+                // spawning an OPRA session for something that isn't OPRA.
+                if conn.code != "databento-opra" {
+                    error!(
+                        code = %conn.code,
+                        "unsupported Databento feed connection — only databento-opra \
+                         (OPRA options) is implemented; feed not started"
+                    );
+                    continue;
+                }
+                let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
+                marks_doorbells.push(opra_pos_tx);
+                let health = state.stream_health().handle("DATABENTO", "OPRA", stream_health::StreamKind::Feed);
+                let session = quote_feed::QuoteFeedSession::new(
+                    opra_stream::DatabentoOpraFeed::new(api_key.clone()),
+                    state.pool().clone(),
+                    quote_tx.clone(),
+                    opra_pos_rx,
+                    health.clone(),
+                );
+                tokio::spawn(stream_supervisor::supervise("DATABENTO/OPRA", health, session));
+                info!(code = %conn.code, "registered DATABENTO/OPRA feed");
+            }
+        }
     }
 
     // Binance public market data — no credentials, so it is always on. Each feed
@@ -807,9 +1068,10 @@ async fn serve() {
 
     // Populate an empty catalog from brokers in the background, so the minutes-long
     // option-chain fetch never delays the server binding below. `auto_sync_pending`
-    // was computed above (catalog empty + a broker has creds).
+    // and `synced_brokers` were both computed above (catalog empty + which brokers
+    // the store credentials).
     if auto_sync_pending {
-        setup::bootstrap::spawn_sync();
+        setup::bootstrap::spawn_sync(synced_brokers);
     }
 
     // Register routes
@@ -933,8 +1195,33 @@ async fn serve() {
 #[cfg(test)]
 mod tests {
     use super::bind_is_loopback;
-    use super::{admin_password_from_env, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
+    use super::{admin_password_from_env, must_refuse_to_start, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
     use crate::config::FileConfig;
+
+    /// The most consequential new behaviour in the credential-store plan,
+    /// table-tested directly: refuse iff at least one stored credential is
+    /// unusable AND *none at all* decoded successfully. A missing master key
+    /// is not a separate case — every row with a blob decodes to `Error` with
+    /// no key at all, so it falls under "all fail" for free (last row).
+    /// The load-bearing property this guards is the "some fail" row: a single
+    /// bad or stale credential must never be able to disarm every other one.
+    #[test]
+    fn must_refuse_to_start_only_when_nothing_at_all_decoded() {
+        // (any_configured, any_error) -> must_refuse
+        let cases = [
+            (false, false, false), // none stored: normal fresh install
+            (true, false, false),  // all decrypt: normal running system
+            (true, true, false),   // some fail: one bad row must not disarm the rest
+            (false, true, true),   // all fail (includes "no key configured" — see decode()): refuse
+        ];
+        for (any_configured, any_error, expected) in cases {
+            assert_eq!(
+                must_refuse_to_start(any_configured, any_error),
+                expected,
+                "any_configured={any_configured} any_error={any_error}"
+            );
+        }
+    }
 
     /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares
     /// process-global env state with every other test in the binary.

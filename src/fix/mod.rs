@@ -24,22 +24,92 @@ use quickfix::{
 use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tracing::{error, info};
+use tracing::{debug, error, info};
+
+/// FIX tags whose value is authentication material and must never reach a log
+/// line: 553 (Username — the Binance API key, `binance.rs`), 554 (Password —
+/// the IBKR account password, `ibkr.rs`), and 96 (RawData — the Binance Ed25519
+/// logon signature). Every other tag is left alone: the wire log is a real
+/// debugging tool and must stay useful.
+const SECRET_FIX_TAGS: [&str; 3] = ["553", "554", "96"];
+
+/// Redact the value of every [`SECRET_FIX_TAGS`] field in a raw, SOH-delimited
+/// FIX message. Splitting on SOH first (rather than a substring search for
+/// `"554="` etc.) is what keeps this from mangling a value that merely
+/// *contains* those characters elsewhere in the message — only a field whose
+/// own tag matches is touched.
+fn redact_fix_secrets(msg: &str) -> String {
+    msg.split('\x01')
+        .map(|field| match field.split_once('=') {
+            Some((tag, _)) if SECRET_FIX_TAGS.contains(&tag) => format!("{tag}=<redacted>"),
+            _ => field.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\x01")
+}
 
 /// Routes QuickFIX's session log (raw messages + admin events) into `tracing` so
 /// the FIX wire is visible alongside the rest of the OMS logs. SOH is rendered as
-/// `|`. Messages log at debug; session events at info.
+/// `|`. Messages log at debug under the `fix::wire` target (with `main.rs`'s
+/// default `EnvFilter` of `info`, this keeps the wire off stdout unless
+/// `RUST_LOG=fix::wire=debug` is set, which shows it); session events at info.
+/// Secret tags are redacted in both directions regardless of level — see
+/// `redact_fix_secrets`.
 struct TracingFixLog;
 
 impl LogCallback for TracingFixLog {
     fn on_incoming(&self, _session: Option<&SessionId>, msg: &str) {
-        info!(target: "fix::wire", dir = "in", "{}", msg.replace('\x01', "|"));
+        debug!(target: "fix::wire", dir = "in", "{}", redact_fix_secrets(msg).replace('\x01', "|"));
     }
     fn on_outgoing(&self, _session: Option<&SessionId>, msg: &str) {
-        info!(target: "fix::wire", dir = "out", "{}", msg.replace('\x01', "|"));
+        debug!(target: "fix::wire", dir = "out", "{}", redact_fix_secrets(msg).replace('\x01', "|"));
     }
     fn on_event(&self, _session: Option<&SessionId>, msg: &str) {
         info!(target: "fix::wire", "{}", msg);
+    }
+}
+
+#[cfg(test)]
+mod tracing_fix_log_tests {
+    use super::redact_fix_secrets;
+
+    /// The IBKR logon: tag 554 carries the account password. Everything else
+    /// (message type, sender, target) must survive so the log stays useful.
+    #[test]
+    fn redacts_ibkr_password_and_keeps_other_tags() {
+        let msg = "8=FIX.4.2\x019=70\x0135=A\x0149=OMS\x0156=IBKR\x01554=MYPASSWORD\x0110=001\x01";
+        let out = redact_fix_secrets(msg);
+        assert!(!out.contains("MYPASSWORD"), "password leaked: {out}");
+        assert!(out.contains("554=<redacted>"), "tag 554 should show as redacted: {out}");
+        assert!(out.contains("35=A"), "message type must survive: {out}");
+        assert!(out.contains("49=OMS"), "sender comp id must survive: {out}");
+    }
+
+    /// The Binance logon: tag 553 carries the API key, tag 96 the Ed25519
+    /// signature. Both must be gone; the rest of the logon stays intact.
+    #[test]
+    fn redacts_binance_api_key_and_signature() {
+        let msg = "8=FIX.4.4\x019=90\x0135=A\x0149=OMS\x0156=SPOT\x01553=MYAPIKEY\x0196=SIGNATUREBASE64\x0110=002\x01";
+        let out = redact_fix_secrets(msg);
+        assert!(!out.contains("MYAPIKEY"), "api key leaked: {out}");
+        assert!(!out.contains("SIGNATUREBASE64"), "signature leaked: {out}");
+        assert!(out.contains("553=<redacted>"), "tag 553 should show as redacted: {out}");
+        assert!(out.contains("96=<redacted>"), "tag 96 should show as redacted: {out}");
+        assert!(out.contains("35=A"));
+        assert!(out.contains("49=OMS"));
+    }
+
+    /// A value that merely *contains* "554=" as text — not the tag itself —
+    /// must not be mangled. Splitting on SOH field boundaries is what makes
+    /// this safe: only a field whose own tag is exactly "554" is touched.
+    #[test]
+    fn does_not_mangle_a_substring_that_merely_looks_like_a_secret_tag() {
+        let msg = "35=A\x0149=OMS\x0158=note: contains 554=999 as literal text\x0110=003\x01";
+        let out = redact_fix_secrets(msg);
+        assert!(
+            out.contains("58=note: contains 554=999 as literal text"),
+            "unrelated field must survive untouched: {out}"
+        );
     }
 }
 
@@ -253,37 +323,41 @@ pub fn start_session(
     Ok(adapter)
 }
 
-/// Read `{prefix}_{suffix}`, returning `None` when unset or empty.
-fn env_opt(prefix: &str, suffix: &str) -> Option<String> {
-    std::env::var(format!("{prefix}_{suffix}")).ok().filter(|s| !s.is_empty())
-}
-
-/// Wire an IBKR FIX order-entry session for `env_name` if `IBKR_{ENV}_FIX_HOST` is
-/// set. Returns the adapter to register in the broker registry, or `None` when not
-/// configured. Requires `_FIX_PORT`, `_SENDER_COMP_ID`, `_TARGET_COMP_ID`,
-/// `_FIX_PASSWORD`.
+/// Wire an IBKR FIX order-entry session for `env_name` from an already-decrypted
+/// credential (see `crate::credentials`). Returns the adapter to register in the
+/// broker registry, or `None` if the session failed to start.
+///
+/// `creds` must be `BrokerCredentials::IbkrFix` — the caller (`serve()`) only
+/// reaches this function after matching that variant out of the store, so a
+/// mismatch here means a caller bug, not bad operator input; it is logged and
+/// treated as "not started" rather than panicking, so one broken caller cannot
+/// take the process down.
 #[allow(clippy::too_many_arguments)]
 pub fn start_ibkr(
     env_name: &str,
+    creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
     kafka: Option<KafkaClient>,
     position_changed_tx: Option<mpsc::Sender<()>>,
 ) -> Option<Arc<FixBrokerAdapter>> {
-    let prefix = format!("IBKR_{env_name}");
-    let host = env_opt(&prefix, "FIX_HOST")?;
+    let crate::credentials::BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } =
+        creds
+    else {
+        error!(env = env_name, "start_ibkr called with non-IBKR credentials (programming error)");
+        return None;
+    };
     let cfg = FixConfig {
-        host,
-        port: env_opt(&prefix, "FIX_PORT").and_then(|s| s.parse().ok()).unwrap_or(4001),
-        sender_comp_id: env_opt(&prefix, "SENDER_COMP_ID").unwrap_or_else(|| "OMS".into()),
-        target_comp_id: env_opt(&prefix, "TARGET_COMP_ID").unwrap_or_else(|| "IBKR".into()),
-        ssl: env_opt(&prefix, "FIX_SSL").map(|s| s != "N").unwrap_or(true),
+        host: host.clone(),
+        port: *port,
+        sender_comp_id: sender_comp_id.clone(),
+        target_comp_id: target_comp_id.clone(),
+        ssl: *ssl,
         heartbeat_secs: 30,
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("IBKR", env_name);
-    let password = env_opt(&prefix, "FIX_PASSWORD").unwrap_or_default();
-    let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password));
+    let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password.clone()));
     // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
     match start_session(dialect, cfg, "ibkr", health, pool, kafka, position_changed_tx, None) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
@@ -291,26 +365,42 @@ pub fn start_ibkr(
     }
 }
 
-/// Wire a Binance Spot FIX order-entry session for `env_name` if
-/// `BINANCE_{ENV}_FIX_HOST` is set. Reuses the existing `BINANCE_{ENV}_API_KEY` +
-/// `_PRIVATE_KEY_PATH` credential for Ed25519 logon signing.
+/// Wire a Binance Spot FIX order-entry session for `env_name` from an
+/// already-decrypted credential. `creds` must be `BrokerCredentials::BinanceFix`
+/// — see `start_ibkr`'s doc comment for why a mismatch is logged, not panicked.
+/// `private_key` is PEM contents (not a path) — the store holds the key material
+/// itself, so there is nothing to read from disk here.
 #[allow(clippy::too_many_arguments)]
 pub fn start_binance(
     env_name: &str,
+    creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
     kafka: Option<KafkaClient>,
     position_changed_tx: Option<mpsc::Sender<()>>,
 ) -> Option<Arc<FixBrokerAdapter>> {
-    let prefix = format!("BINANCE_{env_name}");
-    let host = env_opt(&prefix, "FIX_HOST")?;
-    let api_key = env_opt(&prefix, "API_KEY")?;
-    let pem_path = env_opt(&prefix, "PRIVATE_KEY_PATH")?;
-    let pem = match std::fs::read_to_string(&pem_path) {
-        Ok(p) => p,
-        Err(e) => { error!(env = env_name, "Binance FIX: cannot read {pem_path}: {e}"); return None; }
+    let crate::credentials::BrokerCredentials::BinanceFix {
+        host, port, sender_comp_id, target_comp_id, api_key, private_key,
+    } = creds
+    else {
+        error!(env = env_name, "start_binance called with non-Binance credentials (programming error)");
+        return None;
     };
-    let dialect = match BinanceDialect::new(api_key.clone(), &pem) {
+    // A REST-only Binance credential stores an empty host (see `import_env::scan_env`
+    // and `save_broker` from the cockpit-to-be — REST never reads a FIX host, so
+    // nothing requires one to be set). Asking for FIX transport on such a
+    // credential must fail clearly here, before ever touching the network, rather
+    // than attempting a QuickFIX connection to `SocketConnectHost = ""`.
+    if host.is_empty() {
+        error!(
+            env = env_name,
+            "start_binance: credential has no FIX host configured — set it (e.g. via \
+             BINANCE_{{ENV}}_FIX_HOST before `oms config import-env`, or the cockpit \
+             once it can edit credentials) before selecting FIX transport"
+        );
+        return None;
+    }
+    let dialect = match BinanceDialect::new(api_key.clone(), private_key) {
         Ok(d) => Arc::new(d) as Arc<dyn FixDialect>,
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX dialect init failed"); return None; }
     };
@@ -318,7 +408,7 @@ pub fn start_binance(
     // order-reconciliation reads through the same credential's REST API. Orders still
     // go over FIX; only the recon snapshot/status reads use REST.
     let read_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>> =
-        match crate::adapters::binance::BinanceAdapter::new(api_key, &pem, env_name) {
+        match crate::adapters::binance::BinanceAdapter::new(api_key.clone(), private_key, env_name) {
             Ok(a) => Some(Arc::new(a)),
             Err(e) => {
                 error!(env = env_name, error = %e, "Binance FIX: REST recon delegate init failed; recon disabled");
@@ -326,10 +416,10 @@ pub fn start_binance(
             }
         };
     let cfg = FixConfig {
-        host,
-        port: env_opt(&prefix, "FIX_PORT").and_then(|s| s.parse().ok()).unwrap_or(9000),
-        sender_comp_id: env_opt(&prefix, "SENDER_COMP_ID").unwrap_or_else(|| "OMS".into()),
-        target_comp_id: env_opt(&prefix, "TARGET_COMP_ID").unwrap_or_else(|| "SPOT".into()),
+        host: host.clone(),
+        port: *port,
+        sender_comp_id: sender_comp_id.clone(),
+        target_comp_id: target_comp_id.clone(),
         ssl: true, // Binance FIX requires TLS.
         heartbeat_secs: 30,
     };
@@ -338,5 +428,74 @@ pub fn start_binance(
     match start_session(dialect, cfg, "binance", health, pool, kafka, position_changed_tx, read_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::BrokerCredentials;
+
+    /// `PgPool::connect_lazy` builds a pool without ever connecting — safe here
+    /// because every test below hits a guard that returns `None` before the
+    /// pool, network, or QuickFIX are touched at all.
+    fn lazy_pool() -> PgPool {
+        PgPool::connect_lazy("postgres://localhost/oms_test_never_connects")
+            .expect("connect_lazy never actually connects")
+    }
+
+    fn alpaca_cred() -> BrokerCredentials {
+        BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() }
+    }
+
+    fn ibkr_cred() -> BrokerCredentials {
+        BrokerCredentials::IbkrFix {
+            host: "h".into(),
+            port: 4001,
+            sender_comp_id: "S".into(),
+            target_comp_id: "T".into(),
+            password: "p".into(),
+            ssl: true,
+        }
+    }
+
+    /// A caller bug (the wrong credential variant reaching `start_ibkr`) must be
+    /// logged and refused, not panic or attempt a connection built from garbage
+    /// data — see the doc comment on `start_ibkr`. `#[tokio::test]`, not
+    /// `#[test]`: `PgPool::connect_lazy` spawns a background maintenance task at
+    /// construction even though it never actually connects, so it needs a Tokio
+    /// context to exist in.
+    #[tokio::test]
+    async fn start_ibkr_refuses_a_non_ibkr_credential() {
+        let health = StreamHealthRegistry::new();
+        let result = start_ibkr("PAPER", &alpaca_cred(), &health, lazy_pool(), None, None);
+        assert!(result.is_none());
+    }
+
+    /// Same guard, the other direction.
+    #[tokio::test]
+    async fn start_binance_refuses_a_non_binance_credential() {
+        let health = StreamHealthRegistry::new();
+        let result = start_binance("PAPER", &ibkr_cred(), &health, lazy_pool(), None, None);
+        assert!(result.is_none());
+    }
+
+    /// The empty-host guard added this round: a REST-only Binance credential
+    /// (empty `host`, per `import_env::scan_env` — REST never reads a FIX host)
+    /// must refuse FIX transport rather than attempt a QuickFIX connection to
+    /// `SocketConnectHost = ""`.
+    #[tokio::test]
+    async fn start_binance_refuses_an_empty_fix_host() {
+        let health = StreamHealthRegistry::new();
+        let creds = BrokerCredentials::BinanceFix {
+            host: "".into(),
+            port: 9000,
+            sender_comp_id: "OMS".into(),
+            target_comp_id: "SPOT".into(),
+            api_key: "k".into(),
+            private_key: "pem".into(),
+        };
+        let result = start_binance("PAPER", &creds, &health, lazy_pool(), None, None);
+        assert!(result.is_none());
     }
 }

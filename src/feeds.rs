@@ -14,7 +14,8 @@ use dataprovider::FeedSymbology;
 /// conditional on credentials (see `serve`); coverage is not, so
 /// [`crate::preflight`] can still report what a feed *would* price.
 pub static ALL: &[&dyn FeedSymbology] = &[
-    &crate::opra_stream::DatabentoOpraFeed,
+    // Symbology only — this never runs a session, so the key is a placeholder.
+    &crate::opra_stream::DatabentoOpraFeed::new(String::new()),
     &crate::binance_feed::BinanceFeed,
     &crate::bybit_feed::BybitFeed,
 ];

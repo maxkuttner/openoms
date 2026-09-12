@@ -59,9 +59,11 @@ still missing (the common case is the role existing but `CREATE DATABASE`
 having failed) and finishes migrations, grants and seeding, all of which are
 safe to re-run.
 
-The instrument catalog starts empty. Put broker credentials in `.env` and it fills
-itself on the next boot; see [Loading instruments](#loading-instruments). Create
-portfolios, accounts and trading identities in the cockpit.
+The instrument catalog starts empty. Import broker credentials with `oms config
+import-env` and it fills itself on the next boot; see [Loading
+instruments](#loading-instruments) and [Broker and feed
+credentials](#broker-and-feed-credentials). Create portfolios, accounts and
+trading identities in the cockpit.
 
 ### What each step does
 
@@ -129,7 +131,50 @@ has never been initialized, or an install from before this fallback existed has 
 `oms` role password this command has no way to reconstruct.
 
 `.env` is an override file, not a prerequisite — copy `.env.example` when you need
-broker credentials, a real admin password, or a non-local database.
+a real admin password or a non-local database. Broker and feed credentials do not
+go here; see [Broker and feed credentials](#broker-and-feed-credentials).
+
+## Broker and feed credentials
+
+Broker and feed API keys live encrypted in Postgres (`oms.broker_connection` and
+`oms.feed_connection`), sealed with the master key `oms init` wrote to
+`oms.toml`. **The environment is no longer read for them** — `ALPACA_*`,
+`BINANCE_*` and `DATABENTO_API_KEY` are not consulted at boot, only `*_ENV`
+(which environment to route to), `*_TRANSPORT` and `BINANCE_FEED_WS_URL`.
+
+Get credentials into the store with:
+
+```sh
+cargo run -- config import-env
+```
+
+a one-shot migration off the old `{BROKER}_{ENV}_*` variables in `.env`: it seals
+whatever it finds there into the store and reports what it imported (and what it
+skipped, and why — e.g. a key set without its matching secret). Run it once, then
+delete the credential lines from `.env`; they do nothing there any more. A
+cockpit screen for entering credentials directly, without going through `.env`
+first, is coming in a later plan.
+
+To change the master key itself, `cargo run -- config rotate-key` re-wraps every
+stored credential under a freshly generated key and prints it — the rows are
+already re-wrapped by the time the command returns, so the printed key is the
+only remaining copy outside the database until you save it into `oms.toml` as
+`oms.master_key`. Keep the old key around until that edit is saved.
+
+**Losing `oms.toml` loses every stored credential** — there is no recovery path
+that doesn't involve re-entering them. Back it up, and back it up again after
+`rotate-key`.
+
+With no master key at all: a fresh install with nothing stored yet still starts
+(there is nothing to decrypt). Once any credential has been imported, starting
+without a master key — or with one that decrypts *none* of what's stored — is
+refused, naming the problem, rather than starting with adapters silently
+unregistered. A key that decrypts some rows but not others still starts: one
+stale or wrong credential must not be able to disarm every other one — the
+unusable rows are logged (`credentials unusable: ...`) so they can be fixed.
+
+A credential change needs a restart to take effect; the store is read once at
+boot, not watched for changes.
 
 ## Roles and schemas
 
@@ -189,9 +234,11 @@ Upgrading an existing install is `git pull && cargo run -- database migrate`.
 The instrument catalog comes from brokers, not from a bundled list. There are two
 ways in, and they run the same code.
 
-**Automatic.** With broker credentials in `.env`, an empty catalog is populated in
-the background on boot. This is the normal path after `database init` — start the
-server, and instruments appear. The sync can take minutes for full option chains.
+**Automatic.** With broker credentials imported into the store (see [Broker and
+feed credentials](#broker-and-feed-credentials)), an empty catalog is populated
+in the background on boot. This is the normal path after `database init` and
+`oms config import-env` — start the server, and instruments appear. The sync can
+take minutes for full option chains.
 
 ```sh
 # OMS_SYNC_ON_BOOT=never       # opt out entirely

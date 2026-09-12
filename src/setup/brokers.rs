@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::{BrokerInstrument, InstrumentProvider};
+use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::setup::catalog;
 
 const BATCH: usize = 4000;
@@ -56,24 +57,28 @@ impl Broker {
         format!("{}-{}", self.code().to_lowercase(), self.environment().to_lowercase())
     }
 
-    /// Whether this broker's credentials are present in the environment.
+    /// Whether this broker has a usable credential in the store — its
+    /// conventional `broker_connection.code` (e.g. "alpaca-paper") appears in
+    /// `connections` with a `Configured` credential.
     ///
-    /// The single source of truth for "can we sync this broker": the same env vars
-    /// `build_alpaca`/`build_binance` require, so cred *detection* (boot-time
-    /// auto-sync) and cred *use* (constructing the adapter) can never disagree.
-    pub fn has_creds(self) -> bool {
-        let set = |k: &str| env::var(k).is_ok_and(|v| !v.is_empty());
-        match self {
-            Broker::Alpaca => {
-                let e = alpaca_env();
-                set(&format!("ALPACA_{e}_API_KEY")) && set(&format!("ALPACA_{e}_API_SECRET"))
-            }
-            Broker::Binance => {
-                let e = binance_env();
-                set(&format!("BINANCE_{e}_API_KEY")) && set(&format!("BINANCE_{e}_PRIVATE_KEY_PATH"))
-            }
-        }
+    /// This is now the single source of truth for "can we sync this broker":
+    /// `run` (below) sources `build_alpaca`/`build_binance`'s credential from the
+    /// same store, so cred *detection* (`bootstrap::will_sync_on_boot`/
+    /// `spawn_sync`) and cred *use* (`run`) can never disagree — mirroring the
+    /// guarantee this method's doc comment made before the credential store
+    /// existed, when both sides read the environment instead.
+    pub fn has_creds(self, connections: &[Connection<BrokerCredentials>]) -> bool {
+        connections
+            .iter()
+            .any(|c| c.code == self.connection_code() && matches!(c.credentials, CredentialState::Configured(_)))
     }
+}
+
+/// Every broker in `Broker::ALL` whose store credential is `Configured`.
+/// Computed once by `serve()` and reused for both `will_sync_on_boot` and
+/// `spawn_sync`, so the two cannot disagree about which brokers are eligible.
+pub fn brokers_with_creds(connections: &[Connection<BrokerCredentials>]) -> Vec<Broker> {
+    Broker::ALL.iter().copied().filter(|b| b.has_creds(connections)).collect()
 }
 
 fn alpaca_env() -> String {
@@ -108,6 +113,61 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&super::database_url()?).await?;
+
+    // Credentials come from the store — the same load `serve()` and
+    // `config import-env` use — so this command and boot-time adapter
+    // registration can never disagree about what a broker is configured with.
+    // Same three-way key handling as `serve()`: absent-and-nothing-stored is a
+    // normal fresh install, absent-with-credentials-stored is fatal, and an
+    // invalid key is fatal.
+    let master = match crate::config::master_key(crate::config::load()) {
+        Some(Ok(k)) => Some(k),
+        Some(Err(e)) => return Err(format!("invalid master key: {e}").into()),
+        None => None,
+    };
+    if master.is_none() {
+        // Fail safe, not fail open: a query failure must not silently disarm
+        // this the way `.unwrap_or(false)` would — see the identical reasoning
+        // in `serve()`.
+        let might_be_stored = match crate::credentials::any_credentials_stored(&pool).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("could not determine whether credentials are stored, assuming they may be: {e}");
+                true
+            }
+        };
+        if might_be_stored {
+            return Err(
+                "credentials are stored but no master key is configured \
+                 (set oms.master_key in oms.toml, or OMS_MASTER_KEY)"
+                    .into(),
+            );
+        }
+    }
+
+    let code = args.broker.connection_code();
+    let connections = crate::credentials::load_brokers(&pool, master.as_ref()).await?;
+    let creds = match connections.into_iter().find(|c| c.code == code) {
+        Some(Connection { credentials: CredentialState::Configured(creds), .. }) => creds,
+        Some(Connection { credentials: CredentialState::Unconfigured, .. }) => {
+            return Err(format!(
+                "{code}: no credentials stored — run `oms config import-env` (with the \
+                 relevant env vars set) or configure it, then retry"
+            )
+            .into());
+        }
+        Some(Connection { credentials: CredentialState::Error(e), .. }) => {
+            return Err(format!("{code}: credentials unusable: {e}").into());
+        }
+        None => {
+            return Err(format!(
+                "{code}: no broker_connection row — start the server once to create it \
+                 (ensure_broker_connections runs at boot), then retry"
+            )
+            .into());
+        }
+    };
+
     let underlyings: Vec<String> = args
         .underlyings
         .split(',')
@@ -116,8 +176,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     let provider: Box<dyn InstrumentProvider> = match args.broker {
-        Broker::Alpaca => Box::new(build_alpaca()?),
-        Broker::Binance => Box::new(build_binance()?),
+        Broker::Alpaca => Box::new(build_alpaca(&creds)?),
+        Broker::Binance => Box::new(build_binance(&creds)?),
     };
 
     info!("fetching {} catalog …", args.broker.code());
@@ -190,28 +250,31 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Build an `AlpacaAdapter` standalone from env (`ALPACA_ENV` + `ALPACA_{ENV}_API_KEY/SECRET`).
-fn build_alpaca() -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
-    let env_name = alpaca_env();
-    let key = env::var(format!("ALPACA_{env_name}_API_KEY"))
-        .map_err(|_| format!("ALPACA_{env_name}_API_KEY must be set"))?;
-    let secret = env::var(format!("ALPACA_{env_name}_API_SECRET"))
-        .map_err(|_| format!("ALPACA_{env_name}_API_SECRET must be set"))?;
-    Ok(AlpacaAdapter::new(key, secret, &env_name))
+/// Build an `AlpacaAdapter` from a store credential. `ALPACA_ENV` still selects
+/// *which* environment to sync (PAPER vs LIVE) — that is a mode selector, not a
+/// secret — but the key/secret themselves come from `creds`, not the environment.
+fn build_alpaca(creds: &BrokerCredentials) -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
+    match creds {
+        BrokerCredentials::Alpaca { key, secret } => {
+            Ok(AlpacaAdapter::new(key.clone(), secret.clone(), &alpaca_env()))
+        }
+        // `run` looked this credential up by `Broker::Alpaca.connection_code()`,
+        // so any other variant here is a programming error (a code/kind
+        // mismatch in the store), not something an operator can hit.
+        other => Err(format!("alpaca-* credential is not an Alpaca credential: {other:?}").into()),
+    }
 }
 
-/// Build a `BinanceAdapter` from env. The catalog endpoint (exchangeInfo) is
-/// public, but the adapter constructor needs a valid key pair; reuse the server
-/// wiring (`BINANCE_{ENV}_API_KEY` + `BINANCE_{ENV}_PRIVATE_KEY_PATH`).
-fn build_binance() -> Result<BinanceAdapter, Box<dyn std::error::Error>> {
-    let env_name = binance_env();
-    let key = env::var(format!("BINANCE_{env_name}_API_KEY"))
-        .map_err(|_| format!("BINANCE_{env_name}_API_KEY must be set"))?;
-    let pem_path = env::var(format!("BINANCE_{env_name}_PRIVATE_KEY_PATH"))
-        .map_err(|_| format!("BINANCE_{env_name}_PRIVATE_KEY_PATH must be set"))?;
-    let pem = std::fs::read_to_string(&pem_path)
-        .map_err(|e| format!("reading {pem_path}: {e}"))?;
-    BinanceAdapter::new(key, &pem, &env_name).map_err(Into::into)
+/// Build a `BinanceAdapter` from a store credential. The catalog endpoint
+/// (exchangeInfo) is public, but the adapter constructor needs a valid key pair
+/// regardless — `private_key` is PEM contents already (no file read needed).
+fn build_binance(creds: &BrokerCredentials) -> Result<BinanceAdapter, Box<dyn std::error::Error>> {
+    match creds {
+        BrokerCredentials::BinanceFix { api_key, private_key, .. } => {
+            BinanceAdapter::new(api_key.clone(), private_key, &binance_env()).map_err(Into::into)
+        }
+        other => Err(format!("binance-* credential is not a Binance credential: {other:?}").into()),
+    }
 }
 
 /// A broker mapping row ready to upsert into `broker_instrument`.
@@ -293,4 +356,106 @@ async fn bulk_upsert_broker_instrument(
     .await?;
 
     Ok(chunk.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `has_creds`/`brokers_with_creds` derive the connection code from
+    /// `ALPACA_ENV`/`BINANCE_ENV` (via `connection_code()`), so a hardcoded
+    /// `"alpaca-paper"`/`"binance-paper"` in a test only holds while those vars
+    /// are unset or `PAPER` — an ambient `ALPACA_ENV=LIVE` in the shell (or a
+    /// prior test in the same binary) would silently break the assertion. These
+    /// tests mutate process env, so they must not run concurrently with anything
+    /// else reading the same keys — serialized by `ENV_LOCK`, same pattern as
+    /// `setup::import_env::tests`, which has its own separate `ENV_LOCK`
+    /// instance. The two don't coordinate with each other, and don't need to
+    /// today: every test on both sides only ever *clears*
+    /// `ALPACA_ENV`/`BINANCE_ENV`, never sets them. If a test in either module
+    /// starts *setting* one of those vars instead, the two locks must be
+    /// merged into one shared lock first — otherwise tests in the two modules
+    /// could interleave and see each other's env mutations.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn clear() {
+        std::env::remove_var("ALPACA_ENV");
+        std::env::remove_var("BINANCE_ENV");
+    }
+
+    fn connection(code: &str, credentials: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
+        Connection {
+            code: code.to_string(),
+            kind: "TEST".to_string(),
+            environment: Some("PAPER".to_string()),
+            status: "ACTIVE".to_string(),
+            credentials,
+            credentials_updated_at: None,
+        }
+    }
+
+    fn alpaca_cred() -> BrokerCredentials {
+        BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() }
+    }
+
+    /// `has_creds` must key off the connection code, not just "is anything
+    /// Configured somewhere in the list" — a Binance row must not make Alpaca
+    /// look credentialed.
+    #[test]
+    fn has_creds_is_true_only_for_a_configured_row_with_the_matching_code() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let alpaca_code = Broker::Alpaca.connection_code();
+        let connections = vec![connection(&alpaca_code, CredentialState::Configured(alpaca_cred()))];
+        let alpaca_has = Broker::Alpaca.has_creds(&connections);
+        let binance_has = Broker::Binance.has_creds(&connections);
+        clear();
+
+        assert!(alpaca_has);
+        assert!(!binance_has);
+    }
+
+    /// `Unconfigured` and `Error` are both "not usable" — neither counts as having
+    /// credentials, only `Configured` does.
+    #[test]
+    fn has_creds_is_false_for_unconfigured_and_error_rows() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let connections = vec![
+            connection(&Broker::Alpaca.connection_code(), CredentialState::Unconfigured),
+            connection(&Broker::Binance.connection_code(), CredentialState::Error("bad key".into())),
+        ];
+        let alpaca_has = Broker::Alpaca.has_creds(&connections);
+        let binance_has = Broker::Binance.has_creds(&connections);
+        clear();
+
+        assert!(!alpaca_has);
+        assert!(!binance_has);
+    }
+
+    /// A code that never appears in the list (no row at all) is indistinguishable
+    /// from Unconfigured — no row means no credential either.
+    #[test]
+    fn has_creds_is_false_when_no_row_exists_for_the_code() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let alpaca_has = Broker::Alpaca.has_creds(&[]);
+        clear();
+
+        assert!(!alpaca_has);
+    }
+
+    #[test]
+    fn brokers_with_creds_returns_only_the_configured_subset() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear();
+        let connections = vec![
+            connection(&Broker::Alpaca.connection_code(), CredentialState::Configured(alpaca_cred())),
+            connection(&Broker::Binance.connection_code(), CredentialState::Unconfigured),
+        ];
+        let result = brokers_with_creds(&connections);
+        clear();
+
+        assert_eq!(result, vec![Broker::Alpaca]);
+    }
 }

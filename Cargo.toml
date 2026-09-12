@@ -21,7 +21,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tower = "0.4"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13.1", features = ["json"] }
 base64 = "0.22"
@@ -29,6 +29,7 @@ bcrypt = "0.15"
 toml = "0.8"
 rpassword = "7"
 rand = "0.8"
+aes-gcm = "0.10"
 databento = { version = "0.54.0", default-features = false, features = ["live", "chrono"]}
 csv = "1"
 

@@ -18,13 +18,18 @@ async fn catalog_nonempty(pool: &PgPool) -> Result<bool, sqlx::Error> {
     Ok(n > 0)
 }
 
-/// Ensure a `broker_connection` exists for every broker whose creds are present.
+/// Ensure a `broker_connection` exists for every broker in `Broker::ALL`.
 ///
-/// This is routing config, not a fixture: a credentialed broker with no connection
-/// row cannot take an order at all. Runs as the `oms` role (which owns the schema),
-/// idempotent on `code`.
+/// Routing config, not a fixture — but unlike the env-based world this used to
+/// run in, a connection row is no longer evidence that credentials are present;
+/// it is the target a credential attaches to (`oms config import-env`, and
+/// eventually the cockpit, both write into an existing row rather than creating
+/// one — see `import_env::run`). So this now runs unconditionally: an
+/// uncredentialed row simply reads as "needs setup", exactly like a feed row
+/// already does. Runs as the `oms` role (which owns the schema), idempotent on
+/// `code`.
 pub async fn ensure_broker_connections(pool: &PgPool) {
-    for broker in Broker::ALL.iter().copied().filter(|b| b.has_creds()) {
+    for broker in Broker::ALL.iter().copied() {
         let code = broker.connection_code();
         let res = sqlx::query(
             "INSERT INTO oms.broker_connection (code, broker_code, environment, status) \
@@ -51,16 +56,18 @@ pub fn sync_on_boot_enabled() -> bool {
     !env::var("OMS_SYNC_ON_BOOT").is_ok_and(|v| v.eq_ignore_ascii_case("never"))
 }
 
-/// Whether a boot-time sync will run: enabled, catalog empty, and some broker has
-/// creds. The caller uses this to tell preflight an empty catalog is expected.
-pub async fn will_sync_on_boot(pool: &PgPool) -> bool {
-    sync_on_boot_enabled()
-        && Broker::ALL.iter().any(|b| b.has_creds())
-        && !catalog_nonempty(pool).await.unwrap_or(true)
+/// Whether a boot-time sync will run: enabled, catalog empty, and `synced_brokers`
+/// (the store-credentialed subset `serve()` already computed via
+/// `brokers::brokers_with_creds`, so this and [`spawn_sync`] can never disagree
+/// about which brokers are eligible) is non-empty. The caller uses this to tell
+/// preflight an empty catalog is expected.
+pub async fn will_sync_on_boot(pool: &PgPool, synced_brokers: &[Broker]) -> bool {
+    sync_on_boot_enabled() && !synced_brokers.is_empty() && !catalog_nonempty(pool).await.unwrap_or(true)
 }
 
-/// Populate the instrument catalog from every broker whose creds are present, on a
-/// dedicated background thread.
+/// Populate the instrument catalog from every broker in `pending` (the
+/// store-credentialed set from [`will_sync_on_boot`]), on a dedicated background
+/// thread.
 ///
 /// A separate thread with its own current-thread runtime, not `tokio::spawn`: the
 /// sync path threads a non-`Send` boxed error across its awaits, and this keeps that
@@ -68,8 +75,8 @@ pub async fn will_sync_on_boot(pool: &PgPool) -> bool {
 /// The job is genuinely independent — `setup::brokers::run` opens its own pool as
 /// the `oms` role — so nothing is shared with the server runtime. Caller checks
 /// [`will_sync_on_boot`] first.
-pub fn spawn_sync() {
-    std::thread::spawn(|| {
+pub fn spawn_sync(pending: Vec<Broker>) {
+    std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
@@ -77,18 +84,22 @@ pub fn spawn_sync() {
                 return;
             }
         };
-        rt.block_on(sync_all_brokers());
+        rt.block_on(sync_all_brokers(pending));
     });
 }
 
-/// Run `sync-broker` for each broker whose creds are present. Each is independent:
-/// one being unreachable logs and does not stop the others, nor the server.
-async fn sync_all_brokers() {
+/// Run `sync-broker` for each broker in `pending`. Each is independent: one being
+/// unreachable logs and does not stop the others, nor the server.
+///
+/// `pending` reflects the store's view of who is credentialed (from
+/// [`will_sync_on_boot`]); `brokers::run` sources its own credential from the same
+/// store, so there is nothing to re-filter here — a broker in `pending` is
+/// guaranteed to have a `Configured` credential `run` can read.
+async fn sync_all_brokers(pending: Vec<Broker>) {
     let underlyings = env::var("OMS_SYNC_UNDERLYINGS").unwrap_or_default();
-    let brokers: Vec<Broker> = Broker::ALL.iter().copied().filter(|b| b.has_creds()).collect();
-    info!("bootstrap: catalog empty — syncing {} broker(s) in background", brokers.len());
+    info!("bootstrap: catalog empty — syncing {} broker(s) in background", pending.len());
 
-    for broker in brokers {
+    for broker in pending {
         let args = brokers::Args {
             broker,
             underlyings: underlyings.clone(),
@@ -107,29 +118,11 @@ async fn sync_all_brokers() {
 mod tests {
     use super::*;
 
-    /// Cred detection reads the `{BROKER}_{ENV}_*` vars for the active env. These
-    /// tests mutate process env, so they must not run in parallel with anything else
-    /// reading the same keys — serialized here by living in one test.
-    #[test]
-    fn alpaca_creds_detected_only_when_both_present() {
-        env::set_var("ALPACA_ENV", "PAPER");
-        env::remove_var("ALPACA_PAPER_API_KEY");
-        env::remove_var("ALPACA_PAPER_API_SECRET");
-        assert!(!Broker::Alpaca.has_creds());
-
-        env::set_var("ALPACA_PAPER_API_KEY", "k");
-        assert!(!Broker::Alpaca.has_creds(), "key alone is not enough");
-
-        env::set_var("ALPACA_PAPER_API_SECRET", "s");
-        assert!(Broker::Alpaca.has_creds());
-
-        // An empty value is not a credential.
-        env::set_var("ALPACA_PAPER_API_SECRET", "");
-        assert!(!Broker::Alpaca.has_creds());
-
-        env::remove_var("ALPACA_PAPER_API_KEY");
-        env::remove_var("ALPACA_PAPER_API_SECRET");
-    }
+    // `Broker::has_env_creds` and its test (`alpaca_env_creds_detected_only_when_both_present`)
+    // were removed along with the function: `setup::brokers::run` now sources
+    // credentials from the store like everything else, so there is no more
+    // env-reading cred-detection path for this module to test. `has_creds`, the
+    // store-based check, is covered in `setup::brokers::tests` instead.
 
     #[test]
     fn sync_on_boot_defaults_on_and_only_never_disables() {

@@ -17,6 +17,7 @@
 - **Rust edition 2021.** Doc comments explain *why*, not *what*.
 - **AES-256-GCM.** Stored bytes are `[12-byte nonce][ciphertext‖tag]`, nonce fresh per write from the OS RNG.
 - **The connection's `code` is the AAD**, binding each blob to its row so a copied `credentials` value cannot decrypt onto a different connection.
+- **Because the code is the AAD, renaming a connection orphans its credentials.** Any path that can change a `code` must decrypt under the old code and re-seal under the new one in the same transaction, or must refuse the rename. Nothing in this plan renames a connection; Plan 4's editing UI is where this bites, and it is called out in the spec's follow-ups.
 - **Secrets never reach a log, a `Debug`, an error message, or an HTTP response.** Every credential type gets a hand-written redacting `Debug`, matching the existing impls in `src/config.rs` and `src/setup/init.rs`.
 - **No plaintext credential is ever written to disk** — not to `oms.toml`, not to a temp file.
 - **After this plan, the environment is no longer consulted for broker or feed credentials.** No fallback, no precedence: the database is the only source. `import-env` is the one-shot bridge.
@@ -517,14 +518,34 @@ mod tests {
     /// out of the database, so it must survive the round trip exactly.
     #[test]
     fn json_round_trips_every_variant() {
-        for c in [alpaca(), binance()] {
-            let json = serde_json::to_vec(&c).expect("serialize");
-            let back: BrokerCredentials = serde_json::from_slice(&json).expect("deserialize");
-            assert_eq!(format!("{back:?}"), format!("{c:?}"));
+        // Assert on the secret VALUES, not on Debug output: Debug is redacted, so
+        // comparing rendered strings would pass even if a secret were lost in the
+        // round trip — the one thing this test exists to catch.
+        let json = serde_json::to_vec(&alpaca()).expect("serialize");
+        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
+            BrokerCredentials::Alpaca { key, secret } => {
+                assert_eq!(key, "AKTESTKEY123");
+                assert_eq!(secret, "SUPERSECRETVALUE");
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
+
+        let json = serde_json::to_vec(&binance()).expect("serialize");
+        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
+            BrokerCredentials::BinanceFix { host, port, api_key, private_key, target_comp_id, .. } => {
+                assert_eq!(host, "fix-oe.testnet.binance.vision");
+                assert_eq!(port, 9000);
+                assert_eq!(target_comp_id, "SPOT");
+                assert_eq!(api_key, "BNKEY999");
+                assert!(private_key.contains("MIIBSECRET"), "PEM body must survive intact");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
         let f = FeedCredentials::Databento { api_key: "db-key".into() };
-        let back: FeedCredentials = serde_json::from_slice(&serde_json::to_vec(&f).expect("ser")).expect("de");
-        assert!(matches!(back, FeedCredentials::Databento { .. }));
+        match serde_json::from_slice::<FeedCredentials>(&serde_json::to_vec(&f).expect("ser")).expect("de") {
+            FeedCredentials::Databento { api_key } => assert_eq!(api_key, "db-key"),
+        }
     }
 
     /// THE regression that matters: the redacted view is what reaches an HTTP
@@ -820,11 +841,12 @@ Append inside `mod tests` in `src/credentials.rs`. These test the decode path wi
     #[test]
     fn error_strings_carry_no_secret_material() {
         let sealed = seal(&key(), "alpaca-paper", b"not json at all");
-        if let CredentialState::Error(msg) = decode_broker(Some(&key()), "alpaca-paper", Some(sealed.clone())) {
-            assert!(!msg.contains("AAAA"));
-            for byte in sealed.iter().take(4) {
-                assert!(!msg.contains(&format!("{byte:02x}")) || msg.len() < 200);
-            }
+        // The plaintext here is "not json at all"; the message must not quote it,
+        // must not carry the key, and must not hex-dump the ciphertext.
+        if let CredentialState::Error(msg) = decode_broker(Some(&key()), "alpaca-paper", Some(sealed)) {
+            assert!(!msg.contains("not json at all"), "decrypted payload leaked: {msg}");
+            assert!(!msg.contains("AAAA"), "key material leaked: {msg}");
+            assert!(msg.len() < 120, "suspiciously long, likely dumping data: {msg}");
         } else {
             panic!("expected an error");
         }
@@ -1395,6 +1417,15 @@ Where `serve()` currently reads `ALPACA_*` and calls `fix::start_*`, instead:
 ```
 
 In the `Configured` arm, match the variant: `Alpaca` → `registry.register_alpaca(env, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env)))`; `IbkrFix` → `fix::start_ibkr(...)`; `BinanceFix` → `fix::start_binance(...)`. Take the environment from `conn.environment`.
+
+- [ ] **Step 2b: The Alpaca trade-update streams read the environment a second time**
+
+`serve()` reads the `ALPACA_*` pairs again around `main.rs:750`/`:758` to spawn
+`alpaca_stream::run`, which delivers execution reports. That is a separate read from
+the adapter registration above. Leaving it on the environment means adapters come
+from the store while execution reports stop arriving for a store-only credential.
+Take the key and secret from the same `Configured` credential used to register the
+adapter.
 
 - [ ] **Step 3: Do the same for the Databento feed**
 
