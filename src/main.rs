@@ -858,15 +858,21 @@ async fn serve() {
     // (stream_health, position_changed_tx/rx and marks_doorbells were created
     // before the broker registry so FIX sessions could use them.)
 
-    // Spawn Alpaca trade-update stream tasks (one per configured environment).
-    // Credentials come from `alpaca_creds`, stashed when the adapter was
-    // registered above — a second read of the store (let alone the environment)
-    // here could in principle see a different answer than what was just
-    // registered; reusing the same values makes that impossible by construction.
+    // Spawn Alpaca trade-update stream tasks (one per configured environment),
+    // registered in `StreamRegistry` under a distinct key
+    // (`reload::restart_alpaca_stream`'s `alpaca_exec_stream_code`) so a later
+    // credential swap can abort and respawn just this task rather than leaving
+    // fills arriving against a credential orders no longer route on — the same
+    // split Plan 2 closed at boot, reintroduced at reload without this. Boot
+    // exercises the exact call a runtime reload will use, same as
+    // `restart_databento_feed` below. Credentials come from `alpaca_creds`,
+    // stashed when the adapter was registered above — a second read of the
+    // store (let alone the environment) here could in principle see a
+    // different answer than what was just registered; reusing the same values
+    // makes that impossible by construction.
     for env_name in ["PAPER", "LIVE"] {
         if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), state.registry().get_alpaca(env_name)) {
-            let health = state.stream_health().handle("ALPACA", env_name, stream_health::StreamKind::Execution);
-            tokio::spawn(alpaca_stream::run(env_name, key.clone(), secret.clone(), state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
+            reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &registration_deps, state.streams());
         }
     }
 

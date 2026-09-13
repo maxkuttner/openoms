@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::adapters::alpaca::AlpacaAdapter;
+use crate::alpaca_stream;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::{BrokerRegistry, Transport};
 use crate::app_state::{DoorbellRegistry, StreamRegistry};
@@ -81,6 +82,27 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             }
         },
     }
+}
+
+/// True when reloading this connection also means restarting its execution
+/// stream — the task that delivers fills, separate from the adapter that
+/// routes orders. Only Alpaca has one: its trade-update stream is a plain
+/// websocket task spawned alongside the adapter, signing its own auth with a
+/// copy of the credential (`src/alpaca_stream.rs`). A FIX broker's execution
+/// reports arrive over the same session that routes its orders, so there is
+/// nothing separate to restart, and `classify` never reports `Registered` for
+/// one on reload anyway (see its doc comment) — so in practice this is only
+/// ever asked about a connection already known to be Alpaca.
+///
+/// Not yet called from production code: `build_registry`'s boot/reload loop
+/// rebuilds `alpaca_creds` fresh on every pass regardless (see
+/// `RegistrationOutput`'s doc comment), so today's callers already know to
+/// respawn unconditionally without asking. This is the decision Task 5's
+/// reload endpoint will consult once it reports outcomes per connection over
+/// HTTP. Exercised directly by the test below.
+#[allow(dead_code)]
+pub fn restarts_execution_stream(outcome: &ConnectionOutcome) -> bool {
+    matches!(outcome, ConnectionOutcome::Registered)
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential
@@ -345,6 +367,62 @@ pub fn restart_databento_feed(
     streams.insert("databento-opra", handle);
 }
 
+/// The `StreamRegistry` key for one environment's Alpaca execution stream.
+///
+/// Feed codes are connection codes ("databento-opra"); this is deliberately
+/// not one — the ":exec" suffix a connection code can never contain — so an
+/// execution stream can never collide with a feed entry in the same registry,
+/// and aborting one can never accidentally take out the other.
+fn alpaca_exec_stream_code(env_name: &str) -> String {
+    format!("alpaca-{}:exec", env_name.to_lowercase())
+}
+
+/// (Re)start one Alpaca environment's execution-report stream — the task that
+/// delivers fills — against a freshly built `adapter`, registering its handle
+/// in `streams` under `alpaca_exec_stream_code` (see there for why that key,
+/// not the connection code).
+///
+/// Unlike `restart_databento_feed`, there is no "nothing changed, skip it"
+/// case to consider: every call to `build_registry` builds a brand new
+/// `AlpacaAdapter` for each active, configured Alpaca connection (`classify`
+/// never reports `RestartRequired` for Alpaca), so this must run every time
+/// that happens. The stream signs its own websocket auth directly with `key`
+/// and `secret`, and holds `adapter` to post fills back through — both fresh
+/// on every call — so skipping the respawn would leave the previous stream's
+/// fills landing against an adapter the registry no longer serves orders
+/// through. That split is exactly what this task exists to close; aborting
+/// first (rather than only inserting) is what makes a reload also cover the
+/// case where nothing is running yet, same as `restart_databento_feed`.
+///
+/// Takes `deps` rather than its individual fields (pool, stream_health, kafka,
+/// position_changed_tx) both to stay under clippy's argument-count lint and
+/// because it is the same bundle `build_registry` already draws on — boot and
+/// a later reload share one source for these rather than each re-deriving or
+/// threading them through separately.
+pub fn restart_alpaca_stream(
+    env_name: &'static str,
+    key: String,
+    secret: String,
+    adapter: Arc<AlpacaAdapter>,
+    deps: &RegistrationDeps,
+    streams: &StreamRegistry,
+) {
+    let code = alpaca_exec_stream_code(env_name);
+    streams.abort_and_remove(&code);
+    let health = deps.stream_health.handle("ALPACA", env_name, StreamKind::Execution);
+    let handle = tokio::spawn(alpaca_stream::run(
+        env_name,
+        key,
+        secret,
+        deps.pool.clone(),
+        deps.kafka.clone(),
+        adapter,
+        health,
+        deps.position_changed_tx.clone(),
+    ));
+    streams.insert(code, handle);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +601,27 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// Swapping an Alpaca adapter must also restart its execution stream, or
+    /// orders route on the new credential while fills arrive on the old one.
+    #[test]
+    fn reloading_alpaca_also_restarts_its_execution_stream() {
+        let c = conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca()));
+        assert!(restarts_execution_stream(&classify(&c, false)));
+
+        let disabled = conn("alpaca-paper", "DISABLED", CredentialState::Configured(alpaca()));
+        assert!(!restarts_execution_stream(&classify(&disabled, false)));
+    }
+
+    /// The execution stream's registry key must never collide with a feed
+    /// code — `restart_databento_feed` keys the same `StreamRegistry` by bare
+    /// connection code ("databento-opra"), so an execution stream's key must
+    /// be shaped so it can never equal one, for any environment.
+    #[test]
+    fn alpaca_exec_stream_code_cannot_collide_with_a_feed_code() {
+        assert_eq!(alpaca_exec_stream_code("PAPER"), "alpaca-paper:exec");
+        assert_eq!(alpaca_exec_stream_code("LIVE"), "alpaca-live:exec");
+        assert_ne!(alpaca_exec_stream_code("PAPER"), "databento-opra");
     }
 }
