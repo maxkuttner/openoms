@@ -546,6 +546,25 @@ pub async fn update_account(
 
 // ── Broker connections ────────────────────────────────────────────────────────
 
+/// Rejects a `broker_code` the adapter registry could never be reached
+/// under. `broker_code` is unconstrained `TEXT` — no CHECK, no FK — but
+/// `reload.rs` registers adapters under hardcoded literals (`"IBKR"`,
+/// `"BINANCE"`, …), keyed by this same column. A code that saves clean here
+/// but doesn't match one of those literals passes reload silently and then
+/// 503s every order routed through it — see `setup::brokers::known_broker_codes`
+/// for why the accepted set is sourced from there rather than repeated here.
+fn validate_broker_code(code: &str) -> Result<(), AdminError> {
+    let known = crate::setup::brokers::known_broker_codes();
+    if known.contains(&code) {
+        Ok(())
+    } else {
+        Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("broker_code must be one of: {} (got {code:?})", known.join(", ")),
+        })
+    }
+}
+
 #[utoipa::path(
     post, path = "/admin/broker-connections", tag = "admin",
     request_body = CreateBrokerConnection,
@@ -566,6 +585,7 @@ pub async fn create_broker_connection(
             message: "environment must be PAPER or LIVE".to_string(),
         });
     }
+    validate_broker_code(&payload.broker_code)?;
     info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
@@ -737,6 +757,9 @@ pub async fn update_broker_connection(
                 message: "environment must be PAPER or LIVE".to_string(),
             });
         }
+    }
+    if let Some(ref broker_code) = payload.broker_code {
+        validate_broker_code(broker_code)?;
     }
     info!(broker_connection_code = %code, "admin update broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
@@ -2698,5 +2721,36 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup after");
+    }
+
+    #[test]
+    fn a_canonical_broker_code_is_accepted() {
+        assert!(validate_broker_code("ALPACA").is_ok());
+        assert!(validate_broker_code("BINANCE").is_ok());
+        assert!(validate_broker_code("IBKR").is_ok());
+    }
+
+    /// The registry keys adapters are registered under are case-sensitive
+    /// literals (`reload.rs`); a code that only differs in case looks fine at
+    /// save time and at reload, then 503s every order — the exact hazard this
+    /// validation exists to close.
+    #[test]
+    fn a_differently_cased_broker_code_is_rejected() {
+        let err = validate_broker_code("binance").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_unknown_broker_code_is_rejected() {
+        let err = validate_broker_code("COINBASE").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn the_error_names_the_accepted_values() {
+        let err = validate_broker_code("nope").unwrap_err();
+        assert!(err.message.contains("ALPACA"), "{}", err.message);
+        assert!(err.message.contains("BINANCE"), "{}", err.message);
+        assert!(err.message.contains("IBKR"), "{}", err.message);
     }
 }
