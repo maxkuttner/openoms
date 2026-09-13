@@ -61,6 +61,65 @@ export interface BrokerConnection {
   updated_at: string;
 }
 
+// A configured feed connection row (distinct from FeedSummary, which is the
+// ranked provider/instrument-class policy). Mirrors admin.rs's
+// FeedConnectionSummary.
+export interface FeedConnectionSummary {
+  code: string;
+  provider: string;
+  dataset: string | null;
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// --- Credentials (src/admin.rs, src/credentials.rs) -----------------------
+//
+// Shared by broker-connections and feed-connections: GET/PUT/DELETE
+// .../credentials and POST .../credentials/test all speak these shapes.
+
+export interface RedactedField {
+  name: string;
+  value: string | null;
+  secret: boolean;
+}
+
+export interface RedactedCredentials {
+  code: string;
+  state: "configured" | "unconfigured" | "error";
+  /** Populated only when state === "configured". */
+  fields: RedactedField[];
+  /** Set only when state === "error". */
+  message: string | null;
+  updated_at: string | null;
+}
+
+export interface TestResponse {
+  tested: boolean;
+  ok: boolean;
+  message: string | null;
+}
+
+// Serde external tagging on the Rust side (reload::ConnectionOutcome): unit
+// variants serialize as bare strings, the one payload-carrying variant as an
+// object — `{ Failed: "reason" }`.
+export type ConnectionOutcome =
+  | "Registered"
+  | "Unconfigured"
+  | "Disabled"
+  | "RestartRequired"
+  | { Failed: string };
+
+export interface SaveResponse {
+  redacted: RedactedCredentials;
+  /** false for FIX (IbkrFix/BinanceFix) — never checked before writing. */
+  tested: boolean;
+  /** Present exactly when tested === false. */
+  message: string | null;
+  /** null only if the reload report unexpectedly lacked an entry for this code. */
+  reload: ConnectionOutcome | null;
+}
+
 export interface ApiKeyRecord {
   id: string;
   principal_id: string;
