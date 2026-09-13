@@ -1,5 +1,11 @@
 # Live Credential Reload Implementation Plan
 
+**Status (2026-09-13):** All six tasks implemented and individually reviewed;
+final review fixes and HTTP/store verification complete. See
+`../reports/2026-09-13-live-credential-reload-verification.md` for executed checks
+and remaining boundaries. The task checkboxes below are the original execution
+recipe; they are not the current status ledger.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Apply a changed credential without restarting the server — for the connections where that is actually safe — and give the cockpit a reload trigger to call.
