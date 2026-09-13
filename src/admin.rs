@@ -1743,6 +1743,58 @@ pub async fn delete_feed_connection_credentials(
     Ok(Json(redact_connection(conn)))
 }
 
+/// Test the credential already stored for a feed connection, changing
+/// nothing. See `test_broker_connection_credentials` — identical shape,
+/// backed by `load_feeds`/`test_feed` instead of `load_brokers`/`test_broker`.
+/// Unlike FIX, a stored Databento key genuinely gets tested here: `test_feed`
+/// runs the same connect-and-auth handshake as the save path's pre-write
+/// check, so this can return a real pass or fail rather than `NotTestable`.
+#[utoipa::path(
+    post, path = "/admin/feed-connections/{code}/credentials/test", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    responses(
+        (status = 200, description = "Test outcome for the stored credential", body = TestResponse),
+        (status = 400, description = "No credential is stored for this connection"),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the stored credential could not be decrypted"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn test_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<TestResponse>, AdminError> {
+    info!(feed_connection_code = %code, "admin test feed connection credentials");
+
+    let master = resolve_master_key()?;
+    let connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    let creds = match conn.credentials {
+        CredentialState::Configured(c) => c,
+        CredentialState::Unconfigured => {
+            return Err(AdminError {
+                status: StatusCode::BAD_REQUEST,
+                message: "no credential is stored for this connection".into(),
+            });
+        }
+        CredentialState::Error(e) => {
+            return Err(AdminError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("stored credential could not be decrypted: {e}"),
+            });
+        }
+    };
+
+    let outcome = credentials_api::test_feed(&creds).await;
+    Ok(Json(test_response(&outcome)))
+}
+
 // ── API key management ────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

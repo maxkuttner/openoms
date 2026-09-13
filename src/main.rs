@@ -117,6 +117,7 @@ mod reload_tests;
         admin::get_feed_connection_credentials,
         admin::put_feed_connection_credentials,
         admin::delete_feed_connection_credentials,
+        admin::test_feed_connection_credentials,
         admin::reload_connections,
         admin::create_risk_limit,
         admin::list_risk_limits,
@@ -1137,6 +1138,10 @@ async fn serve() {
                 .put(admin::put_feed_connection_credentials)
                 .delete(admin::delete_feed_connection_credentials),
         )
+        .route(
+            "/admin/feed-connections/:code/credentials/test",
+            post(admin::test_feed_connection_credentials),
+        )
         .route("/admin/connections/reload", post(admin::reload_connections))
         .route(
             "/admin/principals/:id/grants",
@@ -1234,6 +1239,7 @@ mod tests {
         assert!(json.contains("/admin/broker-connections/{code}/credentials/test"));
         assert!(json.contains("/admin/feed-connections"));
         assert!(json.contains("/admin/feed-connections/{code}/credentials"));
+        assert!(json.contains("/admin/feed-connections/{code}/credentials/test"));
         assert!(json.contains("SaveResponse"));
         assert!(json.contains("TestResponse"));
         assert!(json.contains("CredentialSubmission"));
