@@ -189,6 +189,11 @@ pub enum TestOutcome {
 ///
 /// Alpaca gets a real check: `GET /v2/account` is a lightweight, read-only,
 /// sub-second call, so a wrong key fails loudly before it is ever saved.
+/// `environment` ("PAPER" | "LIVE") must be the *connection's own*
+/// environment, not a hardcoded literal — `AlpacaAdapter::new` picks the live
+/// endpoint only for exactly `"LIVE"`, so a real live credential tested
+/// against a hardcoded `"PAPER"` would 401 and the caller's gate would
+/// refuse a credential that is perfectly valid.
 ///
 /// IBKR and Binance are FIX. The only way to know a FIX credential is good is
 /// to log on with it, and this process already owns the one FIX session per
@@ -197,10 +202,10 @@ pub enum TestOutcome {
 /// second logon attempt against it here would collide with that session
 /// rather than test anything). So this deliberately does not attempt one and
 /// says so via `NotTestable`, rather than reporting a pass it did not earn.
-pub async fn test_broker(creds: &BrokerCredentials) -> TestOutcome {
+pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOutcome {
     match creds {
         BrokerCredentials::Alpaca { key, secret } => {
-            let adapter = AlpacaAdapter::new(key.clone(), secret.clone(), "PAPER");
+            let adapter = AlpacaAdapter::new(key.clone(), secret.clone(), environment);
             match adapter.get_account().await {
                 Ok(_) => TestOutcome::Passed,
                 Err(e) => TestOutcome::Failed(e.to_string()),

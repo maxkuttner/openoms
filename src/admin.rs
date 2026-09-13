@@ -850,6 +850,13 @@ pub struct SaveResponse {
     /// so the UI reports "not testable" rather than implying a pass it never
     /// earned.
     pub tested: bool,
+    /// Present exactly when `tested` is `false`: `TestOutcome::NotTestable`'s
+    /// own explanation (e.g. "FIX credentials are validated at session
+    /// logon, not before save"), passed through so the cockpit renders the
+    /// server's reason instead of hardcoding its own guess at the wording.
+    /// Always `None` when `tested` is `true` — a `Failed` test never reaches
+    /// this response at all (422, before anything is written).
+    pub message: Option<String>,
     /// `None` only if the reload report (queried by this same connection's
     /// code, right after the save that triggered it) somehow lacks an entry
     /// for it — never expected in practice, but a missing key is safer to
@@ -901,6 +908,34 @@ fn should_persist(result: &Result<(), String>) -> bool {
     result.is_ok()
 }
 
+/// The environment `credentials_api::test_broker` checks an Alpaca credential
+/// against: the connection's *own* stored environment, never a hardcoded
+/// literal. `AlpacaAdapter::new` picks the live endpoint only for exactly
+/// `"LIVE"`, so testing a real `LIVE` credential against a hardcoded
+/// `"PAPER"` 401s and the save gate refuses a credential that is perfectly
+/// valid — the bug this function exists to make impossible to reintroduce.
+/// `None` is never expected for a broker row (`load_brokers` always sets
+/// `Some(env)`), so it falls back to the safer default, PAPER.
+fn test_environment(conn_environment: Option<&str>) -> &str {
+    conn_environment.unwrap_or("PAPER")
+}
+
+/// Parses the raw request body into a `CredentialSubmission`, deliberately
+/// not `Json<CredentialSubmission>` at the extractor: axum's own extractor
+/// answers a type mismatch (e.g. a numeric `port`) with its own 422 before
+/// the handler ever runs — indistinguishable from this endpoint's
+/// test-failed 422, which its docs promise means "did not authenticate".
+/// That axum rejection also echoes the offending value into its message
+/// ("invalid type: integer `12345`"). Taking a `Value` at the extractor and
+/// parsing it here keeps a malformed body a 400 with a message that names
+/// the problem, never the value.
+fn parse_submission(raw: serde_json::Value) -> Result<CredentialSubmission, AdminError> {
+    serde_json::from_value(raw).map_err(|_| AdminError {
+        status: StatusCode::BAD_REQUEST,
+        message: "request body could not be parsed: every field value must be a string".into(),
+    })
+}
+
 /// Save (create or edit) a broker connection's credential.
 ///
 /// The order is the requirement: decrypt what is already stored, merge the
@@ -921,7 +956,7 @@ fn should_persist(result: &Result<(), String>) -> bool {
     request_body = CredentialSubmission,
     responses(
         (status = 200, description = "Saved, tested where possible, and reloaded", body = SaveResponse),
-        (status = 400, description = "The submission could not be parsed into a credential (unknown field, bad port, ...)"),
+        (status = 400, description = "The request body was malformed, or could not be parsed into a credential (unknown field, bad port, ...)"),
         (status = 404, description = "Not found"),
         (status = 422, description = "The credential did not authenticate; nothing was written"),
         (status = 500, description = "The credential store could not be read, the master key is invalid or unset, or the reload failed"),
@@ -931,9 +966,11 @@ fn should_persist(result: &Result<(), String>) -> bool {
 pub async fn put_broker_connection_credentials(
     State(state): State<AppState>,
     Path(code): Path<String>,
-    Json(submission): Json<CredentialSubmission>,
+    Json(raw): Json<serde_json::Value>,
 ) -> Result<Json<SaveResponse>, AdminError> {
     info!(broker_connection_code = %code, "admin save broker connection credentials");
+
+    let submission = parse_submission(raw)?;
 
     // A write, unlike a read, cannot tolerate an absent key: there would be
     // nothing to seal the credential under.
@@ -954,14 +991,18 @@ pub async fn put_broker_connection_credentials(
         CredentialState::Configured(c) => Some(c),
         CredentialState::Unconfigured | CredentialState::Error(_) => None,
     };
+    // Captured before `conn.kind`/`existing` are consumed below — the
+    // connection's own environment, never a hardcoded literal. See
+    // `test_environment`'s doc comment for why this matters.
+    let environment = test_environment(conn.environment.as_deref()).to_string();
 
     // Parse merged.
     let parsed = credentials_api::parse_broker(&conn.kind, existing, &submission)
         .map_err(|e| AdminError { status: StatusCode::BAD_REQUEST, message: e.to_string() })?;
 
     // Test.
-    let outcome = credentials_api::test_broker(&parsed).await;
-    let tested = test_response(&outcome).tested;
+    let outcome = credentials_api::test_broker(&parsed, &environment).await;
+    let TestResponse { tested, message, .. } = test_response(&outcome);
     let gate = persist_gate(&outcome);
     if !should_persist(&gate) {
         return Err(AdminError {
@@ -987,7 +1028,7 @@ pub async fn put_broker_connection_credentials(
         .find(|c| c.code == code)
         .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
-    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, reload }))
+    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, reload }))
 }
 
 /// Clear a broker connection's stored credential.
@@ -1013,6 +1054,17 @@ pub async fn delete_broker_connection_credentials(
 ) -> Result<Json<RedactedCredentials>, AdminError> {
     info!(broker_connection_code = %code, "admin delete broker connection credentials");
 
+    // Cleared before the reload runs: if the reload below fails, this row is
+    // already null while the old adapter keeps routing on the credential it
+    // was built with. That is a real gap, but a self-healing one — the
+    // `UPDATE` still reports a row affected on an already-null row (it
+    // matches on `code`, not on `credentials IS NOT NULL`), so a retried
+    // `DELETE` runs the reload again with nothing left to clear. Clearing
+    // *after* a successful reload would remove that safety net: a failed
+    // reload would then leave the credential live with no record that
+    // deletion was ever requested, and a retry would have nothing to update
+    // to notice the difference. Don't reorder this without keeping that
+    // property.
     let result = sqlx::query(
         "UPDATE broker_connection \
          SET credentials = NULL, credentials_updated_at = NULL, updated_at = now() \
@@ -1072,6 +1124,7 @@ pub async fn test_broker_connection_credentials(
         .into_iter()
         .find(|c| c.code == code)
         .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+    let environment = test_environment(conn.environment.as_deref()).to_string();
 
     let creds = match conn.credentials {
         CredentialState::Configured(c) => c,
@@ -1089,7 +1142,7 @@ pub async fn test_broker_connection_credentials(
         }
     };
 
-    let outcome = credentials_api::test_broker(&creds).await;
+    let outcome = credentials_api::test_broker(&creds, &environment).await;
     Ok(Json(test_response(&outcome)))
 }
 
@@ -2483,22 +2536,57 @@ mod tests {
         assert!(!should_persist(&persist_gate(&TestOutcome::Failed("401 unauthorized".into()))));
     }
 
+    /// The regression this function exists to prevent: a `LIVE` connection's
+    /// own environment must reach `AlpacaAdapter::new`, not a hardcoded
+    /// `"PAPER"` literal that would 401 a perfectly valid live credential.
+    /// (Asserting the adapter's own base URL would need either a network
+    /// call or a getter on `AlpacaAdapter`, which is not a file this task
+    /// may touch — this asserts the value that actually reaches the
+    /// constructor instead.)
+    #[test]
+    fn test_environment_uses_the_connections_own_environment_not_a_hardcoded_default() {
+        assert_eq!(test_environment(Some("LIVE")), "LIVE");
+        assert_eq!(test_environment(Some("PAPER")), "PAPER");
+        assert_eq!(test_environment(None), "PAPER");
+    }
+
+    /// A non-string field value (e.g. a JSON number where the wire format
+    /// expects a string) must be a 400 that names the problem — not axum's
+    /// own extractor 422, which this endpoint's docs reserve for "the
+    /// credential did not authenticate", and not a message that echoes the
+    /// submitted value back.
+    #[test]
+    fn a_non_string_field_value_is_a_400_that_does_not_echo_it() {
+        let raw = serde_json::json!({"key": "AKROUNDTRIP", "secret": 12345});
+        let err = parse_submission(raw).expect_err("a numeric field value must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(!err.message.contains("12345"), "the submitted value must not be echoed: {}", err.message);
+    }
+
     /// A save response must carry the redacted view, never the submission.
+    /// Built through `redact_connection` — the same function the handler
+    /// calls — from a `Configured` credential holding a distinctive secret,
+    /// so this can actually fail: the brief's original version asserted
+    /// `!body.contains("SUPERSECRET")` against a `RedactedCredentials`
+    /// literal that never contained "SUPERSECRET" to begin with, which
+    /// cannot fail for any implementation.
     #[test]
     fn the_save_response_carries_no_submitted_secret() {
+        let conn = broker(
+            "alpaca-paper",
+            CredentialState::Configured(BrokerCredentials::Alpaca {
+                key: "AKLIVE".into(),
+                secret: "SUPERSECRETVALUE".into(),
+            }),
+        );
         let body = serde_json::to_string(&SaveResponse {
-            redacted: RedactedCredentials {
-                code: "alpaca-paper".into(),
-                state: "configured".into(),
-                fields: vec![crate::credentials::RedactedField { name: "secret".into(), value: None, secret: true }],
-                message: None,
-                updated_at: None,
-            },
+            redacted: redact_connection(conn),
             tested: true,
+            message: None,
             reload: None,
         })
         .expect("serialize");
-        assert!(!body.contains("SUPERSECRET"));
+        assert!(!body.contains("SUPERSECRETVALUE"), "submitted secret leaked into the save response: {body}");
         assert!(body.contains("alpaca-paper"));
     }
 
@@ -2589,7 +2677,7 @@ mod tests {
 
         // decrypt existing (none yet) → parse merged → test → persist
         let parsed = credentials_api::parse_broker("IBKR", None, &submission).expect("parse_broker");
-        let outcome = credentials_api::test_broker(&parsed).await;
+        let outcome = credentials_api::test_broker(&parsed, "PAPER").await;
         assert!(
             should_persist(&persist_gate(&outcome)),
             "IBKR is NotTestable and must still be allowed to persist"
