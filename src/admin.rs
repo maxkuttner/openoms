@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials};
+use crate::credentials_api::{self, CredentialSubmission, TestOutcome};
 use crate::reload;
 use crate::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
@@ -762,6 +763,24 @@ pub async fn update_broker_connection(
     Ok(Json(record))
 }
 
+/// Resolves the configured master key the same way every credential endpoint
+/// must: absent is fine — every row still reads back correctly as
+/// Unconfigured-if-null / Error-if-not — but a *present and invalid* key is
+/// reported rather than silently folded into "no key configured"; a wrong
+/// key must not be hidden behind that story. Shared so `GET`, `PUT`,
+/// `DELETE`, `test`, and `reload_connections` cannot each resolve this a
+/// different way.
+fn resolve_master_key() -> Result<Option<crate::secrets::MasterKey>, AdminError> {
+    match crate::config::master_key(crate::config::load()) {
+        Some(Ok(k)) => Ok(Some(k)),
+        Some(Err(e)) => Err(AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("master key is invalid: {e}"),
+        }),
+        None => Ok(None),
+    }
+}
+
 /// Maps one loaded connection's credential state onto the wire shape. Split
 /// out from the handler so the mapping — the part that must never let a
 /// secret through — is exercised directly in tests, with no database.
@@ -803,20 +822,7 @@ pub async fn get_broker_connection_credentials(
 ) -> Result<Json<RedactedCredentials>, AdminError> {
     info!(broker_connection_code = %code, "admin get broker connection credentials");
 
-    // Same resolution `reload_connections` uses: a configured-but-invalid key
-    // is reported, never silently treated as absent — absent is survivable
-    // (every row reads back Unconfigured-if-null / Error-if-not, correctly),
-    // but a wrong key must not be hidden behind that same "no key" story.
-    let master = match crate::config::master_key(crate::config::load()) {
-        Some(Ok(k)) => Some(k),
-        Some(Err(e)) => {
-            return Err(AdminError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("master key is invalid: {e}"),
-            });
-        }
-        None => None,
-    };
+    let master = resolve_master_key()?;
 
     let connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
         .await
@@ -828,6 +834,263 @@ pub async fn get_broker_connection_credentials(
         .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
     Ok(Json(redact_connection(conn)))
+}
+
+/// Response body for a successful credential save.
+///
+/// `reload` is this connection's own entry out of the reload report the save
+/// already triggered — not a second call the cockpit has to make — so the UI
+/// can say "applied" (a REST adapter, swapped live) or "restart required" (a
+/// FIX session) in the same response that confirms the write.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SaveResponse {
+    pub redacted: RedactedCredentials,
+    /// Whether the credential was actually checked against the broker before
+    /// being written — `false` for FIX (see `credentials_api::test_broker`),
+    /// so the UI reports "not testable" rather than implying a pass it never
+    /// earned.
+    pub tested: bool,
+    /// `None` only if the reload report (queried by this same connection's
+    /// code, right after the save that triggered it) somehow lacks an entry
+    /// for it — never expected in practice, but a missing key is safer to
+    /// surface as "unknown" than to synthesize an outcome for.
+    #[schema(value_type = Object, nullable = true)]
+    pub reload: Option<reload::ConnectionOutcome>,
+}
+
+/// Response body for `POST .../credentials/test`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TestResponse {
+    /// Whether a check was actually attempted — `false` for FIX.
+    pub tested: bool,
+    /// Only meaningful when `tested` is `true`: whether it passed.
+    pub ok: bool,
+    /// Present on anything short of a clean pass: the broker's rejection
+    /// reason, or why nothing was attempted. Never derived from submitted
+    /// input — see `TestOutcome`'s own doc comment.
+    pub message: Option<String>,
+}
+
+/// Maps a `TestOutcome` onto the wire shape both the `test` endpoint and the
+/// save path's `tested` flag draw from, so the two cannot disagree about
+/// what counts as tested.
+fn test_response(outcome: &TestOutcome) -> TestResponse {
+    match outcome {
+        TestOutcome::Passed => TestResponse { tested: true, ok: true, message: None },
+        TestOutcome::Failed(msg) => TestResponse { tested: true, ok: false, message: Some(msg.clone()) },
+        TestOutcome::NotTestable(why) => TestResponse { tested: false, ok: false, message: Some((*why).to_string()) },
+    }
+}
+
+/// Whether `outcome` permits the write to proceed, as `Ok(())` / `Err(reason)`
+/// so the 422 body can reuse the broker's own message with no reformatting.
+/// `NotTestable` permits the write — see `credentials_api::test_broker` for
+/// why "we didn't check" is not the same as "it failed" — only `Failed` does
+/// not.
+fn persist_gate(outcome: &TestOutcome) -> Result<(), String> {
+    match outcome {
+        TestOutcome::Passed | TestOutcome::NotTestable(_) => Ok(()),
+        TestOutcome::Failed(msg) => Err(msg.clone()),
+    }
+}
+
+/// A failed test must stop before the write. This is the gate the whole
+/// feature rests on: a credential that cannot authenticate must never
+/// replace one that can.
+fn should_persist(result: &Result<(), String>) -> bool {
+    result.is_ok()
+}
+
+/// Save (create or edit) a broker connection's credential.
+///
+/// The order is the requirement: decrypt what is already stored, merge the
+/// submission over it (`credentials_api::parse_broker`), test the *merged*
+/// result — never the raw submission, since an omitted field must inherit a
+/// value that already passes — and only once that clears does anything get
+/// written. A `Failed` test returns 422 with the broker's own message and
+/// changes nothing: no write, no reload. `NotTestable` (FIX) proceeds to
+/// save — `tested: false` in the response says so, rather than implying a
+/// pass never earned.
+///
+/// The save itself reloads the running registry so the new credential takes
+/// effect (or the cockpit is told a restart is needed) without a second
+/// call — see `SaveResponse::reload`.
+#[utoipa::path(
+    put, path = "/admin/broker-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    request_body = CredentialSubmission,
+    responses(
+        (status = 200, description = "Saved, tested where possible, and reloaded", body = SaveResponse),
+        (status = 400, description = "The submission could not be parsed into a credential (unknown field, bad port, ...)"),
+        (status = 404, description = "Not found"),
+        (status = 422, description = "The credential did not authenticate; nothing was written"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid or unset, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn put_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(submission): Json<CredentialSubmission>,
+) -> Result<Json<SaveResponse>, AdminError> {
+    info!(broker_connection_code = %code, "admin save broker connection credentials");
+
+    // A write, unlike a read, cannot tolerate an absent key: there would be
+    // nothing to seal the credential under.
+    let master = resolve_master_key()?.ok_or_else(|| AdminError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "no master key is configured (set oms.master_key in oms.toml); cannot save credentials".into(),
+    })?;
+
+    // Decrypt existing.
+    let connections = crate::credentials::load_brokers(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+    let existing = match &conn.credentials {
+        CredentialState::Configured(c) => Some(c),
+        CredentialState::Unconfigured | CredentialState::Error(_) => None,
+    };
+
+    // Parse merged.
+    let parsed = credentials_api::parse_broker(&conn.kind, existing, &submission)
+        .map_err(|e| AdminError { status: StatusCode::BAD_REQUEST, message: e.to_string() })?;
+
+    // Test.
+    let outcome = credentials_api::test_broker(&parsed).await;
+    let tested = test_response(&outcome).tested;
+    let gate = persist_gate(&outcome);
+    if !should_persist(&gate) {
+        return Err(AdminError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: gate.expect_err("should_persist(&gate) was false, so gate must be Err"),
+        });
+    }
+
+    // Persist.
+    crate::credentials::save_broker(state.pool(), &master, &code, &parsed)
+        .await
+        .map_err(map_db_error)?;
+
+    // Reload — the existing, serialized, FIX-aware path; not a second one.
+    let report = reload_with_key(state.clone(), Some(master.clone())).await?;
+    let reload = report.0.connections.into_iter().find(|(c, _)| *c == code).map(|(_, outcome)| outcome);
+
+    let refreshed = crate::credentials::load_brokers(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = refreshed
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, reload }))
+}
+
+/// Clear a broker connection's stored credential.
+///
+/// Also reloads: leaving a removed credential's adapter live would be the
+/// silent-mismatch class this project has hit repeatedly (see `reload.rs`'s
+/// module doc). The reload's own outcome is not carried in the response —
+/// unlike the save path, there is nothing to test or report other than
+/// "unconfigured", which `redacted.state` already says.
+#[utoipa::path(
+    delete, path = "/admin/broker-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "Cleared and reloaded — now unconfigured", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn delete_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(broker_connection_code = %code, "admin delete broker connection credentials");
+
+    let result = sqlx::query(
+        "UPDATE broker_connection \
+         SET credentials = NULL, credentials_updated_at = NULL, updated_at = now() \
+         WHERE code = $1",
+    )
+    .bind(&code)
+    .execute(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("broker_connection"));
+    }
+
+    // Disarm the adapter before reporting success — the reload path, not a
+    // second one. The report itself is not surfaced here (see this fn's doc
+    // comment); only that the reload ran before we report success.
+    let master = resolve_master_key()?;
+    let _report = reload_with_key(state.clone(), master.clone()).await?;
+
+    let connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
+}
+
+/// Test the credential already stored for a broker connection, changing
+/// nothing. Distinct from the save path's pre-write test: this one exists so
+/// an operator can re-check a credential that is already live (e.g. after a
+/// broker-side key rotation) without resubmitting it.
+#[utoipa::path(
+    post, path = "/admin/broker-connections/{code}/credentials/test", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "Test outcome for the stored credential", body = TestResponse),
+        (status = 400, description = "No credential is stored for this connection"),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the stored credential could not be decrypted"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn test_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<TestResponse>, AdminError> {
+    info!(broker_connection_code = %code, "admin test broker connection credentials");
+
+    let master = resolve_master_key()?;
+    let connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    let creds = match conn.credentials {
+        CredentialState::Configured(c) => c,
+        CredentialState::Unconfigured => {
+            return Err(AdminError {
+                status: StatusCode::BAD_REQUEST,
+                message: "no credential is stored for this connection".into(),
+            });
+        }
+        CredentialState::Error(e) => {
+            return Err(AdminError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("stored credential could not be decrypted: {e}"),
+            });
+        }
+    };
+
+    let outcome = credentials_api::test_broker(&creds).await;
+    Ok(Json(test_response(&outcome)))
 }
 
 /// Re-read the credential store and apply what can be applied without a
@@ -864,16 +1127,7 @@ pub async fn get_broker_connection_credentials(
 pub async fn reload_connections(
     State(state): State<AppState>,
 ) -> Result<Json<reload::ReloadReport>, AdminError> {
-    let master = match crate::config::master_key(crate::config::load()) {
-        Some(Ok(k)) => Some(k),
-        Some(Err(e)) => {
-            return Err(AdminError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("refusing to reload: master key is invalid: {e}"),
-            });
-        }
-        None => None,
-    };
+    let master = resolve_master_key()?;
 
     reload_with_key(state, master).await
 }
@@ -2206,5 +2460,155 @@ mod tests {
     #[test]
     fn a_registered_feed_is_never_stopped() {
         assert!(!should_stop_databento_feed(&reload::ConnectionOutcome::Registered));
+    }
+
+    // ── Credential write endpoints ──────────────────────────────────────
+
+    /// A failed test must stop before the write. This is the gate the whole
+    /// feature rests on: a credential that cannot authenticate must never
+    /// replace one that can.
+    #[test]
+    fn a_failed_test_blocks_the_write() {
+        assert!(!should_persist(&Err("401 unauthorized".into())));
+        assert!(should_persist(&Ok(())));
+    }
+
+    /// `persist_gate` is the seam between `TestOutcome` and `should_persist`:
+    /// `Passed` and `NotTestable` (FIX — "we didn't check", not "it
+    /// failed") both permit the write; only `Failed` withholds it.
+    #[test]
+    fn passed_and_not_testable_permit_the_write_only_failed_blocks_it() {
+        assert!(should_persist(&persist_gate(&TestOutcome::Passed)));
+        assert!(should_persist(&persist_gate(&TestOutcome::NotTestable("checked at session logon"))));
+        assert!(!should_persist(&persist_gate(&TestOutcome::Failed("401 unauthorized".into()))));
+    }
+
+    /// A save response must carry the redacted view, never the submission.
+    #[test]
+    fn the_save_response_carries_no_submitted_secret() {
+        let body = serde_json::to_string(&SaveResponse {
+            redacted: RedactedCredentials {
+                code: "alpaca-paper".into(),
+                state: "configured".into(),
+                fields: vec![crate::credentials::RedactedField { name: "secret".into(), value: None, secret: true }],
+                message: None,
+                updated_at: None,
+            },
+            tested: true,
+            reload: None,
+        })
+        .expect("serialize");
+        assert!(!body.contains("SUPERSECRET"));
+        assert!(body.contains("alpaca-paper"));
+    }
+
+    /// `test_response` is what both the `test` endpoint and the save path's
+    /// `tested` flag draw from: a real pass reports `tested`, `ok`, and no
+    /// message.
+    #[test]
+    fn test_response_reports_a_clean_pass() {
+        let r = test_response(&TestOutcome::Passed);
+        assert!(r.tested);
+        assert!(r.ok);
+        assert!(r.message.is_none());
+    }
+
+    /// FIX must never imply a pass it did not earn: `tested` and `ok` are
+    /// both `false`, with the reason carried in `message`.
+    #[test]
+    fn test_response_reports_not_testable_honestly() {
+        let r = test_response(&TestOutcome::NotTestable("checked at session logon"));
+        assert!(!r.tested);
+        assert!(!r.ok);
+        assert_eq!(r.message.as_deref(), Some("checked at session logon"));
+    }
+
+    /// A rejected credential is `tested` (an attempt was made) but not `ok`,
+    /// with the broker's own message carried through unchanged.
+    #[test]
+    fn test_response_reports_a_failure_with_its_message() {
+        let r = test_response(&TestOutcome::Failed("401 unauthorized".into()));
+        assert!(r.tested);
+        assert!(!r.ok);
+        assert_eq!(r.message.as_deref(), Some("401 unauthorized"));
+    }
+
+    /// Exercises the real seal/save/load/redact path against Postgres — the
+    /// SQL text `save_broker` and `load_brokers` run has no coverage at all
+    /// without a database. Mirrors `credentials.rs`'s own round trip: the
+    /// handler's decision logic (`parse_broker`, `test_broker`,
+    /// `persist_gate`) is exercised directly rather than through HTTP, since
+    /// this test never starts a server.
+    ///
+    /// Run with: cargo test -- --ignored
+    /// Requires: a live, migrated Postgres reachable via the usual POSTGRES_*
+    /// config.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn put_equivalent_round_trip_saves_and_redacts_with_no_secret_value() {
+        use crate::secrets::parse_master_key;
+        use crate::setup::database::config;
+
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        let pool = sqlx::PgPool::connect(&cfg.url()).await.expect("connect");
+
+        let code = "test-admin-credential-put-roundtrip";
+
+        // Clean slate, in case a previous panicked run left this behind.
+        sqlx::query("DELETE FROM oms.broker_connection WHERE code = $1")
+            .bind(code)
+            .execute(&pool)
+            .await
+            .expect("cleanup before");
+
+        // IBKR, not Alpaca: `test_broker` is `NotTestable` for FIX, so this
+        // round trip never reaches the network — see `credentials_api::test_broker`.
+        sqlx::query(
+            "INSERT INTO oms.broker_connection (code, broker_code, environment, status) \
+             VALUES ($1, 'IBKR', 'PAPER', 'ACTIVE')",
+        )
+        .bind(code)
+        .execute(&pool)
+        .await
+        .expect("insert test broker_connection row");
+
+        let key = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("key");
+
+        let submission = CredentialSubmission {
+            fields: [
+                ("host", "fix.roundtrip.test"),
+                ("port", "4101"),
+                ("sender_comp_id", "SENDERROUNDTRIP"),
+                ("target_comp_id", "TARGETROUNDTRIP"),
+                ("password", "ROUNDTRIPSECRETPW"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        };
+
+        // decrypt existing (none yet) → parse merged → test → persist
+        let parsed = credentials_api::parse_broker("IBKR", None, &submission).expect("parse_broker");
+        let outcome = credentials_api::test_broker(&parsed).await;
+        assert!(
+            should_persist(&persist_gate(&outcome)),
+            "IBKR is NotTestable and must still be allowed to persist"
+        );
+        crate::credentials::save_broker(&pool, &key, code, &parsed).await.expect("save_broker");
+
+        let brokers = crate::credentials::load_brokers(&pool, Some(&key)).await.expect("load_brokers");
+        let conn = brokers.into_iter().find(|c| c.code == code).expect("row present");
+        let redacted = redact_connection(conn);
+
+        assert_eq!(redacted.state, "configured");
+        let body = serde_json::to_string(&redacted).expect("serialize");
+        assert!(!body.contains("ROUNDTRIPSECRETPW"), "submitted secret leaked into the redacted view: {body}");
+
+        // Leave the table as we found it.
+        sqlx::query("DELETE FROM oms.broker_connection WHERE code = $1")
+            .bind(code)
+            .execute(&pool)
+            .await
+            .expect("cleanup after");
     }
 }

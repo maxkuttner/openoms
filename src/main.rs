@@ -110,6 +110,9 @@ mod reload_tests;
         admin::get_broker_connection,
         admin::update_broker_connection,
         admin::get_broker_connection_credentials,
+        admin::put_broker_connection_credentials,
+        admin::delete_broker_connection_credentials,
+        admin::test_broker_connection_credentials,
         admin::reload_connections,
         admin::create_risk_limit,
         admin::list_risk_limits,
@@ -133,6 +136,7 @@ mod reload_tests;
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
         admin::RedactedCredentials, crate::credentials::RedactedField,
+        crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
         Grant, CreateGrant, UpdateGrant,
@@ -1112,7 +1116,13 @@ async fn serve() {
         )
         .route(
             "/admin/broker-connections/:code/credentials",
-            get(admin::get_broker_connection_credentials),
+            get(admin::get_broker_connection_credentials)
+                .put(admin::put_broker_connection_credentials)
+                .delete(admin::delete_broker_connection_credentials),
+        )
+        .route(
+            "/admin/broker-connections/:code/credentials/test",
+            post(admin::test_broker_connection_credentials),
         )
         .route("/admin/connections/reload", post(admin::reload_connections))
         .route(
@@ -1194,6 +1204,23 @@ mod tests {
                 "any_configured={any_configured} any_error={any_error}"
             );
         }
+    }
+
+    /// Generating the document is the only thing that would actually catch a
+    /// bad `#[schema(...)]` override (e.g. on `SaveResponse::reload`, which
+    /// points at a type — `reload::ConnectionOutcome` — with no `ToSchema`
+    /// impl of its own) or a typo'd path: nothing else in the test suite
+    /// calls `openapi()`.
+    #[test]
+    fn openapi_document_includes_the_credential_write_endpoints() {
+        use utoipa::OpenApi;
+        let doc = super::ApiDoc::openapi();
+        let json = serde_json::to_string(&doc).expect("serialize openapi doc");
+        assert!(json.contains("/admin/broker-connections/{code}/credentials"));
+        assert!(json.contains("/admin/broker-connections/{code}/credentials/test"));
+        assert!(json.contains("SaveResponse"));
+        assert!(json.contains("TestResponse"));
+        assert!(json.contains("CredentialSubmission"));
     }
 
     /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares

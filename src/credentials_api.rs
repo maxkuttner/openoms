@@ -1,17 +1,14 @@
 //! Turning a submitted credential form into a typed `BrokerCredentials`, and
 //! (where it is cheap and safe) checking that it actually authenticates.
 //!
-//! This is the seam between an HTTP handler (task 3) and `credentials.rs`:
+//! This is the seam between an HTTP handler (`admin.rs`'s
+//! `put`/`delete`/`test` broker-credential endpoints) and `credentials.rs`:
 //! `parse_broker` is pure — no I/O, no `config::load()`, no database — so it
 //! can be exercised with plain unit tests, and `test_broker` is the only part
 //! of this module that reaches the network.
-//!
-//! Nothing outside `mod tests` calls into this module yet — the HTTP handlers
-//! that will (task 3) do not exist. `allow(dead_code)` at module scope stands
-//! in for that until then, rather than being sprinkled item by item.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
+use serde::Deserialize;
 
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::credentials::BrokerCredentials;
@@ -19,9 +16,15 @@ use crate::credentials::BrokerCredentials;
 /// A submitted credential form: field name to raw string value, exactly as
 /// an HTML form or a JSON object would hand it over. Untyped on purpose —
 /// giving each broker its own typed request struct would just move the
-/// "which fields did they actually send" question from here into task 3's
+/// "which fields did they actually send" question from here into the
 /// handler, where the merge rule would have to be reimplemented per broker.
+///
+/// `#[serde(flatten)]` so the wire body is the field map itself
+/// (`{"host": "...", "port": "4101"}`), not `{"fields": {...}}` — the shape
+/// the cockpit form naturally produces.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CredentialSubmission {
+    #[serde(flatten)]
     pub fields: HashMap<String, String>,
 }
 
@@ -258,6 +261,67 @@ mod tests {
     fn an_empty_secret_is_treated_as_omitted() {
         match parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse") {
             BrokerCredentials::Alpaca { secret, .. } => assert_eq!(secret, "OLDSECRET"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    fn existing_ibkr() -> BrokerCredentials {
+        BrokerCredentials::IbkrFix {
+            host: "old.fix.example".into(),
+            port: 4101,
+            sender_comp_id: "OLDSENDER".into(),
+            target_comp_id: "OLDTARGET".into(),
+            password: "OLDPASSWORD".into(),
+            ssl: true,
+        }
+    }
+
+    /// The merge rule above is proven only for Alpaca's two fields; IBKR and
+    /// Binance have six each, verified so far only by hand-trace (task 2
+    /// review). This exercises it on a non-secret IBKR field: omit `host`,
+    /// submit everything else, and confirm the stored host survives. A
+    /// regression here would silently inherit an old FIX host.
+    #[test]
+    fn an_omitted_non_secret_field_keeps_the_stored_value_on_ibkr() {
+        match parse_broker(
+            "IBKR",
+            Some(&existing_ibkr()),
+            &sub(&[
+                ("port", "4102"),
+                ("sender_comp_id", "NEWSENDER"),
+                ("target_comp_id", "NEWTARGET"),
+                ("password", "NEWPASSWORD"),
+            ]),
+        )
+        .expect("parse")
+        {
+            BrokerCredentials::IbkrFix { host, .. } => {
+                assert_eq!(host, "old.fix.example", "an omitted host must carry over from the stored credential");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Same rule, empty-string submission: a blank `host` input left in a
+    /// form must not silently blank out a working FIX host.
+    #[test]
+    fn an_empty_non_secret_field_keeps_the_stored_value_on_ibkr() {
+        match parse_broker(
+            "IBKR",
+            Some(&existing_ibkr()),
+            &sub(&[
+                ("host", ""),
+                ("port", "4102"),
+                ("sender_comp_id", "NEWSENDER"),
+                ("target_comp_id", "NEWTARGET"),
+                ("password", "NEWPASSWORD"),
+            ]),
+        )
+        .expect("parse")
+        {
+            BrokerCredentials::IbkrFix { host, .. } => {
+                assert_eq!(host, "old.fix.example", "an empty host must be treated as omitted, not as a value");
+            }
             other => panic!("wrong variant: {other:?}"),
         }
     }
