@@ -918,17 +918,21 @@ async fn serve() {
                     );
                     continue;
                 }
+                // Credential-driven, so its task is registered in `StreamRegistry`
+                // (unlike the public Binance/Bybit feeds below): a later credential
+                // change can abort and replace it without a process restart.
+                // `restart_databento_feed` is the same path a runtime reload will
+                // use, so boot exercises it too rather than inlining a separate spawn.
                 let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
                 marks_doorbells.push(opra_pos_tx);
-                let health = state.stream_health().handle("DATABENTO", "OPRA", stream_health::StreamKind::Feed);
-                let session = quote_feed::QuoteFeedSession::new(
-                    opra_stream::DatabentoOpraFeed::new(api_key.clone()),
+                reload::restart_databento_feed(
+                    api_key.clone(),
                     state.pool().clone(),
+                    state.stream_health(),
+                    state.streams(),
                     quote_tx.clone(),
                     opra_pos_rx,
-                    health.clone(),
                 );
-                tokio::spawn(stream_supervisor::supervise("DATABENTO/OPRA", health, session));
                 info!(code = %conn.code, "registered DATABENTO/OPRA feed");
             }
         }
@@ -936,7 +940,10 @@ async fn serve() {
 
     // Binance public market data — no credentials, so it is always on. Each feed
     // needs its own doorbell receiver (an mpsc has exactly one consumer), so the
-    // sender is cloned per feed rather than shared.
+    // sender is cloned per feed rather than shared. Not registered in
+    // `StreamRegistry`: there is no credential that could change under it, so
+    // there is nothing for a reload to restart here — leave it running for the
+    // life of the process, same as before this feature existed.
     {
         let (binance_pos_tx, binance_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
         marks_doorbells.push(binance_pos_tx);
@@ -953,7 +960,9 @@ async fn serve() {
 
     // Bybit public market data — a second source for the same crypto pairs, so a
     // Binance outage does not leave positions unmarked. Ranked below Binance in
-    // provider_feed_policy; the router decides which one owns the mark.
+    // provider_feed_policy; the router decides which one owns the mark. Also not
+    // credential-driven, so — like Binance above — not registered in
+    // `StreamRegistry`.
     {
         let (bybit_pos_tx, bybit_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
         marks_doorbells.push(bybit_pos_tx);

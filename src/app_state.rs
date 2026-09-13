@@ -1,7 +1,9 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use symbology::{Identifier, InMemoryCache, OpenFigiClient};
+use tokio::task::JoinHandle;
 
 use crate::adapters::BrokerRegistry;
 use crate::kafka::KafkaClient;
@@ -10,6 +12,58 @@ use crate::stream_health::StreamHealthRegistry;
 
 /// The OpenFIGI-backed instrument identification engine, with an in-memory cache.
 pub type SymbologyEngine = Identifier<OpenFigiClient, InMemoryCache>;
+
+/// Handles for the supervised feed tasks, keyed by connection code, so a
+/// credential change can stop one and start its replacement.
+///
+/// A `Mutex<HashMap<..>>`, unlike the broker registry's `ArcSwap`: feeds are
+/// not on the order path, so a lock here costs nothing, and what this needs is
+/// point `insert`/`remove` on individual entries — `ArcSwap` only publishes
+/// whole-snapshot replacements, which is the wrong shape for "stop and restart
+/// just this one feed" without disturbing the others.
+///
+/// `abort()` rather than a graceful stop is acceptable *for feeds specifically*:
+/// `stream_supervisor` already treats a dropped stream as a disconnect to
+/// reconnect from, so losing an in-flight quote to an abort is indistinguishable
+/// from losing it to a network blip — which the system already tolerates by
+/// design. That reasoning does not extend to broker sessions, which is exactly
+/// why FIX is out of scope for this plan.
+#[derive(Clone, Default)]
+pub struct StreamRegistry {
+    handles: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+}
+
+impl StreamRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a freshly spawned feed task under `code`. Does not stop
+    /// anything already registered there — callers replacing a running feed
+    /// must call `abort_and_remove` first (see `reload.rs`), or the old task
+    /// keeps running unsupervised, double-subscribed alongside the new one.
+    pub fn insert(&self, code: impl Into<String>, handle: JoinHandle<()>) {
+        self.handles.lock().unwrap().insert(code.into(), handle);
+    }
+
+    /// Stop and forget the task registered under `code`, if any. A no-op when
+    /// nothing is registered there — e.g. first boot, or a feed that never
+    /// started.
+    pub fn abort_and_remove(&self, code: &str) {
+        if let Some(handle) = self.handles.lock().unwrap().remove(code) {
+            handle.abort();
+        }
+    }
+
+    /// Codes currently registered. Diagnostics and tests.
+    ///
+    /// Not yet called from production code — nothing exposes the live feed set
+    /// over the API. Exercised directly by the tests below.
+    #[allow(dead_code)]
+    pub fn codes(&self) -> Vec<String> {
+        self.handles.lock().unwrap().keys().cloned().collect()
+    }
+}
 
 /// Shared application state injected into every Axum handler via State<AppState>.
 #[derive(Clone)]
@@ -26,6 +80,10 @@ pub struct AppState {
     symbology: Arc<SymbologyEngine>,
     stream_health: StreamHealthRegistry,
     marks: MarkStore,
+    /// Handles for the credentialed feed tasks (Databento OPRA) so a reload can
+    /// restart one under a new credential. Binance and Bybit market data are
+    /// public — not credential-driven — and are never registered here.
+    streams: StreamRegistry,
 }
 
 impl AppState {
@@ -47,6 +105,7 @@ impl AppState {
             symbology: Arc::new(symbology),
             stream_health,
             marks: MarkStore::new(),
+            streams: StreamRegistry::new(),
         }
     }
 
@@ -83,6 +142,10 @@ impl AppState {
     }
 
     pub fn marks(&self) -> &MarkStore { &self.marks }
+
+    pub fn streams(&self) -> &StreamRegistry {
+        &self.streams
+    }
 }
 
 #[cfg(test)]
@@ -151,5 +214,27 @@ mod tests {
         second.register_alpaca("LIVE", sample_alpaca_adapter());
         state.swap_registry(second);
         assert!(state.registry().get_alpaca("LIVE").is_some());
+    }
+
+    /// Aborting a feed must actually stop it, and re-inserting under the same
+    /// code must not leave the old task running — two Databento sessions would
+    /// double-subscribe and double-count marks.
+    #[tokio::test]
+    async fn replacing_a_stream_aborts_the_previous_one() {
+        let reg = StreamRegistry::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        let first = tokio::spawn(async move {
+            // Hold the sender until aborted.
+            let _tx = tx;
+            std::future::pending::<()>().await;
+        });
+        reg.insert("databento-opra", first);
+
+        reg.abort_and_remove("databento-opra");
+
+        // The sender was dropped with the task, so the channel closes.
+        assert!(rx.recv().await.is_none(), "the previous task should have been aborted");
+        assert!(reg.codes().is_empty());
     }
 }

@@ -17,10 +17,14 @@ use tracing::{error, info, warn};
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::{BrokerRegistry, Transport};
+use crate::app_state::StreamRegistry;
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::fix;
 use crate::kafka::KafkaClient;
-use crate::stream_health::StreamHealthRegistry;
+use crate::opra_stream::DatabentoOpraFeed;
+use crate::quote_feed::QuoteFeedSession;
+use crate::stream_health::{StreamHealthRegistry, StreamKind};
+use crate::stream_supervisor;
 
 /// What happened to one connection during a registration pass.
 ///
@@ -291,6 +295,53 @@ pub async fn build_registry(
     }
 
     RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters }
+}
+
+/// (Re)start the Databento OPRA feed session under (possibly new) credentials,
+/// publishing the fresh handle into `streams` under the same code it always
+/// runs under.
+///
+/// Only Databento is credential-driven among the market-data feeds — Binance
+/// and Bybit are public and are never restarted here or anywhere else (see
+/// `StreamRegistry`'s doc comment in `app_state.rs`). That is also why this
+/// function, unlike `build_registry`, does not loop over a slice of
+/// connections: there is exactly one credentialed feed to restart.
+///
+/// Calling this when nothing is registered yet (boot) is safe: `abort_and_remove`
+/// on an empty registry is a no-op, so boot and a later credential-driven
+/// restart are the same call.
+///
+/// `position_changed_rx` is supplied by the caller rather than created here:
+/// its sender half is fanned out to every feed from a task `serve()` spawns
+/// once, at boot, and this function has no way to add a new sender to that
+/// fan-out after the fact. A caller that restarts this feed outside of boot
+/// must also account for its doorbell no longer being reachable from that
+/// fan-out — this task deliberately did not reshape that wiring.
+pub fn restart_databento_feed(
+    api_key: String,
+    pool: PgPool,
+    stream_health: &StreamHealthRegistry,
+    streams: &StreamRegistry,
+    quote_tx: mpsc::Sender<dataprovider::Quote>,
+    position_changed_rx: mpsc::Receiver<()>,
+) {
+    streams.abort_and_remove("databento-opra");
+    let health = stream_health.handle("DATABENTO", "OPRA", StreamKind::Feed);
+    let session = QuoteFeedSession::new(
+        DatabentoOpraFeed::new(api_key),
+        pool,
+        quote_tx,
+        position_changed_rx,
+        health.clone(),
+    );
+    // `supervise` returns `!` (it never returns), so `JoinHandle<!>` — wrap it in
+    // a block so the spawned future's output is `()`, matching what
+    // `StreamRegistry` stores. The wrapping changes nothing about behavior:
+    // `.await` on a `!`-returning future never completes either way.
+    let handle = tokio::spawn(async move {
+        stream_supervisor::supervise("DATABENTO/OPRA", health, session).await;
+    });
+    streams.insert("databento-opra", handle);
 }
 
 #[cfg(test)]
