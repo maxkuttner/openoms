@@ -889,7 +889,13 @@ async fn apply_reload(
     // in order (verified by reading every branch), which is what makes the
     // positional zip below sound. This is a real coupling across a module
     // boundary rather than something the type system enforces, so pin it.
-    debug_assert_eq!(
+    //
+    // `assert_eq!`, not `debug_assert_eq!`: a release build is exactly where this
+    // must not silently pass. `zip` truncates on a length mismatch and — worse —
+    // shifts the pairing, so a broken invariant would apply one connection's
+    // outcome to another connection's environment and stop or restart the wrong
+    // execution stream. Failing loudly beats routing fills through the wrong one.
+    assert_eq!(
         broker_connections.len(),
         report.connections.len(),
         "build_registry must report exactly one outcome per input connection, in order"
