@@ -32,6 +32,9 @@ type Props = {
   fields: Field[];
   editable?: boolean;
   deletable?: boolean;
+  // Extra per-row action rendered in the action cell, before Edit. Additive —
+  // omit it and nothing changes.
+  rowAction?: (row: any) => ReactNode;
 };
 
 // Render the value of one field, resolving select options (incl. async optionsPath).
@@ -66,7 +69,7 @@ function FieldInput({ field, form }: { field: Field; form: any }) {
   }
 }
 
-export function CrudResource({ title, path, idKey = "id", columns, fields, editable, deletable }: Props) {
+export function CrudResource({ title, path, idKey = "id", columns, fields, editable, deletable, rowAction }: Props) {
   const list = useList<any>(path);
   const [editing, setEditing] = useState<any | null>(null); // row being edited, or {} for create
   const isCreate = editing && !editing[idKey];
@@ -112,7 +115,7 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
               {columns.map((c) => (
                 <Table.Th key={c.key}>{c.label}</Table.Th>
               ))}
-              {(editable || deletable) && <Table.Th />}
+              {(editable || deletable || rowAction) && <Table.Th />}
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
@@ -121,9 +124,10 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
                 {columns.map((c) => (
                   <Table.Td key={c.key}>{c.render ? c.render(row) : formatCell(row[c.key])}</Table.Td>
                 ))}
-                {(editable || deletable) && (
+                {(editable || deletable || rowAction) && (
                   <Table.Td>
                     <Group gap="xs" justify="flex-end">
+                      {rowAction?.(row)}
                       {editable && (
                         <Button size="xs" variant="light" onClick={() => open(row)}>
                           Edit
