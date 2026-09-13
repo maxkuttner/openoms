@@ -94,13 +94,11 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
 /// one on reload anyway (see its doc comment) — so in practice this is only
 /// ever asked about a connection already known to be Alpaca.
 ///
-/// Not yet called from production code: `build_registry`'s boot/reload loop
-/// rebuilds `alpaca_creds` fresh on every pass regardless (see
-/// `RegistrationOutput`'s doc comment), so today's callers already know to
-/// respawn unconditionally without asking. This is the decision Task 5's
-/// reload endpoint will consult once it reports outcomes per connection over
-/// HTTP. Exercised directly by the test below.
-#[allow(dead_code)]
+/// Called by the `/admin/connections/reload` handler (`admin.rs`) to decide,
+/// per connection, whether to restart its execution stream — rather than the
+/// handler re-deriving the same answer from `alpaca_creds` membership, which
+/// would be a second, potentially diverging judgment call on the same
+/// question `classify` already settled.
 pub fn restarts_execution_stream(outcome: &ConnectionOutcome) -> bool {
     matches!(outcome, ConnectionOutcome::Registered)
 }
@@ -623,5 +621,24 @@ mod tests {
         assert_eq!(alpaca_exec_stream_code("PAPER"), "alpaca-paper:exec");
         assert_eq!(alpaca_exec_stream_code("LIVE"), "alpaca-live:exec");
         assert_ne!(alpaca_exec_stream_code("PAPER"), "databento-opra");
+    }
+
+    /// The report is an HTTP response body. It must name connections and
+    /// outcomes and nothing else: a reload that echoed a credential would undo
+    /// the entire point of encrypting it.
+    #[test]
+    fn the_report_carries_no_credential_material() {
+        let report = ReloadReport {
+            connections: vec![
+                ("alpaca-paper".into(), ConnectionOutcome::Registered),
+                ("ibkr-paper".into(), ConnectionOutcome::RestartRequired),
+                ("binance-paper".into(), ConnectionOutcome::Failed("could not decrypt".into())),
+            ],
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        for secret in ["SUPERSECRET", "BEGIN PRIVATE KEY", "api_key"] {
+            assert!(!json.contains(secret), "{secret} in {json}");
+        }
+        assert!(json.contains("alpaca-paper") && json.contains("RestartRequired"));
     }
 }

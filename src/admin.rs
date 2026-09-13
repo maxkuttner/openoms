@@ -12,6 +12,8 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::credentials::{Connection, CredentialState, FeedCredentials};
+use crate::reload;
 use crate::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
 use crate::symbology_resolver::{self, ResolveError, ResolveOutcome};
@@ -738,6 +740,162 @@ pub async fn update_broker_connection(
     .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
     Ok(Json(record))
+}
+
+/// Re-read the credential store and apply what can be applied without a
+/// process restart.
+///
+/// Returns 200 even when some connections could not be reloaded: a FIX
+/// credential (IBKR, or Binance running FIX) always reports `RestartRequired`
+/// — that is the expected outcome, not a failure — and a non-2xx would make
+/// the cockpit treat normal operation as an error. The per-connection
+/// outcomes in the body carry the detail, never the credential itself.
+///
+/// A failed read of either store — a database error, or a master key that is
+/// missing when credentials are stored, or present but wrong — leaves the
+/// running registry exactly as it was and reports 500 instead of swapping.
+/// Swapping in a registry built from an incomplete read would disarm every
+/// broker; declining is the safer failure.
+#[utoipa::path(
+    post, path = "/admin/connections/reload", tag = "admin",
+    responses(
+        (status = 200, description = "Per-connection reload report (codes and outcomes only — no credential material)"),
+        (status = 500, description = "The credential store could not be read, or the master key is invalid; nothing was changed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn reload_connections(
+    State(state): State<AppState>,
+) -> Result<Json<reload::ReloadReport>, AdminError> {
+    let master = match crate::config::master_key(crate::config::load()) {
+        Some(Ok(k)) => Some(k),
+        Some(Err(e)) => {
+            return Err(AdminError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("refusing to reload: master key is invalid: {e}"),
+            });
+        }
+        None => None,
+    };
+
+    // Both stores are read before anything is touched: a failure in either one
+    // must abort the whole reload rather than swap in a registry built from a
+    // half-read store (see this function's doc comment).
+    let broker_connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+        .await
+        .map_err(|e| AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to load broker connections: {e}"),
+        })?;
+    let feed_connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+        .await
+        .map_err(|e| AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to load feed connections: {e}"),
+        })?;
+
+    info!("admin reload connections");
+
+    let deps = reload::RegistrationDeps {
+        pool: state.pool().clone(),
+        stream_health: state.stream_health().clone(),
+        kafka: state.kafka().cloned(),
+        position_changed_tx: state.position_changed_tx(),
+    };
+
+    // `current` is dropped (via `drop(current)` below, before any `.await`)
+    // rather than held across the swap — an `arc_swap::Guard`, not a
+    // `std::sync::Mutex` guard, so clippy's `await_holding_lock` does not apply
+    // to it either way, but there is no reason to hold it a moment longer than
+    // `build_registry` needs to read from it.
+    let current = state.registry();
+    let reload::RegistrationOutput {
+        registry,
+        mut report,
+        alpaca_creds,
+        // Always empty on a reload: every active Binance connection classifies
+        // `RestartRequired` here (see `classify`'s doc comment), so
+        // `build_registry` never takes the "build a fresh REST adapter" branch
+        // outside of boot. Nothing to spawn a stream for.
+        binance_rest_adapters: _binance_rest_adapters,
+    } = reload::build_registry(&broker_connections, false, &current, &deps).await;
+    drop(current);
+
+    state.swap_registry(registry);
+
+    // Restart the execution stream of every connection this pass actually
+    // re-registered. `restarts_execution_stream` is true only for `Registered`,
+    // and `classify` never reports `Registered` for a FIX connection on reload
+    // (see its own doc comment) — so in practice this only ever fires for
+    // Alpaca. Using it here, rather than re-deriving the same answer from
+    // `alpaca_creds` membership, is what makes this loop follow the outcome
+    // the report already committed to, instead of a second, potentially
+    // diverging judgment call.
+    for (conn, (_, outcome)) in broker_connections.iter().zip(report.connections.iter()) {
+        if !reload::restarts_execution_stream(outcome) {
+            continue;
+        }
+        let env_name: &'static str = match conn.environment.as_deref() {
+            Some("PAPER") => "PAPER",
+            Some("LIVE") => "LIVE",
+            _ => continue,
+        };
+        if let (Some((key, secret)), Some(adapter)) =
+            (alpaca_creds.get(env_name), state.registry().get_alpaca(env_name))
+        {
+            reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &deps, state.streams());
+        }
+    }
+
+    // Feed connections have no FIX-shaped "cannot reload" case: Databento is a
+    // plain REST/WS credential behind a supervised task, restartable the same
+    // way an Alpaca adapter is. Classified and appended to the same report so
+    // the cockpit sees every connection — broker or feed — in one response.
+    for conn in &feed_connections {
+        let outcome = classify_feed(conn);
+        if let (
+            reload::ConnectionOutcome::Registered,
+            CredentialState::Configured(FeedCredentials::Databento { api_key }),
+        ) = (&outcome, &conn.credentials)
+        {
+            reload::restart_databento_feed(
+                api_key.clone(),
+                state.pool().clone(),
+                state.stream_health(),
+                state.streams(),
+                state.doorbells(),
+                state.quote_tx(),
+            );
+        }
+        report.connections.push((conn.code.clone(), outcome));
+    }
+
+    Ok(Json(report))
+}
+
+/// Classify one feed connection for the reload report — the feed-side
+/// counterpart to `reload::classify`. Simpler than the broker version: no
+/// feed credential owns a thread with no stop path, so there is no
+/// `RestartRequired` case here — a configured, active feed either applies
+/// immediately or is reported `Failed`.
+fn classify_feed(conn: &Connection<FeedCredentials>) -> reload::ConnectionOutcome {
+    if conn.status != "ACTIVE" {
+        return reload::ConnectionOutcome::Disabled;
+    }
+    match &conn.credentials {
+        CredentialState::Unconfigured => reload::ConnectionOutcome::Unconfigured,
+        CredentialState::Error(e) => reload::ConnectionOutcome::Failed(e.clone()),
+        // Only one Databento feed is implemented (the OPRA feed, keyed
+        // "databento-opra" — see the matching guard boot itself runs in
+        // `serve()`); a different code with the same credential shape is a
+        // misconfiguration, not something to start.
+        CredentialState::Configured(FeedCredentials::Databento { .. }) if conn.code == "databento-opra" => {
+            reload::ConnectionOutcome::Registered
+        }
+        CredentialState::Configured(FeedCredentials::Databento { .. }) => {
+            reload::ConnectionOutcome::Failed("unsupported Databento feed connection".into())
+        }
+    }
 }
 
 // ── API key management ────────────────────────────────────────────────────────

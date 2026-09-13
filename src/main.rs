@@ -790,13 +790,21 @@ async fn serve() {
     // so extras are redundant and try_send never blocks the fill path. A fan-out
     // task (spawned below, once every feed has registered) relays to each feed's
     // own doorbell, so execution.rs need not know how many feeds exist.
+    //
+    // The registry that fan-out reads from (keyed by feed code, so a restarted
+    // feed's fresh sender replaces its old one rather than accumulating a dead
+    // entry — see `DoorbellRegistry`'s doc comment) lives on `AppState` itself,
+    // not as a local here: the `/admin/connections/reload` handler needs to
+    // reach the exact same map this fan-out task drains, and a `serve()`-local
+    // would be unreachable from a request handler.
     let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
-    // Keyed by feed code so a restarted feed's fresh sender replaces its old
-    // one rather than accumulating a second, dead entry — see
-    // `DoorbellRegistry`'s doc comment. `Clone`d (Arc inside) into the fan-out
-    // task below and into `reload::restart_databento_feed`, rather than moved,
-    // so a runtime reload can still reach it after the fan-out task starts.
-    let marks_doorbells = app_state::DoorbellRegistry::new();
+
+    // Quote channel every market-data feed publishes onto. Created here, ahead
+    // of `AppState`, for the same reason: a runtime reload needs to hand a
+    // restarted feed this exact sender, not a disconnected second channel, so
+    // it has to be a value `AppState` can hold and hand back out, not a
+    // `serve()`-local threaded only through the boot-time spawns below.
+    let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
 
     // Adapters come from the store, not the environment. `build_registry` is the
     // one code path that turns a credential into an adapter, so a credential
@@ -837,8 +845,21 @@ async fn serve() {
     // AppState. Constructed with an empty registry and immediately swapped to the
     // one `build_registry` just produced — the same `swap_registry` call a
     // runtime reload will use — so boot itself exercises that path rather than
-    // being the one caller that bypasses it.
-    let state = AppState::new(pool, admin_token, admin_auth_enabled, BrokerRegistry::new(), kafka_client, symbology, stream_health);
+    // being the one caller that bypasses it. `position_changed_tx` and
+    // `quote_tx` are handed in (not just kept as `serve()` locals) so the
+    // `/admin/connections/reload` handler can rebuild an equivalent
+    // `RegistrationDeps` and restart feeds against the same channels boot used.
+    let state = AppState::new(
+        pool,
+        admin_token,
+        admin_auth_enabled,
+        BrokerRegistry::new(),
+        kafka_client,
+        symbology,
+        stream_health,
+        Some(position_changed_tx.clone()),
+        quote_tx.clone(),
+    );
     state.swap_registry(registry);
 
     // One-time backfill: if the position projection is empty, rebuild it from the
@@ -855,8 +876,9 @@ async fn serve() {
         Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
-    // (stream_health, position_changed_tx/rx and marks_doorbells were created
-    // before the broker registry so FIX sessions could use them.)
+    // (stream_health, position_changed_tx/rx and quote_tx/rx were created
+    // before the broker registry so FIX sessions could use them, and before
+    // `AppState` so it could be constructed holding them.)
 
     // Spawn Alpaca trade-update stream tasks (one per configured environment),
     // registered in `StreamRegistry` under a distinct key
@@ -884,10 +906,9 @@ async fn serve() {
         tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
     }
 
-    // Market data: feeds emit quotes onto one channel; the router is the sole
-    // writer to MarkStore. Adding a vendor means spawning another feed here —
-    // nothing downstream changes.
-    let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
+    // Market data: feeds emit quotes onto one channel (created above, alongside
+    // `AppState`); the router is the sole writer to MarkStore. Adding a vendor
+    // means spawning another feed here — nothing downstream changes.
     tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
 
     // Retire dated contracts once their expiry instant passes, so the feeds below
@@ -940,7 +961,7 @@ async fn serve() {
                     state.pool().clone(),
                     state.stream_health(),
                     state.streams(),
-                    &marks_doorbells,
+                    state.doorbells(),
                     quote_tx.clone(),
                 );
                 info!(code = %conn.code, "registered DATABENTO/OPRA feed");
@@ -956,7 +977,7 @@ async fn serve() {
     // life of the process, same as before this feature existed.
     {
         let (binance_pos_tx, binance_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        marks_doorbells.set("BINANCE/SPOT", binance_pos_tx);
+        state.doorbells().set("BINANCE/SPOT", binance_pos_tx);
         let health = state.stream_health().handle("BINANCE", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             binance_feed::BinanceFeed,
@@ -975,7 +996,7 @@ async fn serve() {
     // `StreamRegistry`.
     {
         let (bybit_pos_tx, bybit_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        marks_doorbells.set("BYBIT/SPOT", bybit_pos_tx);
+        state.doorbells().set("BYBIT/SPOT", bybit_pos_tx);
         let health = state.stream_health().handle("BYBIT", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             bybit_feed::BybitFeed,
@@ -992,7 +1013,7 @@ async fn serve() {
     // this must never block. Cloned rather than moved so a later credential
     // reload can still register a replacement doorbell through the same
     // `DoorbellRegistry` after this task has started — see its doc comment.
-    let fanout_doorbells = marks_doorbells.clone();
+    let fanout_doorbells = state.doorbells().clone();
     tokio::spawn(async move {
         while position_changed_rx.recv().await.is_some() {
             fanout_doorbells.ring_all();
@@ -1075,6 +1096,7 @@ async fn serve() {
             "/admin/broker-connections/:code",
             axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
         )
+        .route("/admin/connections/reload", post(admin::reload_connections))
         .route(
             "/admin/principals/:id/grants",
             post(admin::create_grant).get(admin::list_grants),

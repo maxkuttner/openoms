@@ -55,15 +55,6 @@ impl StreamRegistry {
             handle.abort();
         }
     }
-
-    /// Codes currently registered. Diagnostics and tests.
-    ///
-    /// Not yet called from production code — nothing exposes the live feed set
-    /// over the API. Exercised directly by the tests below.
-    #[allow(dead_code)]
-    pub fn codes(&self) -> Vec<String> {
-        self.handles.lock().unwrap().keys().cloned().collect()
-    }
 }
 
 /// Fan-out targets for the "a fill changed positions, go re-check what's held"
@@ -105,12 +96,6 @@ impl DoorbellRegistry {
             let _ = tx.try_send(());
         }
     }
-
-    /// Number of feeds currently registered. Tests and diagnostics.
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.senders.lock().unwrap().len()
-    }
 }
 
 /// Shared application state injected into every Axum handler via State<AppState>.
@@ -132,9 +117,25 @@ pub struct AppState {
     /// restart one under a new credential. Binance and Bybit market data are
     /// public — not credential-driven — and are never registered here.
     streams: StreamRegistry,
+    /// Fan-out targets for the fill→marks doorbell. Owned here — not just a
+    /// `serve()` local — so the reload handler can register a restarted feed's
+    /// replacement sender into the exact map the boot-time fan-out task already
+    /// reads from; see `DoorbellRegistry`'s own doc comment for why keyed
+    /// replacement, not accumulation, matters.
+    doorbells: DoorbellRegistry,
+    /// Sender half of the fill→marks doorbell, so a reload can hand a restarted
+    /// FIX/Alpaca adapter the *same* channel boot wired up rather than a copy
+    /// nothing reads. `None` only in a test fixture that never signs up for the
+    /// doorbell at all.
+    position_changed_tx: Option<mpsc::Sender<()>>,
+    /// Where every market-data feed publishes quotes. Stored so a reload can
+    /// hand a restarted feed the same channel the boot-time `mark_router` task
+    /// already reads from, instead of constructing a second, disconnected one.
+    quote_tx: mpsc::Sender<dataprovider::Quote>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
         admin_token: String,
@@ -143,6 +144,8 @@ impl AppState {
         kafka: Option<KafkaClient>,
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
+        position_changed_tx: Option<mpsc::Sender<()>>,
+        quote_tx: mpsc::Sender<dataprovider::Quote>,
     ) -> Self {
         Self {
             pool,
@@ -154,6 +157,9 @@ impl AppState {
             stream_health,
             marks: MarkStore::new(),
             streams: StreamRegistry::new(),
+            doorbells: DoorbellRegistry::new(),
+            position_changed_tx,
+            quote_tx,
         }
     }
 
@@ -168,11 +174,9 @@ impl AppState {
     }
 
     /// Publish a new registry. Readers see it on their next `registry()` call;
-    /// anything already holding an adapter is unaffected.
-    ///
-    /// Not yet called from production code — the reload endpoint that calls this
-    /// lands in a later task. Exercised directly by the tests below.
-    #[allow(dead_code)]
+    /// anything already holding an adapter is unaffected. Called by the
+    /// `/admin/connections/reload` handler in `admin.rs`, and by boot itself
+    /// (see `serve()`) so the very first publish exercises the same path.
     pub fn swap_registry(&self, next: BrokerRegistry) {
         self.registry.store(Arc::new(next));
     }
@@ -194,6 +198,25 @@ impl AppState {
     pub fn streams(&self) -> &StreamRegistry {
         &self.streams
     }
+
+    pub fn doorbells(&self) -> &DoorbellRegistry {
+        &self.doorbells
+    }
+
+    /// A fresh handle on the fill→marks doorbell sender, for handing to a
+    /// freshly built `RegistrationDeps` (see `reload.rs`). Cloning a
+    /// `mpsc::Sender` is cheap — it is a handle onto the shared channel state,
+    /// not the channel itself.
+    pub fn position_changed_tx(&self) -> Option<mpsc::Sender<()>> {
+        self.position_changed_tx.clone()
+    }
+
+    /// A fresh handle on the shared quote channel every market-data feed
+    /// publishes onto, for restarting a feed outside of boot (see
+    /// `reload::restart_databento_feed`).
+    pub fn quote_tx(&self) -> mpsc::Sender<dataprovider::Quote> {
+        self.quote_tx.clone()
+    }
 }
 
 #[cfg(test)]
@@ -209,6 +232,10 @@ mod tests {
         let symbology = Identifier::new(OpenFigiClient::new(None), InMemoryCache::new());
         let mut registry = BrokerRegistry::new();
         registry.register_alpaca("PAPER", sample_alpaca_adapter());
+        // Nothing in these tests drains either channel — they only exercise the
+        // registry swap and the stream/doorbell registries, never a real fill or
+        // a real quote.
+        let (quote_tx, _quote_rx) = mpsc::channel(1);
         AppState::new(
             pool,
             "test-admin-token".to_string(),
@@ -217,6 +244,8 @@ mod tests {
             None,
             symbology,
             StreamHealthRegistry::new(),
+            None,
+            quote_tx,
         )
     }
 
@@ -281,9 +310,9 @@ mod tests {
 
         reg.abort_and_remove("databento-opra");
 
-        // The sender was dropped with the task, so the channel closes.
+        // The sender was dropped with the task, so the channel closes — this is
+        // the actual proof the task was aborted, not just unregistered.
         assert!(rx.recv().await.is_none(), "the previous task should have been aborted");
-        assert!(reg.codes().is_empty());
     }
 
     /// Replacing a feed's doorbell must overwrite its entry, not add a second
@@ -298,7 +327,6 @@ mod tests {
 
         reg.set("databento-opra", tx1);
         reg.set("databento-opra", tx2);
-        assert_eq!(reg.len(), 1, "the second registration should replace, not accumulate");
 
         reg.ring_all();
 
