@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use symbology::{Identifier, InMemoryCache, OpenFigiClient};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::adapters::BrokerRegistry;
@@ -62,6 +63,53 @@ impl StreamRegistry {
     #[allow(dead_code)]
     pub fn codes(&self) -> Vec<String> {
         self.handles.lock().unwrap().keys().cloned().collect()
+    }
+}
+
+/// Fan-out targets for the "a fill changed positions, go re-check what's held"
+/// doorbell, keyed by feed code.
+///
+/// Keyed, rather than a plain `Vec`, so that restarting a feed *replaces* its
+/// entry instead of appending a second one: the old sender's receiver is owned
+/// by the task `StreamRegistry::abort_and_remove` just aborted, so an
+/// unreplaced old entry would sit forever pointing at a dead channel, and
+/// every future ring would keep `try_send`ing into it for no reason.
+///
+/// `std::sync::Mutex`, not an `ArcSwap`: the critical section here is the
+/// `try_send` loop in `ring_all`, which never awaits, and it only ever runs on
+/// the fill path, which is not high-frequency — the same reasoning as
+/// `StreamRegistry`'s mutex, and the opposite of the broker registry's
+/// `ArcSwap`, which sits on the much hotter, latency-sensitive order path.
+#[derive(Clone, Default)]
+pub struct DoorbellRegistry {
+    senders: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
+}
+
+impl DoorbellRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register `tx` as the doorbell target for `code`, replacing whatever was
+    /// registered there before (see the struct doc comment for why replacing,
+    /// not accumulating, matters).
+    pub fn set(&self, code: impl Into<String>, tx: mpsc::Sender<()>) {
+        self.senders.lock().unwrap().insert(code.into(), tx);
+    }
+
+    /// Wake every registered feed. Non-blocking: a full per-feed channel
+    /// already means "reload pending" for that feed, so a failed `try_send`
+    /// is fine to ignore.
+    pub fn ring_all(&self) {
+        for tx in self.senders.lock().unwrap().values() {
+            let _ = tx.try_send(());
+        }
+    }
+
+    /// Number of feeds currently registered. Tests and diagnostics.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.senders.lock().unwrap().len()
     }
 }
 
@@ -236,5 +284,25 @@ mod tests {
         // The sender was dropped with the task, so the channel closes.
         assert!(rx.recv().await.is_none(), "the previous task should have been aborted");
         assert!(reg.codes().is_empty());
+    }
+
+    /// Replacing a feed's doorbell must overwrite its entry, not add a second
+    /// one — otherwise a restarted feed's old, now-dead sender keeps
+    /// accumulating on every reload, and `ring_all` keeps trying (harmlessly,
+    /// but pointlessly) to wake a receiver nothing is listening on anymore.
+    #[tokio::test]
+    async fn replacing_a_doorbell_reaches_only_the_new_channel() {
+        let reg = DoorbellRegistry::new();
+        let (tx1, mut rx1) = tokio::sync::mpsc::channel::<()>(1);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<()>(1);
+
+        reg.set("databento-opra", tx1);
+        reg.set("databento-opra", tx2);
+        assert_eq!(reg.len(), 1, "the second registration should replace, not accumulate");
+
+        reg.ring_all();
+
+        assert!(rx2.try_recv().is_ok(), "the new channel should have been rung");
+        assert!(rx1.try_recv().is_err(), "the old channel should not have been rung");
     }
 }

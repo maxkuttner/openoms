@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::{BrokerRegistry, Transport};
-use crate::app_state::StreamRegistry;
+use crate::app_state::{DoorbellRegistry, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::fix;
 use crate::kafka::KafkaClient;
@@ -298,8 +298,9 @@ pub async fn build_registry(
 }
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
-/// publishing the fresh handle into `streams` under the same code it always
-/// runs under.
+/// publishing the fresh handle into `streams` and the fresh doorbell sender
+/// into `doorbells`, both under the same code ("databento-opra") this feed
+/// always runs under.
 ///
 /// Only Databento is credential-driven among the market-data feeds — Binance
 /// and Bybit are public and are never restarted here or anywhere else (see
@@ -308,24 +309,24 @@ pub async fn build_registry(
 /// connections: there is exactly one credentialed feed to restart.
 ///
 /// Calling this when nothing is registered yet (boot) is safe: `abort_and_remove`
-/// on an empty registry is a no-op, so boot and a later credential-driven
-/// restart are the same call.
-///
-/// `position_changed_rx` is supplied by the caller rather than created here:
-/// its sender half is fanned out to every feed from a task `serve()` spawns
-/// once, at boot, and this function has no way to add a new sender to that
-/// fan-out after the fact. A caller that restarts this feed outside of boot
-/// must also account for its doorbell no longer being reachable from that
-/// fan-out — this task deliberately did not reshape that wiring.
+/// on an empty registry is a no-op and `doorbells.set` on an unpopulated code
+/// is a plain insert, so boot and a later credential-driven restart are the
+/// same call. The doorbell channel pair is created *inside* this function
+/// (rather than threaded in by the caller) precisely so that guarantee holds:
+/// a caller that built its own pair and pushed the sender into a fan-out list
+/// by hand could forget to replace the old entry, which is the bug this
+/// function exists to make impossible — see `DoorbellRegistry`'s doc comment.
 pub fn restart_databento_feed(
     api_key: String,
     pool: PgPool,
     stream_health: &StreamHealthRegistry,
     streams: &StreamRegistry,
+    doorbells: &DoorbellRegistry,
     quote_tx: mpsc::Sender<dataprovider::Quote>,
-    position_changed_rx: mpsc::Receiver<()>,
 ) {
     streams.abort_and_remove("databento-opra");
+    let (position_changed_tx, position_changed_rx) = mpsc::channel::<()>(1);
+    doorbells.set("databento-opra", position_changed_tx);
     let health = stream_health.handle("DATABENTO", "OPRA", StreamKind::Feed);
     let session = QuoteFeedSession::new(
         DatabentoOpraFeed::new(api_key),

@@ -791,7 +791,12 @@ async fn serve() {
     // task (spawned below, once every feed has registered) relays to each feed's
     // own doorbell, so execution.rs need not know how many feeds exist.
     let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
-    let mut marks_doorbells: Vec<tokio::sync::mpsc::Sender<()>> = Vec::new();
+    // Keyed by feed code so a restarted feed's fresh sender replaces its old
+    // one rather than accumulating a second, dead entry — see
+    // `DoorbellRegistry`'s doc comment. `Clone`d (Arc inside) into the fan-out
+    // task below and into `reload::restart_databento_feed`, rather than moved,
+    // so a runtime reload can still reach it after the fan-out task starts.
+    let marks_doorbells = app_state::DoorbellRegistry::new();
 
     // Adapters come from the store, not the environment. `build_registry` is the
     // one code path that turns a credential into an adapter, so a credential
@@ -919,19 +924,18 @@ async fn serve() {
                     continue;
                 }
                 // Credential-driven, so its task is registered in `StreamRegistry`
-                // (unlike the public Binance/Bybit feeds below): a later credential
-                // change can abort and replace it without a process restart.
-                // `restart_databento_feed` is the same path a runtime reload will
-                // use, so boot exercises it too rather than inlining a separate spawn.
-                let (opra_pos_tx, opra_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-                marks_doorbells.push(opra_pos_tx);
+                // and its doorbell in `DoorbellRegistry` (unlike the public
+                // Binance/Bybit feeds below): a later credential change can abort
+                // and replace it without a process restart. `restart_databento_feed`
+                // owns its own doorbell channel pair — see its doc comment — so
+                // boot exercises the exact same call a runtime reload will use.
                 reload::restart_databento_feed(
                     api_key.clone(),
                     state.pool().clone(),
                     state.stream_health(),
                     state.streams(),
+                    &marks_doorbells,
                     quote_tx.clone(),
-                    opra_pos_rx,
                 );
                 info!(code = %conn.code, "registered DATABENTO/OPRA feed");
             }
@@ -946,7 +950,7 @@ async fn serve() {
     // life of the process, same as before this feature existed.
     {
         let (binance_pos_tx, binance_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        marks_doorbells.push(binance_pos_tx);
+        marks_doorbells.set("BINANCE/SPOT", binance_pos_tx);
         let health = state.stream_health().handle("BINANCE", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             binance_feed::BinanceFeed,
@@ -965,7 +969,7 @@ async fn serve() {
     // `StreamRegistry`.
     {
         let (bybit_pos_tx, bybit_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        marks_doorbells.push(bybit_pos_tx);
+        marks_doorbells.set("BYBIT/SPOT", bybit_pos_tx);
         let health = state.stream_health().handle("BYBIT", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             bybit_feed::BybitFeed,
@@ -977,13 +981,15 @@ async fn serve() {
         tokio::spawn(stream_supervisor::supervise("BYBIT/SPOT", health, session));
     }
 
-    // Relay the fill path's single doorbell to every feed. try_send: a full
-    // per-feed channel already means "reload pending", and this must never block.
+    // Relay the fill path's single doorbell to every feed. `ring_all`'s
+    // `try_send`: a full per-feed channel already means "reload pending", and
+    // this must never block. Cloned rather than moved so a later credential
+    // reload can still register a replacement doorbell through the same
+    // `DoorbellRegistry` after this task has started — see its doc comment.
+    let fanout_doorbells = marks_doorbells.clone();
     tokio::spawn(async move {
         while position_changed_rx.recv().await.is_some() {
-            for doorbell in &marks_doorbells {
-                let _ = doorbell.try_send(());
-            }
+            fanout_doorbells.ring_all();
         }
     });
 
