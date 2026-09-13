@@ -124,6 +124,7 @@ mod reload_tests;
         admin::resolve_symbology,
         admin::backfill_symbology,
         admin::expiry_sweep,
+        admin::setup_status,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -144,6 +145,7 @@ mod reload_tests;
         admin::InstrumentSummary, admin::FeedSummary,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
         admin::ExpirySweepResult,
+        admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
     )),
     modifiers(&SecurityAddon),
@@ -1148,6 +1150,7 @@ async fn serve() {
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
         .route("/admin/symbology/backfill", post(admin::backfill_symbology))
         .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
+        .route("/admin/setup-status", get(admin::setup_status))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let scalar_html = {

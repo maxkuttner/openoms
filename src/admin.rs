@@ -2365,6 +2365,129 @@ pub async fn expiry_sweep(
     Ok(Json(ExpirySweepResult { recomputed, expired }))
 }
 
+// ── Setup status ───────────────────────────────────────────────────────────
+
+/// One connection's classification, for the checklist below. Deliberately
+/// the same three strings `RedactedCredentials` uses
+/// (`configured`/`unconfigured`/`error`) rather than a boolean — "stored but
+/// the master key can't open it" is a different operator problem from
+/// "never configured", and collapsing them here would hide exactly the
+/// misconfiguration this checklist exists to surface.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SetupConnectionStatus {
+    pub code: String,
+    pub state: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SetupCatalogStatus {
+    pub instruments: i64,
+    pub state: String,
+}
+
+/// The checklist an operator (or the cockpit's own onboarding banner) reads to
+/// answer "what is left to configure" — nothing else in this system can
+/// answer that question in one call today.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SetupStatus {
+    pub database: String,
+    /// `"default"` iff the admin console is still guarded by the built-in
+    /// dev password rather than an operator-chosen one — see
+    /// `admin_password_state`.
+    pub admin_password: String,
+    /// Whether a master key is configured. Never the key itself, nor even
+    /// whether it is *valid* — an invalid key surfaces the same way every
+    /// other credential-reading endpoint surfaces it, as a 500 from
+    /// `resolve_master_key`, not folded into this field.
+    pub master_key: String,
+    pub brokers: Vec<SetupConnectionStatus>,
+    pub feeds: Vec<SetupConnectionStatus>,
+    pub catalog: SetupCatalogStatus,
+    pub portfolios: i64,
+}
+
+/// Maps a decoded connection's credential state onto the checklist's three
+/// strings. Pulled out of `setup_status` so the classification — not the
+/// database round-trip — is what a unit test exercises.
+fn connection_state_label<T>(state: &CredentialState<T>) -> &'static str {
+    match state {
+        CredentialState::Configured(_) => "configured",
+        CredentialState::Unconfigured => "unconfigured",
+        CredentialState::Error(_) => "error",
+    }
+}
+
+/// `"empty"` below any instrument count is meaningful — an operator has not
+/// yet synced a catalog at all — `"ok"` otherwise. Not a judgment about
+/// *how much* catalog is enough; that is out of scope for a boolean-ish
+/// checklist entry.
+fn catalog_state(instruments: i64) -> &'static str {
+    if instruments == 0 {
+        "empty"
+    } else {
+        "ok"
+    }
+}
+
+/// A fresh install and a properly operated one differ in exactly one way an
+/// operator can forget to fix: the admin console password. Reported by
+/// comparison against the same constant `main.rs` falls back to, so this can
+/// never drift from what boot actually accepted.
+fn admin_password_state(password: &str) -> &'static str {
+    if password == crate::DEFAULT_ADMIN_PASSWORD {
+        "default"
+    } else {
+        "set"
+    }
+}
+
+/// What is left to configure. Reuses `credentials::load_brokers`/`load_feeds`
+/// — the exact decode path `reload_connections` uses — so this checklist
+/// cannot report a connection "configured" that the reload path would
+/// actually refuse to register, or the reverse.
+#[utoipa::path(
+    get, path = "/admin/setup-status", tag = "admin",
+    responses((status = 200, description = "OK", body = SetupStatus)),
+    security(("bearer_token" = []))
+)]
+pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, AdminError> {
+    let key = resolve_master_key()?;
+
+    let brokers = crate::credentials::load_brokers(state.pool(), key.as_ref())
+        .await
+        .map_err(map_db_error)?
+        .into_iter()
+        .map(|c| SetupConnectionStatus { state: connection_state_label(&c.credentials).to_string(), code: c.code })
+        .collect();
+
+    let feeds = crate::credentials::load_feeds(state.pool(), key.as_ref())
+        .await
+        .map_err(map_db_error)?
+        .into_iter()
+        .map(|c| SetupConnectionStatus { state: connection_state_label(&c.credentials).to_string(), code: c.code })
+        .collect();
+
+    let instruments: i64 = sqlx::query_scalar("SELECT count(*) FROM instrument")
+        .fetch_one(state.pool())
+        .await
+        .map_err(map_db_error)?;
+
+    let portfolios: i64 = sqlx::query_scalar("SELECT count(*) FROM portfolio")
+        .fetch_one(state.pool())
+        .await
+        .map_err(map_db_error)?;
+
+    Ok(Json(SetupStatus {
+        database: "ok".to_string(),
+        admin_password: admin_password_state(&state.admin_token).to_string(),
+        master_key: if key.is_some() { "configured" } else { "unconfigured" }.to_string(),
+        brokers,
+        feeds,
+        catalog: SetupCatalogStatus { state: catalog_state(instruments).to_string(), instruments },
+        portfolios,
+    }))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -2752,5 +2875,20 @@ mod tests {
         assert!(err.message.contains("ALPACA"), "{}", err.message);
         assert!(err.message.contains("BINANCE"), "{}", err.message);
         assert!(err.message.contains("IBKR"), "{}", err.message);
+    }
+
+    #[test]
+    fn catalog_state_reflects_the_count() {
+        assert_eq!(catalog_state(0), "empty");
+        assert_eq!(catalog_state(14_000), "ok");
+    }
+
+    /// The checklist exists to tell an operator what is left. A default admin
+    /// password must be reported, because it is the one thing a fresh install
+    /// has that a finished one must not.
+    #[test]
+    fn a_default_admin_password_is_reported() {
+        assert_eq!(admin_password_state("openoms-dev"), "default");
+        assert_eq!(admin_password_state("something-else"), "set");
     }
 }
