@@ -173,8 +173,60 @@ unregistered. A key that decrypts some rows but not others still starts: one
 stale or wrong credential must not be able to disarm every other one — the
 unusable rows are logged (`credentials unusable: ...`) so they can be fixed.
 
-A credential change needs a restart to take effect; the store is read once at
-boot, not watched for changes.
+### Applying a credential change
+
+After changing a stored credential (`import-env`, `rotate-key`, or a later
+write endpoint), `POST /admin/connections/reload` applies it — the store is
+read once at boot and is not otherwise watched for changes, so this is what
+picks up an edit without restarting the process. What "applies" means depends
+on the connection:
+
+- **Alpaca and the Databento feed apply immediately.** Both are plain REST/WS
+  clients behind a supervised task; the reload builds a fresh one (and, for
+  Alpaca, restarts its execution-report stream too) and drops the old one.
+- **IBKR and Binance FIX sessions need a process restart.** A FIX session owns
+  a thread that parks forever with no stop path, so a second session dialing
+  the same venue would collide with the first on logon and sequence numbers.
+  The reload leaves the running session exactly as it is and reports
+  `RestartRequired` for that connection in the response — trading through it
+  is unaffected, it just is not running the new credential yet. This holds for
+  a Binance connection even when its transport is REST rather than FIX:
+  narrowing that is a follow-up, not done today.
+
+The response names every connection with its outcome (`Registered`,
+`RestartRequired`, `Unconfigured`, `Disabled`, or `Failed` with a reason) —
+never the credential itself. **A 200 with a mix of outcomes is the normal
+case**, not an error: reloading after rotating one Alpaca key while an IBKR
+session sits untouched returns 200, `Registered` for one and `RestartRequired`
+for the other.
+
+Disabling a connection and reloading stops its execution stream or feed task
+so it stops acting on the old credential; a FIX session, again, keeps running
+regardless until a restart, since there is no way to stop it from inside the
+process.
+
+The reload refuses with 500 and changes nothing in three cases: a database
+error reading either credential store; a master key that is configured but
+does not parse; or every stored credential across both stores failing to
+decrypt under the resolved key while nothing at all decoded — the same
+refusal boot itself makes on startup, applied here to what the reload just
+read. That last case is this endpoint's headline scenario: `rotate-key` run
+from another process re-seals every row under a new key while this process
+still holds the old one in memory. A key that opens some rows but not others
+still reloads — the bad rows are reported `Failed`, and if a broker or the
+feed already had a working adapter running, that adapter (or feed task) is
+left alone rather than torn down over one unreadable row.
+
+**`config::load()` is memoized for the life of the process** — whatever master
+key it resolved at boot is what every reload keeps using, even after
+`oms.toml` is edited. This is why a reload right after `rotate-key` is this
+endpoint's headline refusal case, not just an edge case: `rotate-key` re-seals
+every row under a *new* key from a separate, short-lived process, but this
+server is still holding the *old* key in memory, so the reload decrypts
+nothing and correctly refuses with 500 rather than swap in an empty registry.
+Applying a rotated master key — as opposed to a rotated broker or feed
+credential — needs an actual restart; a reload cannot do it, no matter how
+promptly `oms.toml` is updated with the new key first.
 
 ## Roles and schemas
 

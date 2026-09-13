@@ -915,21 +915,30 @@ pub async fn reload_connections(
     // way an Alpaca adapter is. Classified and appended to the same report so
     // the cockpit sees every connection — broker or feed — in one response.
     //
-    // A feed not `Registered` this pass (Disabled, Unconfigured, or Failed)
-    // has its task stopped too — `restart_databento_feed` keys `StreamRegistry`
-    // by the feed's own connection code (unlike the Alpaca execution stream
-    // above), so `abort_and_remove(&conn.code)` is the exact key a previous
-    // pass would have registered it under. Otherwise a feed an operator just
-    // turned off keeps silently streaming quotes into `MarkStore` on its old
-    // credential — the same class of bug as the Alpaca case above.
+    // A feed classified `Disabled` or `Unconfigured` — a deliberate operator
+    // state, not a storage failure — has its task stopped too:
+    // `restart_databento_feed` (in `reload.rs`) aborts and re-inserts under the
+    // hardcoded literal `"databento-opra"`, *not* `conn.code` — there being
+    // only one Databento feed made a bare literal simplest at the time. That
+    // only lines up with `abort_and_remove(&conn.code)` below because
+    // `classify_feed` pins its `Registered` case to that exact code (see
+    // there); a second feed connection would need `restart_databento_feed`
+    // keyed by `conn.code` for real, not this coincidence. Otherwise a feed an
+    // operator just turned off keeps silently streaming quotes into
+    // `MarkStore` on its old credential — the same class of bug as the Alpaca
+    // case above.
     //
-    // Unlike the broker loop, `Failed` (a decrypt error) is not special-cased
-    // here to keep a feed running: there is no feed equivalent of
-    // `BrokerRegistry`'s `current` to carry an adapter forward from —
-    // `classify_feed` never reports anything a session could be recovered
-    // from, and stopping a feed whose credential just became unreadable is
-    // the same "declining is safer than a silent stale session" reasoning,
-    // just with no carry-forward option available to prefer instead.
+    // `Failed` (a decrypt error) is deliberately NOT stopped — the mirror of
+    // the broker loop's `Error`/`RestartRequired` carry-forward above, applied
+    // to a feed: the running task was built from a credential that decrypted
+    // fine the last time this ran, and a *stored* row becoming unreadable is
+    // not evidence the feed itself stopped working. Unlike the broker case
+    // there is nothing to carry forward — the task was never touched, so
+    // simply not calling `abort_and_remove` is all "carry forward" means
+    // here. A stopped feed means no marks, which means positions go
+    // unpriced — worse than leaving it on its last-known-good credential
+    // until the row is fixed. The report still says `Failed`, so the
+    // operator is told even though the feed keeps running.
     for conn in &feed_connections {
         let outcome = classify_feed(conn);
         match (&outcome, &conn.credentials) {
@@ -943,7 +952,8 @@ pub async fn reload_connections(
                     state.quote_tx(),
                 );
             }
-            _ => state.streams().abort_and_remove(&conn.code),
+            _ if should_stop_databento_feed(&outcome) => state.streams().abort_and_remove(&conn.code),
+            _ => {}
         }
         report.connections.push((conn.code.clone(), outcome));
     }
@@ -1012,6 +1022,18 @@ fn classify_feed(conn: &Connection<FeedCredentials>) -> reload::ConnectionOutcom
             reload::ConnectionOutcome::Failed("unsupported Databento feed connection".into())
         }
     }
+}
+
+/// Whether the reload loop should stop the Databento feed task: true only for
+/// `Disabled` and `Unconfigured` — deliberate operator states. `Registered` is
+/// handled by `restart_databento_feed` itself; `Failed` is excluded on
+/// purpose, the feed-side mirror of `should_stop_alpaca_stream`'s own
+/// asymmetry for brokers: a decrypt failure on a *stored* row is not evidence
+/// the feed itself stopped working, and a stopped feed means no marks, which
+/// means positions go unpriced. The task is never touched in that case, so
+/// "carry forward" here needs no extra step beyond not calling this.
+fn should_stop_databento_feed(outcome: &reload::ConnectionOutcome) -> bool {
+    matches!(outcome, reload::ConnectionOutcome::Disabled | reload::ConnectionOutcome::Unconfigured)
 }
 
 // ── API key management ────────────────────────────────────────────────────────
@@ -2000,5 +2022,30 @@ mod tests {
         assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Disabled, false));
         assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Unconfigured, false));
         assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Failed("bad key".into()), false));
+    }
+
+    /// `Disabled` and `Unconfigured` are the deliberate-operator-state cases:
+    /// an operator turning a feed off (or never having set it up) must not
+    /// leave it silently streaming quotes on its old credential.
+    #[test]
+    fn disabled_and_unconfigured_feeds_are_stopped() {
+        assert!(should_stop_databento_feed(&reload::ConnectionOutcome::Disabled));
+        assert!(should_stop_databento_feed(&reload::ConnectionOutcome::Unconfigured));
+    }
+
+    /// The rule this task established, mirrored from the broker side: a feed
+    /// whose *stored* credential just failed to decrypt is left running,
+    /// because a stopped feed prices nothing. Unlike Alpaca there is no
+    /// "adapter survived" input to check — the running task is simply never
+    /// touched, so `should_stop_databento_feed` alone decides this.
+    #[test]
+    fn a_failed_feed_credential_is_not_stopped() {
+        assert!(!should_stop_databento_feed(&reload::ConnectionOutcome::Failed("bad key".into())));
+    }
+
+    /// A feed this pass just restarted must never also be stopped.
+    #[test]
+    fn a_registered_feed_is_never_stopped() {
+        assert!(!should_stop_databento_feed(&reload::ConnectionOutcome::Registered));
     }
 }
