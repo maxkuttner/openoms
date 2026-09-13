@@ -101,6 +101,18 @@ pub struct RegistrationDeps {
 /// erases to `Arc<dyn BrokerAdapter>`, and there is no `get_binance` the way
 /// there is `get_alpaca`). Neither belongs on `ReloadReport`: that type is
 /// serialised straight into an HTTP response in Task 5, and one holds secrets.
+///
+/// Trap for whoever wires the reload endpoint: `alpaca_creds` is rebuilt in
+/// full on every call, including a reload where nothing about that Alpaca
+/// connection changed — Alpaca is never `RestartRequired`, so it is always
+/// re-registered fresh. `binance_rest_adapters`, by contrast, comes back
+/// *empty* for a Binance connection that classified as `RestartRequired` and
+/// was carried forward (see `build_registry`) — no new adapter was built, so
+/// there is nothing to add to the list. A handler that naively respawns a
+/// trade-update stream for every entry in `alpaca_creds` on every reload will
+/// start a second, redundant Alpaca stream alongside the one still running
+/// from boot (or the previous reload); the corresponding Binance stream, if
+/// coded the same way, would simply — and correctly — not be respawned.
 pub struct RegistrationOutput {
     pub registry: BrokerRegistry,
     pub report: ReloadReport,
@@ -134,7 +146,7 @@ pub async fn build_registry(
     let mut report = ReloadReport { connections: Vec::new() };
 
     for conn in connections {
-        let outcome = classify(conn, is_boot);
+        let mut outcome = classify(conn, is_boot);
 
         if matches!(outcome, ConnectionOutcome::Disabled) {
             info!(code = %conn.code, kind = %conn.kind, "broker connection disabled, skipping");
@@ -192,18 +204,32 @@ pub async fn build_registry(
                         if matches!(outcome, ConnectionOutcome::RestartRequired) {
                             // Carry the running session forward rather than starting a
                             // second one against the same venue (see fn doc comment).
-                            if let Some(adapter) = current.get("IBKR", env_name) {
-                                registry.register("IBKR", env_name, adapter);
+                            match current.get("IBKR", env_name) {
+                                Some(adapter) => registry.register("IBKR", env_name, adapter),
+                                // Nothing was actually running to carry forward — a
+                                // materially different state from "restart to pick up
+                                // your change": the operator needs to know there is no
+                                // fallback adapter serving this connection right now.
+                                None => {
+                                    outcome = ConnectionOutcome::Failed(
+                                        "connection needs a restart to apply this change and has no running adapter to fall back on".into(),
+                                    );
+                                }
                             }
-                        } else if let Some(adapter) = fix::start_ibkr(
-                            env_name,
-                            creds,
-                            &deps.stream_health,
-                            deps.pool.clone(),
-                            deps.kafka.clone(),
-                            deps.position_changed_tx.clone(),
-                        ) {
-                            registry.register("IBKR", env_name, adapter);
+                        } else {
+                            match fix::start_ibkr(
+                                env_name,
+                                creds,
+                                &deps.stream_health,
+                                deps.pool.clone(),
+                                deps.kafka.clone(),
+                                deps.position_changed_tx.clone(),
+                            ) {
+                                Some(adapter) => registry.register("IBKR", env_name, adapter),
+                                None => {
+                                    outcome = ConnectionOutcome::Failed("IBKR FIX session could not start".into());
+                                }
+                            }
                         }
                     }
                     BrokerCredentials::BinanceFix { api_key, private_key, .. } => {
@@ -212,8 +238,13 @@ pub async fn build_registry(
                             // whatever is currently registered, FIX or REST, rather
                             // than rebuilding — even a REST rebuild is deferred to a
                             // follow-up, not this task.
-                            if let Some(adapter) = current.get("BINANCE", env_name) {
-                                registry.register("BINANCE", env_name, adapter);
+                            match current.get("BINANCE", env_name) {
+                                Some(adapter) => registry.register("BINANCE", env_name, adapter),
+                                None => {
+                                    outcome = ConnectionOutcome::Failed(
+                                        "connection needs a restart to apply this change and has no running adapter to fall back on".into(),
+                                    );
+                                }
                             }
                         } else {
                             // Transport is an explicit choice via BINANCE_{ENV}_TRANSPORT=fix|rest
@@ -232,7 +263,10 @@ pub async fn build_registry(
                                         deps.position_changed_tx.clone(),
                                     ) {
                                         Some(adapter) => registry.register("BINANCE", env_name, adapter),
-                                        None => error!(code = %conn.code, "Binance FIX session could not start"),
+                                        None => {
+                                            error!(code = %conn.code, "Binance FIX session could not start");
+                                            outcome = ConnectionOutcome::Failed("Binance FIX session could not start".into());
+                                        }
                                     }
                                 }
                                 Transport::Rest => match BinanceAdapter::new(api_key.clone(), private_key, env_name) {
@@ -242,7 +276,10 @@ pub async fn build_registry(
                                         binance_rest_adapters.push((env_name, adapter));
                                         info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BINANCE/{env_name} adapter (REST/WS)");
                                     }
-                                    Err(e) => error!(code = %conn.code, "Binance adapter not registered: {e}"),
+                                    Err(e) => {
+                                        error!(code = %conn.code, "Binance adapter not registered: {e}");
+                                        outcome = ConnectionOutcome::Failed(format!("Binance adapter not registered: {e}"));
+                                    }
                                 },
                             }
                         }
@@ -284,6 +321,46 @@ mod tests {
         }
     }
 
+    fn binance() -> BrokerCredentials {
+        BrokerCredentials::BinanceFix {
+            host: "h".into(), port: 9000,
+            sender_comp_id: "OMS".into(), target_comp_id: "SPOT".into(),
+            api_key: "k".into(), private_key: "pk".into(),
+        }
+    }
+
+    /// A `RegistrationDeps` that never touches the network: `PgPool::connect_lazy`
+    /// builds a pool without ever connecting (see `app_state.rs`'s tests), and the
+    /// `RestartRequired` carry-forward path this is used with never dials out —
+    /// it only reads `current`.
+    fn stub_deps() -> RegistrationDeps {
+        RegistrationDeps {
+            pool: PgPool::connect_lazy("postgres://localhost/oms_test_never_connects")
+                .expect("connect_lazy never actually connects"),
+            stream_health: StreamHealthRegistry::new(),
+            kafka: None,
+            position_changed_tx: None,
+        }
+    }
+
+    fn ibkr_conn(code: &str, status: &str, credentials: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
+        Connection {
+            code: code.into(),
+            kind: "IBKR".into(),
+            environment: Some("PAPER".into()),
+            status: status.into(),
+            credentials,
+            credentials_updated_at: None,
+        }
+    }
+
+    /// Any concrete `BrokerAdapter` stands in for "an adapter is already running"
+    /// — `build_registry` only ever moves the `Arc` around for the carry-forward
+    /// path, it never inspects what is inside it.
+    fn stub_adapter() -> Arc<AlpacaAdapter> {
+        Arc::new(AlpacaAdapter::new("k".into(), "s".into(), "PAPER"))
+    }
+
     #[test]
     fn a_disabled_connection_is_never_registered() {
         let c = conn("alpaca-paper", "DISABLED", CredentialState::Configured(alpaca()));
@@ -315,15 +392,84 @@ mod tests {
     #[test]
     fn fix_connections_need_a_restart_but_rest_ones_do_not() {
         let rest = conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca()));
-        let fix = conn("ibkr-paper", "ACTIVE", CredentialState::Configured(ibkr()));
+        let ibkr_fix = conn("ibkr-paper", "ACTIVE", CredentialState::Configured(ibkr()));
+        let binance_fix = conn("binance-paper", "ACTIVE", CredentialState::Configured(binance()));
 
         // At boot both are registered — nothing is running yet to conflict with.
         assert!(matches!(classify(&rest, true), ConnectionOutcome::Registered));
-        assert!(matches!(classify(&fix, true), ConnectionOutcome::Registered));
+        assert!(matches!(classify(&ibkr_fix, true), ConnectionOutcome::Registered));
+        assert!(matches!(classify(&binance_fix, true), ConnectionOutcome::Registered));
 
-        // On reload the FIX one must report a restart rather than starting a
-        // second session to the same venue.
+        // On reload the FIX ones must report a restart rather than starting a
+        // second session to the same venue — including `BinanceFix` when the
+        // actual transport would have been REST (see `classify`'s doc comment).
         assert!(matches!(classify(&rest, false), ConnectionOutcome::Registered));
-        assert!(matches!(classify(&fix, false), ConnectionOutcome::RestartRequired));
+        assert!(matches!(classify(&ibkr_fix, false), ConnectionOutcome::RestartRequired));
+        assert!(matches!(classify(&binance_fix, false), ConnectionOutcome::RestartRequired));
+    }
+
+    /// The most consequential rule in this plan, pinned end-to-end through
+    /// `build_registry` rather than asserted only in a comment: a reload must
+    /// never disarm a FIX session that is already running. `current` holds an
+    /// adapter under ("IBKR", "PAPER"); the connection classifies as
+    /// `RestartRequired` (is_boot = false), and that existing adapter must land
+    /// in the new registry untouched — `fix::start_ibkr` must never be called
+    /// (it would try to dial out, which `stub_deps`'s lazy pool can't satisfy
+    /// anyway, but the point is it must not even be attempted).
+    #[tokio::test]
+    async fn restart_required_carries_the_existing_fix_adapter_forward() {
+        let mut current = BrokerRegistry::new();
+        current.register("IBKR", "PAPER", stub_adapter());
+
+        let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Configured(ibkr()));
+        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+
+        assert!(output.registry.get("IBKR", "PAPER").is_some(), "the running adapter must be carried forward, not dropped");
+        assert_eq!(
+            output.report.connections,
+            vec![("ibkr-paper".to_string(), ConnectionOutcome::RestartRequired)]
+        );
+    }
+
+    /// The flip side: a connection that is not eligible to run at all — disabled,
+    /// or never configured — must not inherit whatever happens to be sitting in
+    /// `current` under the same (kind, environment) key. The control flow makes
+    /// this impossible today (both cases return before the carry-forward branch
+    /// is even reached); this pins it so it stays impossible.
+    #[tokio::test]
+    async fn disabled_and_unconfigured_connections_never_carry_an_adapter_forward() {
+        let mut current = BrokerRegistry::new();
+        current.register("IBKR", "PAPER", stub_adapter());
+
+        let disabled = ibkr_conn("ibkr-paper", "DISABLED", CredentialState::Configured(ibkr()));
+        let output = build_registry(&[disabled], false, &current, &stub_deps()).await;
+        assert!(output.registry.get("IBKR", "PAPER").is_none());
+
+        let unconfigured = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Unconfigured);
+        let output = build_registry(&[unconfigured], false, &current, &stub_deps()).await;
+        assert!(output.registry.get("IBKR", "PAPER").is_none());
+    }
+
+    /// A `RestartRequired` connection with nothing in `current` to carry forward
+    /// (e.g. a brand new FIX credential added between boot and this reload) must
+    /// not silently claim `RestartRequired` while registering nothing — that
+    /// reads as "restart to pick up your change" when there is no fallback
+    /// adapter serving the connection at all right now. It must downgrade to
+    /// `Failed` with a reason naming both facts.
+    #[tokio::test]
+    async fn restart_required_with_nothing_to_carry_forward_is_reported_failed() {
+        let current = BrokerRegistry::new(); // empty: nothing running for any venue
+        let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Configured(ibkr()));
+        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+
+        assert!(output.registry.get("IBKR", "PAPER").is_none());
+        match &output.report.connections[0] {
+            (code, ConnectionOutcome::Failed(reason)) => {
+                assert_eq!(code, "ibkr-paper");
+                assert!(reason.contains("restart"), "reason should say a restart is needed: {reason}");
+                assert!(reason.contains("no running adapter"), "reason should say there is nothing to fall back on: {reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }
