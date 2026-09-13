@@ -62,6 +62,7 @@ mod preflight;
 mod config;
 mod secrets;
 mod credentials;
+mod credentials_api;
 mod expiry;
 mod fix;
 mod reload;
