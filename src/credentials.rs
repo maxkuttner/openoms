@@ -152,14 +152,32 @@ pub fn redacted_fields(c: &BrokerCredentials) -> Vec<RedactedField> {
     to_wire(c.redact())
 }
 
-/// See `redacted_fields` — same mapping, for feed credentials. No feed-facing
-/// endpoint consumes this yet (the broker read path is this task's scope);
-/// kept alongside `redacted_fields` so the wire mapping for both credential
-/// kinds lands in one place rather than being reinvented when that endpoint
-/// is added, and exercised in the meantime by `no_secret_field_carries_a_value`.
-#[allow(dead_code)]
+/// See `redacted_fields` — same mapping, for feed credentials. Used by
+/// `admin::redact_connection` via the `ToRedactedFields` impl below, and
+/// exercised directly by `no_secret_field_carries_a_value`.
 pub fn redacted_fields_feed(c: &FeedCredentials) -> Vec<RedactedField> {
     to_wire(c.redact())
+}
+
+/// Lets `admin::redact_connection` map either credential kind to its wire
+/// form through one generic function, instead of admin.rs duplicating that
+/// mapping per kind. `redacted_fields`/`redacted_fields_feed` stay the
+/// directly-testable, per-kind entry points named in `mod tests` below —
+/// these impls are simply what calls them from outside this module.
+pub trait ToRedactedFields {
+    fn to_redacted_fields(&self) -> Vec<RedactedField>;
+}
+
+impl ToRedactedFields for BrokerCredentials {
+    fn to_redacted_fields(&self) -> Vec<RedactedField> {
+        redacted_fields(self)
+    }
+}
+
+impl ToRedactedFields for FeedCredentials {
+    fn to_redacted_fields(&self) -> Vec<RedactedField> {
+        redacted_fields_feed(self)
+    }
 }
 
 fn to_wire(r: Redacted) -> Vec<RedactedField> {

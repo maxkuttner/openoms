@@ -807,9 +807,15 @@ fn resolve_master_key() -> Result<Option<crate::secrets::MasterKey>, AdminError>
 /// Maps one loaded connection's credential state onto the wire shape. Split
 /// out from the handler so the mapping — the part that must never let a
 /// secret through — is exercised directly in tests, with no database.
-fn redact_connection(conn: Connection<BrokerCredentials>) -> RedactedCredentials {
+///
+/// Generic over `T: ToRedactedFields` rather than pinned to
+/// `BrokerCredentials`: brokers and feeds share this exact mapping (only
+/// which fields are secret differs, and that lives in each type's own
+/// `Redact` impl), so a feed connection reuses this function instead of
+/// admin.rs growing a second copy of it.
+fn redact_connection<T: crate::credentials::ToRedactedFields>(conn: Connection<T>) -> RedactedCredentials {
     let (state, fields, message) = match conn.credentials {
-        CredentialState::Configured(c) => ("configured", crate::credentials::redacted_fields(&c), None),
+        CredentialState::Configured(c) => ("configured", c.to_redacted_fields(), None),
         CredentialState::Unconfigured => ("unconfigured", Vec::new(), None),
         CredentialState::Error(e) => ("error", Vec::new(), Some(e)),
     };
@@ -1523,6 +1529,218 @@ fn classify_feed(conn: &Connection<FeedCredentials>) -> reload::ConnectionOutcom
 /// "carry forward" here needs no extra step beyond not calling this.
 fn should_stop_databento_feed(outcome: &reload::ConnectionOutcome) -> bool {
     matches!(outcome, reload::ConnectionOutcome::Disabled | reload::ConnectionOutcome::Unconfigured)
+}
+
+// ── Feed connections ──────────────────────────────────────────────────────────
+//
+// Mirrors the "Broker connections" section above: same redacted view, same
+// write gate (decrypt existing → parse merged → test → persist → reload), same
+// 400-vs-422 split. The pieces that don't vary by credential kind —
+// `resolve_master_key`, `redact_connection`, `test_response`, `persist_gate`,
+// `should_persist`, `parse_submission`, `reload_with_key` — are reused as-is
+// from that section, not copied.
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FeedConnectionSummary {
+    pub code: String,
+    pub provider: String,
+    /// Nullable in the schema — a feed connection can exist before its
+    /// dataset is known, same as credentials can be unconfigured.
+    pub dataset: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The configured feed connections themselves (rows), distinct from
+/// `list_feeds` above, which reports the ranked market-data source *policy*
+/// (`provider_feed_policy`) plus coverage counts. Nothing served
+/// `feed_connection` rows before this — the cockpit's feed credentials page
+/// has no list to render without it.
+#[utoipa::path(
+    get, path = "/admin/feed-connections", tag = "admin",
+    responses((status = 200, description = "OK", body = [FeedConnectionSummary])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_feed_connections(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<FeedConnectionSummary>>, AdminError> {
+    info!("admin list feed connections");
+    let records = sqlx::query_as::<_, FeedConnectionSummary>(
+        r#"
+        SELECT code, provider, dataset, status, created_at, updated_at
+        FROM feed_connection
+        ORDER BY code
+        "#,
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(records))
+}
+
+/// What is configured for one feed connection, with every secret withheld.
+/// See `get_broker_connection_credentials` — identical shape and `state`
+/// semantics, just backed by `load_feeds` instead of `load_brokers`.
+#[utoipa::path(
+    get, path = "/admin/feed-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    responses(
+        (status = 200, description = "OK — configured, unconfigured, or error; never a decrypted secret", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the configured master key is invalid"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(feed_connection_code = %code, "admin get feed connection credentials");
+
+    let master = resolve_master_key()?;
+
+    let connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
+}
+
+/// Save (create or edit) a feed connection's credential. See
+/// `put_broker_connection_credentials` for the order this follows and why —
+/// the only differences are `parse_feed`/`test_feed` in place of
+/// `parse_broker`/`test_broker` (feeds have no per-connection environment to
+/// thread through) and `save_feed` in place of `save_broker`.
+#[utoipa::path(
+    put, path = "/admin/feed-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    request_body = CredentialSubmission,
+    responses(
+        (status = 200, description = "Saved, tested where possible, and reloaded", body = SaveResponse),
+        (status = 400, description = "The request body was malformed, or could not be parsed into a credential (unknown field, ...)"),
+        (status = 404, description = "Not found"),
+        (status = 422, description = "The credential did not authenticate; nothing was written"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid or unset, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn put_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(raw): Json<serde_json::Value>,
+) -> Result<Json<SaveResponse>, AdminError> {
+    info!(feed_connection_code = %code, "admin save feed connection credentials");
+
+    let submission = parse_submission(raw)?;
+
+    // A write, unlike a read, cannot tolerate an absent key — same as brokers.
+    let master = resolve_master_key()?.ok_or_else(|| AdminError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "no master key is configured (set oms.master_key in oms.toml); cannot save credentials".into(),
+    })?;
+
+    // Decrypt existing. 404s here even though `save_feed` itself would
+    // upsert the row (see its doc comment) — this endpoint only edits a feed
+    // connection that already exists, same as the broker path.
+    let connections = crate::credentials::load_feeds(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+    let existing = match &conn.credentials {
+        CredentialState::Configured(c) => Some(c),
+        CredentialState::Unconfigured | CredentialState::Error(_) => None,
+    };
+
+    // Parse merged.
+    let parsed = credentials_api::parse_feed(&conn.kind, existing, &submission)
+        .map_err(|e| AdminError { status: StatusCode::BAD_REQUEST, message: e.to_string() })?;
+
+    // Test.
+    let outcome = credentials_api::test_feed(&parsed).await;
+    let TestResponse { tested, message, .. } = test_response(&outcome);
+    let gate = persist_gate(&outcome);
+    if !should_persist(&gate) {
+        return Err(AdminError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: gate.expect_err("should_persist(&gate) was false, so gate must be Err"),
+        });
+    }
+
+    // Persist.
+    crate::credentials::save_feed(state.pool(), &master, &code, &parsed)
+        .await
+        .map_err(map_db_error)?;
+
+    // Reload — the existing, serialized path; not a second one.
+    let report = reload_with_key(state.clone(), Some(master.clone())).await?;
+    let reload = report.0.connections.into_iter().find(|(c, _)| *c == code).map(|(_, outcome)| outcome);
+
+    let refreshed = crate::credentials::load_feeds(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = refreshed
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, reload }))
+}
+
+/// Clear a feed connection's stored credential. See
+/// `delete_broker_connection_credentials` for the ordering rationale (clear
+/// before reload, so a failed reload still leaves a retryable state).
+#[utoipa::path(
+    delete, path = "/admin/feed-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    responses(
+        (status = 200, description = "Cleared and reloaded — now unconfigured", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn delete_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(feed_connection_code = %code, "admin delete feed connection credentials");
+
+    let result = sqlx::query(
+        "UPDATE feed_connection \
+         SET credentials = NULL, credentials_updated_at = NULL, updated_at = now() \
+         WHERE code = $1",
+    )
+    .bind(&code)
+    .execute(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("feed_connection"));
+    }
+
+    // Disarm the feed task before reporting success — same as the broker path.
+    let master = resolve_master_key()?;
+    let _report = reload_with_key(state.clone(), master.clone()).await?;
+
+    let connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
 }
 
 // ── API key management ────────────────────────────────────────────────────────
@@ -2734,6 +2952,26 @@ mod tests {
         .expect("serialize");
         assert!(!body.contains("SUPERSECRETVALUE"), "submitted secret leaked into the save response: {body}");
         assert!(body.contains("alpaca-paper"));
+    }
+
+    /// Same regression, feed side: `redact_connection`'s generic dispatch
+    /// (`ToRedactedFields`) must redact a `FeedCredentials::Databento` just
+    /// as thoroughly as it redacts a broker credential.
+    #[test]
+    fn the_feed_save_response_carries_no_submitted_secret() {
+        let conn = feed(
+            "databento-opra",
+            CredentialState::Configured(FeedCredentials::Databento { api_key: "SUPERSECRETFEEDKEY".into() }),
+        );
+        let body = serde_json::to_string(&SaveResponse {
+            redacted: redact_connection(conn),
+            tested: true,
+            message: None,
+            reload: None,
+        })
+        .expect("serialize");
+        assert!(!body.contains("SUPERSECRETFEEDKEY"), "submitted secret leaked into the save response: {body}");
+        assert!(body.contains("databento-opra"));
     }
 
     /// `test_response` is what both the `test` endpoint and the save path's

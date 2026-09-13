@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 use crate::adapters::alpaca::AlpacaAdapter;
-use crate::credentials::BrokerCredentials;
+use crate::credentials::{BrokerCredentials, FeedCredentials};
 
 /// A submitted credential form: field name to raw string value, exactly as
 /// an HTML form or a JSON object would hand it over. Untyped on purpose —
@@ -164,6 +164,29 @@ pub fn parse_broker(
     }
 }
 
+/// Turns a submitted form into a typed feed credential, same merge rule as
+/// `parse_broker` above (present-non-empty replaces; omitted-or-empty keeps
+/// what is stored; omitted with nothing stored is `MissingField`).
+///
+/// `FeedCredentials` has exactly one variant today, but this is written as a
+/// `match kind` — not a bare struct literal — so a second provider is a new
+/// arm here, the same shape `parse_broker` already has for its three
+/// brokers, rather than a rewrite of this function's signature.
+pub fn parse_feed(
+    kind: &str,
+    existing: Option<&FeedCredentials>,
+    sub: &CredentialSubmission,
+) -> Result<FeedCredentials, CredentialError> {
+    match kind {
+        "DATABENTO" => {
+            let existing_key =
+                existing.map(|FeedCredentials::Databento { api_key }| api_key.as_str());
+            Ok(FeedCredentials::Databento { api_key: field(sub, "api_key", existing_key)?.to_string() })
+        }
+        other => Err(CredentialError::UnknownKind(other.to_string())),
+    }
+}
+
 /// Outcome of attempting to verify a credential before it is saved.
 ///
 /// A plain `Result<(), String>` can only say "it worked" or "it didn't" — it
@@ -220,10 +243,54 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
     }
 }
 
+/// The Databento dataset `test_feed` authenticates against. Mirrors
+/// `opra_stream::OPRA_DATASET` (private to that module, so not reusable
+/// directly): `databento-opra` is, today, the only Databento feed connection
+/// this build ever registers (see `admin::classify_feed`'s and `serve()`'s
+/// matching "only databento-opra" guards) and it is hardcoded to OPRA options
+/// data. A second Databento feed on a different dataset would need this
+/// hardcoded literal replaced with something read off the connection row,
+/// not a new parameter threaded through just for this one caller.
+const DATABENTO_OPRA_DATASET: &str = "OPRA.PILLAR";
+
+/// Tests a feed credential the cheap way, where one exists — the feed-side
+/// counterpart to `test_broker`.
+///
+/// Databento's live gateway is authenticated as part of connecting:
+/// `LiveClient::builder().key(..).dataset(..).build()` opens a TCP connection
+/// and runs the CRAM handshake, and returns an error if the gateway rejects
+/// the key — before a single `subscribe()` or `start()` is ever called, so
+/// this never requests, receives, or decodes a market-data record. That
+/// makes it the same shape of check as Alpaca's `GET /v2/account`: a real,
+/// lightweight, side-effect-free round trip against the provider, not a full
+/// live subscription. The connection is closed immediately after a
+/// successful build; nothing about it is kept.
+pub async fn test_feed(creds: &FeedCredentials) -> TestOutcome {
+    match creds {
+        FeedCredentials::Databento { api_key } => {
+            let builder = match databento::LiveClient::builder().key(api_key.clone()) {
+                Ok(b) => b,
+                Err(e) => return TestOutcome::Failed(e.to_string()),
+            };
+            match builder.dataset(DATABENTO_OPRA_DATASET).build().await {
+                Ok(mut client) => {
+                    // Best-effort: the auth check already happened in `build()`
+                    // above, so a failure to close politely does not change
+                    // the outcome — only leaves the gateway to time the
+                    // connection out on its own.
+                    let _ = client.close().await;
+                    TestOutcome::Passed
+                }
+                Err(e) => TestOutcome::Failed(e.to_string()),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::credentials::BrokerCredentials;
+    use crate::credentials::{BrokerCredentials, FeedCredentials};
 
     fn sub(pairs: &[(&str, &str)]) -> CredentialSubmission {
         CredentialSubmission {
@@ -361,5 +428,50 @@ mod tests {
         ]));
         let msg = format!("{:?}", r.unwrap_err());
         assert!(!msg.contains("SUPERSECRETVALUE"), "submitted value leaked into {msg}");
+    }
+
+    // ── parse_feed ──────────────────────────────────────────────────────
+
+    fn existing_databento() -> FeedCredentials {
+        FeedCredentials::Databento { api_key: "OLDKEY".into() }
+    }
+
+    #[test]
+    fn a_full_feed_submission_replaces_everything() {
+        match parse_feed("DATABENTO", None, &sub(&[("api_key", "NEWKEY")])).expect("parse") {
+            FeedCredentials::Databento { api_key } => assert_eq!(api_key, "NEWKEY"),
+        }
+    }
+
+    /// The same edit experience `parse_broker` gives brokers: an omitted
+    /// secret must inherit the stored one rather than erroring or blanking it.
+    #[test]
+    fn an_omitted_feed_secret_keeps_the_stored_one() {
+        match parse_feed("DATABENTO", Some(&existing_databento()), &sub(&[])).expect("parse") {
+            FeedCredentials::Databento { api_key } => {
+                assert_eq!(api_key, "OLDKEY", "the stored key must survive an omission");
+            }
+        }
+    }
+
+    /// An empty string is an omission, not a value — same rule as brokers.
+    #[test]
+    fn an_empty_feed_secret_is_treated_as_omitted() {
+        match parse_feed("DATABENTO", Some(&existing_databento()), &sub(&[("api_key", "")])).expect("parse") {
+            FeedCredentials::Databento { api_key } => assert_eq!(api_key, "OLDKEY"),
+        }
+    }
+
+    #[test]
+    fn an_omitted_feed_secret_with_nothing_stored_is_an_error() {
+        assert!(matches!(
+            parse_feed("DATABENTO", None, &sub(&[])),
+            Err(CredentialError::MissingField("api_key"))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_feed_kind_is_rejected() {
+        assert!(matches!(parse_feed("POLYGON", None, &sub(&[])), Err(CredentialError::UnknownKind(_))));
     }
 }

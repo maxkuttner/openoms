@@ -113,6 +113,10 @@ mod reload_tests;
         admin::put_broker_connection_credentials,
         admin::delete_broker_connection_credentials,
         admin::test_broker_connection_credentials,
+        admin::list_feed_connections,
+        admin::get_feed_connection_credentials,
+        admin::put_feed_connection_credentials,
+        admin::delete_feed_connection_credentials,
         admin::reload_connections,
         admin::create_risk_limit,
         admin::list_risk_limits,
@@ -142,7 +146,7 @@ mod reload_tests;
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
-        admin::InstrumentSummary, admin::FeedSummary,
+        admin::InstrumentSummary, admin::FeedSummary, admin::FeedConnectionSummary,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
         admin::ExpirySweepResult,
         admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
@@ -1126,6 +1130,13 @@ async fn serve() {
             "/admin/broker-connections/:code/credentials/test",
             post(admin::test_broker_connection_credentials),
         )
+        .route("/admin/feed-connections", get(admin::list_feed_connections))
+        .route(
+            "/admin/feed-connections/:code/credentials",
+            get(admin::get_feed_connection_credentials)
+                .put(admin::put_feed_connection_credentials)
+                .delete(admin::delete_feed_connection_credentials),
+        )
         .route("/admin/connections/reload", post(admin::reload_connections))
         .route(
             "/admin/principals/:id/grants",
@@ -1221,9 +1232,12 @@ mod tests {
         let json = serde_json::to_string(&doc).expect("serialize openapi doc");
         assert!(json.contains("/admin/broker-connections/{code}/credentials"));
         assert!(json.contains("/admin/broker-connections/{code}/credentials/test"));
+        assert!(json.contains("/admin/feed-connections"));
+        assert!(json.contains("/admin/feed-connections/{code}/credentials"));
         assert!(json.contains("SaveResponse"));
         assert!(json.contains("TestResponse"));
         assert!(json.contains("CredentialSubmission"));
+        assert!(json.contains("FeedConnectionSummary"));
     }
 
     /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares
