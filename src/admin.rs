@@ -86,6 +86,26 @@ pub struct UpdateBrokerConnection {
     pub status: Option<String>,
 }
 
+/// The credential view safe to put on the wire. `state` mirrors
+/// `CredentialState` so the cockpit can tell "needs setup" (`unconfigured`)
+/// apart from "stored but the master key does not open it" (`error`) — the
+/// distinction the whole credential store was built to preserve; collapsing
+/// them would invite an operator to re-enter a credential that is already
+/// there instead of fixing the key. `fields` is populated only when `state`
+/// is `"configured"`; `message` only when `state` is `"error"`. Never carries
+/// a decrypted secret, in either state.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RedactedCredentials {
+    pub code: String,
+    /// "configured" | "unconfigured" | "error"
+    pub state: String,
+    pub fields: Vec<crate::credentials::RedactedField>,
+    /// The reason a stored blob could not be used — set only when
+    /// `state == "error"`, and always a description, never the payload.
+    pub message: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[utoipa::path(
     post, path = "/admin/principals", tag = "admin",
     request_body = CreatePrincipal,
@@ -740,6 +760,74 @@ pub async fn update_broker_connection(
     .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
     Ok(Json(record))
+}
+
+/// Maps one loaded connection's credential state onto the wire shape. Split
+/// out from the handler so the mapping — the part that must never let a
+/// secret through — is exercised directly in tests, with no database.
+fn redact_connection(conn: Connection<BrokerCredentials>) -> RedactedCredentials {
+    let (state, fields, message) = match conn.credentials {
+        CredentialState::Configured(c) => ("configured", crate::credentials::redacted_fields(&c), None),
+        CredentialState::Unconfigured => ("unconfigured", Vec::new(), None),
+        CredentialState::Error(e) => ("error", Vec::new(), Some(e)),
+    };
+    RedactedCredentials {
+        code: conn.code,
+        state: state.to_string(),
+        fields,
+        message,
+        updated_at: conn.credentials_updated_at,
+    }
+}
+
+/// What is configured for one broker connection, with every secret withheld.
+///
+/// 404 only when the connection row itself does not exist. A connection with
+/// no credentials stored is still 200, `state: "unconfigured"` — it exists,
+/// it just needs setup, which is a different operator situation from 404
+/// ("no such connection") and from `state: "error"` ("stored, but the master
+/// key does not open it"). See `RedactedCredentials`.
+#[utoipa::path(
+    get, path = "/admin/broker-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "OK — configured, unconfigured, or error; never a decrypted secret", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the configured master key is invalid"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(broker_connection_code = %code, "admin get broker connection credentials");
+
+    // Same resolution `reload_connections` uses: a configured-but-invalid key
+    // is reported, never silently treated as absent — absent is survivable
+    // (every row reads back Unconfigured-if-null / Error-if-not, correctly),
+    // but a wrong key must not be hidden behind that same "no key" story.
+    let master = match crate::config::master_key(crate::config::load()) {
+        Some(Ok(k)) => Some(k),
+        Some(Err(e)) => {
+            return Err(AdminError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("master key is invalid: {e}"),
+            });
+        }
+        None => None,
+    };
+
+    let connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
 }
 
 /// Re-read the credential store and apply what can be applied without a

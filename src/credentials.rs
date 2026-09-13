@@ -131,6 +131,47 @@ impl std::fmt::Debug for FeedCredentials {
     }
 }
 
+/// One field of a credential as it may be shown on the wire. Named so the UI
+/// always knows the field exists — even when `value` is withheld — and can
+/// render a "leave blank to keep" input rather than an empty box that looks
+/// like the value was lost. `secret` is carried explicitly rather than left
+/// for a caller to infer from `value.is_none()`, so a future field that is
+/// merely *absent* (not secret) cannot be mistaken for one that is withheld.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct RedactedField {
+    pub name: String,
+    pub value: Option<String>,
+    pub secret: bool,
+}
+
+/// Maps `Redacted.fields`'s `(name, value)` pairs onto the wire shape:
+/// `secret` is `value.is_none()`, the same convention `hidden()`/`shown()`
+/// already encode. This is a mapping, not a second redaction path — the only
+/// redaction logic is `Redact::redact`, above.
+pub fn redacted_fields(c: &BrokerCredentials) -> Vec<RedactedField> {
+    to_wire(c.redact())
+}
+
+/// See `redacted_fields` — same mapping, for feed credentials. No feed-facing
+/// endpoint consumes this yet (the broker read path is this task's scope);
+/// kept alongside `redacted_fields` so the wire mapping for both credential
+/// kinds lands in one place rather than being reinvented when that endpoint
+/// is added, and exercised in the meantime by `no_secret_field_carries_a_value`.
+#[allow(dead_code)]
+pub fn redacted_fields_feed(c: &FeedCredentials) -> Vec<RedactedField> {
+    to_wire(c.redact())
+}
+
+fn to_wire(r: Redacted) -> Vec<RedactedField> {
+    r.fields
+        .into_iter()
+        .map(|(name, value)| {
+            let secret = value.is_none();
+            RedactedField { name, value, secret }
+        })
+        .collect()
+}
+
 /// What is known about a connection's credentials.
 #[derive(Debug)]
 pub enum CredentialState<T> {
@@ -452,6 +493,45 @@ mod tests {
 
         let r = format!("{:?}", FeedCredentials::Databento { api_key: "db-key".into() }.redact());
         assert!(!r.contains("db-key"), "feed key leaked: {r}");
+    }
+
+    /// The wire form must mark which fields are secret, so the UI can render a
+    /// "leave blank to keep" input rather than an empty text box that looks like
+    /// the value was lost.
+    #[test]
+    fn the_wire_form_marks_secret_fields() {
+        let fields = super::redacted_fields(&alpaca());
+        let secret: Vec<_> = fields.iter().filter(|f| f.secret).map(|f| f.name.as_str()).collect();
+        assert_eq!(secret, vec!["secret"], "only the secret is secret; the key id is shown");
+
+        let shown = fields.iter().find(|f| f.name == "key").expect("key present");
+        assert!(shown.value.is_some(), "the key id must be visible so the operator can tell which is installed");
+    }
+
+    /// A secret field must never carry a value on the wire — this is the whole
+    /// point of the type.
+    #[test]
+    fn no_secret_field_carries_a_value() {
+        for creds in [alpaca(), binance(), ibkr()] {
+            for f in super::redacted_fields(&creds) {
+                if f.secret {
+                    assert!(f.value.is_none(), "{} leaked a value", f.name);
+                }
+            }
+        }
+        for f in super::redacted_fields_feed(&FeedCredentials::Databento { api_key: "db-key".into() }) {
+            assert!(f.value.is_none() || !f.secret);
+        }
+    }
+
+    /// Every field of every variant must appear — a field silently missing from
+    /// the wire form is a field the UI cannot offer to set.
+    #[test]
+    fn every_field_appears_on_the_wire() {
+        let names: Vec<_> = super::redacted_fields(&ibkr()).into_iter().map(|f| f.name).collect();
+        for expected in ["host", "port", "sender_comp_id", "target_comp_id", "password", "ssl"] {
+            assert!(names.contains(&expected.to_string()), "{expected} missing from {names:?}");
+        }
     }
 
     /// `{:?}` on the credentials themselves must not print secrets either — a

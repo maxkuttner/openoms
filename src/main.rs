@@ -108,6 +108,7 @@ mod reload_tests;
         admin::list_broker_connections,
         admin::get_broker_connection,
         admin::update_broker_connection,
+        admin::get_broker_connection_credentials,
         admin::reload_connections,
         admin::create_risk_limit,
         admin::list_risk_limits,
@@ -130,6 +131,7 @@ mod reload_tests;
         CreatePortfolio, UpdatePortfolio,
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
+        admin::RedactedCredentials, crate::credentials::RedactedField,
         CreateKey, ApiKeyRecord,
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
         Grant, CreateGrant, UpdateGrant,
@@ -1106,6 +1108,10 @@ async fn serve() {
         .route(
             "/admin/broker-connections/:code",
             axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
+        )
+        .route(
+            "/admin/broker-connections/:code/credentials",
+            get(admin::get_broker_connection_credentials),
         )
         .route("/admin/connections/reload", post(admin::reload_connections))
         .route(
