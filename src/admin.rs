@@ -12,7 +12,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::credentials::{Connection, CredentialState, FeedCredentials};
+use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials};
 use crate::reload;
 use crate::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
@@ -751,16 +751,25 @@ pub async fn update_broker_connection(
 /// the cockpit treat normal operation as an error. The per-connection
 /// outcomes in the body carry the detail, never the credential itself.
 ///
-/// A failed read of either store — a database error, or a master key that is
-/// missing when credentials are stored, or present but wrong — leaves the
-/// running registry exactly as it was and reports 500 instead of swapping.
-/// Swapping in a registry built from an incomplete read would disarm every
-/// broker; declining is the safer failure.
+/// Reports 500 and leaves the running registry exactly as it was, without
+/// swapping, in three cases: a database error reading either store; a master
+/// key that is configured but invalid; or — the case `boot` itself already
+/// refuses to start in, via the same `nothing_decrypted` predicate — every
+/// stored credential across *both* stores failing to decrypt under the
+/// resolved key while nothing at all decoded. That last case is this
+/// endpoint's own headline scenario: `oms config rotate-key` re-seals every
+/// row from a separate process while this server still holds the old key in
+/// memory (`config::load` is memoized, so an edit to `oms.toml` after boot is
+/// never picked up by this endpoint either — restart to pick up a changed
+/// master key itself). POSTing a reload right after a rotation, instead of
+/// restarting, is exactly the workflow this endpoint exists to avoid a
+/// restart for; without this gate it would swap in a registry with every
+/// broker unregistered and still report 200.
 #[utoipa::path(
     post, path = "/admin/connections/reload", tag = "admin",
     responses(
         (status = 200, description = "Per-connection reload report (codes and outcomes only — no credential material)"),
-        (status = 500, description = "The credential store could not be read, or the master key is invalid; nothing was changed"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid, or nothing at all decrypted; nothing was changed"),
     ),
     security(("bearer_token" = []))
 )]
@@ -794,6 +803,24 @@ pub async fn reload_connections(
             message: format!("failed to load feed connections: {e}"),
         })?;
 
+    // Mirror boot's own refusal gate (`crate::nothing_decrypted`) before
+    // touching anything: `credentials::decode` turns an unreadable blob into
+    // `CredentialState::Error`, not an `Err`, so the two loads above succeed
+    // even when the resolved key opens nothing at all. Without this check a
+    // reload that raced a `rotate-key` run in a separate process — this
+    // endpoint's own headline use case — would swap in a registry with every
+    // broker unregistered and still report 200. See this function's doc
+    // comment for why this is not merely a defensive check.
+    if must_refuse_reload(&broker_connections, &feed_connections) {
+        return Err(AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "refusing to reload: credentials are stored but none of them could be \
+                      decrypted under the configured master key (see the per-connection errors \
+                      in the server log); the running registry is unchanged"
+                .to_string(),
+        });
+    }
+
     info!("admin reload connections");
 
     let deps = reload::RegistrationDeps {
@@ -823,27 +850,63 @@ pub async fn reload_connections(
 
     state.swap_registry(registry);
 
-    // Restart the execution stream of every connection this pass actually
-    // re-registered. `restarts_execution_stream` is true only for `Registered`,
-    // and `classify` never reports `Registered` for a FIX connection on reload
-    // (see its own doc comment) — so in practice this only ever fires for
+    // `build_registry` pushes exactly one report entry per input connection,
+    // in order (verified by reading every branch), which is what makes the
+    // positional zip below sound. This is a real coupling across a module
+    // boundary rather than something the type system enforces, so pin it.
+    debug_assert_eq!(
+        broker_connections.len(),
+        report.connections.len(),
+        "build_registry must report exactly one outcome per input connection, in order"
+    );
+
+    // For each broker connection: restart its execution stream if this pass
+    // re-registered it, or stop one still running under a credential that is
+    // no longer live if this pass did not.
+    //
+    // `restarts_execution_stream` is true only for `Registered`, and
+    // `classify` never reports `Registered` for a FIX connection on reload
+    // (see its own doc comment) — so the restart arm only ever fires for
     // Alpaca. Using it here, rather than re-deriving the same answer from
     // `alpaca_creds` membership, is what makes this loop follow the outcome
     // the report already committed to, instead of a second, potentially
     // diverging judgment call.
+    //
+    // The stop arm covers `Disabled` and `Unconfigured`, and a `Failed` that
+    // truly has nothing running: nothing before this task ever stopped the
+    // *execution stream* for one of them — an operator disabling
+    // `alpaca-paper` because a key leaked would see the report say `Disabled`
+    // while the trade-update websocket kept ingesting fills on the old
+    // credential. `RestartRequired` is deliberately excluded: its adapter is
+    // carried forward and is still meant to be running.
+    //
+    // The condition is "no Alpaca adapter survived this pass for this
+    // environment", not "the outcome wasn't Registered" — those differ for
+    // exactly one case: an `Error`ed Alpaca connection whose credential
+    // failed to decrypt but whose adapter was carried forward from `current`
+    // (see `build_registry`'s `Error` arm, added for the same "one bad row
+    // must not disarm a working connection" reason `RestartRequired` already
+    // gets). Aborting the stream there, on the outcome alone, would stop
+    // fills while orders kept routing through the surviving adapter —
+    // recreating, in miniature, the exact order/fill split Task 4 closed for
+    // the double-stream case, just from the opposite direction (zero streams
+    // instead of two). `alpaca_exec_stream_code` is keyed by environment, not
+    // by broker kind, so checking `get_alpaca` from a non-Alpaca connection's
+    // iteration (e.g. an IBKR row sharing the same environment) is always a
+    // harmless no-op — nothing is ever registered under that key for them.
     for (conn, (_, outcome)) in broker_connections.iter().zip(report.connections.iter()) {
-        if !reload::restarts_execution_stream(outcome) {
-            continue;
-        }
         let env_name: &'static str = match conn.environment.as_deref() {
             Some("PAPER") => "PAPER",
             Some("LIVE") => "LIVE",
             _ => continue,
         };
-        if let (Some((key, secret)), Some(adapter)) =
-            (alpaca_creds.get(env_name), state.registry().get_alpaca(env_name))
-        {
-            reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &deps, state.streams());
+        let alpaca_adapter = state.registry().get_alpaca(env_name);
+        if reload::restarts_execution_stream(outcome) {
+            if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), alpaca_adapter) {
+                reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &deps, state.streams());
+            }
+        } else if should_stop_alpaca_stream(outcome, alpaca_adapter.is_some()) {
+            state.streams().abort_and_remove(&reload::alpaca_exec_stream_code(env_name));
         }
     }
 
@@ -851,26 +914,79 @@ pub async fn reload_connections(
     // plain REST/WS credential behind a supervised task, restartable the same
     // way an Alpaca adapter is. Classified and appended to the same report so
     // the cockpit sees every connection — broker or feed — in one response.
+    //
+    // A feed not `Registered` this pass (Disabled, Unconfigured, or Failed)
+    // has its task stopped too — `restart_databento_feed` keys `StreamRegistry`
+    // by the feed's own connection code (unlike the Alpaca execution stream
+    // above), so `abort_and_remove(&conn.code)` is the exact key a previous
+    // pass would have registered it under. Otherwise a feed an operator just
+    // turned off keeps silently streaming quotes into `MarkStore` on its old
+    // credential — the same class of bug as the Alpaca case above.
+    //
+    // Unlike the broker loop, `Failed` (a decrypt error) is not special-cased
+    // here to keep a feed running: there is no feed equivalent of
+    // `BrokerRegistry`'s `current` to carry an adapter forward from —
+    // `classify_feed` never reports anything a session could be recovered
+    // from, and stopping a feed whose credential just became unreadable is
+    // the same "declining is safer than a silent stale session" reasoning,
+    // just with no carry-forward option available to prefer instead.
     for conn in &feed_connections {
         let outcome = classify_feed(conn);
-        if let (
-            reload::ConnectionOutcome::Registered,
-            CredentialState::Configured(FeedCredentials::Databento { api_key }),
-        ) = (&outcome, &conn.credentials)
-        {
-            reload::restart_databento_feed(
-                api_key.clone(),
-                state.pool().clone(),
-                state.stream_health(),
-                state.streams(),
-                state.doorbells(),
-                state.quote_tx(),
-            );
+        match (&outcome, &conn.credentials) {
+            (reload::ConnectionOutcome::Registered, CredentialState::Configured(FeedCredentials::Databento { api_key })) => {
+                reload::restart_databento_feed(
+                    api_key.clone(),
+                    state.pool().clone(),
+                    state.stream_health(),
+                    state.streams(),
+                    state.doorbells(),
+                    state.quote_tx(),
+                );
+            }
+            _ => state.streams().abort_and_remove(&conn.code),
         }
         report.connections.push((conn.code.clone(), outcome));
     }
 
     Ok(Json(report))
+}
+
+/// Whether `reload_connections` must refuse rather than swap: the same
+/// judgment `crate::nothing_decrypted` makes at boot, applied to what this
+/// reload just read. Combines *both* stores into the one configured/error
+/// verdict — a broker-only or feed-only reading of "did anything decrypt"
+/// would miss the case where, say, every broker credential is readable but
+/// every feed credential just got re-sealed under a key this process does not
+/// have yet (or vice versa); either way, if literally nothing across the
+/// whole store decoded while something is known to be stored and unusable,
+/// this reload has nothing safe to swap in.
+fn must_refuse_reload(
+    broker_connections: &[Connection<BrokerCredentials>],
+    feed_connections: &[Connection<FeedCredentials>],
+) -> bool {
+    let any_configured = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)))
+        || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)));
+    let any_error = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)))
+        || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)));
+    crate::nothing_decrypted(any_configured, any_error)
+}
+
+/// Whether the reload loop should stop an Alpaca environment's execution
+/// stream: true iff this pass did not just restart it (`outcome` is not
+/// `Registered`) *and* nothing survived the swap to keep serving orders under
+/// it either.
+///
+/// The second half is what keeps this different from a plain "outcome wasn't
+/// `Registered`" check: an `Error`ed connection whose credential failed to
+/// decrypt can still have `alpaca_adapter_survived = true`, because
+/// `build_registry`'s `Error` arm carries the previous adapter forward (the
+/// same "one bad row must not disarm a working connection" reasoning
+/// `RestartRequired` already gets). Stopping the stream in that case would
+/// halt fills while orders kept routing through the surviving adapter —
+/// recreating, from the opposite direction, the order/fill split Task 4
+/// closed for the double-stream case.
+fn should_stop_alpaca_stream(outcome: &reload::ConnectionOutcome, alpaca_adapter_survived: bool) -> bool {
+    !reload::restarts_execution_stream(outcome) && !alpaca_adapter_survived
 }
 
 /// Classify one feed connection for the reload report — the feed-side
@@ -1774,5 +1890,115 @@ fn map_db_error(err: sqlx::Error) -> AdminError {
     AdminError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: format!("database error: {err}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn broker(code: &str, state: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
+        Connection {
+            code: code.into(),
+            kind: "ALPACA".into(),
+            environment: Some("PAPER".into()),
+            status: "ACTIVE".into(),
+            credentials: state,
+            credentials_updated_at: None,
+        }
+    }
+
+    fn feed(code: &str, state: CredentialState<FeedCredentials>) -> Connection<FeedCredentials> {
+        Connection {
+            code: code.into(),
+            kind: "DATABENTO".into(),
+            environment: None,
+            status: "ACTIVE".into(),
+            credentials: state,
+            credentials_updated_at: None,
+        }
+    }
+
+    fn good_alpaca() -> CredentialState<BrokerCredentials> {
+        CredentialState::Configured(BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() })
+    }
+
+    /// The gate must never fire on a normal running system or a fresh
+    /// install: nothing stored, or everything stored decrypts fine.
+    #[test]
+    fn does_not_refuse_when_nothing_or_everything_decrypted() {
+        assert!(!must_refuse_reload(&[], &[]), "nothing stored at all");
+
+        let brokers = vec![broker("alpaca-paper", good_alpaca())];
+        assert!(!must_refuse_reload(&brokers, &[]), "everything decrypts");
+    }
+
+    /// One bad row must never disarm every other one — the same
+    /// partial-failure tolerance boot itself has via `nothing_decrypted`.
+    #[test]
+    fn does_not_refuse_on_a_partial_failure() {
+        let brokers = vec![
+            broker("alpaca-paper", good_alpaca()),
+            broker("binance-paper", CredentialState::Error("bad key".into())),
+        ];
+        assert!(!must_refuse_reload(&brokers, &[]), "one bad row among good ones must not refuse");
+    }
+
+    /// The headline case this gate exists for: every broker credential fails
+    /// to decrypt (e.g. a `rotate-key` run this process's in-memory master
+    /// key no longer matches) and nothing else is stored to save it.
+    #[test]
+    fn refuses_when_every_broker_credential_fails_and_nothing_else_decrypted() {
+        let brokers = vec![broker("alpaca-paper", CredentialState::Error("bad key".into()))];
+        assert!(must_refuse_reload(&brokers, &[]));
+    }
+
+    /// The gate looks across *both* stores, not just brokers: an all-feed
+    /// failure with no broker credentials stored at all must refuse too.
+    #[test]
+    fn refuses_when_only_feeds_are_stored_and_all_fail() {
+        let feeds = vec![feed("databento-opra", CredentialState::Error("bad key".into()))];
+        assert!(must_refuse_reload(&[], &feeds));
+    }
+
+    /// A broker credential decrypting fine must save a reload even when every
+    /// feed credential fails — the two stores are OR'd together into one "did
+    /// anything at all decrypt" verdict, matching `nothing_decrypted`'s own
+    /// contract, which does not distinguish which store a decoded row came
+    /// from.
+    #[test]
+    fn a_good_broker_saves_the_reload_even_if_every_feed_fails() {
+        let brokers = vec![broker("alpaca-paper", good_alpaca())];
+        let feeds = vec![feed("databento-opra", CredentialState::Error("bad key".into()))];
+        assert!(!must_refuse_reload(&brokers, &feeds));
+    }
+
+    /// A connection this pass just restarted must never also be stopped,
+    /// regardless of whether an adapter happens to already be there.
+    #[test]
+    fn a_registered_connection_is_never_stopped() {
+        assert!(!should_stop_alpaca_stream(&reload::ConnectionOutcome::Registered, true));
+        assert!(!should_stop_alpaca_stream(&reload::ConnectionOutcome::Registered, false));
+    }
+
+    /// The regression this function exists to prevent: an `Error`ed
+    /// connection whose adapter was carried forward (see `build_registry`'s
+    /// `Error` arm) must keep its execution stream running, or orders route
+    /// while fills silently stop arriving.
+    #[test]
+    fn a_failed_connection_with_a_surviving_adapter_is_not_stopped() {
+        assert!(!should_stop_alpaca_stream(
+            &reload::ConnectionOutcome::Failed("bad key".into()),
+            true,
+        ));
+    }
+
+    /// The ordinary cases this function exists for: `Disabled`, `Unconfigured`,
+    /// and a `Failed` with nothing left running all mean stop.
+    #[test]
+    fn disabled_unconfigured_and_unrecovered_failed_are_stopped() {
+        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Disabled, false));
+        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Unconfigured, false));
+        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Failed("bad key".into()), false));
     }
 }

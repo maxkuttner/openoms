@@ -155,8 +155,13 @@ pub struct RegistrationOutput {
 /// session against the same venue would collide on logon and sequence numbers
 /// with the one already running, and simply not registering it would silently
 /// disarm a working session, which is worse than declining to apply a change.
-/// At boot `current` is an empty registry, so there is nothing to carry and
-/// every connection is built fresh — this is what makes boot's call to this
+/// A row whose stored credential fails to decrypt (`CredentialState::Error`)
+/// carries its existing adapter forward the same way, for the same reason —
+/// see the `Error` arm below — even though nothing about *that* case requires
+/// avoiding a second session; one bad or re-sealed row simply should not be
+/// able to disarm a connection that was working a moment ago. At boot
+/// `current` is an empty registry, so there is nothing to carry and every
+/// connection is built fresh — this is what makes boot's call to this
 /// function produce exactly the registry `serve()` used to build inline.
 pub async fn build_registry(
     connections: &[Connection<BrokerCredentials>],
@@ -196,6 +201,33 @@ pub async fn build_registry(
             }
             CredentialState::Error(e) => {
                 error!(code = %conn.code, kind = %conn.kind, "credentials unusable: {e}");
+                // Carry the existing adapter forward, the same deliberate trade
+                // `RestartRequired` makes just below: the in-memory adapter (if
+                // any) was built from a credential that decrypted fine the last
+                // time this ran, and a *stored* row going unreadable — a
+                // `rotate-key` run racing this reload, a hand-edited row, bit
+                // rot — is not evidence the broker itself stopped working. One
+                // bad row must not be able to disarm a connection that was
+                // routing orders a moment ago; that would make `Error` strictly
+                // worse than `RestartRequired`'s own carry-forward for no
+                // reason. The report still says `Failed` (set by `classify`),
+                // so the operator is told even though the previous adapter
+                // keeps serving orders. `conn.kind`/`env_name` (plaintext DB
+                // columns), not the credential, identify what to look for in
+                // `current` — the credential itself is exactly what failed to
+                // decode, so it cannot be consulted here.
+                //
+                // Alpaca goes through `register_alpaca`/`get_alpaca`, not the
+                // generic path: `BrokerRegistry` keeps a second, Alpaca-only
+                // map that `restart_alpaca_stream` (via `get_alpaca`) reads
+                // from, and only `register_alpaca` keeps both maps in sync.
+                if conn.kind == "ALPACA" {
+                    if let Some(adapter) = current.get_alpaca(env_name) {
+                        registry.register_alpaca(env_name, adapter);
+                    }
+                } else if let Some(adapter) = current.get(&conn.kind, env_name) {
+                    registry.register(&conn.kind, env_name, adapter);
+                }
             }
             CredentialState::Configured(creds) => {
                 // `broker_code` and the stored credential's own variant tag are two
@@ -371,7 +403,11 @@ pub fn restart_databento_feed(
 /// not one — the ":exec" suffix a connection code can never contain — so an
 /// execution stream can never collide with a feed entry in the same registry,
 /// and aborting one can never accidentally take out the other.
-fn alpaca_exec_stream_code(env_name: &str) -> String {
+///
+/// `pub(crate)`, not private: `admin::reload_connections` also needs this key
+/// to stop a stream whose connection is no longer registered (Disabled,
+/// Unconfigured, or Failed), not only to start one.
+pub(crate) fn alpaca_exec_stream_code(env_name: &str) -> String {
     format!("alpaca-{}:exec", env_name.to_lowercase())
 }
 
@@ -599,6 +635,70 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// The same rule as `restart_required_carries_the_existing_fix_adapter_forward`,
+    /// pinned for the other way an adapter can go missing: the *stored* row
+    /// itself became unreadable rather than needing a restart. A single bad
+    /// row (a `rotate-key` run racing this reload, a hand-edited row, bit rot)
+    /// must not be able to disarm a connection that was routing orders a
+    /// moment ago — `current` still holds a good adapter built the last time
+    /// this decrypted, and it must be carried forward exactly like
+    /// `RestartRequired`'s adapter is, while the report still says `Failed`
+    /// so the operator is told.
+    #[tokio::test]
+    async fn an_error_credential_carries_the_existing_adapter_forward() {
+        let mut current = BrokerRegistry::new();
+        current.register("IBKR", "PAPER", stub_adapter());
+
+        let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Error("bad key".into()));
+        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+
+        assert!(
+            output.registry.get("IBKR", "PAPER").is_some(),
+            "the previously-working adapter must be carried forward despite the row failing to decrypt"
+        );
+        match &output.report.connections[0] {
+            (code, ConnectionOutcome::Failed(reason)) => {
+                assert_eq!(code, "ibkr-paper");
+                assert!(reason.contains("bad key"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The Alpaca-specific half of the same rule: `BrokerRegistry` keeps a
+    /// second, Alpaca-only map (`get_alpaca`) that only `register_alpaca`
+    /// keeps in sync with the generic one — carrying forward through the
+    /// generic `register`/`get` alone would leave `get_alpaca` unable to find
+    /// the carried adapter, which is what `restart_alpaca_stream` (and a
+    /// later reload that *does* decrypt fine) actually calls.
+    #[tokio::test]
+    async fn an_error_alpaca_credential_carries_forward_through_get_alpaca() {
+        let mut current = BrokerRegistry::new();
+        current.register_alpaca("PAPER", stub_adapter());
+
+        let c = conn("alpaca-paper", "ACTIVE", CredentialState::Error("bad key".into()));
+        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+
+        assert!(
+            output.registry.get_alpaca("PAPER").is_some(),
+            "get_alpaca must still resolve the carried-forward adapter, not just the generic get()"
+        );
+    }
+
+    /// The flip side of both tests above: an `Error`ed connection with nothing
+    /// in `current` to carry forward has nothing to register — it must not
+    /// panic or fabricate an adapter, just report `Failed` with the decrypt
+    /// error's own reason.
+    #[tokio::test]
+    async fn an_error_credential_with_nothing_to_carry_forward_registers_nothing() {
+        let current = BrokerRegistry::new();
+        let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Error("bad key".into()));
+        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+
+        assert!(output.registry.get("IBKR", "PAPER").is_none());
+        assert!(matches!(&output.report.connections[0], (_, ConnectionOutcome::Failed(_))));
     }
 
     /// Swapping an Alpaca adapter must also restart its execution stream, or

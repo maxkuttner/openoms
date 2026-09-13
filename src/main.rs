@@ -106,6 +106,7 @@ mod reload;
         admin::list_broker_connections,
         admin::get_broker_connection,
         admin::update_broker_connection,
+        admin::reload_connections,
         admin::create_risk_limit,
         admin::list_risk_limits,
         admin::get_risk_limit,
@@ -239,26 +240,33 @@ fn admin_password_from_env() -> Option<String> {
         .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
 }
 
-/// Whether `serve()` must refuse to start over the credential-decrypt gate.
-/// Pulled out of `serve()` as a pure function so the combinations are directly
+/// Whether the credential-decrypt gate says nothing usable came back — true
+/// iff something is stored and unusable AND *nothing at all* decoded. Named
+/// for what it answers, not for either of its two callers: `serve()` uses it
+/// to decide whether to refuse to start, and `admin::reload_connections` uses
+/// the identical judgment to decide whether a reload may swap in what it just
+/// built (see that function's doc comment) — a reload that would leave the
+/// system in a state boot itself would have refused to start in is exactly as
+/// wrong as boot starting there directly.
+///
+/// Pulled out as a pure function so the combinations are directly
 /// table-testable — this is the most consequential new behaviour in the
 /// credential-store plan (a wrong answer here either misrepresents the
-/// system's state by starting with no working adapters, or refuses to start a
+/// system's state by running with no working adapters, or refuses a
 /// perfectly fine partially-configured install) and it deserves more than
 /// incidental coverage via a live database.
 ///
 /// `any_configured` and `any_error` summarise every broker + feed connection's
 /// decoded `CredentialState` (`Configured`/`Error`/`Unconfigured` — see
-/// `credentials.rs`) after `serve()` has loaded them under the resolved master
-/// key: `any_configured` is true iff at least one row decoded successfully,
-/// `any_error` iff at least one row has a blob that did not. Fatal iff
-/// something is stored and unusable AND *nothing at all* decoded — a missing
-/// master key falls out of this for free, since with no key every row that
-/// has a blob decodes straight to `Error` (see `decode`), never `Configured`.
-/// A partial failure (some rows open, some do not) must still start: one bad
-/// or stale credential must not be able to disarm every other one, so this
-/// is deliberately NOT `any_error` alone.
-fn must_refuse_to_start(any_configured: bool, any_error: bool) -> bool {
+/// `credentials.rs`) after the caller has loaded them under the resolved
+/// master key: `any_configured` is true iff at least one row decoded
+/// successfully, `any_error` iff at least one row has a blob that did not.
+/// A missing master key falls out of this for free, since with no key every
+/// row that has a blob decodes straight to `Error` (see `decode`), never
+/// `Configured`. A partial failure (some rows open, some do not) must still
+/// pass: one bad or stale credential must not be able to disarm every other
+/// one, so this is deliberately NOT `any_error` alone.
+fn nothing_decrypted(any_configured: bool, any_error: bool) -> bool {
     any_error && !any_configured
 }
 
@@ -684,12 +692,12 @@ async fn serve() {
     // in credentials.rs, so that case needs no separate check here). A key that
     // opens SOME rows but not others must still start: one bad or stale
     // credential must not be able to disarm every other one, so this only fires
-    // when literally nothing usable came back — see `must_refuse_to_start`.
+    // when literally nothing usable came back — see `nothing_decrypted`.
     let any_configured = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)))
         || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Configured(_)));
     let any_error = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)))
         || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)));
-    if must_refuse_to_start(any_configured, any_error) {
+    if nothing_decrypted(any_configured, any_error) {
         // Named per-connection first, immediately above the summary, so an
         // operator sees exactly which rows failed rather than just the count.
         for conn in &broker_connections {
@@ -1150,7 +1158,7 @@ async fn serve() {
 #[cfg(test)]
 mod tests {
     use super::bind_is_loopback;
-    use super::{admin_password_from_env, must_refuse_to_start, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
+    use super::{admin_password_from_env, nothing_decrypted, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
     use crate::config::FileConfig;
 
     /// The most consequential new behaviour in the credential-store plan,
@@ -1161,7 +1169,7 @@ mod tests {
     /// The load-bearing property this guards is the "some fail" row: a single
     /// bad or stale credential must never be able to disarm every other one.
     #[test]
-    fn must_refuse_to_start_only_when_nothing_at_all_decoded() {
+    fn nothing_decrypted_only_when_nothing_at_all_decoded() {
         // (any_configured, any_error) -> must_refuse
         let cases = [
             (false, false, false), // none stored: normal fresh install
@@ -1171,7 +1179,7 @@ mod tests {
         ];
         for (any_configured, any_error, expected) in cases {
             assert_eq!(
-                must_refuse_to_start(any_configured, any_error),
+                nothing_decrypted(any_configured, any_error),
                 expected,
                 "any_configured={any_configured} any_error={any_error}"
             );

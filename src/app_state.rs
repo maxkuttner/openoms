@@ -313,6 +313,11 @@ mod tests {
         // The sender was dropped with the task, so the channel closes — this is
         // the actual proof the task was aborted, not just unregistered.
         assert!(rx.recv().await.is_none(), "the previous task should have been aborted");
+        // And the map entry itself is gone, not just the task inside it left
+        // to dangle — reached via the private field directly (this test module
+        // is a descendant of `app_state`, so it sees what `codes()` used to
+        // expose) now that the diagnostics-only accessor is gone.
+        assert!(reg.handles.lock().unwrap().is_empty(), "abort_and_remove must also remove the map entry");
     }
 
     /// Replacing a feed's doorbell must overwrite its entry, not add a second
