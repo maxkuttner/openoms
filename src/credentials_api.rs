@@ -8,6 +8,7 @@
 //! of this module that reaches the network.
 
 use std::collections::HashMap;
+use std::time::Duration;
 use serde::Deserialize;
 
 use crate::adapters::alpaca::AlpacaAdapter;
@@ -208,6 +209,28 @@ pub enum TestOutcome {
     NotTestable(&'static str),
 }
 
+/// How long a credential test may spend talking to a provider before it is
+/// reported as a failure.
+///
+/// Neither provider client sets a timeout of its own (Alpaca's is a bare
+/// `reqwest::Client::new()`, which has none by default), so without this a
+/// provider that completes the TCP handshake and then goes silent would hold
+/// the admin request open indefinitely — and with it the cockpit's "Test"
+/// button, which has no way to cancel. Ten seconds is far longer than either
+/// check needs against a healthy provider.
+const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The failure reported when a provider stops responding mid-test. Says which
+/// provider and how long was waited, because "test failed" alone would be
+/// indistinguishable from a rejected credential — the operator needs to know
+/// their key was never actually judged.
+fn timed_out(provider: &str) -> TestOutcome {
+    TestOutcome::Failed(format!(
+        "{provider} did not respond within {}s — credential not verified",
+        TEST_TIMEOUT.as_secs()
+    ))
+}
+
 /// Tests a credential the cheap way, where one exists.
 ///
 /// Alpaca gets a real check: `GET /v2/account` is a lightweight, read-only,
@@ -229,9 +252,10 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
     match creds {
         BrokerCredentials::Alpaca { key, secret } => {
             let adapter = AlpacaAdapter::new(key.clone(), secret.clone(), environment);
-            match adapter.get_account().await {
-                Ok(_) => TestOutcome::Passed,
-                Err(e) => TestOutcome::Failed(e.to_string()),
+            match tokio::time::timeout(TEST_TIMEOUT, adapter.get_account()).await {
+                Ok(Ok(_)) => TestOutcome::Passed,
+                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
+                Err(_) => timed_out("Alpaca"),
             }
         }
         BrokerCredentials::IbkrFix { .. } => {
@@ -272,16 +296,19 @@ pub async fn test_feed(creds: &FeedCredentials) -> TestOutcome {
                 Ok(b) => b,
                 Err(e) => return TestOutcome::Failed(e.to_string()),
             };
-            match builder.dataset(DATABENTO_OPRA_DATASET).build().await {
-                Ok(mut client) => {
-                    // Best-effort: the auth check already happened in `build()`
-                    // above, so a failure to close politely does not change
-                    // the outcome — only leaves the gateway to time the
+            let build = builder.dataset(DATABENTO_OPRA_DATASET).build();
+            match tokio::time::timeout(TEST_TIMEOUT, build).await {
+                Ok(Ok(mut client)) => {
+                    // Best-effort, and bounded for the same reason the build
+                    // is: the auth check already happened in `build()` above,
+                    // so failing to close politely does not change the
+                    // outcome — it only leaves the gateway to time the
                     // connection out on its own.
-                    let _ = client.close().await;
+                    let _ = tokio::time::timeout(TEST_TIMEOUT, client.close()).await;
                     TestOutcome::Passed
                 }
-                Err(e) => TestOutcome::Failed(e.to_string()),
+                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
+                Err(_) => timed_out("Databento"),
             }
         }
     }
