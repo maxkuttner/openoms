@@ -74,4 +74,6 @@ jobs:
           echo "$out" | grep -q "0 pending" || { echo "unexpected pending"; exit 1; }
 
       - name: database-backed tests
+        env:
+          OMS_RELOAD_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: cargo test -- --ignored

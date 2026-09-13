@@ -65,6 +65,8 @@ mod credentials;
 mod expiry;
 mod fix;
 mod reload;
+#[cfg(test)]
+mod reload_tests;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -902,7 +904,7 @@ async fn serve() {
     // makes that impossible by construction.
     for env_name in ["PAPER", "LIVE"] {
         if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), state.registry().get_alpaca(env_name)) {
-            reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &registration_deps, state.streams());
+            reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &registration_deps, state.streams()).await;
         }
     }
 
@@ -911,7 +913,8 @@ async fn serve() {
     // the adapter already holds them).
     for (env_name, adapter) in binance_rest_adapters {
         let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
-        tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
+        let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
+        state.streams().insert(reload::binance_exec_stream_code(env_name), handle);
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside
@@ -971,7 +974,7 @@ async fn serve() {
                     state.streams(),
                     state.doorbells(),
                     quote_tx.clone(),
-                );
+                ).await;
                 info!(code = %conn.code, "registered DATABENTO/OPRA feed");
             }
         }

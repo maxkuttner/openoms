@@ -175,7 +175,7 @@ unusable rows are logged (`credentials unusable: ...`) so they can be fixed.
 
 ### Applying a credential change
 
-After changing a stored credential (`import-env`, `rotate-key`, or a later
+After changing a stored broker or feed credential (`import-env` or a later
 write endpoint), `POST /admin/connections/reload` applies it — the store is
 read once at boot and is not otherwise watched for changes, so this is what
 picks up an edit without restarting the process. What "applies" means depends
@@ -200,8 +200,21 @@ case**, not an error: reloading after rotating one Alpaca key while an IBKR
 session sits untouched returns 200, `Registered` for one and `RestartRequired`
 for the other.
 
+`Registered` means the adapter/task was installed, **not** that the remote
+service has authenticated it. Stream health reports the subsequent connection
+state. Reload does not test credentials before applying them; the credential
+editing API in Plan 4 will supply that gate.
+
+Reloads are serialized from the store read through stream replacement. Both
+credential tables are read from one repeatable-read snapshot, and a replacement
+waits for the old task to exit before starting. Once accepted, a reload finishes
+even if its HTTP client disconnects. Order readers remain lock-free; this is not
+an atomic broker-side cutover or a guarantee of uninterrupted streaming during
+reconnection. Alpaca's existing reconciliation sweep recovers missed fills.
+
 Disabling a connection and reloading stops its execution stream or feed task
-so it stops acting on the old credential; a FIX session, again, keeps running
+so it stops acting on the old credential. This includes Binance REST execution
+streams and deleted connection rows. A FIX session, again, keeps running
 regardless until a restart, since there is no way to stop it from inside the
 process.
 

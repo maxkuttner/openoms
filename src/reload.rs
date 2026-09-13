@@ -18,7 +18,7 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::alpaca_stream;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::{BrokerRegistry, Transport};
-use crate::app_state::{DoorbellRegistry, StreamRegistry};
+use crate::app_state::{AppState, DoorbellRegistry, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::fix;
 use crate::kafka::KafkaClient;
@@ -368,7 +368,7 @@ pub async fn build_registry(
 /// a caller that built its own pair and pushed the sender into a fan-out list
 /// by hand could forget to replace the old entry, which is the bug this
 /// function exists to make impossible — see `DoorbellRegistry`'s doc comment.
-pub fn restart_databento_feed(
+pub async fn restart_databento_feed(
     api_key: String,
     pool: PgPool,
     stream_health: &StreamHealthRegistry,
@@ -376,10 +376,11 @@ pub fn restart_databento_feed(
     doorbells: &DoorbellRegistry,
     quote_tx: mpsc::Sender<dataprovider::Quote>,
 ) {
-    streams.abort_and_remove("databento-opra");
+    streams.abort_and_remove("databento-opra").await;
     let (position_changed_tx, position_changed_rx) = mpsc::channel::<()>(1);
     doorbells.set("databento-opra", position_changed_tx);
     let health = stream_health.handle("DATABENTO", "OPRA", StreamKind::Feed);
+    health.set_connecting();
     let session = QuoteFeedSession::new(
         DatabentoOpraFeed::new(api_key),
         pool,
@@ -411,6 +412,48 @@ pub(crate) fn alpaca_exec_stream_code(env_name: &str) -> String {
     format!("alpaca-{}:exec", env_name.to_lowercase())
 }
 
+pub(crate) fn binance_exec_stream_code(env_name: &str) -> String {
+    format!("binance-{}:exec", env_name.to_lowercase())
+}
+
+/// The network boundary of reload. Store reads, classification, serialization,
+/// swaps and stops remain real in integration tests; only new external sessions
+/// are substituted with controlled tasks.
+#[async_trait::async_trait]
+pub(crate) trait ReloadStreams: Send + Sync + 'static {
+    async fn alpaca(
+        &self,
+        environment: &'static str,
+        credentials: (String, String),
+        adapter: Arc<AlpacaAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    );
+
+    async fn databento(&self, api_key: String, state: &AppState);
+}
+
+pub(crate) struct LiveReloadStreams;
+
+#[async_trait::async_trait]
+impl ReloadStreams for LiveReloadStreams {
+    async fn alpaca(
+        &self,
+        environment: &'static str,
+        (key, secret): (String, String),
+        adapter: Arc<AlpacaAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    ) {
+        restart_alpaca_stream(environment, key, secret, adapter, deps, streams).await;
+    }
+
+    async fn databento(&self, api_key: String, state: &AppState) {
+        restart_databento_feed(api_key, state.pool().clone(), state.stream_health(),
+            state.streams(), state.doorbells(), state.quote_tx()).await;
+    }
+}
+
 /// (Re)start one Alpaca environment's execution-report stream — the task that
 /// delivers fills — against a freshly built `adapter`, registering its handle
 /// in `streams` under `alpaca_exec_stream_code` (see there for why that key,
@@ -433,7 +476,7 @@ pub(crate) fn alpaca_exec_stream_code(env_name: &str) -> String {
 /// because it is the same bundle `build_registry` already draws on — boot and
 /// a later reload share one source for these rather than each re-deriving or
 /// threading them through separately.
-pub fn restart_alpaca_stream(
+pub async fn restart_alpaca_stream(
     env_name: &'static str,
     key: String,
     secret: String,
@@ -442,8 +485,9 @@ pub fn restart_alpaca_stream(
     streams: &StreamRegistry,
 ) {
     let code = alpaca_exec_stream_code(env_name);
-    streams.abort_and_remove(&code);
+    streams.abort_and_remove(&code).await;
     let health = deps.stream_health.handle("ALPACA", env_name, StreamKind::Execution);
+    health.set_connecting();
     let handle = tokio::spawn(alpaca_stream::run(
         env_name,
         key,

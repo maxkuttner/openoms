@@ -787,21 +787,60 @@ pub async fn reload_connections(
         None => None,
     };
 
+    reload_with_key(state, master).await
+}
+
+/// Own the operation independently of the HTTP request: once stream shutdown
+/// starts, a disconnected client must not cancel the reload halfway through.
+/// The explicit key also lets integration tests exercise the real path without
+/// reading the user's memoized configuration or mutating process environment.
+pub(crate) async fn reload_with_key(
+    state: AppState,
+    master: Option<crate::secrets::MasterKey>,
+) -> Result<Json<reload::ReloadReport>, AdminError> {
+    reload_using(state, master, reload::LiveReloadStreams).await
+}
+
+pub(crate) async fn reload_using(
+    state: AppState,
+    master: Option<crate::secrets::MasterKey>,
+    streams: impl reload::ReloadStreams,
+) -> Result<Json<reload::ReloadReport>, AdminError> {
+    tokio::spawn(async move { apply_reload(state, master, streams).await })
+        .await
+        .map_err(|_| AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "reload task failed; inspect server logs and connection health".into(),
+        })?
+}
+
+async fn apply_reload(
+    state: AppState,
+    master: Option<crate::secrets::MasterKey>,
+    streams: impl reload::ReloadStreams,
+) -> Result<Json<reload::ReloadReport>, AdminError> {
+    let _reload_guard = state.lock_reload().await;
+
     // Both stores are read before anything is touched: a failure in either one
     // must abort the whole reload rather than swap in a registry built from a
-    // half-read store (see this function's doc comment).
-    let broker_connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+    // half-read store. One snapshot also prevents a concurrent key rotation
+    // from being observed between the broker and feed queries.
+    let mut snapshot = state.pool().begin().await.map_err(reload_store_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *snapshot).await.map_err(reload_store_error)?;
+    let broker_connections = crate::credentials::load_brokers(&mut *snapshot, master.as_ref())
         .await
         .map_err(|e| AdminError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("failed to load broker connections: {e}"),
         })?;
-    let feed_connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+    let feed_connections = crate::credentials::load_feeds(&mut *snapshot, master.as_ref())
         .await
         .map_err(|e| AdminError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("failed to load feed connections: {e}"),
         })?;
+    snapshot.commit().await.map_err(reload_store_error)?;
 
     // Mirror boot's own refusal gate (`crate::nothing_decrypted`) before
     // touching anything: `credentials::decode` turns an unreadable blob into
@@ -815,8 +854,7 @@ pub async fn reload_connections(
         return Err(AdminError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "refusing to reload: credentials are stored but none of them could be \
-                      decrypted under the configured master key (see the per-connection errors \
-                      in the server log); the running registry is unchanged"
+                      decrypted under the configured master key; the running registry is unchanged"
                 .to_string(),
         });
     }
@@ -830,11 +868,8 @@ pub async fn reload_connections(
         position_changed_tx: state.position_changed_tx(),
     };
 
-    // `current` is dropped (via `drop(current)` below, before any `.await`)
-    // rather than held across the swap — an `arc_swap::Guard`, not a
-    // `std::sync::Mutex` guard, so clippy's `await_holding_lock` does not apply
-    // to it either way, but there is no reason to hold it a moment longer than
-    // `build_registry` needs to read from it.
+    // Release this snapshot after registration, before joining old streams.
+    // The reload lock keeps another writer from changing it during this pass.
     let current = state.registry();
     let reload::RegistrationOutput {
         registry,
@@ -903,10 +938,22 @@ pub async fn reload_connections(
         let alpaca_adapter = state.registry().get_alpaca(env_name);
         if reload::restarts_execution_stream(outcome) {
             if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), alpaca_adapter) {
-                reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &deps, state.streams());
+                streams.alpaca(env_name, (key.clone(), secret.clone()), adapter, &deps, state.streams()).await;
             }
         } else if should_stop_alpaca_stream(outcome, alpaca_adapter.is_some()) {
-            state.streams().abort_and_remove(&reload::alpaca_exec_stream_code(env_name));
+            stop_execution_stream(&state, "ALPACA", env_name, &reload::alpaca_exec_stream_code(env_name)).await;
+        }
+    }
+
+    // Reconcile known execution tasks against the resulting registry, not just
+    // input rows: a deleted row has no iteration in the loop above. Binance REST
+    // is restart-required but its existing task must still stop when disabled.
+    for env_name in ["PAPER", "LIVE"] {
+        if state.registry().get_alpaca(env_name).is_none() {
+            stop_execution_stream(&state, "ALPACA", env_name, &reload::alpaca_exec_stream_code(env_name)).await;
+        }
+        if state.registry().get("BINANCE", env_name).is_none() {
+            stop_execution_stream(&state, "BINANCE", env_name, &reload::binance_exec_stream_code(env_name)).await;
         }
     }
 
@@ -943,22 +990,40 @@ pub async fn reload_connections(
         let outcome = classify_feed(conn);
         match (&outcome, &conn.credentials) {
             (reload::ConnectionOutcome::Registered, CredentialState::Configured(FeedCredentials::Databento { api_key })) => {
-                reload::restart_databento_feed(
-                    api_key.clone(),
-                    state.pool().clone(),
-                    state.stream_health(),
-                    state.streams(),
-                    state.doorbells(),
-                    state.quote_tx(),
-                );
+                streams.databento(api_key.clone(), &state).await;
             }
-            _ if should_stop_databento_feed(&outcome) => state.streams().abort_and_remove(&conn.code),
+            _ if should_stop_databento_feed(&outcome) && conn.code == "databento-opra" => stop_databento_feed(&state).await,
             _ => {}
         }
         report.connections.push((conn.code.clone(), outcome));
     }
+    if !feed_connections.iter().any(|conn| conn.code == "databento-opra") {
+        stop_databento_feed(&state).await;
+    }
 
     Ok(Json(report))
+}
+
+fn reload_store_error(error: sqlx::Error) -> AdminError {
+    AdminError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to read credential snapshot: {error}"),
+    }
+}
+
+async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str, code: &str) {
+    if state.streams().abort_and_remove(code).await {
+        state.stream_health().handle(broker, environment, crate::stream_health::StreamKind::Execution)
+            .set_down("connection disabled, unconfigured, or removed");
+    }
+}
+
+async fn stop_databento_feed(state: &AppState) {
+    if state.streams().abort_and_remove("databento-opra").await {
+        state.stream_health().handle("DATABENTO", "OPRA", crate::stream_health::StreamKind::Feed)
+            .set_down("connection disabled, unconfigured, or removed");
+    }
+    state.doorbells().remove("databento-opra");
 }
 
 /// Whether `reload_connections` must refuse rather than swap: the same

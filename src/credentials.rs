@@ -202,15 +202,15 @@ pub fn decode_feed(
 /// Every configured broker connection, credentials decoded under `key`. A
 /// connection missing or unusable credentials is still returned — its state
 /// says why, rather than being silently dropped from the list.
-pub async fn load_brokers(
-    pool: &PgPool,
+pub async fn load_brokers<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     key: Option<&MasterKey>,
 ) -> Result<Vec<Connection<BrokerCredentials>>, sqlx::Error> {
     let rows = sqlx::query_as::<_, (String, String, String, String, Option<Vec<u8>>, Option<DateTime<Utc>>)>(
         "SELECT code, broker_code, environment, status, credentials, credentials_updated_at \
          FROM oms.broker_connection ORDER BY code",
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     Ok(rows
@@ -228,15 +228,15 @@ pub async fn load_brokers(
 
 /// Every configured feed connection, credentials decoded under `key`. See
 /// `load_brokers` — same shape, same reasoning.
-pub async fn load_feeds(
-    pool: &PgPool,
+pub async fn load_feeds<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     key: Option<&MasterKey>,
 ) -> Result<Vec<Connection<FeedCredentials>>, sqlx::Error> {
     let rows = sqlx::query_as::<_, (String, String, String, Option<Vec<u8>>, Option<DateTime<Utc>>)>(
         "SELECT code, provider, status, credentials, credentials_updated_at \
          FROM oms.feed_connection ORDER BY code",
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     Ok(rows

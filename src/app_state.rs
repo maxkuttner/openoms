@@ -47,12 +47,20 @@ impl StreamRegistry {
         self.handles.lock().unwrap().insert(code.into(), handle);
     }
 
-    /// Stop and forget the task registered under `code`, if any. A no-op when
+    /// Stop, join and forget the task registered under `code`, if any. Returns
+    /// whether a task was removed. A no-op when
     /// nothing is registered there — e.g. first boot, or a feed that never
     /// started.
-    pub fn abort_and_remove(&self, code: &str) {
-        if let Some(handle) = self.handles.lock().unwrap().remove(code) {
+    pub async fn abort_and_remove(&self, code: &str) -> bool {
+        // Drop the map lock before waiting. abort() only schedules cancellation;
+        // joining proves the old task has released its socket before replacement.
+        let handle = self.handles.lock().unwrap().remove(code);
+        if let Some(handle) = handle {
             handle.abort();
+            let _ = handle.await;
+            true
+        } else {
+            false
         }
     }
 }
@@ -88,6 +96,10 @@ impl DoorbellRegistry {
         self.senders.lock().unwrap().insert(code.into(), tx);
     }
 
+    pub fn remove(&self, code: &str) {
+        self.senders.lock().unwrap().remove(code);
+    }
+
     /// Wake every registered feed. Non-blocking: a full per-feed channel
     /// already means "reload pending" for that feed, so a failed `try_send`
     /// is fine to ignore.
@@ -109,13 +121,15 @@ pub struct AppState {
     /// already routing holds its own `Arc` and finishes against the adapter it
     /// started with. A `Mutex` here would put a lock on every order.
     registry: Arc<ArcSwap<BrokerRegistry>>,
+    /// Serialize the entire reload, including store reads and stream joins.
+    /// Order readers still use ArcSwap and never acquire this lock.
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
     kafka: Option<KafkaClient>,
     symbology: Arc<SymbologyEngine>,
     stream_health: StreamHealthRegistry,
     marks: MarkStore,
-    /// Handles for the credentialed feed tasks (Databento OPRA) so a reload can
-    /// restart one under a new credential. Binance and Bybit market data are
-    /// public — not credential-driven — and are never registered here.
+    /// Handles for Databento and Alpaca/Binance REST execution tasks. Public
+    /// Binance/Bybit market-data feeds are never registered here.
     streams: StreamRegistry,
     /// Fan-out targets for the fill→marks doorbell. Owned here — not just a
     /// `serve()` local — so the reload handler can register a restarted feed's
@@ -152,6 +166,7 @@ impl AppState {
             admin_token,
             admin_auth_enabled,
             registry: Arc::new(ArcSwap::from_pointee(registry)),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             kafka,
             symbology: Arc::new(symbology),
             stream_health,
@@ -179,6 +194,10 @@ impl AppState {
     /// (see `serve()`) so the very first publish exercises the same path.
     pub fn swap_registry(&self, next: BrokerRegistry) {
         self.registry.store(Arc::new(next));
+    }
+
+    pub async fn lock_reload(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.reload_lock.lock().await
     }
 
     pub fn kafka(&self) -> Option<&KafkaClient> {
@@ -308,16 +327,18 @@ mod tests {
         });
         reg.insert("databento-opra", first);
 
-        reg.abort_and_remove("databento-opra");
+        assert!(reg.abort_and_remove("databento-opra").await);
 
         // The sender was dropped with the task, so the channel closes — this is
         // the actual proof the task was aborted, not just unregistered.
-        assert!(rx.recv().await.is_none(), "the previous task should have been aborted");
+        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected),
+            "stop must finish cancellation before returning, not at a later await");
         // And the map entry itself is gone, not just the task inside it left
         // to dangle — reached via the private field directly (this test module
         // is a descendant of `app_state`, so it sees what `codes()` used to
         // expose) now that the diagnostics-only accessor is gone.
         assert!(reg.handles.lock().unwrap().is_empty(), "abort_and_remove must also remove the map entry");
+        assert!(!reg.abort_and_remove("databento-opra").await);
     }
 
     /// Replacing a feed's doorbell must overwrite its entry, not add a second
