@@ -13,11 +13,9 @@ mod symbology_resolver;
 mod setup;
 
 use crate::adapters::BrokerRegistry;
-use crate::adapters::Transport;
-use crate::adapters::alpaca::AlpacaAdapter;
-use crate::adapters::binance::BinanceAdapter;
 use crate::app_state::AppState;
-use crate::credentials::{BrokerCredentials, CredentialState, FeedCredentials};
+use crate::credentials::{CredentialState, FeedCredentials};
+use crate::reload::{RegistrationDeps, RegistrationOutput};
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit, BlotterRow};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
@@ -42,7 +40,6 @@ use axum::{
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
-use std::sync::Arc;
 use dotenvy::dotenv;
 use tracing::{error, info, warn};
 use tracing_subscriber::{self, EnvFilter};
@@ -67,6 +64,7 @@ mod secrets;
 mod credentials;
 mod expiry;
 mod fix;
+mod reload;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -795,118 +793,28 @@ async fn serve() {
     let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
     let mut marks_doorbells: Vec<tokio::sync::mpsc::Sender<()>> = Vec::new();
 
-    // Adapters come from the store, not the environment. One code path builds an
-    // adapter, so a credential saved at runtime (Plan 3) and one loaded at boot
-    // cannot diverge. `broker_connections` was loaded once, above, alongside the
-    // master-key resolution.
-    let mut registry = BrokerRegistry::new();
-    // Stashed while registering so the Alpaca trade-update stream spawn further
-    // down (execution reports) reuses the exact credential each adapter was built
-    // from, rather than re-reading the store — let alone the environment — a
-    // second time.
-    let mut alpaca_creds: std::collections::HashMap<&'static str, (String, String)> =
-        std::collections::HashMap::new();
-    // Binance REST adapters (BINANCE_{ENV}_TRANSPORT=rest, the default), kept so
-    // the WS user-data stream can be spawned below. FIX owns its own execution
-    // reports, so nothing is stashed for that case.
-    let mut binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)> = Vec::new();
-
-    for conn in &broker_connections {
-        if conn.status != "ACTIVE" {
-            info!(code = %conn.code, kind = %conn.kind, "broker connection disabled, skipping");
-            continue;
-        }
-        // broker_connection.environment is DB-checked to ('PAPER'|'LIVE'); anything
-        // else would be a schema mismatch, not operator input to gently degrade.
-        let env_name: &'static str = match conn.environment.as_deref() {
-            Some("PAPER") => "PAPER",
-            Some("LIVE") => "LIVE",
-            other => {
-                error!(code = %conn.code, kind = %conn.kind, environment = ?other, "broker connection has an unrecognised environment, skipping");
-                continue;
-            }
-        };
-        match &conn.credentials {
-            CredentialState::Unconfigured => {
-                info!(code = %conn.code, kind = %conn.kind, "no credentials stored, adapter not registered");
-            }
-            CredentialState::Error(e) => {
-                error!(code = %conn.code, kind = %conn.kind, "credentials unusable: {e}");
-            }
-            CredentialState::Configured(creds) => {
-                // `broker_code` and the stored credential's own variant tag are two
-                // independent sources of truth for "what kind of broker is this" —
-                // normally in lockstep, but nothing enforces it (e.g. a credential
-                // hand-imported into the wrong row). Registration below follows the
-                // credential's variant, not `conn.kind`, so this cannot mis-route an
-                // adapter — but the mismatch itself is a real misconfiguration worth
-                // surfacing rather than registering silently.
-                let expected_kind = match creds {
-                    BrokerCredentials::Alpaca { .. } => "ALPACA",
-                    BrokerCredentials::IbkrFix { .. } => "IBKR",
-                    BrokerCredentials::BinanceFix { .. } => "BINANCE",
-                };
-                if conn.kind != expected_kind {
-                    warn!(
-                        code = %conn.code, kind = %conn.kind, credential_kind = expected_kind,
-                        "broker_connection's broker_code does not match its stored credential's kind"
-                    );
-                }
-                match creds {
-                BrokerCredentials::Alpaca { key, secret } => {
-                    registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env_name)));
-                    alpaca_creds.insert(env_name, (key.clone(), secret.clone()));
-                    info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered ALPACA/{env_name} adapter");
-                }
-                BrokerCredentials::IbkrFix { .. } => {
-                    // IBKR is FIX-only — the FIX session both routes orders and
-                    // delivers execution reports.
-                    if let Some(adapter) = fix::start_ibkr(
-                        env_name,
-                        creds,
-                        &stream_health,
-                        pool.clone(),
-                        kafka_client.clone(),
-                        Some(position_changed_tx.clone()),
-                    ) {
-                        registry.register("IBKR", env_name, adapter);
-                    }
-                }
-                BrokerCredentials::BinanceFix { api_key, private_key, .. } => {
-                    // Transport is an explicit choice via BINANCE_{ENV}_TRANSPORT=fix|rest
-                    // (default rest) — a wire-protocol setting, not a secret, so it stays
-                    // on the environment. `fix` runs one FIX session for order entry +
-                    // execution reports; `rest` runs the REST adapter + WS user-data stream,
-                    // built from the same store credential (no more PEM file read).
-                    match Transport::from_env(&format!("BINANCE_{env_name}"), Transport::Rest) {
-                        Transport::Fix => {
-                            match fix::start_binance(
-                                env_name,
-                                creds,
-                                &stream_health,
-                                pool.clone(),
-                                kafka_client.clone(),
-                                Some(position_changed_tx.clone()),
-                            ) {
-                                Some(adapter) => registry.register("BINANCE", env_name, adapter),
-                                None => error!(code = %conn.code, "Binance FIX session could not start"),
-                            }
-                        }
-                        Transport::Rest => match BinanceAdapter::new(api_key.clone(), private_key, env_name) {
-                            Ok(adapter) => {
-                                let adapter = Arc::new(adapter);
-                                registry.register("BINANCE", env_name, adapter.clone());
-                                binance_rest_adapters.push((env_name, adapter));
-                                info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BINANCE/{env_name} adapter (REST/WS)");
-                            }
-                            Err(e) => error!(code = %conn.code, "Binance adapter not registered: {e}"),
-                        },
-                    }
-                }
-                }
-            }
-        }
-    }
+    // Adapters come from the store, not the environment. `build_registry` is the
+    // one code path that turns a credential into an adapter, so a credential
+    // saved at runtime (a later task's reload endpoint) and one loaded at boot
+    // cannot diverge — boot is simply its first caller, with `is_boot = true`
+    // and an empty registry (nothing yet exists to carry forward).
+    // `broker_connections` was loaded once, above, alongside the master-key
+    // resolution.
+    let registration_deps = RegistrationDeps {
+        pool: pool.clone(),
+        stream_health: stream_health.clone(),
+        kafka: kafka_client.clone(),
+        position_changed_tx: Some(position_changed_tx.clone()),
+    };
+    let RegistrationOutput {
+        registry,
+        // Not consumed yet — Task 5's reload endpoint returns this as the HTTP
+        // response body. Every connection's outcome is already logged above by
+        // `build_registry`, so there is nothing left to do with it here.
+        report: _report,
+        alpaca_creds,
+        binance_rest_adapters,
+    } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &registration_deps).await;
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
     // (OPENFIGI_API_KEY) raises the limits and batch size.
@@ -921,8 +829,12 @@ async fn serve() {
         symbology::InMemoryCache::new(),
     );
 
-    // AppState
-    let state = AppState::new(pool, admin_token, admin_auth_enabled, registry, kafka_client, symbology, stream_health);
+    // AppState. Constructed with an empty registry and immediately swapped to the
+    // one `build_registry` just produced — the same `swap_registry` call a
+    // runtime reload will use — so boot itself exercises that path rather than
+    // being the one caller that bypasses it.
+    let state = AppState::new(pool, admin_token, admin_auth_enabled, BrokerRegistry::new(), kafka_client, symbology, stream_health);
+    state.swap_registry(registry);
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
