@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { typeLabel, curlFor, escapeHtml, renderApi } from "./build-docs.mjs";
+import { typeLabel, curlFor, escapeHtml, renderApi, inlineDiagrams } from "./build-docs.mjs";
 
 const spec = {
   openapi: "3.0.3",
@@ -61,4 +61,23 @@ test("renderApi emits one section per tag and documents each operation", () => {
   assert.match(html, /POST/, "method missing");
   assert.match(html, /422/, "response code missing");
   assert.doesNotMatch(html, /<script src|https?:\/\/(?!localhost)/, "no external references allowed");
+});
+
+test("inlineDiagrams puts each SVG inside its own placeholder", () => {
+  const html = `<figure class="diagram" data-diagram="overview"></figure>
+                <figure class="diagram" data-diagram="er"></figure>`;
+  const svgs = { overview: "<svg id='a'></svg>", er: "<svg id='b'></svg>" };
+  const out = inlineDiagrams(html, svgs);
+
+  assert.match(out, /data-diagram="overview"[^]*?<svg id='a'>/);
+  assert.match(out, /data-diagram="er"[^]*?<svg id='b'>/);
+  assert.doesNotMatch(out, /data-diagram="overview"[^]*?<svg id='b'>[^]*?<\/figure>\s*<figure/);
+});
+
+test("inlineDiagrams fails loudly on a placeholder with no SVG", () => {
+  // A silently empty figure would publish an architecture page with a hole in it.
+  assert.throws(
+    () => inlineDiagrams(`<figure class="diagram" data-diagram="runtime"></figure>`, {}),
+    /runtime/,
+  );
 });

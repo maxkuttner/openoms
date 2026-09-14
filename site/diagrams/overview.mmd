@@ -1,0 +1,27 @@
+flowchart LR
+  DBN["Databento<br/>OPRA options"]:::feed
+  BNF["Binance<br/>spot book"]:::feed
+  BYF["Bybit<br/>spot book"]:::feed
+
+  FS["FeedSymbology<br/>candidates() + to_feed_symbol()"]:::feed
+
+  INST[("instrument<br/><b>symbol @ venue</b>")]:::core
+
+  BI[("broker_instrument")]:::exec
+  IP["InstrumentProvider<br/>list_instruments()"]:::exec
+
+  ALP["Alpaca<br/>equities · options"]:::exec
+  BNB["Binance<br/>crypto spot"]:::exec
+
+  DBN --> FS
+  BNF --> FS
+  BYF --> FS
+  FS -- "derived at startup<br/>(nothing stored)" --> INST
+  INST -- "1:n" --> BI
+  BI -- "sync-broker" --> IP
+  IP --> ALP
+  IP --> BNB
+
+  classDef core fill:#151a20,stroke:#25b083,color:#d7dce3;
+  classDef exec fill:#1a1e26,stroke:#ce9a3b,color:#d7dce3;
+  classDef feed fill:#151a20,stroke:#0e7490,color:#d7dce3;

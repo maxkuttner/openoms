@@ -428,3 +428,121 @@ footer {
     max-height: none;
   }
 }
+
+/* ---------------------------------------------------------------------- */
+/* Architecture page (site/build-docs.mjs -> architecture.html). The four */
+/* mermaid diagrams live in site/diagrams/*.mmd and are rendered to SVG   */
+/* and inlined at build time, so these rules only style the surrounding  */
+/* page — the SVGs carry their own colours (see the diagrams' classDefs, */
+/* rewritten against these same tokens).                                 */
+/* ---------------------------------------------------------------------- */
+:root {
+  --arch-core: #25b083;
+  --arch-exec: #ce9a3b;
+  --arch-feed: #0e7490;
+  --arch-ref: #8b949e;
+}
+
+main.arch {
+  max-width: 64rem;
+}
+
+.arch-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+@media (max-width: 42rem) {
+  .arch-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+.arch-card {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 1rem 1.1rem;
+}
+
+.arch-card-tag {
+  margin: 0;
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.arch-card-title {
+  margin: 0.35rem 0 0.4rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.arch-card-body {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+
+figure.diagram {
+  margin: 1rem 0 0;
+  padding: 0;
+}
+
+figure.diagram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+}
+
+figure.diagram figcaption {
+  margin-top: 0.6rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+  text-align: center;
+}
+
+.arch-steps {
+  list-style: none;
+  margin: 1.25rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.arch-step {
+  display: flex;
+  gap: 0.9rem;
+  align-items: baseline;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+}
+
+.arch-step-num {
+  flex: none;
+  min-width: 1.2rem;
+  font-weight: 700;
+  font-size: 0.78rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.arch-step-cmd {
+  margin: 0;
+  font-weight: 600;
+  font-size: 0.9rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.arch-step-body {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: var(--dim);
+}

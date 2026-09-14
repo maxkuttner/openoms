@@ -12,6 +12,13 @@
 // styling becomes the site's own CSS classes (see the "docs" section
 // appended to site/style.css).
 //
+// Also writes architecture.html: site/architecture.html is a hand-written
+// template with a <figure data-diagram="NAME"> placeholder per diagram;
+// mermaid-cli renders site/diagrams/*.mmd to SVG ahead of this script
+// (CI-only dependency, never installed into the repo — see the task-4
+// brief), and inlineDiagrams() below splices each SVG into its placeholder
+// so the published page runs no mermaid at all.
+//
 // No npm dependencies: node:fs, node:path and node:url only.
 
 import * as fs from "node:fs";
@@ -313,6 +320,33 @@ export function renderApi(spec) {
 `;
 }
 
+// -- architecture page (diagrams inlined at build time) --------------------
+
+// Matches one `<figure class="diagram" data-diagram="NAME">...</figure>`
+// placeholder, capturing NAME and whatever's already inside it (a
+// <figcaption>, normally). Non-greedy so a figure never swallows the next one.
+const DIAGRAM_RE = /<figure class="diagram" data-diagram="([a-z]+)">([^]*?)<\/figure>/g;
+
+/**
+ * Replace each `<figure data-diagram="NAME">` placeholder's contents with that
+ * diagram's SVG, keeping any <figcaption> already inside it.
+ *
+ * A missing SVG throws rather than leaving an empty figure: a hole in a
+ * published page is worse than a failed build, and CI is where this should
+ * stop.
+ */
+export function inlineDiagrams(html, svgs) {
+  return html.replace(DIAGRAM_RE, (whole, name, inner) => {
+    const svg = svgs[name];
+    if (!svg) {
+      throw new Error(
+        `inlineDiagrams: no SVG for diagram "${name}" — did the mermaid-cli render step run?`,
+      );
+    }
+    return `<figure class="diagram" data-diagram="${name}">${svg}${inner}</figure>`;
+  });
+}
+
 // -- entry point ----------------------------------------------------------
 
 function main() {
@@ -324,6 +358,24 @@ function main() {
   const outDir = path.resolve(process.argv[2] ?? "_site");
   fs.mkdirSync(outDir, { recursive: true });
   fs.writeFileSync(path.join(outDir, "api.html"), renderApi(spec));
+
+  // The four mermaid sources live in site/diagrams/*.mmd; mermaid-cli renders
+  // them to SVG before this script runs (see site/build-docs.test.mjs and the
+  // task-4 brief's Step 7 for the exact invocation) — this script only reads
+  // the result and inlines it.
+  const svgDir = path.resolve(process.argv[3] ?? path.join(outDir, "diagrams"));
+  if (!fs.existsSync(svgDir)) {
+    throw new Error(
+      `build-docs: no diagram SVGs at ${svgDir} — run mermaid-cli over site/diagrams/*.mmd first.`,
+    );
+  }
+  const svgs = {};
+  for (const f of fs.readdirSync(svgDir)) {
+    if (f.endsWith(".svg")) svgs[path.basename(f, ".svg")] = fs.readFileSync(path.join(svgDir, f), "utf8");
+  }
+
+  const archTemplate = fs.readFileSync(path.join(repoRoot, "site", "architecture.html"), "utf8");
+  fs.writeFileSync(path.join(outDir, "architecture.html"), inlineDiagrams(archTemplate, svgs));
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

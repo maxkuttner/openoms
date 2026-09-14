@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>openoms — architecture</title>
+    <link rel="icon" href="favicon.svg" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="docs-header">
+      <p class="docs-back"><a href="index.html">&larr; openoms</a></p>
+      <h1>Instrument model</h1>
+      <p class="tagline">
+        One canonical <b>instrument</b> catalog in the middle, two independent mappings off it: a
+        broker's tradable handle (<code>broker_instrument</code>, a table) and a data feed's
+        pricing symbol (<code>FeedSymbology</code>, derived in code). Priceable and tradable are
+        independent.
+      </p>
+    </header>
+
+    <main class="arch">
+      <section class="arch-cards">
+        <div class="arch-card">
+          <p class="arch-card-tag" style="color: var(--arch-core)">Master</p>
+          <p class="arch-card-title"><code>instrument</code></p>
+          <p class="arch-card-body">
+            Canonical identity, keyed <code>(symbol, venue)</code>. Asset/instrument class,
+            microstructure, FIGI. Option legs in <code>instrument_derivative</code>.
+          </p>
+        </div>
+        <div class="arch-card">
+          <p class="arch-card-tag" style="color: var(--arch-exec)">Execution</p>
+          <p class="arch-card-title"><code>broker_instrument</code></p>
+          <p class="arch-card-body">
+            Tradable mapping — one row per instrument per broker: <code>broker_symbol</code>,
+            <code>native_id</code>, limits. Written by <code>sync-broker</code> from the adapter's
+            <code>InstrumentProvider</code>. Its existence means tradable.
+          </p>
+        </div>
+        <div class="arch-card">
+          <p class="arch-card-tag" style="color: var(--arch-feed)">Market data</p>
+          <p class="arch-card-title"><code>FeedSymbology</code></p>
+          <p class="arch-card-body">
+            Pricing mapping, 1:n — and a pure function, not a table. <code>candidates()</code>
+            picks the catalog slice a feed covers, <code>to_feed_symbol()</code> renames it; one
+            symbol can price the pair on several venues. Evaluated at subscribe time.
+          </p>
+        </div>
+      </section>
+
+      <section>
+        <h2>End to end</h2>
+        <p class="after">
+          One catalog in the middle, an adapter at each end. A feed translates its own symbols
+          through <code>FeedSymbology</code>; a broker publishes its tradable catalog through
+          <code>InstrumentProvider</code>. Each adapter owns its own symbology, so neither end
+          knows the other exists.
+        </p>
+        <figure class="diagram" data-diagram="overview">
+          <figcaption>How feeds, instruments and broker connections relate</figcaption>
+        </figure>
+      </section>
+
+      <section>
+        <h2>Tables &amp; relationships</h2>
+        <p class="after">
+          Foreign keys shown. <code>broker_instrument</code> references the master instrument.
+          There is no feed table: the pricing mapping is derived in code. Two soft links by code
+          (no FK): <code>broker_code</code> &rarr; <code>broker_connection</code>, and
+          <code>feed_code</code> is ranked for failover in <code>provider_feed_policy</code>.
+        </p>
+        <figure class="diagram" data-diagram="er">
+          <figcaption>Tables and foreign keys, instrument at the centre</figcaption>
+        </figure>
+      </section>
+
+      <section>
+        <h2>Seeding — the order matters</h2>
+        <p class="after">
+          Two steps, and the order is a hard dependency rather than a convention. Each reads what
+          the one before it wrote, and nothing ever points backwards — a data feed never creates
+          an instrument, and an instrument never creates a venue. Feeds are not part of it: they
+          derive their mapping at startup. You rarely run these by hand: the app self-provisions
+          on boot (roles, schema, ref-data via the admin role) and background-syncs instruments
+          when the catalog is empty — the make targets are the manual equivalent, kept as an
+          escape hatch (<code>OMS_BOOTSTRAP=off</code>).
+        </p>
+        <figure class="diagram" data-diagram="seed">
+          <figcaption>What each step writes, and what the runtime only ever reads</figcaption>
+        </figure>
+
+        <ol class="arch-steps">
+          <li class="arch-step">
+            <span class="arch-step-num" style="color: var(--arch-ref)">0</span>
+            <div>
+              <p class="arch-step-cmd">make db-seed</p>
+              <p class="arch-step-body">
+                Reference data: ISO 4217 <code>currency</code>, the ISO 10383 MIC
+                <code>venue</code> registry, plus crypto exchange venues (<code>BINANCE</code>,
+                <code>BYBIT</code>) that have no MIC. Both are foreign-key targets for
+                <code>instrument</code>.
+              </p>
+            </div>
+          </li>
+          <li class="arch-step">
+            <span class="arch-step-num" style="color: var(--arch-exec)">1</span>
+            <div>
+              <p class="arch-step-cmd">make sync-broker BROKER=&hellip;</p>
+              <p class="arch-step-body">
+                The broker's catalog becomes the instrument set. Writes <code>instrument</code>
+                (+ <code>instrument_derivative</code>) and the <code>broker_instrument</code>
+                routing handle in one pass. Anything the broker doesn't list, we don't know about.
+              </p>
+            </div>
+          </li>
+          <li class="arch-step">
+            <span class="arch-step-num" style="color: var(--arch-feed)">&mdash;</span>
+            <div>
+              <p class="arch-step-cmd">(nothing &mdash; feeds derive)</p>
+              <p class="arch-step-body">
+                There is no third step. At startup each feed reads the catalog step 2 built and
+                works out what it calls those instruments, in memory. Nothing is written, so
+                nothing can go stale or be forgotten after the next <code>sync-broker</code>.
+              </p>
+            </div>
+          </li>
+        </ol>
+
+        <p class="note">
+          <b>How this used to bite.</b> A missing <code>venue</code> or <code>currency</code> row
+          silently dropped every instrument referencing it, so a broker sync could
+          &ldquo;succeed&rdquo; with thousands of rows missing — <code>sync-broker</code> now
+          exits non-zero instead (pass <code>--allow-skips</code> to accept a partial catalog).
+          And the old <code>map-feed</code> step was not retroactive: instruments added by a
+          later sync had no feed mapping until someone re-ran it. Deriving the mapping removed
+          that failure rather than fixing it. What remains is checked at startup by
+          <code>preflight</code>, which refuses to boot on an empty catalog and names any held
+          position it cannot price or route.
+        </p>
+      </section>
+
+      <section>
+        <h2>Runtime — the two paths</h2>
+        <p class="after">
+          Pricing derives its symbols through <code>FeedSymbology</code>; order routing reads
+          <code>broker_instrument</code>. They never cross — a feed can price an instrument no
+          broker trades, and vice versa.
+        </p>
+        <figure class="diagram" data-diagram="runtime">
+          <figcaption>The pricing path and the execution path never cross</figcaption>
+        </figure>
+      </section>
+
+      <p class="after" style="font-size: 0.8rem">
+        Reflects migrations 0016&ndash;0020 and the <code>sync-broker</code> flow. See also
+        <a href="api.html">API docs</a>.
+      </p>
+    </main>
+  </body>
+</html>
