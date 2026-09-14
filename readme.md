@@ -38,6 +38,13 @@ Then, in a second terminal:
 cd cockpit && npm install && npm run dev  # admin console on localhost:5173
 ```
 
+A released `oms` binary serves the cockpit itself at
+<http://localhost:3001/cockpit/> — the bundle is compiled in, so there is no second
+process to start. The `npm run dev` server above is for developing the cockpit: it
+hot-reloads and proxies the API to a running OMS. A source build embeds nothing
+unless you run `npm run build` in `cockpit/` before `cargo build`; until then
+`/cockpit/` returns a 404 that says so.
+
 `init` asks for your Postgres host, port, database name, superuser name and
 password — pressing Enter through every prompt targets a default local Postgres
 (`localhost:5432`, superuser `postgres`, database `ods`). A passed `--host`,

@@ -1183,6 +1183,7 @@ async fn serve() {
         .route("/health", get(handlers::health))
         .merge(orders_router)
         .merge(admin_router)
+        .merge(cockpit::router())
         // add 404 route as fallback
         .fallback(handlers::handler_404)
         .with_state(state);
@@ -1191,6 +1192,9 @@ async fn serve() {
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     let host_url = format!("http://{}", bind_addr);
     info!("OMS listening on {}", host_url);
+    if cockpit::is_bundled() {
+        info!("Cockpit: {}/cockpit/", host_url);
+    }
     info!("Scalar UI: {}/scalar", host_url);
     info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);
     axum::serve(listener, app).await.unwrap();

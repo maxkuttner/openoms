@@ -9,10 +9,15 @@
 //! output. So there is no release assert — the routes explain where the dev UI is.
 
 use axum::{
+    extract::Path as UrlPath,
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
+    Router,
 };
 use include_dir::{include_dir, Dir};
+
+use crate::app_state::AppState;
 
 static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/cockpit/dist");
 
@@ -83,6 +88,30 @@ pub fn respond(path: &str) -> Response {
     }
 }
 
+async fn redirect_to_slash() -> Redirect {
+    Redirect::temporary("/cockpit/")
+}
+
+async fn index() -> Response {
+    respond("")
+}
+
+async fn asset(UrlPath(path): UrlPath<String>) -> Response {
+    respond(&path)
+}
+
+/// Mounted outside the admin auth layer on purpose: the SPA shell has to load
+/// before there is a token to send, and these routes carry no data — only the
+/// static bundle. Authentication happens where it already did, on `/admin/*`.
+pub fn router() -> Router<AppState> {
+    Router::new()
+        // axum's `*path` wildcard needs at least one character after the slash, so
+        // `/cockpit/` itself gets its own route.
+        .route("/cockpit", get(redirect_to_slash))
+        .route("/cockpit/", get(index))
+        .route("/cockpit/*path", get(asset))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +175,28 @@ mod tests {
             .expect("at least one hashed asset");
         let name = first.path().to_string_lossy().to_string();
         assert_eq!(asset_for(&name).unwrap().cache_control, IMMUTABLE);
+    }
+
+    #[tokio::test]
+    async fn the_bare_path_redirects_to_the_trailing_slash() {
+        // The SPA's asset URLs are relative to /cockpit/ (vite `base`), so without
+        // the trailing slash the browser resolves them one level too high.
+        let res = redirect_to_slash().await.into_response();
+        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[header::LOCATION], "/cockpit/");
+    }
+
+    #[tokio::test]
+    async fn the_index_route_serves_the_shell_or_explains_itself() {
+        let res = index().await;
+        let expected = if is_bundled() { StatusCode::OK } else { StatusCode::NOT_FOUND };
+        assert_eq!(res.status(), expected);
+    }
+
+    #[tokio::test]
+    async fn the_wildcard_route_resolves_a_client_side_route() {
+        let res = asset(axum::extract::Path("orders".to_string())).await;
+        let expected = if is_bundled() { StatusCode::OK } else { StatusCode::NOT_FOUND };
+        assert_eq!(res.status(), expected);
     }
 }
