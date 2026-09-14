@@ -2,7 +2,7 @@ import { useEffect, useState, lazy, Suspense } from "react";
 import { AppShell, Group, NavLink, Button, Center, Text, Loader } from "@mantine/core";
 import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { api, setToken } from "./api/client";
+import { api, setToken, API_BASE } from "./api/client";
 import { Logo } from "./components/Logo";
 import { LoginPage } from "./pages/Login";
 import { PrincipalsPage } from "./pages/Principals";
@@ -42,7 +42,7 @@ const DOCS_NAV = [
 function ConnectionDot() {
   const { data: ok } = useQuery({
     queryKey: ["health"],
-    queryFn: async () => (await fetch("/api/health")).ok,
+    queryFn: async () => (await fetch(`${API_BASE}/health`)).ok,
     refetchInterval: 10000,
   });
   return (
