@@ -17,8 +17,6 @@ use axum::{
 };
 use include_dir::{include_dir, Dir};
 
-use crate::app_state::AppState;
-
 static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/cockpit/dist");
 
 /// Vite emits content-hashed asset filenames, so a given URL's bytes never change.
@@ -103,7 +101,7 @@ async fn asset(UrlPath(path): UrlPath<String>) -> Response {
 /// Mounted outside the admin auth layer on purpose: the SPA shell has to load
 /// before there is a token to send, and these routes carry no data — only the
 /// static bundle. Authentication happens where it already did, on `/admin/*`.
-pub fn router() -> Router<AppState> {
+pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         // axum's `*path` wildcard needs at least one character after the slash, so
         // `/cockpit/` itself gets its own route.
@@ -198,5 +196,52 @@ mod tests {
         let res = asset(axum::extract::Path("orders".to_string())).await;
         let expected = if is_bundled() { StatusCode::OK } else { StatusCode::NOT_FOUND };
         assert_eq!(res.status(), expected);
+    }
+
+    // The tests above call the handlers directly, which is cheap but bypasses
+    // axum's actual path matching — it would not have caught an overlap between
+    // the exact `/cockpit/` route and the `/cockpit/*path` wildcard, which is
+    // exactly the axum-0.7 hazard `router()`'s doc comment calls out. This test
+    // binds a real listener and drives it with a real HTTP client so the route
+    // table itself — not just the handler bodies — is under test.
+    #[tokio::test]
+    async fn the_router_dispatches_through_axums_real_route_table() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router::<()>().with_state(());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let base = format!("http://{addr}");
+
+        // 1. The bare path is reached and redirects to the trailing slash.
+        let res = client.get(format!("{base}/cockpit")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[reqwest::header::LOCATION], "/cockpit/");
+
+        let expected = if is_bundled() { reqwest::StatusCode::OK } else { reqwest::StatusCode::NOT_FOUND };
+
+        // 2. The exact-match `/cockpit/` route wins over the `/cockpit/*path`
+        // wildcard (it would also match an empty capture, if axum let it).
+        let res = client.get(format!("{base}/cockpit/")).send().await.unwrap();
+        assert_eq!(res.status(), expected);
+
+        // 3. The wildcard resolves an extensionless, client-side deep link.
+        let res = client.get(format!("{base}/cockpit/orders")).send().await.unwrap();
+        assert_eq!(res.status(), expected);
+
+        // 4. An extensioned miss is a genuine 404 in both build states, never the
+        // shell fallback.
+        let res = client
+            .get(format!("{base}/cockpit/assets/nope-00000000.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
     }
 }
