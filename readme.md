@@ -20,13 +20,22 @@
 
 ```sh
 curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+```
+
+`~/.local/bin` is not on the default macOS `PATH`. The installer prints the one
+`export` line to add when it isn't on yours — add it, then:
+
+```sh
 oms database init
 oms
 ```
 
 Then open <http://localhost:3001/cockpit/>. Prebuilt binaries cover macOS on Apple
 Silicon and Linux on x86_64; the installer verifies a checksum, drops `oms` in
-`~/.local/bin` and does nothing else. Everything below builds from source instead.
+`~/.local/bin` and does nothing else. `oms database init` needs a Postgres 16, and
+the Linux binary needs OpenSSL 3 — Debian 12 and Ubuntu 22.04+ have it, Ubuntu
+20.04, RHEL 8 and Amazon Linux 2 do not. Everything below builds from source
+instead.
 
 ## Setup
 
