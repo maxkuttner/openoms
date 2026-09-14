@@ -62,6 +62,7 @@ mod preflight;
 mod config;
 mod secrets;
 mod credentials;
+mod credentials_api;
 mod expiry;
 mod fix;
 mod reload;
@@ -108,6 +109,15 @@ mod reload_tests;
         admin::list_broker_connections,
         admin::get_broker_connection,
         admin::update_broker_connection,
+        admin::get_broker_connection_credentials,
+        admin::put_broker_connection_credentials,
+        admin::delete_broker_connection_credentials,
+        admin::test_broker_connection_credentials,
+        admin::list_feed_connections,
+        admin::get_feed_connection_credentials,
+        admin::put_feed_connection_credentials,
+        admin::delete_feed_connection_credentials,
+        admin::test_feed_connection_credentials,
         admin::reload_connections,
         admin::create_risk_limit,
         admin::list_risk_limits,
@@ -119,6 +129,7 @@ mod reload_tests;
         admin::resolve_symbology,
         admin::backfill_symbology,
         admin::expiry_sweep,
+        admin::setup_status,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -130,13 +141,16 @@ mod reload_tests;
         CreatePortfolio, UpdatePortfolio,
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
+        admin::RedactedCredentials, crate::credentials::RedactedField,
+        crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
         Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
-        admin::InstrumentSummary, admin::FeedSummary,
+        admin::InstrumentSummary, admin::FeedSummary, admin::FeedConnectionSummary,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
         admin::ExpirySweepResult,
+        admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
     )),
     modifiers(&SecurityAddon),
@@ -658,6 +672,7 @@ async fn serve() {
     // first place, and `load_brokers` needs to see them to report them (even as
     // `Unconfigured`) rather than silently loading an empty list.
     setup::bootstrap::ensure_broker_connections(&pool).await;
+    setup::bootstrap::ensure_feed_connections(&pool).await;
 
     // Every broker/feed connection, credentials decoded under `master` (or left
     // `Unconfigured`/`Error` when there is none — see `decode` in credentials.rs).
@@ -1107,6 +1122,27 @@ async fn serve() {
             "/admin/broker-connections/:code",
             axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
         )
+        .route(
+            "/admin/broker-connections/:code/credentials",
+            get(admin::get_broker_connection_credentials)
+                .put(admin::put_broker_connection_credentials)
+                .delete(admin::delete_broker_connection_credentials),
+        )
+        .route(
+            "/admin/broker-connections/:code/credentials/test",
+            post(admin::test_broker_connection_credentials),
+        )
+        .route("/admin/feed-connections", get(admin::list_feed_connections))
+        .route(
+            "/admin/feed-connections/:code/credentials",
+            get(admin::get_feed_connection_credentials)
+                .put(admin::put_feed_connection_credentials)
+                .delete(admin::delete_feed_connection_credentials),
+        )
+        .route(
+            "/admin/feed-connections/:code/credentials/test",
+            post(admin::test_feed_connection_credentials),
+        )
         .route("/admin/connections/reload", post(admin::reload_connections))
         .route(
             "/admin/principals/:id/grants",
@@ -1131,6 +1167,7 @@ async fn serve() {
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
         .route("/admin/symbology/backfill", post(admin::backfill_symbology))
         .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
+        .route("/admin/setup-status", get(admin::setup_status))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
     let scalar_html = {
@@ -1187,6 +1224,27 @@ mod tests {
                 "any_configured={any_configured} any_error={any_error}"
             );
         }
+    }
+
+    /// Generating the document is the only thing that would actually catch a
+    /// bad `#[schema(...)]` override (e.g. on `SaveResponse::reload`, which
+    /// points at a type — `reload::ConnectionOutcome` — with no `ToSchema`
+    /// impl of its own) or a typo'd path: nothing else in the test suite
+    /// calls `openapi()`.
+    #[test]
+    fn openapi_document_includes_the_credential_write_endpoints() {
+        use utoipa::OpenApi;
+        let doc = super::ApiDoc::openapi();
+        let json = serde_json::to_string(&doc).expect("serialize openapi doc");
+        assert!(json.contains("/admin/broker-connections/{code}/credentials"));
+        assert!(json.contains("/admin/broker-connections/{code}/credentials/test"));
+        assert!(json.contains("/admin/feed-connections"));
+        assert!(json.contains("/admin/feed-connections/{code}/credentials"));
+        assert!(json.contains("/admin/feed-connections/{code}/credentials/test"));
+        assert!(json.contains("SaveResponse"));
+        assert!(json.contains("TestResponse"));
+        assert!(json.contains("CredentialSubmission"));
+        assert!(json.contains("FeedConnectionSummary"));
     }
 
     /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares

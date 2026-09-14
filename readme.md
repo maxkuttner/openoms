@@ -151,9 +151,37 @@ cargo run -- config import-env
 a one-shot migration off the old `{BROKER}_{ENV}_*` variables in `.env`: it seals
 whatever it finds there into the store and reports what it imported (and what it
 skipped, and why — e.g. a key set without its matching secret). Run it once, then
-delete the credential lines from `.env`; they do nothing there any more. A
-cockpit screen for entering credentials directly, without going through `.env`
-first, is coming in a later plan.
+delete the credential lines from `.env`; they do nothing there any more.
+
+**The cockpit's Broker connections and Data feeds pages configure credentials
+directly, without going through `.env` at all.** Each connection row has a
+"Credentials" button opening a panel that:
+
+- shows whether a credential is `configured`, `unconfigured` ("needs setup"),
+  or `error` (stored, but the master key doesn't open it — the panel surfaces
+  the reason so it can be fixed rather than mistaken for a fresh install);
+- renders one field per credential (host, port, key id, ...) with secret
+  fields (API secret, FIX password, private key) shown as password inputs
+  that default to blank and are placeholdered "leave blank to keep" once a
+  credential is configured — you can change a host or key id without
+  re-typing a secret the cockpit never has to show;
+- **Test** re-checks the credential currently stored (not unsaved form
+  input) against the provider — for Alpaca and Databento this is a real
+  authenticated round trip; for IBKR/Binance FIX it reports "not testable
+  before save", since the only way to validate a FIX credential is a session
+  logon, and this process already owns that session;
+- **Save** tests the *submitted* credential (merged over whatever is already
+  stored) before writing anything — a failing test is refused with the
+  provider's own rejection reason and nothing is persisted or reloaded. FIX
+  credentials skip this pre-write test the same way Test does, and save
+  regardless;
+- **Clear** deletes the stored credential (behind a confirmation) and
+  disarms the connection's adapter, same as reload disabling it.
+
+A successful save reports the reload outcome inline — "applied immediately"
+for Alpaca and Databento, "restart required" for IBKR/Binance FIX — see
+[Applying a credential change](#applying-a-credential-change) below for what
+that means operationally.
 
 To change the master key itself, `cargo run -- config rotate-key` re-wraps every
 stored credential under a freshly generated key and prints it — the rows are
@@ -202,8 +230,11 @@ for the other.
 
 `Registered` means the adapter/task was installed, **not** that the remote
 service has authenticated it. Stream health reports the subsequent connection
-state. Reload does not test credentials before applying them; the credential
-editing API in Plan 4 will supply that gate.
+state. Reload itself does not test credentials before applying them — that
+gate lives one step earlier, in `PUT .../credentials` (the save the cockpit's
+credential panel calls): it tests the merged submission before writing
+anything, and a failing test is refused with the provider's message, with no
+write and no reload triggered.
 
 Reloads are serialized from the store read through stream replacement. Both
 credential tables are read from one repeatable-read snapshot, and a replacement
@@ -240,6 +271,12 @@ nothing and correctly refuses with 500 rather than swap in an empty registry.
 Applying a rotated master key — as opposed to a rotated broker or feed
 credential — needs an actual restart; a reload cannot do it, no matter how
 promptly `oms.toml` is updated with the new key first.
+
+**Kafka and OpenFIGI stay environment-only** — `KAFKA_BROKER`, `KAFKA_TOPIC`,
+`KAFKA_CLIENT_ID`, `KAFKA_PROJECTOR_GROUP_ID` and `OPENFIGI_API_KEY` are plain
+`env::var` reads (`src/kafka.rs`, `src/main.rs`), not part of the encrypted
+credential store and not configurable from the cockpit. Same shape as broker
+and feed credentials, deliberately deferred.
 
 ## Roles and schemas
 

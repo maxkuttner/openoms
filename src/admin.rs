@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials};
+use crate::credentials_api::{self, CredentialSubmission, TestOutcome};
 use crate::reload;
 use crate::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
@@ -84,6 +85,26 @@ pub struct UpdateBrokerConnection {
     pub broker_code: Option<String>,
     pub environment: Option<String>,
     pub status: Option<String>,
+}
+
+/// The credential view safe to put on the wire. `state` mirrors
+/// `CredentialState` so the cockpit can tell "needs setup" (`unconfigured`)
+/// apart from "stored but the master key does not open it" (`error`) — the
+/// distinction the whole credential store was built to preserve; collapsing
+/// them would invite an operator to re-enter a credential that is already
+/// there instead of fixing the key. `fields` is populated only when `state`
+/// is `"configured"`; `message` only when `state` is `"error"`. Never carries
+/// a decrypted secret, in either state.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RedactedCredentials {
+    pub code: String,
+    /// "configured" | "unconfigured" | "error"
+    pub state: String,
+    pub fields: Vec<crate::credentials::RedactedField>,
+    /// The reason a stored blob could not be used — set only when
+    /// `state == "error"`, and always a description, never the payload.
+    pub message: Option<String>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[utoipa::path(
@@ -525,6 +546,25 @@ pub async fn update_account(
 
 // ── Broker connections ────────────────────────────────────────────────────────
 
+/// Rejects a `broker_code` the adapter registry could never be reached
+/// under. `broker_code` is unconstrained `TEXT` — no CHECK, no FK — but
+/// `reload.rs` registers adapters under hardcoded literals (`"IBKR"`,
+/// `"BINANCE"`, …), keyed by this same column. A code that saves clean here
+/// but doesn't match one of those literals passes reload silently and then
+/// 503s every order routed through it — see `setup::brokers::known_broker_codes`
+/// for why the accepted set is sourced from there rather than repeated here.
+fn validate_broker_code(code: &str) -> Result<(), AdminError> {
+    let known = crate::setup::brokers::known_broker_codes();
+    if known.contains(&code) {
+        Ok(())
+    } else {
+        Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("broker_code must be one of: {} (got {code:?})", known.join(", ")),
+        })
+    }
+}
+
 #[utoipa::path(
     post, path = "/admin/broker-connections", tag = "admin",
     request_body = CreateBrokerConnection,
@@ -545,6 +585,7 @@ pub async fn create_broker_connection(
             message: "environment must be PAPER or LIVE".to_string(),
         });
     }
+    validate_broker_code(&payload.broker_code)?;
     info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
@@ -717,6 +758,9 @@ pub async fn update_broker_connection(
             });
         }
     }
+    if let Some(ref broker_code) = payload.broker_code {
+        validate_broker_code(broker_code)?;
+    }
     info!(broker_connection_code = %code, "admin update broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
@@ -740,6 +784,395 @@ pub async fn update_broker_connection(
     .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
     Ok(Json(record))
+}
+
+/// Resolves the configured master key the same way every credential endpoint
+/// must: absent is fine — every row still reads back correctly as
+/// Unconfigured-if-null / Error-if-not — but a *present and invalid* key is
+/// reported rather than silently folded into "no key configured"; a wrong
+/// key must not be hidden behind that story. Shared so `GET`, `PUT`,
+/// `DELETE`, `test`, and `reload_connections` cannot each resolve this a
+/// different way.
+fn resolve_master_key() -> Result<Option<crate::secrets::MasterKey>, AdminError> {
+    match crate::config::master_key(crate::config::load()) {
+        Some(Ok(k)) => Ok(Some(k)),
+        Some(Err(e)) => Err(AdminError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("master key is invalid: {e}"),
+        }),
+        None => Ok(None),
+    }
+}
+
+/// Maps one loaded connection's credential state onto the wire shape. Split
+/// out from the handler so the mapping — the part that must never let a
+/// secret through — is exercised directly in tests, with no database.
+///
+/// Generic over `T: ToRedactedFields` rather than pinned to
+/// `BrokerCredentials`: brokers and feeds share this exact mapping (only
+/// which fields are secret differs, and that lives in each type's own
+/// `Redact` impl), so a feed connection reuses this function instead of
+/// admin.rs growing a second copy of it.
+fn redact_connection<T: crate::credentials::ToRedactedFields>(conn: Connection<T>) -> RedactedCredentials {
+    let (state, fields, message) = match conn.credentials {
+        CredentialState::Configured(c) => ("configured", c.to_redacted_fields(), None),
+        CredentialState::Unconfigured => ("unconfigured", Vec::new(), None),
+        CredentialState::Error(e) => ("error", Vec::new(), Some(e)),
+    };
+    RedactedCredentials {
+        code: conn.code,
+        state: state.to_string(),
+        fields,
+        message,
+        updated_at: conn.credentials_updated_at,
+    }
+}
+
+/// What is configured for one broker connection, with every secret withheld.
+///
+/// 404 only when the connection row itself does not exist. A connection with
+/// no credentials stored is still 200, `state: "unconfigured"` — it exists,
+/// it just needs setup, which is a different operator situation from 404
+/// ("no such connection") and from `state: "error"` ("stored, but the master
+/// key does not open it"). See `RedactedCredentials`.
+#[utoipa::path(
+    get, path = "/admin/broker-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "OK — configured, unconfigured, or error; never a decrypted secret", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the configured master key is invalid"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(broker_connection_code = %code, "admin get broker connection credentials");
+
+    let master = resolve_master_key()?;
+
+    let connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
+}
+
+/// Response body for a successful credential save.
+///
+/// `reload` is this connection's own entry out of the reload report the save
+/// already triggered — not a second call the cockpit has to make — so the UI
+/// can say "applied" (a REST adapter, swapped live) or "restart required" (a
+/// FIX session) in the same response that confirms the write.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SaveResponse {
+    pub redacted: RedactedCredentials,
+    /// Whether the credential was actually checked against the broker before
+    /// being written — `false` for FIX (see `credentials_api::test_broker`),
+    /// so the UI reports "not testable" rather than implying a pass it never
+    /// earned.
+    pub tested: bool,
+    /// Present exactly when `tested` is `false`: `TestOutcome::NotTestable`'s
+    /// own explanation (e.g. "FIX credentials are validated at session
+    /// logon, not before save"), passed through so the cockpit renders the
+    /// server's reason instead of hardcoding its own guess at the wording.
+    /// Always `None` when `tested` is `true` — a `Failed` test never reaches
+    /// this response at all (422, before anything is written).
+    pub message: Option<String>,
+    /// `None` only if the reload report (queried by this same connection's
+    /// code, right after the save that triggered it) somehow lacks an entry
+    /// for it — never expected in practice, but a missing key is safer to
+    /// surface as "unknown" than to synthesize an outcome for.
+    #[schema(value_type = Object, nullable = true)]
+    pub reload: Option<reload::ConnectionOutcome>,
+}
+
+/// Response body for `POST .../credentials/test`.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TestResponse {
+    /// Whether a check was actually attempted — `false` for FIX.
+    pub tested: bool,
+    /// Only meaningful when `tested` is `true`: whether it passed.
+    pub ok: bool,
+    /// Present on anything short of a clean pass: the broker's rejection
+    /// reason, or why nothing was attempted. Never derived from submitted
+    /// input — see `TestOutcome`'s own doc comment.
+    pub message: Option<String>,
+}
+
+/// Maps a `TestOutcome` onto the wire shape both the `test` endpoint and the
+/// save path's `tested` flag draw from, so the two cannot disagree about
+/// what counts as tested.
+fn test_response(outcome: &TestOutcome) -> TestResponse {
+    match outcome {
+        TestOutcome::Passed => TestResponse { tested: true, ok: true, message: None },
+        TestOutcome::Failed(msg) => TestResponse { tested: true, ok: false, message: Some(msg.clone()) },
+        TestOutcome::NotTestable(why) => TestResponse { tested: false, ok: false, message: Some((*why).to_string()) },
+    }
+}
+
+/// Whether `outcome` permits the write to proceed, as `Ok(())` / `Err(reason)`
+/// so the 422 body can reuse the broker's own message with no reformatting.
+/// `NotTestable` permits the write — see `credentials_api::test_broker` for
+/// why "we didn't check" is not the same as "it failed" — only `Failed` does
+/// not.
+fn persist_gate(outcome: &TestOutcome) -> Result<(), String> {
+    match outcome {
+        TestOutcome::Passed | TestOutcome::NotTestable(_) => Ok(()),
+        TestOutcome::Failed(msg) => Err(msg.clone()),
+    }
+}
+
+/// A failed test must stop before the write. This is the gate the whole
+/// feature rests on: a credential that cannot authenticate must never
+/// replace one that can.
+fn should_persist(result: &Result<(), String>) -> bool {
+    result.is_ok()
+}
+
+/// The environment `credentials_api::test_broker` checks an Alpaca credential
+/// against: the connection's *own* stored environment, never a hardcoded
+/// literal. `AlpacaAdapter::new` picks the live endpoint only for exactly
+/// `"LIVE"`, so testing a real `LIVE` credential against a hardcoded
+/// `"PAPER"` 401s and the save gate refuses a credential that is perfectly
+/// valid — the bug this function exists to make impossible to reintroduce.
+/// `None` is never expected for a broker row (`load_brokers` always sets
+/// `Some(env)`), so it falls back to the safer default, PAPER.
+fn test_environment(conn_environment: Option<&str>) -> &str {
+    conn_environment.unwrap_or("PAPER")
+}
+
+/// Parses the raw request body into a `CredentialSubmission`, deliberately
+/// not `Json<CredentialSubmission>` at the extractor: axum's own extractor
+/// answers a type mismatch (e.g. a numeric `port`) with its own 422 before
+/// the handler ever runs — indistinguishable from this endpoint's
+/// test-failed 422, which its docs promise means "did not authenticate".
+/// That axum rejection also echoes the offending value into its message
+/// ("invalid type: integer `12345`"). Taking a `Value` at the extractor and
+/// parsing it here keeps a malformed body a 400 with a message that names
+/// the problem, never the value.
+fn parse_submission(raw: serde_json::Value) -> Result<CredentialSubmission, AdminError> {
+    serde_json::from_value(raw).map_err(|_| AdminError {
+        status: StatusCode::BAD_REQUEST,
+        message: "request body could not be parsed: every field value must be a string".into(),
+    })
+}
+
+/// Save (create or edit) a broker connection's credential.
+///
+/// The order is the requirement: decrypt what is already stored, merge the
+/// submission over it (`credentials_api::parse_broker`), test the *merged*
+/// result — never the raw submission, since an omitted field must inherit a
+/// value that already passes — and only once that clears does anything get
+/// written. A `Failed` test returns 422 with the broker's own message and
+/// changes nothing: no write, no reload. `NotTestable` (FIX) proceeds to
+/// save — `tested: false` in the response says so, rather than implying a
+/// pass never earned.
+///
+/// The save itself reloads the running registry so the new credential takes
+/// effect (or the cockpit is told a restart is needed) without a second
+/// call — see `SaveResponse::reload`.
+#[utoipa::path(
+    put, path = "/admin/broker-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    request_body = CredentialSubmission,
+    responses(
+        (status = 200, description = "Saved, tested where possible, and reloaded", body = SaveResponse),
+        (status = 400, description = "The request body was malformed, or could not be parsed into a credential (unknown field, bad port, ...)"),
+        (status = 404, description = "Not found"),
+        (status = 422, description = "The credential did not authenticate; nothing was written"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid or unset, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn put_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(raw): Json<serde_json::Value>,
+) -> Result<Json<SaveResponse>, AdminError> {
+    info!(broker_connection_code = %code, "admin save broker connection credentials");
+
+    let submission = parse_submission(raw)?;
+
+    // A write, unlike a read, cannot tolerate an absent key: there would be
+    // nothing to seal the credential under.
+    let master = resolve_master_key()?.ok_or_else(|| AdminError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "no master key is configured (set oms.master_key in oms.toml); cannot save credentials".into(),
+    })?;
+
+    // Decrypt existing.
+    let connections = crate::credentials::load_brokers(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+    let existing = match &conn.credentials {
+        CredentialState::Configured(c) => Some(c),
+        CredentialState::Unconfigured | CredentialState::Error(_) => None,
+    };
+    // Captured before `conn.kind`/`existing` are consumed below — the
+    // connection's own environment, never a hardcoded literal. See
+    // `test_environment`'s doc comment for why this matters.
+    let environment = test_environment(conn.environment.as_deref()).to_string();
+
+    // Parse merged.
+    let parsed = credentials_api::parse_broker(&conn.kind, existing, &submission)
+        .map_err(|e| AdminError { status: StatusCode::BAD_REQUEST, message: e.to_string() })?;
+
+    // Test.
+    let outcome = credentials_api::test_broker(&parsed, &environment).await;
+    let TestResponse { tested, message, .. } = test_response(&outcome);
+    let gate = persist_gate(&outcome);
+    if !should_persist(&gate) {
+        return Err(AdminError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: gate.expect_err("should_persist(&gate) was false, so gate must be Err"),
+        });
+    }
+
+    // Persist.
+    crate::credentials::save_broker(state.pool(), &master, &code, &parsed)
+        .await
+        .map_err(map_db_error)?;
+
+    // Reload — the existing, serialized, FIX-aware path; not a second one.
+    let report = reload_with_key(state.clone(), Some(master.clone())).await?;
+    let reload = report.0.connections.into_iter().find(|(c, _)| *c == code).map(|(_, outcome)| outcome);
+
+    let refreshed = crate::credentials::load_brokers(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = refreshed
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, reload }))
+}
+
+/// Clear a broker connection's stored credential.
+///
+/// Also reloads: leaving a removed credential's adapter live would be the
+/// silent-mismatch class this project has hit repeatedly (see `reload.rs`'s
+/// module doc). The reload's own outcome is not carried in the response —
+/// unlike the save path, there is nothing to test or report other than
+/// "unconfigured", which `redacted.state` already says.
+#[utoipa::path(
+    delete, path = "/admin/broker-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "Cleared and reloaded — now unconfigured", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn delete_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(broker_connection_code = %code, "admin delete broker connection credentials");
+
+    // Cleared before the reload runs: if the reload below fails, this row is
+    // already null while the old adapter keeps routing on the credential it
+    // was built with. That is a real gap, but a self-healing one — the
+    // `UPDATE` still reports a row affected on an already-null row (it
+    // matches on `code`, not on `credentials IS NOT NULL`), so a retried
+    // `DELETE` runs the reload again with nothing left to clear. Clearing
+    // *after* a successful reload would remove that safety net: a failed
+    // reload would then leave the credential live with no record that
+    // deletion was ever requested, and a retry would have nothing to update
+    // to notice the difference. Don't reorder this without keeping that
+    // property.
+    let result = sqlx::query(
+        "UPDATE broker_connection \
+         SET credentials = NULL, credentials_updated_at = NULL, updated_at = now() \
+         WHERE code = $1",
+    )
+    .bind(&code)
+    .execute(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("broker_connection"));
+    }
+
+    // Disarm the adapter before reporting success — the reload path, not a
+    // second one. The report itself is not surfaced here (see this fn's doc
+    // comment); only that the reload ran before we report success.
+    let master = resolve_master_key()?;
+    let _report = reload_with_key(state.clone(), master.clone()).await?;
+
+    let connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
+}
+
+/// Test the credential already stored for a broker connection, changing
+/// nothing. Distinct from the save path's pre-write test: this one exists so
+/// an operator can re-check a credential that is already live (e.g. after a
+/// broker-side key rotation) without resubmitting it.
+#[utoipa::path(
+    post, path = "/admin/broker-connections/{code}/credentials/test", tag = "admin",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 200, description = "Test outcome for the stored credential", body = TestResponse),
+        (status = 400, description = "No credential is stored for this connection"),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the stored credential could not be decrypted"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn test_broker_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<TestResponse>, AdminError> {
+    info!(broker_connection_code = %code, "admin test broker connection credentials");
+
+    let master = resolve_master_key()?;
+    let connections = crate::credentials::load_brokers(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("broker_connection"))?;
+    let environment = test_environment(conn.environment.as_deref()).to_string();
+
+    let creds = match conn.credentials {
+        CredentialState::Configured(c) => c,
+        CredentialState::Unconfigured => {
+            return Err(AdminError {
+                status: StatusCode::BAD_REQUEST,
+                message: "no credential is stored for this connection".into(),
+            });
+        }
+        CredentialState::Error(e) => {
+            return Err(AdminError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("stored credential could not be decrypted: {e}"),
+            });
+        }
+    };
+
+    let outcome = credentials_api::test_broker(&creds, &environment).await;
+    Ok(Json(test_response(&outcome)))
 }
 
 /// Re-read the credential store and apply what can be applied without a
@@ -776,16 +1209,7 @@ pub async fn update_broker_connection(
 pub async fn reload_connections(
     State(state): State<AppState>,
 ) -> Result<Json<reload::ReloadReport>, AdminError> {
-    let master = match crate::config::master_key(crate::config::load()) {
-        Some(Ok(k)) => Some(k),
-        Some(Err(e)) => {
-            return Err(AdminError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("refusing to reload: master key is invalid: {e}"),
-            });
-        }
-        None => None,
-    };
+    let master = resolve_master_key()?;
 
     reload_with_key(state, master).await
 }
@@ -1105,6 +1529,270 @@ fn classify_feed(conn: &Connection<FeedCredentials>) -> reload::ConnectionOutcom
 /// "carry forward" here needs no extra step beyond not calling this.
 fn should_stop_databento_feed(outcome: &reload::ConnectionOutcome) -> bool {
     matches!(outcome, reload::ConnectionOutcome::Disabled | reload::ConnectionOutcome::Unconfigured)
+}
+
+// ── Feed connections ──────────────────────────────────────────────────────────
+//
+// Mirrors the "Broker connections" section above: same redacted view, same
+// write gate (decrypt existing → parse merged → test → persist → reload), same
+// 400-vs-422 split. The pieces that don't vary by credential kind —
+// `resolve_master_key`, `redact_connection`, `test_response`, `persist_gate`,
+// `should_persist`, `parse_submission`, `reload_with_key` — are reused as-is
+// from that section, not copied.
+
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FeedConnectionSummary {
+    pub code: String,
+    pub provider: String,
+    /// Nullable in the schema — a feed connection can exist before its
+    /// dataset is known, same as credentials can be unconfigured.
+    pub dataset: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The configured feed connections themselves (rows), distinct from
+/// `list_feeds` above, which reports the ranked market-data source *policy*
+/// (`provider_feed_policy`) plus coverage counts. Nothing served
+/// `feed_connection` rows before this — the cockpit's feed credentials page
+/// has no list to render without it.
+#[utoipa::path(
+    get, path = "/admin/feed-connections", tag = "admin",
+    responses((status = 200, description = "OK", body = [FeedConnectionSummary])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_feed_connections(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<FeedConnectionSummary>>, AdminError> {
+    info!("admin list feed connections");
+    let records = sqlx::query_as::<_, FeedConnectionSummary>(
+        r#"
+        SELECT code, provider, dataset, status, created_at, updated_at
+        FROM feed_connection
+        ORDER BY code
+        "#,
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+
+    Ok(Json(records))
+}
+
+/// What is configured for one feed connection, with every secret withheld.
+/// See `get_broker_connection_credentials` — identical shape and `state`
+/// semantics, just backed by `load_feeds` instead of `load_brokers`.
+#[utoipa::path(
+    get, path = "/admin/feed-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    responses(
+        (status = 200, description = "OK — configured, unconfigured, or error; never a decrypted secret", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the configured master key is invalid"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(feed_connection_code = %code, "admin get feed connection credentials");
+
+    let master = resolve_master_key()?;
+
+    let connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
+}
+
+/// Save (create or edit) a feed connection's credential. See
+/// `put_broker_connection_credentials` for the order this follows and why —
+/// the only differences are `parse_feed`/`test_feed` in place of
+/// `parse_broker`/`test_broker` (feeds have no per-connection environment to
+/// thread through) and `save_feed` in place of `save_broker`.
+#[utoipa::path(
+    put, path = "/admin/feed-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    request_body = CredentialSubmission,
+    responses(
+        (status = 200, description = "Saved, tested where possible, and reloaded", body = SaveResponse),
+        (status = 400, description = "The request body was malformed, or could not be parsed into a credential (unknown field, ...)"),
+        (status = 404, description = "Not found"),
+        (status = 422, description = "The credential did not authenticate; nothing was written"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid or unset, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn put_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(raw): Json<serde_json::Value>,
+) -> Result<Json<SaveResponse>, AdminError> {
+    info!(feed_connection_code = %code, "admin save feed connection credentials");
+
+    let submission = parse_submission(raw)?;
+
+    // A write, unlike a read, cannot tolerate an absent key — same as brokers.
+    let master = resolve_master_key()?.ok_or_else(|| AdminError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: "no master key is configured (set oms.master_key in oms.toml); cannot save credentials".into(),
+    })?;
+
+    // Decrypt existing. 404s here even though `save_feed` itself would
+    // upsert the row (see its doc comment) — this endpoint only edits a feed
+    // connection that already exists, same as the broker path.
+    let connections = crate::credentials::load_feeds(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+    let existing = match &conn.credentials {
+        CredentialState::Configured(c) => Some(c),
+        CredentialState::Unconfigured | CredentialState::Error(_) => None,
+    };
+
+    // Parse merged.
+    let parsed = credentials_api::parse_feed(&conn.kind, existing, &submission)
+        .map_err(|e| AdminError { status: StatusCode::BAD_REQUEST, message: e.to_string() })?;
+
+    // Test.
+    let outcome = credentials_api::test_feed(&parsed).await;
+    let TestResponse { tested, message, .. } = test_response(&outcome);
+    let gate = persist_gate(&outcome);
+    if !should_persist(&gate) {
+        return Err(AdminError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: gate.expect_err("should_persist(&gate) was false, so gate must be Err"),
+        });
+    }
+
+    // Persist.
+    crate::credentials::save_feed(state.pool(), &master, &code, &parsed)
+        .await
+        .map_err(map_db_error)?;
+
+    // Reload — the existing, serialized path; not a second one.
+    let report = reload_with_key(state.clone(), Some(master.clone())).await?;
+    let reload = report.0.connections.into_iter().find(|(c, _)| *c == code).map(|(_, outcome)| outcome);
+
+    let refreshed = crate::credentials::load_feeds(state.pool(), Some(&master))
+        .await
+        .map_err(map_db_error)?;
+    let conn = refreshed
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, reload }))
+}
+
+/// Clear a feed connection's stored credential. See
+/// `delete_broker_connection_credentials` for the ordering rationale (clear
+/// before reload, so a failed reload still leaves a retryable state).
+#[utoipa::path(
+    delete, path = "/admin/feed-connections/{code}/credentials", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    responses(
+        (status = 200, description = "Cleared and reloaded — now unconfigured", body = RedactedCredentials),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, the master key is invalid, or the reload failed"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn delete_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<RedactedCredentials>, AdminError> {
+    info!(feed_connection_code = %code, "admin delete feed connection credentials");
+
+    let result = sqlx::query(
+        "UPDATE feed_connection \
+         SET credentials = NULL, credentials_updated_at = NULL, updated_at = now() \
+         WHERE code = $1",
+    )
+    .bind(&code)
+    .execute(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(AdminError::not_found("feed_connection"));
+    }
+
+    // Disarm the feed task before reporting success — same as the broker path.
+    let master = resolve_master_key()?;
+    let _report = reload_with_key(state.clone(), master.clone()).await?;
+
+    let connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    Ok(Json(redact_connection(conn)))
+}
+
+/// Test the credential already stored for a feed connection, changing
+/// nothing. See `test_broker_connection_credentials` — identical shape,
+/// backed by `load_feeds`/`test_feed` instead of `load_brokers`/`test_broker`.
+/// Unlike FIX, a stored Databento key genuinely gets tested here: `test_feed`
+/// runs the same connect-and-auth handshake as the save path's pre-write
+/// check, so this can return a real pass or fail rather than `NotTestable`.
+#[utoipa::path(
+    post, path = "/admin/feed-connections/{code}/credentials/test", tag = "admin",
+    params(("code" = String, Path, description = "Feed connection code")),
+    responses(
+        (status = 200, description = "Test outcome for the stored credential", body = TestResponse),
+        (status = 400, description = "No credential is stored for this connection"),
+        (status = 404, description = "Not found"),
+        (status = 500, description = "The credential store could not be read, or the stored credential could not be decrypted"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn test_feed_connection_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<Json<TestResponse>, AdminError> {
+    info!(feed_connection_code = %code, "admin test feed connection credentials");
+
+    let master = resolve_master_key()?;
+    let connections = crate::credentials::load_feeds(state.pool(), master.as_ref())
+        .await
+        .map_err(map_db_error)?;
+    let conn = connections
+        .into_iter()
+        .find(|c| c.code == code)
+        .ok_or_else(|| AdminError::not_found("feed_connection"))?;
+
+    let creds = match conn.credentials {
+        CredentialState::Configured(c) => c,
+        CredentialState::Unconfigured => {
+            return Err(AdminError {
+                status: StatusCode::BAD_REQUEST,
+                message: "no credential is stored for this connection".into(),
+            });
+        }
+        CredentialState::Error(e) => {
+            return Err(AdminError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("stored credential could not be decrypted: {e}"),
+            });
+        }
+    };
+
+    let outcome = credentials_api::test_feed(&creds).await;
+    Ok(Json(test_response(&outcome)))
 }
 
 // ── API key management ────────────────────────────────────────────────────────
@@ -1947,6 +2635,129 @@ pub async fn expiry_sweep(
     Ok(Json(ExpirySweepResult { recomputed, expired }))
 }
 
+// ── Setup status ───────────────────────────────────────────────────────────
+
+/// One connection's classification, for the checklist below. Deliberately
+/// the same three strings `RedactedCredentials` uses
+/// (`configured`/`unconfigured`/`error`) rather than a boolean — "stored but
+/// the master key can't open it" is a different operator problem from
+/// "never configured", and collapsing them here would hide exactly the
+/// misconfiguration this checklist exists to surface.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SetupConnectionStatus {
+    pub code: String,
+    pub state: String,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SetupCatalogStatus {
+    pub instruments: i64,
+    pub state: String,
+}
+
+/// The checklist an operator (or the cockpit's own onboarding banner) reads to
+/// answer "what is left to configure" — nothing else in this system can
+/// answer that question in one call today.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct SetupStatus {
+    pub database: String,
+    /// `"default"` iff the admin console is still guarded by the built-in
+    /// dev password rather than an operator-chosen one — see
+    /// `admin_password_state`.
+    pub admin_password: String,
+    /// Whether a master key is configured. Never the key itself, nor even
+    /// whether it is *valid* — an invalid key surfaces the same way every
+    /// other credential-reading endpoint surfaces it, as a 500 from
+    /// `resolve_master_key`, not folded into this field.
+    pub master_key: String,
+    pub brokers: Vec<SetupConnectionStatus>,
+    pub feeds: Vec<SetupConnectionStatus>,
+    pub catalog: SetupCatalogStatus,
+    pub portfolios: i64,
+}
+
+/// Maps a decoded connection's credential state onto the checklist's three
+/// strings. Pulled out of `setup_status` so the classification — not the
+/// database round-trip — is what a unit test exercises.
+fn connection_state_label<T>(state: &CredentialState<T>) -> &'static str {
+    match state {
+        CredentialState::Configured(_) => "configured",
+        CredentialState::Unconfigured => "unconfigured",
+        CredentialState::Error(_) => "error",
+    }
+}
+
+/// `"empty"` below any instrument count is meaningful — an operator has not
+/// yet synced a catalog at all — `"ok"` otherwise. Not a judgment about
+/// *how much* catalog is enough; that is out of scope for a boolean-ish
+/// checklist entry.
+fn catalog_state(instruments: i64) -> &'static str {
+    if instruments == 0 {
+        "empty"
+    } else {
+        "ok"
+    }
+}
+
+/// A fresh install and a properly operated one differ in exactly one way an
+/// operator can forget to fix: the admin console password. Reported by
+/// comparison against the same constant `main.rs` falls back to, so this can
+/// never drift from what boot actually accepted.
+fn admin_password_state(password: &str) -> &'static str {
+    if password == crate::DEFAULT_ADMIN_PASSWORD {
+        "default"
+    } else {
+        "set"
+    }
+}
+
+/// What is left to configure. Reuses `credentials::load_brokers`/`load_feeds`
+/// — the exact decode path `reload_connections` uses — so this checklist
+/// cannot report a connection "configured" that the reload path would
+/// actually refuse to register, or the reverse.
+#[utoipa::path(
+    get, path = "/admin/setup-status", tag = "admin",
+    responses((status = 200, description = "OK", body = SetupStatus)),
+    security(("bearer_token" = []))
+)]
+pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, AdminError> {
+    let key = resolve_master_key()?;
+
+    let brokers = crate::credentials::load_brokers(state.pool(), key.as_ref())
+        .await
+        .map_err(map_db_error)?
+        .into_iter()
+        .map(|c| SetupConnectionStatus { state: connection_state_label(&c.credentials).to_string(), code: c.code })
+        .collect();
+
+    let feeds = crate::credentials::load_feeds(state.pool(), key.as_ref())
+        .await
+        .map_err(map_db_error)?
+        .into_iter()
+        .map(|c| SetupConnectionStatus { state: connection_state_label(&c.credentials).to_string(), code: c.code })
+        .collect();
+
+    let instruments: i64 = sqlx::query_scalar("SELECT count(*) FROM instrument")
+        .fetch_one(state.pool())
+        .await
+        .map_err(map_db_error)?;
+
+    let portfolios: i64 = sqlx::query_scalar("SELECT count(*) FROM portfolio")
+        .fetch_one(state.pool())
+        .await
+        .map_err(map_db_error)?;
+
+    Ok(Json(SetupStatus {
+        database: "ok".to_string(),
+        admin_password: admin_password_state(&state.admin_token).to_string(),
+        master_key: if key.is_some() { "configured" } else { "unconfigured" }.to_string(),
+        brokers,
+        feeds,
+        catalog: SetupCatalogStatus { state: catalog_state(instruments).to_string(), instruments },
+        portfolios,
+    }))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -2118,5 +2929,256 @@ mod tests {
     #[test]
     fn a_registered_feed_is_never_stopped() {
         assert!(!should_stop_databento_feed(&reload::ConnectionOutcome::Registered));
+    }
+
+    // ── Credential write endpoints ──────────────────────────────────────
+
+    /// A failed test must stop before the write. This is the gate the whole
+    /// feature rests on: a credential that cannot authenticate must never
+    /// replace one that can.
+    #[test]
+    fn a_failed_test_blocks_the_write() {
+        assert!(!should_persist(&Err("401 unauthorized".into())));
+        assert!(should_persist(&Ok(())));
+    }
+
+    /// `persist_gate` is the seam between `TestOutcome` and `should_persist`:
+    /// `Passed` and `NotTestable` (FIX — "we didn't check", not "it
+    /// failed") both permit the write; only `Failed` withholds it.
+    #[test]
+    fn passed_and_not_testable_permit_the_write_only_failed_blocks_it() {
+        assert!(should_persist(&persist_gate(&TestOutcome::Passed)));
+        assert!(should_persist(&persist_gate(&TestOutcome::NotTestable("checked at session logon"))));
+        assert!(!should_persist(&persist_gate(&TestOutcome::Failed("401 unauthorized".into()))));
+    }
+
+    /// The regression this function exists to prevent: a `LIVE` connection's
+    /// own environment must reach `AlpacaAdapter::new`, not a hardcoded
+    /// `"PAPER"` literal that would 401 a perfectly valid live credential.
+    /// (Asserting the adapter's own base URL would need either a network
+    /// call or a getter on `AlpacaAdapter`, which is not a file this task
+    /// may touch — this asserts the value that actually reaches the
+    /// constructor instead.)
+    #[test]
+    fn test_environment_uses_the_connections_own_environment_not_a_hardcoded_default() {
+        assert_eq!(test_environment(Some("LIVE")), "LIVE");
+        assert_eq!(test_environment(Some("PAPER")), "PAPER");
+        assert_eq!(test_environment(None), "PAPER");
+    }
+
+    /// A non-string field value (e.g. a JSON number where the wire format
+    /// expects a string) must be a 400 that names the problem — not axum's
+    /// own extractor 422, which this endpoint's docs reserve for "the
+    /// credential did not authenticate", and not a message that echoes the
+    /// submitted value back.
+    #[test]
+    fn a_non_string_field_value_is_a_400_that_does_not_echo_it() {
+        let raw = serde_json::json!({"key": "AKROUNDTRIP", "secret": 12345});
+        let err = parse_submission(raw).expect_err("a numeric field value must be rejected");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(!err.message.contains("12345"), "the submitted value must not be echoed: {}", err.message);
+    }
+
+    /// A save response must carry the redacted view, never the submission.
+    /// Built through `redact_connection` — the same function the handler
+    /// calls — from a `Configured` credential holding a distinctive secret,
+    /// so this can actually fail: the brief's original version asserted
+    /// `!body.contains("SUPERSECRET")` against a `RedactedCredentials`
+    /// literal that never contained "SUPERSECRET" to begin with, which
+    /// cannot fail for any implementation.
+    #[test]
+    fn the_save_response_carries_no_submitted_secret() {
+        let conn = broker(
+            "alpaca-paper",
+            CredentialState::Configured(BrokerCredentials::Alpaca {
+                key: "AKLIVE".into(),
+                secret: "SUPERSECRETVALUE".into(),
+            }),
+        );
+        let body = serde_json::to_string(&SaveResponse {
+            redacted: redact_connection(conn),
+            tested: true,
+            message: None,
+            reload: None,
+        })
+        .expect("serialize");
+        assert!(!body.contains("SUPERSECRETVALUE"), "submitted secret leaked into the save response: {body}");
+        assert!(body.contains("alpaca-paper"));
+    }
+
+    /// Same regression, feed side: `redact_connection`'s generic dispatch
+    /// (`ToRedactedFields`) must redact a `FeedCredentials::Databento` just
+    /// as thoroughly as it redacts a broker credential.
+    #[test]
+    fn the_feed_save_response_carries_no_submitted_secret() {
+        let conn = feed(
+            "databento-opra",
+            CredentialState::Configured(FeedCredentials::Databento { api_key: "SUPERSECRETFEEDKEY".into() }),
+        );
+        let body = serde_json::to_string(&SaveResponse {
+            redacted: redact_connection(conn),
+            tested: true,
+            message: None,
+            reload: None,
+        })
+        .expect("serialize");
+        assert!(!body.contains("SUPERSECRETFEEDKEY"), "submitted secret leaked into the save response: {body}");
+        assert!(body.contains("databento-opra"));
+    }
+
+    /// `test_response` is what both the `test` endpoint and the save path's
+    /// `tested` flag draw from: a real pass reports `tested`, `ok`, and no
+    /// message.
+    #[test]
+    fn test_response_reports_a_clean_pass() {
+        let r = test_response(&TestOutcome::Passed);
+        assert!(r.tested);
+        assert!(r.ok);
+        assert!(r.message.is_none());
+    }
+
+    /// FIX must never imply a pass it did not earn: `tested` and `ok` are
+    /// both `false`, with the reason carried in `message`.
+    #[test]
+    fn test_response_reports_not_testable_honestly() {
+        let r = test_response(&TestOutcome::NotTestable("checked at session logon"));
+        assert!(!r.tested);
+        assert!(!r.ok);
+        assert_eq!(r.message.as_deref(), Some("checked at session logon"));
+    }
+
+    /// A rejected credential is `tested` (an attempt was made) but not `ok`,
+    /// with the broker's own message carried through unchanged.
+    #[test]
+    fn test_response_reports_a_failure_with_its_message() {
+        let r = test_response(&TestOutcome::Failed("401 unauthorized".into()));
+        assert!(r.tested);
+        assert!(!r.ok);
+        assert_eq!(r.message.as_deref(), Some("401 unauthorized"));
+    }
+
+    /// Exercises the real seal/save/load/redact path against Postgres — the
+    /// SQL text `save_broker` and `load_brokers` run has no coverage at all
+    /// without a database. Mirrors `credentials.rs`'s own round trip: the
+    /// handler's decision logic (`parse_broker`, `test_broker`,
+    /// `persist_gate`) is exercised directly rather than through HTTP, since
+    /// this test never starts a server.
+    ///
+    /// Run with: cargo test -- --ignored
+    /// Requires: a live, migrated Postgres reachable via the usual POSTGRES_*
+    /// config.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn put_equivalent_round_trip_saves_and_redacts_with_no_secret_value() {
+        use crate::secrets::parse_master_key;
+        use crate::setup::database::config;
+
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        let pool = sqlx::PgPool::connect(&cfg.url()).await.expect("connect");
+
+        let code = "test-admin-credential-put-roundtrip";
+
+        // Clean slate, in case a previous panicked run left this behind.
+        sqlx::query("DELETE FROM oms.broker_connection WHERE code = $1")
+            .bind(code)
+            .execute(&pool)
+            .await
+            .expect("cleanup before");
+
+        // IBKR, not Alpaca: `test_broker` is `NotTestable` for FIX, so this
+        // round trip never reaches the network — see `credentials_api::test_broker`.
+        sqlx::query(
+            "INSERT INTO oms.broker_connection (code, broker_code, environment, status) \
+             VALUES ($1, 'IBKR', 'PAPER', 'ACTIVE')",
+        )
+        .bind(code)
+        .execute(&pool)
+        .await
+        .expect("insert test broker_connection row");
+
+        let key = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").expect("key");
+
+        let submission = CredentialSubmission {
+            fields: [
+                ("host", "fix.roundtrip.test"),
+                ("port", "4101"),
+                ("sender_comp_id", "SENDERROUNDTRIP"),
+                ("target_comp_id", "TARGETROUNDTRIP"),
+                ("password", "ROUNDTRIPSECRETPW"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        };
+
+        // decrypt existing (none yet) → parse merged → test → persist
+        let parsed = credentials_api::parse_broker("IBKR", None, &submission).expect("parse_broker");
+        let outcome = credentials_api::test_broker(&parsed, "PAPER").await;
+        assert!(
+            should_persist(&persist_gate(&outcome)),
+            "IBKR is NotTestable and must still be allowed to persist"
+        );
+        crate::credentials::save_broker(&pool, &key, code, &parsed).await.expect("save_broker");
+
+        let brokers = crate::credentials::load_brokers(&pool, Some(&key)).await.expect("load_brokers");
+        let conn = brokers.into_iter().find(|c| c.code == code).expect("row present");
+        let redacted = redact_connection(conn);
+
+        assert_eq!(redacted.state, "configured");
+        let body = serde_json::to_string(&redacted).expect("serialize");
+        assert!(!body.contains("ROUNDTRIPSECRETPW"), "submitted secret leaked into the redacted view: {body}");
+
+        // Leave the table as we found it.
+        sqlx::query("DELETE FROM oms.broker_connection WHERE code = $1")
+            .bind(code)
+            .execute(&pool)
+            .await
+            .expect("cleanup after");
+    }
+
+    #[test]
+    fn a_canonical_broker_code_is_accepted() {
+        assert!(validate_broker_code("ALPACA").is_ok());
+        assert!(validate_broker_code("BINANCE").is_ok());
+        assert!(validate_broker_code("IBKR").is_ok());
+    }
+
+    /// The registry keys adapters are registered under are case-sensitive
+    /// literals (`reload.rs`); a code that only differs in case looks fine at
+    /// save time and at reload, then 503s every order — the exact hazard this
+    /// validation exists to close.
+    #[test]
+    fn a_differently_cased_broker_code_is_rejected() {
+        let err = validate_broker_code("binance").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_unknown_broker_code_is_rejected() {
+        let err = validate_broker_code("COINBASE").unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn the_error_names_the_accepted_values() {
+        let err = validate_broker_code("nope").unwrap_err();
+        assert!(err.message.contains("ALPACA"), "{}", err.message);
+        assert!(err.message.contains("BINANCE"), "{}", err.message);
+        assert!(err.message.contains("IBKR"), "{}", err.message);
+    }
+
+    #[test]
+    fn catalog_state_reflects_the_count() {
+        assert_eq!(catalog_state(0), "empty");
+        assert_eq!(catalog_state(14_000), "ok");
+    }
+
+    /// The checklist exists to tell an operator what is left. A default admin
+    /// password must be reported, because it is the one thing a fresh install
+    /// has that a finished one must not.
+    #[test]
+    fn a_default_admin_password_is_reported() {
+        assert_eq!(admin_password_state("openoms-dev"), "default");
+        assert_eq!(admin_password_state("something-else"), "set");
     }
 }

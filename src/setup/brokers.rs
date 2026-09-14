@@ -81,6 +81,23 @@ pub fn brokers_with_creds(connections: &[Connection<BrokerCredentials>]) -> Vec<
     Broker::ALL.iter().copied().filter(|b| b.has_creds(connections)).collect()
 }
 
+/// FIX-only venues `reload.rs` registers under a literal, hardcoded key — they
+/// have no `sync-broker` support and so no `Broker` variant, but the registry
+/// key is exactly as real as `Broker::code()`'s. Kept here, next to `Broker`,
+/// so both halves of "what can `broker_connection.broker_code` legally be"
+/// live in one file.
+const FIX_ONLY_BROKER_CODES: &[&str] = &["IBKR"];
+
+/// Every `broker_code` the adapter registry can actually be reached under:
+/// `Broker::ALL`'s codes plus the FIX-only venues above. This is the single
+/// source callers validate a `broker_connection.broker_code` write against —
+/// see `admin::validate_broker_code` — so that list and `reload.rs`'s
+/// registration literals cannot drift apart into the silent-503 hazard a
+/// second, independently maintained list would reintroduce.
+pub fn known_broker_codes() -> Vec<&'static str> {
+    Broker::ALL.iter().map(|b| b.code()).chain(FIX_ONLY_BROKER_CODES.iter().copied()).collect()
+}
+
 fn alpaca_env() -> String {
     env::var("ALPACA_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
 }

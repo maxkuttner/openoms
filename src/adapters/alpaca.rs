@@ -82,6 +82,19 @@ impl AlpacaAdapter {
         }
     }
 
+    /// `GET /v2/account` — the cheapest authenticated call Alpaca offers, and
+    /// the credential test used by `credentials_api::test_broker`: read-only,
+    /// no side effects, sub-second, and a wrong key fails it immediately.
+    pub async fn get_account(&self) -> Result<serde_json::Value, BrokerError> {
+        let url = format!("{}/v2/account", self.base_url);
+        let resp = self.get_json(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        if resp.status().is_success() {
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))
+        } else {
+            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+        }
+    }
+
     fn get_json(&self, url: &str) -> reqwest::RequestBuilder {
         self.client
             .get(url)

@@ -54,20 +54,37 @@ pub enum FeedCredentials {
 /// present by name with no value. Ordered so the UI can render it directly.
 #[derive(Debug, Serialize)]
 pub struct Redacted {
-    pub fields: Vec<(String, Option<String>)>,
+    pub fields: Vec<RedactedField>,
 }
 
 pub trait Redact {
     fn redact(&self) -> Redacted;
 }
 
-fn shown(name: &str, value: impl ToString) -> (String, Option<String>) {
-    (name.to_string(), Some(value.to_string()))
+fn shown(name: &str, value: impl ToString) -> RedactedField {
+    RedactedField { name: name.to_string(), value: Some(value.to_string()), secret: false, hint: None }
 }
 
 /// A secret: named so the UI knows the field exists, with no value.
-fn hidden(name: &str) -> (String, Option<String>) {
-    (name.to_string(), None)
+fn hidden(name: &str) -> RedactedField {
+    RedactedField { name: name.to_string(), value: None, secret: true, hint: None }
+}
+
+/// A value too sensitive to echo back but useful to identify — the tail of an
+/// Alpaca key id, say.
+///
+/// The real value is withheld exactly as a secret's is, so it can never be
+/// submitted back as though it were real input. That distinction is the whole
+/// point: a mask returned in `value` would be prefilled by the cockpit and
+/// then, being non-empty, merged as a deliberate replacement — writing the
+/// literal "…AB12" over the operator's key the first time they edited any
+/// other field. `hint` exists so the UI can still say *which* credential is
+/// installed without ever holding something it could submit.
+///
+/// Not `secret`: a key id is an identifier, not a password, and should not
+/// render as one.
+fn masked(name: &str, hint: impl ToString) -> RedactedField {
+    RedactedField { name: name.to_string(), value: None, secret: false, hint: Some(hint.to_string()) }
 }
 
 impl Redact for BrokerCredentials {
@@ -76,7 +93,7 @@ impl Redact for BrokerCredentials {
             BrokerCredentials::Alpaca { key, .. } => vec![
                 // The last four characters identify which key is installed without
                 // being enough to use it — the same trick every payment UI uses.
-                shown("key", format!("…{}", tail4(key))),
+                masked("key", format!("…{}", tail4(key))),
                 hidden("secret"),
             ],
             BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, ssl, .. } => vec![
@@ -129,6 +146,69 @@ impl std::fmt::Debug for FeedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FeedCredentials{:?}", self.redact().fields)
     }
+}
+
+/// One field of a credential as it may be shown on the wire. Named so the UI
+/// always knows the field exists — even when `value` is withheld — and can
+/// render a "leave blank to keep" input rather than an empty box that looks
+/// like the value was lost. `secret` is carried explicitly rather than left
+/// for a caller to infer from `value.is_none()`, so a future field that is
+/// merely *absent* (not secret) cannot be mistaken for one that is withheld.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct RedactedField {
+    pub name: String,
+    /// The stored value, when it is safe to echo and safe to submit back
+    /// unchanged. `None` for both secrets and masked identifiers — in either
+    /// case the cockpit must leave the input blank, so that an untouched
+    /// field submits empty and the merge rule keeps what is stored.
+    pub value: Option<String>,
+    pub secret: bool,
+    /// A display-only preview of a withheld value (see `masked`). Never a
+    /// value the client may send back.
+    pub hint: Option<String>,
+}
+
+/// Hands back `Redacted`'s fields, which are already the wire shape.
+///
+/// This used to derive `secret` from `value.is_none()`. That inference broke
+/// once `masked` existed — a masked identifier also has no value but is not a
+/// secret — so each constructor now states `secret` outright. This is a
+/// pass-through, not a second redaction path: the only redaction logic is
+/// `Redact::redact`, above.
+pub fn redacted_fields(c: &BrokerCredentials) -> Vec<RedactedField> {
+    to_wire(c.redact())
+}
+
+/// See `redacted_fields` — same mapping, for feed credentials. Used by
+/// `admin::redact_connection` via the `ToRedactedFields` impl below, and
+/// exercised directly by `no_secret_field_carries_a_value`.
+pub fn redacted_fields_feed(c: &FeedCredentials) -> Vec<RedactedField> {
+    to_wire(c.redact())
+}
+
+/// Lets `admin::redact_connection` map either credential kind to its wire
+/// form through one generic function, instead of admin.rs duplicating that
+/// mapping per kind. `redacted_fields`/`redacted_fields_feed` stay the
+/// directly-testable, per-kind entry points named in `mod tests` below —
+/// these impls are simply what calls them from outside this module.
+pub trait ToRedactedFields {
+    fn to_redacted_fields(&self) -> Vec<RedactedField>;
+}
+
+impl ToRedactedFields for BrokerCredentials {
+    fn to_redacted_fields(&self) -> Vec<RedactedField> {
+        redacted_fields(self)
+    }
+}
+
+impl ToRedactedFields for FeedCredentials {
+    fn to_redacted_fields(&self) -> Vec<RedactedField> {
+        redacted_fields_feed(self)
+    }
+}
+
+fn to_wire(r: Redacted) -> Vec<RedactedField> {
+    r.fields
 }
 
 /// What is known about a connection's credentials.
@@ -452,6 +532,74 @@ mod tests {
 
         let r = format!("{:?}", FeedCredentials::Databento { api_key: "db-key".into() }.redact());
         assert!(!r.contains("db-key"), "feed key leaked: {r}");
+    }
+
+    /// The wire form must mark which fields are secret, so the UI can render a
+    /// "leave blank to keep" input rather than an empty text box that looks like
+    /// the value was lost.
+    #[test]
+    fn the_wire_form_marks_secret_fields() {
+        let fields = super::redacted_fields(&alpaca());
+        let secret: Vec<_> = fields.iter().filter(|f| f.secret).map(|f| f.name.as_str()).collect();
+        assert_eq!(secret, vec!["secret"], "only the secret is secret; the key id is an identifier");
+
+        let key = fields.iter().find(|f| f.name == "key").expect("key present");
+        assert!(key.hint.is_some(), "the key id needs a hint so the operator can tell which key is installed");
+    }
+
+    /// A mask must never arrive in `value`, because the cockpit prefills from
+    /// `value` and the merge rule reads any non-empty submission as a
+    /// deliberate replacement. A mask in `value` therefore round-trips: the
+    /// operator edits some unrelated field, and "…Y123" is written over their
+    /// real key id. It is withheld like a secret and offered only as a `hint`.
+    #[test]
+    fn a_masked_identifier_is_never_submittable() {
+        let fields = super::redacted_fields(&alpaca());
+        let key = fields.iter().find(|f| f.name == "key").expect("key present");
+        assert_eq!(key.value, None, "a masked identifier must not be prefillable");
+        assert_eq!(key.hint.as_deref(), Some("…Y123"));
+        assert!(!key.secret, "a key id is an identifier, not a password");
+    }
+
+    /// Whatever a field's kind, a value the client is given back must be one it
+    /// can safely resubmit unchanged. Anything withheld — secret or masked —
+    /// must leave `value` empty so an untouched input submits blank and the
+    /// merge rule keeps what is stored.
+    #[test]
+    fn every_returned_value_is_safe_to_resubmit() {
+        for creds in [alpaca(), binance(), ibkr()] {
+            for f in super::redacted_fields(&creds) {
+                if f.hint.is_some() || f.secret {
+                    assert!(f.value.is_none(), "{} returned a value it cannot take back", f.name);
+                }
+            }
+        }
+    }
+
+    /// A secret field must never carry a value on the wire — this is the whole
+    /// point of the type.
+    #[test]
+    fn no_secret_field_carries_a_value() {
+        for creds in [alpaca(), binance(), ibkr()] {
+            for f in super::redacted_fields(&creds) {
+                if f.secret {
+                    assert!(f.value.is_none(), "{} leaked a value", f.name);
+                }
+            }
+        }
+        for f in super::redacted_fields_feed(&FeedCredentials::Databento { api_key: "db-key".into() }) {
+            assert!(f.value.is_none() || !f.secret);
+        }
+    }
+
+    /// Every field of every variant must appear — a field silently missing from
+    /// the wire form is a field the UI cannot offer to set.
+    #[test]
+    fn every_field_appears_on_the_wire() {
+        let names: Vec<_> = super::redacted_fields(&ibkr()).into_iter().map(|f| f.name).collect();
+        for expected in ["host", "port", "sender_comp_id", "target_comp_id", "password", "ssl"] {
+            assert!(names.contains(&expected.to_string()), "{expected} missing from {names:?}");
+        }
     }
 
     /// `{:?}` on the credentials themselves must not print secrets either — a
