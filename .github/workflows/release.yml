@@ -18,6 +18,13 @@ jobs:
             target: aarch64-apple-darwin
           # 22.04, not ubuntu-latest: 24.04 links glibc 2.39 and the binary then
           # refuses to start on Debian 12 or Ubuntu 22.04, which is most servers.
+          #
+          # The Linux artifact also links the system OpenSSL (libssl.so.3), so it
+          # needs OpenSSL 3 at runtime — present on Debian 12 and Ubuntu 22.04+,
+          # absent on Ubuntu 20.04, RHEL 8 and Amazon Linux 2, which glibc alone
+          # would not rule out. Documented as a requirement in the readme and on
+          # the site. If it ever matters, the follow-up is linking OpenSSL
+          # statically here too, the way macOS does via OMS_OPENSSL_STATIC.
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
@@ -57,7 +64,32 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install openssl@3
 
-      - run: cargo build --release
+      # `cargo build` with no --target builds for the runner's host triple, but the
+      # tarball is named from matrix.target and install.sh picks by that name alone.
+      # They agree today only because each runner's host happens to match; a runner
+      # image swap would mislabel the artifact silently. --target would move the
+      # output path every step below depends on, so assert instead.
+      - name: the runner's host triple must match the artifact name
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "host=$host matrix=${{ matrix.target }}"
+          [ "$host" = "${{ matrix.target }}" ] || {
+            echo "cargo builds for $host, artifact would be named ${{ matrix.target }}"
+            exit 1
+          }
+
+      - name: build
+        env:
+          # macOS only. Links OpenSSL statically so the published binary carries no
+          # /opt/homebrew load path and runs on a Mac without Homebrew. See build.rs.
+          OMS_OPENSSL_STATIC: ${{ runner.os == 'macOS' && '1' || '' }}
+        run: cargo build --release
+
+      - name: no absolute Homebrew load paths in the macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          otool -L target/release/oms
+          ! otool -L target/release/oms | grep -qi 'homebrew\|openssl'
 
       - run: strip target/release/oms
 

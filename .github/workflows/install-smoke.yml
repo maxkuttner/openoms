@@ -32,6 +32,14 @@ jobs:
           echo "installed $got, latest release $tag"
           [ "$got" = "${tag#v}" ] || { echo "installed version does not match the latest release"; exit 1; }
 
+      # The runner has Homebrew's openssl@3, so `oms --version` passing here proves
+      # nothing about a Mac that doesn't. Check the load paths directly instead.
+      - name: the macOS binary needs no Homebrew
+        if: runner.os == 'macOS'
+        run: |
+          otool -L "$HOME/.local/bin/oms"
+          ! otool -L "$HOME/.local/bin/oms" | grep -qi 'homebrew\|openssl'
+
       - name: the binary carries the cockpit
         run: |
           "$HOME/.local/bin/oms" --help >/dev/null
