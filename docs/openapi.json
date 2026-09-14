@@ -1,0 +1,4198 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "OMS API",
+    "description": "",
+    "license": {
+      "name": ""
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/admin/accounts": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_accounts",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Account"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_account",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccount"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Account"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already exists"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/accounts/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_account",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Account"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "update_account",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Account ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAccount"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Account"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/broker-connections": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_broker_connections",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BrokerConnection"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_broker_connection",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBrokerConnection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrokerConnection"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid environment (must be PAPER or LIVE)"
+          },
+          "409": {
+            "description": "Already exists"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/broker-connections/{code}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_broker_connection",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrokerConnection"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "update_broker_connection",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBrokerConnection"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrokerConnection"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid environment"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/broker-connections/{code}/credentials": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "What is configured for one broker connection, with every secret withheld.",
+        "description": "404 only when the connection row itself does not exist. A connection with\nno credentials stored is still 200, `state: \"unconfigured\"` — it exists,\nit just needs setup, which is a different operator situation from 404\n(\"no such connection\") and from `state: \"error\"` (\"stored, but the master\nkey does not open it\"). See `RedactedCredentials`.",
+        "operationId": "get_broker_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK — configured, unconfigured, or error; never a decrypted secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RedactedCredentials"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "The credential store could not be read, or the configured master key is invalid"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Save (create or edit) a broker connection's credential.",
+        "description": "The order is the requirement: decrypt what is already stored, merge the\nsubmission over it (`credentials_api::parse_broker`), test the *merged*\nresult — never the raw submission, since an omitted field must inherit a\nvalue that already passes — and only once that clears does anything get\nwritten. A `Failed` test returns 422 with the broker's own message and\nchanges nothing: no write, no reload. `NotTestable` (FIX) proceeds to\nsave — `tested: false` in the response says so, rather than implying a\npass never earned.\n\nThe save itself reloads the running registry so the new credential takes\neffect (or the cockpit is told a restart is needed) without a second\ncall — see `SaveResponse::reload`.",
+        "operationId": "put_broker_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialSubmission"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, tested where possible, and reloaded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request body was malformed, or could not be parsed into a credential (unknown field, bad port, ...)"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "422": {
+            "description": "The credential did not authenticate; nothing was written"
+          },
+          "500": {
+            "description": "The credential store could not be read, the master key is invalid or unset, or the reload failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Clear a broker connection's stored credential.",
+        "description": "Also reloads: leaving a removed credential's adapter live would be the\nsilent-mismatch class this project has hit repeatedly (see `reload.rs`'s\nmodule doc). The reload's own outcome is not carried in the response —\nunlike the save path, there is nothing to test or report other than\n\"unconfigured\", which `redacted.state` already says.",
+        "operationId": "delete_broker_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cleared and reloaded — now unconfigured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RedactedCredentials"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "The credential store could not be read, the master key is invalid, or the reload failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/broker-connections/{code}/credentials/test": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Test the credential already stored for a broker connection, changing",
+        "description": "nothing. Distinct from the save path's pre-write test: this one exists so\nan operator can re-check a credential that is already live (e.g. after a\nbroker-side key rotation) without resubmitting it.",
+        "operationId": "test_broker_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Test outcome for the stored credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No credential is stored for this connection"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "The credential store could not be read, or the stored credential could not be decrypted"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/connections/reload": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Re-read the credential store and apply what can be applied without a",
+        "description": "process restart.\n\nReturns 200 even when some connections could not be reloaded: a FIX\ncredential (IBKR, or Binance running FIX) always reports `RestartRequired`\n— that is the expected outcome, not a failure — and a non-2xx would make\nthe cockpit treat normal operation as an error. The per-connection\noutcomes in the body carry the detail, never the credential itself.\n\nReports 500 and leaves the running registry exactly as it was, without\nswapping, in three cases: a database error reading either store; a master\nkey that is configured but invalid; or — the case `boot` itself already\nrefuses to start in, via the same `nothing_decrypted` predicate — every\nstored credential across *both* stores failing to decrypt under the\nresolved key while nothing at all decoded. That last case is this\nendpoint's own headline scenario: `oms config rotate-key` re-seals every\nrow from a separate process while this server still holds the old key in\nmemory (`config::load` is memoized, so an edit to `oms.toml` after boot is\nnever picked up by this endpoint either — restart to pick up a changed\nmaster key itself). POSTing a reload right after a rotation, instead of\nrestarting, is exactly the workflow this endpoint exists to avoid a\nrestart for; without this gate it would swap in a registry with every\nbroker unregistered and still report 200.",
+        "operationId": "reload_connections",
+        "responses": {
+          "200": {
+            "description": "Per-connection reload report (codes and outcomes only — no credential material)"
+          },
+          "500": {
+            "description": "The credential store could not be read, the master key is invalid, or nothing at all decrypted; nothing was changed"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/feed-connections": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "The configured feed connections themselves (rows), distinct from",
+        "description": "`list_feeds` above, which reports the ranked market-data source *policy*\n(`provider_feed_policy`) plus coverage counts. Nothing served\n`feed_connection` rows before this — the cockpit's feed credentials page\nhas no list to render without it.",
+        "operationId": "list_feed_connections",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FeedConnectionSummary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/feed-connections/{code}/credentials": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "What is configured for one feed connection, with every secret withheld.",
+        "description": "See `get_broker_connection_credentials` — identical shape and `state`\nsemantics, just backed by `load_feeds` instead of `load_brokers`.",
+        "operationId": "get_feed_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Feed connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK — configured, unconfigured, or error; never a decrypted secret",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RedactedCredentials"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "The credential store could not be read, or the configured master key is invalid"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Save (create or edit) a feed connection's credential. See",
+        "description": "`put_broker_connection_credentials` for the order this follows and why —\nthe only differences are `parse_feed`/`test_feed` in place of\n`parse_broker`/`test_broker` (feeds have no per-connection environment to\nthread through) and `save_feed` in place of `save_broker`.",
+        "operationId": "put_feed_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Feed connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CredentialSubmission"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Saved, tested where possible, and reloaded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SaveResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request body was malformed, or could not be parsed into a credential (unknown field, ...)"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "422": {
+            "description": "The credential did not authenticate; nothing was written"
+          },
+          "500": {
+            "description": "The credential store could not be read, the master key is invalid or unset, or the reload failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Clear a feed connection's stored credential. See",
+        "description": "`delete_broker_connection_credentials` for the ordering rationale (clear\nbefore reload, so a failed reload still leaves a retryable state).",
+        "operationId": "delete_feed_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Feed connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cleared and reloaded — now unconfigured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RedactedCredentials"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "The credential store could not be read, the master key is invalid, or the reload failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/feed-connections/{code}/credentials/test": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Test the credential already stored for a feed connection, changing",
+        "description": "nothing. See `test_broker_connection_credentials` — identical shape,\nbacked by `load_feeds`/`test_feed` instead of `load_brokers`/`test_broker`.\nUnlike FIX, a stored Databento key genuinely gets tested here: `test_feed`\nruns the same connect-and-auth handshake as the save path's pre-write\ncheck, so this can return a real pass or fail rather than `NotTestable`.",
+        "operationId": "test_feed_connection_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Feed connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Test outcome for the stored credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No credential is stored for this connection"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "500": {
+            "description": "The credential store could not be read, or the stored credential could not be decrypted"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/feeds": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "The configured data feeds: the ranked market-data source policy plus how many",
+        "description": "instruments each currently prices. Distinct from broker connections (execution).",
+        "operationId": "list_feeds",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FeedSummary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/instruments": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_instruments",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/InstrumentSummary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/instruments/expiry-sweep": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Run the instrument expiry pass now, instead of waiting for the hourly tick.",
+        "description": "Same function the background job calls, so an on-demand run and a scheduled one\ncannot diverge. Useful right after seeding a calendar (every dated contract gets\nits instant immediately) and for confirming a correction took effect.",
+        "operationId": "expiry_sweep",
+        "responses": {
+          "200": {
+            "description": "Expiry sweep summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExpirySweepResult"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/orders": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_orders_blotter",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "portfolio_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "nullable": true
+            }
+          },
+          {
+            "name": "instrument_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "principal_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "nullable": true
+            }
+          },
+          {
+            "name": "broker_connection_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "side",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BlotterRow"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/portfolios": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_portfolios",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Portfolio"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_portfolio",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePortfolio"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Portfolio"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already exists"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/portfolios/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_portfolio",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Portfolio ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Portfolio"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "update_portfolio",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Portfolio ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePortfolio"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Portfolio"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/principals": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_principals",
+        "parameters": [
+          {
+            "name": "external_subject",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Principal"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_principal",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreatePrincipal"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Principal"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Already exists"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/principals/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_principal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Principal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "update_principal",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePrincipal"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Principal"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/principals/{id}/grants": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_grants",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Grant"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_grant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateGrant"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Grant"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Grant already exists for this principal/portfolio"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/principals/{id}/grants/{grant_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "delete_grant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "grant_id",
+            "in": "path",
+            "description": "Grant ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "update_grant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "grant_id",
+            "in": "path",
+            "description": "Grant ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateGrant"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Grant"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/principals/{id}/keys": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_principal_keys",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiKeyRecord"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "register_principal_key",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateKey"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created — plaintext secret included once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiKeyRecord"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/principals/{id}/keys/{key_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "revoke_principal_key",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "key_id",
+            "in": "path",
+            "description": "Key ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/risk-limits": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_risk_limits",
+        "parameters": [
+          {
+            "name": "portfolio_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RiskLimit"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_risk_limit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRiskLimit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskLimit"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid trading_state"
+          },
+          "409": {
+            "description": "Limit already exists for this portfolio/instrument"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/risk-limits/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_risk_limit",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Risk limit ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskLimit"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "delete_risk_limit",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Risk limit ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "update_risk_limit",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Risk limit ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateRiskLimit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RiskLimit"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid trading_state"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/setup-status": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "What is left to configure. Reuses `credentials::load_brokers`/`load_feeds`",
+        "description": "— the exact decode path `reload_connections` uses — so this checklist\ncannot report a connection \"configured\" that the reload path would\nactually refuse to register, or the reverse.",
+        "operationId": "setup_status",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SetupStatus"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/symbology/backfill": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "backfill_symbology",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackfillRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Backfill summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackfillResult"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/symbology/resolve": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "resolve_symbology",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Resolution",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResolveOutcome"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/trading-tokens": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_trading_tokens",
+        "responses": {
+          "200": {
+            "description": "Active trading tokens",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TradingTokenRow"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_trading_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTradingToken"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created — single bearer token included once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TradingTokenCreated"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Auto-provision needs an active broker connection"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/trading-tokens/{key_id}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "revoke_trading_token",
+        "parameters": [
+          {
+            "name": "key_id",
+            "in": "path",
+            "description": "Token key id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "handlers"
+        ],
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/orders": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "summary": "The caller's own blotter.",
+        "description": "Same rows and same filters as the admin blotter, bounded to the portfolios this\nprincipal may view. `principal_id` in the query string is ignored rather than\nhonoured — the authenticated identity is the only thing that decides scope, so\npassing someone else's id does nothing.",
+        "operationId": "list_orders",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "portfolio_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "nullable": true
+            }
+          },
+          {
+            "name": "instrument_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "principal_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "nullable": true
+            }
+          },
+          {
+            "name": "broker_connection_code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "side",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "nullable": true
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BlotterRow"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/orders/cancel": {
+      "post": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "orders_cancel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelOrder"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Cancel accepted"
+          },
+          "400": {
+            "description": "Invalid UUID"
+          },
+          "404": {
+            "description": "Order not found"
+          },
+          "409": {
+            "description": "Order state version mismatch"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/orders/submit": {
+      "post": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "orders_submit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitOrderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Order accepted and routed"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "No trade grant for principal/portfolio/account"
+          },
+          "409": {
+            "description": "Order already exists"
+          },
+          "422": {
+            "description": "Instrument not found, inactive, no tradeable broker mapping, or rejected by pre-trade risk"
+          },
+          "502": {
+            "description": "Broker rejected the order"
+          },
+          "503": {
+            "description": "No broker adapter configured"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/orders/{id}": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "get_order",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Order ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderAggregateState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid UUID"
+          },
+          "404": {
+            "description": "Order not found"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/orders/{id}/allocations": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "list_allocations",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Order ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Allocation"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "create_allocations",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Block order ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAllocations"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Allocated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Allocation"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "No allocate grant on the block portfolio"
+          },
+          "404": {
+            "description": "Order not found"
+          },
+          "422": {
+            "description": "Nothing filled, over-allocation, or invalid target"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/portfolios": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "summary": "The portfolios this principal may act on.",
+        "description": "Exists so a trading token is self-sufficient: every other trading route needs a\nportfolio UUID, and without this the caller has to be handed one out of band (or\nread the admin surface, which is exactly the authority a trading token must not\nhave). Scope is the principal's own grants — there is no filter to widen it.",
+        "operationId": "list_portfolios",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GrantedPortfolio"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/portfolios/{id}/positions": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "get_portfolio_positions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Portfolio ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Position"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "No view grant for principal/portfolio"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Account": {
+        "type": "object",
+        "required": [
+          "id",
+          "code",
+          "broker_connection_code",
+          "external_account_ref",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "broker_connection_code": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "external_account_ref": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Allocation": {
+        "type": "object",
+        "required": [
+          "id",
+          "order_id",
+          "from_portfolio_id",
+          "to_portfolio_id",
+          "instrument_id",
+          "qty",
+          "price",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "from_portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "instrument_id": {
+            "type": "string"
+          },
+          "order_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "price": {
+            "type": "number",
+            "format": "double"
+          },
+          "qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "to_portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "AllocationSplit": {
+        "type": "object",
+        "required": [
+          "portfolio_id",
+          "qty"
+        ],
+        "properties": {
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "qty": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "ApiKeyRecord": {
+        "type": "object",
+        "required": [
+          "id",
+          "principal_id",
+          "key_id",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "secret": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "BackfillRequest": {
+        "type": "object",
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          }
+        }
+      },
+      "BackfillResult": {
+        "type": "object",
+        "required": [
+          "scanned",
+          "stamped",
+          "ambiguous",
+          "unresolved"
+        ],
+        "properties": {
+          "ambiguous": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "scanned": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "stamped": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "unresolved": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "BlotterRow": {
+        "type": "object",
+        "required": [
+          "order_id",
+          "principal_id",
+          "principal_code",
+          "portfolio_id",
+          "portfolio_code",
+          "account_id",
+          "broker_connection_code",
+          "instrument_id",
+          "side",
+          "order_type",
+          "status",
+          "original_qty",
+          "leaves_qty",
+          "cum_qty",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "avg_px": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "broker_connection_code": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "cum_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "instrument_id": {
+            "type": "string"
+          },
+          "instrument_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "instrument_symbol": {
+            "type": "string",
+            "nullable": true
+          },
+          "leaves_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "order_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "order_type": {
+            "type": "string"
+          },
+          "original_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "portfolio_code": {
+            "type": "string"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "principal_code": {
+            "type": "string"
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "side": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "BrokerConnection": {
+        "type": "object",
+        "required": [
+          "code",
+          "broker_code",
+          "environment",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "broker_code": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CancelOrder": {
+        "type": "object",
+        "required": [
+          "order_id"
+        ],
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "CreateAccount": {
+        "type": "object",
+        "required": [
+          "code",
+          "broker_connection_code",
+          "external_account_ref",
+          "status"
+        ],
+        "properties": {
+          "broker_connection_code": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "external_account_ref": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateAllocations": {
+        "type": "object",
+        "required": [
+          "splits"
+        ],
+        "properties": {
+          "splits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AllocationSplit"
+            }
+          }
+        }
+      },
+      "CreateBrokerConnection": {
+        "type": "object",
+        "required": [
+          "code",
+          "broker_code",
+          "environment",
+          "status"
+        ],
+        "properties": {
+          "broker_code": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateGrant": {
+        "type": "object",
+        "required": [
+          "portfolio_id",
+          "can_trade",
+          "can_view",
+          "can_allocate"
+        ],
+        "properties": {
+          "can_allocate": {
+            "type": "boolean"
+          },
+          "can_trade": {
+            "type": "boolean"
+          },
+          "can_view": {
+            "type": "boolean"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "CreateKey": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "CreatePortfolio": {
+        "type": "object",
+        "required": [
+          "code",
+          "name",
+          "status"
+        ],
+        "properties": {
+          "base_currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "code": {
+            "type": "string"
+          },
+          "default_account_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "CreatePrincipal": {
+        "type": "object",
+        "required": [
+          "code",
+          "principal_type",
+          "status"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "external_subject": {
+            "type": "string",
+            "nullable": true
+          },
+          "principal_type": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateRiskLimit": {
+        "type": "object",
+        "required": [
+          "portfolio_id",
+          "instrument_id"
+        ],
+        "properties": {
+          "instrument_id": {
+            "type": "string"
+          },
+          "max_order_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_order_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "trading_state": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "CreateTradingToken": {
+        "type": "object",
+        "required": [
+          "principal_id"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "Human label for this key (shown in the token list). Optional.",
+            "nullable": true
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Optionally entitle the principal to trade this portfolio (adds a `can_trade`\ngrant). Omit if the principal is already granted, or to grant separately.",
+            "nullable": true
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Mint the token under this existing principal (the trader/strategy/service it\nbelongs to). Create principals on the Principals admin surface first."
+          }
+        }
+      },
+      "CredentialSubmission": {
+        "type": "object",
+        "description": "A submitted credential form: field name to raw string value, exactly as\nan HTML form or a JSON object would hand it over. Untyped on purpose —\ngiving each broker its own typed request struct would just move the\n\"which fields did they actually send\" question from here into the\nhandler, where the merge rule would have to be reimplemented per broker.\n\n`#[serde(flatten)]` so the wire body is the field map itself\n(`{\"host\": \"...\", \"port\": \"4101\"}`), not `{\"fields\": {...}}` — the shape\nthe cockpit form naturally produces.",
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "ExpirySweepResult": {
+        "type": "object",
+        "required": [
+          "recomputed",
+          "expired"
+        ],
+        "properties": {
+          "expired": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Instruments moved from ACTIVE to EXPIRED.",
+            "minimum": 0
+          },
+          "recomputed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Contracts whose UTC `expires_at` was derived or corrected from the venue\ncalendar. Non-zero on the first run after seeding a calendar, or after\ncorrecting one; zero on a steady-state run.",
+            "minimum": 0
+          }
+        }
+      },
+      "FeedConnectionSummary": {
+        "type": "object",
+        "required": [
+          "code",
+          "provider",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "dataset": {
+            "type": "string",
+            "description": "Nullable in the schema — a feed connection can exist before its\ndataset is known, same as credentials can be unconfigured.",
+            "nullable": true
+          },
+          "provider": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "FeedSummary": {
+        "type": "object",
+        "required": [
+          "feed_code",
+          "instrument_class",
+          "rank",
+          "enabled",
+          "mapped_instruments"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "feed_code": {
+            "type": "string"
+          },
+          "instrument_class": {
+            "type": "string"
+          },
+          "mapped_instruments": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many active instruments this feed's symbology covers, for the class.\nDerived from the feed's own `candidates()` filter at request time."
+          },
+          "rank": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Ranked failover preference within the class; lower wins."
+          }
+        }
+      },
+      "Grant": {
+        "type": "object",
+        "required": [
+          "id",
+          "principal_id",
+          "portfolio_id",
+          "can_trade",
+          "can_view",
+          "can_allocate",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "can_allocate": {
+            "type": "boolean"
+          },
+          "can_trade": {
+            "type": "boolean"
+          },
+          "can_view": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "GrantedPortfolio": {
+        "type": "object",
+        "description": "One portfolio the caller is entitled to, with the entitlement itself.\n\nThe flags are returned rather than filtered on, so a client can grey out what it\ncannot do instead of discovering it from a 403 mid-order.",
+        "required": [
+          "portfolio_id",
+          "code",
+          "name",
+          "status",
+          "can_trade",
+          "can_view",
+          "can_allocate"
+        ],
+        "properties": {
+          "base_currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "can_allocate": {
+            "type": "boolean"
+          },
+          "can_trade": {
+            "type": "boolean"
+          },
+          "can_view": {
+            "type": "boolean"
+          },
+          "code": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "portfolio_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "InstrumentSummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "symbol",
+          "name",
+          "venue",
+          "asset_class",
+          "status"
+        ],
+        "properties": {
+          "asset_class": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "venue": {
+            "type": "string"
+          }
+        }
+      },
+      "OrderAggregateState": {
+        "type": "object",
+        "required": [
+          "order_id",
+          "client_order_id",
+          "portfolio_id",
+          "account_id",
+          "instrument_id",
+          "side",
+          "order_type",
+          "time_in_force",
+          "original_qty",
+          "leaves_qty",
+          "cum_qty",
+          "status",
+          "version"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "avg_px": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "client_order_id": {
+            "type": "string"
+          },
+          "cum_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "instrument_id": {
+            "type": "string"
+          },
+          "leaves_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "limit_price": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "order_id": {
+            "type": "string"
+          },
+          "order_type": {
+            "$ref": "#/components/schemas/OrderType"
+          },
+          "original_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "portfolio_id": {
+            "type": "string"
+          },
+          "resume_to_status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OrderStatus"
+              }
+            ],
+            "nullable": true
+          },
+          "side": {
+            "$ref": "#/components/schemas/OrderSide"
+          },
+          "status": {
+            "$ref": "#/components/schemas/OrderStatus"
+          },
+          "time_in_force": {
+            "$ref": "#/components/schemas/TimeInForce"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "OrderSide": {
+        "type": "string",
+        "enum": [
+          "buy",
+          "sell"
+        ]
+      },
+      "OrderType": {
+        "type": "string",
+        "enum": [
+          "market",
+          "limit"
+        ]
+      },
+      "Portfolio": {
+        "type": "object",
+        "required": [
+          "id",
+          "code",
+          "name",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "base_currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "code": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "default_account_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Position": {
+        "type": "object",
+        "description": "A position row as returned by the API.\n\n`realized_pnl` comes from the projection; the mark-dependent fields are joined\nin from the in-memory [`crate::marks::MarkStore`] at request time. They are\n`None` when no live mark exists for the instrument — a position we can hold but\nnot value (no market-data source, or the feed is down) is a first-class state,\nnot an error, so it renders as a gap rather than a misleading zero.",
+        "required": [
+          "portfolio_id",
+          "instrument_id",
+          "net_qty",
+          "avg_cost",
+          "realized_pnl",
+          "updated_at"
+        ],
+        "properties": {
+          "avg_cost": {
+            "type": "number",
+            "format": "double"
+          },
+          "instrument_id": {
+            "type": "string"
+          },
+          "mark": {
+            "type": "number",
+            "format": "double",
+            "description": "Mid of the current top-of-book quote.",
+            "nullable": true
+          },
+          "mark_ts": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the mark was received; lets a caller judge staleness.",
+            "nullable": true
+          },
+          "market_value": {
+            "type": "number",
+            "format": "double",
+            "description": "`net_qty * mark * contract_size` — signed, so shorts are negative.",
+            "nullable": true
+          },
+          "net_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "realized_pnl": {
+            "type": "number",
+            "format": "double"
+          },
+          "unrealized_pnl": {
+            "type": "number",
+            "format": "double",
+            "description": "`(mark - avg_cost) * net_qty * contract_size` — signed-correct for shorts.",
+            "nullable": true
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Principal": {
+        "type": "object",
+        "required": [
+          "id",
+          "code",
+          "principal_type",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "display_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "external_subject": {
+            "type": "string",
+            "nullable": true
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "principal_type": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "RedactedCredentials": {
+        "type": "object",
+        "description": "The credential view safe to put on the wire. `state` mirrors\n`CredentialState` so the cockpit can tell \"needs setup\" (`unconfigured`)\napart from \"stored but the master key does not open it\" (`error`) — the\ndistinction the whole credential store was built to preserve; collapsing\nthem would invite an operator to re-enter a credential that is already\nthere instead of fixing the key. `fields` is populated only when `state`\nis `\"configured\"`; `message` only when `state` is `\"error\"`. Never carries\na decrypted secret, in either state.",
+        "required": [
+          "code",
+          "state",
+          "fields"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/crate.credentials.RedactedField"
+            }
+          },
+          "message": {
+            "type": "string",
+            "description": "The reason a stored blob could not be used — set only when\n`state == \"error\"`, and always a description, never the payload.",
+            "nullable": true
+          },
+          "state": {
+            "type": "string",
+            "description": "\"configured\" | \"unconfigured\" | \"error\""
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          }
+        }
+      },
+      "RedactedField": {
+        "type": "object",
+        "description": "One field of a credential as it may be shown on the wire. Named so the UI\nalways knows the field exists — even when `value` is withheld — and can\nrender a \"leave blank to keep\" input rather than an empty box that looks\nlike the value was lost. `secret` is carried explicitly rather than left\nfor a caller to infer from `value.is_none()`, so a future field that is\nmerely *absent* (not secret) cannot be mistaken for one that is withheld.",
+        "required": [
+          "name",
+          "secret"
+        ],
+        "properties": {
+          "hint": {
+            "type": "string",
+            "description": "A display-only preview of a withheld value (see `masked`). Never a\nvalue the client may send back.",
+            "nullable": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "boolean"
+          },
+          "value": {
+            "type": "string",
+            "description": "The stored value, when it is safe to echo and safe to submit back\nunchanged. `None` for both secrets and masked identifiers — in either\ncase the cockpit must leave the input blank, so that an untouched\nfield submits empty and the merge rule keeps what is stored.",
+            "nullable": true
+          }
+        }
+      },
+      "ResolveOutcome": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Identified; `instrument_id` is `None` if we hold no matching master instrument.",
+            "required": [
+              "figi",
+              "outcome"
+            ],
+            "properties": {
+              "figi": {
+                "type": "string"
+              },
+              "identity": {
+                "allOf": [
+                  {
+                    "$ref": "#/components/schemas/ResolvedIdentity"
+                  }
+                ],
+                "nullable": true
+              },
+              "instrument_id": {
+                "type": "integer",
+                "format": "int64",
+                "nullable": true
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "resolved"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "candidates",
+              "outcome"
+            ],
+            "properties": {
+              "candidates": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ResolvedIdentity"
+                }
+              },
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "ambiguous"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "outcome"
+            ],
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "unresolved"
+                ]
+              }
+            }
+          }
+        ],
+        "discriminator": {
+          "propertyName": "outcome"
+        }
+      },
+      "ResolveRequest": {
+        "type": "object",
+        "properties": {
+          "cusip": {
+            "type": "string",
+            "nullable": true
+          },
+          "exch_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "figi": {
+            "type": "string",
+            "nullable": true
+          },
+          "isin": {
+            "type": "string",
+            "nullable": true
+          },
+          "mic": {
+            "type": "string",
+            "nullable": true
+          },
+          "ticker": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "ResolvedIdentity": {
+        "type": "object",
+        "required": [
+          "figi"
+        ],
+        "properties": {
+          "composite_figi": {
+            "type": "string",
+            "nullable": true
+          },
+          "exch_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "figi": {
+            "type": "string"
+          },
+          "market_sector": {
+            "type": "string",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "security_type": {
+            "type": "string",
+            "nullable": true
+          },
+          "share_class_figi": {
+            "type": "string",
+            "nullable": true
+          },
+          "ticker": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "RiskLimit": {
+        "type": "object",
+        "required": [
+          "id",
+          "portfolio_id",
+          "instrument_id",
+          "trading_state",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "instrument_id": {
+            "type": "string"
+          },
+          "max_order_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_order_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "trading_state": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SaveResponse": {
+        "type": "object",
+        "description": "Response body for a successful credential save.\n\n`reload` is this connection's own entry out of the reload report the save\nalready triggered — not a second call the cockpit has to make — so the UI\ncan say \"applied\" (a REST adapter, swapped live) or \"restart required\" (a\nFIX session) in the same response that confirms the write.",
+        "required": [
+          "redacted",
+          "tested",
+          "reload"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Present exactly when `tested` is `false`: `TestOutcome::NotTestable`'s\nown explanation (e.g. \"FIX credentials are validated at session\nlogon, not before save\"), passed through so the cockpit renders the\nserver's reason instead of hardcoding its own guess at the wording.\nAlways `None` when `tested` is `true` — a `Failed` test never reaches\nthis response at all (422, before anything is written).",
+            "nullable": true
+          },
+          "redacted": {
+            "$ref": "#/components/schemas/RedactedCredentials"
+          },
+          "reload": {
+            "type": "object",
+            "description": "`None` only if the reload report (queried by this same connection's\ncode, right after the save that triggered it) somehow lacks an entry\nfor it — never expected in practice, but a missing key is safer to\nsurface as \"unknown\" than to synthesize an outcome for.",
+            "nullable": true
+          },
+          "tested": {
+            "type": "boolean",
+            "description": "Whether the credential was actually checked against the broker before\nbeing written — `false` for FIX (see `credentials_api::test_broker`),\nso the UI reports \"not testable\" rather than implying a pass it never\nearned."
+          }
+        }
+      },
+      "SetupCatalogStatus": {
+        "type": "object",
+        "required": [
+          "instruments",
+          "state"
+        ],
+        "properties": {
+          "instruments": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "SetupConnectionStatus": {
+        "type": "object",
+        "description": "One connection's classification, for the checklist below. Deliberately\nthe same three strings `RedactedCredentials` uses\n(`configured`/`unconfigured`/`error`) rather than a boolean — \"stored but\nthe master key can't open it\" is a different operator problem from\n\"never configured\", and collapsing them here would hide exactly the\nmisconfiguration this checklist exists to surface.",
+        "required": [
+          "code",
+          "state"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        }
+      },
+      "SetupStatus": {
+        "type": "object",
+        "description": "The checklist an operator (or the cockpit's own onboarding banner) reads to\nanswer \"what is left to configure\" — nothing else in this system can\nanswer that question in one call today.",
+        "required": [
+          "database",
+          "admin_password",
+          "master_key",
+          "brokers",
+          "feeds",
+          "catalog",
+          "portfolios"
+        ],
+        "properties": {
+          "admin_password": {
+            "type": "string",
+            "description": "`\"default\"` iff the admin console is still guarded by the built-in\ndev password rather than an operator-chosen one — see\n`admin_password_state`."
+          },
+          "brokers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SetupConnectionStatus"
+            }
+          },
+          "catalog": {
+            "$ref": "#/components/schemas/SetupCatalogStatus"
+          },
+          "database": {
+            "type": "string"
+          },
+          "feeds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SetupConnectionStatus"
+            }
+          },
+          "master_key": {
+            "type": "string",
+            "description": "Whether a master key is configured. Never the key itself, nor even\nwhether it is *valid* — an invalid key surfaces the same way every\nother credential-reading endpoint surfaces it, as a 500 from\n`resolve_master_key`, not folded into this field."
+          },
+          "portfolios": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "SubmitOrder": {
+        "type": "object",
+        "required": [
+          "order_id",
+          "client_order_id",
+          "portfolio_id",
+          "account_id",
+          "instrument_id",
+          "side",
+          "order_type",
+          "time_in_force",
+          "quantity"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "client_order_id": {
+            "type": "string"
+          },
+          "instrument_id": {
+            "type": "string"
+          },
+          "limit_price": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "order_id": {
+            "type": "string"
+          },
+          "order_type": {
+            "$ref": "#/components/schemas/OrderType"
+          },
+          "portfolio_id": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number",
+            "format": "double"
+          },
+          "side": {
+            "$ref": "#/components/schemas/OrderSide"
+          },
+          "time_in_force": {
+            "$ref": "#/components/schemas/TimeInForce"
+          }
+        }
+      },
+      "SubmitOrderRequest": {
+        "type": "object",
+        "description": "Wire payload for POST /orders/submit. `account_id` is optional — when omitted it is\nresolved from the portfolio's `default_account_id`; when present it overrides.",
+        "required": [
+          "order_id",
+          "client_order_id",
+          "portfolio_id",
+          "side",
+          "order_type",
+          "time_in_force",
+          "quantity"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "Optional account UUID; omit to use the portfolio's default account.",
+            "example": null,
+            "nullable": true
+          },
+          "client_order_id": {
+            "type": "string",
+            "description": "Your own reference string, echoed back on updates.",
+            "example": "my-ref-001"
+          },
+          "instrument_id": {
+            "type": "string",
+            "description": "Instrument surrogate key (BIGINT as string), not a UUID. Omit when naming the\ninstrument by `symbol` instead.",
+            "example": null,
+            "nullable": true
+          },
+          "limit_price": {
+            "type": "number",
+            "format": "double",
+            "description": "Required for `limit` orders; omit for `market`.",
+            "example": null,
+            "nullable": true
+          },
+          "order_id": {
+            "type": "string",
+            "description": "Client-generated UUID; also the idempotency key (a repeat is a 409).",
+            "example": "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b"
+          },
+          "order_type": {
+            "$ref": "#/components/schemas/OrderType"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "description": "Portfolio UUID the order books against.",
+            "example": "b2c3d4e5-6f70-4812-93a4-556677889900"
+          },
+          "quantity": {
+            "type": "number",
+            "format": "double",
+            "example": 1.0
+          },
+          "side": {
+            "$ref": "#/components/schemas/OrderSide"
+          },
+          "symbol": {
+            "type": "string",
+            "description": "The instrument's venue-native symbol, as an alternative to `instrument_id`.\nAccepts the `Symbol@Venue` shorthand (`SPY260918C00770000@OPRA`) or a bare\nsymbol qualified by the `venue` field.",
+            "example": "SPY260918C00770000@OPRA",
+            "nullable": true
+          },
+          "time_in_force": {
+            "$ref": "#/components/schemas/TimeInForce"
+          },
+          "venue": {
+            "type": "string",
+            "description": "Venue (MIC) qualifying `symbol`. Omit when `symbol` already carries `@VENUE`,\nor when the symbol is unique across venues.",
+            "example": null,
+            "nullable": true
+          }
+        }
+      },
+      "TestResponse": {
+        "type": "object",
+        "description": "Response body for `POST .../credentials/test`.",
+        "required": [
+          "tested",
+          "ok"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Present on anything short of a clean pass: the broker's rejection\nreason, or why nothing was attempted. Never derived from submitted\ninput — see `TestOutcome`'s own doc comment.",
+            "nullable": true
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "Only meaningful when `tested` is `true`: whether it passed."
+          },
+          "tested": {
+            "type": "boolean",
+            "description": "Whether a check was actually attempted — `false` for FIX."
+          }
+        }
+      },
+      "TimeInForce": {
+        "type": "string",
+        "enum": [
+          "day",
+          "gtc",
+          "ioc",
+          "fok"
+        ]
+      },
+      "TradingTokenCreated": {
+        "type": "object",
+        "required": [
+          "token",
+          "key_id",
+          "principal_id"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "nullable": true
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "token": {
+            "type": "string",
+            "description": "The single bearer token — `Authorization: Bearer <token>`. Shown once."
+          }
+        }
+      },
+      "TradingTokenRow": {
+        "type": "object",
+        "required": [
+          "key_id",
+          "principal_id",
+          "principal_code",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "key_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string",
+            "nullable": true
+          },
+          "principal_code": {
+            "type": "string"
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "principal_name": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateAccount": {
+        "type": "object",
+        "properties": {
+          "broker_connection_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "code": {
+            "type": "string",
+            "nullable": true
+          },
+          "external_account_ref": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateBrokerConnection": {
+        "type": "object",
+        "properties": {
+          "broker_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateGrant": {
+        "type": "object",
+        "properties": {
+          "can_allocate": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "can_trade": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "can_view": {
+            "type": "boolean",
+            "nullable": true
+          }
+        }
+      },
+      "UpdatePortfolio": {
+        "type": "object",
+        "properties": {
+          "base_currency": {
+            "type": "string",
+            "nullable": true
+          },
+          "code": {
+            "type": "string",
+            "nullable": true
+          },
+          "default_account_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "UpdatePrincipal": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "nullable": true
+          },
+          "display_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "external_subject": {
+            "type": "string",
+            "nullable": true
+          },
+          "principal_type": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateRiskLimit": {
+        "type": "object",
+        "properties": {
+          "max_order_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_order_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "trading_state": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "basic_auth": {
+        "type": "http",
+        "scheme": "basic",
+        "description": "Username = key_id, password = secret."
+      },
+      "bearer_token": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "User endpoints: a trading token, `key_id.secret` (Databento-style). Admin endpoints (/admin/*): the static admin token."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "orders",
+      "description": "Order submission and cancellation"
+    },
+    {
+      "name": "admin",
+      "description": "Admin management of principals, portfolios, accounts, broker connections, and keys"
+    }
+  ]
+}

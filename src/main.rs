@@ -1336,6 +1336,22 @@ mod tests {
     }
 
     #[test]
+    fn the_committed_openapi_spec_is_current() {
+        // The docs site renders docs/openapi.json rather than calling a running
+        // server, so a stale file silently publishes a wrong API reference.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/openapi.json");
+        let committed = std::fs::read_to_string(path)
+            .expect("docs/openapi.json is missing — regenerate: cargo run -- openapi > docs/openapi.json");
+
+        assert_eq!(
+            committed.trim(),
+            super::openapi_json().trim(),
+            "docs/openapi.json is out of date. Regenerate it:\n\n    \
+             cargo run -- openapi > docs/openapi.json\n"
+        );
+    }
+
+    #[test]
     fn the_openapi_subcommand_renders_a_usable_spec() {
         // The docs site is built from this JSON, not from a running server, so the
         // command has to produce a complete spec with no database and no config.
