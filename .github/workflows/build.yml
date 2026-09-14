@@ -77,3 +77,33 @@ jobs:
         env:
           OMS_RELOAD_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: cargo test -- --ignored
+
+  cockpit:
+    name: cockpit bundle embeds and serves
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+
+      - name: build the bundle
+        working-directory: cockpit
+        run: npm ci && npm run build
+
+      - name: the bundle calls the OMS same-origin
+        run: ./cockpit/check-api-base.sh
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: the embed is populated and served
+        run: "cargo test cockpit:: -- --nocapture"
+
+      - name: and the embed is genuinely non-empty
+        run: |
+          test -s cockpit/dist/index.html \
+            || { echo "cockpit/dist/index.html missing — the embed tests all no-op'd"; exit 1; }
