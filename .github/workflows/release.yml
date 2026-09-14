@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          # 22.04, not ubuntu-latest: 24.04 links glibc 2.39 and the binary then
+          # refuses to start on Debian 12 or Ubuntu 22.04, which is most servers.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the tag must match Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n '/^\[package\]/,/^\[/p' Cargo.toml \
+                   | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
+          echo "tag=$tag cargo=$crate"
+          [ "$tag" = "$crate" ] || {
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cockpit/package-lock.json
+
+      - name: build the cockpit bundle
+        working-directory: cockpit
+        run: npm ci && npm run build
+
+      - name: the bundle must exist before cargo embeds it
+        run: test -s cockpit/dist/index.html
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # build.rs finds a Homebrew OpenSSL for the quickfix SSL link. cmake is
+      # preinstalled on both runner images.
+      - name: openssl
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - run: cargo build --release
+
+      - run: strip target/release/oms
+
+      - name: the binary reports the tag's version
+        run: |
+          got="$(./target/release/oms --version | awk '{print $NF}')"
+          [ "$got" = "${GITHUB_REF_NAME#v}" ] || {
+            echo "binary reports $got, tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: package
+        run: |
+          tar czf "oms-${{ matrix.target }}.tar.gz" -C target/release oms
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "oms-${{ matrix.target }}.tar.gz" > "oms-${{ matrix.target }}.sha256"
+          else
+            shasum -a 256 "oms-${{ matrix.target }}.tar.gz" > "oms-${{ matrix.target }}.sha256"
+          fi
+          cat "oms-${{ matrix.target }}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oms-${{ matrix.target }}
+          path: |
+            oms-${{ matrix.target }}.tar.gz
+            oms-${{ matrix.target }}.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: one SHA256SUMS for the release
+        working-directory: dist
+        run: |
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          cat SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 2
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
