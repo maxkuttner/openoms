@@ -180,6 +180,13 @@ what it deliberately does not do.
    plus the cockpit URL and a one-line note that `oms database init` needs a Postgres
    to talk to.
 
+### Prerequisite: `oms --version`
+
+The smoke check and the release workflow's tag assertion both shell out to
+`oms --version`, which the CLI does not currently accept — `#[command(...)]` at
+`src/main.rs:293` declares `name` and `about` but not `version`. Adding the `version`
+token makes clap generate it from the crate version.
+
 ### Environment variables
 
 | Variable | Default | Purpose |
