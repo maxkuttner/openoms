@@ -1,0 +1,42 @@
+name: Install smoke test
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: install exactly the way the landing page says to
+        run: curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+
+      - name: the installed binary runs and matches the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          got="$("$HOME/.local/bin/oms" --version | awk '{print $NF}')"
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          echo "installed $got, latest release $tag"
+          [ "$got" = "${tag#v}" ] || { echo "installed version does not match the latest release"; exit 1; }
+
+      - name: the binary carries the cockpit
+        run: |
+          "$HOME/.local/bin/oms" --help >/dev/null
+          # The embed is bytes inside the binary, so grep for a string only the
+          # built bundle contributes. A UI-less release would pass every other
+          # check in this workflow.
+          grep -qa 'oms-cockpit\|<div id="root">' "$HOME/.local/bin/oms" \
+            || { echo "no cockpit bundle found in the released binary"; exit 1; }
