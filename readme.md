@@ -16,6 +16,18 @@
 
 ---
 
+## Install
+
+```sh
+curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+oms database init
+oms
+```
+
+Then open <http://localhost:3001/cockpit/>. Prebuilt binaries cover macOS on Apple
+Silicon and Linux on x86_64; the installer verifies a checksum, drops `oms` in
+`~/.local/bin` and does nothing else. Everything below builds from source instead.
+
 ## Setup
 
 ```sh
