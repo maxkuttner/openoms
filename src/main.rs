@@ -190,8 +190,14 @@ impl utoipa::Modify for SecurityAddon {
     }
 }
 
-
-
+/// The OpenAPI spec as pretty JSON.
+///
+/// Split out from the subcommand so a test can assert the spec is complete without
+/// spawning a process. `docs/openapi.json` is generated from this and committed;
+/// see the drift test that keeps the two in step.
+fn openapi_json() -> String {
+    serde_json::to_string_pretty(&ApiDoc::openapi()).expect("the OpenAPI spec must serialise")
+}
 
 /// Where the server listens when `OMS_BIND_ADDR` says nothing. Loopback by
 /// design: a fresh clone should start and be reachable from a browser on the same
@@ -316,6 +322,8 @@ enum Command {
         #[command(flatten)]
         db: DbArgs,
     },
+    /// Print the OpenAPI spec as JSON, for the docs build and for scripting.
+    Openapi,
 }
 
 #[derive(clap::Subcommand)]
@@ -600,6 +608,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::Openapi) => println!("{}", openapi_json()),
         None => serve().await,
     }
 }
@@ -1324,6 +1333,25 @@ mod tests {
         std::env::remove_var("OMS_ADMIN_TOKEN");
 
         assert_eq!(result.as_deref(), Some("from-token"));
+    }
+
+    #[test]
+    fn the_openapi_subcommand_renders_a_usable_spec() {
+        // The docs site is built from this JSON, not from a running server, so the
+        // command has to produce a complete spec with no database and no config.
+        let json = super::openapi_json();
+        let spec: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert!(spec["openapi"].as_str().is_some(), "missing openapi version");
+        assert!(
+            spec["paths"].as_object().map(|p| !p.is_empty()).unwrap_or(false),
+            "spec has no paths"
+        );
+        assert!(
+            spec["paths"]["/orders/submit"].is_object(),
+            "expected /orders/submit in the spec, got: {:?}",
+            spec["paths"].as_object().map(|p| p.keys().collect::<Vec<_>>())
+        );
     }
 
     #[test]
