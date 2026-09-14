@@ -290,7 +290,7 @@ fn nothing_decrypted(any_configured: bool, any_error: bool) -> bool {
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
 #[derive(clap::Parser)]
-#[command(name = "oms", about = "OMS server + setup CLI")]
+#[command(name = "oms", version, about = "OMS server + setup CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -1319,5 +1319,14 @@ mod tests {
         std::env::remove_var("OMS_ADMIN_TOKEN");
 
         assert_eq!(result.as_deref(), Some("from-token"));
+    }
+
+    #[test]
+    fn cli_reports_its_version() {
+        use clap::CommandFactory;
+        let cmd = <super::Cli as CommandFactory>::command();
+        let version = cmd.get_version()
+            .expect("--version must be available: install.sh smoke-checks it");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
     }
 }
