@@ -54,20 +54,37 @@ pub enum FeedCredentials {
 /// present by name with no value. Ordered so the UI can render it directly.
 #[derive(Debug, Serialize)]
 pub struct Redacted {
-    pub fields: Vec<(String, Option<String>)>,
+    pub fields: Vec<RedactedField>,
 }
 
 pub trait Redact {
     fn redact(&self) -> Redacted;
 }
 
-fn shown(name: &str, value: impl ToString) -> (String, Option<String>) {
-    (name.to_string(), Some(value.to_string()))
+fn shown(name: &str, value: impl ToString) -> RedactedField {
+    RedactedField { name: name.to_string(), value: Some(value.to_string()), secret: false, hint: None }
 }
 
 /// A secret: named so the UI knows the field exists, with no value.
-fn hidden(name: &str) -> (String, Option<String>) {
-    (name.to_string(), None)
+fn hidden(name: &str) -> RedactedField {
+    RedactedField { name: name.to_string(), value: None, secret: true, hint: None }
+}
+
+/// A value too sensitive to echo back but useful to identify — the tail of an
+/// Alpaca key id, say.
+///
+/// The real value is withheld exactly as a secret's is, so it can never be
+/// submitted back as though it were real input. That distinction is the whole
+/// point: a mask returned in `value` would be prefilled by the cockpit and
+/// then, being non-empty, merged as a deliberate replacement — writing the
+/// literal "…AB12" over the operator's key the first time they edited any
+/// other field. `hint` exists so the UI can still say *which* credential is
+/// installed without ever holding something it could submit.
+///
+/// Not `secret`: a key id is an identifier, not a password, and should not
+/// render as one.
+fn masked(name: &str, hint: impl ToString) -> RedactedField {
+    RedactedField { name: name.to_string(), value: None, secret: false, hint: Some(hint.to_string()) }
 }
 
 impl Redact for BrokerCredentials {
@@ -76,7 +93,7 @@ impl Redact for BrokerCredentials {
             BrokerCredentials::Alpaca { key, .. } => vec![
                 // The last four characters identify which key is installed without
                 // being enough to use it — the same trick every payment UI uses.
-                shown("key", format!("…{}", tail4(key))),
+                masked("key", format!("…{}", tail4(key))),
                 hidden("secret"),
             ],
             BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, ssl, .. } => vec![
@@ -140,14 +157,24 @@ impl std::fmt::Debug for FeedCredentials {
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct RedactedField {
     pub name: String,
+    /// The stored value, when it is safe to echo and safe to submit back
+    /// unchanged. `None` for both secrets and masked identifiers — in either
+    /// case the cockpit must leave the input blank, so that an untouched
+    /// field submits empty and the merge rule keeps what is stored.
     pub value: Option<String>,
     pub secret: bool,
+    /// A display-only preview of a withheld value (see `masked`). Never a
+    /// value the client may send back.
+    pub hint: Option<String>,
 }
 
-/// Maps `Redacted.fields`'s `(name, value)` pairs onto the wire shape:
-/// `secret` is `value.is_none()`, the same convention `hidden()`/`shown()`
-/// already encode. This is a mapping, not a second redaction path — the only
-/// redaction logic is `Redact::redact`, above.
+/// Hands back `Redacted`'s fields, which are already the wire shape.
+///
+/// This used to derive `secret` from `value.is_none()`. That inference broke
+/// once `masked` existed — a masked identifier also has no value but is not a
+/// secret — so each constructor now states `secret` outright. This is a
+/// pass-through, not a second redaction path: the only redaction logic is
+/// `Redact::redact`, above.
 pub fn redacted_fields(c: &BrokerCredentials) -> Vec<RedactedField> {
     to_wire(c.redact())
 }
@@ -182,12 +209,6 @@ impl ToRedactedFields for FeedCredentials {
 
 fn to_wire(r: Redacted) -> Vec<RedactedField> {
     r.fields
-        .into_iter()
-        .map(|(name, value)| {
-            let secret = value.is_none();
-            RedactedField { name, value, secret }
-        })
-        .collect()
 }
 
 /// What is known about a connection's credentials.
@@ -520,10 +541,39 @@ mod tests {
     fn the_wire_form_marks_secret_fields() {
         let fields = super::redacted_fields(&alpaca());
         let secret: Vec<_> = fields.iter().filter(|f| f.secret).map(|f| f.name.as_str()).collect();
-        assert_eq!(secret, vec!["secret"], "only the secret is secret; the key id is shown");
+        assert_eq!(secret, vec!["secret"], "only the secret is secret; the key id is an identifier");
 
-        let shown = fields.iter().find(|f| f.name == "key").expect("key present");
-        assert!(shown.value.is_some(), "the key id must be visible so the operator can tell which is installed");
+        let key = fields.iter().find(|f| f.name == "key").expect("key present");
+        assert!(key.hint.is_some(), "the key id needs a hint so the operator can tell which key is installed");
+    }
+
+    /// A mask must never arrive in `value`, because the cockpit prefills from
+    /// `value` and the merge rule reads any non-empty submission as a
+    /// deliberate replacement. A mask in `value` therefore round-trips: the
+    /// operator edits some unrelated field, and "…Y123" is written over their
+    /// real key id. It is withheld like a secret and offered only as a `hint`.
+    #[test]
+    fn a_masked_identifier_is_never_submittable() {
+        let fields = super::redacted_fields(&alpaca());
+        let key = fields.iter().find(|f| f.name == "key").expect("key present");
+        assert_eq!(key.value, None, "a masked identifier must not be prefillable");
+        assert_eq!(key.hint.as_deref(), Some("…Y123"));
+        assert!(!key.secret, "a key id is an identifier, not a password");
+    }
+
+    /// Whatever a field's kind, a value the client is given back must be one it
+    /// can safely resubmit unchanged. Anything withheld — secret or masked —
+    /// must leave `value` empty so an untouched input submits blank and the
+    /// merge rule keeps what is stored.
+    #[test]
+    fn every_returned_value_is_safe_to_resubmit() {
+        for creds in [alpaca(), binance(), ibkr()] {
+            for f in super::redacted_fields(&creds) {
+                if f.hint.is_some() || f.secret {
+                    assert!(f.value.is_none(), "{} returned a value it cannot take back", f.name);
+                }
+            }
+        }
     }
 
     /// A secret field must never carry a value on the wire — this is the whole

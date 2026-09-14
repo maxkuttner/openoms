@@ -23,10 +23,23 @@ use crate::credentials::{BrokerCredentials, FeedCredentials};
 /// `#[serde(flatten)]` so the wire body is the field map itself
 /// (`{"host": "...", "port": "4101"}`), not `{"fields": {...}}` — the shape
 /// the cockpit form naturally produces.
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct CredentialSubmission {
     #[serde(flatten)]
     pub fields: HashMap<String, String>,
+}
+
+/// Hand-written for the same reason `BrokerCredentials` and `FeedCredentials`
+/// have their own: this holds raw submitted secrets, so a derived `Debug` is
+/// one `info!(?submission)` away from putting every one of them in the log.
+/// Prints the field *names* — useful for seeing what a form actually sent —
+/// and never a value.
+impl std::fmt::Debug for CredentialSubmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&str> = self.fields.keys().map(String::as_str).collect();
+        names.sort_unstable(); // HashMap order is arbitrary; a stable Debug is easier to read
+        write!(f, "CredentialSubmission{names:?}")
+    }
 }
 
 impl CredentialSubmission {
@@ -292,6 +305,23 @@ const DATABENTO_OPRA_DATASET: &str = "OPRA.PILLAR";
 pub async fn test_feed(creds: &FeedCredentials) -> TestOutcome {
     match creds {
         FeedCredentials::Databento { api_key } => {
+            // Screened before the key reaches the client, not for validation's
+            // sake but to keep it out of the log. `databento`'s `ApiKey::new`
+            // (0.54.0, src/lib.rs:249) reacts to a 32-character key containing
+            // any non-ASCII byte with `error!("API key '{key}' ...")` — the
+            // whole key, into our subscriber. The returned error's Display is
+            // clean, so only the log leaks, but a credential in a log file is
+            // exactly what this module exists to prevent. The realistic
+            // trigger is a paste whose length is right and one of whose
+            // characters arrived as a Unicode lookalike — a smart quote or an
+            // en-dash out of a chat client.
+            if !api_key.is_ascii() {
+                return TestOutcome::Failed(
+                    "key contains non-ASCII characters — it was probably pasted from an \
+                     editor or chat client that substituted a character"
+                        .to_string(),
+                );
+            }
             let builder = match databento::LiveClient::builder().key(api_key.clone()) {
                 Ok(b) => b,
                 Err(e) => return TestOutcome::Failed(e.to_string()),
@@ -316,6 +346,39 @@ pub async fn test_feed(creds: &FeedCredentials) -> TestOutcome {
 
 #[cfg(test)]
 mod tests {
+
+    /// A non-ASCII key must be rejected *before* it reaches the databento
+    /// client, which logs the whole key when handed a 32-character key with a
+    /// non-ASCII byte. Returns early, so this test touches no network.
+    #[tokio::test]
+    async fn a_non_ascii_databento_key_is_rejected_without_reaching_the_client() {
+        // 32 chars, one of them a Unicode en-dash — the length that reaches
+        // databento's non-ASCII branch.
+        let key = format!("{}\u{2013}", "a".repeat(31));
+        assert_eq!(key.chars().count(), 32);
+        let outcome = test_feed(&FeedCredentials::Databento { api_key: key.clone() }).await;
+        match outcome {
+            TestOutcome::Failed(msg) => {
+                assert!(msg.contains("non-ASCII"), "unexpected message: {msg}");
+                assert!(!msg.contains(&key), "the failure echoed the key back");
+                assert!(!msg.contains(&"a".repeat(31)), "the failure echoed the key back");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// `CredentialSubmission` holds raw secrets, so its `Debug` must print
+    /// names only. A derived `Debug` here would put every submitted secret one
+    /// `info!(?submission)` away from the log.
+    #[test]
+    fn debug_for_a_submission_never_prints_a_value() {
+        let s = sub(&[("key", "AKREALKEY"), ("secret", "sup3r-s3cret")]);
+        let printed = format!("{s:?}");
+        assert!(printed.contains("key"), "field names are useful: {printed}");
+        assert!(printed.contains("secret"));
+        assert!(!printed.contains("AKREALKEY"), "leaked a value: {printed}");
+        assert!(!printed.contains("sup3r-s3cret"), "leaked a value: {printed}");
+    }
     use super::*;
     use crate::credentials::{BrokerCredentials, FeedCredentials};
 

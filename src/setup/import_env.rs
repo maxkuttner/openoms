@@ -199,6 +199,7 @@ pub async fn run(pool: &PgPool, key: &MasterKey) -> Result<usize, Box<dyn std::e
     // its doc comment in bootstrap.rs), so this cannot create anything a
     // normal boot wouldn't have.
     crate::setup::bootstrap::ensure_broker_connections(pool).await;
+    crate::setup::bootstrap::ensure_feed_connections(pool).await;
 
     let mut n = 0;
     for (code, cred) in &brokers {

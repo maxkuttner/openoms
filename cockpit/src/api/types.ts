@@ -80,8 +80,16 @@ export interface FeedConnectionSummary {
 
 export interface RedactedField {
   name: string;
+  /**
+   * The stored value, when it is safe to echo and safe to submit back
+   * unchanged. Null for both secrets and masked identifiers — in either case
+   * the input must be left blank, so an untouched field submits empty and the
+   * server's merge rule keeps what is stored.
+   */
   value: string | null;
   secret: boolean;
+  /** Display-only preview of a withheld value. Never send this back. */
+  hint: string | null;
 }
 
 export interface RedactedCredentials {

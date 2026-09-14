@@ -26,8 +26,8 @@ async fn catalog_nonempty(pool: &PgPool) -> Result<bool, sqlx::Error> {
 /// eventually the cockpit, both write into an existing row rather than creating
 /// one — see `import_env::run`). So this now runs unconditionally: an
 /// uncredentialed row simply reads as "needs setup", exactly like a feed row
-/// already does. Runs as the `oms` role (which owns the schema), idempotent on
-/// `code`.
+/// does (see [`ensure_feed_connections`]). Runs as the `oms` role (which owns
+/// the schema), idempotent on `code`.
 pub async fn ensure_broker_connections(pool: &PgPool) {
     for broker in Broker::ALL.iter().copied() {
         let code = broker.connection_code();
@@ -44,6 +44,47 @@ pub async fn ensure_broker_connections(pool: &PgPool) {
             Ok(r) if r.rows_affected() > 0 => info!("bootstrap: created broker_connection {code}"),
             Ok(_) => {} // already existed
             Err(e) => error!("bootstrap: could not ensure broker_connection {code}: {e}"),
+        }
+    }
+}
+
+/// Ensure a `feed_connection` row exists for the market-data feed this build
+/// supports.
+///
+/// The exact counterpart to [`ensure_broker_connections`], and for the same
+/// reason: a connection row is the target a credential attaches to, not
+/// evidence that one exists. Without this, a fresh install had no feed row at
+/// all — the cockpit's Data Feeds page showed "no feed connections", every
+/// credential endpoint 404'd, and the only way to create the row was
+/// `oms config import-env` with the key already in `.env`, which is the exact
+/// workflow configuring feeds from the GUI exists to replace.
+///
+/// One row, hardcoded: `databento-opra` is the only feed this build ever
+/// registers (`admin::classify_feed` and `serve()` both guard on that literal,
+/// and `reload::restart_databento_feed` re-inserts under it). `provider` must
+/// be `DATABENTO` to match what `credentials::save_feed` writes, so a row
+/// seeded here and a row written by an import are indistinguishable. `dataset`
+/// mirrors `credentials_api::DATABENTO_OPRA_DATASET`.
+///
+/// Runs as the `oms` role, idempotent on `code`, and deliberately does not
+/// touch `credentials` — `DO NOTHING` so re-running at every boot can never
+/// disturb a configured feed.
+pub async fn ensure_feed_connections(pool: &PgPool) {
+    const FEEDS: [(&str, &str, &str); 1] = [("databento-opra", "DATABENTO", "OPRA.PILLAR")];
+    for (code, provider, dataset) in FEEDS {
+        let res = sqlx::query(
+            "INSERT INTO oms.feed_connection (code, provider, dataset, status) \
+             VALUES ($1, $2, $3, 'ACTIVE') ON CONFLICT (code) DO NOTHING",
+        )
+        .bind(code)
+        .bind(provider)
+        .bind(dataset)
+        .execute(pool)
+        .await;
+        match res {
+            Ok(r) if r.rows_affected() > 0 => info!("bootstrap: created feed_connection {code}"),
+            Ok(_) => {} // already existed
+            Err(e) => error!("bootstrap: could not ensure feed_connection {code}: {e}"),
         }
     }
 }

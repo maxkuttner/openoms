@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "@mantine/form";
 import {
@@ -130,7 +130,22 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
     queryFn: () => api.get<RedactedCredentials>(credPath),
   });
 
-  const form = useForm<Record<string, string>>({ initialValues: {} });
+  // `required` on an input only renders an asterisk; enforcement is this
+  // validator. It fires only when there is nothing stored to fall back on —
+  // once a credential is configured, an empty field means "keep", which is
+  // the whole point of the merge rule and must not be flagged as missing.
+  const form = useForm<Record<string, string>>({
+    initialValues: {},
+    validate: (values) =>
+      Object.fromEntries(
+        specs
+          .filter((spec) => spec.input !== "checkbox")
+          .map((spec) => [
+            spec.name,
+            isFreshRef.current && !(values[spec.name] ?? "").trim() ? "required" : null,
+          ]),
+      ),
+  });
   const [lastTest, setLastTest] = useState<TestResponse | null>(null);
   const [lastSave, setLastSave] = useState<SaveResponse | null>(null);
 
@@ -138,15 +153,30 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
   // `unconfigured` and (per parse_broker/parse_feed) `error` are both parsed
   // with `existing: None`, so both need every field filled in fresh.
   const isFresh = data?.state !== "configured";
+  // `form` is created before `isFresh` is in scope, and Mantine captures the
+  // validator once — a ref keeps it reading the current value.
+  const isFreshRef = useRef(isFresh);
+  isFreshRef.current = isFresh;
+
+  // The server's fields by name, used both to seed the form and to render
+  // each input's placeholder.
+  const wireByName = useMemo(
+    () => new Map((data?.fields ?? []).map((f) => [f.name, f])),
+    [data?.fields],
+  );
 
   useEffect(() => {
-    const wireByName = new Map((data?.fields ?? []).map((f) => [f.name, f]));
     const init: Record<string, string> = {};
     for (const spec of specs) {
       if (spec.secret) {
         init[spec.name] = ""; // never prefilled — the server never sends a secret value
         continue;
       }
+      // Only a non-null `value` is prefillable. A masked identifier (Alpaca's
+      // key id) arrives with `value: null` and a `hint`, precisely so it is
+      // not prefilled — the merge rule reads any non-empty submission as a
+      // replacement, so a prefilled mask would overwrite the real value the
+      // first time the operator edited some other field.
       const wire = wireByName.get(spec.name);
       init[spec.name] = wire?.value ?? (spec.input === "checkbox" ? "true" : "");
     }
@@ -244,7 +274,16 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
                 />
               );
             }
-            const placeholder = spec.secret && !isFresh ? "leave blank to keep" : undefined;
+            // A withheld field — secret or masked — shows what is installed
+            // (where there is a hint) and says blank means keep.
+            const hint = wireByName.get(spec.name)?.hint ?? null;
+            const placeholder = isFresh
+              ? undefined
+              : hint
+                ? `${hint} — leave blank to keep`
+                : spec.secret
+                  ? "leave blank to keep"
+                  : undefined;
             if (spec.input === "textarea") {
               return (
                 <Textarea

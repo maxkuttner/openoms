@@ -672,6 +672,7 @@ async fn serve() {
     // first place, and `load_brokers` needs to see them to report them (even as
     // `Unconfigured`) rather than silently loading an empty list.
     setup::bootstrap::ensure_broker_connections(&pool).await;
+    setup::bootstrap::ensure_feed_connections(&pool).await;
 
     // Every broker/feed connection, credentials decoded under `master` (or left
     // `Unconfigured`/`Error` when there is none — see `decode` in credentials.rs).
