@@ -16,6 +16,27 @@
 
 ---
 
+## Install
+
+```sh
+curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+```
+
+`~/.local/bin` is not on the default macOS `PATH`. The installer prints the one
+`export` line to add when it isn't on yours — add it, then:
+
+```sh
+oms database init
+oms
+```
+
+Then open <http://localhost:3001/cockpit/>. Prebuilt binaries cover macOS on Apple
+Silicon and Linux on x86_64; the installer verifies a checksum, drops `oms` in
+`~/.local/bin` and does nothing else. `oms database init` needs a Postgres 16, and
+the Linux binary needs OpenSSL 3 — Debian 12 and Ubuntu 22.04+ have it, Ubuntu
+20.04, RHEL 8 and Amazon Linux 2 do not. Everything below builds from source
+instead.
+
 ## Setup
 
 ```sh
@@ -37,6 +58,13 @@ Then, in a second terminal:
 ```sh
 cd cockpit && npm install && npm run dev  # admin console on localhost:5173
 ```
+
+A released `oms` binary serves the cockpit itself at
+<http://localhost:3001/cockpit/> — the bundle is compiled in, so there is no second
+process to start. The `npm run dev` server above is for developing the cockpit: it
+hot-reloads and proxies the API to a running OMS. A source build embeds nothing
+unless you run `npm run build` in `cockpit/` before `cargo build`; until then
+`/cockpit/` returns a 404 that says so.
 
 `init` asks for your Postgres host, port, database name, superuser name and
 password — pressing Enter through every prompt targets a default local Postgres

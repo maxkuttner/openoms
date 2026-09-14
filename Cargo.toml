@@ -71,6 +71,9 @@ clap = { version = "4", features = ["derive"] }
 # Embed SQL and CSV assets into the binary
 include_dir = "0.7"
 
+# Content types for the embedded cockpit bundle
+mime_guess = "2"
+
 # FIX connectivity (IBKR 4.2, Binance 4.4) — Rust bindings over the QuickFIX C++
 # engine. It owns the session layer (logon/heartbeat/seqnum/resend+gap-fill) and
 # TLS; we implement its ApplicationCallback. Needs cmake + a C++ compiler to build.

@@ -1,0 +1,131 @@
+/* Colors from cockpit/public/favicon.svg, so the page looks like the product. */
+:root {
+  --bg: #0d1014;
+  --panel: #151a20;
+  --border: #2a2f38;
+  --text: #d7dce3;
+  --dim: #8b949e;
+  --accent: #25b083;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 4rem 1.25rem 6rem;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+header,
+main,
+footer {
+  max-width: 46rem;
+  margin: 0 auto;
+}
+
+header {
+  text-align: center;
+  margin-bottom: 3.5rem;
+}
+
+h1 {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 2.25rem;
+  letter-spacing: -0.02em;
+}
+
+.tagline {
+  margin: 0;
+  color: var(--dim);
+}
+
+h2 {
+  font-size: 1.05rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  margin: 3rem 0 0.75rem;
+}
+
+pre {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.1rem 1.25rem;
+  overflow-x: auto;
+  margin: 0;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+}
+
+pre code {
+  color: var(--accent);
+}
+
+#copy {
+  margin-top: 0.6rem;
+  background: transparent;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+#copy:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.after,
+.note {
+  color: var(--dim);
+  font-size: 0.92rem;
+}
+
+.note {
+  border-left: 2px solid var(--border);
+  padding-left: 0.9rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+ul {
+  padding-left: 1.1rem;
+}
+
+li {
+  margin: 0.35rem 0;
+}
+
+img {
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 1rem;
+  display: block;
+}
+
+header img {
+  border: 0;
+  margin: 0 auto;
+}
+
+footer {
+  margin-top: 4rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 1.5rem;
+  font-size: 0.9rem;
+}

@@ -3,6 +3,11 @@
 // A bearer token (OMS_ADMIN_TOKEN) is attached when set; in dev with
 // OMS_ADMIN_AUTH_ENABLED=false the server ignores it, so no token is needed.
 
+// Dev runs behind Vite's proxy, which strips this prefix (see vite.config.ts).
+// A production bundle is served by the OMS itself at /cockpit/, so it is
+// same-origin and calls the API with no prefix at all.
+export const API_BASE = import.meta.env.DEV ? "/api" : "";
+
 const TOKEN_KEY = "oms_admin_token";
 
 export function getToken(): string {
@@ -22,7 +27,7 @@ export class ApiError extends Error {
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const token = getToken();
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     method,
     headers: {
       "Content-Type": "application/json",

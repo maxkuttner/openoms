@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { Box, Group, Loader, Stack, Text } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import { C, CmdLine, Eyebrow } from "../components/apiTheme";
+import { API_BASE } from "../api/client";
 
 // A small, self-documenting API reference rendered directly from the OMS
 // OpenAPI spec (/api-docs/openapi.json). Databento-flavoured: no framework,
@@ -238,7 +239,7 @@ export function ApiDocsPage() {
   const { data: spec, isLoading, error } = useQuery<Spec>({
     queryKey: ["openapi"],
     queryFn: async () => {
-      const r = await fetch("/api/api-docs/openapi.json");
+      const r = await fetch(`${API_BASE}/api-docs/openapi.json`);
       if (!r.ok) throw new Error(`spec ${r.status}`);
       return r.json();
     },

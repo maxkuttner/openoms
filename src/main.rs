@@ -66,6 +66,7 @@ mod credentials_api;
 mod expiry;
 mod fix;
 mod reload;
+mod cockpit;
 #[cfg(test)]
 mod reload_tests;
 
@@ -290,7 +291,7 @@ fn nothing_decrypted(any_configured: bool, any_error: bool) -> bool {
 /// default, preserving `default-run = "rustoms"`); `oms setup …` runs a
 /// maintenance/seeding subcommand.
 #[derive(clap::Parser)]
-#[command(name = "oms", about = "OMS server + setup CLI")]
+#[command(name = "oms", version, about = "OMS server + setup CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -1182,6 +1183,7 @@ async fn serve() {
         .route("/health", get(handlers::health))
         .merge(orders_router)
         .merge(admin_router)
+        .merge(cockpit::router())
         // add 404 route as fallback
         .fallback(handlers::handler_404)
         .with_state(state);
@@ -1190,6 +1192,9 @@ async fn serve() {
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     let host_url = format!("http://{}", bind_addr);
     info!("OMS listening on {}", host_url);
+    if cockpit::is_bundled() {
+        info!("Cockpit: {}/cockpit/", host_url);
+    }
     info!("Scalar UI: {}/scalar", host_url);
     info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);
     axum::serve(listener, app).await.unwrap();
@@ -1319,5 +1324,14 @@ mod tests {
         std::env::remove_var("OMS_ADMIN_TOKEN");
 
         assert_eq!(result.as_deref(), Some("from-token"));
+    }
+
+    #[test]
+    fn cli_reports_its_version() {
+        use clap::CommandFactory;
+        let cmd = <super::Cli as CommandFactory>::command();
+        let version = cmd.get_version()
+            .expect("--version must be available: install.sh smoke-checks it");
+        assert_eq!(version, env!("CARGO_PKG_VERSION"));
     }
 }
