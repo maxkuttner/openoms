@@ -107,3 +107,11 @@ jobs:
         run: |
           test -s cockpit/dist/index.html \
             || { echo "cockpit/dist/index.html missing — the embed tests all no-op'd"; exit 1; }
+
+  shellcheck:
+    name: shellcheck install.sh
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck is preinstalled on the GitHub Ubuntu images.
+      - run: shellcheck install.sh cockpit/check-api-base.sh
