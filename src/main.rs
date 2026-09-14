@@ -66,6 +66,7 @@ mod credentials_api;
 mod expiry;
 mod fix;
 mod reload;
+mod cockpit;
 #[cfg(test)]
 mod reload_tests;
 

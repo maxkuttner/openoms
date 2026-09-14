@@ -9,6 +9,8 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    ensure_cockpit_dist();
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -40,4 +42,15 @@ fn main() {
         "cargo:warning=OpenSSL lib dir not found; the quickfix SSL link may fail. \
          Set OPENSSL_DIR or `brew install openssl@3`."
     );
+}
+
+/// `cockpit/dist` is a build output and is gitignored, but `include_dir!` on a
+/// missing directory fails to compile — so a fresh clone would not build until
+/// someone ran npm. Create it empty instead. An empty embed is the normal state of
+/// a source build and is handled, not an error (see `src/cockpit.rs`).
+fn ensure_cockpit_dist() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let dist = Path::new(&manifest).join("cockpit").join("dist");
+    std::fs::create_dir_all(&dist).expect("create cockpit/dist");
+    println!("cargo:rerun-if-changed=cockpit/dist");
 }
