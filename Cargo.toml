@@ -80,3 +80,13 @@ mime_guess = "2"
 # engine. It owns the session layer (logon/heartbeat/seqnum/resend+gap-fill) and
 # TLS; we implement its ApplicationCallback. Needs cmake + a C++ compiler to build.
 quickfix = { version = "0.2", features = ["build-with-ssl"] }
+
+# OIDC relying-party protocol: discovery, the code exchange, and ID-token
+# verification. Not a session framework — sessions are ours (src/sessions.rs).
+openidconnect = "4"
+
+[dev-dependencies]
+# Test-only: mints an in-process RSA key pair for src/oidc.rs's TestSigner, so
+# ID-token verification can be tested against real signatures without an IdP.
+# Already an indirect dependency of openidconnect; pinned here to use it directly.
+rsa = "0.9"

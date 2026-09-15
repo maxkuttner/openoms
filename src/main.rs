@@ -12,6 +12,7 @@ mod recon_orders;
 mod symbology_resolver;
 mod setup;
 mod sessions;
+mod oidc;
 
 use crate::adapters::BrokerRegistry;
 use crate::app_state::AppState;
