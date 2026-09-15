@@ -26,6 +26,8 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13.1", features = ["json"] }
 base64 = "0.22"
 bcrypt = "0.15"
+# Session cookie values are hashed, not bcrypted: see src/sessions.rs.
+sha2 = "0.10"
 toml = "0.8"
 rpassword = "7"
 rand = "0.8"

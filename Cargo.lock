@@ -2731,6 +2731,7 @@ dependencies = [
  "scalar_api_reference",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "symbology",
  "tokio",

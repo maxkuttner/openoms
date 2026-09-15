@@ -11,6 +11,7 @@ mod positions;
 mod recon_orders;
 mod symbology_resolver;
 mod setup;
+mod sessions;
 
 use crate::adapters::BrokerRegistry;
 use crate::app_state::AppState;
