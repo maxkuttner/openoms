@@ -9,7 +9,7 @@ use chrono::{DateTime, Duration, Utc};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, Method};
 
 /// Written to the browser once; only its hash is ever stored.
 pub struct SessionToken {
@@ -120,12 +120,68 @@ pub fn cookie_from_headers(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
+/// Reject state-changing requests that did not come from our own origin.
+///
+/// `SameSite=Lax` already blocks the classic cross-site form post; this closes
+/// what it does not cover and is why there is no CSRF token anywhere in this
+/// design. Reads are exempt: they change nothing, and demanding an `Origin` on
+/// GET would break ordinary links into the app.
+pub fn origin_is_allowed(headers: &HeaderMap, method: &Method, public_base_url: &str) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return true;
+    }
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    origin.trim_end_matches('/') == public_base_url.trim_end_matches('/')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::Method;
 
     fn ttl() -> SessionTtl {
         SessionTtl { idle: Duration::minutes(30), absolute: Duration::hours(12) }
+    }
+
+    fn with_origin(origin: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", origin.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn a_post_from_our_own_origin_is_allowed() {
+        let headers = with_origin("https://oms.example.com");
+
+        assert!(origin_is_allowed(&headers, &Method::POST, "https://oms.example.com"));
+    }
+
+    #[test]
+    fn a_post_from_somewhere_else_is_refused() {
+        let headers = with_origin("https://evil.example.com");
+
+        assert!(!origin_is_allowed(&headers, &Method::POST, "https://oms.example.com"));
+    }
+
+    #[test]
+    fn a_state_changing_request_with_no_origin_at_all_is_refused() {
+        assert!(!origin_is_allowed(&HeaderMap::new(), &Method::POST, "https://oms.example.com"));
+    }
+
+    #[test]
+    fn a_read_is_not_gated_on_origin() {
+        // GET is not state-changing, and SameSite=Lax already governs top-level
+        // navigation. Refusing origin-less GETs would break ordinary links.
+        assert!(origin_is_allowed(&HeaderMap::new(), &Method::GET, "https://oms.example.com"));
+    }
+
+    #[test]
+    fn a_trailing_slash_in_the_configured_url_does_not_break_the_match() {
+        let headers = with_origin("https://oms.example.com");
+
+        assert!(origin_is_allowed(&headers, &Method::POST, "https://oms.example.com/"));
     }
 
     #[test]
