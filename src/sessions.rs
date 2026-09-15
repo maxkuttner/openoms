@@ -10,6 +10,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use axum::http::{HeaderMap, Method};
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
 
 /// Written to the browser once; only its hash is ever stored.
 pub struct SessionToken {
@@ -134,6 +136,100 @@ pub fn origin_is_allowed(headers: &HeaderMap, method: &Method, public_base_url: 
         return false;
     };
     origin.trim_end_matches('/') == public_base_url.trim_end_matches('/')
+}
+
+pub struct SessionRecord {
+    pub id: Uuid,
+    pub principal_id: Uuid,
+    pub principal_code: String,
+    pub last_seen_at: DateTime<Utc>,
+    pub absolute_expires_at: DateTime<Utc>,
+}
+
+pub async fn create_session(
+    pool: &PgPool,
+    principal_id: Uuid,
+    ttl: &SessionTtl,
+    user_agent: Option<&str>,
+) -> Result<SessionToken, sqlx::Error> {
+    let token = generate_session_token();
+    sqlx::query(
+        "INSERT INTO user_session (principal_id, token_hash, absolute_expires_at, user_agent) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(principal_id)
+    .bind(&token.hash)
+    .bind(absolute_expiry(Utc::now(), ttl))
+    .bind(user_agent)
+    .execute(pool)
+    .await?;
+    Ok(token)
+}
+
+/// Resolve a cookie value to its session, joining `principal` so a disabled
+/// principal's sessions stop resolving — the same rule `verify_key` applies to
+/// API keys.
+pub async fn lookup_session(
+    pool: &PgPool,
+    token_hash: &str,
+) -> Result<Option<SessionRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT s.id, s.principal_id, p.code AS principal_code, \
+                s.last_seen_at, s.absolute_expires_at \
+         FROM user_session s \
+         JOIN principal p ON p.id = s.principal_id \
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status = 'ACTIVE'",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| SessionRecord {
+        id: r.get("id"),
+        principal_id: r.get("principal_id"),
+        principal_code: r.get("principal_code"),
+        last_seen_at: r.get("last_seen_at"),
+        absolute_expires_at: r.get("absolute_expires_at"),
+    }))
+}
+
+pub async fn touch_session(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE user_session SET last_seen_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn revoke_session(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE user_session SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn revoke_all_for_principal(
+    pool: &PgPool,
+    principal_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE user_session SET revoked_at = now() \
+         WHERE principal_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(principal_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete sessions past their absolute cap. Idle expiry is enforced on read, so
+/// this only clears what can never resolve again.
+pub async fn sweep_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM user_session WHERE absolute_expires_at < now()")
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 #[cfg(test)]
@@ -298,5 +394,106 @@ mod tests {
     #[test]
     fn no_cookie_header_is_not_an_error() {
         assert_eq!(cookie_from_headers(&axum::http::HeaderMap::new(), "oms_session"), None);
+    }
+
+    /// Round trip against a real database. The store is nothing but SQL, so a
+    /// test without Postgres would only be testing sqlx.
+    ///
+    /// Run with: cargo test -- --ignored
+    /// Requires: a live Postgres reachable via the usual POSTGRES_* config.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_session_lives_until_it_is_revoked() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "session-store-test").await;
+
+        let token = create_session(&pool, principal_id, &SessionTtl::default(), Some("test-agent"))
+            .await
+            .expect("create");
+
+        let found = lookup_session(&pool, &token.hash).await.expect("lookup").expect("present");
+        assert_eq!(found.principal_id, principal_id);
+        assert_eq!(found.principal_code, principal_code);
+
+        touch_session(&pool, found.id).await.expect("touch");
+        revoke_session(&pool, found.id).await.expect("revoke");
+
+        assert!(
+            lookup_session(&pool, &token.hash).await.expect("lookup").is_none(),
+            "a revoked session must not resolve"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_disabled_principal_loses_its_sessions() {
+        let pool = test_pool().await;
+        let (principal_id, _principal_code) = seed_principal(&pool, "session-disable-test").await;
+        let token = create_session(&pool, principal_id, &SessionTtl::default(), None)
+            .await
+            .expect("create");
+
+        sqlx::query("UPDATE principal SET status = 'DISABLED' WHERE id = $1")
+            .bind(principal_id)
+            .execute(&pool)
+            .await
+            .expect("disable");
+
+        assert!(lookup_session(&pool, &token.hash).await.expect("lookup").is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn revoking_a_principal_kills_every_one_of_its_sessions() {
+        let pool = test_pool().await;
+        let (principal_id, _principal_code) = seed_principal(&pool, "session-revoke-all-test").await;
+        let a = create_session(&pool, principal_id, &SessionTtl::default(), None).await.expect("a");
+        let b = create_session(&pool, principal_id, &SessionTtl::default(), None).await.expect("b");
+
+        let killed = revoke_all_for_principal(&pool, principal_id).await.expect("revoke all");
+
+        assert_eq!(killed, 2);
+        assert!(lookup_session(&pool, &a.hash).await.expect("a").is_none());
+        assert!(lookup_session(&pool, &b.hash).await.expect("b").is_none());
+    }
+
+    // ── test plumbing ────────────────────────────────────────────────────────
+
+    /// `main` loads .env before resolving config; a test binary does not, so
+    /// without this the test resolves a different database than the server runs
+    /// against. The `oms` role carries `search_path = oms, public`
+    /// (db/access/roles.sql); these are the admin credentials, so set it here.
+    async fn test_pool() -> sqlx::PgPool {
+        use crate::setup::database::config;
+        dotenvy::dotenv().ok();
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .expect("connect")
+    }
+
+    /// `principal.code` is `UNIQUE` and these tests leave their rows behind, so
+    /// the code is suffixed with the row's own id. Returns the id and the code
+    /// actually inserted, since callers assert against it.
+    async fn seed_principal(pool: &sqlx::PgPool, code: &str) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let code = format!("{code}-{id}");
+        sqlx::query(
+            "INSERT INTO principal (id, code, principal_type, display_name, status) \
+             VALUES ($1, $2, 'HUMAN', $2, 'ACTIVE')",
+        )
+        .bind(id)
+        .bind(&code)
+        .execute(pool)
+        .await
+        .expect("seed principal");
+        (id, code)
     }
 }
