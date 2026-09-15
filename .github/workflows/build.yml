@@ -115,3 +115,16 @@ jobs:
       - uses: actions/checkout@v4
       # shellcheck is preinstalled on the GitHub Ubuntu images.
       - run: shellcheck install.sh cockpit/check-api-base.sh
+
+  site:
+    name: site build script tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # No package.json here on purpose: node's built-in test runner needs none.
+      - run: node --test site/

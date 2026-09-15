@@ -46,13 +46,20 @@ jobs:
 
       # CI-only dependency: it pulls headless Chromium, which is why it is not in
       # any committed manifest and not a devDependency of the cockpit.
+      #
+      # Pinned: the rendered SVGs are the published artifact and their
+      # appearance is version-dependent (11.17 reads rowOdd/rowEven where
+      # 11.16 read attributeBackgroundColorOdd/Even — see site/diagrams/
+      # mermaid-config.json). 11.17.0 is the exact version the diagrams were
+      # rehearsed and visually checked against; bump deliberately, not by
+      # letting an unrelated push silently re-render against latest.
       - name: render the diagrams
         run: |
-          npm i -g @mermaid-js/mermaid-cli
+          npm i -g @mermaid-js/mermaid-cli@11.17.0
           mkdir -p _site/diagrams
           for f in site/diagrams/*.mmd; do
             n="$(basename "$f" .mmd)"
-            mmdc -i "$f" -o "_site/diagrams/$n.svg" -c site/diagrams/mermaid-config.json -b transparent
+            mmdc -i "$f" -o "_site/diagrams/$n.svg" -c site/diagrams/mermaid-config.json -b transparent -I "$n"
           done
           ls -la _site/diagrams
 
