@@ -272,6 +272,12 @@ impl Provider {
         // before it is stored.
         refuse_insecure_endpoint(&token_endpoint, "token")?;
         let jwks_uri = metadata.jwks_uri().clone();
+        // The worst of the three to leave unguarded: an attacker who can
+        // substitute the key set served from here can sign arbitrary ID
+        // tokens that then pass `verify_id_token` — every other hardening in
+        // the verifier becomes irrelevant once the keys themselves are
+        // attacker-controlled.
+        refuse_insecure_endpoint(jwks_uri.as_str(), "jwks")?;
 
         let keys = JsonWebKeySet::fetch_async(&jwks_uri, &http_client)
             .await
@@ -684,22 +690,35 @@ mod tests {
         assert_eq!(provider.redirect_uri(), "https://oms.example.com/auth/callback");
     }
 
+    /// `refuse_insecure_endpoint` is called identically for all three
+    /// discovered endpoints (`discover`'s `authorization`/`token`/`jwks`
+    /// call sites) — exercised here by label so a future call site that
+    /// forgets the check is the only way any of the three could go
+    /// unguarded, not a gap in what's tested.
+    const ENDPOINT_LABELS: [&str; 3] = ["authorization", "token", "jwks"];
+
     #[test]
     fn an_https_endpoint_is_always_trusted() {
-        assert!(refuse_insecure_endpoint("https://id.example.com/token", "token").is_ok());
+        for label in ENDPOINT_LABELS {
+            assert!(refuse_insecure_endpoint("https://id.example.com/x", label).is_ok());
+        }
     }
 
     #[test]
     fn an_http_endpoint_on_loopback_is_tolerated_for_local_development() {
-        assert!(refuse_insecure_endpoint("http://localhost:8080/token", "token").is_ok());
-        assert!(refuse_insecure_endpoint("http://127.0.0.1:8080/token", "token").is_ok());
-        assert!(refuse_insecure_endpoint("http://[::1]:8080/token", "token").is_ok());
+        for label in ENDPOINT_LABELS {
+            assert!(refuse_insecure_endpoint("http://localhost:8080/x", label).is_ok());
+            assert!(refuse_insecure_endpoint("http://127.0.0.1:8080/x", label).is_ok());
+            assert!(refuse_insecure_endpoint("http://[::1]:8080/x", label).is_ok());
+        }
     }
 
     #[test]
     fn an_http_endpoint_off_loopback_is_refused() {
-        let err = refuse_insecure_endpoint("http://id.example.com/token", "token").unwrap_err();
-        assert!(matches!(err, OidcError::ProviderUnavailable(_)));
+        for label in ENDPOINT_LABELS {
+            let err = refuse_insecure_endpoint("http://id.example.com/x", label).unwrap_err();
+            assert!(matches!(err, OidcError::ProviderUnavailable(_)));
+        }
     }
 
     #[test]
