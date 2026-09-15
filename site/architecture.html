@@ -52,13 +52,22 @@
       <section>
         <h2>End to end</h2>
         <p class="after">
-          One catalog in the middle, an adapter at each end. A feed translates its own symbols
-          through <code>FeedSymbology</code>; a broker publishes its tradable catalog through
-          <code>InstrumentProvider</code>. Each adapter owns its own symbology, so neither end
-          knows the other exists.
+          One catalog in the middle, an adapter at each end. Brokers <b>write</b> it:
+          <code>sync-broker</code> asks each broker's <code>InstrumentProvider</code> what it
+          lists and stores that as <code>instrument</code> plus a <code>broker_instrument</code>
+          routing row. Feeds only <b>read</b> it: at subscribe time
+          <code>FeedSymbology.candidates()</code> picks the slice of the catalog that feed
+          covers and <code>to_feed_symbol()</code> renames each hit into whatever that feed
+          calls it.
+        </p>
+        <p class="after">
+          That second mapping is computed, not stored — there is no feed table anywhere. It is
+          rebuilt from the catalog on every subscription, which is why a broker sync that adds
+          instruments needs no follow-up step to make them priceable, and why nothing can go
+          stale. Each adapter owns its own symbology, so neither end knows the other exists.
         </p>
         <figure class="diagram" data-diagram="overview">
-          <figcaption>How feeds, instruments and broker connections relate</figcaption>
+          <figcaption>Brokers write the catalog; feeds read it and rename in memory</figcaption>
         </figure>
       </section>
 
