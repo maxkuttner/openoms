@@ -20,6 +20,12 @@ pub enum ResolveOutcome {
     /// `required_claim` is configured and the identity's claims don't satisfy
     /// it. No principal was read, created, or touched.
     ClaimRejected,
+    /// `external_subject` already belongs to a row this subject must never
+    /// resolve onto or touch — a non-HUMAN principal (SERVICE, STRATEGY,
+    /// DESK) or a DISABLED one. Nothing was created or modified: this is a
+    /// refusal, not a provisioning opportunity, since `external_subject` is
+    /// UNIQUE and this subject can never claim a different row.
+    SubjectNotAvailable,
 }
 
 /// Match an authenticated subject to its principal, creating one on first sight.
@@ -74,18 +80,33 @@ pub async fn resolve_or_provision(
     // error: whichever insert loses the race just updates the winner's row
     // (display_name only — code, id, and grants are untouched) and returns
     // it, same as if it had matched on the lookup above.
+    //
+    // The DO UPDATE's WHERE guard is load-bearing: without it, a conflict
+    // against a SERVICE/STRATEGY/DESK or DISABLED principal would still fire
+    // the update and hand this subject that row's id, code, and every grant
+    // it holds — a privilege escalation. With the guard, a conflict against
+    // such a row satisfies no WHERE clause, so DO UPDATE affects zero rows
+    // and RETURNING yields nothing: `fetch_optional` sees `None`, and that is
+    // treated as a refusal below, not as "nothing happened, fall through to
+    // provisioning" (this row already exists — provisioning would collide on
+    // the UNIQUE external_subject too).
     let row = sqlx::query(
         "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
          VALUES ($1, $2, 'HUMAN', $3, $4, 'ACTIVE') \
          ON CONFLICT (external_subject) DO UPDATE SET display_name = EXCLUDED.display_name \
+         WHERE principal.principal_type = 'HUMAN' AND principal.status = 'ACTIVE' \
          RETURNING id, code",
     )
     .bind(Uuid::new_v4())
     .bind(&code)
     .bind(&identity.subject)
     .bind(&identity.display_name)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
+
+    let Some(row) = row else {
+        return Ok(ResolveOutcome::SubjectNotAvailable);
+    };
 
     Ok(ResolveOutcome::Resolved {
         principal_id: row.get("id"),
@@ -224,12 +245,66 @@ mod tests {
         assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
     }
 
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_subject_already_held_by_a_service_principal_is_refused_not_hijacked() {
+        let pool = test_pool().await;
+        let subject = format!("sub-{}", Uuid::new_v4());
+        let (service_id, original_name) = seed_service_principal_with_subject(&pool, &subject).await;
+
+        // An attacker-controlled display_name must not leak into the service
+        // principal even though the ON CONFLICT arbiter (external_subject)
+        // does match this row.
+        let mut identity = identity_for(&subject);
+        identity.display_name = Some("Attacker-Controlled Name".to_string());
+
+        let outcome = resolve_or_provision(&pool, &identity, None).await.expect("resolve");
+
+        assert!(matches!(outcome, ResolveOutcome::SubjectNotAvailable));
+
+        let principal_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM principal WHERE external_subject = $1")
+                .bind(&subject)
+                .fetch_one(&pool)
+                .await
+                .expect("count principals for subject");
+        assert_eq!(principal_count, 1, "no second principal must be created for a taken subject");
+
+        let name: String = sqlx::query_scalar("SELECT display_name FROM principal WHERE id = $1")
+            .bind(service_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read display_name");
+        assert_eq!(name, original_name, "the service principal must not be touched");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_subject_held_by_a_disabled_human_is_refused_not_reactivated() {
+        let pool = test_pool().await;
+        let subject = format!("sub-{}", Uuid::new_v4());
+        let disabled_id = seed_disabled_human_with_subject(&pool, &subject).await;
+
+        let outcome = resolve_or_provision(&pool, &identity_for(&subject), None)
+            .await
+            .expect("resolve");
+
+        assert!(matches!(outcome, ResolveOutcome::SubjectNotAvailable));
+
+        let status: String = sqlx::query_scalar("SELECT status FROM principal WHERE id = $1")
+            .bind(disabled_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read status");
+        assert_eq!(status, "DISABLED", "a disabled principal must not be reactivated by a login attempt");
+    }
+
     // ── test plumbing ────────────────────────────────────────────────────────
 
     fn principal_id_of(outcome: &ResolveOutcome) -> Uuid {
         match outcome {
             ResolveOutcome::Resolved { principal_id, .. } => *principal_id,
-            ResolveOutcome::ClaimRejected => panic!("expected a resolved principal"),
+            _ => panic!("expected a resolved principal"),
         }
     }
 
@@ -281,6 +356,50 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed principal");
+        id
+    }
+
+    /// Seeds an ACTIVE SERVICE principal already bound to `subject` — the
+    /// scenario where a human's `sub` collides with a machine credential's.
+    /// Returns its id and the `display_name` it was seeded with, so callers
+    /// can assert that name survives untouched.
+    async fn seed_service_principal_with_subject(
+        pool: &sqlx::PgPool,
+        subject: &str,
+    ) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let code = format!("service-{id}");
+        let display_name = format!("Service {id}");
+        sqlx::query(
+            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
+             VALUES ($1, $2, 'SERVICE', $3, $4, 'ACTIVE')",
+        )
+        .bind(id)
+        .bind(&code)
+        .bind(subject)
+        .bind(&display_name)
+        .execute(pool)
+        .await
+        .expect("seed service principal");
+        (id, display_name)
+    }
+
+    /// Seeds a DISABLED HUMAN principal already bound to `subject` — e.g. an
+    /// offboarded user whose `external_subject` an admin never cleared.
+    /// Returns its id.
+    async fn seed_disabled_human_with_subject(pool: &sqlx::PgPool, subject: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let code = format!("disabled-{id}");
+        sqlx::query(
+            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
+             VALUES ($1, $2, 'HUMAN', $3, $2, 'DISABLED')",
+        )
+        .bind(id)
+        .bind(&code)
+        .bind(subject)
+        .execute(pool)
+        .await
+        .expect("seed disabled principal");
         id
     }
 }

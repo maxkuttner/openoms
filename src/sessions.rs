@@ -202,7 +202,9 @@ pub async fn create_session(
 
 /// Resolve a cookie value to its session, joining `principal` so a disabled
 /// principal's sessions stop resolving — the same rule `verify_key` applies to
-/// API keys.
+/// API keys. Also requires `principal_type = 'HUMAN'`: a SERVICE or STRATEGY
+/// principal must never hold a browser session, even if a row somehow carries
+/// a live `user_session` for it.
 pub async fn lookup_session(
     pool: &PgPool,
     token_hash: &str,
@@ -212,7 +214,8 @@ pub async fn lookup_session(
                 s.last_seen_at, s.absolute_expires_at \
          FROM user_session s \
          JOIN principal p ON p.id = s.principal_id \
-         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status = 'ACTIVE'",
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status = 'ACTIVE' \
+               AND p.principal_type = 'HUMAN'",
     )
     .bind(token_hash)
     .fetch_optional(pool)
