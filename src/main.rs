@@ -13,6 +13,7 @@ mod symbology_resolver;
 mod setup;
 mod sessions;
 mod oidc;
+mod auth_api;
 
 use crate::adapters::BrokerRegistry;
 use crate::app_state::AppState;
