@@ -48,10 +48,58 @@ test("curlFor builds a request against the documented path", () => {
   assert.match(curl, /SPY@ARCX/, "the body should use the schema's example");
 });
 
+test("renderApi shows a body panel for a map-shaped (additionalProperties) request body", () => {
+  // Mirrors CredentialSubmission: no named `properties`, so bodyFields is
+  // empty, but the body itself is real and its description must not be
+  // dropped — and the curl example must not read as an empty, safe-to-run '{}'.
+  const credSpec = {
+    ...spec,
+    paths: {
+      "/admin/broker-connections/{code}/credentials": {
+        put: {
+          tags: ["admin"],
+          summary: "Set broker credentials",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/CredentialSubmission" },
+              },
+            },
+          },
+          responses: { 200: { description: "ok" } },
+        },
+      },
+    },
+    components: {
+      schemas: {
+        CredentialSubmission: {
+          type: "object",
+          description: "A submitted credential form: field name to raw string value.",
+          additionalProperties: { type: "string" },
+        },
+      },
+    },
+  };
+
+  const html = renderApi(credSpec);
+  assert.match(html, /Request body/, "no body panel rendered for a map-shaped body");
+  assert.match(
+    html,
+    /A submitted credential form: field name to raw string value\./,
+    "the body's description was dropped",
+  );
+  assert.match(html, /any field name/i, "no indication the body accepts arbitrary field names");
+});
+
 test("escapeHtml neutralises markup from the spec", () => {
   // Descriptions come from doc comments in Rust source; a stray angle bracket
   // must not become a tag in the generated page.
   assert.equal(escapeHtml(`<script>"x"&`), "&lt;script&gt;&quot;x&quot;&amp;");
+  // Not just double quotes: every interpolation site in this file happens to
+  // use double-quoted attributes today, but that's an invariant this
+  // function shouldn't rely on.
+  assert.equal(escapeHtml(`it's <b>"bold"</b>`), "it&#39;s &lt;b&gt;&quot;bold&quot;&lt;/b&gt;");
 });
 
 test("renderApi emits one section per tag and documents each operation", () => {

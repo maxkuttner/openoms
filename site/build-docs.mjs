@@ -116,7 +116,8 @@ export function escapeHtml(s) {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 const slug = (m, p) => `${m}-${p}`.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
@@ -204,23 +205,38 @@ function renderOperation(spec, entry) {
       )
     : "";
 
-  const bodyHtml = bodyFields.length
+  // Gated on the body existing, not on bodyFields.length: a map-shaped body
+  // (additionalProperties, no named `properties`) has no fields to list but
+  // is still a real body — its description still belongs on the page, and
+  // curlFor still emits a --data example for it, so silence here would be
+  // misleading rather than merely empty.
+  const bodyHtml = body
     ? renderPanel(
         "Request body",
         (body?.description
           ? `<div class="docs-row-desc docs-body-desc">${escapeHtml(body.description)}</div>`
           : "") +
-          bodyFields
-            .map(([name, s]) =>
-              renderRow({
-                name,
-                type: typeLabel(spec, s),
-                required: body?.required?.includes(name),
-                example: resolve(spec, s)?.example,
-                desc: resolve(spec, s)?.description,
-              }),
-            )
-            .join(""),
+          (bodyFields.length
+            ? bodyFields
+                .map(([name, s]) =>
+                  renderRow({
+                    name,
+                    type: typeLabel(spec, s),
+                    required: body?.required?.includes(name),
+                    example: resolve(spec, s)?.example,
+                    desc: resolve(spec, s)?.description,
+                  }),
+                )
+                .join("")
+            : body.additionalProperties
+              ? renderRow({
+                  name: "(any field name)",
+                  type:
+                    body.additionalProperties === true
+                      ? "any"
+                      : `${typeLabel(spec, body.additionalProperties)} value`,
+                })
+              : ""),
       )
     : "";
 
@@ -366,6 +382,15 @@ function main() {
   const repoRoot = path.resolve(here, "..");
   const specPath = path.join(repoRoot, "docs", "openapi.json");
   const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
+
+  // Malformed JSON already throws (JSON.parse above); this catches the other
+  // way a spec can be broken without being invalid JSON — present but empty
+  // `paths`, which would otherwise build and deploy a reference with no
+  // endpoints. Mirrors the Rust test `the_openapi_subcommand_renders_a_usable_spec`,
+  // which asserts the same thing on the `oms openapi` output.
+  if (!spec.paths || Object.keys(spec.paths).length === 0) {
+    throw new Error(`build-docs: docs/openapi.json has no paths — is it stale or truncated?`);
+  }
 
   const outDir = path.resolve(process.argv[2] ?? "_site");
   fs.mkdirSync(outDir, { recursive: true });
