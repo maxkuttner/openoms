@@ -91,10 +91,19 @@ pub struct CookiePolicy {
 ///
 /// `ttl` is `SessionTtl::default()` for now; a later task sources it from
 /// configuration instead.
+///
+/// `public_base_url` is the CSRF origin check's expected value (see
+/// `origin_is_allowed`). It must be a *configured* value, never derived from
+/// a request's own `Host` header — a `Host`-derived expectation moves with
+/// whatever `Host` an attacker sends (DNS rebinding, a proxy forwarding an
+/// attacker-controlled `Host`), so the check would always pass. `None` for
+/// now — a later task sources it from OIDC configuration, which is also the
+/// only place a session can ever be minted (see `auth::auth_middleware`).
 #[derive(Clone)]
 pub struct SessionConfig {
     pub cookie_policy: CookiePolicy,
     pub ttl: SessionTtl,
+    pub public_base_url: Option<String>,
 }
 
 pub fn cookie_policy(bind_addr: &str) -> CookiePolicy {

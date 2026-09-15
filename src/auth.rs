@@ -109,21 +109,44 @@ pub async fn auth_middleware(
         .await?
         .ok_or_else(unauthorized)?;
 
-    if kind == CredentialKind::Session {
-        let host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let scheme = if state.session_config.cookie_policy.secure { "https" } else { "http" };
-        let expected_origin = format!("{scheme}://{host}");
-        if !crate::sessions::origin_is_allowed(req.headers(), req.method(), &expected_origin) {
-            return Err(forbidden());
-        }
-    }
+    enforce_origin_for_session(kind, req.headers(), req.method(), &state.session_config)?;
 
     req.extensions_mut().insert(ctx);
     Ok(next.run(req).await)
+}
+
+/// The CSRF origin check, applied to `Session`-authenticated requests only —
+/// a no-op for `ApiKey`, which never carries an `Origin` header at all (the
+/// existing Python client and `oms` CLI would fail every request if gated on
+/// it).
+///
+/// The expected origin must be a *configured* value (`session_config`'s
+/// `public_base_url`), never derived from this request's own `Host` header —
+/// a `Host`-derived expectation moves with whatever `Host` an attacker sends
+/// (DNS rebinding, a proxy forwarding an attacker-controlled `Host`), so the
+/// check would always pass.
+///
+/// `None` is refused rather than falling back to anything derived from the
+/// request: in practice this branch is unreachable, since a session can only
+/// ever be minted by the OIDC callback, and OIDC configuration always
+/// carries `public_base_url` alongside it. If it's missing here anyway, fail
+/// closed.
+fn enforce_origin_for_session(
+    kind: CredentialKind,
+    headers: &axum::http::HeaderMap,
+    method: &axum::http::Method,
+    session_config: &SessionConfig,
+) -> Result<(), Response> {
+    if kind != CredentialKind::Session {
+        return Ok(());
+    }
+    let Some(public_base_url) = session_config.public_base_url.as_deref() else {
+        return Err(forbidden());
+    };
+    if !crate::sessions::origin_is_allowed(headers, method, public_base_url) {
+        return Err(forbidden());
+    }
+    Ok(())
 }
 
 /// Look up an active api key by `key_id` and bcrypt-verify `secret`. Returns
@@ -259,7 +282,71 @@ mod tests {
     use crate::sessions::{cookie_policy, SessionTtl};
 
     fn session_config() -> SessionConfig {
-        SessionConfig { cookie_policy: cookie_policy("localhost:3001"), ttl: SessionTtl::default() }
+        SessionConfig {
+            cookie_policy: cookie_policy("localhost:3001"),
+            ttl: SessionTtl::default(),
+            public_base_url: None,
+        }
+    }
+
+    #[test]
+    fn a_session_authenticated_state_change_is_refused_when_no_base_url_is_configured() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("origin", "https://oms.example.com".parse().unwrap());
+
+        let result = enforce_origin_for_session(
+            CredentialKind::Session,
+            &headers,
+            &axum::http::Method::POST,
+            &session_config(), // public_base_url: None
+        );
+
+        assert!(result.is_err(), "no configured base URL must fail closed, not fall back to anything request-derived");
+    }
+
+    #[test]
+    fn a_session_authenticated_state_change_is_allowed_when_the_origin_matches_the_configured_base_url() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("origin", "https://oms.example.com".parse().unwrap());
+        let mut config = session_config();
+        config.public_base_url = Some("https://oms.example.com".to_string());
+
+        assert!(enforce_origin_for_session(
+            CredentialKind::Session,
+            &headers,
+            &axum::http::Method::POST,
+            &config,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_session_authenticated_state_change_is_refused_when_the_origin_does_not_match() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("origin", "https://evil.example.com".parse().unwrap());
+        let mut config = session_config();
+        config.public_base_url = Some("https://oms.example.com".to_string());
+
+        assert!(enforce_origin_for_session(
+            CredentialKind::Session,
+            &headers,
+            &axum::http::Method::POST,
+            &config,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_api_key_request_is_never_gated_on_origin_even_with_no_base_url_configured() {
+        // The existing Python client and `oms` CLI send a Bearer token and no
+        // Origin header at all — this must never be refused on that basis.
+        assert!(enforce_origin_for_session(
+            CredentialKind::ApiKey,
+            &axum::http::HeaderMap::new(),
+            &axum::http::Method::POST,
+            &session_config(), // public_base_url: None
+        )
+        .is_ok());
     }
 
     #[tokio::test]

@@ -275,6 +275,7 @@ mod tests {
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001"),
                 ttl: crate::sessions::SessionTtl::default(),
+                public_base_url: None,
             },
         )
     }

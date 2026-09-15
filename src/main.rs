@@ -896,10 +896,14 @@ async fn serve() {
     // `__Host-`-prefixed cookies only where HTTPS can actually back them — see
     // `sessions::cookie_policy`) rather than recomputed on every request.
     // `SessionTtl::default()` for now; a later task sources idle/absolute TTL
-    // from configuration instead.
+    // from configuration instead. `public_base_url: None` likewise — a later
+    // task wires it in from OIDC configuration; until then, a session-
+    // authenticated request fails closed on the CSRF origin check rather than
+    // trusting anything derived from the request itself (see `auth_middleware`).
     let session_config = sessions::SessionConfig {
         cookie_policy: sessions::cookie_policy(&bind_addr),
         ttl: sessions::SessionTtl::default(),
+        public_base_url: None,
     };
 
     let state = AppState::new(
