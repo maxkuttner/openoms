@@ -984,6 +984,55 @@
         ]
       }
     },
+    "/admin/orders/{id}/events": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get_order_events_admin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Order ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The order's audit trail, oldest event first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrderEventView"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid UUID"
+          },
+          "404": {
+            "description": "Order not found"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/portfolios": {
       "get": {
         "tags": [
@@ -2398,6 +2447,58 @@
         ]
       }
     },
+    "/orders/{id}/events": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "get_order_events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Order ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The order's audit trail, oldest event first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OrderEventView"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid UUID"
+          },
+          "403": {
+            "description": "No view grant for principal/portfolio"
+          },
+          "404": {
+            "description": "Order not found"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/portfolios": {
       "get": {
         "tags": [
@@ -3288,6 +3389,66 @@
           },
           "time_in_force": {
             "$ref": "#/components/schemas/TimeInForce"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "OrderEventView": {
+        "type": "object",
+        "description": "One entry in an order's audit trail.\n\n`occurred_at` is when the domain decided the event; `recorded_at` is when the\nstore appended it. They differ for anything that arrives from a broker stream,\nand an auditor wants both.",
+        "required": [
+          "version",
+          "event_id",
+          "event_type",
+          "actor",
+          "occurred_at",
+          "recorded_at",
+          "schema_version",
+          "summary",
+          "payload"
+        ],
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "causation_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "correlation_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "payload": {
+            "description": "The event body exactly as stored — the forensic record, not a rendering of it."
+          },
+          "recorded_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "schema_version": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "status_after": {
+            "type": "string",
+            "nullable": true
+          },
+          "summary": {
+            "type": "string"
           },
           "version": {
             "type": "integer",

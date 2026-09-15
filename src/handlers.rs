@@ -140,7 +140,7 @@ impl SubmitOrderRequest {
 
 /// Which entitlement a route demands on the portfolio an order books against.
 #[derive(Clone, Copy)]
-enum OrderPermission {
+pub(crate) enum OrderPermission {
     View,
     Trade,
 }
@@ -165,7 +165,7 @@ impl OrderPermission {
 /// A missing order is 404 and an unentitled one is 403 — deliberately distinguished.
 /// Collapsing both to 404 would hide typos behind "not found"; order ids are UUIDs, so
 /// confirming one exists tells an attacker who already guessed it nothing new.
-async fn require_order_grant(
+pub(crate) async fn require_order_grant(
     pool: &PgPool,
     principal_id: Uuid,
     order_id: Uuid,

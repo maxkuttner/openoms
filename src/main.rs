@@ -1,5 +1,6 @@
 mod adapters;
 mod event_store;
+mod order_events;
 mod domain;
 mod handlers;
 mod models;
@@ -84,6 +85,8 @@ mod reload_tests;
         handlers::create_allocations,
         handlers::list_allocations,
         handlers::get_orders_blotter,
+        order_events::get_order_events,
+        order_events::get_order_events_admin,
         admin::create_principal,
         admin::list_principals,
         admin::get_principal,
@@ -136,6 +139,7 @@ mod reload_tests;
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         crate::positions::Position,
         Allocation, CreateAllocations, AllocationSplit, BlotterRow,
+        order_events::OrderEventView,
         handlers::GrantedPortfolio,
         Principal, Portfolio, Account, BrokerConnection,
         CreatePrincipal, UpdatePrincipal,
@@ -1078,6 +1082,7 @@ async fn serve() {
         .route("/orders/submit", post(handlers::orders_submit))
         .route("/orders/cancel", post(handlers::orders_cancel))
         .route("/orders/:id", get(handlers::get_order))
+        .route("/orders/:id/events", get(order_events::get_order_events))
         .route("/orders", get(handlers::list_orders))
         .route("/portfolios", get(handlers::list_portfolios))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
@@ -1090,6 +1095,10 @@ async fn serve() {
     // 2) Register admin routes (protected by static bearer token only)
     let admin_router = Router::new()
         .route("/admin/orders", get(handlers::get_orders_blotter))
+        .route(
+            "/admin/orders/:id/events",
+            get(order_events::get_order_events_admin),
+        )
         .route(
             "/admin/principals",
             post(admin::create_principal).get(admin::list_principals),
