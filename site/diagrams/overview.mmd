@@ -3,14 +3,14 @@ flowchart LR
   BNB["Binance<br/>crypto spot"]:::exec
   IP["InstrumentProvider<br/>list_instruments()"]:::exec
 
-  subgraph STORE["stored in Postgres"]
+  subgraph STORE["the catalog — two Postgres tables, survive restarts"]
     direction TB
-    INST[("instrument<br/><b>symbol @ venue</b>")]:::core
-    BI[("broker_instrument")]:::exec
+    INST[("instrument<br/><b>symbol @ venue</b><br/>what exists, one row each")]:::core
+    BI[("broker_instrument<br/>how to route it,<br/>one row per broker")]:::exec
   end
 
-  subgraph MEM["in memory only"]
-    FS["FeedSymbology<br/>candidates() · to_feed_symbol()"]:::feed
+  subgraph MEM["no table — recomputed on every subscribe"]
+    FS["FeedSymbology<br/>candidates() picks the slice<br/>to_feed_symbol() renames it"]:::feed
   end
 
   DBN["Databento<br/>OPRA options"]:::feed
