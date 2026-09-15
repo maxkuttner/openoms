@@ -11,6 +11,7 @@ Usage:
     oms positions <portfolio_id>
     oms orders list [--status routed] [--portfolio ID] [--limit 20]
     oms orders get <order_id>
+    oms orders history <order_id>
     oms orders cancel <order_id> [--reason "..."]
     oms submit --portfolio ID --symbol SPY260918C00770000@OPRA --side buy --qty 1
     oms submit --portfolio ID --symbol AAPL --venue XNAS --side buy --qty 10 \
@@ -124,6 +125,14 @@ def cmd_orders_get(args: argparse.Namespace) -> None:
     print(json.dumps(dataclasses.asdict(order), indent=2))
 
 
+def cmd_orders_history(args: argparse.Namespace) -> None:
+    _emit(
+        args,
+        _client(args).order_events(args.order_id),
+        ["version", "occurred_at", "event_type", "actor", "summary"],
+    )
+
+
 def cmd_orders_cancel(args: argparse.Namespace) -> None:
     outcome = _client(args).cancel(args.order_id, reason=args.reason)
     if outcome == "pending":
@@ -187,6 +196,12 @@ def build_parser() -> argparse.ArgumentParser:
     get = osub.add_parser("get", parents=[common], help="one order's full state")
     get.add_argument("order_id")
     get.set_defaults(func=cmd_orders_get)
+
+    hist = osub.add_parser(
+        "history", parents=[common], help="one order's audit trail, oldest event first"
+    )
+    hist.add_argument("order_id")
+    hist.set_defaults(func=cmd_orders_history)
 
     can = osub.add_parser("cancel", parents=[common], help="cancel an order")
     can.add_argument("order_id")

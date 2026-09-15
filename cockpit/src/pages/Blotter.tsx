@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { Group, Title, Table, Select, Loader, Text, Badge, Stack, Button, Tooltip } from "@mantine/core";
+import { Group, Title, Table, Select, Loader, Text, Badge, Stack, Button, Tooltip, Drawer } from "@mantine/core";
 import { useList } from "../api/hooks";
 import { InstrumentSelect } from "../components/InstrumentSelect";
+import { OrderTimeline } from "../components/OrderTimeline";
 import type { BlotterRow, Portfolio, Principal } from "../api/types";
 
 const STATUSES = ["submitted", "routed", "partially_filled", "filled", "canceled", "rejected", "expired"].map(
@@ -23,6 +24,7 @@ export function BlotterPage() {
   const [portfolioId, setPortfolioId] = useState<string | null>(null);
   const [principalId, setPrincipalId] = useState<string | null>(null);
   const [instrument, setInstrument] = useState<string | null>(null);
+  const [selected, setSelected] = useState<BlotterRow | null>(null);
 
   const portfolios = useList<Portfolio>("/admin/portfolios");
   const principals = useList<Principal>("/admin/principals");
@@ -45,6 +47,7 @@ export function BlotterPage() {
   return (
     <Stack>
       <Title order={3}>Blotter — who is trading what</Title>
+      <Text size="sm" c="dimmed" mt={-8}>Click an order for its full audit trail.</Text>
       <Group align="flex-end">
         <Select label="Status" data={STATUSES} value={status} onChange={setStatus} clearable w={160} />
         <Select
@@ -71,6 +74,28 @@ export function BlotterPage() {
         <Button variant="default" onClick={clear}>Clear</Button>
       </Group>
 
+      <Drawer
+        opened={selected !== null}
+        onClose={() => setSelected(null)}
+        position="right"
+        size="lg"
+        title={
+          selected && (
+            <Stack gap={0}>
+              <Text fw={600}>
+                {selected.instrument_symbol ?? selected.instrument_id} · {selected.side}{" "}
+                {selected.original_qty}
+              </Text>
+              <Text size="xs" c="dimmed">
+                {selected.order_id} · {selected.portfolio_code} · {selected.principal_code}
+              </Text>
+            </Stack>
+          )
+        }
+      >
+        {selected && <OrderTimeline orderId={selected.order_id} />}
+      </Drawer>
+
       {orders.isLoading ? (
         <Loader />
       ) : (
@@ -92,7 +117,11 @@ export function BlotterPage() {
           </Table.Thead>
           <Table.Tbody>
             {(orders.data ?? []).map((o) => (
-              <Table.Tr key={o.order_id}>
+              <Table.Tr
+                key={o.order_id}
+                onClick={() => setSelected(o)}
+                style={{ cursor: "pointer" }}
+              >
                 <Table.Td>{new Date(o.created_at).toLocaleString()}</Table.Td>
                 <Table.Td>{o.principal_code}</Table.Td>
                 <Table.Td>{o.portfolio_code}</Table.Td>

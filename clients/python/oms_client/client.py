@@ -31,6 +31,7 @@ from .models import (
     Allocation,
     BlotterRow,
     Order,
+    OrderEvent,
     Portfolio,
     Position,
     RowList,
@@ -154,6 +155,14 @@ class OMS:
     def order(self, order_id: str) -> Order:
         """Fetch one order's current state. Needs `can_view` on its portfolio."""
         return Order.from_dict(self._get_json(f"/orders/{order_id}"))
+
+    def order_events(self, order_id: str) -> "RowList[OrderEvent]":
+        """One order's audit trail, oldest event first. Needs `can_view`.
+
+        This is the order's history as the OMS recorded it — every state change,
+        immutable and complete, not a log written alongside one.
+        """
+        return parse_list(OrderEvent, self._get_json(f"/orders/{order_id}/events"))
 
     def orders(
         self,

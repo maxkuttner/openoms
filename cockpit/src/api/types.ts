@@ -202,6 +202,24 @@ export interface BlotterRow {
   updated_at: string;
 }
 
+/** One entry in an order's audit trail (GET /admin/orders/:id/events). */
+export interface OrderEvent {
+  version: number;
+  event_id: string;
+  event_type: string;
+  actor: string;
+  /** When the domain decided the event. */
+  occurred_at: string;
+  /** When the store appended it — later than `occurred_at` for broker-driven events. */
+  recorded_at: string;
+  status_after: string | null;
+  correlation_id: string | null;
+  causation_id: string | null;
+  schema_version: number;
+  summary: string;
+  payload: unknown;
+}
+
 export interface InstrumentSummary {
   id: number;
   symbol: string;

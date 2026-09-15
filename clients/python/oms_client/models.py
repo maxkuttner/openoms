@@ -91,6 +91,36 @@ class BlotterRow:
 
 
 @dataclass
+class OrderEvent:
+    """One entry in an order's audit trail, from ``GET /orders/{id}/events``.
+
+    `occurred_at` is when the domain decided the event; `recorded_at` is when the
+    store appended it. They diverge for anything a broker reported, and both are
+    part of the record.
+
+    `payload` stays a plain dict — it is the stored event body, and its shape is the
+    event type's, not one this client should flatten.
+    """
+
+    version: int
+    event_id: str
+    event_type: str
+    actor: str
+    occurred_at: str
+    recorded_at: str
+    schema_version: int
+    summary: str
+    payload: Dict[str, Any]
+    status_after: Optional[str] = None
+    correlation_id: Optional[str] = None
+    causation_id: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "OrderEvent":
+        return _of(cls, d)
+
+
+@dataclass
 class Portfolio:
     """A portfolio this token may act on, from ``GET /portfolios``.
 

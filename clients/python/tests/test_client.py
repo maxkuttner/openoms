@@ -244,3 +244,90 @@ def test_orders_keeps_supplied_filters():
     oms.orders(status="routed", side="buy")
     params = session.calls[0][2]["params"]
     assert params["status"] == "routed" and params["side"] == "buy"
+
+
+def test_order_events_returns_the_audit_trail_oldest_first():
+    """The timeline is the order's history, and history has an order."""
+    session = FakeSession(
+        FakeResponse(
+            200,
+            [
+                {
+                    "version": 1,
+                    "event_id": "e-1",
+                    "event_type": "order_submitted",
+                    "actor": "oms",
+                    "occurred_at": "2026-09-15T14:01:00Z",
+                    "recorded_at": "2026-09-15T14:01:00Z",
+                    "status_after": "submitted",
+                    "correlation_id": None,
+                    "causation_id": None,
+                    "schema_version": 0,
+                    "summary": "submitted buy 100 AAPL limit 190.02 (day)",
+                    "payload": {"quantity": 100.0},
+                },
+                {
+                    "version": 2,
+                    "event_id": "e-2",
+                    "event_type": "order_filled",
+                    "actor": "alpaca",
+                    "occurred_at": "2026-09-15T14:02:11Z",
+                    "recorded_at": "2026-09-15T14:02:11Z",
+                    "status_after": "filled",
+                    "correlation_id": None,
+                    "causation_id": None,
+                    "schema_version": 0,
+                    "summary": "filled 100 @ 190.02 on XNAS",
+                    "payload": {"fill_qty": 100.0},
+                },
+            ],
+        )
+    )
+    client = OMS("http://oms", token="t", session=session)
+
+    events = client.order_events("o-1")
+
+    assert session.calls[0][1].endswith("/orders/o-1/events")
+    assert [e.version for e in events] == [1, 2]
+    assert events[1].summary == "filled 100 @ 190.02 on XNAS"
+    assert events[1].actor == "alpaca"
+    assert events[1].payload == {"fill_qty": 100.0}
+
+
+def test_an_order_event_tolerates_a_field_the_client_does_not_know():
+    """`_of` drops unknown keys so the server can add fields freely."""
+    session = FakeSession(
+        FakeResponse(
+            200,
+            [
+                {
+                    "version": 1,
+                    "event_id": "e-1",
+                    "event_type": "order_routed",
+                    "actor": "oms",
+                    "occurred_at": "2026-09-15T14:01:00Z",
+                    "recorded_at": "2026-09-15T14:01:00Z",
+                    "status_after": "routed",
+                    "schema_version": 0,
+                    "summary": "routed to XNAS as 9912",
+                    "payload": {},
+                    "a_field_from_the_future": "ignored",
+                }
+            ],
+        )
+    )
+    client = OMS("http://oms", token="t", session=session)
+
+    events = client.order_events("o-1")
+
+    assert events[0].summary == "routed to XNAS as 9912"
+    assert not hasattr(events[0], "a_field_from_the_future")
+
+
+def test_orders_history_is_wired_into_the_cli():
+    from oms_client.cli import build_parser, cmd_orders_history
+
+    args = build_parser().parse_args(["orders", "history", "o-1"])
+
+    assert args.func is cmd_orders_history
+    assert args.order_id == "o-1"
