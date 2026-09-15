@@ -433,6 +433,11 @@ mod tests {
             .await
             .expect("create");
 
+        assert!(
+            lookup_session(&pool, &token.hash).await.expect("lookup").is_some(),
+            "the session must resolve while the principal is still active"
+        );
+
         sqlx::query("UPDATE principal SET status = 'DISABLED' WHERE id = $1")
             .bind(principal_id)
             .execute(&pool)
