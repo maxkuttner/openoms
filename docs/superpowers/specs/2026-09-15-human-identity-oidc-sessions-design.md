@@ -206,8 +206,28 @@ every request.** If it goes down mid-session, trading continues.
 Hand-rolled ID-token validation is a well-known source of security bugs: skipped
 signature checks, unvalidated `aud`, accepting `alg: none`. Use a maintained OIDC
 client crate rather than writing discovery, JWKS handling and validation by hand.
-`openidconnect` is the candidate; confirm its fit during implementation rather than
-assuming it here.
+
+**Pinned: `openidconnect` 4.x** (`ramosbugs/openidconnect-rs`), used for exactly three
+things — provider discovery, the code-for-token exchange, and ID-token verification.
+It is the de-facto standard in this space and the crate the Rust OIDC ecosystem is
+built on top of, with roughly four million recent downloads.
+
+Checked on 2026-09-15: 4.0.1 released 2025-07-06, last repository activity
+2025-11-08, 641 stars, 76 open issues, not archived. Adoption is strong but the pace
+has slowed — no release in about fourteen months. That is a flag on a
+security-critical dependency, not a blocker: OIDC is a stable protocol and the
+download volume means defects surface. Re-check before implementation starts if that
+is more than a few months from now.
+
+**The wrapper crates are deliberately rejected.** `axum-oidc` and similar bring their
+own session and middleware model, which would fight the design chosen here — our
+session lives in Postgres, is ours to revoke, and is produced by our own middleware.
+We want the protocol library, not a framework.
+
+The risk is contained by a boundary the design already draws for other reasons: the
+validator takes its keys as an argument, with discovery and JWKS caching outside it.
+That seam exists to make the security-critical half testable without a network, and
+it doubles as the swap point if this dependency ever needs replacing.
 
 Whatever is chosen, **the validator must accept its keys as an argument rather than
 fetching them.** Discovery and JWKS caching sit outside it. That is what makes the
