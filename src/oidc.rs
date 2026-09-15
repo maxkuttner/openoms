@@ -11,10 +11,14 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use openidconnect::core::{
     CoreIdToken, CoreIdTokenVerifier, CoreJsonWebKeySet as JsonWebKeySet, CoreJwsSigningAlgorithm,
+    CoreProviderMetadata,
 };
 use openidconnect::{
-    ClaimsVerificationError, ClientId, IssuerUrl, Nonce, SignatureVerificationError,
+    ClaimsVerificationError, ClientId, IssuerUrl, JsonWebKeySetUrl, Nonce,
+    SignatureVerificationError,
 };
+
+use crate::config::OidcSettings;
 
 /// What we require of a token before we'll trust it: the IdP that must have
 /// issued it, the client (`aud`) it must have been minted for, the nonce this
@@ -60,6 +64,11 @@ pub enum OidcError {
     /// The token's signing algorithm is not one we allow — including `none`.
     /// This is decided from OUR allow-list, never from the token's own header.
     UnsupportedAlgorithm,
+    /// Discovery, a JWKS fetch, or the token-endpoint exchange itself failed —
+    /// a transport or configuration problem talking to the IdP, not a
+    /// judgment about whether a token is trustworthy. Carries a message for
+    /// logs; never populated from response bodies that could hold a token.
+    ProviderUnavailable(String),
 }
 
 /// Verifies an OIDC ID token's signature and standard claims against
@@ -168,6 +177,287 @@ fn map_signature_error(err: SignatureVerificationError) -> OidcError {
         // enum grows later: all mean "we don't trust this signature".
         _ => OidcError::Signature,
     }
+}
+
+/// The JWKS cache: the keys as last fetched, and when — the latter is what
+/// enforces the once-a-minute refetch cap.
+struct CachedKeys {
+    keys: JsonWebKeySet,
+    fetched_at: DateTime<Utc>,
+}
+
+/// How long an unrecognised `kid` is allowed to trigger a JWKS refetch. Below
+/// this, a token history of unknown key ids just verifies against whatever is
+/// cached (and fails) rather than hitting the IdP again — a malformed or
+/// adversarial token must not be able to drive a fetch storm.
+const JWKS_REFETCH_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
+
+/// A configured connection to one OIDC identity provider: its discovered (or,
+/// in tests, pre-baked) endpoints, plus a cached JWKS refreshed on demand.
+///
+/// Holds the client secret and talks to the IdP directly — `verify_id_token`
+/// remains the one place that decides whether a token is trustworthy; this
+/// type's job is only to get a token and the keys to check it with.
+pub struct Provider {
+    settings: OidcSettings,
+    client_secret: String,
+    authorization_endpoint: String,
+    token_endpoint: String,
+    jwks_uri: String,
+    http_client: openidconnect::reqwest::Client,
+    keys: tokio::sync::RwLock<CachedKeys>,
+}
+
+impl Provider {
+    /// Discovers `settings.issuer`'s metadata (`{issuer}/.well-known/openid-configuration`)
+    /// and fetches its JWKS once, up front, so the first login attempt after
+    /// startup doesn't pay for a cold cache.
+    pub async fn discover(settings: OidcSettings, client_secret: String) -> Result<Provider, OidcError> {
+        let http_client = build_http_client()?;
+
+        let issuer = IssuerUrl::new(settings.issuer.clone())
+            .map_err(|e| OidcError::ProviderUnavailable(format!("invalid issuer URL: {e}")))?;
+        let metadata = CoreProviderMetadata::discover_async(issuer, &http_client)
+            .await
+            .map_err(|e| OidcError::ProviderUnavailable(format!("OIDC discovery failed: {e}")))?;
+
+        let authorization_endpoint = metadata.authorization_endpoint().to_string();
+        let token_endpoint = metadata
+            .token_endpoint()
+            .ok_or_else(|| {
+                OidcError::ProviderUnavailable("provider metadata has no token_endpoint".into())
+            })?
+            .to_string();
+        let jwks_uri = metadata.jwks_uri().clone();
+
+        let keys = JsonWebKeySet::fetch_async(&jwks_uri, &http_client)
+            .await
+            .map_err(|e| OidcError::ProviderUnavailable(format!("failed to fetch JWKS: {e}")))?;
+
+        Ok(Provider {
+            settings,
+            client_secret,
+            authorization_endpoint,
+            token_endpoint,
+            jwks_uri: jwks_uri.to_string(),
+            http_client,
+            keys: tokio::sync::RwLock::new(CachedKeys { keys, fetched_at: Utc::now() }),
+        })
+    }
+
+    /// A `Provider` built from pre-baked endpoints, with no discovery and no
+    /// network call — for tests. `issuer` is used verbatim to derive fake
+    /// `/authorize`, `/token` and `/jwks` endpoints the way a real IdP would
+    /// lay them out under its issuer URL.
+    #[cfg(test)]
+    pub fn for_test(issuer: &str, client_id: &str, public_base_url: &str) -> Provider {
+        Provider {
+            settings: OidcSettings {
+                issuer: issuer.to_string(),
+                client_id: client_id.to_string(),
+                public_base_url: public_base_url.to_string(),
+                scopes: vec!["openid".to_string()],
+                required_claim: None,
+                ttl: crate::sessions::SessionTtl::default(),
+            },
+            client_secret: "test-secret".to_string(),
+            authorization_endpoint: format!("{issuer}/authorize"),
+            token_endpoint: format!("{issuer}/token"),
+            jwks_uri: format!("{issuer}/jwks"),
+            http_client: build_http_client().expect("building a client touches no network"),
+            keys: tokio::sync::RwLock::new(CachedKeys {
+                keys: JsonWebKeySet::new(Vec::new()),
+                fetched_at: Utc::now(),
+            }),
+        }
+    }
+
+    /// `{public_base_url}/auth/callback`, tolerating a trailing slash on the
+    /// configured base URL — this is the one place that derivation happens,
+    /// so the authorization URL and the real callback route can never drift
+    /// apart.
+    pub fn redirect_uri(&self) -> String {
+        format!("{}/auth/callback", self.settings.public_base_url.trim_end_matches('/'))
+    }
+
+    /// The URL to send the browser to in order to start a login. `state` and
+    /// `nonce` are minted by the caller (and must be remembered against the
+    /// pending login to check on callback); `pkce_challenge` is the S256
+    /// challenge derived from a verifier the caller also holds onto. PKCE
+    /// method is hard-coded to S256 — `plain` is never offered.
+    pub fn authorize_url(&self, state: &str, nonce: &str, pkce_challenge: &str) -> String {
+        let mut url = openidconnect::url::Url::parse(&self.authorization_endpoint)
+            .expect("authorization_endpoint was validated at discovery or for_test construction");
+
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &self.settings.client_id)
+            .append_pair("redirect_uri", &self.redirect_uri())
+            .append_pair("scope", &self.settings.scopes.join(" "))
+            .append_pair("state", state)
+            .append_pair("nonce", nonce)
+            .append_pair("code_challenge", pkce_challenge)
+            .append_pair("code_challenge_method", "S256");
+
+        url.to_string()
+    }
+
+    /// Exchanges an authorization code for a verified identity. `pkce_verifier`
+    /// must match the challenge given to `authorize_url`; `nonce` must match
+    /// the one minted for this login. Only the resulting `VerifiedIdentity` is
+    /// returned — the IdP's access and refresh tokens are discarded and never
+    /// stored, per the human-identity design constraint that sessions are
+    /// ours, not the IdP's.
+    pub async fn exchange_code(
+        &self,
+        code: &str,
+        pkce_verifier: &str,
+        nonce: &str,
+    ) -> Result<VerifiedIdentity, OidcError> {
+        let token = self.request_id_token(code, pkce_verifier).await?;
+
+        let expected = Expectations {
+            issuer: self.settings.issuer.clone(),
+            audience: self.settings.client_id.clone(),
+            nonce: nonce.to_string(),
+            leeway: chrono::Duration::seconds(60),
+        };
+
+        self.verify_with_cache(&token, &expected).await
+    }
+
+    /// POSTs the authorization-code grant to the token endpoint and pulls out
+    /// just the `id_token`. Any `access_token` / `refresh_token` in the
+    /// response is dropped on the floor right here — this function's return
+    /// type has no room to carry them further even by accident.
+    async fn request_id_token(&self, code: &str, pkce_verifier: &str) -> Result<String, OidcError> {
+        let redirect_uri = self.redirect_uri();
+        let params = [
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", self.settings.client_id.as_str()),
+            ("client_secret", self.client_secret.as_str()),
+            ("code_verifier", pkce_verifier),
+        ];
+
+        let response = self
+            .http_client
+            .post(&self.token_endpoint)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| OidcError::ProviderUnavailable(format!("token request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(OidcError::ProviderUnavailable(format!(
+                "token endpoint returned {}",
+                response.status()
+            )));
+        }
+
+        // `.text()` + `serde_json::from_str` rather than `.json()`: the
+        // latter needs `reqwest`'s `json` feature, which `openidconnect`
+        // doesn't enable on the `reqwest` 0.12 it pulls in, and there's no
+        // reason to widen that dependency just for this.
+        let text = response
+            .text()
+            .await
+            .map_err(|e| OidcError::ProviderUnavailable(format!("failed to read token response: {e}")))?;
+        let body: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| OidcError::ProviderUnavailable(format!("malformed token response: {e}")))?;
+
+        body.get("id_token")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| OidcError::ProviderUnavailable("token response has no id_token".into()))
+    }
+
+    /// Verifies `token` against the cached JWKS, refreshing that cache first
+    /// if the token names a `kid` we don't currently hold — rate-limited to
+    /// `JWKS_REFETCH_INTERVAL` so a stream of tokens with bogus or unknown
+    /// `kid`s can't drive a fetch storm against the IdP.
+    async fn verify_with_cache(
+        &self,
+        token: &str,
+        expected: &Expectations,
+    ) -> Result<VerifiedIdentity, OidcError> {
+        self.refresh_keys_if_unknown_kid(token).await;
+
+        let cache = self.keys.read().await;
+        verify_id_token(token, &cache.keys, expected, Utc::now())
+    }
+
+    async fn refresh_keys_if_unknown_kid(&self, token: &str) {
+        let Some(kid) = token_kid(token) else {
+            // No `kid` in the header at all: nothing to look up by, so there
+            // is nothing a refetch could fix. Let verification proceed (and
+            // fail on its own terms) against whatever is cached.
+            return;
+        };
+
+        if self.has_key(&kid).await {
+            return;
+        }
+
+        let mut cache = self.keys.write().await;
+        // Re-check under the write lock: another concurrent login may have
+        // already refreshed the cache while we were waiting for it.
+        if cache.keys.keys().iter().any(|k| key_id_matches(k, &kid)) {
+            return;
+        }
+        if Utc::now() - cache.fetched_at < JWKS_REFETCH_INTERVAL {
+            // Rate-limited: a malformed/adversarial token with an unknown
+            // `kid` must not be able to force a fetch on every attempt.
+            return;
+        }
+
+        if let Ok(url) = JsonWebKeySetUrl::new(self.jwks_uri.clone()) {
+            if let Ok(fresh) = JsonWebKeySet::fetch_async(&url, &self.http_client).await {
+                cache.keys = fresh;
+            }
+        }
+        // The window resets whether the fetch above succeeded or not — a
+        // failing IdP shouldn't be hammered every time a token comes in
+        // either.
+        cache.fetched_at = Utc::now();
+    }
+
+    async fn has_key(&self, kid: &str) -> bool {
+        let cache = self.keys.read().await;
+        cache.keys.keys().iter().any(|k| key_id_matches(k, kid))
+    }
+}
+
+fn key_id_matches(key: &openidconnect::core::CoreJsonWebKey, kid: &str) -> bool {
+    use openidconnect::JsonWebKey as _;
+    key.key_id().map(|id| id.as_str()) == Some(kid)
+}
+
+/// Builds the `reqwest` client used for discovery, JWKS fetches and the token
+/// exchange. This is `openidconnect`'s own re-export of `reqwest` (currently
+/// 0.12.x, distinct from this crate's direct `reqwest` 0.13 dependency used
+/// elsewhere) — its `AsyncHttpClient` impl is only defined for that exact
+/// type, so fighting to reuse our 0.13 client would just mean hand-rolling
+/// the trait impl for no benefit.
+fn build_http_client() -> Result<openidconnect::reqwest::Client, OidcError> {
+    openidconnect::reqwest::ClientBuilder::new()
+        // Following redirects here would let a malicious or compromised IdP
+        // response redirect these requests anywhere (SSRF).
+        .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| OidcError::ProviderUnavailable(format!("failed to build HTTP client: {e}")))
+}
+
+/// Reads the `kid` header field without verifying anything — used only to
+/// decide whether the JWKS cache needs a refetch before real verification is
+/// attempted. A missing or malformed header just means "don't refetch";
+/// `verify_id_token` is the sole authority on whether the token is valid.
+fn token_kid(token: &str) -> Option<String> {
+    let header_b64 = token.split('.').next()?;
+    let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+    header.get("kid")?.as_str().map(String::from)
 }
 
 #[cfg(test)]
@@ -326,6 +616,29 @@ mod tests {
         });
 
         assert!(verify_id_token(&token, &s.keys(), &expectations(), Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn the_authorize_url_carries_everything_the_provider_needs() {
+        let provider = Provider::for_test("https://id.example.com", "oms", "https://oms.example.com");
+
+        let url = provider.authorize_url("st-1", "n-1", "challenge-1");
+
+        assert!(url.starts_with("https://id.example.com/authorize"));
+        assert!(url.contains("client_id=oms"));
+        assert!(url.contains("state=st-1"));
+        assert!(url.contains("nonce=n-1"));
+        assert!(url.contains("code_challenge=challenge-1"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("redirect_uri=https%3A%2F%2Foms.example.com%2Fauth%2Fcallback"));
+        assert!(url.contains("scope=openid"));
+    }
+
+    #[test]
+    fn the_redirect_uri_is_derived_from_one_configured_value() {
+        let provider = Provider::for_test("https://id.example.com", "oms", "https://oms.example.com/");
+
+        assert_eq!(provider.redirect_uri(), "https://oms.example.com/auth/callback");
     }
 
     // --- TestSigner -----------------------------------------------------
