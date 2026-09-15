@@ -127,4 +127,7 @@ jobs:
           node-version: "22"
 
       # No package.json here on purpose: node's built-in test runner needs none.
-      - run: node --test site/
+      # The files are listed by shell glob rather than passing the directory:
+      # `node --test site/` only discovers tests in newer Node, and on the
+      # runner's 22.x it tries to load `site` as a module and dies.
+      - run: node --test site/*.test.mjs
