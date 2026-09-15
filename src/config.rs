@@ -26,6 +26,8 @@ pub struct FileConfig {
     pub oms: OmsSection,
     #[serde(default)]
     pub server: ServerSection,
+    #[serde(default)]
+    pub auth: AuthSection,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -61,6 +63,57 @@ pub struct ServerSection {
     pub bind_addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_password: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSection {
+    #[serde(default)]
+    pub oidc: OidcSection,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_claim: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_claim_value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_minutes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absolute_ttl_hours: Option<i64>,
+}
+
+pub struct OidcSettings {
+    pub issuer: String,
+    pub client_id: String,
+    pub public_base_url: String,
+    pub scopes: Vec<String>,
+    pub required_claim: Option<(String, String)>,
+    pub ttl: crate::sessions::SessionTtl,
+}
+
+impl std::fmt::Debug for OidcSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcSettings")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field("public_base_url", &self.public_base_url)
+            .field("scopes", &self.scopes)
+            .field("required_claim", &self.required_claim)
+            .field("ttl", &format_args!("SessionTtl {{ idle: {}, absolute: {} }}",
+                self.ttl.idle, self.ttl.absolute))
+            .finish()
+    }
 }
 
 // Hand-written so a stray `{:?}` — in a log line, a panic message, an
@@ -166,6 +219,36 @@ pub fn load() -> Option<&'static FileConfig> {
             }
         })
         .as_ref()
+}
+
+impl FileConfig {
+    /// The OIDC settings, or `None` when login is not configured.
+    ///
+    /// Incomplete is treated as absent on purpose: a half-filled block would
+    /// otherwise produce a login flow that cannot complete, and a 404 is a far
+    /// clearer signal than a redirect into a broken exchange.
+    pub fn oidc(&self) -> Option<OidcSettings> {
+        let s = &self.auth.oidc;
+        let (issuer, client_id, public_base_url) =
+            (s.issuer.clone()?, s.client_id.clone()?, s.public_base_url.clone()?);
+
+        Some(OidcSettings {
+            issuer,
+            client_id,
+            public_base_url,
+            scopes: s.scopes.clone().unwrap_or_else(|| {
+                vec!["openid".into(), "profile".into(), "email".into()]
+            }),
+            required_claim: s
+                .required_claim
+                .clone()
+                .zip(s.required_claim_value.clone()),
+            ttl: crate::sessions::SessionTtl {
+                idle: chrono::Duration::minutes(s.idle_ttl_minutes.unwrap_or(30)),
+                absolute: chrono::Duration::hours(s.absolute_ttl_hours.unwrap_or(12)),
+            },
+        })
+    }
 }
 
 /// Write a new config file, refusing to overwrite one that exists.
@@ -471,5 +554,79 @@ admin_password = "admin-pw"
         let result = master_key(Some(&file)).expect("configured");
         std::env::remove_var("OMS_MASTER_KEY");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn no_oidc_block_means_no_oidc() {
+        let cfg: FileConfig = toml::from_str("[server]\nbind_addr = \"localhost:3001\"\n").unwrap();
+
+        assert!(cfg.oidc().is_none(), "absent configuration must not half-enable login");
+    }
+
+    #[test]
+    fn a_complete_block_produces_settings_with_defaults_filled_in() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://oms.example.com"
+            "#,
+        )
+        .unwrap();
+
+        let settings = cfg.oidc().expect("settings");
+        assert_eq!(settings.issuer, "https://id.example.com");
+        assert_eq!(settings.scopes, vec!["openid", "profile", "email"]);
+        assert_eq!(settings.ttl.idle, chrono::Duration::minutes(30));
+        assert_eq!(settings.ttl.absolute, chrono::Duration::hours(12));
+        assert!(settings.required_claim.is_none());
+    }
+
+    #[test]
+    fn an_incomplete_block_is_refused_rather_than_half_applied() {
+        let cfg: FileConfig = toml::from_str(
+            "[auth.oidc]\nissuer = \"https://id.example.com\"\n",
+        )
+        .unwrap();
+
+        assert!(cfg.oidc().is_none(), "issuer without client_id cannot log anyone in");
+    }
+
+    #[test]
+    fn a_claim_gate_needs_both_halves_to_bind() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://oms.example.com"
+            required_claim = "groups"
+            required_claim_value = "traders"
+            "#,
+        )
+        .unwrap();
+
+        let settings = cfg.oidc().expect("settings");
+        assert_eq!(settings.required_claim, Some(("groups".into(), "traders".into())));
+    }
+
+    #[test]
+    fn ttls_are_overridable() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://oms.example.com"
+            idle_ttl_minutes = 15
+            absolute_ttl_hours = 8
+            "#,
+        )
+        .unwrap();
+
+        let settings = cfg.oidc().expect("settings");
+        assert_eq!(settings.ttl.idle, chrono::Duration::minutes(15));
+        assert_eq!(settings.ttl.absolute, chrono::Duration::hours(8));
     }
 }
