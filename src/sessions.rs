@@ -45,7 +45,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SessionTtl {
     pub idle: Duration,
     pub absolute: Duration,

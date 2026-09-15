@@ -93,6 +93,7 @@ pub struct OidcSection {
     pub absolute_ttl_hours: Option<i64>,
 }
 
+#[derive(Debug)]
 pub struct OidcSettings {
     pub issuer: String,
     pub client_id: String,
@@ -100,20 +101,6 @@ pub struct OidcSettings {
     pub scopes: Vec<String>,
     pub required_claim: Option<(String, String)>,
     pub ttl: crate::sessions::SessionTtl,
-}
-
-impl std::fmt::Debug for OidcSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OidcSettings")
-            .field("issuer", &self.issuer)
-            .field("client_id", &self.client_id)
-            .field("public_base_url", &self.public_base_url)
-            .field("scopes", &self.scopes)
-            .field("required_claim", &self.required_claim)
-            .field("ttl", &format_args!("SessionTtl {{ idle: {}, absolute: {} }}",
-                self.ttl.idle, self.ttl.absolute))
-            .finish()
-    }
 }
 
 // Hand-written so a stray `{:?}` — in a log line, a panic message, an
@@ -594,6 +581,34 @@ admin_password = "admin-pw"
     }
 
     #[test]
+    fn missing_client_id_is_caught() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            public_base_url = "https://oms.example.com"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.oidc().is_none(), "missing client_id must refuse the config");
+    }
+
+    #[test]
+    fn missing_public_base_url_is_caught() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            "#,
+        )
+        .unwrap();
+
+        assert!(cfg.oidc().is_none(), "missing public_base_url must refuse the config");
+    }
+
+    #[test]
     fn a_claim_gate_needs_both_halves_to_bind() {
         let cfg: FileConfig = toml::from_str(
             r#"
@@ -609,6 +624,40 @@ admin_password = "admin-pw"
 
         let settings = cfg.oidc().expect("settings");
         assert_eq!(settings.required_claim, Some(("groups".into(), "traders".into())));
+    }
+
+    #[test]
+    fn claim_gate_without_value_does_not_bind() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://oms.example.com"
+            required_claim = "groups"
+            "#,
+        )
+        .unwrap();
+
+        let settings = cfg.oidc().expect("settings");
+        assert!(settings.required_claim.is_none(), "claim gate needs both claim and value");
+    }
+
+    #[test]
+    fn claim_gate_without_claim_does_not_bind() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://oms.example.com"
+            required_claim_value = "traders"
+            "#,
+        )
+        .unwrap();
+
+        let settings = cfg.oidc().expect("settings");
+        assert!(settings.required_claim.is_none(), "claim gate needs both claim and value");
     }
 
     #[test]
