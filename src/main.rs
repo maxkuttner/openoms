@@ -444,7 +444,14 @@ async fn main() {
     // `RUST_LOG` at all this falls back to plain `info`, so anyone who sets
     // nothing sees exactly what they saw before this filter existed.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    // stderr, not stdout: `oms openapi` writes its spec to stdout, and a log line
+    // landing there (from this prelude, or RUST_LOG picked up from a dotenv-loaded
+    // .env catching a dependency's startup log) would corrupt `cargo run -- openapi
+    // > docs/openapi.json`.
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     let cli = <Cli as clap::Parser>::parse();
     match cli.command {
