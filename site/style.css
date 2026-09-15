@@ -440,7 +440,6 @@ footer {
   --arch-core: #25b083;
   --arch-exec: #ce9a3b;
   --arch-feed: #0e7490;
-  --arch-ref: #8b949e;
 }
 
 main.arch {
@@ -507,42 +506,3 @@ figure.diagram figcaption {
   text-align: center;
 }
 
-.arch-steps {
-  list-style: none;
-  margin: 1.25rem 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.6rem;
-}
-
-.arch-step {
-  display: flex;
-  gap: 0.9rem;
-  align-items: baseline;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  border-radius: 8px;
-  padding: 0.7rem 0.9rem;
-}
-
-.arch-step-num {
-  flex: none;
-  min-width: 1.2rem;
-  font-weight: 700;
-  font-size: 0.78rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.arch-step-cmd {
-  margin: 0;
-  font-weight: 600;
-  font-size: 0.9rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-
-.arch-step-body {
-  margin: 0.25rem 0 0;
-  font-size: 0.85rem;
-  color: var(--dim);
-}
