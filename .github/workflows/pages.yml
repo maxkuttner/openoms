@@ -7,6 +7,8 @@ on:
       - "site/**"
       - "install.sh"
       - "assets/screenshot*.png"
+      - "docs/openapi.json"
+      - "cockpit/public/favicon.svg"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -37,6 +39,28 @@ jobs:
           cp install.sh _site/install.sh
           cp assets/screenshot01.png assets/screenshot02.png _site/assets/
           cp cockpit/public/favicon.svg _site/favicon.svg
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # CI-only dependency: it pulls headless Chromium, which is why it is not in
+      # any committed manifest and not a devDependency of the cockpit.
+      - name: render the diagrams
+        run: |
+          npm i -g @mermaid-js/mermaid-cli
+          mkdir -p _site/diagrams
+          for f in site/diagrams/*.mmd; do
+            n="$(basename "$f" .mmd)"
+            mmdc -i "$f" -o "_site/diagrams/$n.svg" -c site/diagrams/mermaid-config.json -b transparent
+          done
+          ls -la _site/diagrams
+
+      - name: build the docs pages
+        run: node site/build-docs.mjs _site
+
+      - name: drop the intermediate SVGs
+        run: "rm -rf _site/diagrams"
 
       - uses: actions/configure-pages@v5
 
