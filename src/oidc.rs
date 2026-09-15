@@ -87,6 +87,15 @@ pub fn verify_id_token(
         // `now` is a parameter (not `Utc::now()`) so tests control time
         // exactly. Folding `leeway` in here — rather than comparing it after
         // the fact — is what gives an ID token a grace window around `exp`.
+        //
+        // This shift is only safe because `exp` is the *only* time-based
+        // check this verifier performs: the crate's `iat` and `auth_time`
+        // verifiers default to no-ops here, and there is no `nbf` claim in
+        // OIDC ID tokens. If a future change calls
+        // `set_issue_time_verifier_fn`, `set_max_age`, or
+        // `set_auth_time_verifier_fn` on this same verifier, shifting `now`
+        // would silently loosen those checks too — that coupling would not
+        // be visible at the call site making the change.
         .set_time_fn(move || now - leeway);
 
     // `&Nonce` compares its digest against the claimed nonce's digest
@@ -181,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn a_well_formed_token_yields_its_subject() {
+    fn a_well_formed_token_yields_its_subject_and_profile_claims() {
         let s = signer();
         let token = s.token_with(|c| c);
 
@@ -189,6 +198,25 @@ mod tests {
             .expect("a valid token must verify");
 
         assert_eq!(identity.subject, "user-42");
+        assert_eq!(identity.display_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(identity.email.as_deref(), Some("ada@example.com"));
+    }
+
+    #[test]
+    fn a_token_without_name_or_email_still_verifies_with_none() {
+        let s = signer();
+        let token = s.token_with(|mut c| {
+            c.name = None;
+            c.email = None;
+            c
+        });
+
+        let identity = verify_id_token(&token, &s.keys(), &expectations(), Utc::now())
+            .expect("name and email are optional OIDC claims, not required ones");
+
+        assert_eq!(identity.subject, "user-42");
+        assert_eq!(identity.display_name, None);
+        assert_eq!(identity.email, None);
     }
 
     #[test]
@@ -271,6 +299,25 @@ mod tests {
     }
 
     #[test]
+    fn an_algorithm_confusion_token_is_refused() {
+        // The classic RS256→HS256 attack: forge a token with `alg: HS256`,
+        // HMAC-signed using the RSA *public* key's bytes as the shared
+        // secret. A verifier that blindly looks up "the key for this token"
+        // and hands it to whatever primitive `alg` names would accept this,
+        // since the RSA public key is, by design, public. Our allow-list
+        // (`set_allowed_algs`) refuses it on its own; the crate's own
+        // refusal of symmetric algorithms for public clients would refuse it
+        // even if that allow-list were absent.
+        let s = signer();
+        let token = s.confusion_token();
+
+        assert_eq!(
+            verify_id_token(&token, &s.keys(), &expectations(), Utc::now()),
+            Err(OidcError::UnsupportedAlgorithm)
+        );
+    }
+
+    #[test]
     fn a_token_within_clock_leeway_still_verifies() {
         let s = signer();
         let token = s.token_with(|mut c| {
@@ -291,10 +338,14 @@ mod tests {
     // signature at all (`IdToken::new` always signs) — `unsigned_token`
     // therefore assembles that one adversarial case by hand.
 
+    use hmac::{Hmac, Mac};
     use openidconnect::core::{CoreIdTokenClaims, CoreJsonWebKeySet, CoreRsaPrivateSigningKey};
     use openidconnect::{
-        Audience, EmptyAdditionalClaims, PrivateSigningKey, StandardClaims, SubjectIdentifier,
+        Audience, EmptyAdditionalClaims, EndUserEmail, EndUserName, LocalizedClaim,
+        PrivateSigningKey, StandardClaims, SubjectIdentifier,
     };
+
+    type HmacSha256 = Hmac<sha2::Sha256>;
 
     /// The claims of a token under test, in plain field form so `token_with`
     /// closures can mutate individual claims directly (mirroring how an
@@ -308,6 +359,8 @@ mod tests {
         exp: i64,
         iat: i64,
         nonce: String,
+        name: Option<String>,
+        email: Option<String>,
     }
 
     impl Default for Claims {
@@ -320,11 +373,14 @@ mod tests {
                 exp: (now + chrono::Duration::minutes(5)).timestamp(),
                 iat: now.timestamp(),
                 nonce: "n-123".into(),
+                name: Some("Ada Lovelace".into()),
+                email: Some("ada@example.com".into()),
             }
         }
     }
 
     struct TestSigner {
+        key_pair: rsa::RsaPrivateKey,
         signing_key: CoreRsaPrivateSigningKey,
     }
 
@@ -341,7 +397,10 @@ mod tests {
             let signing_key =
                 CoreRsaPrivateSigningKey::from_pem(&pem, None).expect("build signing key from PEM");
 
-            TestSigner { signing_key }
+            TestSigner {
+                key_pair,
+                signing_key,
+            }
         }
 
         fn keys(&self) -> CoreJsonWebKeySet {
@@ -353,7 +412,7 @@ mod tests {
         fn token_with(&self, f: impl FnOnce(Claims) -> Claims) -> String {
             let c = f(Claims::default());
 
-            let claims = CoreIdTokenClaims::new(
+            let mut claims = CoreIdTokenClaims::new(
                 IssuerUrl::new(c.iss).expect("valid issuer URL"),
                 vec![Audience::new(c.aud)],
                 DateTime::from_timestamp(c.exp, 0).expect("valid exp"),
@@ -362,6 +421,13 @@ mod tests {
                 EmptyAdditionalClaims {},
             )
             .set_nonce(Some(Nonce::new(c.nonce)));
+
+            if let Some(name) = c.name {
+                claims = claims.set_name(Some(LocalizedClaim::from(EndUserName::new(name))));
+            }
+            if let Some(email) = c.email {
+                claims = claims.set_email(Some(EndUserEmail::new(email)));
+            }
 
             CoreIdToken::new(
                 claims,
@@ -393,6 +459,50 @@ mod tests {
             let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
 
             format!("{header_b64}.{payload_b64}.")
+        }
+
+        /// DER bytes of this signer's RSA *public* key — the exact bytes an
+        /// IdP publishes in its JWKS for signature verification. Never the
+        /// private key.
+        fn public_key_der(&self) -> Vec<u8> {
+            use rsa::pkcs1::EncodeRsaPublicKey;
+
+            self.key_pair
+                .to_public_key()
+                .to_pkcs1_der()
+                .expect("encode RSA public key as DER")
+                .as_bytes()
+                .to_vec()
+        }
+
+        /// The classic RS256→HS256 algorithm-confusion attack: a token
+        /// claiming `alg: HS256`, HMAC-SHA256-signed using this signer's RSA
+        /// *public* key bytes as the shared secret. As with `unsigned_token`,
+        /// `openidconnect`'s public signing API can't produce this (it only
+        /// signs with an actual `JwsSigningAlgorithm`, and never treats a
+        /// verification key as an HMAC secret), so it's assembled by hand.
+        fn confusion_token(&self) -> String {
+            let c = Claims::default();
+            let header = serde_json::json!({ "alg": "HS256" });
+            let payload = serde_json::json!({
+                "iss": c.iss,
+                "aud": c.aud,
+                "sub": c.sub,
+                "exp": c.exp,
+                "iat": c.iat,
+                "nonce": c.nonce,
+            });
+
+            let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string());
+            let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
+            let signing_input = format!("{header_b64}.{payload_b64}");
+
+            let mut mac = HmacSha256::new_from_slice(&self.public_key_der())
+                .expect("HMAC accepts a key of any length");
+            mac.update(signing_input.as_bytes());
+            let signature_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+
+            format!("{signing_input}.{signature_b64}")
         }
     }
 }

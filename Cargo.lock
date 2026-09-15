@@ -3023,6 +3023,7 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek",
  "futures-util",
+ "hmac",
  "include_dir",
  "mime_guess",
  "openidconnect",

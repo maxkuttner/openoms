@@ -90,3 +90,6 @@ openidconnect = "4"
 # ID-token verification can be tested against real signatures without an IdP.
 # Already an indirect dependency of openidconnect; pinned here to use it directly.
 rsa = "0.9"
+# Test-only: HMACs the RS256→HS256 algorithm-confusion token in
+# src/oidc.rs's TestSigner. Already an indirect dependency of openidconnect.
+hmac = "0.12"
