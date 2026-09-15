@@ -1,0 +1,23 @@
+flowchart TB
+  subgraph PRICE["Pricing path (market data)"]
+    direction LR
+    LF["Live feeds<br/>Databento · Binance · Bybit"]:::feed
+    QF["subscribe held<br/>via FeedSymbology"]:::feed
+    MR["mark_router<br/>ranked by provider_feed_policy"]:::feed
+    MS[("MarkStore")]:::feed
+    PL["positions · M2M P/L"]:::core
+    LF --> QF --> MR --> MS --> PL
+  end
+  subgraph EXEC["Execution path (orders)"]
+    direction LR
+    ORD["Order"]:::core
+    ACC["account -> broker_connection<br/>(broker_code, env)"]:::exec
+    BIx["broker_instrument<br/>broker_symbol / native_id"]:::exec
+    REG["BrokerRegistry adapter"]:::exec
+    API["Broker API"]:::exec
+    ORD --> ACC --> REG
+    ORD -. "resolve handle" .-> BIx --> REG --> API
+  end
+  classDef core fill:#151a20,stroke:#25b083,color:#d7dce3;
+  classDef exec fill:#1a1e26,stroke:#ce9a3b,color:#d7dce3;
+  classDef feed fill:#151a20,stroke:#0e7490,color:#d7dce3;

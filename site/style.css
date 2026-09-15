@@ -129,3 +129,380 @@ footer {
   gap: 1.5rem;
   font-size: 0.9rem;
 }
+
+/* ---------------------------------------------------------------------- */
+/* API reference (site/build-docs.mjs -> api.html). Colours below are the */
+/* cockpit's apiTheme.tsx palette (C.green/amber/red/faint), reused here  */
+/* so the static page matches the admin UI it was ported from.           */
+/* ---------------------------------------------------------------------- */
+:root {
+  --docs-green: #22ae6c;
+  --docs-amber: #ce9a3b;
+  --docs-red: #b0554f;
+  --docs-faint: #6b7280;
+}
+
+.docs-header {
+  text-align: left;
+}
+
+.docs-back a {
+  font-size: 0.85rem;
+  color: var(--dim);
+  text-decoration: none;
+}
+
+.docs-back a:hover {
+  color: var(--accent);
+}
+
+.docs-version {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: var(--docs-faint);
+}
+
+.docs-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 2.5rem;
+  max-width: 70rem;
+}
+
+.docs-nav {
+  position: sticky;
+  top: 1.5rem;
+  flex: none;
+  width: 12.5rem;
+  max-height: calc(100vh - 6rem);
+  overflow-y: auto;
+}
+
+.docs-nav-group {
+  margin-bottom: 1.1rem;
+}
+
+.docs-nav-link {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.15rem 0;
+  text-decoration: none;
+  font-size: 0.72rem;
+}
+
+.docs-nav-link .method {
+  font-size: 0.6rem;
+  padding: 0 4px;
+}
+
+.docs-nav-path {
+  color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.docs-content {
+  flex: 1;
+  min-width: 0;
+  max-width: 50rem;
+}
+
+.docs-eyebrow {
+  font-size: 0.62rem;
+  color: var(--docs-faint);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.docs-section {
+  margin-top: 2.5rem;
+}
+
+.docs-tag {
+  margin-top: 0;
+}
+
+.docs-op {
+  margin: 1.3rem 0 2rem;
+  padding-top: 1.3rem;
+  border-top: 1px solid var(--border);
+}
+
+.docs-op:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.docs-op-head {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.docs-op-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95rem;
+  word-break: break-all;
+}
+
+.docs-op-summary {
+  color: var(--dim);
+  font-size: 0.88rem;
+  margin: 0.6rem 0 0;
+  white-space: pre-wrap;
+}
+
+.docs-op-auth {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.docs-auth-scheme {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--docs-green);
+}
+
+/* method badges */
+.method {
+  display: inline-flex;
+  flex: none;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border-radius: 4px;
+  padding: 2px 7px;
+  border: 1px solid currentColor;
+}
+
+.method-get {
+  color: var(--docs-green);
+}
+
+.method-post,
+.method-put,
+.method-patch {
+  color: var(--docs-amber);
+}
+
+.method-delete {
+  color: var(--docs-red);
+}
+
+/* parameter / field / response panels */
+.docs-panel {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 6px;
+  overflow: hidden;
+  margin-top: 0.75rem;
+}
+
+.docs-panel-title {
+  padding: 0.45rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.62rem;
+  color: var(--docs-faint);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.docs-row {
+  display: flex;
+  gap: 0.9rem;
+  padding: 0.55rem 0.9rem;
+  border-top: 1px solid var(--border);
+}
+
+.docs-row:first-of-type {
+  border-top: none;
+}
+
+.docs-row-name {
+  flex: none;
+  width: 9.5rem;
+}
+
+.docs-row-name-text {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+}
+
+.docs-required {
+  color: var(--docs-amber);
+}
+
+.docs-row-type {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.7rem;
+  color: var(--docs-faint);
+}
+
+.docs-row-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.docs-row-desc {
+  font-size: 0.78rem;
+  color: var(--dim);
+}
+
+.docs-body-desc {
+  padding: 0.55rem 0.9rem;
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
+}
+
+.docs-row-example {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.7rem;
+  color: var(--docs-faint);
+  margin-top: 0.2rem;
+}
+
+.docs-resp-row {
+  display: flex;
+  gap: 0.9rem;
+  padding: 0.45rem 0.9rem;
+  border-top: 1px solid var(--border);
+}
+
+.docs-resp-row:first-of-type {
+  border-top: none;
+}
+
+.docs-resp-code {
+  flex: none;
+  width: 2.75rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.resp-green {
+  color: var(--docs-green);
+}
+
+.resp-amber {
+  color: var(--docs-amber);
+}
+
+.resp-red {
+  color: var(--docs-red);
+}
+
+.docs-resp-desc {
+  font-size: 0.78rem;
+  color: var(--dim);
+}
+
+.docs-example {
+  background: var(--bg);
+}
+
+.docs-curl {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 0.72rem;
+}
+
+@media (max-width: 42rem) {
+  .docs-main {
+    flex-direction: column;
+  }
+
+  .docs-nav {
+    position: static;
+    width: 100%;
+    max-height: none;
+  }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Architecture page (site/build-docs.mjs -> architecture.html). The four */
+/* mermaid diagrams live in site/diagrams/*.mmd and are rendered to SVG   */
+/* and inlined at build time, so these rules only style the surrounding  */
+/* page — the SVGs carry their own colours (see the diagrams' classDefs, */
+/* rewritten against these same tokens).                                 */
+/* ---------------------------------------------------------------------- */
+:root {
+  --arch-core: #25b083;
+  --arch-exec: #ce9a3b;
+  --arch-feed: #0e7490;
+}
+
+main.arch {
+  max-width: 64rem;
+}
+
+.arch-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+@media (max-width: 42rem) {
+  .arch-cards {
+    grid-template-columns: 1fr;
+  }
+}
+
+.arch-card {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 1rem 1.1rem;
+}
+
+.arch-card-tag {
+  margin: 0;
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.arch-card-title {
+  margin: 0.35rem 0 0.4rem;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.arch-card-body {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--dim);
+}
+
+figure.diagram {
+  margin: 1rem 0 0;
+  padding: 0;
+}
+
+figure.diagram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+}
+
+figure.diagram figcaption {
+  margin-top: 0.6rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+  text-align: center;
+}
+

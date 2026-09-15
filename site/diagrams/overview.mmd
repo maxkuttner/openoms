@@ -1,0 +1,33 @@
+flowchart LR
+  ALP["Alpaca<br/>equities · options"]:::exec
+  BNB["Binance<br/>crypto spot"]:::exec
+  IP["InstrumentProvider<br/>list_instruments()"]:::exec
+
+  subgraph STORE["the catalog — two Postgres tables, survive restarts"]
+    direction TB
+    INST[("instrument<br/><b>symbol @ venue</b><br/>what exists, one row each")]:::core
+    BI[("broker_instrument<br/>how to route it,<br/>one row per broker")]:::exec
+  end
+
+  subgraph MEM["no table — recomputed on every subscribe"]
+    FS["FeedSymbology<br/>candidates() picks the slice<br/>to_feed_symbol() renames it"]:::feed
+  end
+
+  DBN["Databento<br/>OPRA options"]:::feed
+  BNF["Binance<br/>spot book"]:::feed
+  BYF["Bybit<br/>spot book"]:::feed
+
+  ALP --> IP
+  BNB --> IP
+  IP -- "sync-broker writes" --> INST
+  IP -- "writes" --> BI
+  INST -. "1:n" .- BI
+
+  INST -- "read per subscribe" --> FS
+  FS -- "feed's own symbols" --> DBN
+  FS --> BNF
+  FS --> BYF
+
+  classDef core fill:#151a20,stroke:#25b083,color:#d7dce3;
+  classDef exec fill:#1a1e26,stroke:#ce9a3b,color:#d7dce3;
+  classDef feed fill:#151a20,stroke:#0e7490,color:#d7dce3;

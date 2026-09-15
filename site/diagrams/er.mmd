@@ -1,0 +1,38 @@
+erDiagram
+  VENUE    ||--o{ INSTRUMENT : "lists (MIC)"
+  CURRENCY ||--o{ INSTRUMENT : "quoted in"
+  INSTRUMENT ||--o| INSTRUMENT_DERIVATIVE : "option legs"
+  INSTRUMENT ||--o{ BROKER_INSTRUMENT : "tradable via"
+  BROKER_CONNECTION ||--o{ ACCOUNT : "routing target"
+  INSTRUMENT {
+    bigint id PK
+    text   symbol "UNIQUE(symbol,venue)"
+    text   venue FK
+    text   currency FK
+    text   asset_class
+    text   instrument_class
+    text   figi
+  }
+  INSTRUMENT_DERIVATIVE {
+    bigint instrument_id PK,FK
+    text   underlying_symbol
+    text   option_kind
+    numeric strike_price
+    date   expiry_date
+  }
+  BROKER_INSTRUMENT {
+    bigint instrument_id FK
+    text   broker_code "ALPACA|BINANCE"
+    text   broker_symbol
+    text   native_id
+    bool   is_tradeable
+    numeric min_quantity
+  }
+  VENUE { text code PK "XNAS, OPRA, BINANCE" }
+  CURRENCY { text code PK "USD, USDT" }
+  BROKER_CONNECTION {
+    text code PK
+    text broker_code
+    text environment "PAPER|LIVE"
+  }
+  ACCOUNT { text code PK }

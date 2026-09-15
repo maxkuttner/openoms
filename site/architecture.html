@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>openoms — architecture</title>
+    <link rel="icon" href="favicon.svg" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="docs-header">
+      <p class="docs-back"><a href="index.html">&larr; openoms</a></p>
+      <h1>Instrument model</h1>
+      <p class="tagline">
+        One canonical <b>instrument</b> catalog in the middle, two independent mappings off it: a
+        broker's tradable handle (<code>broker_instrument</code>, a table) and a data feed's
+        pricing symbol (<code>FeedSymbology</code>, derived in code). Priceable and tradable are
+        independent.
+      </p>
+    </header>
+
+    <main class="arch">
+      <section class="arch-cards">
+        <div class="arch-card">
+          <p class="arch-card-tag" style="color: var(--arch-core)">Master</p>
+          <p class="arch-card-title"><code>instrument</code></p>
+          <p class="arch-card-body">
+            Canonical identity, keyed <code>(symbol, venue)</code>. Asset/instrument class,
+            microstructure, FIGI. Option legs in <code>instrument_derivative</code>.
+          </p>
+        </div>
+        <div class="arch-card">
+          <p class="arch-card-tag" style="color: var(--arch-exec)">Execution</p>
+          <p class="arch-card-title"><code>broker_instrument</code></p>
+          <p class="arch-card-body">
+            Tradable mapping — one row per instrument per broker: <code>broker_symbol</code>,
+            <code>native_id</code>, limits. Written by <code>sync-broker</code> from the adapter's
+            <code>InstrumentProvider</code>. Its existence means tradable.
+          </p>
+        </div>
+        <div class="arch-card">
+          <p class="arch-card-tag" style="color: var(--arch-feed)">Market data</p>
+          <p class="arch-card-title"><code>FeedSymbology</code></p>
+          <p class="arch-card-body">
+            Pricing mapping, 1:n — and a pure function, not a table. <code>candidates()</code>
+            picks the catalog slice a feed covers, <code>to_feed_symbol()</code> renames it; one
+            symbol can price the pair on several venues. Evaluated at subscribe time.
+          </p>
+        </div>
+      </section>
+
+      <section>
+        <h2>End to end</h2>
+        <p class="after">
+          One catalog in the middle, an adapter at each end. Brokers <b>write</b> it:
+          <code>sync-broker</code> asks each broker's <code>InstrumentProvider</code> what it
+          lists and stores that as <code>instrument</code> plus a <code>broker_instrument</code>
+          routing row. Feeds only <b>read</b> it: at subscribe time
+          <code>FeedSymbology.candidates()</code> picks the slice of the catalog that feed
+          covers and <code>to_feed_symbol()</code> renames each hit into whatever that feed
+          calls it.
+        </p>
+        <p class="after">
+          That second mapping is computed, not stored — there is no feed table anywhere. It is
+          rebuilt from the catalog on every subscription, which is why a broker sync that adds
+          instruments needs no follow-up step to make them priceable, and why nothing can go
+          stale. Each adapter owns its own symbology, so neither end knows the other exists.
+        </p>
+        <figure class="diagram" data-diagram="overview">
+          <figcaption>Brokers write the catalog; feeds read it and rename in memory</figcaption>
+        </figure>
+      </section>
+
+      <section>
+        <h2>Tables &amp; relationships</h2>
+        <p class="after">
+          Foreign keys shown. <code>broker_instrument</code> references the master instrument.
+          There is no feed table: the pricing mapping is derived in code. Two soft links by code
+          (no FK): <code>broker_code</code> &rarr; <code>broker_connection</code>, and
+          <code>feed_code</code> is ranked for failover in <code>provider_feed_policy</code>.
+        </p>
+        <figure class="diagram" data-diagram="er">
+          <figcaption>Tables and foreign keys, instrument at the centre</figcaption>
+        </figure>
+      </section>
+
+      <section>
+        <h2>Runtime — the two paths</h2>
+        <p class="after">
+          Pricing derives its symbols through <code>FeedSymbology</code>; order routing reads
+          <code>broker_instrument</code>. They never cross — a feed can price an instrument no
+          broker trades, and vice versa.
+        </p>
+        <figure class="diagram" data-diagram="runtime">
+          <figcaption>The pricing path and the execution path never cross</figcaption>
+        </figure>
+      </section>
+
+      <p class="after" style="font-size: 0.8rem">
+        Reflects migrations 0016&ndash;0020 and the <code>sync-broker</code> flow. See also
+        <a href="api.html">API docs</a>.
+      </p>
+    </main>
+  </body>
+</html>

@@ -1,5 +1,5 @@
-import { useEffect, useState, lazy, Suspense } from "react";
-import { AppShell, Group, NavLink, Button, Center, Text, Loader } from "@mantine/core";
+import { useEffect, useState } from "react";
+import { AppShell, Group, NavLink, Button, Center, Text, Loader, Anchor } from "@mantine/core";
 import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, setToken, API_BASE } from "./api/client";
@@ -15,12 +15,6 @@ import { InstrumentsPage } from "./pages/Instruments";
 import { DataFeedsPage } from "./pages/DataFeeds";
 import { ApiPage } from "./pages/Api";
 
-// Heavy bundles (Scalar, Mermaid) — only load when their doc page is opened.
-const ApiDocsPage = lazy(() => import("./pages/ApiDocs").then((m) => ({ default: m.ApiDocsPage })));
-const ArchitecturePage = lazy(() =>
-  import("./pages/Architecture").then((m) => ({ default: m.ArchitecturePage })),
-);
-
 const NAV = [
   { to: "/principals", label: "Principals" },
   { to: "/tokens", label: "API" },
@@ -31,12 +25,6 @@ const NAV = [
   { to: "/risk-limits", label: "Risk limits" },
   { to: "/blotter", label: "Blotter" },
   { to: "/instruments", label: "Instruments" },
-];
-
-// Grouped under a "Docs" section in the navbar.
-const DOCS_NAV = [
-  { to: "/docs/architecture", label: "Architecture" },
-  { to: "/api-docs", label: "API docs" },
 ];
 
 function ConnectionDot() {
@@ -79,17 +67,18 @@ function Console({ onLogout }: { onLogout: () => void }) {
             active={pathname.startsWith(n.to)}
           />
         ))}
-        <NavLink label="Docs" defaultOpened childrenOffset={16}>
-          {DOCS_NAV.map((n) => (
-            <NavLink
-              key={n.to}
-              component={RouterNavLink}
-              to={n.to}
-              label={n.label}
-              active={pathname.startsWith(n.to)}
-            />
-          ))}
-        </NavLink>
+        <Group px="sm" py="xs">
+          {/* The docs live on the public site now — they are what someone reads *before*
+              installing, so they do not belong behind a login. */}
+          <Anchor
+            href="https://maxkuttner.github.io/openoms/architecture.html"
+            target="_blank"
+            rel="noreferrer"
+            fz="sm"
+          >
+            Docs ↗
+          </Anchor>
+        </Group>
       </AppShell.Navbar>
       <AppShell.Main>
         <Routes>
@@ -103,22 +92,6 @@ function Console({ onLogout }: { onLogout: () => void }) {
           <Route path="/risk-limits" element={<RiskLimitsPage />} />
           <Route path="/blotter" element={<BlotterPage />} />
           <Route path="/instruments" element={<InstrumentsPage />} />
-          <Route
-            path="/docs/architecture"
-            element={
-              <Suspense fallback={<Loader />}>
-                <ArchitecturePage />
-              </Suspense>
-            }
-          />
-          <Route
-            path="/api-docs"
-            element={
-              <Suspense fallback={<Loader />}>
-                <ApiDocsPage />
-              </Suspense>
-            }
-          />
         </Routes>
       </AppShell.Main>
     </AppShell>

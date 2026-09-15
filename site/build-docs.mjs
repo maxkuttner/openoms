@@ -1,0 +1,450 @@
+#!/usr/bin/env node
+//
+// Renders the committed OpenAPI spec (docs/openapi.json) into a static
+// api.html. The published site has no server to ask for the spec at
+// request time — unlike the cockpit's ApiDocs page, which fetches
+// /api-docs/openapi.json from a running oms — so this bakes the same
+// reference into a plain HTML page at build time.
+//
+// Ported from cockpit/src/pages/ApiDocs.tsx, which was already plain
+// functions over the spec: resolve/typeLabel/example/curlFor/respColor
+// carry over near verbatim, JSX becomes template strings, and Mantine's
+// styling becomes the site's own CSS classes (see the "docs" section
+// appended to site/style.css).
+//
+// Also writes architecture.html: site/architecture.html is a hand-written
+// template with a <figure data-diagram="NAME"> placeholder per diagram;
+// mermaid-cli renders site/diagrams/*.mmd to SVG ahead of this script
+// (CI-only dependency, never installed into the repo — see the task-4
+// brief), and inlineDiagrams() below splices each SVG into its placeholder
+// so the published page runs no mermaid at all.
+//
+// mmdc MUST be called with -c site/diagrams/mermaid-config.json — that config
+// is the only thing that themes the parts a per-node classDef can't reach
+// (erDiagram entities/attribute rows, subgraph cluster fills, edge-label
+// backgrounds), so without it every diagram renders in mermaid's stock light
+// theme regardless of the classDef colours below:
+//
+//   for f in site/diagrams/*.mmd; do
+//     n=$(basename "$f" .mmd)
+//     mmdc -i "$f" -o "<out-dir>/diagrams/$n.svg" -b transparent \
+//       -c site/diagrams/mermaid-config.json
+//   done
+//
+// No npm dependencies: node:fs, node:path and node:url only.
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const METHODS = ["get", "post", "put", "patch", "delete"];
+
+// -- spec helpers (ported from ApiDocs.tsx) ---------------------------------
+
+const refName = (ref) => ref?.split("/").pop();
+
+export function resolve(spec, s) {
+  if (!s) return s;
+  if (s.$ref) return spec.components?.schemas?.[refName(s.$ref) ?? ""] ?? {};
+  return s;
+}
+
+export function typeLabel(spec, s) {
+  const r = resolve(spec, s);
+  if (!r) return "—";
+  if (r.enum) return r.enum.join(" | ");
+  if (r.type === "array") return `${typeLabel(spec, r.items)}[]`;
+  const base = r.type ?? (r.properties ? "object" : "—");
+  // A format, when the spec gives one, is more specific than the bare type
+  // (e.g. "int64" says more than "integer"), so prefer it over the base.
+  return r.format ?? base;
+}
+
+// A concrete example value for a schema, used to render a runnable request body.
+export function example(spec, s) {
+  const r = resolve(spec, s);
+  if (!r) return null;
+  if (r.example !== undefined) return r.example;
+  if (r.enum) return r.enum[0];
+  switch (r.type) {
+    case "number":
+    case "integer":
+      return 0;
+    case "boolean":
+      return false;
+    case "array":
+      return [example(spec, r.items)];
+    case "object": {
+      const o = {};
+      for (const [k, v] of Object.entries(r.properties ?? {})) o[k] = example(spec, v);
+      return o;
+    }
+    default:
+      return r.nullable ? null : "";
+  }
+}
+
+const bodyOf = (spec, op) => resolve(spec, op.requestBody?.content?.["application/json"]?.schema);
+
+// A single obviously-placeholder value for a map-shaped body's value type
+// (additionalProperties), used only when there are no named `properties` to
+// build a real example from. Reuses example()'s type handling so a numeric
+// or boolean value type still round-trips as valid JSON of that type; a
+// bare fallback of "VALUE" covers string and anything else, deliberately —
+// inventing a plausible-looking field name here would document a field that
+// may not exist (the real names come from each broker's own credential form).
+function placeholderValue(spec, valueSchema) {
+  const r = resolve(spec, valueSchema);
+  switch (r?.type) {
+    case "number":
+    case "integer":
+      return 0;
+    case "boolean":
+      return false;
+    default:
+      return "VALUE";
+  }
+}
+
+export function curlFor(spec, method, path_, op) {
+  const lines = [`curl "$OMS_URL${path_}"`];
+  if (method !== "get") lines.push(`  -X ${method.toUpperCase()}`);
+  if (op.security?.length) lines.push(`  --header "Authorization: Bearer $OMS_TOKEN"`);
+  const body = bodyOf(spec, op);
+  if (body) {
+    lines.push(`  --header "Content-Type: application/json"`);
+    // A map-shaped body (additionalProperties, no named `properties`) has no
+    // fields for example() to enumerate, so it falls through to `{}` — valid
+    // JSON, but indistinguishable from "send this and you're done", which for
+    // a credential-write endpoint reads as "submit an empty credential form".
+    // Named-properties bodies (every other endpoint) are untouched below.
+    const hasNamedProperties = Object.keys(body.properties ?? {}).length > 0;
+    const exampleBody =
+      !hasNamedProperties && body.additionalProperties
+        ? { FIELD_NAME: placeholderValue(spec, body.additionalProperties) }
+        : example(spec, body);
+    lines.push(`  --data '${JSON.stringify(exampleBody, null, 2)}'`);
+  }
+  return lines.join(" \\\n");
+}
+
+// Status-code colour category. Green for 2xx, red for 5xx, amber otherwise
+// (matches cockpit/src/components/apiTheme.tsx's C.green/C.amber/C.red).
+export function respColor(code) {
+  const c = String(code);
+  if (c.startsWith("2")) return "green";
+  if (c.startsWith("5")) return "red";
+  return "amber";
+}
+
+// -- HTML rendering -----------------------------------------------------
+
+// Every string interpolated from the spec goes through this. Descriptions
+// and summaries originate in Rust doc comments and must never become markup.
+export function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const slug = (m, p) => `${m}-${p}`.replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+
+// Buckets operations by their first tag, matching ApiDocsPage's grouping.
+// Operations with no tag land in a final "other" group.
+function groupOperations(spec) {
+  const groups = [];
+  const byTag = new Map();
+  for (const [p, ops] of Object.entries(spec.paths ?? {})) {
+    for (const m of METHODS) {
+      const op = ops[m];
+      if (!op) continue;
+      const tag = op.tags?.[0] ?? "other";
+      if (!byTag.has(tag)) {
+        byTag.set(tag, []);
+        groups.push([tag, byTag.get(tag)]);
+      }
+      byTag.get(tag).push({ method: m, path: p, op });
+    }
+  }
+  return groups;
+}
+
+function renderRow({ name, type, required, example: ex, desc }) {
+  const hasExample = ex !== undefined && ex !== null && ex !== "";
+  const exampleHtml = hasExample
+    ? `<div class="docs-row-example">e.g. ${escapeHtml(typeof ex === "string" ? ex : JSON.stringify(ex))}</div>`
+    : "";
+  return `<div class="docs-row">
+    <div class="docs-row-name">
+      <div class="docs-row-name-text">${escapeHtml(name)}${required ? '<span class="docs-required"> *</span>' : ""}</div>
+      <div class="docs-row-type">${escapeHtml(type)}</div>
+    </div>
+    <div class="docs-row-body">
+      ${desc ? `<div class="docs-row-desc">${escapeHtml(desc)}</div>` : ""}
+      ${exampleHtml}
+    </div>
+  </div>`;
+}
+
+function renderPanel(title, innerHtml) {
+  return `<div class="docs-panel">
+    <div class="docs-panel-title">${escapeHtml(title)}</div>
+    ${innerHtml}
+  </div>`;
+}
+
+function renderMethodBadge(method) {
+  return `<span class="method method-${escapeHtml(method)}">${escapeHtml(method.toUpperCase())}</span>`;
+}
+
+function renderOperation(spec, entry) {
+  const { method, path: p, op } = entry;
+  const id = slug(method, p);
+  const params = op.parameters ?? [];
+  const body = bodyOf(spec, op);
+  const bodyFields = Object.entries(body?.properties ?? {});
+  const schemes = Array.from(new Set((op.security ?? []).flatMap((m) => Object.keys(m))));
+
+  const summaryHtml =
+    op.summary || op.description
+      ? `<p class="docs-op-summary">${escapeHtml(op.summary || op.description)}</p>`
+      : "";
+
+  const authHtml = schemes.length
+    ? `<div class="docs-op-auth"><span class="docs-eyebrow">Auth</span>${schemes
+        .map((s) => `<span class="docs-auth-scheme">${escapeHtml(s)}</span>`)
+        .join("")}</div>`
+    : "";
+
+  const paramsHtml = params.length
+    ? renderPanel(
+        "Parameters",
+        params
+          .map((prm) =>
+            renderRow({
+              name: prm.name,
+              type: `${prm.in} · ${typeLabel(spec, prm.schema)}`,
+              required: prm.required,
+              desc: prm.description,
+            }),
+          )
+          .join(""),
+      )
+    : "";
+
+  // Gated on the body existing, not on bodyFields.length: a map-shaped body
+  // (additionalProperties, no named `properties`) has no fields to list but
+  // is still a real body — its description still belongs on the page, and
+  // curlFor still emits a --data example for it, so silence here would be
+  // misleading rather than merely empty.
+  const bodyHtml = body
+    ? renderPanel(
+        "Request body",
+        (body?.description
+          ? `<div class="docs-row-desc docs-body-desc">${escapeHtml(body.description)}</div>`
+          : "") +
+          (bodyFields.length
+            ? bodyFields
+                .map(([name, s]) =>
+                  renderRow({
+                    name,
+                    type: typeLabel(spec, s),
+                    required: body?.required?.includes(name),
+                    example: resolve(spec, s)?.example,
+                    desc: resolve(spec, s)?.description,
+                  }),
+                )
+                .join("")
+            : body.additionalProperties
+              ? renderRow({
+                  name: "(any field name)",
+                  type:
+                    body.additionalProperties === true
+                      ? "any"
+                      : `${typeLabel(spec, body.additionalProperties)} value`,
+                })
+              : ""),
+      )
+    : "";
+
+  const responsesHtml = op.responses
+    ? renderPanel(
+        "Responses",
+        Object.entries(op.responses)
+          .map(
+            ([code, r]) =>
+              `<div class="docs-resp-row"><span class="docs-resp-code resp-${respColor(code)}">${escapeHtml(
+                code,
+              )}</span><span class="docs-resp-desc">${escapeHtml(r?.description ?? "")}</span></div>`,
+          )
+          .join(""),
+      )
+    : "";
+
+  const curl = curlFor(spec, method, p, op);
+
+  return `<div class="docs-op" id="${id}">
+    <div class="docs-op-head">
+      ${renderMethodBadge(method)}
+      <span class="docs-op-path">${escapeHtml(p)}</span>
+    </div>
+    ${summaryHtml}
+    ${authHtml}
+    ${paramsHtml}
+    ${bodyHtml}
+    ${responsesHtml}
+    <div class="docs-panel docs-example">
+      <div class="docs-panel-title">Example</div>
+      <pre class="docs-curl"><code>${escapeHtml(curl)}</code></pre>
+    </div>
+  </div>`;
+}
+
+// Full HTML document: same <head> shape as site/index.html, a header
+// linking back to it, then one <section> per tag with one block per
+// operation (method badge, path, summary, parameters, request-body
+// fields, response codes, curl example).
+export function renderApi(spec) {
+  const groups = groupOperations(spec);
+  const schemes = spec.components?.securitySchemes ?? {};
+
+  const navHtml = groups
+    .map(
+      ([tag, entries]) => `<div class="docs-nav-group">
+        <div class="docs-eyebrow">${escapeHtml(tag)}</div>
+        ${entries
+          .map(
+            (e) =>
+              `<a class="docs-nav-link" href="#${slug(e.method, e.path)}">${renderMethodBadge(
+                e.method,
+              )}<span class="docs-nav-path">${escapeHtml(e.path)}</span></a>`,
+          )
+          .join("")}
+      </div>`,
+    )
+    .join("");
+
+  const authSection = Object.keys(schemes).length
+    ? renderPanel(
+        "Authentication",
+        Object.entries(schemes)
+          .map(([name, s]) => renderRow({ name, type: `http · ${s?.scheme ?? ""}`, desc: s?.description }))
+          .join(""),
+      )
+    : "";
+
+  const groupsHtml = groups
+    .map(
+      ([tag, entries]) => `<section class="docs-section">
+        <h2 class="docs-tag">${escapeHtml(tag)}</h2>
+        ${entries.map((e) => renderOperation(spec, e)).join("")}
+      </section>`,
+    )
+    .join("");
+
+  const title = spec.info?.title ?? "OMS API";
+  const version = spec.info?.version ?? "";
+
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>openoms — API reference</title>
+    <link rel="icon" href="favicon.svg" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="docs-header">
+      <p class="docs-back"><a href="index.html">&larr; openoms</a></p>
+      <h1>${escapeHtml(title)} <span class="docs-version">v${escapeHtml(version)}</span></h1>
+      <p class="tagline">
+        Point clients at your OMS host (<code>$OMS_URL</code>). Mint a bearer token on the
+        Tokens tab and send it as <code>Authorization: Bearer $OMS_TOKEN</code>.
+      </p>
+    </header>
+    <main class="docs-main">
+      <nav class="docs-nav">${navHtml}</nav>
+      <div class="docs-content">
+        ${authSection}
+        ${groupsHtml}
+      </div>
+    </main>
+  </body>
+</html>
+`;
+}
+
+// -- architecture page (diagrams inlined at build time) --------------------
+
+// Matches one `<figure class="diagram" data-diagram="NAME">...</figure>`
+// placeholder, capturing NAME and whatever's already inside it (a
+// <figcaption>, normally). Non-greedy so a figure never swallows the next one.
+const DIAGRAM_RE = /<figure class="diagram" data-diagram="([a-z]+)">([^]*?)<\/figure>/g;
+
+/**
+ * Replace each `<figure data-diagram="NAME">` placeholder's contents with that
+ * diagram's SVG, keeping any <figcaption> already inside it.
+ *
+ * A missing SVG throws rather than leaving an empty figure: a hole in a
+ * published page is worse than a failed build, and CI is where this should
+ * stop.
+ */
+export function inlineDiagrams(html, svgs) {
+  return html.replace(DIAGRAM_RE, (whole, name, inner) => {
+    const svg = svgs[name];
+    if (!svg) {
+      throw new Error(
+        `inlineDiagrams: no SVG for diagram "${name}" — did the mermaid-cli render step run?`,
+      );
+    }
+    return `<figure class="diagram" data-diagram="${name}">${svg}${inner}</figure>`;
+  });
+}
+
+// -- entry point ----------------------------------------------------------
+
+function main() {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = path.resolve(here, "..");
+  const specPath = path.join(repoRoot, "docs", "openapi.json");
+  const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
+
+  // Malformed JSON already throws (JSON.parse above); this catches the other
+  // way a spec can be broken without being invalid JSON — present but empty
+  // `paths`, which would otherwise build and deploy a reference with no
+  // endpoints. Mirrors the Rust test `the_openapi_subcommand_renders_a_usable_spec`,
+  // which asserts the same thing on the `oms openapi` output.
+  if (!spec.paths || Object.keys(spec.paths).length === 0) {
+    throw new Error(`build-docs: docs/openapi.json has no paths — is it stale or truncated?`);
+  }
+
+  const outDir = path.resolve(process.argv[2] ?? "_site");
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, "api.html"), renderApi(spec));
+
+  // The four mermaid sources live in site/diagrams/*.mmd; mermaid-cli renders
+  // them to SVG before this script runs (see site/build-docs.test.mjs and the
+  // task-4 brief's Step 7 for the exact invocation) — this script only reads
+  // the result and inlines it.
+  const svgDir = path.resolve(process.argv[3] ?? path.join(outDir, "diagrams"));
+  if (!fs.existsSync(svgDir)) {
+    throw new Error(
+      `build-docs: no diagram SVGs at ${svgDir} — run mermaid-cli (with -c site/diagrams/mermaid-config.json) over site/diagrams/*.mmd first.`,
+    );
+  }
+  const svgs = {};
+  for (const f of fs.readdirSync(svgDir)) {
+    if (f.endsWith(".svg")) svgs[path.basename(f, ".svg")] = fs.readFileSync(path.join(svgDir, f), "utf8");
+  }
+
+  const archTemplate = fs.readFileSync(path.join(repoRoot, "site", "architecture.html"), "utf8");
+  fs.writeFileSync(path.join(outDir, "architecture.html"), inlineDiagrams(archTemplate, svgs));
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
+}
