@@ -88,7 +88,9 @@ impl OrderEventStore {
                 correlation_id::text AS correlation_id,
                 causation_id::text AS causation_id,
                 schema_version,
-                created_at
+                -- Stored as TIMESTAMP (no zone) in UTC; sqlx will only decode a
+                -- DateTime<Utc> from a TIMESTAMPTZ, so say so in the query.
+                created_at AT TIME ZONE 'UTC' AS created_at
              FROM order_event
              WHERE order_id = $1
              ORDER BY version ASC"
@@ -235,5 +237,73 @@ impl OrderEventStore {
         .fetch_one(&mut **tx)
         .await?;
         Ok(version)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::setup::database::config;
+
+    /// `load_stream` had never run against a real database — nothing called it — so
+    /// its column list and its types had never been checked. `created_at` is
+    /// `TIMESTAMP` (no zone), which sqlx refuses to decode as `DateTime<Utc>`, and
+    /// the column it ordered by was spelled differently from the column that
+    /// existed. Only Postgres can catch either.
+    ///
+    /// Appends to the order log, which is append-only by design: this leaves its
+    /// events behind under a throwaway order id.
+    ///
+    /// Run with: cargo test -- --ignored
+    /// Requires: a live Postgres reachable via the usual POSTGRES_* config.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn an_appended_event_reads_back_out_of_the_stream() {
+        // `main` loads .env before resolving config; a test binary does not, so
+        // without this the test would silently resolve a different database than
+        // the server runs against.
+        dotenvy::dotenv().ok();
+        // The runtime pool connects as the `oms` role, which carries
+        // `search_path = oms, public` (db/access/roles.sql). These are the admin
+        // credentials, so the test has to set the same path itself.
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .expect("connect");
+        let store = OrderEventStore::new(pool);
+        let order_id = Uuid::new_v4();
+
+        store
+            .append_events(
+                order_id,
+                0,
+                &[NewOrderEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    event_type: "order_submitted".to_string(),
+                    actor: "event-store-test".to_string(),
+                    payload: serde_json::json!({ "probe": true }),
+                    correlation_id: None,
+                    causation_id: None,
+                    schema_version: 0,
+                }],
+            )
+            .await
+            .expect("append");
+
+        let stream = store.load_stream(order_id).await.expect("load stream");
+
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].version, 1);
+        assert_eq!(stream[0].actor, "event-store-test");
+        assert_eq!(stream[0].payload["probe"], true);
     }
 }

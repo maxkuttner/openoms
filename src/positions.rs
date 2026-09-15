@@ -217,7 +217,7 @@ pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
          FROM order_event e \
          JOIN order_state os ON os.order_id = e.order_id \
          WHERE e.event_type IN ('order_partially_filled', 'order_filled') \
-         ORDER BY e.gloabl_position",
+         ORDER BY e.global_position",
     )
     .fetch_all(pool)
     .await?;
