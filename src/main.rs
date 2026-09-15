@@ -892,6 +892,16 @@ async fn serve() {
     // `quote_tx` are handed in (not just kept as `serve()` locals) so the
     // `/admin/connections/reload` handler can rebuild an equivalent
     // `RegistrationDeps` and restart feeds against the same channels boot used.
+    // Session cookie policy is derived once here from the bind address (secure,
+    // `__Host-`-prefixed cookies only where HTTPS can actually back them — see
+    // `sessions::cookie_policy`) rather than recomputed on every request.
+    // `SessionTtl::default()` for now; a later task sources idle/absolute TTL
+    // from configuration instead.
+    let session_config = sessions::SessionConfig {
+        cookie_policy: sessions::cookie_policy(&bind_addr),
+        ttl: sessions::SessionTtl::default(),
+    };
+
     let state = AppState::new(
         pool,
         admin_token,
@@ -902,6 +912,7 @@ async fn serve() {
         stream_health,
         Some(position_changed_tx.clone()),
         quote_tx.clone(),
+        session_config,
     );
     state.swap_registry(registry);
 

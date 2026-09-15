@@ -116,6 +116,11 @@ pub struct AppState {
     pool: PgPool,
     pub admin_token: String,
     pub admin_auth_enabled: bool,
+    /// Cookie policy + TTLs for browser sessions. Derived once at boot from
+    /// the bind address (see `sessions::cookie_policy`) rather than per
+    /// request, and carried whole rather than as separate constructor
+    /// arguments — see `auth::authenticate`, its only reader.
+    pub session_config: crate::sessions::SessionConfig,
     /// Swappable so a credential change can publish a new registry without
     /// restarting: readers on the order path take an atomic load, and an order
     /// already routing holds its own `Arc` and finishes against the adapter it
@@ -160,11 +165,13 @@ impl AppState {
         stream_health: StreamHealthRegistry,
         position_changed_tx: Option<mpsc::Sender<()>>,
         quote_tx: mpsc::Sender<dataprovider::Quote>,
+        session_config: crate::sessions::SessionConfig,
     ) -> Self {
         Self {
             pool,
             admin_token,
             admin_auth_enabled,
+            session_config,
             registry: Arc::new(ArcSwap::from_pointee(registry)),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             kafka,
@@ -265,6 +272,10 @@ mod tests {
             StreamHealthRegistry::new(),
             None,
             quote_tx,
+            crate::sessions::SessionConfig {
+                cookie_policy: crate::sessions::cookie_policy("localhost:3001"),
+                ttl: crate::sessions::SessionTtl::default(),
+            },
         )
     }
 

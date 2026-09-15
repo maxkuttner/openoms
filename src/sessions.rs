@@ -45,6 +45,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+#[derive(Clone)]
 pub struct SessionTtl {
     pub idle: Duration,
     pub absolute: Duration,
@@ -78,8 +79,22 @@ pub fn needs_touch(now: DateTime<Utc>, last_seen_at: DateTime<Utc>) -> bool {
 /// Both require HTTPS, which plain-http localhost cannot satisfy — so a loopback
 /// bind drops them, and anything else requires them. Same reasoning as the
 /// default-admin-password rule in `main.rs`.
+#[derive(Clone)]
 pub struct CookiePolicy {
     pub secure: bool,
+}
+
+/// The pieces of session handling that are fixed once at boot rather than
+/// recomputed per request: the cookie policy is derived from the bind address
+/// (see `cookie_policy`), and the TTLs govern idle/absolute expiry. Held on
+/// `AppState` as a single field so a request never redoes this derivation.
+///
+/// `ttl` is `SessionTtl::default()` for now; a later task sources it from
+/// configuration instead.
+#[derive(Clone)]
+pub struct SessionConfig {
+    pub cookie_policy: CookiePolicy,
+    pub ttl: SessionTtl,
 }
 
 pub fn cookie_policy(bind_addr: &str) -> CookiePolicy {

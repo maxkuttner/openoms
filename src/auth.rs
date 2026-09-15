@@ -9,47 +9,135 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::sessions::SessionConfig;
 
 #[derive(Clone)]
 pub struct AuthContext {
     pub principal_id: Uuid,
+    /// The acting principal's `code`, carried so a handler can stamp an
+    /// event's `actor` without a second query.
+    pub principal_code: String,
 }
 
-/// Authenticate a trading request and inject `AuthContext { principal_id }`.
+/// Which door a request came through. Authorization never branches on this —
+/// a session and an API key carrying the same `principal_id` have identical
+/// powers — the only thing that differs by kind is the CSRF origin check in
+/// `auth_middleware`, which applies to `Session` only: the existing Python
+/// client and `oms` CLI send a Bearer token and no `Origin` header at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialKind {
+    Session,
+    ApiKey,
+}
+
+/// Resolve whichever credential the request carries.
 ///
-/// Accepts two equivalent credential forms carrying the same `(key_id, secret)`:
-/// - HTTP **Basic** `key_id:secret` — the original form, kept for back-compat.
-/// - **Bearer** `key_id.secret` — a single copy-paste "trading token" (Databento
-///   style). Split on the first `.` (neither `ak_…` key ids nor `sk_…` secrets
-///   contain a dot).
+/// Session cookie first, key material second. Both produce the same
+/// `AuthContext`: the difference between a human and a machine ends here, and
+/// no handler downstream can tell them apart.
 ///
-/// Both resolve through the same DB lookup + bcrypt verify ([`verify_key`]).
+/// `session_config` is threaded in rather than derived from a bind address
+/// here, so the cookie policy is computed once at boot (see `AppState`) and
+/// so the idle/absolute TTL is never silently hardcoded — a later task makes
+/// it configurable, and doing the derivation per call would ignore that.
+pub async fn authenticate(
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    session_config: &SessionConfig,
+) -> Result<Option<(AuthContext, CredentialKind)>, Response> {
+    let policy = &session_config.cookie_policy;
+    if let Some(value) =
+        crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy))
+    {
+        let hash = crate::sessions::hash_session_token(&value);
+        if let Some(record) = crate::sessions::lookup_session(pool, &hash)
+            .await
+            .map_err(|_| service_unavailable())?
+        {
+            let now = chrono::Utc::now();
+            if crate::sessions::is_expired(
+                now,
+                record.last_seen_at,
+                record.absolute_expires_at,
+                &session_config.ttl,
+            ) {
+                return Ok(None);
+            }
+            if crate::sessions::needs_touch(now, record.last_seen_at) {
+                crate::sessions::touch_session(pool, record.id)
+                    .await
+                    .map_err(|_| service_unavailable())?;
+            }
+            return Ok(Some((
+                AuthContext {
+                    principal_id: record.principal_id,
+                    principal_code: record.principal_code,
+                },
+                CredentialKind::Session,
+            )));
+        }
+    }
+
+    let Ok((key_id, secret)) = extract_trading_credentials(headers) else {
+        return Ok(None);
+    };
+    Ok(verify_key(pool, &key_id, &secret).await?.map(|(principal_id, principal_code)| {
+        (AuthContext { principal_id, principal_code }, CredentialKind::ApiKey)
+    }))
+}
+
+/// Authenticate a trading request and inject `AuthContext`.
+///
+/// Accepts two doors that both resolve to the same `AuthContext`:
+/// - A session cookie, set at sign-in (see `sessions.rs`).
+/// - An API key, in one of two equivalent credential forms carrying the same
+///   `(key_id, secret)`:
+///   - HTTP **Basic** `key_id:secret` — the original form, kept for back-compat.
+///   - **Bearer** `key_id.secret` — a single copy-paste "trading token"
+///     (Databento style). Split on the first `.` (neither `ak_…` key ids nor
+///     `sk_…` secrets contain a dot).
+///
+/// A session-authenticated request additionally has to pass the CSRF origin
+/// check (`origin_is_allowed`) — an API-key request never carries an `Origin`
+/// header at all, so gating those on it would break every existing caller.
 pub async fn auth_middleware(
     State(state): State<AppState>,
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    let (key_id, secret) = extract_trading_credentials(req.headers())?;
-
-    let principal_id = verify_key(state.pool(), &key_id, &secret)
+    let (ctx, kind) = authenticate(state.pool(), req.headers(), &state.session_config)
         .await?
         .ok_or_else(unauthorized)?;
 
-    req.extensions_mut().insert(AuthContext { principal_id });
+    if kind == CredentialKind::Session {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let scheme = if state.session_config.cookie_policy.secure { "https" } else { "http" };
+        let expected_origin = format!("{scheme}://{host}");
+        if !crate::sessions::origin_is_allowed(req.headers(), req.method(), &expected_origin) {
+            return Err(forbidden());
+        }
+    }
+
+    req.extensions_mut().insert(ctx);
     Ok(next.run(req).await)
 }
 
-/// Look up an active api key by `key_id` and bcrypt-verify `secret`. Returns the
-/// owning `principal_id` on success, `None` if the key is unknown/revoked or the
-/// secret doesn't match. `Err` only for infrastructure failures (DB / task join).
+/// Look up an active api key by `key_id` and bcrypt-verify `secret`. Returns
+/// the owning `(principal_id, principal_code)` on success, `None` if the key
+/// is unknown/revoked or the secret doesn't match. `Err` only for
+/// infrastructure failures (DB / task join).
 pub async fn verify_key(
     pool: &sqlx::PgPool,
     key_id: &str,
     secret: &str,
-) -> Result<Option<Uuid>, Response> {
-    let row = sqlx::query_as::<_, (Uuid, String)>(
+) -> Result<Option<(Uuid, String)>, Response> {
+    let row = sqlx::query_as::<_, (Uuid, String, String)>(
         r#"
-        SELECT k.principal_id, k.secret_hash
+        SELECT k.principal_id, p.code, k.secret_hash
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         WHERE k.key_id = $1 AND k.revoked_at IS NULL AND p.status = 'ACTIVE'
@@ -60,7 +148,7 @@ pub async fn verify_key(
     .await
     .map_err(|_| service_unavailable())?;
 
-    let Some((principal_id, secret_hash)) = row else {
+    let Some((principal_id, principal_code, secret_hash)) = row else {
         return Ok(None);
     };
 
@@ -71,7 +159,7 @@ pub async fn verify_key(
         .map_err(|_| service_unavailable())?
         .map_err(|_| unauthorized())?;
 
-    Ok(valid.then_some(principal_id))
+    Ok(valid.then_some((principal_id, principal_code)))
 }
 
 pub async fn admin_middleware(
@@ -163,4 +251,153 @@ fn service_unavailable() -> Response {
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .body("service unavailable".into())
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions::{cookie_policy, SessionTtl};
+
+    fn session_config() -> SessionConfig {
+        SessionConfig { cookie_policy: cookie_policy("localhost:3001"), ttl: SessionTtl::default() }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_session_cookie_authenticates_exactly_like_a_key() {
+        let pool = test_pool().await;
+        let (principal_id, code) = seed_principal(&pool, "auth-session-test").await;
+        let token = crate::sessions::create_session(
+            &pool,
+            principal_id,
+            &SessionTtl::default(),
+            None,
+        )
+        .await
+        .expect("create session");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("cookie", format!("oms_session={}", token.plaintext).parse().unwrap());
+
+        let (ctx, kind) = authenticate(&pool, &headers, &session_config())
+            .await
+            .expect("authenticate")
+            .expect("a session should authenticate");
+
+        assert_eq!(ctx.principal_id, principal_id);
+        assert_eq!(ctx.principal_code, code, "the code must ride along, for the audit trail");
+        assert_eq!(kind, CredentialKind::Session);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn an_idle_session_no_longer_authenticates() {
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "auth-idle-test").await;
+        let token = crate::sessions::create_session(
+            &pool,
+            principal_id,
+            &SessionTtl::default(),
+            None,
+        )
+        .await
+        .expect("create session");
+
+        // Backdate past the 30-minute idle window.
+        sqlx::query(
+            "UPDATE user_session SET last_seen_at = now() - interval '31 minutes' \
+             WHERE token_hash = $1",
+        )
+        .bind(&token.hash)
+        .execute(&pool)
+        .await
+        .expect("backdate");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("cookie", format!("oms_session={}", token.plaintext).parse().unwrap());
+
+        assert!(authenticate(&pool, &headers, &session_config())
+            .await
+            .expect("authenticate")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn no_credential_of_either_kind_is_not_an_authentication() {
+        let pool = test_pool().await;
+
+        assert!(authenticate(&pool, &axum::http::HeaderMap::new(), &session_config())
+            .await
+            .expect("authenticate")
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn an_api_key_still_authenticates_and_is_tagged_as_such() {
+        let pool = test_pool().await;
+        let (principal_id, code) = seed_principal(&pool, "auth-apikey-test").await;
+        let key_id = format!("ak_test_auth_{}", Uuid::new_v4());
+        let secret = "s3cr3t-value";
+        let secret_hash = bcrypt::hash(secret, bcrypt::DEFAULT_COST).expect("hash");
+        sqlx::query(
+            "INSERT INTO api_key (key_id, principal_id, secret_hash) VALUES ($1, $2, $3)",
+        )
+        .bind(&key_id)
+        .bind(principal_id)
+        .bind(&secret_hash)
+        .execute(&pool)
+        .await
+        .expect("seed api key");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {key_id}.{secret}").parse().unwrap(),
+        );
+
+        let (ctx, kind) = authenticate(&pool, &headers, &session_config())
+            .await
+            .expect("authenticate")
+            .expect("an api key should authenticate");
+
+        assert_eq!(ctx.principal_id, principal_id);
+        assert_eq!(ctx.principal_code, code);
+        assert_eq!(kind, CredentialKind::ApiKey);
+    }
+
+    // ── test plumbing ────────────────────────────────────────────────────────
+    // Copied from `sessions.rs`'s test module — see its comments for why.
+
+    async fn test_pool() -> sqlx::PgPool {
+        use crate::setup::database::config;
+        dotenvy::dotenv().ok();
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .expect("connect")
+    }
+
+    async fn seed_principal(pool: &sqlx::PgPool, code: &str) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let code = format!("{code}-{id}");
+        sqlx::query(
+            "INSERT INTO principal (id, code, principal_type, display_name, status) \
+             VALUES ($1, $2, 'HUMAN', $2, 'ACTIVE')",
+        )
+        .bind(id)
+        .bind(&code)
+        .execute(pool)
+        .await
+        .expect("seed principal");
+        (id, code)
+    }
 }
