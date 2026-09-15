@@ -132,10 +132,11 @@ pub async fn resolve_or_provision(
 
 // ── HTTP layer: /auth/login, /auth/callback, /auth/logout, /auth/me ────────
 //
-// Task 13 mounts these on the router, registers them with OpenAPI, and wires
-// `AuthApiState` from `[auth.oidc]` config. This module only has to make the
-// handlers themselves correct — routing, auth-gating `/auth/me` behind
-// `auth_middleware`, and config plumbing are that later task's job.
+// Mounted in `main.rs`'s `serve()`: `/auth/login`, `/auth/callback` and
+// `/auth/logout` on their own unauthenticated router (merged only when
+// `config.oidc()` is `Some`), `/auth/me` on `orders_router` behind
+// `auth_middleware`. `AuthApiState` is constructed there too, from
+// `[auth.oidc]` config plus `oidc::Provider::discover`.
 
 /// What `login` and `callback` need beyond `AppState`: the configured
 /// provider connection and the optional claim gate `resolve_or_provision`
@@ -248,6 +249,12 @@ fn pkce_challenge(verifier: &str) -> String {
 /// the flow cookie, and sends the browser to the provider. Cannot fail —
 /// there is no user input yet and no network call, only local randomness —
 /// so this returns a bare `Response`, not a `Result`.
+#[utoipa::path(
+    get, path = "/auth/login", tag = "auth",
+    responses(
+        (status = 302, description = "Redirects to the identity provider's authorization endpoint"),
+    ),
+)]
 pub async fn login(State(state): State<AppState>, Extension(auth_state): Extension<AuthApiState>) -> Response {
     let flow = FlowState {
         state: random_token(),
@@ -270,7 +277,7 @@ pub async fn login(State(state): State<AppState>, Extension(auth_state): Extensi
 /// are `Option` (rather than required) because a provider error omits both —
 /// forcing that case through a deserialization failure would make it
 /// indistinguishable from a client sending a genuinely malformed request.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
 pub struct CallbackParams {
     pub code: Option<String>,
     pub state: Option<String>,
@@ -356,6 +363,17 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
 /// exchange/token failure, `ClaimRejected`, and `SubjectNotAvailable` (the
 /// latter two both map to 403 — see `ResolveOutcome`) all return before
 /// `create_session` is ever called.
+#[utoipa::path(
+    get, path = "/auth/callback", tag = "auth",
+    params(CallbackParams),
+    responses(
+        (status = 302, description = "Login completed; session cookie set, redirects to /"),
+        (status = 400, description = "Malformed callback, or a missing/expired/mismatched login flow"),
+        (status = 401, description = "The provider rejected the login, or the exchanged token failed verification"),
+        (status = 403, description = "The claim gate rejected the identity, or the subject belongs to a non-human or disabled principal"),
+        (status = 502, description = "The identity provider was unreachable"),
+    ),
+)]
 pub async fn callback(
     State(state): State<AppState>,
     Extension(auth_state): Extension<AuthApiState>,
@@ -441,6 +459,12 @@ pub async fn callback(
 /// Reads the raw cookie itself rather than requiring `Extension<AuthContext>`
 /// so it stays idempotent: a missing, already-revoked, or expired session
 /// still gets a `clear_cookie_header` in the response instead of a 401.
+#[utoipa::path(
+    post, path = "/auth/logout", tag = "auth",
+    responses(
+        (status = 204, description = "Session revoked and cookie cleared (idempotent)"),
+    ),
+)]
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let policy = &state.session_config.cookie_policy;
     if let Some(value) = sessions::cookie_from_headers(&headers, sessions::cookie_name(policy)) {
@@ -467,7 +491,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result
 
 /// The signed-in principal plus its granted portfolios — the shape a
 /// front end needs to render itself without a second round trip.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct MeResponse {
     pub principal_id: String,
     pub code: String,
@@ -480,6 +504,14 @@ pub struct MeResponse {
 /// Reuses `handlers::list_portfolios`'s exact query shape rather than a
 /// widened or narrowed one, so `/auth/me`'s notion of "granted portfolios"
 /// can never drift from `/portfolios`'s.
+#[utoipa::path(
+    get, path = "/auth/me", tag = "auth",
+    responses(
+        (status = 200, description = "OK", body = MeResponse),
+        (status = 401, description = "Not authenticated"),
+    ),
+    security(("basic_auth" = []), ("bearer_token" = []))
+)]
 pub async fn me(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -664,6 +696,20 @@ mod tests {
 
         assert_eq!(challenge, pkce_challenge(verifier));
         assert_ne!(challenge, verifier);
+    }
+
+    #[test]
+    fn pkce_challenge_matches_the_rfc_7636_appendix_b_known_answer_vector() {
+        // https://www.rfc-editor.org/rfc/rfc7636#appendix-B — a fixed
+        // verifier/challenge pair. Self-consistency alone (the test above)
+        // would still pass if `pkce_challenge` used, say, SHA-1 instead of
+        // SHA-256: same input, same output, just the wrong transform. Pinning
+        // the actual published output is what catches that — instead of
+        // finding out only when a real IdP starts rejecting every login.
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let expected_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+        assert_eq!(pkce_challenge(verifier), expected_challenge);
     }
 
     #[tokio::test]

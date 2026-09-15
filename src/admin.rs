@@ -2101,8 +2101,14 @@ pub struct RevokedSessions {
 /// Effective on the very next request from any of them — `lookup_session`
 /// only resolves a session while `revoked_at IS NULL`, so there is nothing
 /// to invalidate beyond the row itself (no cache sits in front of it).
-/// Not mounted yet; wiring the route is a later task, so this (and
-/// `RevokedSessions`) will show as dead code until then.
+#[utoipa::path(
+    delete, path = "/admin/principals/{id}/sessions", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    responses(
+        (status = 200, description = "OK", body = RevokedSessions),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn revoke_principal_sessions(
     State(state): State<AppState>,
     Path(principal_id): Path<Uuid>,

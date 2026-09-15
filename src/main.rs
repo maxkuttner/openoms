@@ -38,11 +38,13 @@ use axum::{
     routing::get,
     routing::post,
     middleware,
+    Extension,
     Router
 };
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
+use std::sync::Arc;
 use dotenvy::dotenv;
 use tracing::{error, info, warn};
 use tracing_subscriber::{self, EnvFilter};
@@ -134,6 +136,11 @@ mod reload_tests;
         admin::backfill_symbology,
         admin::expiry_sweep,
         admin::setup_status,
+        admin::revoke_principal_sessions,
+        auth_api::login,
+        auth_api::callback,
+        auth_api::logout,
+        auth_api::me,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -156,11 +163,14 @@ mod reload_tests;
         admin::ExpirySweepResult,
         admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
+        admin::RevokedSessions,
+        auth_api::MeResponse,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "orders", description = "Order submission and cancellation"),
         (name = "admin", description = "Admin management of principals, portfolios, accounts, broker connections, and keys"),
+        (name = "auth", description = "OIDC login and the signed-in principal"),
     )
 )]
 struct ApiDoc;
@@ -824,6 +834,29 @@ async fn serve() {
         }
     };
 
+    // Same rule, for OIDC login instead of the admin console: a session
+    // cookie can only carry `Secure` when `sessions::cookie_policy` judges
+    // the bind loopback or the public base URL `https://` (see that
+    // function). Off loopback with a non-`https://` `public_base_url`, the
+    // cookie would be set without `Secure` and sent in clear text on every
+    // request — so refuse to start rather than silently serve a login that
+    // hands out a stealable session. A fresh `[auth.oidc]` block with no
+    // bind change at all (the common local-dev case) never reaches this:
+    // `bind_is_loopback` is true there, same as the admin-password rule
+    // above.
+    if let Some(oidc) = file_cfg.and_then(|f| f.oidc()) {
+        if !bind_is_loopback(&bind_addr) && !oidc.public_base_url.starts_with("https://") {
+            error!(
+                "refusing to start: [auth.oidc] is configured, OMS_BIND_ADDR ({bind_addr}) is \
+                 reachable beyond this machine, and auth.oidc.public_base_url ({}) is not \
+                 https:// — the session cookie could not carry Secure and would be sent in \
+                 clear text. Serve OIDC login behind https, or bind to loopback only.",
+                oidc.public_base_url
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Stream health + the fill→marks doorbell are created here (before the broker
     // registry) because FIX sessions register their adapter *and* start their
     // session in one step, so they need both up front. The same StreamHealthRegistry
@@ -897,15 +930,22 @@ async fn serve() {
     // Session cookie policy is derived once here from the bind address (secure,
     // `__Host-`-prefixed cookies only where HTTPS can actually back them — see
     // `sessions::cookie_policy`) rather than recomputed on every request.
-    // `SessionTtl::default()` for now; a later task sources idle/absolute TTL
-    // from configuration instead. `public_base_url: None` likewise — a later
-    // task wires it in from OIDC configuration; until then, a session-
-    // authenticated request fails closed on the CSRF origin check rather than
-    // trusting anything derived from the request itself (see `auth_middleware`).
+    // `ttl`/`public_base_url` come from `[auth.oidc]` when it's configured —
+    // `FileConfig::oidc` is the one place idle/absolute TTL overrides and the
+    // public base URL are read — and fall back to `SessionTtl::default()`/
+    // `None` when it is not. A session can only ever be minted by the OIDC
+    // callback, so `public_base_url` being `None` here means OIDC is off,
+    // which means no session-authenticated request can ever reach
+    // `auth_middleware`'s CSRF origin check to begin with — see that
+    // function's doc comment for why a missing base URL still fails closed
+    // there rather than assuming this.
     let session_config = sessions::SessionConfig {
         cookie_policy: sessions::cookie_policy(&bind_addr),
-        ttl: sessions::SessionTtl::default(),
-        public_base_url: None,
+        ttl: file_cfg
+            .and_then(|f| f.oidc())
+            .map(|o| o.ttl)
+            .unwrap_or_default(),
+        public_base_url: file_cfg.and_then(|f| f.oidc()).map(|o| o.public_base_url),
     };
 
     let state = AppState::new(
@@ -1110,6 +1150,55 @@ async fn serve() {
         setup::bootstrap::spawn_sync(synced_brokers);
     }
 
+    // OIDC login. `config.oidc()` is `None` unless `[auth.oidc]` has every
+    // required field (see `FileConfig::oidc`) — that, alone, is what keeps
+    // login off by default: no block means `auth_api_state` stays `None`,
+    // `auth_router` below is never built, and `/auth/*` falls through to
+    // `handler_404` exactly as it does today.
+    //
+    // The client secret is deliberately not read from `oms.toml` (nor from
+    // the sealed broker/feed credential store `credentials.rs` uses — see
+    // this task's report for why that store doesn't fit a single, singleton
+    // secret without new schema and a new write path that is out of this
+    // task's scope) — `OMS_OIDC_CLIENT_SECRET` is the bootstrap-tier
+    // environment variable, the same tier `OMS_ADMIN_PASSWORD` and
+    // `OMS_MASTER_KEY` already live on.
+    //
+    // A discovery failure (IdP unreachable, secret missing, or an insecure
+    // endpoint refused by `oidc::Provider::discover`) logs an error and
+    // leaves `auth_api_state` `None` rather than exiting: an operator who
+    // configured `[auth.oidc]` still needs the rest of the OMS — order
+    // routing, the admin console — to come up even if the IdP is down or the
+    // secret hasn't been set yet. It is retried only on the next restart.
+    let auth_api_state: Option<auth_api::AuthApiState> =
+        if let Some(oidc_settings) = file_cfg.and_then(|f| f.oidc()) {
+            match env::var("OMS_OIDC_CLIENT_SECRET").ok().filter(|v| !v.is_empty()) {
+                None => {
+                    error!(
+                        "[auth.oidc] is configured but OMS_OIDC_CLIENT_SECRET is not set — OIDC \
+                         login is disabled for this run. Set OMS_OIDC_CLIENT_SECRET to the client \
+                         secret registered at the provider and restart."
+                    );
+                    None
+                }
+                Some(client_secret) => {
+                    let required_claim = oidc_settings.required_claim.clone();
+                    match oidc::Provider::discover(oidc_settings, client_secret).await {
+                        Ok(provider) => {
+                            info!("OIDC discovery succeeded — login enabled");
+                            Some(auth_api::AuthApiState { provider: Arc::new(provider), required_claim })
+                        }
+                        Err(e) => {
+                            error!(error = ?e, "OIDC discovery failed — login is disabled for this run");
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
     // Register routes
 
     // 1) Register order routes
@@ -1124,6 +1213,11 @@ async fn serve() {
             "/orders/:id/allocations",
             post(handlers::create_allocations).get(handlers::list_allocations),
         )
+        // `/auth/me` requires authentication (unlike login/callback/logout,
+        // which are unauthenticated by definition), so it belongs here,
+        // behind the same `auth_middleware` as every other authenticated
+        // route, rather than on the unauthenticated `auth_router` below.
+        .route("/auth/me", get(auth_api::me))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes (protected by static bearer token only)
@@ -1144,6 +1238,10 @@ async fn serve() {
         .route(
             "/admin/principals/:id/keys/:key_id",
             axum::routing::delete(admin::revoke_principal_key),
+        )
+        .route(
+            "/admin/principals/:id/sessions",
+            axum::routing::delete(admin::revoke_principal_sessions),
         )
         .route(
             "/admin/trading-tokens",
@@ -1231,14 +1329,31 @@ async fn serve() {
         scalar_api_reference::scalar_html_default(&config)
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/scalar", get(move || async move { Html(scalar_html) }))
         .route("/api-docs/openapi.json", get(|| async { axum::Json(ApiDoc::openapi()) }))
         // add health check route
         .route("/health", get(handlers::health))
         .merge(orders_router)
         .merge(admin_router)
-        .merge(cockpit::router())
+        .merge(cockpit::router());
+
+    // 3) Register the unauthenticated OIDC routes — merged only when
+    // `auth_api_state` resolved above, i.e. only when `[auth.oidc]` is
+    // configured and discovery succeeded. Left unmerged, `/auth/*` falls
+    // through to `handler_404` below exactly as it does with no OIDC config
+    // at all: the off-by-default behaviour holds whether the block is
+    // absent or merely not yet working.
+    if let Some(auth_state) = auth_api_state {
+        let auth_router = Router::new()
+            .route("/auth/login", get(auth_api::login))
+            .route("/auth/callback", get(auth_api::callback))
+            .route("/auth/logout", post(auth_api::logout))
+            .layer(Extension(auth_state));
+        app = app.merge(auth_router);
+    }
+
+    let app = app
         // add 404 route as fallback
         .fallback(handlers::handler_404)
         .with_state(state);

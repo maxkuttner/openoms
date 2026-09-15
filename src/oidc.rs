@@ -192,6 +192,43 @@ struct CachedKeys {
 /// adversarial token must not be able to drive a fetch storm.
 const JWKS_REFETCH_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
 
+/// True for hosts reachable only from this machine — the one case
+/// `refuse_insecure_endpoint` tolerates an `http://` discovered endpoint for,
+/// so a local Keycloak run entirely on loopback still works without TLS.
+///
+/// `host` is `url::Url::host_str()`'s output, which brackets an IPv6 literal
+/// (`"[::1]"`, not `"::1"`) — unlike `setup::database::config::is_loopback_host`,
+/// which parses a bare `host:port` pair and so never sees brackets.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// Refuses a discovered endpoint that is neither `https://` nor loopback
+/// `http://`.
+///
+/// `authorization_endpoint` and `token_endpoint` come straight off the
+/// provider's own discovery document (`CoreProviderMetadata`), which applies
+/// no scheme check of its own. A misconfigured — or compromised — IdP
+/// advertising `http://` for the token endpoint would put the client secret
+/// on the wire in clear text on every code exchange; for the authorization
+/// endpoint, it would send the PKCE challenge and the browser redirect over
+/// an interceptable channel. Loopback is the one deliberate exception, so a
+/// local Keycloak in development still works without standing up TLS for it.
+fn refuse_insecure_endpoint(url: &str, label: &str) -> Result<(), OidcError> {
+    let parsed = openidconnect::url::Url::parse(url).map_err(|e| {
+        OidcError::ProviderUnavailable(format!("{label} endpoint is not a valid URL: {e}"))
+    })?;
+    let is_loopback = parsed.host_str().is_some_and(is_loopback_host);
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback => Ok(()),
+        scheme => Err(OidcError::ProviderUnavailable(format!(
+            "{label} endpoint advertised by the provider is not https:// and not loopback \
+             (scheme {scheme:?}); refusing to trust it: {url}"
+        ))),
+    }
+}
+
 /// A configured connection to one OIDC identity provider: its discovered (or,
 /// in tests, pre-baked) endpoints, plus a cached JWKS refreshed on demand.
 ///
@@ -222,12 +259,18 @@ impl Provider {
             .map_err(|e| OidcError::ProviderUnavailable(format!("OIDC discovery failed: {e}")))?;
 
         let authorization_endpoint = metadata.authorization_endpoint().to_string();
+        refuse_insecure_endpoint(&authorization_endpoint, "authorization")?;
         let token_endpoint = metadata
             .token_endpoint()
             .ok_or_else(|| {
                 OidcError::ProviderUnavailable("provider metadata has no token_endpoint".into())
             })?
             .to_string();
+        // The client secret rides on this exact request (`request_id_token`'s
+        // token-endpoint POST) — an `http://` token endpoint would put it on
+        // the wire in clear text. Checked before it is ever used, not just
+        // before it is stored.
+        refuse_insecure_endpoint(&token_endpoint, "token")?;
         let jwks_uri = metadata.jwks_uri().clone();
 
         let keys = JsonWebKeySet::fetch_async(&jwks_uri, &http_client)
@@ -639,6 +682,29 @@ mod tests {
         let provider = Provider::for_test("https://id.example.com", "oms", "https://oms.example.com/");
 
         assert_eq!(provider.redirect_uri(), "https://oms.example.com/auth/callback");
+    }
+
+    #[test]
+    fn an_https_endpoint_is_always_trusted() {
+        assert!(refuse_insecure_endpoint("https://id.example.com/token", "token").is_ok());
+    }
+
+    #[test]
+    fn an_http_endpoint_on_loopback_is_tolerated_for_local_development() {
+        assert!(refuse_insecure_endpoint("http://localhost:8080/token", "token").is_ok());
+        assert!(refuse_insecure_endpoint("http://127.0.0.1:8080/token", "token").is_ok());
+        assert!(refuse_insecure_endpoint("http://[::1]:8080/token", "token").is_ok());
+    }
+
+    #[test]
+    fn an_http_endpoint_off_loopback_is_refused() {
+        let err = refuse_insecure_endpoint("http://id.example.com/token", "token").unwrap_err();
+        assert!(matches!(err, OidcError::ProviderUnavailable(_)));
+    }
+
+    #[test]
+    fn a_malformed_endpoint_url_is_refused_not_panicked_on() {
+        assert!(refuse_insecure_endpoint("not a url", "token").is_err());
     }
 
     // --- TestSigner -----------------------------------------------------
