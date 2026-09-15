@@ -91,6 +91,9 @@ project should not reimplement worse.
   that spec comes, `broker_connection.credentials_updated_by` is where it plugs in.
 - **Local password authentication.** No `password_hash` column, now or later.
 - **Storing IdP access or refresh tokens.** See "Token handling" below.
+- **Sealing the OIDC client secret in the credential store.** It is read from
+  `OMS_OIDC_CLIENT_SECRET` instead (see "Client registration and key material").
+  Giving it a home in the sealed store is possible follow-up work, not done here.
 
 ## Design
 
@@ -184,11 +187,22 @@ only.
 
 ### Client registration and key material
 
-The OMS is a confidential client. Issuer URL, client id and scopes are plain config;
-**the client secret goes into the sealed credential store**, not `oms.toml` —
-`secrets.rs::seal` (AES-256-GCM with an AAD) is already how this project keeps a
-secret out of a database dump, and an IdP client secret is exactly that. It is
-written through the existing `oms config` credential maintenance command.
+The OMS is a confidential client. Issuer URL, client id and scopes are plain config.
+
+**Correction (implementation, 2026-09-16):** this section originally specified that
+the client secret goes into the sealed credential store (`secrets.rs::seal`,
+AES-256-GCM with an AAD), written through the `oms config` credential maintenance
+command, on the reasoning that the secret should not be recoverable out of a
+database dump. That store is keyed by broker/feed connection row; it has no schema
+or write path for a single OIDC client secret, and building one is its own piece of
+work, not a byproduct of this task. **The implementation instead reads the secret
+from the `OMS_OIDC_CLIENT_SECRET` environment variable**, never written to
+`oms.toml` or to any table. This is bootstrap-tier, the same tier as
+`OMS_ADMIN_PASSWORD`, `POSTGRES_PASSWORD` and `OMS_PASSWORD`, all of which already
+live in `.env` rather than the sealed store — and it still satisfies this section's
+original reason for sealing the secret: it never reaches the database, so it cannot
+appear in a dump. Moving it into the sealed store later, once that schema and write
+path exist, is possible follow-up work; see "Out of scope" below.
 
 Discovery (`{issuer}/.well-known/openid-configuration`) is fetched lazily and cached.
 JWKS is cached and refetched on an unknown `kid`, rate-limited so a malformed token
@@ -299,7 +313,9 @@ A `[auth.oidc]` block in `oms.toml`: issuer, client id, scopes, optional require
 claim, session idle and absolute TTLs, and the OMS's own public base URL — from which
 the redirect URI is derived as `{public_base_url}/auth/callback` and against which the
 callback's `Origin` is checked, so there is one value to configure and one value
-registered at the IdP. The client secret is not in the file.
+registered at the IdP. The client secret is not in the file — it comes from the
+`OMS_OIDC_CLIENT_SECRET` environment variable (see "Client registration and key
+material" above for why).
 
 **Off by default.** With no `[auth.oidc]` block, the OMS behaves exactly as it does
 today: `/auth/*` returns 404 and nothing else changes. The

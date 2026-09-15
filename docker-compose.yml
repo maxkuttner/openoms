@@ -38,5 +38,44 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
+  # A disposable identity provider for exercising OIDC login end to end.
+  #
+  # Not part of the default `docker compose up -d` — it lives under the `oidc`
+  # profile, so it only starts when explicitly asked for and stays out of CI
+  # and of every developer's normal Postgres-only loop:
+  #
+  #     docker compose --profile oidc up -d keycloak
+  #     OMS_OIDC_CLIENT_SECRET=oms-dev-secret cargo run
+  #
+  # `--import-realm` loads docker/keycloak/oms-dev-realm.json on boot, which
+  # creates the `oms-dev` realm, one confidential client (`oms`, secret
+  # `oms-dev-secret`, redirect URI `http://localhost:3001/auth/callback`) and
+  # one user (`trader` / `trader`) — no manual console clicking needed. Point
+  # `oms.toml` at it:
+  #
+  #     [auth.oidc]
+  #     issuer = "http://localhost:8080/realms/oms-dev"
+  #     client_id = "oms"
+  #     public_base_url = "http://localhost:3001"
+  #
+  # then open http://localhost:3001/auth/login and sign in as `trader` /
+  # `trader`. `start-dev` is Keycloak's own non-production mode — fine for
+  # this, not for anything real. Admin console at localhost:8080, `admin` /
+  # `admin`.
+  keycloak:
+    container_name: oms-keycloak
+    image: quay.io/keycloak/keycloak:26.0
+    profiles: ["oidc"]
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./docker/keycloak/oms-dev-realm.json:/opt/keycloak/data/import/oms-dev-realm.json:ro
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   oms-postgres:

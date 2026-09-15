@@ -726,6 +726,18 @@ mod tests {
         assert!(refuse_insecure_endpoint("not a url", "token").is_err());
     }
 
+    /// `is_loopback_host` matches on the exact string, so a hostile look-alike
+    /// that merely *contains* a loopback name must not be mistaken for it —
+    /// otherwise `127.0.0.1.evil.com` or `localhost.evil.com` could downgrade
+    /// an endpoint to plain `http://` by embedding the loopback name as a
+    /// prefix. Pinned here as a test rather than left to inspection.
+    #[test]
+    fn loopback_look_alikes_are_not_mistaken_for_loopback() {
+        assert!(!is_loopback_host("127.0.0.1.evil.com"));
+        assert!(!is_loopback_host("localhost.evil.com"));
+        assert!(!is_loopback_host("[::1].evil.com"));
+    }
+
     // --- TestSigner -----------------------------------------------------
     //
     // Mints RSA-signed ID tokens in-process, using the same key and JWT types

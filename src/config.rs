@@ -7,6 +7,47 @@
 //!
 //! Every field is optional. The file is one tier in the flag → env → file →
 //! default chain, so a half-filled file is normal rather than an error.
+//!
+//! `oms init` generates `[database]`, `[oms]` and `[server]` for you.
+//! `[auth.oidc]` is not — enabling login is opt-in and added by hand. A
+//! representative file looks like this:
+//!
+//! ```toml
+//! [database]
+//! host = "localhost"
+//! port = 5432
+//! username = "postgres"
+//! database = "ods"
+//!
+//! [oms]
+//! password = "generated-by-init"
+//! master_key = "base64:generated-by-init"
+//!
+//! [server]
+//! bind_addr = "localhost:3001"
+//! admin_password = "generated-by-init"
+//!
+//! # Uncomment to enable OIDC login. With no [auth.oidc] block at all, login
+//! # stays off and the OMS behaves exactly as it does today: /auth/* returns
+//! # 404 and nothing else changes.
+//! #
+//! # The client secret is NOT set here — it comes from the
+//! # OMS_OIDC_CLIENT_SECRET environment variable and is never written to this
+//! # file.
+//! #
+//! # [auth.oidc]
+//! # issuer = "https://idp.example.com/realms/oms"
+//! # client_id = "oms"
+//! # public_base_url = "https://oms.example.com"
+//! # scopes = ["openid", "profile", "email"]      # default shown
+//! # required_claim = "groups"                     # optional gate; needs both
+//! # required_claim_value = "oms-traders"           # halves to take effect
+//! # idle_ttl_minutes = 30                          # default shown
+//! # absolute_ttl_hours = 12                        # default shown
+//! ```
+//!
+//! See "Enabling login (OIDC)" in `README.md` for what to register at the
+//! identity provider.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
