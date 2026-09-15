@@ -4,14 +4,30 @@
 //! human who successfully completes OIDC login needs one too. This module
 //! owns that mapping and, on first login, the provisioning of a new row.
 //!
-//! HTTP handlers for `/auth/*` are a later task's concern and live outside
-//! this module — `resolve_or_provision` takes an already-`VerifiedIdentity`
-//! and a database pool, and makes no assumption about how either arrived.
+//! `resolve_or_provision` takes an already-`VerifiedIdentity` and a database
+//! pool, and makes no assumption about how either arrived — that's the job of
+//! the `/auth/*` HTTP handlers below, which route an OIDC login through it.
 
+use std::sync::Arc;
+
+use axum::{
+    extract::{Extension, Query, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Redirect, Response},
+    Json,
+};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::oidc::VerifiedIdentity;
+use crate::app_state::AppState;
+use crate::auth::AuthContext;
+use crate::handlers::{self, ApiError};
+use crate::oidc::{OidcError, Provider, VerifiedIdentity};
+use crate::sessions::{self, CookiePolicy};
 
 /// The result of matching a verified identity to a principal.
 pub enum ResolveOutcome {
@@ -114,6 +130,402 @@ pub async fn resolve_or_provision(
     })
 }
 
+// ── HTTP layer: /auth/login, /auth/callback, /auth/logout, /auth/me ────────
+//
+// Task 13 mounts these on the router, registers them with OpenAPI, and wires
+// `AuthApiState` from `[auth.oidc]` config. This module only has to make the
+// handlers themselves correct — routing, auth-gating `/auth/me` behind
+// `auth_middleware`, and config plumbing are that later task's job.
+
+/// What `login` and `callback` need beyond `AppState`: the configured
+/// provider connection and the optional claim gate `resolve_or_provision`
+/// checks. Kept out of `AppState` because OIDC is optional and off by
+/// default (see `FileConfig::oidc`); Task 13 constructs this once at boot,
+/// only when `[auth.oidc]` is configured, and hands it to the router as an
+/// `Extension`.
+#[derive(Clone)]
+pub struct AuthApiState {
+    pub provider: Arc<Provider>,
+    pub required_claim: Option<(String, String)>,
+}
+
+/// `state`, `nonce`, and the PKCE verifier for one pending login. Minted by
+/// `login`, carried to the browser in a short-lived cookie (see
+/// `flow_cookie`), and read back by `callback` — never persisted to a table,
+/// since they are per-browser and worthless the moment the callback returns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowState {
+    pub state: String,
+    pub nonce: String,
+    pub pkce_verifier: String,
+}
+
+/// How long the flow cookie lives. Long enough to cover a human clicking
+/// through an IdP login form; short enough that an abandoned flow cookie is
+/// useless well before anyone could find and replay it.
+const FLOW_COOKIE_MAX_AGE_SECONDS: i64 = 300;
+
+/// Distinct from the session cookie's name (`sessions::cookie_name`) so the
+/// two can never collide or be confused for one another; `__Host-`-prefixed
+/// under the same secure policy as the session cookie for the same reason
+/// (see `sessions::cookie_name`).
+fn flow_cookie_name(policy: &CookiePolicy) -> &'static str {
+    if policy.secure {
+        "__Host-oms_login_flow"
+    } else {
+        "oms_login_flow"
+    }
+}
+
+/// Builds the `Set-Cookie` header that carries `flow` to the browser.
+/// `HttpOnly` so no script on the page can read the PKCE verifier;
+/// `SameSite=Lax` and `Max-Age=300` so it cannot outlive the login it was
+/// minted for.
+pub fn flow_cookie(policy: &CookiePolicy, flow: &FlowState) -> String {
+    let encoded = encode_flow(flow);
+    let mut header = format!(
+        "{}={encoded}; Path=/; HttpOnly; SameSite=Lax; Max-Age={FLOW_COOKIE_MAX_AGE_SECONDS}",
+        flow_cookie_name(policy)
+    );
+    if policy.secure {
+        header.push_str("; Secure");
+    }
+    header
+}
+
+/// Expires the flow cookie immediately — used once `callback` has read it,
+/// so a completed (or abandoned) login flow leaves nothing behind to replay.
+fn clear_flow_cookie(policy: &CookiePolicy) -> String {
+    let mut header = format!(
+        "{}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+        flow_cookie_name(policy)
+    );
+    if policy.secure {
+        header.push_str("; Secure");
+    }
+    header
+}
+
+/// Reads `flow_cookie`'s value back out, or `None` if it is absent, expired,
+/// or corrupt. A callback with no flow cookie cannot be trusted — there is
+/// nothing to compare its `state` against — so this is the gate `callback`
+/// checks before anything else touches the network.
+pub fn flow_from_cookie(headers: &HeaderMap, policy: &CookiePolicy) -> Option<FlowState> {
+    let value = sessions::cookie_from_headers(headers, flow_cookie_name(policy))?;
+    decode_flow(&value)
+}
+
+/// JSON, then base64url (no padding) — the same alphabet already used for
+/// `state`/`nonce`/`pkce_verifier` (see `random_token`), so the cookie value
+/// never needs percent-encoding.
+fn encode_flow(flow: &FlowState) -> String {
+    let json = serde_json::to_vec(flow).expect("FlowState is plain strings; serialization cannot fail");
+    URL_SAFE_NO_PAD.encode(json)
+}
+
+fn decode_flow(value: &str) -> Option<FlowState> {
+    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// A cryptographically random, URL-safe token — used for `state`, `nonce`,
+/// and the PKCE verifier alike. 32 bytes of entropy, same as
+/// `sessions::generate_session_token`.
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The S256 PKCE challenge for `verifier`: `base64url(SHA256(verifier))`,
+/// unpadded. `plain` is never used — this crate only ever speaks S256.
+fn pkce_challenge(verifier: &str) -> String {
+    let digest = Sha256::digest(verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest)
+}
+
+/// Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in
+/// the flow cookie, and sends the browser to the provider. Cannot fail —
+/// there is no user input yet and no network call, only local randomness —
+/// so this returns a bare `Response`, not a `Result`.
+pub async fn login(State(state): State<AppState>, Extension(auth_state): Extension<AuthApiState>) -> Response {
+    let flow = FlowState {
+        state: random_token(),
+        nonce: random_token(),
+        pkce_verifier: random_token(),
+    };
+    let challenge = pkce_challenge(&flow.pkce_verifier);
+    let authorize_url = auth_state.provider.authorize_url(&flow.state, &flow.nonce, &challenge);
+
+    let mut response = Redirect::to(&authorize_url).into_response();
+    let cookie = flow_cookie(&state.session_config.cookie_policy, &flow);
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        cookie.parse().expect("flow cookie header value is plain ASCII"),
+    );
+    response
+}
+
+/// What the provider sent back on `GET /auth/callback`. `code` and `state`
+/// are `Option` (rather than required) because a provider error omits both —
+/// forcing that case through a deserialization failure would make it
+/// indistinguishable from a client sending a genuinely malformed request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallbackParams {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The decision table for a callback request, before anything is exchanged
+/// or even looked up against the flow cookie. Kept as a pure function of
+/// `CallbackParams` so it's testable without a provider, a pool, or a cookie.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallbackOutcome {
+    /// A `code` and `state` both arrived — the only shape worth proceeding
+    /// with.
+    Ok { code: String, state: String },
+    /// The provider itself refused or aborted the login (e.g.
+    /// `error=access_denied`). Surfaced, not swallowed: this must reach the
+    /// caller as a distinct, logged failure rather than falling through to
+    /// "malformed".
+    ProviderError(String),
+    /// Neither of the above — missing `code` or `state` with no `error`
+    /// either. Not a shape a real provider (or a real error) produces.
+    Malformed,
+}
+
+/// Classifies a callback request. `error` wins even if `code`/`state` also
+/// happen to be present — a provider is never expected to send both, but if
+/// one did, the error is the more truthful signal.
+pub fn classify_callback(params: &CallbackParams) -> CallbackOutcome {
+    if let Some(error) = &params.error {
+        return CallbackOutcome::ProviderError(error.clone());
+    }
+    match (&params.code, &params.state) {
+        (Some(code), Some(state)) => CallbackOutcome::Ok { code: code.clone(), state: state.clone() },
+        _ => CallbackOutcome::Malformed,
+    }
+}
+
+/// Whether the `state` the provider echoed back matches the one minted for
+/// this flow. Checked before the authorization code is ever exchanged — an
+/// attacker-supplied `state` (or a stale one from a different, abandoned
+/// flow) must never reach the network call.
+pub fn callback_state_matches(flow: &FlowState, provided_state: &str) -> bool {
+    flow.state == provided_state
+}
+
+/// A login failure whose detail must not reach the client — see the
+/// `OidcError` doc comment on never letting provider/transport detail leak
+/// into a response body. The caller has already logged the real reason.
+fn login_failed(status: StatusCode) -> ApiError {
+    ApiError { status, message: "login failed".to_string() }
+}
+
+/// Maps an `OidcError` from `exchange_code` to a response status without
+/// ever putting the error's own message (which can carry transport or
+/// provider response detail) into that response. `ProviderUnavailable` is
+/// genuinely an upstream problem (502); every other variant means the token
+/// itself did not check out, which from the client's perspective is the same
+/// as a bad credential (401).
+fn map_oidc_error(err: OidcError) -> ApiError {
+    let status = match err {
+        OidcError::ProviderUnavailable(ref detail) => {
+            tracing::warn!(detail, "oidc provider unavailable during code exchange");
+            StatusCode::BAD_GATEWAY
+        }
+        other => {
+            tracing::warn!(error = ?other, "oidc code exchange produced an untrusted token");
+            StatusCode::UNAUTHORIZED
+        }
+    };
+    login_failed(status)
+}
+
+fn db_error(context: &str, err: sqlx::Error) -> ApiError {
+    tracing::error!(error = ?err, context, "database error in auth_api");
+    ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: "internal error".to_string() }
+}
+
+/// Completes a login: validates the callback, exchanges the code, resolves
+/// (or provisions) the principal, and mints a session.
+///
+/// Every failure path here ends in a clean `ApiError` and no session:
+/// a provider error, a missing/expired flow cookie, a `state` mismatch, an
+/// exchange/token failure, `ClaimRejected`, and `SubjectNotAvailable` (the
+/// latter two both map to 403 — see `ResolveOutcome`) all return before
+/// `create_session` is ever called.
+pub async fn callback(
+    State(state): State<AppState>,
+    Extension(auth_state): Extension<AuthApiState>,
+    headers: HeaderMap,
+    Query(params): Query<CallbackParams>,
+) -> Result<Response, ApiError> {
+    let (code, provided_state) = match classify_callback(&params) {
+        CallbackOutcome::ProviderError(error) => {
+            tracing::warn!(error, "oidc provider returned an error on callback");
+            return Err(login_failed(StatusCode::UNAUTHORIZED));
+        }
+        CallbackOutcome::Malformed => {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "malformed callback".to_string(),
+            });
+        }
+        CallbackOutcome::Ok { code, state } => (code, state),
+    };
+
+    let policy = &state.session_config.cookie_policy;
+    let flow = flow_from_cookie(&headers, policy).ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "missing or expired login flow".to_string(),
+    })?;
+
+    // Checked before the code is exchanged: an attacker-supplied or replayed
+    // `state` must never reach the network.
+    if !callback_state_matches(&flow, &provided_state) {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            message: "state mismatch".to_string(),
+        });
+    }
+
+    let identity = auth_state
+        .provider
+        .exchange_code(&code, &flow.pkce_verifier, &flow.nonce)
+        .await
+        .map_err(map_oidc_error)?;
+
+    let outcome = resolve_or_provision(state.pool(), &identity, auth_state.required_claim.as_ref())
+        .await
+        .map_err(|err| db_error("resolve_or_provision", err))?;
+
+    // Exhaustive on purpose: `SubjectNotAvailable` is a refusal, not a
+    // variant a catch-all should ever be allowed to treat as success.
+    let principal_id = match outcome {
+        ResolveOutcome::Resolved { principal_id, .. } => principal_id,
+        ResolveOutcome::ClaimRejected => {
+            return Err(ApiError { status: StatusCode::FORBIDDEN, message: "not authorized".to_string() });
+        }
+        ResolveOutcome::SubjectNotAvailable => {
+            return Err(ApiError { status: StatusCode::FORBIDDEN, message: "not authorized".to_string() });
+        }
+    };
+
+    let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+    let token = sessions::create_session(state.pool(), principal_id, &state.session_config.ttl, user_agent)
+        .await
+        .map_err(|err| db_error("create_session", err))?;
+
+    let mut response = Redirect::to("/").into_response();
+    let response_headers = response.headers_mut();
+    response_headers.append(
+        header::SET_COOKIE,
+        sessions::set_cookie_header(policy, &token.plaintext, state.session_config.ttl.absolute)
+            .parse()
+            .expect("session cookie header value is plain ASCII"),
+    );
+    response_headers.append(
+        header::SET_COOKIE,
+        clear_flow_cookie(policy).parse().expect("flow cookie header value is plain ASCII"),
+    );
+    Ok(response)
+}
+
+/// Local logout only: revokes our session and clears our cookie. The IdP's
+/// own session is deliberately left alone — RP-initiated logout (redirecting
+/// to the provider's `end_session_endpoint`) is not implemented, so signing
+/// out of the OMS does not sign the user out of their other applications.
+///
+/// Reads the raw cookie itself rather than requiring `Extension<AuthContext>`
+/// so it stays idempotent: a missing, already-revoked, or expired session
+/// still gets a `clear_cookie_header` in the response instead of a 401.
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    let policy = &state.session_config.cookie_policy;
+    if let Some(value) = sessions::cookie_from_headers(&headers, sessions::cookie_name(policy)) {
+        let hash = sessions::hash_session_token(&value);
+        if let Some(record) = sessions::lookup_session(state.pool(), &hash)
+            .await
+            .map_err(|err| db_error("lookup_session", err))?
+        {
+            sessions::revoke_session(state.pool(), record.id)
+                .await
+                .map_err(|err| db_error("revoke_session", err))?;
+        }
+    }
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        sessions::clear_cookie_header(policy)
+            .parse()
+            .expect("session cookie header value is plain ASCII"),
+    );
+    Ok(response)
+}
+
+/// The signed-in principal plus its granted portfolios — the shape a
+/// front end needs to render itself without a second round trip.
+#[derive(Debug, Serialize)]
+pub struct MeResponse {
+    pub principal_id: String,
+    pub code: String,
+    pub display_name: Option<String>,
+    pub portfolios: Vec<handlers::GrantedPortfolio>,
+}
+
+/// Who the caller is signed in as, and what they can act on.
+///
+/// Reuses `handlers::list_portfolios`'s exact query shape rather than a
+/// widened or narrowed one, so `/auth/me`'s notion of "granted portfolios"
+/// can never drift from `/portfolios`'s.
+pub async fn me(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<MeResponse>, ApiError> {
+    let display_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM principal WHERE id = $1")
+            .bind(auth.principal_id)
+            .fetch_one(state.pool())
+            .await
+            .map_err(|err| db_error("select principal", err))?;
+
+    let rows = sqlx::query(
+        "SELECT p.id, p.code, p.name, p.status, p.base_currency, \
+                g.can_trade, g.can_view, g.can_allocate \
+         FROM principal_portfolio_grant g \
+         JOIN portfolio p ON p.id = g.portfolio_id \
+         WHERE g.principal_id = $1 \
+         ORDER BY p.code",
+    )
+    .bind(auth.principal_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(|err| db_error("list granted portfolios", err))?;
+
+    let portfolios = rows
+        .into_iter()
+        .map(|r| handlers::GrantedPortfolio {
+            portfolio_id: r.get::<Uuid, _>("id").to_string(),
+            code: r.get("code"),
+            name: r.get("name"),
+            status: r.get("status"),
+            base_currency: r.get("base_currency"),
+            can_trade: r.get("can_trade"),
+            can_view: r.get("can_view"),
+            can_allocate: r.get("can_allocate"),
+        })
+        .collect();
+
+    Ok(Json(MeResponse {
+        principal_id: auth.principal_id.to_string(),
+        code: auth.principal_code,
+        display_name,
+        portfolios,
+    }))
+}
+
 /// True if `claims[claim_name]` equals `required_value`, whether the claim is
 /// a bare string (`"groups": "traders"`) or an array of strings
 /// (`"groups": ["traders", "staff"]`). Any other shape — absent, a number, an
@@ -171,6 +583,88 @@ fn slugify(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_flow_cookie_survives_a_round_trip() {
+        let policy = crate::sessions::cookie_policy("localhost:3001");
+        let flow = FlowState {
+            state: "st-1".into(),
+            nonce: "n-1".into(),
+            pkce_verifier: "v-1".into(),
+        };
+
+        let header = flow_cookie(&policy, &flow);
+        let mut headers = HeaderMap::new();
+        let value = header.split(';').next().unwrap().to_string();
+        headers.insert("cookie", value.parse().unwrap());
+
+        let read = flow_from_cookie(&headers, &policy).expect("flow");
+        assert_eq!(read.state, "st-1");
+        assert_eq!(read.nonce, "n-1");
+        assert_eq!(read.pkce_verifier, "v-1");
+    }
+
+    #[test]
+    fn the_flow_cookie_is_short_lived_and_unreadable_to_script() {
+        let policy = crate::sessions::cookie_policy("localhost:3001");
+        let header = flow_cookie(&policy, &FlowState {
+            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(),
+        });
+
+        assert!(header.contains("HttpOnly"));
+        assert!(header.contains("Max-Age=300"));
+    }
+
+    #[test]
+    fn a_callback_with_no_flow_cookie_cannot_be_trusted() {
+        assert!(flow_from_cookie(&HeaderMap::new(), &crate::sessions::cookie_policy("localhost:3001")).is_none());
+    }
+
+    #[test]
+    fn a_state_mismatch_is_rejected_before_anything_is_exchanged() {
+        let flow = FlowState { state: "expected".into(), nonce: "n".into(), pkce_verifier: "v".into() };
+
+        assert!(!callback_state_matches(&flow, "attacker-supplied"));
+        assert!(callback_state_matches(&flow, "expected"));
+    }
+
+    #[test]
+    fn a_provider_error_is_surfaced_rather_than_swallowed() {
+        let params = CallbackParams {
+            code: None,
+            state: None,
+            error: Some("access_denied".into()),
+        };
+
+        assert_eq!(classify_callback(&params), CallbackOutcome::ProviderError("access_denied".into()));
+    }
+
+    #[test]
+    fn a_callback_without_a_code_is_malformed() {
+        let params = CallbackParams { code: None, state: Some("st".into()), error: None };
+
+        assert_eq!(classify_callback(&params), CallbackOutcome::Malformed);
+    }
+
+    #[test]
+    fn a_flow_cookie_on_a_public_bind_is_host_prefixed_and_secure() {
+        let policy = crate::sessions::cookie_policy("0.0.0.0:3001");
+        let header = flow_cookie(&policy, &FlowState {
+            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(),
+        });
+
+        assert!(header.starts_with("__Host-oms_login_flow="));
+        assert!(header.contains("Secure"));
+    }
+
+    #[test]
+    fn pkce_challenge_is_deterministic_and_not_the_verifier_itself() {
+        let verifier = "a-verifier-value";
+        let challenge = pkce_challenge(verifier);
+
+        assert_eq!(challenge, pkce_challenge(verifier));
+        assert_ne!(challenge, verifier);
+    }
 
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
