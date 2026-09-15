@@ -19,6 +19,18 @@
 // brief), and inlineDiagrams() below splices each SVG into its placeholder
 // so the published page runs no mermaid at all.
 //
+// mmdc MUST be called with -c site/diagrams/mermaid-config.json — that config
+// is the only thing that themes the parts a per-node classDef can't reach
+// (erDiagram entities/attribute rows, subgraph cluster fills, edge-label
+// backgrounds), so without it every diagram renders in mermaid's stock light
+// theme regardless of the classDef colours below:
+//
+//   for f in site/diagrams/*.mmd; do
+//     n=$(basename "$f" .mmd)
+//     mmdc -i "$f" -o "<out-dir>/diagrams/$n.svg" -b transparent \
+//       -c site/diagrams/mermaid-config.json
+//   done
+//
 // No npm dependencies: node:fs, node:path and node:url only.
 
 import * as fs from "node:fs";
@@ -366,7 +378,7 @@ function main() {
   const svgDir = path.resolve(process.argv[3] ?? path.join(outDir, "diagrams"));
   if (!fs.existsSync(svgDir)) {
     throw new Error(
-      `build-docs: no diagram SVGs at ${svgDir} — run mermaid-cli over site/diagrams/*.mmd first.`,
+      `build-docs: no diagram SVGs at ${svgDir} — run mermaid-cli (with -c site/diagrams/mermaid-config.json) over site/diagrams/*.mmd first.`,
     );
   }
   const svgs = {};

@@ -1,0 +1,27 @@
+{
+  "theme": "base",
+  "themeVariables": {
+    "background": "#0d1014",
+    "mainBkg": "#151a20",
+    "primaryColor": "#151a20",
+    "primaryTextColor": "#d7dce3",
+    "primaryBorderColor": "#2a2f38",
+    "secondaryColor": "#1a1e26",
+    "secondaryTextColor": "#d7dce3",
+    "secondaryBorderColor": "#2a2f38",
+    "tertiaryColor": "#1a1e26",
+    "tertiaryTextColor": "#d7dce3",
+    "tertiaryBorderColor": "#2a2f38",
+    "textColor": "#d7dce3",
+    "nodeTextColor": "#d7dce3",
+    "nodeBorder": "#2a2f38",
+    "lineColor": "#8b949e",
+    "titleColor": "#d7dce3",
+    "edgeLabelBackground": "#151a20",
+    "clusterBkg": "#151a20",
+    "clusterBorder": "#2a2f38",
+    "attributeBackgroundColorOdd": "#151a20",
+    "attributeBackgroundColorEven": "#1a1e26",
+    "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
+  }
+}
