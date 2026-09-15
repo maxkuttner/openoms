@@ -86,6 +86,26 @@ export function example(spec, s) {
 
 const bodyOf = (spec, op) => resolve(spec, op.requestBody?.content?.["application/json"]?.schema);
 
+// A single obviously-placeholder value for a map-shaped body's value type
+// (additionalProperties), used only when there are no named `properties` to
+// build a real example from. Reuses example()'s type handling so a numeric
+// or boolean value type still round-trips as valid JSON of that type; a
+// bare fallback of "VALUE" covers string and anything else, deliberately —
+// inventing a plausible-looking field name here would document a field that
+// may not exist (the real names come from each broker's own credential form).
+function placeholderValue(spec, valueSchema) {
+  const r = resolve(spec, valueSchema);
+  switch (r?.type) {
+    case "number":
+    case "integer":
+      return 0;
+    case "boolean":
+      return false;
+    default:
+      return "VALUE";
+  }
+}
+
 export function curlFor(spec, method, path_, op) {
   const lines = [`curl "$OMS_URL${path_}"`];
   if (method !== "get") lines.push(`  -X ${method.toUpperCase()}`);
@@ -93,7 +113,17 @@ export function curlFor(spec, method, path_, op) {
   const body = bodyOf(spec, op);
   if (body) {
     lines.push(`  --header "Content-Type: application/json"`);
-    lines.push(`  --data '${JSON.stringify(example(spec, body), null, 2)}'`);
+    // A map-shaped body (additionalProperties, no named `properties`) has no
+    // fields for example() to enumerate, so it falls through to `{}` — valid
+    // JSON, but indistinguishable from "send this and you're done", which for
+    // a credential-write endpoint reads as "submit an empty credential form".
+    // Named-properties bodies (every other endpoint) are untouched below.
+    const hasNamedProperties = Object.keys(body.properties ?? {}).length > 0;
+    const exampleBody =
+      !hasNamedProperties && body.additionalProperties
+        ? { FIELD_NAME: placeholderValue(spec, body.additionalProperties) }
+        : example(spec, body);
+    lines.push(`  --data '${JSON.stringify(exampleBody, null, 2)}'`);
   }
   return lines.join(" \\\n");
 }

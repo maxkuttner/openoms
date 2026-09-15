@@ -92,6 +92,53 @@ test("renderApi shows a body panel for a map-shaped (additionalProperties) reque
   assert.match(html, /any field name/i, "no indication the body accepts arbitrary field names");
 });
 
+test("curlFor gives a map-shaped body an honest placeholder, not an empty '{}'", () => {
+  // {} is valid JSON but reads as "send this and you're done" — for a
+  // credential-write endpoint that means "submit an empty credential form".
+  // The placeholder must not invent a plausible-looking field name either
+  // (api_key, secret, ...): the real names come from each broker's own form.
+  const credSpec = {
+    paths: {
+      "/admin/broker-connections/{code}/credentials": {
+        put: {
+          requestBody: {
+            content: { "application/json": { schema: { $ref: "#/components/schemas/CredentialSubmission" } } },
+          },
+          responses: { 200: { description: "ok" } },
+        },
+      },
+    },
+    components: {
+      schemas: {
+        CredentialSubmission: {
+          type: "object",
+          description: "A submitted credential form.",
+          additionalProperties: { type: "string" },
+        },
+      },
+    },
+  };
+
+  const curl = curlFor(
+    credSpec,
+    "put",
+    "/admin/broker-connections/{code}/credentials",
+    credSpec.paths["/admin/broker-connections/{code}/credentials"].put,
+  );
+  assert.doesNotMatch(curl, /--data '\{\}'/, "still emits the empty, runnable-looking body");
+  assert.match(curl, /FIELD_NAME/, "no placeholder field name shown");
+  assert.doesNotMatch(curl, /api_key|secret|password|token/i, "invented a realistic-looking field name");
+});
+
+test("curlFor is unchanged for a named-properties body", () => {
+  // Regression guard: the additionalProperties handling above must not touch
+  // the path every other endpoint (55 of 57) actually uses.
+  const curl = curlFor(spec, "post", "/orders/submit", spec.paths["/orders/submit"].post);
+  assert.match(curl, /"symbol": "SPY@ARCX"/);
+  assert.match(curl, /"quantity": 0/);
+  assert.doesNotMatch(curl, /FIELD_NAME/);
+});
+
 test("escapeHtml neutralises markup from the spec", () => {
   // Descriptions come from doc comments in Rust source; a stray angle bracket
   // must not become a tag in the generated page.
