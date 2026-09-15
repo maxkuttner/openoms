@@ -146,6 +146,16 @@ pub fn cookie_from_headers(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
+/// Whether `method` is exempt from origin checks: it changes nothing, so
+/// neither demanding an `Origin` on it nor refusing it for want of one buys
+/// any security — only availability loss. The single source of truth for
+/// that method list, so `origin_is_allowed` and any fail-closed caller (see
+/// `auth::enforce_origin_for_session`) can't drift apart on which methods
+/// count as "safe."
+pub fn is_read_method(method: &Method) -> bool {
+    matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
 /// Reject state-changing requests that did not come from our own origin.
 ///
 /// `SameSite=Lax` already blocks the classic cross-site form post; this closes
@@ -153,7 +163,7 @@ pub fn cookie_from_headers(headers: &HeaderMap, name: &str) -> Option<String> {
 /// design. Reads are exempt: they change nothing, and demanding an `Origin` on
 /// GET would break ordinary links into the app.
 pub fn origin_is_allowed(headers: &HeaderMap, method: &Method, public_base_url: &str) -> bool {
-    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+    if is_read_method(method) {
         return true;
     }
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {

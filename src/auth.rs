@@ -126,18 +126,22 @@ pub async fn auth_middleware(
 /// (DNS rebinding, a proxy forwarding an attacker-controlled `Host`), so the
 /// check would always pass.
 ///
-/// `None` is refused rather than falling back to anything derived from the
-/// request: in practice this branch is unreachable, since a session can only
-/// ever be minted by the OIDC callback, and OIDC configuration always
+/// A missing `public_base_url` is refused rather than falling back to
+/// anything derived from the request — but only for state-changing methods:
+/// a read changes nothing, so blocking it buys no security, only
+/// availability loss (`sessions::is_read_method` is the same list
+/// `origin_is_allowed` itself exempts, so the two can't drift apart). In
+/// practice the state-changing branch is unreachable, since a session can
+/// only ever be minted by the OIDC callback, and OIDC configuration always
 /// carries `public_base_url` alongside it. If it's missing here anyway, fail
-/// closed.
+/// closed on writes.
 fn enforce_origin_for_session(
     kind: CredentialKind,
     headers: &axum::http::HeaderMap,
     method: &axum::http::Method,
     session_config: &SessionConfig,
 ) -> Result<(), Response> {
-    if kind != CredentialKind::Session {
+    if kind != CredentialKind::Session || crate::sessions::is_read_method(method) {
         return Ok(());
     }
     let Some(public_base_url) = session_config.public_base_url.as_deref() else {
@@ -302,6 +306,21 @@ mod tests {
         );
 
         assert!(result.is_err(), "no configured base URL must fail closed, not fall back to anything request-derived");
+    }
+
+    #[test]
+    fn a_session_authenticated_read_is_allowed_even_when_no_base_url_is_configured() {
+        // A GET changes nothing, so refusing it for want of a configured
+        // base URL buys no security — only availability loss. The fail-closed
+        // rule in `enforce_origin_for_session` must apply to writes only.
+        let result = enforce_origin_for_session(
+            CredentialKind::Session,
+            &axum::http::HeaderMap::new(),
+            &axum::http::Method::GET,
+            &session_config(), // public_base_url: None
+        );
+
+        assert!(result.is_ok(), "reads must not be blocked by a missing public_base_url");
     }
 
     #[test]
