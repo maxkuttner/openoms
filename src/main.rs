@@ -978,6 +978,27 @@ async fn serve() {
     // return as a disconnect to back off from — wrong shape for a periodic job.
     tokio::spawn(expiry::run(state.pool().clone()));
 
+    // Delete browser sessions past their absolute cap. Idle expiry is already
+    // enforced on read (`sessions::lookup_session`'s join to `principal`), so
+    // this sweep only clears rows that can never resolve again — it exists to
+    // keep `user_session` from growing forever, not to enforce expiry itself.
+    // Hourly, same cadence as the expiry sweep above, for the same reason: the
+    // work matches almost nothing on a normal tick, so a shorter interval buys
+    // nothing and a longer one just leaves dead rows around longer.
+    {
+        let pool = state.pool().clone();
+        tokio::spawn(async move {
+            loop {
+                match sessions::sweep_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(removed) => info!(removed, "session sweep"),
+                    Err(e) => error!(error = %e, "session sweep failed; retrying next interval"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
     // Feed credentials come from the store, same as brokers above. Gating the
     // spawn here is not enough on its own — `DatabentoOpraFeed` takes the key
     // explicitly and passes it to the `databento` client's `.key(...)` builder, so
