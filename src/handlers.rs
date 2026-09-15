@@ -29,7 +29,15 @@ use crate::event_store::{OrderEventStore, NewOrderEvent};
 use crate::kafka::publish_events;
 use crate::risk_engine::{PgRiskDataProvider, RiskCheckError, RiskEngine};
 
-
+/// Who to record as having caused an event.
+///
+/// `"oms"` is reserved for events the system generates on its own — expiry
+/// sweeps, reconciliation. A command that arrived with a credential is
+/// attributed to that credential's principal, whether it came from a browser
+/// session or an API key.
+fn actor_for(auth: &AuthContext) -> String {
+    auth.principal_code.clone()
+}
 
 // Generic api error struct
 pub struct ApiError {
@@ -550,7 +558,7 @@ pub async fn orders_submit(
     let metadata = EventMetadata {
         event_id: Uuid::new_v4().into(),
         timestamp: Utc::now(),
-        actor: "oms".into(),
+        actor: actor_for(&auth),
     };
 
     // run through state machine and decide whether can proceed
@@ -713,7 +721,7 @@ pub async fn orders_submit(
     let route_metadata = EventMetadata {
         event_id: Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
-        actor: "oms".to_string(),
+        actor: actor_for(&auth),
     };
 
     let route_events = applied
@@ -982,7 +990,7 @@ pub async fn orders_cancel(
     let metadata = EventMetadata {
         event_id: Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
-        actor: "oms".to_string(),
+        actor: actor_for(&auth),
     };
 
     // run through state machine and decide whether can proceed
@@ -1801,6 +1809,18 @@ mod tests {
     fn order_permission_maps_to_grant_column() {
         assert_eq!(OrderPermission::View.column(), "can_view");
         assert_eq!(OrderPermission::Trade.column(), "can_trade");
+    }
+
+    /// An authenticated command is attributed to whoever sent it — the whole
+    /// point of carrying `principal_code` on `AuthContext`.
+    #[test]
+    fn an_authenticated_command_is_attributed_to_whoever_sent_it() {
+        let auth = AuthContext {
+            principal_id: Uuid::nil(),
+            principal_code: "jane.doe".to_string(),
+        };
+
+        assert_eq!(actor_for(&auth), "jane.doe");
     }
 }
 
