@@ -22,6 +22,8 @@
     "clusterBorder": "#2a2f38",
     "attributeBackgroundColorOdd": "#151a20",
     "attributeBackgroundColorEven": "#1a1e26",
+    "rowOdd": "#151a20",
+    "rowEven": "#1a1e26",
     "fontFamily": "ui-monospace, SFMono-Regular, Menlo, monospace"
   }
 }
