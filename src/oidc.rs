@@ -71,6 +71,34 @@ pub enum OidcError {
     ProviderUnavailable(String),
 }
 
+/// The signing algorithms an ID token is allowed to use.
+///
+/// The standard asymmetric set: RSASSA-PKCS1-v1_5, RSASSA-PSS and ECDSA, each
+/// over SHA-256/384/512. RS256 alone was too narrow — an IdP configured for
+/// ES256 or PS256, both ordinary choices, failed every login with
+/// `UnsupportedAlgorithm`, which reads in the log like an attack rather than a
+/// configuration mismatch.
+///
+/// **The symmetric HMAC algorithms (HS256/384/512) are deliberately absent, and
+/// must stay absent.** Their key is the client secret, and an attacker who
+/// re-signs a token as HS256 using the RSA *public* key bytes as that secret
+/// defeats a verifier that takes the algorithm from the token's own header —
+/// the classic RS256→HS256 key-confusion attack, pinned by
+/// `an_algorithm_confusion_token_is_refused`. `none` is absent for the same
+/// reason. Neither belongs in an allow-list that exists precisely so the
+/// token's own `alg` header never gets a vote.
+const ALLOWED_ALGS: [CoreJwsSigningAlgorithm; 9] = [
+    CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256,
+    CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha384,
+    CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha512,
+    CoreJwsSigningAlgorithm::RsaSsaPssSha256,
+    CoreJwsSigningAlgorithm::RsaSsaPssSha384,
+    CoreJwsSigningAlgorithm::RsaSsaPssSha512,
+    CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+    CoreJwsSigningAlgorithm::EcdsaP384Sha384,
+    CoreJwsSigningAlgorithm::EcdsaP521Sha512,
+];
+
 /// Verifies an OIDC ID token's signature and standard claims against
 /// `expected`, as of `now`.
 ///
@@ -92,7 +120,8 @@ pub fn verify_id_token(
         // Our allow-list, deliberately not derived from the token's own `alg`
         // header: an attacker controls that header, so trusting it would let
         // a forged `alg: none` token walk straight past signature checking.
-        .set_allowed_algs([CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256])
+        // See `ALLOWED_ALGS` for what is in it and what must never be.
+        .set_allowed_algs(ALLOWED_ALGS.clone())
         // `now` is a parameter (not `Utc::now()`) so tests control time
         // exactly. Folding `leeway` in here — rather than comparing it after
         // the fact — is what gives an ID token a grace window around `exp`.
@@ -635,6 +664,40 @@ mod tests {
             verify_id_token(&token, &s.keys(), &expectations(), Utc::now()),
             Err(OidcError::UnsupportedAlgorithm)
         );
+    }
+
+    /// The allow-list by its JWA names, which is how an operator reads it out
+    /// of their IdP's configuration. RS256-only turned an ES256 or PS256
+    /// provider into a login that fails every time.
+    #[test]
+    fn the_allow_list_is_the_standard_asymmetric_set() {
+        let names: Vec<String> = ALLOWED_ALGS
+            .iter()
+            .map(|a| serde_json::to_value(a).expect("serialize alg").as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            names,
+            ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"]
+        );
+    }
+
+    /// The exclusion that defeats key confusion. Widening the allow-list must
+    /// never widen it to a symmetric algorithm — or to `none`, whose whole
+    /// point is having no signature at all.
+    #[test]
+    fn no_symmetric_algorithm_or_none_is_ever_allowed() {
+        for forbidden in [
+            CoreJwsSigningAlgorithm::HmacSha256,
+            CoreJwsSigningAlgorithm::HmacSha384,
+            CoreJwsSigningAlgorithm::HmacSha512,
+            CoreJwsSigningAlgorithm::None,
+        ] {
+            assert!(
+                !ALLOWED_ALGS.contains(&forbidden),
+                "{forbidden:?} must never be accepted for an ID token"
+            );
+        }
     }
 
     #[test]
