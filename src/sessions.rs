@@ -76,17 +76,18 @@ pub fn needs_touch(now: DateTime<Utc>, last_seen_at: DateTime<Utc>) -> bool {
 
 /// Whether this deployment can carry a `Secure`, `__Host-`-prefixed cookie.
 ///
-/// Both require HTTPS, which plain-http localhost cannot satisfy — so a loopback
-/// bind drops them, and anything else requires them. Same reasoning as the
-/// default-admin-password rule in `main.rs`.
+/// Both require HTTPS, which plain-http localhost cannot satisfy — so a purely
+/// loopback plain-http deployment drops them, and anything else requires them.
+/// Same reasoning as the default-admin-password rule in `main.rs`.
 #[derive(Clone)]
 pub struct CookiePolicy {
     pub secure: bool,
 }
 
 /// The pieces of session handling that are fixed once at boot rather than
-/// recomputed per request: the cookie policy is derived from the bind address
-/// (see `cookie_policy`), and the TTLs govern idle/absolute expiry. Held on
+/// recomputed per request: the cookie policy is derived from `public_base_url`
+/// (falling back to the bind address — see `cookie_policy`), and the TTLs
+/// govern idle/absolute expiry. Held on
 /// `AppState` as a single field so a request never redoes this derivation.
 ///
 /// `ttl` is `SessionTtl::default()` for now; a later task sources it from
@@ -106,13 +107,53 @@ pub struct SessionConfig {
     pub public_base_url: Option<String>,
 }
 
-pub fn cookie_policy(bind_addr: &str) -> CookiePolicy {
-    let host = bind_addr.rsplit_once(':').map_or(bind_addr, |(h, _)| h);
-    let loopback = host == "localhost"
-        || host == "::1"
-        || host == "[::1]"
-        || host.starts_with("127.");
-    CookiePolicy { secure: !loopback }
+/// What the browser sees decides this, not what the process bound to.
+///
+/// The bind address is the wrong authority whenever a TLS terminator sits in
+/// front: the standard production topology is nginx or Caddy holding the
+/// certificate and proxying to `127.0.0.1:3001`, which makes the bind loopback
+/// and the site `https://` all the same. Deciding from the bind there would
+/// drop `Secure` and the `__Host-` prefix on a site served over HTTPS, and a
+/// single forced `http://` navigation would then hand a network attacker a
+/// live order-entry session.
+///
+/// So when OIDC is configured — `public_base_url` is `Some`, and it is the
+/// value the IdP redirects back to, i.e. the browser's own view of this
+/// server — its scheme decides. Plain http is honoured only for a genuine
+/// loopback development host (`http://localhost`, `http://127.0.0.1`,
+/// `http://[::1]`), which cannot carry `Secure` at all; anything else
+/// demands it, including an unparseable URL, which fails closed.
+///
+/// With no OIDC configured there is no browser view to consult and no session
+/// can ever be minted (only the OIDC callback mints one), so the bind address
+/// is the only signal left and keeps its old meaning.
+pub fn cookie_policy(bind_addr: &str, public_base_url: Option<&str>) -> CookiePolicy {
+    match public_base_url {
+        Some(url) => CookiePolicy { secure: !is_plain_http_loopback(url) },
+        None => CookiePolicy { secure: !crate::bind_is_loopback(bind_addr) },
+    }
+}
+
+/// Is this base URL plain `http://` on a host reachable only from this
+/// machine — the one shape that legitimately cannot carry a `Secure` cookie?
+///
+/// Loopback is judged by `setup::database::config::is_loopback_host`, the same
+/// exact-match list `main.rs`'s `bind_is_loopback` uses, so a host is never
+/// loopback to one of these and public to the other. `Url::host_str` brackets
+/// an IPv6 literal (`"[::1]"`), which that list also accepts.
+///
+/// Anything unparseable is *not* loopback: an address we cannot read must not
+/// be what talks the server out of setting `Secure`.
+pub fn is_plain_http_loopback(base_url: &str) -> bool {
+    // `openidconnect::url` is the same `url` crate, re-exported — `oidc.rs`
+    // reaches it the same way rather than adding a second direct dependency.
+    let Ok(url) = openidconnect::url::Url::parse(base_url) else {
+        return false;
+    };
+    url.scheme() == "http"
+        && url
+            .host_str()
+            .is_some_and(crate::setup::database::config::is_loopback_host)
 }
 
 pub fn cookie_name(policy: &CookiePolicy) -> &'static str {
@@ -372,7 +413,7 @@ mod tests {
 
     #[test]
     fn a_public_bind_demands_the_host_prefix_and_secure() {
-        let policy = cookie_policy("0.0.0.0:3001");
+        let policy = cookie_policy("0.0.0.0:3001", None);
 
         assert!(policy.secure);
         assert_eq!(cookie_name(&policy), "__Host-oms_session");
@@ -388,7 +429,7 @@ mod tests {
 
     #[test]
     fn a_loopback_bind_drops_the_prefix_and_secure_because_http_cannot_carry_them() {
-        let policy = cookie_policy("localhost:3001");
+        let policy = cookie_policy("localhost:3001", None);
 
         assert!(!policy.secure);
         assert_eq!(cookie_name(&policy), "oms_session");
@@ -401,12 +442,104 @@ mod tests {
 
     #[test]
     fn the_127_form_is_loopback_too() {
-        assert!(!cookie_policy("127.0.0.1:3001").secure);
+        assert!(!cookie_policy("127.0.0.1:3001", None).secure);
+    }
+
+    /// The IPv6 loopback forms, which had no coverage at all. An IPv6 literal
+    /// must be bracketed to carry a port, so `[::1]:3001` is the spelling a
+    /// real bind takes; `[::1]` is the port-less one.
+    ///
+    /// The unbracketed `::1:3001` resolves to the same answer only because
+    /// splitting on the last colon happens to leave `::1` behind; it is
+    /// asserted to agree with `bind_is_loopback` rather than left to chance,
+    /// since that agreement is the point of sharing one implementation.
+    #[test]
+    fn the_ipv6_loopback_forms_are_loopback_too() {
+        assert!(!cookie_policy("[::1]:3001", None).secure, "[::1]:3001");
+        assert!(!cookie_policy("[::1]", None).secure, "[::1]");
+        assert!(!cookie_policy("::1:3001", None).secure, "::1:3001");
+        assert_eq!(cookie_policy("::1:3001", None).secure, !crate::bind_is_loopback("::1:3001"));
+
+        // The same host as an OIDC public base URL, where brackets are
+        // mandatory and `Url` hands them back bracketed.
+        assert!(!cookie_policy("[::1]:3001", Some("http://[::1]:3001")).secure);
+        assert!(cookie_policy("[::1]:3001", Some("https://[::1]:3001")).secure);
+    }
+
+    /// The whole of C2: the standard production topology is a TLS terminator
+    /// in front and a loopback bind behind it. Judged by the bind alone, this
+    /// site — served to browsers over HTTPS — would get a cookie with neither
+    /// `Secure` nor the `__Host-` prefix.
+    #[test]
+    fn a_reverse_proxied_https_site_keeps_secure_behind_a_loopback_bind() {
+        let policy = cookie_policy("127.0.0.1:3001", Some("https://oms.example.com"));
+
+        assert!(policy.secure);
+        assert_eq!(cookie_name(&policy), "__Host-oms_session");
+        assert!(set_cookie_header(&policy, "abc", Duration::hours(12)).contains("Secure"));
+    }
+
+    /// The case the loopback exemption exists for, which must keep working:
+    /// a developer running plain http on their own machine.
+    #[test]
+    fn plain_http_loopback_development_still_drops_secure() {
+        for url in ["http://localhost:3001", "http://127.0.0.1:3001", "http://[::1]:3001"] {
+            let policy = cookie_policy("127.0.0.1:3001", Some(url));
+
+            assert!(!policy.secure, "{url} cannot carry Secure at all");
+            assert_eq!(cookie_name(&policy), "oms_session", "{url}");
+        }
+    }
+
+    /// Plain http on a host other people can reach is not development — it is
+    /// a mistake, and the cookie demands `Secure` rather than going bare.
+    /// (`main.rs` refuses to start on this config; the policy fails closed
+    /// anyway rather than relying on that.)
+    #[test]
+    fn a_plain_http_public_host_still_demands_secure() {
+        assert!(cookie_policy("127.0.0.1:3001", Some("http://oms.example.com")).secure);
+    }
+
+    /// A base URL we cannot read must not be what talks the server out of
+    /// setting `Secure`.
+    #[test]
+    fn an_unreadable_public_base_url_fails_closed() {
+        assert!(cookie_policy("127.0.0.1:3001", Some("not a url")).secure);
+        assert!(cookie_policy("127.0.0.1:3001", Some("")).secure);
+    }
+
+    /// With no OIDC there is no browser view to consult, so the bind decides —
+    /// and it must decide exactly as `bind_is_loopback` does, or a host would
+    /// be loopback to the admin-password rule and public to the cookie rule.
+    /// `127.0.0.2` is the address that used to split them: `starts_with("127.")`
+    /// called it loopback, `bind_is_loopback` did not.
+    #[test]
+    fn the_bind_fallback_agrees_with_the_admin_password_rule() {
+        for addr in ["localhost:3001", "127.0.0.1:3001", "[::1]:3001", "127.0.0.2:3001",
+                     "0.0.0.0:3001", "192.168.1.10:3001", "oms.internal:3001", ""] {
+            assert_eq!(
+                cookie_policy(addr, None).secure,
+                !crate::bind_is_loopback(addr),
+                "{addr} judged differently by the two rules"
+            );
+        }
+    }
+
+    #[test]
+    fn only_plain_http_on_a_loopback_host_is_exempt() {
+        assert!(is_plain_http_loopback("http://localhost:3001"));
+        assert!(is_plain_http_loopback("http://127.0.0.1:3001"));
+        assert!(is_plain_http_loopback("http://[::1]:3001"));
+
+        assert!(!is_plain_http_loopback("https://localhost:3001"), "https needs no exemption");
+        assert!(!is_plain_http_loopback("http://127.0.0.2:3001"), "not the loopback address");
+        assert!(!is_plain_http_loopback("http://oms.example.com"));
+        assert!(!is_plain_http_loopback("garbage"));
     }
 
     #[test]
     fn clearing_the_cookie_expires_it_immediately() {
-        let header = clear_cookie_header(&cookie_policy("localhost:3001"));
+        let header = clear_cookie_header(&cookie_policy("localhost:3001", None));
 
         assert!(header.contains("Max-Age=0"));
         assert!(header.starts_with("oms_session=;"));

@@ -287,7 +287,7 @@ mod tests {
 
     fn session_config() -> SessionConfig {
         SessionConfig {
-            cookie_policy: cookie_policy("localhost:3001"),
+            cookie_policy: cookie_policy("localhost:3001", None),
             ttl: SessionTtl::default(),
             public_base_url: None,
         }

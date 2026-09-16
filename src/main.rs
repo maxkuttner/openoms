@@ -227,7 +227,11 @@ const DEFAULT_ADMIN_PASSWORD: &str = "openoms-dev";
 /// Splits the host off a `host:port` pair before asking, and treats anything it
 /// cannot parse as non-loopback — an unrecognised address must not be what talks
 /// the server into accepting a default password.
-fn bind_is_loopback(addr: &str) -> bool {
+///
+/// `pub(crate)` because `sessions::cookie_policy` asks the same question of the
+/// same string: one implementation, so a host can never be loopback to the
+/// admin-password rule and public to the cookie rule.
+pub(crate) fn bind_is_loopback(addr: &str) -> bool {
     // `[::1]:3001` — bracketed IPv6 literal, host is everything up to the bracket.
     let host = if let Some(rest) = addr.strip_prefix('[') {
         match rest.split_once(']') {
@@ -239,6 +243,29 @@ fn bind_is_loopback(addr: &str) -> bool {
         addr.rsplit_once(':').map_or(addr, |(h, _)| h)
     };
     setup::database::config::is_loopback_host(host)
+}
+
+/// Would starting with this OIDC deployment hand out a cookie the browser
+/// cannot protect? If so, refuse rather than serve a broken or stealable login.
+///
+/// Plain http is acceptable only when *both* halves are loopback:
+///
+/// - The **public base URL** decides `Secure` (`sessions::cookie_policy`). An
+///   `http://` URL on a public host means either no `Secure` at all, or — with
+///   the policy failing closed — a `Secure` cookie the browser drops on an
+///   http site. Both are broken; neither should start.
+/// - The **bind address** still matters on its own: `http://localhost` as the
+///   public base URL with a `0.0.0.0` bind serves a Secure-less session cookie
+///   to every machine on the network, which is exactly the spec's
+///   "any other bind requires both" rule.
+///
+/// An `https://` public base URL is always fine, whatever the bind — that is
+/// the reverse-proxy topology (loopback bind, TLS terminated in front).
+fn refuses_plain_http_oidc(bind_addr: &str, public_base_url: &str) -> bool {
+    let https = public_base_url.starts_with("https://");
+    let purely_local =
+        bind_is_loopback(bind_addr) && sessions::is_plain_http_loopback(public_base_url);
+    !(https || purely_local)
 }
 
 /// Bind address on the usual tiers. No CLI flag exists for this today, so the
@@ -834,23 +861,17 @@ async fn serve() {
         }
     };
 
-    // Same rule, for OIDC login instead of the admin console: a session
-    // cookie can only carry `Secure` when `sessions::cookie_policy` judges
-    // the bind loopback or the public base URL `https://` (see that
-    // function). Off loopback with a non-`https://` `public_base_url`, the
-    // cookie would be set without `Secure` and sent in clear text on every
-    // request — so refuse to start rather than silently serve a login that
-    // hands out a stealable session. A fresh `[auth.oidc]` block with no
-    // bind change at all (the common local-dev case) never reaches this:
-    // `bind_is_loopback` is true there, same as the admin-password rule
-    // above.
+    // Same rule, for OIDC login instead of the admin console. Plain http is
+    // only tolerated when the whole deployment is loopback — see
+    // `refuses_plain_http_oidc` for why both halves have to be asked.
     if let Some(oidc) = file_cfg.and_then(|f| f.oidc()) {
-        if !bind_is_loopback(&bind_addr) && !oidc.public_base_url.starts_with("https://") {
+        if refuses_plain_http_oidc(&bind_addr, &oidc.public_base_url) {
             error!(
-                "refusing to start: [auth.oidc] is configured, OMS_BIND_ADDR ({bind_addr}) is \
-                 reachable beyond this machine, and auth.oidc.public_base_url ({}) is not \
-                 https:// — the session cookie could not carry Secure and would be sent in \
-                 clear text. Serve OIDC login behind https, or bind to loopback only.",
+                "refusing to start: [auth.oidc] is configured and this is not a purely local \
+                 deployment — OMS_BIND_ADDR is {bind_addr} and auth.oidc.public_base_url is {} \
+                 (not https://). The session cookie would either be sent in clear text or be \
+                 dropped by the browser for carrying Secure over http. Serve OIDC login behind \
+                 https, or keep both the bind and the public base URL on loopback.",
                 oidc.public_base_url
             );
             std::process::exit(1);
@@ -927,9 +948,11 @@ async fn serve() {
     // `quote_tx` are handed in (not just kept as `serve()` locals) so the
     // `/admin/connections/reload` handler can rebuild an equivalent
     // `RegistrationDeps` and restart feeds against the same channels boot used.
-    // Session cookie policy is derived once here from the bind address (secure,
-    // `__Host-`-prefixed cookies only where HTTPS can actually back them — see
-    // `sessions::cookie_policy`) rather than recomputed on every request.
+    // Session cookie policy is derived once here from the OIDC public base URL
+    // — the browser's own view of this server, so a TLS terminator in front of
+    // a loopback bind still gets `Secure` and the `__Host-` prefix — falling
+    // back to the bind address when OIDC is off (see `sessions::cookie_policy`)
+    // rather than recomputed on every request.
     // `ttl`/`public_base_url` come from `[auth.oidc]` when it's configured —
     // `FileConfig::oidc` is the one place idle/absolute TTL overrides and the
     // public base URL are read — and fall back to `SessionTtl::default()`/
@@ -939,13 +962,12 @@ async fn serve() {
     // `auth_middleware`'s CSRF origin check to begin with — see that
     // function's doc comment for why a missing base URL still fails closed
     // there rather than assuming this.
+    let oidc_settings = file_cfg.and_then(|f| f.oidc());
+    let public_base_url = oidc_settings.as_ref().map(|o| o.public_base_url.clone());
     let session_config = sessions::SessionConfig {
-        cookie_policy: sessions::cookie_policy(&bind_addr),
-        ttl: file_cfg
-            .and_then(|f| f.oidc())
-            .map(|o| o.ttl)
-            .unwrap_or_default(),
-        public_base_url: file_cfg.and_then(|f| f.oidc()).map(|o| o.public_base_url),
+        cookie_policy: sessions::cookie_policy(&bind_addr, public_base_url.as_deref()),
+        ttl: oidc_settings.as_ref().map(|o| o.ttl.clone()).unwrap_or_default(),
+        public_base_url,
     };
 
     let state = AppState::new(
@@ -1443,6 +1465,32 @@ mod tests {
         assert!(!bind_is_loopback("0.0.0.0:3001"));
         assert!(!bind_is_loopback("192.168.1.10:3001"));
         assert!(!bind_is_loopback("oms.internal:3001"));
+    }
+
+    /// The OIDC start-up gate. Plain http is only ever acceptable when the
+    /// whole deployment is loopback; `https://` is fine on any bind, which is
+    /// the reverse-proxy topology C2 was about.
+    #[test]
+    fn plain_http_oidc_is_only_tolerated_when_everything_is_local() {
+        use super::refuses_plain_http_oidc as refuses;
+
+        // The reverse-proxy topology: loopback bind, TLS terminated in front.
+        assert!(!refuses("127.0.0.1:3001", "https://oms.example.com"));
+        assert!(!refuses("0.0.0.0:3001", "https://oms.example.com"));
+        // Genuine local development, plain http end to end.
+        assert!(!refuses("127.0.0.1:3001", "http://localhost:3001"));
+        assert!(!refuses("[::1]:3001", "http://[::1]:3001"));
+
+        // Reachable from elsewhere and not https: the original rule.
+        assert!(refuses("0.0.0.0:3001", "http://oms.example.com"));
+        // Served to the network but calling itself localhost — the cookie
+        // would go out over the LAN with no Secure at all.
+        assert!(refuses("0.0.0.0:3001", "http://localhost:3001"));
+        // Loopback bind, public http base URL: the cookie demands Secure and
+        // the browser drops it, so login would simply never work.
+        assert!(refuses("127.0.0.1:3001", "http://oms.example.com"));
+        // Neither scheme we understand.
+        assert!(refuses("127.0.0.1:3001", "garbage"));
     }
 
     /// An address we cannot parse must fail closed, never open.

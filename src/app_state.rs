@@ -117,9 +117,10 @@ pub struct AppState {
     pub admin_token: String,
     pub admin_auth_enabled: bool,
     /// Cookie policy + TTLs for browser sessions. Derived once at boot from
-    /// the bind address (see `sessions::cookie_policy`) rather than per
-    /// request, and carried whole rather than as separate constructor
-    /// arguments — see `auth::authenticate`, its only reader.
+    /// the OIDC public base URL, or the bind address when OIDC is off (see
+    /// `sessions::cookie_policy`) rather than per request, and carried whole
+    /// rather than as separate constructor arguments — see
+    /// `auth::authenticate`, its only reader.
     pub session_config: crate::sessions::SessionConfig,
     /// Swappable so a credential change can publish a new registry without
     /// restarting: readers on the order path take an atomic load, and an order
@@ -273,7 +274,7 @@ mod tests {
             None,
             quote_tx,
             crate::sessions::SessionConfig {
-                cookie_policy: crate::sessions::cookie_policy("localhost:3001"),
+                cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
                 ttl: crate::sessions::SessionTtl::default(),
                 public_base_url: None,
             },

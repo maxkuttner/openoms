@@ -31,7 +31,7 @@ fn state(pool: PgPool) -> AppState {
         symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
         StreamHealthRegistry::new(), None, quote_tx,
         crate::sessions::SessionConfig {
-            cookie_policy: crate::sessions::cookie_policy("localhost:3001"),
+            cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
             ttl: crate::sessions::SessionTtl::default(),
             public_base_url: None,
         })

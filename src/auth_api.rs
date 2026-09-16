@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn the_flow_cookie_survives_a_round_trip() {
-        let policy = crate::sessions::cookie_policy("localhost:3001");
+        let policy = crate::sessions::cookie_policy("localhost:3001", None);
         let flow = FlowState {
             state: "st-1".into(),
             nonce: "n-1".into(),
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn the_flow_cookie_is_short_lived_and_unreadable_to_script() {
-        let policy = crate::sessions::cookie_policy("localhost:3001");
+        let policy = crate::sessions::cookie_policy("localhost:3001", None);
         let header = flow_cookie(&policy, &FlowState {
             state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(),
         });
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn a_callback_with_no_flow_cookie_cannot_be_trusted() {
-        assert!(flow_from_cookie(&HeaderMap::new(), &crate::sessions::cookie_policy("localhost:3001")).is_none());
+        assert!(flow_from_cookie(&HeaderMap::new(), &crate::sessions::cookie_policy("localhost:3001", None)).is_none());
     }
 
     #[test]
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_flow_cookie_on_a_public_bind_is_host_prefixed_and_secure() {
-        let policy = crate::sessions::cookie_policy("0.0.0.0:3001");
+        let policy = crate::sessions::cookie_policy("0.0.0.0:3001", None);
         let header = flow_cookie(&policy, &FlowState {
             state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(),
         });
