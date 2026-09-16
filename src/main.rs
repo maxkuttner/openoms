@@ -1235,11 +1235,6 @@ async fn serve() {
             "/orders/:id/allocations",
             post(handlers::create_allocations).get(handlers::list_allocations),
         )
-        // `/auth/me` requires authentication (unlike login/callback/logout,
-        // which are unauthenticated by definition), so it belongs here,
-        // behind the same `auth_middleware` as every other authenticated
-        // route, rather than on the unauthenticated `auth_router` below.
-        .route("/auth/me", get(auth_api::me))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes (protected by static bearer token only)
@@ -1373,6 +1368,24 @@ async fn serve() {
             .route("/auth/logout", post(auth_api::logout))
             .layer(Extension(auth_state));
         app = app.merge(auth_router);
+    }
+
+    // `/auth/me` is the one `/auth/*` route that requires authentication, so
+    // it carries `auth_middleware` rather than riding on the unauthenticated
+    // router above — but it is still an `/auth/*` route, and the spec's
+    // off-by-default promise is that with no `[auth.oidc]` block the whole
+    // prefix 404s and nothing else changes. Mounted unconditionally it broke
+    // that promise for every install that never enabled login.
+    //
+    // Gated on the config block, not on `auth_api_state`: discovery failing
+    // (IdP down, secret unset) must not take `/auth/me` away from sessions
+    // that already exist. The IdP is a dependency of login, not of every
+    // request — see the spec's "Token handling".
+    if oidc_settings.is_some() {
+        let me_router = Router::new()
+            .route("/auth/me", get(auth_api::me))
+            .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+        app = app.merge(me_router);
     }
 
     let app = app
