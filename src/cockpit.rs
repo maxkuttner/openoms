@@ -290,7 +290,10 @@ mod tests {
     async fn the_router_dispatches_through_axums_real_route_table() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = router::<()>().with_state(());
+        // Both routers, mounted together exactly as main.rs mounts them when
+        // OIDC is configured: `/ui/*path`, `/cockpit*` and `/trade*` share one
+        // route table, and an overlap between them would only ever show up here.
+        let app = router::<()>().merge(trade_router::<()>()).with_state(());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -325,5 +328,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // 5. The shared asset tree. `base: '/ui/'` puts every generated asset
+        // URL here, for BOTH bundles — if this route stopped dispatching, both
+        // apps would load a shell with no JavaScript behind it.
+        let res = client.get(format!("{base}/ui/assets/nope-00000000.js")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
+        let res = client.get(format!("{base}/ui/some-route")).send().await.unwrap();
+        assert_eq!(res.status(), expected);
+
+        // 6. The trade app's three routes, the same way round as the cockpit's:
+        // bare path redirects, the exact `/trade/` route wins over the
+        // `/trade/*path` wildcard, and a deep link falls back to the trade
+        // shell.
+        let res = client.get(format!("{base}/trade")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[reqwest::header::LOCATION], "/trade/");
+
+        let res = client.get(format!("{base}/trade/")).send().await.unwrap();
+        assert_eq!(res.status(), expected);
+
+        let res = client.get(format!("{base}/trade/positions")).send().await.unwrap();
+        assert_eq!(res.status(), expected);
+
+        let res = client
+            .get(format!("{base}/trade/assets/nope-00000000.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // And the two shells are genuinely different documents — a `/trade/`
+        // that served the cockpit's index.html would load the admin app, with
+        // its localStorage admin token, at the trader's URL. Only checkable in
+        // a bundled build; in a source build both are the same 404 text.
+        if is_bundled() {
+            let cockpit_shell = client
+                .get(format!("{base}/cockpit/"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            let trade_shell = client
+                .get(format!("{base}/trade/"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert_ne!(cockpit_shell, trade_shell);
+        }
     }
 }
