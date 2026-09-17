@@ -107,6 +107,8 @@ jobs:
         run: |
           test -s cockpit/dist/index.html \
             || { echo "cockpit/dist/index.html missing — the embed tests all no-op'd"; exit 1; }
+          test -s cockpit/dist/trade.html \
+            || { echo "cockpit/dist/trade.html missing — the /trade/ shell tests all no-op'd"; exit 1; }
 
   shellcheck:
     name: shellcheck install.sh
