@@ -1393,11 +1393,19 @@ async fn serve() {
     // (IdP down, secret unset) must not take `/auth/me` away from sessions
     // that already exist. The IdP is a dependency of login, not of every
     // request — see the spec's "Token handling".
+    //
+    // `/trade/*` rides the same gate, for the same reason: the trade app
+    // authenticates by session cookie and nothing else, and a session can
+    // only ever be minted by the OIDC callback. With no `[auth.oidc]` block
+    // configured, `/trade/` would be a screen nobody could ever log into, so
+    // it stays off unless OIDC is at least configured — and, like `/auth/me`,
+    // it must not disappear out from under an already-signed-in trader just
+    // because discovery is transiently failing on this restart.
     if oidc_settings.is_some() {
         let me_router = Router::new()
             .route("/auth/me", get(auth_api::me))
             .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
-        app = app.merge(me_router);
+        app = app.merge(me_router).merge(cockpit::trade_router());
     }
 
     let app = app

@@ -38,16 +38,20 @@ pub fn is_bundled() -> bool {
     DIST.get_file("index.html").is_some()
 }
 
-/// Resolve a path *relative to* `/cockpit/` to an embedded file.
+/// Resolve a path *relative to* its app's mount point to an embedded file.
+///
+/// `shell` is the fallback HTML filename for the app this path belongs to
+/// (`index.html` for `/cockpit/`, `trade.html` for `/trade/`) — both apps
+/// share the same asset tree, but each must fall back to its own shell.
 ///
 /// A miss on a path with no file extension is a client-side route such as
 /// `/cockpit/orders`: only the SPA shell can answer it, so the shell is what a
 /// reload of that URL must return. A miss on a path *with* an extension is a
 /// genuinely absent file and stays a 404 — serving HTML there would hand the
 /// browser an index.html labelled `application/javascript`.
-pub fn asset_for(path: &str) -> Option<Asset> {
+pub fn asset_for(shell: &str, path: &str) -> Option<Asset> {
     let rel = path.trim_start_matches('/');
-    let rel = if rel.is_empty() { "index.html" } else { rel };
+    let rel = if rel.is_empty() { shell } else { rel };
 
     if let Some(file) = DIST.get_file(rel) {
         let cache_control = if rel.starts_with("assets/") { IMMUTABLE } else { NO_CACHE };
@@ -58,10 +62,12 @@ pub fn asset_for(path: &str) -> Option<Asset> {
         });
     }
 
+    // A miss with no extension is a client-side route; only the shell can answer
+    // it. Which shell depends on which app the URL belongs to.
     if std::path::Path::new(rel).extension().is_none() {
-        let shell = DIST.get_file("index.html")?;
+        let shell_file = DIST.get_file(shell)?;
         return Some(Asset {
-            body: shell.contents(),
+            body: shell_file.contents(),
             content_type: "text/html".to_string(),
             cache_control: NO_CACHE,
         });
@@ -70,8 +76,8 @@ pub fn asset_for(path: &str) -> Option<Asset> {
     None
 }
 
-pub fn respond(path: &str) -> Response {
-    match asset_for(path) {
+pub fn respond(shell: &str, path: &str) -> Response {
+    match asset_for(shell, path) {
         Some(asset) => (
             StatusCode::OK,
             [
@@ -91,11 +97,29 @@ async fn redirect_to_slash() -> Redirect {
 }
 
 async fn index() -> Response {
-    respond("")
+    respond("index.html", "")
 }
 
 async fn asset(UrlPath(path): UrlPath<String>) -> Response {
-    respond(&path)
+    respond("index.html", &path)
+}
+
+/// The shared asset tree. Both bundles emit into `dist/assets/`, and Vite's
+/// `base` points every generated URL at `/ui/`.
+async fn ui_asset(UrlPath(path): UrlPath<String>) -> Response {
+    respond("index.html", &path)
+}
+
+async fn redirect_to_trade_slash() -> Redirect {
+    Redirect::temporary("/trade/")
+}
+
+async fn trade_index() -> Response {
+    respond("trade.html", "")
+}
+
+async fn trade_asset(UrlPath(path): UrlPath<String>) -> Response {
+    respond("trade.html", &path)
 }
 
 /// Mounted outside the admin auth layer on purpose: the SPA shell has to load
@@ -103,11 +127,26 @@ async fn asset(UrlPath(path): UrlPath<String>) -> Response {
 /// static bundle. Authentication happens where it already did, on `/admin/*`.
 pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
+        .route("/ui/*path", get(ui_asset))
         // axum's `*path` wildcard needs at least one character after the slash, so
         // `/cockpit/` itself gets its own route.
         .route("/cockpit", get(redirect_to_slash))
         .route("/cockpit/", get(index))
         .route("/cockpit/*path", get(asset))
+}
+
+/// The trader app's shell and assets. Kept as a *separate* router from
+/// `router()` so the caller can mount it only where the trade app can
+/// actually be used — see `main.rs`, which merges this inside the same
+/// `if oidc_settings.is_some()` gate as `/auth/me`: the trade app
+/// authenticates by session cookie only, and a session can only ever be
+/// minted by the OIDC callback, so with no `[auth.oidc]` configured `/trade/`
+/// would otherwise be a screen nobody could ever log into.
+pub fn trade_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route("/trade", get(redirect_to_trade_slash))
+        .route("/trade/", get(trade_index))
+        .route("/trade/*path", get(trade_asset))
 }
 
 #[cfg(test)]
@@ -119,13 +158,21 @@ mod tests {
     // empty embed, CI and every release build a populated one. So each test asserts
     // the behaviour of the build it is actually running in, and CI runs both.
 
+    /// Reads a response body to bytes for equality checks in tests below.
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body readable")
+            .to_vec()
+    }
+
     #[test]
     fn a_source_build_says_where_the_dev_ui_is() {
         if is_bundled() {
             return;
         }
-        assert!(asset_for("").is_none());
-        let res = respond("");
+        assert!(asset_for("index.html", "").is_none());
+        let res = respond("index.html", "");
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
@@ -134,10 +181,10 @@ mod tests {
         if !is_bundled() {
             return;
         }
-        let shell = asset_for("").expect("index.html");
+        let shell = asset_for("index.html", "").expect("index.html");
         assert!(shell.content_type.starts_with("text/html"));
         assert_eq!(shell.cache_control, NO_CACHE);
-        assert_eq!(respond("").status(), StatusCode::OK);
+        assert_eq!(respond("index.html", "").status(), StatusCode::OK);
     }
 
     #[test]
@@ -145,8 +192,8 @@ mod tests {
         if !is_bundled() {
             return;
         }
-        let shell = asset_for("").unwrap();
-        let deep = asset_for("orders").expect("client-side route must serve the shell");
+        let shell = asset_for("index.html", "").unwrap();
+        let deep = asset_for("index.html", "orders").expect("client-side route must serve the shell");
         assert_eq!(shell.body, deep.body);
     }
 
@@ -156,8 +203,43 @@ mod tests {
             return;
         }
         // Has an extension, so it is a real file request, not a client-side route.
-        assert!(asset_for("assets/nope-00000000.js").is_none());
-        assert_eq!(respond("assets/nope-00000000.js").status(), StatusCode::NOT_FOUND);
+        assert!(asset_for("index.html", "assets/nope-00000000.js").is_none());
+        assert_eq!(respond("index.html", "assets/nope-00000000.js").status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_trade_deep_link_falls_back_to_the_trade_shell_not_the_cockpit_one() {
+        if !is_bundled() {
+            return; // source build: nothing embedded to serve
+        }
+        if DIST.get_file("trade.html").is_none() {
+            // Task 4 hasn't built trade.html yet — nothing to assert against.
+            return;
+        }
+        let cockpit = respond("index.html", "orders");
+        let trade = respond("trade.html", "orders");
+
+        assert_eq!(cockpit.status(), StatusCode::OK);
+        assert_eq!(trade.status(), StatusCode::OK);
+        // Both are HTML shells, but they must not be the SAME shell — serving the
+        // cockpit's bundle under /trade/ would load the admin app at the trader's
+        // URL, with the admin token attached.
+        assert_ne!(
+            body_bytes(cockpit).await,
+            body_bytes(trade).await,
+            "each app must fall back to its own shell"
+        );
+    }
+
+    #[test]
+    fn a_missing_asset_stays_missing_for_either_shell() {
+        if !is_bundled() {
+            return;
+        }
+        if DIST.get_file("trade.html").is_none() {
+            return;
+        }
+        assert_eq!(respond("trade.html", "assets/nope.js").status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -172,7 +254,7 @@ mod tests {
             .next()
             .expect("at least one hashed asset");
         let name = first.path().to_string_lossy().to_string();
-        assert_eq!(asset_for(&name).unwrap().cache_control, IMMUTABLE);
+        assert_eq!(asset_for("index.html", &name).unwrap().cache_control, IMMUTABLE);
     }
 
     #[tokio::test]
