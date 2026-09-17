@@ -7,6 +7,7 @@ mod models;
 mod app_state;
 mod auth;
 mod admin;
+mod instruments_api;
 mod risk_engine;
 mod positions;
 mod recon_orders;
@@ -92,6 +93,7 @@ mod reload_tests;
         handlers::get_orders_blotter,
         order_events::get_order_events,
         order_events::get_order_events_admin,
+        instruments_api::list_instruments_for_trader,
         admin::create_principal,
         admin::list_principals,
         admin::get_principal,
@@ -1240,6 +1242,7 @@ async fn serve() {
             "/orders/:id/allocations",
             post(handlers::create_allocations).get(handlers::list_allocations),
         )
+        .route("/instruments", get(instruments_api::list_instruments_for_trader))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes (protected by static bearer token only)

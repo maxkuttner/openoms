@@ -2247,6 +2247,61 @@
         }
       }
     },
+    "/instruments": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "list_instruments_for_trader",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "limit",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching active instruments",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/InstrumentSummary"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/orders": {
       "get": {
         "tags": [

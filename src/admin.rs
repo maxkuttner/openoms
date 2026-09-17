@@ -2521,18 +2521,11 @@ pub async fn list_instruments(
     State(state): State<AppState>,
     Query(params): Query<InstrumentSearch>,
 ) -> Result<Json<Vec<InstrumentSummary>>, AdminError> {
-    let limit = params.limit.unwrap_or(50).clamp(1, 200);
-    let pattern = params.search.as_deref().map(|s| format!("%{s}%"));
-    let records = sqlx::query_as::<_, InstrumentSummary>(
-        "SELECT id, symbol, name, venue, asset_class, status \
-         FROM instrument \
-         WHERE status = 'ACTIVE' AND ($1::text IS NULL OR symbol ILIKE $1 OR name ILIKE $1) \
-         ORDER BY symbol \
-         LIMIT $2",
+    let records = crate::instruments_api::search_instruments(
+        state.pool(),
+        params.search.as_deref(),
+        params.limit,
     )
-    .bind(pattern)
-    .bind(limit)
-    .fetch_all(state.pool())
     .await
     .map_err(map_db_error)?;
     Ok(Json(records))
