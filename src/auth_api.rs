@@ -159,6 +159,35 @@ pub struct FlowState {
     pub state: String,
     pub nonce: String,
     pub pkce_verifier: String,
+    pub return_to: String,
+}
+
+/// Validate a caller-supplied post-login destination.
+///
+/// Only a same-site relative path is allowed. Everything else falls back to
+/// `/`. This is the whole security value of the feature: without it,
+/// `/auth/login` is an open redirect on the endpoint that mints the session,
+/// which is worth more to an attacker than most bugs in this system.
+pub fn sanitize_return_to(raw: Option<&str>) -> String {
+    const DEFAULT: &str = "/";
+
+    let Some(candidate) = raw else { return DEFAULT.to_string() };
+
+    // Must be a path, not a URL, and not scheme-relative.
+    let starts_with_single_slash = candidate.starts_with('/')
+        && !candidate.starts_with("//")
+        && !candidate.starts_with("/\\");
+    if !starts_with_single_slash {
+        return DEFAULT.to_string();
+    }
+
+    // A control character can smuggle a header or confuse a proxy; a real path
+    // never has one.
+    if candidate.chars().any(|c| c.is_control()) {
+        return DEFAULT.to_string();
+    }
+
+    candidate.to_string()
 }
 
 /// How long the flow cookie lives. Long enough to cover a human clicking
@@ -245,21 +274,35 @@ fn pkce_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// Query parameters accepted by `login`. `return_to` is caller-supplied and
+/// therefore untrusted — see `sanitize_return_to`, which is the only thing
+/// that may write it into the `FlowState`.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct LoginParams {
+    pub return_to: Option<String>,
+}
+
 /// Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in
 /// the flow cookie, and sends the browser to the provider. Cannot fail —
 /// there is no user input yet and no network call, only local randomness —
 /// so this returns a bare `Response`, not a `Result`.
 #[utoipa::path(
     get, path = "/auth/login", tag = "auth",
+    params(LoginParams),
     responses(
         (status = 302, description = "Redirects to the identity provider's authorization endpoint"),
     ),
 )]
-pub async fn login(State(state): State<AppState>, Extension(auth_state): Extension<AuthApiState>) -> Response {
+pub async fn login(
+    State(state): State<AppState>,
+    Extension(auth_state): Extension<AuthApiState>,
+    Query(params): Query<LoginParams>,
+) -> Response {
     let flow = FlowState {
         state: random_token(),
         nonce: random_token(),
         pkce_verifier: random_token(),
+        return_to: sanitize_return_to(params.return_to.as_deref()),
     };
     let challenge = pkce_challenge(&flow.pkce_verifier);
     let authorize_url = auth_state.provider.authorize_url(&flow.state, &flow.nonce, &challenge);
@@ -367,7 +410,7 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
     get, path = "/auth/callback", tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 302, description = "Login completed; session cookie set, redirects to /"),
+        (status = 302, description = "Login completed; session cookie set, redirects to the validated return_to (default /)"),
         (status = 400, description = "Malformed callback, or a missing/expired/mismatched login flow"),
         (status = 401, description = "The provider rejected the login, or the exchanged token failed verification"),
         (status = 403, description = "The claim gate rejected the identity, or the subject belongs to a non-human or disabled principal"),
@@ -436,7 +479,7 @@ pub async fn callback(
         .await
         .map_err(|err| db_error("create_session", err))?;
 
-    let mut response = Redirect::to("/").into_response();
+    let mut response = Redirect::to(&flow.return_to).into_response();
     let response_headers = response.headers_mut();
     response_headers.append(
         header::SET_COOKIE,
@@ -623,6 +666,7 @@ mod tests {
             state: "st-1".into(),
             nonce: "n-1".into(),
             pkce_verifier: "v-1".into(),
+            return_to: "/".into(),
         };
 
         let header = flow_cookie(&policy, &flow);
@@ -640,7 +684,7 @@ mod tests {
     fn the_flow_cookie_is_short_lived_and_unreadable_to_script() {
         let policy = crate::sessions::cookie_policy("localhost:3001", None);
         let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(),
+            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(),
         });
 
         assert!(header.contains("HttpOnly"));
@@ -654,7 +698,7 @@ mod tests {
 
     #[test]
     fn a_state_mismatch_is_rejected_before_anything_is_exchanged() {
-        let flow = FlowState { state: "expected".into(), nonce: "n".into(), pkce_verifier: "v".into() };
+        let flow = FlowState { state: "expected".into(), nonce: "n".into(), pkce_verifier: "v".into(), return_to: "/".into() };
 
         assert!(!callback_state_matches(&flow, "attacker-supplied"));
         assert!(callback_state_matches(&flow, "expected"));
@@ -682,7 +726,7 @@ mod tests {
     fn a_flow_cookie_on_a_public_bind_is_host_prefixed_and_secure() {
         let policy = crate::sessions::cookie_policy("0.0.0.0:3001", None);
         let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(),
+            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(),
         });
 
         assert!(header.starts_with("__Host-oms_login_flow="));
@@ -710,6 +754,71 @@ mod tests {
         let expected_challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
         assert_eq!(pkce_challenge(verifier), expected_challenge);
+    }
+
+    #[test]
+    fn a_relative_path_is_kept() {
+        assert_eq!(sanitize_return_to(Some("/trade/")), "/trade/");
+        assert_eq!(sanitize_return_to(Some("/trade/orders?status=filled")), "/trade/orders?status=filled");
+    }
+
+    #[test]
+    fn a_missing_return_to_falls_back_to_the_root() {
+        assert_eq!(sanitize_return_to(None), "/");
+        assert_eq!(sanitize_return_to(Some("")), "/");
+    }
+
+    #[test]
+    fn an_absolute_url_is_refused() {
+        assert_eq!(sanitize_return_to(Some("https://evil.example.com/")), "/");
+        assert_eq!(sanitize_return_to(Some("http://evil.example.com/")), "/");
+    }
+
+    #[test]
+    fn a_protocol_relative_path_is_refused() {
+        // The classic open-redirect bypass: the browser reads "//host" as a
+        // scheme-relative URL and leaves the site entirely.
+        assert_eq!(sanitize_return_to(Some("//evil.example.com")), "/");
+        assert_eq!(sanitize_return_to(Some("//evil.example.com/path")), "/");
+    }
+
+    #[test]
+    fn a_backslash_variant_is_refused() {
+        // Some browsers normalise a backslash to a forward slash, making this
+        // another way to write "//".
+        assert_eq!(sanitize_return_to(Some("/\\evil.example.com")), "/");
+        assert_eq!(sanitize_return_to(Some("\\\\evil.example.com")), "/");
+    }
+
+    #[test]
+    fn a_path_that_does_not_start_with_a_slash_is_refused() {
+        assert_eq!(sanitize_return_to(Some("trade/")), "/");
+        assert_eq!(sanitize_return_to(Some("javascript:alert(1)")), "/");
+    }
+
+    #[test]
+    fn a_control_character_is_refused() {
+        // A newline or tab can be used to smuggle a second header or confuse a
+        // proxy; a legitimate path never contains one.
+        assert_eq!(sanitize_return_to(Some("/trade/\nSet-Cookie: x=1")), "/");
+        assert_eq!(sanitize_return_to(Some("/trade/\tfoo")), "/");
+    }
+
+    #[test]
+    fn the_flow_cookie_carries_the_return_to() {
+        let policy = crate::sessions::cookie_policy("localhost:3001", None);
+        let flow = FlowState {
+            state: "st-1".into(),
+            nonce: "n-1".into(),
+            pkce_verifier: "v-1".into(),
+            return_to: "/trade/".into(),
+        };
+
+        let header = flow_cookie(&policy, &flow);
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", header.split(';').next().unwrap().parse().unwrap());
+
+        assert_eq!(flow_from_cookie(&headers, &policy).expect("flow").return_to, "/trade/");
     }
 
     #[tokio::test]
