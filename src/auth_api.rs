@@ -479,7 +479,11 @@ pub async fn callback(
         .await
         .map_err(|err| db_error("create_session", err))?;
 
-    let mut response = Redirect::to(&flow.return_to).into_response();
+    // Re-validated on read-back, not trusted because we wrote it. The flow
+    // cookie carries neither `__Host-` nor `Secure` on a loopback bind, so its
+    // contents are attacker-influencable in exactly the place it matters least
+    // to be careless: this is the redirect that mints the session.
+    let mut response = Redirect::to(&sanitize_return_to(Some(&flow.return_to))).into_response();
     let response_headers = response.headers_mut();
     response_headers.append(
         header::SET_COOKIE,
