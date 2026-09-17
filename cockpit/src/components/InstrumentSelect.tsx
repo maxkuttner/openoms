@@ -15,28 +15,37 @@ interface Instrument {
 
 // Searchable instrument picker. Binds the master instrument id (as a string, the form
 // of instrument_id used on orders/risk), displays "SYMBOL · name". Server-side search
-// (debounced) against /admin/instruments.
+// (debounced) against basePath (defaults to the admin instruments endpoint).
 export function InstrumentSelect({
   value,
   onChange,
   label,
   required,
   placeholder,
+  basePath = "/admin/instruments",
+  apiGet = api.get,
 }: {
   value: string | null;
   onChange: (v: string | null) => void;
   label?: string;
   required?: boolean;
   placeholder?: string;
+  // Base path for the instrument search endpoint. Defaults to the admin surface;
+  // the trade app passes "/instruments" instead.
+  basePath?: string;
+  // Fetch function used for the request. Defaults to the cockpit's admin client
+  // (which attaches an Authorization: Bearer admin token). The trade app MUST pass
+  // tradeApi.get instead, or it would leak the admin token on every request.
+  apiGet?: (path: string) => Promise<unknown>;
 }) {
   const [search, setSearch] = useState("");
   const [debounced] = useDebouncedValue(search, 250);
   const q = useQuery<Instrument[]>({
-    queryKey: ["/admin/instruments", debounced],
+    queryKey: [basePath, debounced],
     queryFn: () =>
-      api.get<Instrument[]>(
-        `/admin/instruments?limit=50${debounced ? `&search=${encodeURIComponent(debounced)}` : ""}`,
-      ),
+      apiGet(
+        `${basePath}?limit=50${debounced ? `&search=${encodeURIComponent(debounced)}` : ""}`,
+      ) as Promise<Instrument[]>,
   });
   const data = (q.data ?? []).map((i) => ({ value: String(i.id), label: `${i.symbol} · ${i.name}` }));
   return (

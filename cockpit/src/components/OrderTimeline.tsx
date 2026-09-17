@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Timeline, Text, Group, Badge, Code, Loader, Stack, Anchor, Collapse } from "@mantine/core";
-import { useList } from "../api/hooks";
+import { useQuery } from "@tanstack/react-query";
+import { api } from "../api/client";
 import type { OrderEvent } from "../api/types";
 
 /** Ties the dot colour to the status the event left the order in. */
@@ -56,8 +57,25 @@ function Entry({ event }: { event: OrderEvent }) {
  * The events are immutable and complete: this is the whole history of the order, not
  * a log of it.
  */
-export function OrderTimeline({ orderId }: { orderId: string }) {
-  const events = useList<OrderEvent>(`/admin/orders/${orderId}/events`);
+export function OrderTimeline({
+  orderId,
+  eventsPath = "/admin/orders",
+  apiGet = api.get,
+}: {
+  orderId: string;
+  // Base path for the orders resource. Defaults to the admin surface; the trade
+  // app passes "/orders" instead. The full events URL is `${eventsPath}/${orderId}/events`.
+  eventsPath?: string;
+  // Fetch function used for the request. Defaults to the cockpit's admin client
+  // (which attaches an Authorization: Bearer admin token). The trade app MUST pass
+  // tradeApi.get instead, or it would leak the admin token on every request.
+  apiGet?: (path: string) => Promise<unknown>;
+}) {
+  const path = `${eventsPath}/${orderId}/events`;
+  const events = useQuery<OrderEvent[]>({
+    queryKey: [eventsPath, orderId, "events"],
+    queryFn: () => apiGet(path) as Promise<OrderEvent[]>,
+  });
 
   if (events.isLoading) return <Loader size="sm" />;
   if (events.error) return <Text c="red" size="sm">Could not load the order's events.</Text>;
