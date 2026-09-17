@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { Timeline, Text, Group, Badge, Code, Loader, Stack, Anchor, Collapse } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
-import { api } from "../api/client";
 import type { OrderEvent } from "../api/types";
 
 /** Ties the dot colour to the status the event left the order in. */
@@ -60,16 +59,19 @@ function Entry({ event }: { event: OrderEvent }) {
 export function OrderTimeline({
   orderId,
   eventsPath = "/admin/orders",
-  apiGet = api.get,
+  apiGet,
 }: {
   orderId: string;
   // Base path for the orders resource. Defaults to the admin surface; the trade
   // app passes "/orders" instead. The full events URL is `${eventsPath}/${orderId}/events`.
   eventsPath?: string;
-  // Fetch function used for the request. Defaults to the cockpit's admin client
-  // (which attaches an Authorization: Bearer admin token). The trade app MUST pass
-  // tradeApi.get instead, or it would leak the admin token on every request.
-  apiGet?: (path: string) => Promise<unknown>;
+  // Fetch function used for the request. REQUIRED, and deliberately so: there is
+  // no default. A default of the cockpit's admin client (which attaches
+  // Authorization: Bearer <admin token>) would be fail-open — one forgotten prop
+  // on a trade-side usage would put the admin token on a trader request. Making
+  // it required turns that into a compile error instead. The cockpit passes
+  // `api.get`; the trade app passes `tradeApi.get`.
+  apiGet: (path: string) => Promise<unknown>;
 }) {
   const path = `${eventsPath}/${orderId}/events`;
   const events = useQuery<OrderEvent[]>({

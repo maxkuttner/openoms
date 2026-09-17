@@ -49,6 +49,7 @@ function FieldInput({ field, form }: { field: Field; form: any }) {
           required={field.required}
           value={(form.values[field.name] as string) || null}
           onChange={(v) => form.setFieldValue(field.name, v ?? "")}
+          apiGet={api.get}
         />
       );
     case "number":

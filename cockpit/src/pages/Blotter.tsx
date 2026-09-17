@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Group, Title, Table, Select, Loader, Text, Badge, Stack, Button, Tooltip, Drawer } from "@mantine/core";
 import { useList } from "../api/hooks";
+import { api } from "../api/client";
 import { InstrumentSelect } from "../components/InstrumentSelect";
 import { OrderTimeline } from "../components/OrderTimeline";
 import type { BlotterRow, Portfolio, Principal } from "../api/types";
@@ -69,7 +70,7 @@ export function BlotterPage() {
           w={180}
         />
         <div style={{ width: 240 }}>
-          <InstrumentSelect label="Instrument" value={instrument} onChange={setInstrument} />
+          <InstrumentSelect label="Instrument" value={instrument} onChange={setInstrument} apiGet={api.get} />
         </div>
         <Button variant="default" onClick={clear}>Clear</Button>
       </Group>
@@ -93,7 +94,7 @@ export function BlotterPage() {
           )
         }
       >
-        {selected && <OrderTimeline orderId={selected.order_id} />}
+        {selected && <OrderTimeline orderId={selected.order_id} apiGet={api.get} />}
       </Drawer>
 
       {orders.isLoading ? (
