@@ -15,6 +15,14 @@ use crate::admin::{InstrumentSearch, InstrumentSummary};
 use crate::app_state::AppState;
 use crate::handlers::ApiError;
 
+/// Default to 50, clamp into `[1, 200]` — a zero, negative or absent limit
+/// floors to 1 rather than erroring or running unbounded; an oversized one
+/// caps at 200. Pulled out as a pure function so the clamp itself can be
+/// tested without a database.
+fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 200)
+}
+
 /// The one query behind both the admin and trader endpoints.
 pub async fn search_instruments(
     pool: &PgPool,
@@ -22,7 +30,7 @@ pub async fn search_instruments(
     limit: Option<i64>,
 ) -> Result<Vec<InstrumentSummary>, sqlx::Error> {
     let pattern = search.map(|s| format!("%{s}%"));
-    let limit = limit.unwrap_or(50).clamp(1, 200);
+    let limit = clamp_limit(limit);
 
     sqlx::query_as::<_, InstrumentSummary>(
         "SELECT id, symbol, name, venue, asset_class, status \
@@ -83,17 +91,31 @@ mod tests {
         assert!(!ids.contains(&inactive), "an INACTIVE instrument must not be");
     }
 
+    /// No database: exercises `clamp_limit` directly so the clamp itself is
+    /// pinned, independent of what any particular search happens to match.
+    /// A vacuous search-based assertion (previously used here) would pass
+    /// even with `.clamp()` deleted entirely — see fix-round-1 report.
+    #[test]
+    fn the_limit_is_clamped_to_the_documented_range() {
+        assert_eq!(clamp_limit(None), 50, "default is 50");
+        assert_eq!(clamp_limit(Some(0)), 1, "zero floors to 1");
+        assert_eq!(clamp_limit(Some(-5)), 1, "negative floors to 1");
+        assert_eq!(clamp_limit(Some(10_000)), 200, "oversized caps at 200");
+    }
+
+    /// Proves the clamped value actually reaches the SQL `LIMIT`, not just
+    /// that `clamp_limit` computes the right number in isolation.
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn the_limit_is_clamped_to_the_documented_range() {
+    async fn the_clamped_limit_actually_bounds_the_query() {
         let pool = test_pool().await;
+        let prefix = format!("ZZLIMIT{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        for i in 0..3 {
+            seed_instrument(&pool, &format!("{prefix}{i}"), "ACTIVE").await;
+        }
 
-        let none = search_instruments(&pool, Some("ZZNOMATCHATALL"), Some(9_999)).await.expect("high");
-        assert!(none.len() <= 200, "limit must clamp to 200");
-
-        // A zero or negative limit must not produce an error or an unbounded query.
-        let zero = search_instruments(&pool, Some("ZZNOMATCHATALL"), Some(0)).await;
-        assert!(zero.is_ok(), "a zero limit clamps rather than failing");
+        let rows = search_instruments(&pool, Some(&prefix), Some(2)).await.expect("search");
+        assert_eq!(rows.len(), 2, "LIMIT 2 must return exactly 2 of the 3 matching rows");
     }
 
     #[tokio::test]
