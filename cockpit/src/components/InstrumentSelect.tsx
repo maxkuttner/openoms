@@ -4,7 +4,7 @@ import { useDebouncedValue } from "@mantine/hooks";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 
-interface Instrument {
+export interface Instrument {
   id: number;
   symbol: string;
   name: string;
@@ -19,6 +19,7 @@ interface Instrument {
 export function InstrumentSelect({
   value,
   onChange,
+  onSelected,
   label,
   required,
   placeholder,
@@ -27,6 +28,14 @@ export function InstrumentSelect({
 }: {
   value: string | null;
   onChange: (v: string | null) => void;
+  // Optional: fired alongside onChange with the full row already held in
+  // memory from the search results (or null when cleared/not found). Additive
+  // and optional so existing callers (cockpit's Blotter filter and
+  // CrudResource's "instrument" field type) are unaffected; a caller that
+  // needs to render the picked instrument (e.g. a confirmation screen) can
+  // use this instead of re-fetching by id, which this endpoint doesn't
+  // support anyway.
+  onSelected?: (instrument: Instrument | null) => void;
   label?: string;
   required?: boolean;
   placeholder?: string;
@@ -47,7 +56,8 @@ export function InstrumentSelect({
         `${basePath}?limit=50${debounced ? `&search=${encodeURIComponent(debounced)}` : ""}`,
       ) as Promise<Instrument[]>,
   });
-  const data = (q.data ?? []).map((i) => ({ value: String(i.id), label: `${i.symbol} · ${i.name}` }));
+  const rows = q.data ?? [];
+  const data = rows.map((i) => ({ value: String(i.id), label: `${i.symbol} · ${i.name}` }));
   return (
     <Select
       label={label}
@@ -57,7 +67,10 @@ export function InstrumentSelect({
       clearable
       data={data}
       value={value}
-      onChange={onChange}
+      onChange={(v) => {
+        onChange(v);
+        onSelected?.(rows.find((i) => String(i.id) === v) ?? null);
+      }}
       searchValue={search}
       onSearchChange={setSearch}
       nothingFoundMessage={q.isFetching ? "Searching…" : "No matches"}

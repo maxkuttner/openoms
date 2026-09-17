@@ -1,27 +1,13 @@
-import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { notifications } from "@mantine/notifications";
 import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
-import { InstrumentSelect } from "../../components/InstrumentSelect";
+import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
 import type { GrantedPortfolio } from "../App";
 
 type Side = "buy" | "sell";
 type OrderType = "market" | "limit";
 type TimeInForce = "day" | "gtc" | "ioc" | "fok";
-
-// Mirrors the shape /instruments returns (see InstrumentSelect.tsx and
-// src/instruments_api.rs's InstrumentSummary). Used here only to render a
-// human label ("AAPL@XNAS") in the confirmation — InstrumentSelect itself
-// only ever hands the parent the bound id.
-interface InstrumentSummary {
-  id: number;
-  symbol: string;
-  name: string;
-  venue: string;
-  asset_class: string;
-  status: string;
-}
 
 function notifyError(err: unknown) {
   const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
@@ -47,6 +33,12 @@ export function OrderTicket({
     tradeable.length === 1 ? tradeable[0].portfolio_id : null,
   );
   const [instrumentId, setInstrumentId] = useState<string | null>(null);
+  // The full row for the currently selected instrument, handed up by
+  // InstrumentSelect's onSelected alongside its onChange — it already holds
+  // this in memory from the search results, so there is no second fetch.
+  // Since it can only ever be a row the user just picked from the dropdown,
+  // this is correct for ANY instrument, not just a sample of the catalog.
+  const [selectedInstrument, setSelectedInstrument] = useState<Instrument | null>(null);
   const [side, setSide] = useState<Side>("buy");
   const [quantity, setQuantity] = useState<number | string>("");
   const [orderType, setOrderType] = useState<OrderType>("market");
@@ -67,20 +59,12 @@ export function OrderTicket({
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  // Display-only lookup, so the confirmation can say "AAPL@XNAS" rather than
-  // a bare surrogate id. /instruments only supports search-by-symbol/name,
-  // not lookup-by-id, so this takes the first page of the active catalog
-  // (server-clamped to 200). An instrument outside that page still submits
-  // correctly — it just falls back to showing its raw id in the summary.
-  const instruments = useQuery<InstrumentSummary[]>({
-    queryKey: ["/instruments", "ticket-lookup"],
-    queryFn: () => tradeApi.get<InstrumentSummary[]>("/instruments?limit=200"),
-    staleTime: 60_000,
-  });
-  const instrumentLabel = useMemo(() => {
-    const found = instruments.data?.find((i) => String(i.id) === instrumentId);
-    return found ? `${found.symbol}@${found.venue}` : (instrumentId ?? "");
-  }, [instruments.data, instrumentId]);
+  // "SYMBOL@VENUE" for the confirmation text, from the row InstrumentSelect
+  // handed up — real for any instrument the user could have picked, since it
+  // is that same picked row, not a lookup against a capped/alphabetical list.
+  const instrumentLabel = selectedInstrument
+    ? `${selectedInstrument.symbol}@${selectedInstrument.venue}`
+    : (instrumentId ?? "");
 
   const portfolioLabel = tradeable.find((p) => p.portfolio_id === portfolioId)?.code ?? (portfolioId ?? "");
 
@@ -96,6 +80,7 @@ export function OrderTicket({
   // carry a key that already identifies a previous one.
   function reset() {
     setInstrumentId(null);
+    setSelectedInstrument(null);
     setSide("buy");
     setQuantity("");
     setOrderType("market");
@@ -208,6 +193,7 @@ export function OrderTicket({
           required
           value={instrumentId}
           onChange={setInstrumentId}
+          onSelected={setSelectedInstrument}
           basePath="/instruments"
           apiGet={tradeApi.get}
         />
