@@ -7,9 +7,13 @@ const target = process.env.OMS_URL ?? "http://localhost:3001";
 
 export default defineConfig(({ command }) => ({
   plugins: [react()],
-  // Dev serves at "/"; the production bundle is served by the OMS under "/cockpit/"
-  // (tower-http ServeDir), so assets must resolve there.
-  base: command === "build" ? "/cockpit/" : "/",
+  // Both bundles share one asset tree; each app's SHELL is served at its own
+  // path (/cockpit/, /trade/) by src/cockpit.rs. Vite's base is global per
+  // build, so it cannot be either app's path.
+  base: command === "build" ? "/ui/" : "/",
+  build: {
+    rollupOptions: { input: { cockpit: "index.html", trade: "trade.html" } },
+  },
   server: {
     port: 5173,
     proxy: {

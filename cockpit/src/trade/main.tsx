@@ -6,16 +6,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter } from "react-router-dom";
 import "@mantine/core/styles.css";
 import "@mantine/notifications/styles.css";
-import { App } from "./App";
-import { theme } from "./theme";
+import { TradeApp } from "./App";
+import { theme } from "../theme";
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
 });
 
-// BASE_URL is the shared ASSET base (/ui/), not this app's path. The cockpit's
-// shell is served at /cockpit/, so that is its router basename.
-const basename = import.meta.env.DEV ? "/" : "/cockpit/";
+// BASE_URL is the shared ASSET base (/ui/), not this app's path. The trade
+// shell is served at /trade/, so that is its router basename.
+const basename = import.meta.env.DEV ? "/" : "/trade/";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
@@ -23,7 +23,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <Notifications position="top-right" />
       <QueryClientProvider client={queryClient}>
         <BrowserRouter basename={basename}>
-          <App />
+          <TradeApp />
         </BrowserRouter>
       </QueryClientProvider>
     </MantineProvider>
