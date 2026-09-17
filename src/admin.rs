@@ -2083,6 +2083,43 @@ pub async fn revoke_trading_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── Session revocation ────────────────────────────────────────────────────────
+
+/// How many of a principal's sessions were just revoked.
+///
+/// Not itself proof the principal has no *other* way in — a revoked session
+/// only stops resolving on its next `lookup_session` (see
+/// `sessions::lookup_session`'s `revoked_at IS NULL` filter); this endpoint
+/// does not touch API keys.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RevokedSessions {
+    pub revoked: u64,
+}
+
+/// Cut a principal off immediately: revoke every one of its live sessions.
+///
+/// Effective on the very next request from any of them — `lookup_session`
+/// only resolves a session while `revoked_at IS NULL`, so there is nothing
+/// to invalidate beyond the row itself (no cache sits in front of it).
+#[utoipa::path(
+    delete, path = "/admin/principals/{id}/sessions", tag = "admin",
+    params(("id" = Uuid, Path, description = "Principal ID")),
+    responses(
+        (status = 200, description = "OK", body = RevokedSessions),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn revoke_principal_sessions(
+    State(state): State<AppState>,
+    Path(principal_id): Path<Uuid>,
+) -> Result<Json<RevokedSessions>, AdminError> {
+    info!(principal_id = %principal_id, "admin revoke principal sessions");
+    let revoked = crate::sessions::revoke_all_for_principal(state.pool(), principal_id)
+        .await
+        .map_err(map_db_error)?;
+    Ok(Json(RevokedSessions { revoked }))
+}
+
 // ── Grant management ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -3180,5 +3217,63 @@ mod tests {
     fn a_default_admin_password_is_reported() {
         assert_eq!(admin_password_state("openoms-dev"), "default");
         assert_eq!(admin_password_state("something-else"), "set");
+    }
+
+    // ── Session revocation ──────────────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn revoking_sessions_reports_how_many_it_killed() {
+        let pool = test_pool().await;
+        let (principal_id, _code) = seed_principal(&pool, "admin-revoke-sessions-test").await;
+        crate::sessions::create_session(&pool, principal_id, &Default::default(), None)
+            .await
+            .expect("session");
+
+        let revoked = crate::sessions::revoke_all_for_principal(&pool, principal_id)
+            .await
+            .expect("revoke");
+
+        assert_eq!(revoked, 1);
+    }
+
+    // ── test plumbing ────────────────────────────────────────────────────
+
+    /// `main` loads .env before resolving config; a test binary does not, so
+    /// without this the test resolves a different database than the server
+    /// runs against. The `oms` role carries `search_path = oms, public`
+    /// (db/access/roles.sql); these are the admin credentials, so set it here.
+    async fn test_pool() -> sqlx::PgPool {
+        use crate::setup::database::config;
+        dotenvy::dotenv().ok();
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .expect("connect")
+    }
+
+    /// `principal.code` is `UNIQUE` and these tests leave their rows behind,
+    /// so the code is suffixed with the row's own id. Returns the id and the
+    /// code actually inserted, since callers assert against it.
+    async fn seed_principal(pool: &sqlx::PgPool, code: &str) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let code = format!("{code}-{id}");
+        sqlx::query(
+            "INSERT INTO principal (id, code, principal_type, display_name, status) \
+             VALUES ($1, $2, 'HUMAN', $2, 'ACTIVE')",
+        )
+        .bind(id)
+        .bind(&code)
+        .execute(pool)
+        .await
+        .expect("seed principal");
+        (id, code)
     }
 }

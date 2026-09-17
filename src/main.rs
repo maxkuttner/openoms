@@ -12,6 +12,9 @@ mod positions;
 mod recon_orders;
 mod symbology_resolver;
 mod setup;
+mod sessions;
+mod oidc;
+mod auth_api;
 
 use crate::adapters::BrokerRegistry;
 use crate::app_state::AppState;
@@ -36,11 +39,13 @@ use axum::{
     routing::get,
     routing::post,
     middleware,
+    Extension,
     Router
 };
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
+use std::sync::Arc;
 use dotenvy::dotenv;
 use tracing::{error, info, warn};
 use tracing_subscriber::{self, EnvFilter};
@@ -134,6 +139,11 @@ mod reload_tests;
         admin::backfill_symbology,
         admin::expiry_sweep,
         admin::setup_status,
+        admin::revoke_principal_sessions,
+        auth_api::login,
+        auth_api::callback,
+        auth_api::logout,
+        auth_api::me,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -157,11 +167,14 @@ mod reload_tests;
         admin::ExpirySweepResult,
         admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
+        admin::RevokedSessions,
+        auth_api::MeResponse,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "orders", description = "Order submission and cancellation"),
         (name = "admin", description = "Admin management of principals, portfolios, accounts, broker connections, and keys"),
+        (name = "auth", description = "OIDC login and the signed-in principal"),
     )
 )]
 struct ApiDoc;
@@ -218,7 +231,11 @@ const DEFAULT_ADMIN_PASSWORD: &str = "openoms-dev";
 /// Splits the host off a `host:port` pair before asking, and treats anything it
 /// cannot parse as non-loopback — an unrecognised address must not be what talks
 /// the server into accepting a default password.
-fn bind_is_loopback(addr: &str) -> bool {
+///
+/// `pub(crate)` because `sessions::cookie_policy` asks the same question of the
+/// same string: one implementation, so a host can never be loopback to the
+/// admin-password rule and public to the cookie rule.
+pub(crate) fn bind_is_loopback(addr: &str) -> bool {
     // `[::1]:3001` — bracketed IPv6 literal, host is everything up to the bracket.
     let host = if let Some(rest) = addr.strip_prefix('[') {
         match rest.split_once(']') {
@@ -230,6 +247,29 @@ fn bind_is_loopback(addr: &str) -> bool {
         addr.rsplit_once(':').map_or(addr, |(h, _)| h)
     };
     setup::database::config::is_loopback_host(host)
+}
+
+/// Would starting with this OIDC deployment hand out a cookie the browser
+/// cannot protect? If so, refuse rather than serve a broken or stealable login.
+///
+/// Plain http is acceptable only when *both* halves are loopback:
+///
+/// - The **public base URL** decides `Secure` (`sessions::cookie_policy`). An
+///   `http://` URL on a public host means either no `Secure` at all, or — with
+///   the policy failing closed — a `Secure` cookie the browser drops on an
+///   http site. Both are broken; neither should start.
+/// - The **bind address** still matters on its own: `http://localhost` as the
+///   public base URL with a `0.0.0.0` bind serves a Secure-less session cookie
+///   to every machine on the network, which is exactly the spec's
+///   "any other bind requires both" rule.
+///
+/// An `https://` public base URL is always fine, whatever the bind — that is
+/// the reverse-proxy topology (loopback bind, TLS terminated in front).
+fn refuses_plain_http_oidc(bind_addr: &str, public_base_url: &str) -> bool {
+    let https = public_base_url.starts_with("https://");
+    let purely_local =
+        bind_is_loopback(bind_addr) && sessions::is_plain_http_loopback(public_base_url);
+    !(https || purely_local)
 }
 
 /// Bind address on the usual tiers. No CLI flag exists for this today, so the
@@ -825,6 +865,23 @@ async fn serve() {
         }
     };
 
+    // Same rule, for OIDC login instead of the admin console. Plain http is
+    // only tolerated when the whole deployment is loopback — see
+    // `refuses_plain_http_oidc` for why both halves have to be asked.
+    if let Some(oidc) = file_cfg.and_then(|f| f.oidc()) {
+        if refuses_plain_http_oidc(&bind_addr, &oidc.public_base_url) {
+            error!(
+                "refusing to start: [auth.oidc] is configured and this is not a purely local \
+                 deployment — OMS_BIND_ADDR is {bind_addr} and auth.oidc.public_base_url is {} \
+                 (not https://). The session cookie would either be sent in clear text or be \
+                 dropped by the browser for carrying Secure over http. Serve OIDC login behind \
+                 https, or keep both the bind and the public base URL on loopback.",
+                oidc.public_base_url
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Stream health + the fill→marks doorbell are created here (before the broker
     // registry) because FIX sessions register their adapter *and* start their
     // session in one step, so they need both up front. The same StreamHealthRegistry
@@ -895,6 +952,28 @@ async fn serve() {
     // `quote_tx` are handed in (not just kept as `serve()` locals) so the
     // `/admin/connections/reload` handler can rebuild an equivalent
     // `RegistrationDeps` and restart feeds against the same channels boot used.
+    // Session cookie policy is derived once here from the OIDC public base URL
+    // — the browser's own view of this server, so a TLS terminator in front of
+    // a loopback bind still gets `Secure` and the `__Host-` prefix — falling
+    // back to the bind address when OIDC is off (see `sessions::cookie_policy`)
+    // rather than recomputed on every request.
+    // `ttl`/`public_base_url` come from `[auth.oidc]` when it's configured —
+    // `FileConfig::oidc` is the one place idle/absolute TTL overrides and the
+    // public base URL are read — and fall back to `SessionTtl::default()`/
+    // `None` when it is not. A session can only ever be minted by the OIDC
+    // callback, so `public_base_url` being `None` here means OIDC is off,
+    // which means no session-authenticated request can ever reach
+    // `auth_middleware`'s CSRF origin check to begin with — see that
+    // function's doc comment for why a missing base URL still fails closed
+    // there rather than assuming this.
+    let oidc_settings = file_cfg.and_then(|f| f.oidc());
+    let public_base_url = oidc_settings.as_ref().map(|o| o.public_base_url.clone());
+    let session_config = sessions::SessionConfig {
+        cookie_policy: sessions::cookie_policy(&bind_addr, public_base_url.as_deref()),
+        ttl: oidc_settings.as_ref().map(|o| o.ttl.clone()).unwrap_or_default(),
+        public_base_url,
+    };
+
     let state = AppState::new(
         pool,
         admin_token,
@@ -905,6 +984,7 @@ async fn serve() {
         stream_health,
         Some(position_changed_tx.clone()),
         quote_tx.clone(),
+        session_config,
     );
     state.swap_registry(registry);
 
@@ -963,6 +1043,27 @@ async fn serve() {
     // supervised: `stream_supervisor` exists to reconnect streams, and treats a clean
     // return as a disconnect to back off from — wrong shape for a periodic job.
     tokio::spawn(expiry::run(state.pool().clone()));
+
+    // Delete browser sessions past their absolute cap. Idle expiry is already
+    // enforced on read (`sessions::lookup_session`'s join to `principal`), so
+    // this sweep only clears rows that can never resolve again — it exists to
+    // keep `user_session` from growing forever, not to enforce expiry itself.
+    // Hourly, same cadence as the expiry sweep above, for the same reason: the
+    // work matches almost nothing on a normal tick, so a shorter interval buys
+    // nothing and a longer one just leaves dead rows around longer.
+    {
+        let pool = state.pool().clone();
+        tokio::spawn(async move {
+            loop {
+                match sessions::sweep_expired(&pool).await {
+                    Ok(0) => {}
+                    Ok(removed) => info!(removed, "session sweep"),
+                    Err(e) => error!(error = %e, "session sweep failed; retrying next interval"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
 
     // Feed credentials come from the store, same as brokers above. Gating the
     // spawn here is not enough on its own — `DatabentoOpraFeed` takes the key
@@ -1075,6 +1176,55 @@ async fn serve() {
         setup::bootstrap::spawn_sync(synced_brokers);
     }
 
+    // OIDC login. `config.oidc()` is `None` unless `[auth.oidc]` has every
+    // required field (see `FileConfig::oidc`) — that, alone, is what keeps
+    // login off by default: no block means `auth_api_state` stays `None`,
+    // `auth_router` below is never built, and `/auth/*` falls through to
+    // `handler_404` exactly as it does today.
+    //
+    // The client secret is deliberately not read from `oms.toml` (nor from
+    // the sealed broker/feed credential store `credentials.rs` uses — see
+    // this task's report for why that store doesn't fit a single, singleton
+    // secret without new schema and a new write path that is out of this
+    // task's scope) — `OMS_OIDC_CLIENT_SECRET` is the bootstrap-tier
+    // environment variable, the same tier `OMS_ADMIN_PASSWORD` and
+    // `OMS_MASTER_KEY` already live on.
+    //
+    // A discovery failure (IdP unreachable, secret missing, or an insecure
+    // endpoint refused by `oidc::Provider::discover`) logs an error and
+    // leaves `auth_api_state` `None` rather than exiting: an operator who
+    // configured `[auth.oidc]` still needs the rest of the OMS — order
+    // routing, the admin console — to come up even if the IdP is down or the
+    // secret hasn't been set yet. It is retried only on the next restart.
+    let auth_api_state: Option<auth_api::AuthApiState> =
+        if let Some(oidc_settings) = file_cfg.and_then(|f| f.oidc()) {
+            match env::var("OMS_OIDC_CLIENT_SECRET").ok().filter(|v| !v.is_empty()) {
+                None => {
+                    error!(
+                        "[auth.oidc] is configured but OMS_OIDC_CLIENT_SECRET is not set — OIDC \
+                         login is disabled for this run. Set OMS_OIDC_CLIENT_SECRET to the client \
+                         secret registered at the provider and restart."
+                    );
+                    None
+                }
+                Some(client_secret) => {
+                    let required_claim = oidc_settings.required_claim.clone();
+                    match oidc::Provider::discover(oidc_settings, client_secret).await {
+                        Ok(provider) => {
+                            info!("OIDC discovery succeeded — login enabled");
+                            Some(auth_api::AuthApiState { provider: Arc::new(provider), required_claim })
+                        }
+                        Err(e) => {
+                            error!(error = ?e, "OIDC discovery failed — login is disabled for this run");
+                            None
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
     // Register routes
 
     // 1) Register order routes
@@ -1114,6 +1264,10 @@ async fn serve() {
         .route(
             "/admin/principals/:id/keys/:key_id",
             axum::routing::delete(admin::revoke_principal_key),
+        )
+        .route(
+            "/admin/principals/:id/sessions",
+            axum::routing::delete(admin::revoke_principal_sessions),
         )
         .route(
             "/admin/trading-tokens",
@@ -1201,14 +1355,49 @@ async fn serve() {
         scalar_api_reference::scalar_html_default(&config)
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/scalar", get(move || async move { Html(scalar_html) }))
         .route("/api-docs/openapi.json", get(|| async { axum::Json(ApiDoc::openapi()) }))
         // add health check route
         .route("/health", get(handlers::health))
         .merge(orders_router)
         .merge(admin_router)
-        .merge(cockpit::router())
+        .merge(cockpit::router());
+
+    // 3) Register the unauthenticated OIDC routes — merged only when
+    // `auth_api_state` resolved above, i.e. only when `[auth.oidc]` is
+    // configured and discovery succeeded. Left unmerged, `/auth/*` falls
+    // through to `handler_404` below exactly as it does with no OIDC config
+    // at all: the off-by-default behaviour holds whether the block is
+    // absent or merely not yet working.
+    if let Some(auth_state) = auth_api_state {
+        let auth_router = Router::new()
+            .route("/auth/login", get(auth_api::login))
+            .route("/auth/callback", get(auth_api::callback))
+            .route("/auth/logout", post(auth_api::logout))
+            .layer(Extension(auth_state));
+        app = app.merge(auth_router);
+    }
+
+    // `/auth/me` is the one `/auth/*` route that requires authentication, so
+    // it carries `auth_middleware` rather than riding on the unauthenticated
+    // router above — but it is still an `/auth/*` route, and the spec's
+    // off-by-default promise is that with no `[auth.oidc]` block the whole
+    // prefix 404s and nothing else changes. Mounted unconditionally it broke
+    // that promise for every install that never enabled login.
+    //
+    // Gated on the config block, not on `auth_api_state`: discovery failing
+    // (IdP down, secret unset) must not take `/auth/me` away from sessions
+    // that already exist. The IdP is a dependency of login, not of every
+    // request — see the spec's "Token handling".
+    if oidc_settings.is_some() {
+        let me_router = Router::new()
+            .route("/auth/me", get(auth_api::me))
+            .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+        app = app.merge(me_router);
+    }
+
+    let app = app
         // add 404 route as fallback
         .fallback(handlers::handler_404)
         .with_state(state);
@@ -1298,6 +1487,32 @@ mod tests {
         assert!(!bind_is_loopback("0.0.0.0:3001"));
         assert!(!bind_is_loopback("192.168.1.10:3001"));
         assert!(!bind_is_loopback("oms.internal:3001"));
+    }
+
+    /// The OIDC start-up gate. Plain http is only ever acceptable when the
+    /// whole deployment is loopback; `https://` is fine on any bind, which is
+    /// the reverse-proxy topology C2 was about.
+    #[test]
+    fn plain_http_oidc_is_only_tolerated_when_everything_is_local() {
+        use super::refuses_plain_http_oidc as refuses;
+
+        // The reverse-proxy topology: loopback bind, TLS terminated in front.
+        assert!(!refuses("127.0.0.1:3001", "https://oms.example.com"));
+        assert!(!refuses("0.0.0.0:3001", "https://oms.example.com"));
+        // Genuine local development, plain http end to end.
+        assert!(!refuses("127.0.0.1:3001", "http://localhost:3001"));
+        assert!(!refuses("[::1]:3001", "http://[::1]:3001"));
+
+        // Reachable from elsewhere and not https: the original rule.
+        assert!(refuses("0.0.0.0:3001", "http://oms.example.com"));
+        // Served to the network but calling itself localhost — the cookie
+        // would go out over the LAN with no Secure at all.
+        assert!(refuses("0.0.0.0:3001", "http://localhost:3001"));
+        // Loopback bind, public http base URL: the cookie demands Secure and
+        // the browser drops it, so login would simply never work.
+        assert!(refuses("127.0.0.1:3001", "http://oms.example.com"));
+        // Neither scheme we understand.
+        assert!(refuses("127.0.0.1:3001", "garbage"));
     }
 
     /// An address we cannot parse must fail closed, never open.

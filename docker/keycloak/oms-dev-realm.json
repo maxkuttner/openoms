@@ -1,0 +1,37 @@
+{
+  "realm": "oms-dev",
+  "enabled": true,
+  "sslRequired": "none",
+  "clients": [
+    {
+      "clientId": "oms",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "oms-dev-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["http://localhost:3001/auth/callback"],
+      "webOrigins": ["http://localhost:3001"]
+    }
+  ],
+  "users": [
+    {
+      "username": "trader",
+      "email": "trader@example.com",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Dev",
+      "lastName": "Trader",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "trader",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

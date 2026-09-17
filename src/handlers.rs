@@ -29,7 +29,15 @@ use crate::event_store::{OrderEventStore, NewOrderEvent};
 use crate::kafka::publish_events;
 use crate::risk_engine::{PgRiskDataProvider, RiskCheckError, RiskEngine};
 
-
+/// Who to record as having caused an event.
+///
+/// `"oms"` is reserved for events the system generates on its own — expiry
+/// sweeps, reconciliation. A command that arrived with a credential is
+/// attributed to that credential's principal, whether it came from a browser
+/// session or an API key.
+fn actor_for(auth: &AuthContext) -> String {
+    auth.principal_code.clone()
+}
 
 // Generic api error struct
 pub struct ApiError {
@@ -550,7 +558,7 @@ pub async fn orders_submit(
     let metadata = EventMetadata {
         event_id: Uuid::new_v4().into(),
         timestamp: Utc::now(),
-        actor: "oms".into(),
+        actor: actor_for(&auth),
     };
 
     // run through state machine and decide whether can proceed
@@ -713,7 +721,7 @@ pub async fn orders_submit(
     let route_metadata = EventMetadata {
         event_id: Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
-        actor: "oms".to_string(),
+        actor: actor_for(&auth),
     };
 
     let route_events = applied
@@ -982,7 +990,7 @@ pub async fn orders_cancel(
     let metadata = EventMetadata {
         event_id: Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
-        actor: "oms".to_string(),
+        actor: actor_for(&auth),
     };
 
     // run through state machine and decide whether can proceed
@@ -1801,6 +1809,250 @@ mod tests {
     fn order_permission_maps_to_grant_column() {
         assert_eq!(OrderPermission::View.column(), "can_view");
         assert_eq!(OrderPermission::Trade.column(), "can_trade");
+    }
+
+    /// An authenticated command is attributed to whoever sent it — the whole
+    /// point of carrying `principal_code` on `AuthContext`.
+    #[test]
+    fn an_authenticated_command_is_attributed_to_whoever_sent_it() {
+        let auth = AuthContext {
+            principal_id: Uuid::nil(),
+            principal_code: "jane.doe".to_string(),
+        };
+
+        assert_eq!(actor_for(&auth), "jane.doe");
+    }
+
+    /// The test above pins `actor_for` in isolation, which is not the property
+    /// that matters: a call site quietly reverting to the literal `"oms"` would
+    /// compile and keep it green. This one submits a real order through
+    /// `orders_submit` and reads `actor` back out of `order_event`.
+    ///
+    /// The principal code is deliberately longer than 30 characters, because
+    /// `order_event.actor` was `VARCHAR(30)` — this test fails with Postgres
+    /// 22001 against the pre-migration schema, which is exactly the defect it
+    /// exists to catch (see 0024_ALTER_ORDER_EVENT_WIDEN_ACTOR.sql).
+    ///
+    /// No broker adapter is registered, so the submit returns 503 at the
+    /// routing step — *after* TX1 has committed `OrderSubmitted`, which is the
+    /// row being asserted on. Rows are left behind (order_event is append-only,
+    /// guarded by an ON DELETE trigger), so every seeded code is suffixed with
+    /// a fresh UUID the way `sessions.rs`'s Postgres tests do.
+    ///
+    /// Run with: cargo test -- --ignored
+    /// Requires: a live, migrated Postgres reachable via the usual POSTGRES_* config.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_submitted_order_records_the_principal_that_sent_it() {
+        use crate::app_state::AppState;
+        use crate::adapters::BrokerRegistry;
+        use crate::stream_health::StreamHealthRegistry;
+        use symbology::{Identifier, InMemoryCache, OpenFigiClient};
+
+        let pool = test_pool().await;
+        let suffix = Uuid::new_v4();
+
+        let (principal_id, principal_code) = seed_principal(&pool, "audit-actor-call-site-test").await;
+        assert!(
+            principal_code.len() > 30,
+            "the code must exceed the old VARCHAR(30) to catch C1, got {} chars",
+            principal_code.len()
+        );
+
+        // Reference data the instrument FKs into. Taken from whatever the
+        // database already holds rather than hard-coded, so the test does not
+        // depend on one particular MIC or currency having been seeded.
+        let venue: String = sqlx::query_scalar("SELECT code FROM venue ORDER BY code LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded venue");
+        let currency: String = sqlx::query_scalar("SELECT code FROM currency ORDER BY code LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded currency");
+
+        let instrument_id: i64 = sqlx::query_scalar(
+            "INSERT INTO instrument \
+                 (symbol, venue, name, asset_class, instrument_class, currency, status, \
+                  price_precision, price_increment) \
+             VALUES ($1, $2, 'Actor attribution test instrument', 'EQUITY', 'SPOT', $3, 'ACTIVE', 2, 0.01) \
+             RETURNING id",
+        )
+        .bind(format!("ACTOR{}", suffix.simple()))
+        .bind(&venue)
+        .bind(&currency)
+        .fetch_one(&pool)
+        .await
+        .expect("seed instrument");
+
+        // A broker code no adapter is ever registered under, so routing fails
+        // predictably at `registry().get(...)` instead of reaching a network.
+        let broker_code = format!("ACTORTEST{}", suffix.simple());
+        let connection_code = format!("actor-test-conn-{suffix}");
+        sqlx::query(
+            "INSERT INTO broker_connection (code, broker_code, environment, status) \
+             VALUES ($1, $2, 'PAPER', 'ACTIVE')",
+        )
+        .bind(&connection_code)
+        .bind(&broker_code)
+        .execute(&pool)
+        .await
+        .expect("seed broker_connection");
+
+        sqlx::query(
+            "INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) \
+             VALUES ($1, $2, $3, true)",
+        )
+        .bind(instrument_id)
+        .bind(&broker_code)
+        .bind(format!("ACTOR{}", suffix.simple()))
+        .execute(&pool)
+        .await
+        .expect("seed broker_instrument");
+
+        let account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) \
+             VALUES ($1, $2, $3, $4, 'ACTIVE')",
+        )
+        .bind(account_id)
+        .bind(format!("actor-test-account-{suffix}"))
+        .bind(&connection_code)
+        .bind(format!("EXT-{suffix}"))
+        .execute(&pool)
+        .await
+        .expect("seed account");
+
+        let portfolio_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO portfolio (id, code, name, status, default_account_id) \
+             VALUES ($1, $2, 'Actor attribution test portfolio', 'ACTIVE', $3)",
+        )
+        .bind(portfolio_id)
+        .bind(format!("actor-test-portfolio-{suffix}"))
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .expect("seed portfolio");
+
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade) \
+             VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .expect("seed grant");
+
+        // ── the real order path ──────────────────────────────────────────────
+        let (quote_tx, _quote_rx) = tokio::sync::mpsc::channel(1);
+        let state = AppState::new(
+            pool.clone(),
+            "test-admin-token".to_string(),
+            false,
+            BrokerRegistry::new(), // empty: nothing can route
+            None,                  // no Kafka; `publish_events` is a no-op without it
+            Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
+            StreamHealthRegistry::new(),
+            None,
+            quote_tx,
+            crate::sessions::SessionConfig {
+                cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
+                ttl: crate::sessions::SessionTtl::default(),
+                public_base_url: None,
+            },
+        );
+
+        let order_id = Uuid::new_v4();
+        let request = SubmitOrderRequest {
+            order_id: order_id.to_string(),
+            client_order_id: format!("actor-test-{suffix}"),
+            portfolio_id: portfolio_id.to_string(),
+            account_id: None,
+            instrument_id: Some(instrument_id.to_string()),
+            symbol: None,
+            venue: None,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            quantity: 1.0,
+        };
+
+        let auth = AuthContext {
+            principal_id,
+            principal_code: principal_code.clone(),
+        };
+
+        let outcome = orders_submit(State(state), Extension(auth), Json(request)).await;
+
+        let err = outcome
+            .err()
+            .expect("no adapter is registered, so the routing step must fail");
+        assert_eq!(
+            err.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "expected the no-adapter failure, got: {}",
+            err.message
+        );
+
+        // The point of the test: what the call site actually stamped.
+        let actors: Vec<String> = sqlx::query_scalar(
+            "SELECT actor FROM order_event WHERE order_id = $1 ORDER BY version",
+        )
+        .bind(order_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read back the audit trail");
+
+        assert_eq!(
+            actors,
+            vec![principal_code.clone()],
+            "the OrderSubmitted event must name the principal, not 'oms'"
+        );
+    }
+
+    // ── test plumbing ────────────────────────────────────────────────────────
+    // Copied from `sessions.rs`'s test module, for the same reasons given there.
+
+    /// `main` loads .env before resolving config; a test binary does not, so
+    /// without this the test resolves a different database than the server runs
+    /// against. The `oms` role carries `search_path = oms, public`
+    /// (db/access/roles.sql); these are the admin credentials, so set it here.
+    async fn test_pool() -> sqlx::PgPool {
+        use crate::setup::database::config;
+        dotenvy::dotenv().ok();
+        let cfg = config::resolve(config::PostgresOverrides::default());
+        sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .expect("connect")
+    }
+
+    /// `principal.code` is `UNIQUE` and these tests leave their rows behind, so
+    /// the code is suffixed with the row's own id — which is also what pushes it
+    /// past 30 characters.
+    async fn seed_principal(pool: &sqlx::PgPool, code: &str) -> (Uuid, String) {
+        let id = Uuid::new_v4();
+        let code = format!("{code}-{id}");
+        sqlx::query(
+            "INSERT INTO principal (id, code, principal_type, display_name, status) \
+             VALUES ($1, $2, 'HUMAN', $2, 'ACTIVE')",
+        )
+        .bind(id)
+        .bind(&code)
+        .execute(pool)
+        .await
+        .expect("seed principal");
+        (id, code)
     }
 }
 

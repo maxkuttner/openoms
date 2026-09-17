@@ -1664,6 +1664,45 @@
         ]
       }
     },
+    "/admin/principals/{id}/sessions": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Cut a principal off immediately: revoke every one of its live sessions.",
+        "description": "Effective on the very next request from any of them — `lookup_session`\nonly resolves a session while `revoked_at IS NULL`, so there is nothing\nto invalidate beyond the row itself (no cache sits in front of it).",
+        "operationId": "revoke_principal_sessions",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Principal ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokedSessions"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/risk-limits": {
       "get": {
         "tags": [
@@ -2052,6 +2091,125 @@
           }
         },
         "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/auth/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Completes a login: validates the callback, exchanges the code, resolves",
+        "description": "(or provisions) the principal, and mints a session.\n\nEvery failure path here ends in a clean `ApiError` and no session:\na provider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure, `ClaimRejected`, and `SubjectNotAvailable` (the\nlatter two both map to 403 — see `ResolveOutcome`) all return before\n`create_session` is ever called.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "state",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "error",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Login completed; session cookie set, redirects to /"
+          },
+          "400": {
+            "description": "Malformed callback, or a missing/expired/mismatched login flow"
+          },
+          "401": {
+            "description": "The provider rejected the login, or the exchanged token failed verification"
+          },
+          "403": {
+            "description": "The claim gate rejected the identity, or the subject belongs to a non-human or disabled principal"
+          },
+          "502": {
+            "description": "The identity provider was unreachable"
+          }
+        }
+      }
+    },
+    "/auth/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in",
+        "description": "the flow cookie, and sends the browser to the provider. Cannot fail —\nthere is no user input yet and no network call, only local randomness —\nso this returns a bare `Response`, not a `Result`.",
+        "operationId": "login",
+        "responses": {
+          "302": {
+            "description": "Redirects to the identity provider's authorization endpoint"
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Local logout only: revokes our session and clears our cookie. The IdP's",
+        "description": "own session is deliberately left alone — RP-initiated logout (redirecting\nto the provider's `end_session_endpoint`) is not implemented, so signing\nout of the OMS does not sign the user out of their other applications.\n\nReads the raw cookie itself rather than requiring `Extension<AuthContext>`\nso it stays idempotent: a missing, already-revoked, or expired session\nstill gets a `clear_cookie_header` in the response instead of a 401.",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Session revoked and cookie cleared (idempotent)"
+          }
+        }
+      }
+    },
+    "/auth/me": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Who the caller is signed in as, and what they can act on.",
+        "description": "Reuses `handlers::list_portfolios`'s exact query shape rather than a\nwidened or narrowed one, so `/auth/me`'s notion of \"granted portfolios\"\ncan never drift from `/portfolios`'s.",
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Not authenticated"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
           {
             "bearer_token": []
           }
@@ -3315,6 +3473,33 @@
           }
         }
       },
+      "MeResponse": {
+        "type": "object",
+        "description": "The signed-in principal plus its granted portfolios — the shape a\nfront end needs to render itself without a second round trip.",
+        "required": [
+          "principal_id",
+          "code",
+          "portfolios"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "portfolios": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/handlers.GrantedPortfolio"
+            }
+          },
+          "principal_id": {
+            "type": "string"
+          }
+        }
+      },
       "OrderAggregateState": {
         "type": "object",
         "required": [
@@ -3815,6 +4000,20 @@
           "ticker": {
             "type": "string",
             "nullable": true
+          }
+        }
+      },
+      "RevokedSessions": {
+        "type": "object",
+        "description": "How many of a principal's sessions were just revoked.\n\nNot itself proof the principal has no *other* way in — a revoked session\nonly stops resolving on its next `lookup_session` (see\n`sessions::lookup_session`'s `revoked_at IS NULL` filter); this endpoint\ndoes not touch API keys.",
+        "required": [
+          "revoked"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -4354,6 +4553,10 @@
     {
       "name": "admin",
       "description": "Admin management of principals, portfolios, accounts, broker connections, and keys"
+    },
+    {
+      "name": "auth",
+      "description": "OIDC login and the signed-in principal"
     }
   ]
 }

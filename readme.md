@@ -425,6 +425,43 @@ There is a CLI too — `oms orders list`, `oms positions`, `oms submit`. See
   under one principal to rotate credentials without re-permissioning. Revoke anytime.
 - Trading tokens can reach only the trading routes. They can never touch `/admin`.
 
+### Enabling login (OIDC)
+
+**Off by default.** With no `[auth.oidc]` block in `oms.toml`, the OMS behaves
+exactly as it does today — `/auth/login`, `/auth/callback`, `/auth/logout` and
+`/auth/me` all fall through to a plain 404, and nothing else changes.
+
+To turn it on, add an `[auth.oidc]` block (see the sample in `src/config.rs`, or
+`oms.toml` after `init`):
+
+```toml
+[auth.oidc]
+issuer = "https://idp.example.com/realms/oms"
+client_id = "oms"
+public_base_url = "https://oms.example.com"
+```
+
+At the identity provider, register a **confidential client** whose redirect URI is
+`{public_base_url}/auth/callback` — the one value above drives both the redirect
+sent to the provider and the `Origin` check on the callback, so there is only ever
+one URI to get right on both ends.
+
+**The client secret does not go in `oms.toml`.** Set it in the environment as
+`OMS_OIDC_CLIENT_SECRET` instead (`.env` works, same as `OMS_ADMIN_PASSWORD`) — it
+is read at boot and never written to any file or table.
+
+A misconfigured or unreachable provider — bad issuer, discovery failure, missing
+`OMS_OIDC_CLIENT_SECRET` — logs an error and leaves login off for that run; order
+routing and the admin console come up regardless. Fix it and restart.
+
+**A non-loopback bind requires `https://`.** If `[auth.oidc]` is configured and
+`OMS_BIND_ADDR` is not loopback, `public_base_url` must start with `https://` or
+the server refuses to start — the session cookie cannot carry `Secure` otherwise,
+which would send it over the wire in clear text.
+
+See [`docker-compose.yml`](docker-compose.yml) for a disposable Keycloak to test
+against end to end, under the `oidc` profile.
+
 ## Troubleshooting
 
 | Symptom | Cause |
