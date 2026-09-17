@@ -462,6 +462,21 @@ which would send it over the wire in clear text.
 See [`docker-compose.yml`](docker-compose.yml) for a disposable Keycloak to test
 against end to end, under the `oidc` profile.
 
+### The trade app
+
+With `[auth.oidc]` configured, a second, separate single-page app is served at
+<http://localhost:3001/trade/> — for traders, as distinct from `/cockpit/`, which
+stays the admin console. **It only exists when OIDC is configured**: with no
+`[auth.oidc]` block, `/trade/` 404s exactly like `/auth/*` does, and `/cockpit/`
+is unaffected either way.
+
+A trader visiting `/trade/` unauthenticated is sent to `/auth/login`, signs in at
+the identity provider, and is returned to `/trade/` — not `/cockpit/` or `/`. Once
+signed in, the app shows only the portfolios that principal has been granted
+(`can_trade` / `can_view` / `can_allocate` from `principal_portfolio_grant`, the
+same grants `/auth/me` reports) — never the full portfolio list an admin sees in
+the cockpit.
+
 ## Troubleshooting
 
 | Symptom | Cause |
