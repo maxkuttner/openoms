@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
-import { Badge, Button, Drawer, Group, Loader, Select, Stack, Table, Text, Title, Tooltip } from "@mantine/core";
+import {
+  Alert, Badge, Button, Drawer, Group, Loader, Select, Stack, Table, Text, Title, Tooltip,
+} from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
 import { OrderTimeline } from "../../components/OrderTimeline";
 import type { BlotterRow } from "../../api/types";
@@ -24,12 +26,32 @@ const STATUS_COLOR: Record<string, string> = {
 // done, one way or another.
 const TERMINAL = new Set(["filled", "canceled", "rejected", "expired"]);
 
+// How many orders to ask for. The server defaults to 100 and clamps to 1..500
+// (list_orders in src/handlers.rs); asking explicitly means the window is a
+// decision made here rather than a default that silently truncates the blotter.
+const BLOTTER_LIMIT = 200;
+
+// GET /orders/{id}, of which only the status is used here. Mirrors
+// OrderAggregateState in src/domain/orders/state.rs.
+type OrderState = { order_id: string; status: string };
+
 function notifyError(err: unknown) {
   const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
   notifications.show({ message, color: "red" });
 }
 
-export function TradeBlotter({ portfolios }: { portfolios: GrantedPortfolio[] }) {
+export function TradeBlotter({
+  portfolios,
+  followOrderId = null,
+}: {
+  portfolios: GrantedPortfolio[];
+  // The order the ticket just submitted, if any. GET /orders is scoped
+  // server-side to can_view grants, so the same permission that decides which
+  // rows come back decides which portfolios can be picked — Positions uses
+  // can_view for exactly this reason, and the two must not disagree.
+  followOrderId?: string | null;
+}) {
+  const viewable = portfolios.filter((p) => p.can_view);
   const [portfolioId, setPortfolioId] = useState<string | null>(null);
   const [selected, setSelected] = useState<BlotterRow | null>(null);
 
@@ -43,11 +65,36 @@ export function TradeBlotter({ portfolios }: { portfolios: GrantedPortfolio[] })
   // the race, and that is exactly the case this exists for).
   const [cancelling, setCancelling] = useState<Set<string>>(new Set());
 
+  // Filtering and limiting happen SERVER-side. Fetching an unparameterised
+  // /orders and filtering in the browser meant the server's own default window
+  // (LIMIT 100 ORDER BY created_at DESC) silently hid everything older, and
+  // picking a portfolio could show "No orders" while that portfolio had plenty
+  // — just none inside the newest hundred rows across all portfolios.
   const orders = useQuery<BlotterRow[]>({
-    queryKey: ["/orders"],
-    queryFn: () => tradeApi.get<BlotterRow[]>("/orders"),
+    queryKey: ["/orders", { portfolioId, limit: BLOTTER_LIMIT }],
+    queryFn: () => {
+      const params = new URLSearchParams({ limit: String(BLOTTER_LIMIT) });
+      if (portfolioId) params.set("portfolio_id", portfolioId);
+      return tradeApi.get<BlotterRow[]>(`/orders?${params.toString()}`);
+    },
     refetchInterval: 2000,
   });
+
+  // The order the ticket just sent, watched on its own until it leaves
+  // `submitted` — the spec's "after submission" behaviour. The submit response
+  // is empty (204), so the only way to learn what became of the order is to
+  // fetch it; an order that never leaves `submitted` is precisely the
+  // recorded-but-not-routed case the 502/503 toasts warn about, and this is
+  // where a trader sees it rather than being told.
+  const followed = useQuery<OrderState>({
+    queryKey: ["/orders", followOrderId, "state"],
+    queryFn: () => tradeApi.get<OrderState>(`/orders/${followOrderId}`),
+    enabled: followOrderId !== null,
+    // Stop polling once it has moved: there is nothing further to learn.
+    refetchInterval: (query) =>
+      query.state.data && query.state.data.status !== "submitted" ? false : 2000,
+  });
+  const followedStatus = followOrderId ? followed.data?.status ?? null : null;
 
   // Drop an order from `cancelling` once its own polled status says it's done —
   // never on the strength of the POST response alone.
@@ -84,16 +131,18 @@ export function TradeBlotter({ portfolios }: { portfolios: GrantedPortfolio[] })
     }
   }
 
-  const rows = (orders.data ?? []).filter((o) => !portfolioId || o.portfolio_id === portfolioId);
+  // No client-side filtering: what came back IS the answer to the query asked.
+  const rows = orders.data ?? [];
+  const windowFull = rows.length >= BLOTTER_LIMIT;
 
   return (
     <Stack>
       <Group justify="space-between" align="flex-end">
         <Title order={3}>Blotter</Title>
-        {portfolios.length > 1 && (
+        {viewable.length > 1 && (
           <Select
             label="Portfolio"
-            data={portfolios.map((p) => ({ value: p.portfolio_id, label: p.code }))}
+            data={viewable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
             value={portfolioId}
             onChange={setPortfolioId}
             clearable
@@ -102,6 +151,30 @@ export function TradeBlotter({ portfolios }: { portfolios: GrantedPortfolio[] })
           />
         )}
       </Group>
+
+      {followOrderId !== null && (
+        <Alert
+          color={
+            followedStatus === null || followedStatus === "submitted"
+              ? "gray"
+              : STATUS_COLOR[followedStatus] ?? "gray"
+          }
+          title={
+            followedStatus === null
+              ? "Watching your order…"
+              : followedStatus === "submitted"
+                ? "Your order is recorded, not yet routed"
+                : `Your order is ${followedStatus}`
+          }
+        >
+          <Text size="sm">
+            {followOrderId}
+            {followedStatus === "submitted" &&
+              " — it has not reached a broker yet. If it stays here, it was never routed: cancel it below."}
+            {followed.isError && " — could not read this order back; check the rows below."}
+          </Text>
+        </Alert>
+      )}
 
       <Drawer
         opened={selected !== null}
@@ -147,7 +220,12 @@ export function TradeBlotter({ portfolios }: { portfolios: GrantedPortfolio[] })
               const isCancelling = cancelling.has(o.order_id) && !TERMINAL.has(o.status);
               const canCancel = !TERMINAL.has(o.status) && !isCancelling;
               return (
-                <Table.Tr key={o.order_id} onClick={() => setSelected(o)} style={{ cursor: "pointer" }}>
+                <Table.Tr
+                  key={o.order_id}
+                  onClick={() => setSelected(o)}
+                  style={{ cursor: "pointer" }}
+                  bg={o.order_id === followOrderId ? "var(--mantine-color-blue-light)" : undefined}
+                >
                   <Table.Td>{new Date(o.created_at).toLocaleString()}</Table.Td>
                   <Table.Td>
                     <Tooltip label={o.instrument_name ?? `id ${o.instrument_id}`} disabled={!o.instrument_name}>
@@ -191,6 +269,15 @@ export function TradeBlotter({ portfolios }: { portfolios: GrantedPortfolio[] })
                 </Table.Tr>
               );
             })}
+            {windowFull && (
+              <Table.Tr>
+                <Table.Td colSpan={10}>
+                  <Text c="dimmed" size="xs" ta="center">
+                    Showing the {BLOTTER_LIMIT} most recent orders; older ones are not listed.
+                  </Text>
+                </Table.Td>
+              </Table.Tr>
+            )}
             {rows.length === 0 && (
               <Table.Tr>
                 <Table.Td colSpan={10}>
