@@ -22,15 +22,23 @@ React Router. No backend code here — just the admin API.
 
 ## Build
 ```bash
-npm run build   # tsc + vite build -> dist/  (base path /cockpit/)
+npm run build   # tsc + vite build -> dist/  (base path /ui/)
 ```
-`dist/` can be served by any static host, or by the OMS itself (tower-http `ServeDir` at
-`/cockpit`, a planned follow-up).
+Two entry points build into one `dist/`: `index.html` (the cockpit) and `trade.html` (the
+trader app), sharing `dist/assets/`. Vite's `base` is global per build, so the shared asset
+base is `/ui/` and neither app owns it.
+
+`dist/` is embedded into the `oms` binary (`include_dir!`, see `src/cockpit.rs`) and served
+by the OMS itself: `/cockpit/` serves the cockpit shell, `/trade/` the trade shell (mounted
+only when OIDC is configured), and `/ui/*` the assets both of them load.
 
 ## Layout
 - `src/api/` — `client.ts` (typed fetch + bearer token), `types.ts` (resource shapes),
   `hooks.ts` (TanStack Query helpers).
 - `src/components/CrudResource.tsx` — generic list + create/edit/delete used by the simple pages.
+- `src/trade/` — the trader app (`/trade/`): its own cookie-only API client, order ticket,
+  blotter and positions. It shares `src/components/` and the Mantine theme with the cockpit,
+  but never its admin API client.
 - `src/pages/` — Principals (+ keys + grants), Portfolios, Accounts, BrokerConnections,
   RiskLimits, Blotter, ApiDocs (embedded [Scalar](https://scalar.com) reference, lazy-loaded,
   fed from the OMS OpenAPI doc).
