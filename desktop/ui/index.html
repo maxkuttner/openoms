@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>openOMS Trade</title>
+    <style>
+      @font-face {
+        font-family: "JetBrains Mono";
+        src: local("JetBrains Mono");
+      }
+
+      :root {
+        --bg: #0d1014;
+        --panel: #1a1e26;
+        --inset: #0b0d10;
+        --border: #2a2f38;
+        --ink: #eff1f4;
+        --muted: #9aa3af;
+        --green: #22ae6c;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--ink);
+        font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        display: grid;
+        place-items: center;
+      }
+
+      main {
+        width: 360px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 28px;
+      }
+
+      h1 {
+        font-size: 18px;
+        font-weight: 700;
+        letter-spacing: -0.2px;
+        margin: 0 0 20px;
+      }
+
+      label {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        letter-spacing: 0.3px;
+        margin-bottom: 6px;
+      }
+
+      input[type="text"] {
+        width: 100%;
+        background: var(--inset);
+        border: 1px solid var(--border);
+        color: var(--ink);
+        font-family: inherit;
+        font-size: 13px;
+        padding: 8px 10px;
+        border-radius: 4px;
+        outline: none;
+      }
+
+      input[type="text"]:focus {
+        border-color: var(--green);
+      }
+
+      button {
+        width: 100%;
+        margin-top: 16px;
+        background: var(--green);
+        color: var(--bg);
+        border: none;
+        border-radius: 4px;
+        font-family: inherit;
+        font-size: 13px;
+        font-weight: 700;
+        padding: 10px;
+        cursor: pointer;
+      }
+
+      button:hover {
+        opacity: 0.9;
+      }
+
+      #error {
+        margin-top: 12px;
+        font-size: 12px;
+        color: #e0524d;
+        min-height: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Connect to openOMS</h1>
+      <label for="server-url">Server address</label>
+      <input id="server-url" type="text" placeholder="https://oms.example.com" />
+      <button id="connect">Connect</button>
+      <div id="error"></div>
+    </main>
+  </body>
+</html>
