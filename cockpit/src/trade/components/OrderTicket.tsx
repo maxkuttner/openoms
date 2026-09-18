@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { notifications } from "@mantine/notifications";
-import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title } from "@mantine/core";
+import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title, UnstyledButton } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
 import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
 import type { GrantedPortfolio } from "../App";
@@ -29,6 +29,58 @@ const LIVE_AT_VENUE = new Set(["routed", "partially_filled", "filled"]);
 const RECORDED_NOT_ROUTED =
   "The order was RECORDED but NOT routed to the broker — nothing was sent to the venue. " +
   "Cancel it in the blotter to clear it.";
+
+/// Buy and sell as two halves of one control, coloured from the book's own
+/// pair: `depth` for bids, `offer` for asks.
+///
+/// This is deliberately the loudest thing on the ticket. Side is the single
+/// field that, when wrong, sends the opposite order — a dropdown renders it as
+/// one row of text among six, which is not the weight it deserves.
+function SideSelector({ value, onChange }: { value: Side; onChange: (s: Side) => void }) {
+  const half = (s: Side, label: string, color: string) => {
+    const selected = value === s;
+    return (
+      <UnstyledButton
+        onClick={() => onChange(s)}
+        aria-pressed={selected}
+        style={{
+          flex: 1,
+          padding: "10px 0",
+          textAlign: "center",
+          fontWeight: 700,
+          letterSpacing: "0.06em",
+          textTransform: "uppercase",
+          fontSize: "var(--mantine-font-size-sm)",
+          color: selected ? "var(--mantine-color-black)" : `var(--mantine-color-${color}-6)`,
+          background: selected ? `var(--mantine-color-${color}-6)` : "transparent",
+          transition: "background 80ms linear, color 80ms linear",
+        }}
+      >
+        {label}
+      </UnstyledButton>
+    );
+  };
+
+  return (
+    <div>
+      <Text size="sm" fw={500} mb={4}>
+        Side
+      </Text>
+      <Group
+        gap={0}
+        wrap="nowrap"
+        style={{
+          border: "1px solid var(--mantine-color-dark-5)",
+          borderRadius: "var(--mantine-radius-sm)",
+          overflow: "hidden",
+        }}
+      >
+        {half("buy", "Buy", "depth")}
+        {half("sell", "Sell", "offer")}
+      </Group>
+    </div>
+  );
+}
 
 // The order ticket. Sits beside the blotter on the trade screen: fills out an
 // order, forces a confirmation step that states the order in words, and only
@@ -315,19 +367,9 @@ export function OrderTicket({
           apiGet={tradeApi.get}
         />
 
-        <Group grow>
-          <Select
-            label="Side"
-            data={[
-              { value: "buy", label: "Buy" },
-              { value: "sell", label: "Sell" },
-            ]}
-            value={side}
-            onChange={(v) => v && setSide(v as Side)}
-            allowDeselect={false}
-          />
-          <NumberInput label="Quantity" required min={0} value={quantity} onChange={setQuantity} />
-        </Group>
+        <SideSelector value={side} onChange={setSide} />
+
+        <NumberInput label="Quantity" required min={0} value={quantity} onChange={setQuantity} />
 
         <Group grow>
           <Select
@@ -389,7 +431,7 @@ export function OrderTicket({
             <Button variant="default" onClick={() => setConfirmOpen(false)} disabled={submitting}>
               Cancel
             </Button>
-            <Button color={side === "buy" ? "green" : "red"} loading={submitting} onClick={confirmSubmit}>
+            <Button color={side === "buy" ? "depth" : "offer"} loading={submitting} onClick={confirmSubmit}>
               Confirm {side}
             </Button>
           </Group>

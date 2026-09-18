@@ -16,6 +16,24 @@ const depth: MantineColorsTuple = [
   "#007541",
 ];
 
+// The other side of the book. `depth` is named for bids; an order screen needs
+// its twin, so this is built the same way — ten steps, index 6 as the working
+// shade — and reads as the opposite side of a pair rather than as "error red".
+// Side is the one field on a ticket that sends the opposite order when it is
+// wrong, so it is worth a colour of its own rather than a stock badge.
+const offer: MantineColorsTuple = [
+  "#fdeced",
+  "#f8d2d5",
+  "#f0a6ab",
+  "#e77a81",
+  "#e0555e",
+  "#dc3d48",
+  "#db3440", // 6 — pairs with depth[6]
+  "#c22530",
+  "#a91b25",
+  "#8f121a",
+];
+
 // Brand-aligned dark scale (#0d1014 body, #1a1e26 elevated, #2a2f38 borders).
 const ink: MantineColorsTuple = [
   "#c9cdd4",
@@ -37,7 +55,7 @@ export const theme = createTheme({
   primaryColor: "depth",
   primaryShade: { light: 6, dark: 6 },
   defaultRadius: "sm",
-  colors: { depth, dark: ink },
+  colors: { depth, offer, dark: ink },
   other: {
     brandBg: "#0d1014",
     brandInk: "#eff1f4",

@@ -1,10 +1,55 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Alert, AppShell, Button, Container, Group, Loader, Stack, Text } from "@mantine/core";
+import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
 import { Routes, Route, Navigate } from "react-router-dom";
-import { tradeApi, onLoginUnavailable } from "./api/client";
+import { NavLink } from "react-router-dom";
+import { tradeApi, onLoginUnavailable, API_BASE } from "./api/client";
 import { TradePage } from "./pages/Trade";
 import { PositionsPage } from "./pages/Positions";
+
+/// Reachability of the OMS, polled on its own rather than inferred from whichever
+/// screen happens to be mounted. `/health` is unauthenticated, so this answers
+/// "can I reach the server", not "am I still signed in" — an expired session
+/// navigates to sign-in on its own and does not belong in this indicator.
+///
+/// Fetched directly because `/health` answers plain `OK`, which is not JSON and
+/// would throw in the shared client's parser.
+function ConnectionDot() {
+  const health = useQuery({
+    queryKey: ["/health"],
+    queryFn: async () => {
+      const res = await fetch(`${API_BASE}/health`);
+      if (!res.ok) throw new Error(String(res.status));
+      return true;
+    },
+    refetchInterval: 10_000,
+    retry: false,
+  });
+
+  const { color, label } = health.isError
+    ? { color: "var(--mantine-color-offer-6)", label: "No connection to the OMS" }
+    : health.isFetching
+      ? { color: "var(--mantine-color-yellow-6)", label: "Checking the connection" }
+      : { color: "var(--mantine-color-depth-6)", label: "Connected" };
+
+  return (
+    <Tooltip label={label}>
+      <Box
+        aria-label={label}
+        style={{ width: 8, height: 8, borderRadius: "50%", background: color, flexShrink: 0 }}
+      />
+    </Tooltip>
+  );
+}
+
+const navLinkStyle = ({ isActive }: { isActive: boolean }) => ({
+  color: isActive ? "var(--mantine-color-text)" : "var(--mantine-color-dimmed)",
+  textDecoration: "none",
+  fontSize: "var(--mantine-font-size-sm)",
+  fontWeight: isActive ? 600 : 400,
+  paddingBottom: 2,
+  borderBottom: `2px solid ${isActive ? "var(--mantine-color-depth-6)" : "transparent"}`,
+});
 
 export type GrantedPortfolio = {
   portfolio_id: string;
@@ -65,9 +110,24 @@ export function TradeApp() {
   return (
     <AppShell header={{ height: 48 }} padding="md">
       <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between">
-          <Text fw={600}>openOMS</Text>
-          <Text size="sm" c="dimmed">{me.data?.display_name ?? me.data?.code}</Text>
+        <Group h="100%" px="md" justify="space-between" wrap="nowrap">
+          <Group gap="lg" wrap="nowrap">
+            <Text fw={700}>openOMS</Text>
+            <Group gap="md" wrap="nowrap">
+              <NavLink to="/" end style={navLinkStyle}>
+                Trade
+              </NavLink>
+              <NavLink to="/positions" style={navLinkStyle}>
+                Positions
+              </NavLink>
+            </Group>
+          </Group>
+          <Group gap="xs" wrap="nowrap">
+            <ConnectionDot />
+            <Text size="sm" c="dimmed">
+              {me.data?.display_name ?? me.data?.code}
+            </Text>
+          </Group>
         </Group>
       </AppShell.Header>
       <AppShell.Main>

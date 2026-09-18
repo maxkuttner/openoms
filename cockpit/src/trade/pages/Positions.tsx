@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader, Select, Stack, Table, Text, Title, Group } from "@mantine/core";
 import { tradeApi } from "../api/client";
+import { numeric, columnHeader } from "../table";
 import type { Me } from "../App";
 
 // Mirrors src/positions.rs Position. mark, market_value, unrealized_pnl and
@@ -63,29 +64,29 @@ export function PositionsPage({ me }: { me: Me }) {
       ) : positions.isLoading ? (
         <Loader />
       ) : (
-        <Table striped highlightOnHover withTableBorder>
+        <Table striped highlightOnHover withTableBorder verticalSpacing={6} fz="sm">
           <Table.Thead>
             <Table.Tr>
-              <Table.Th>Instrument</Table.Th>
-              <Table.Th ta="right">Net qty</Table.Th>
-              <Table.Th ta="right">Avg cost</Table.Th>
-              <Table.Th ta="right">Mark</Table.Th>
-              <Table.Th ta="right">Market value</Table.Th>
-              <Table.Th ta="right">Unrealized P&L</Table.Th>
-              <Table.Th ta="right">Realized P&L</Table.Th>
-              <Table.Th>Mark time</Table.Th>
+              <Table.Th style={columnHeader}>Instrument</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Net qty</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Avg cost</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Mark</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Market value</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Unrealized P&L</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Realized P&L</Table.Th>
+              <Table.Th style={columnHeader}>Mark time</Table.Th>
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
             {rows.map((p) => (
               <Table.Tr key={p.instrument_id}>
                 <Table.Td>{p.instrument_id}</Table.Td>
-                <Table.Td ta="right">{p.net_qty}</Table.Td>
-                <Table.Td ta="right">{p.avg_cost}</Table.Td>
-                <Table.Td ta="right">{num(p.mark)}</Table.Td>
-                <Table.Td ta="right">{num(p.market_value)}</Table.Td>
-                <Table.Td ta="right">{num(p.unrealized_pnl)}</Table.Td>
-                <Table.Td ta="right">{p.realized_pnl}</Table.Td>
+                <Table.Td style={numeric}>{p.net_qty}</Table.Td>
+                <Table.Td style={numeric}>{p.avg_cost}</Table.Td>
+                <Table.Td style={numeric}>{num(p.mark)}</Table.Td>
+                <Table.Td style={numeric}>{num(p.market_value)}</Table.Td>
+                <Table.Td style={numeric}>{num(p.unrealized_pnl)}</Table.Td>
+                <Table.Td style={numeric}>{p.realized_pnl}</Table.Td>
                 <Table.Td>{p.mark_ts ? new Date(p.mark_ts).toLocaleString() : "—"}</Table.Td>
               </Table.Tr>
             ))}

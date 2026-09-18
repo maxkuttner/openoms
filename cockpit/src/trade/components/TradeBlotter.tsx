@@ -5,6 +5,7 @@ import {
   Alert, Badge, Button, Drawer, Group, Loader, Select, Stack, Table, Text, Title, Tooltip,
 } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
+import { numeric, columnHeader, sideColor } from "../table";
 import { OrderTimeline } from "../../components/OrderTimeline";
 import type { BlotterRow } from "../../api/types";
 import type { GrantedPortfolio } from "../App";
@@ -200,18 +201,18 @@ export function TradeBlotter({
       {orders.isLoading ? (
         <Loader />
       ) : (
-        <Table striped highlightOnHover withTableBorder>
+        <Table striped highlightOnHover withTableBorder verticalSpacing={6} fz="sm">
           <Table.Thead>
             <Table.Tr>
-              <Table.Th>Time</Table.Th>
-              <Table.Th>Instrument</Table.Th>
-              <Table.Th>Side</Table.Th>
-              <Table.Th>Type</Table.Th>
-              <Table.Th>Status</Table.Th>
-              <Table.Th ta="right">Qty</Table.Th>
-              <Table.Th ta="right">Cum</Table.Th>
-              <Table.Th ta="right">Leaves</Table.Th>
-              <Table.Th ta="right">Avg px</Table.Th>
+              <Table.Th style={columnHeader}>Time</Table.Th>
+              <Table.Th style={columnHeader}>Instrument</Table.Th>
+              <Table.Th style={columnHeader}>Side</Table.Th>
+              <Table.Th style={columnHeader}>Type</Table.Th>
+              <Table.Th style={columnHeader}>Status</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Qty</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Cum</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Leaves</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Avg px</Table.Th>
               <Table.Th />
             </Table.Tr>
           </Table.Thead>
@@ -233,7 +234,7 @@ export function TradeBlotter({
                     </Tooltip>
                   </Table.Td>
                   <Table.Td>
-                    <Badge color={o.side === "buy" ? "green" : "red"} variant="light">
+                    <Badge color={sideColor(o.side)} variant="light">
                       {o.side}
                     </Badge>
                   </Table.Td>
@@ -247,10 +248,10 @@ export function TradeBlotter({
                       <Badge color={STATUS_COLOR[o.status] ?? "gray"}>{o.status}</Badge>
                     )}
                   </Table.Td>
-                  <Table.Td ta="right">{o.original_qty}</Table.Td>
-                  <Table.Td ta="right">{o.cum_qty}</Table.Td>
-                  <Table.Td ta="right">{o.leaves_qty}</Table.Td>
-                  <Table.Td ta="right">{o.avg_px ?? "—"}</Table.Td>
+                  <Table.Td style={numeric}>{o.original_qty}</Table.Td>
+                  <Table.Td style={numeric}>{o.cum_qty}</Table.Td>
+                  <Table.Td style={numeric}>{o.leaves_qty}</Table.Td>
+                  <Table.Td style={numeric}>{o.avg_px ?? "—"}</Table.Td>
                   <Table.Td>
                     <Button
                       size="xs"
