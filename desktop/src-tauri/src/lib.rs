@@ -2,6 +2,8 @@
 // static connection page in ../ui/index.html; later tasks wire up the
 // `/health` probe, persisted server address and window menu.
 
+mod server;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
