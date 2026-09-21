@@ -6,7 +6,11 @@
 mod server;
 mod store;
 
+use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::{Manager, Url};
+
+/// Id of the "Change server..." menu item, matched in `on_menu_event`.
+const CHANGE_SERVER_MENU_ID: &str = "change-server";
 
 /// Validate, probe and (only then) persist a server address, then navigate
 /// the main window to its trade app. Never stores a URL that has not
@@ -42,6 +46,37 @@ fn navigate_to_trade_app(app: &tauri::AppHandle, url: &str) -> Result<(), String
         .map_err(|e| format!("Couldn't open the trade app: {e}"))
 }
 
+/// The `tauri://` origin the bundled connection page is served from.
+///
+/// Tauri has no public API to resolve this: the equivalent internal helper,
+/// `AppManager::get_app_url`, is `pub(crate)` (confirmed by reading tauri
+/// 2.11.5's `src/manager/mod.rs`). This mirrors it directly. Everywhere but
+/// Windows and Android it is `tauri://localhost`; there, since a custom
+/// `tauri://` scheme can't be registered, wry serves the same content over
+/// `http://tauri.localhost` instead (`https://` only if `useHttpsScheme` is
+/// set in `tauri.conf.json`, which this app leaves unset).
+fn local_page_url() -> Url {
+    let origin = if cfg!(windows) {
+        "http://tauri.localhost"
+    } else {
+        "tauri://localhost"
+    };
+    Url::parse(&format!("{origin}/index.html")).expect("hardcoded local page URL must parse")
+}
+
+/// Navigate the main window back to the bundled connection page. Used by
+/// the "Change server..." menu item so a trader who typed a wrong-but-
+/// reachable address, or simply wants to point at a different server, has a
+/// way back in without deleting the saved `server.json` by hand.
+fn go_to_connection_page(app: &tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Internal error: no main window".to_string())?;
+    window
+        .navigate(local_page_url())
+        .map_err(|e| format!("Couldn't return to the connection page: {e}"))
+}
+
 /// Decide what a saved address is worth navigating to at launch. Re-runs
 /// `normalise` over whatever `store::load` returned, so a hand-edited or
 /// otherwise externally written `server.json` — valid JSON, a parseable but
@@ -56,6 +91,30 @@ fn startup_target(stored: Option<String>) -> Option<String> {
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![connect])
+        .menu(|handle| {
+            // Keep the platform's standard menu (Quit, Edit, Window, ...)
+            // and add one "Server" submenu on top of it, rather than
+            // replacing the whole menu bar just to add one item.
+            let menu = Menu::default(handle)?;
+            menu.append(&Submenu::with_items(
+                handle,
+                "Server",
+                true,
+                &[&MenuItem::with_id(
+                    handle,
+                    CHANGE_SERVER_MENU_ID,
+                    "Change server…",
+                    true,
+                    None::<&str>,
+                )?],
+            )?)?;
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == CHANGE_SERVER_MENU_ID {
+                let _ = go_to_connection_page(app);
+            }
+        })
         .setup(|app| {
             // A previously saved address that still passes `normalise`
             // sends the window straight to the trade app; otherwise the
