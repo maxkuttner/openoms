@@ -502,6 +502,15 @@ renders in the same window, not a system browser. An IdP that refuses to be
 embedded in an iframe/webview will not work here: Keycloak is fine, Google is
 not.
 
+**The identity provider must be served over HTTPS**, including in development.
+Keycloak issues its login-flow cookies (`AUTH_SESSION_ID`, `KC_RESTART`) with
+`SameSite=None`, which forces `Secure`, and the webview discards a `Secure`
+cookie delivered over `http://` — login then fails with Keycloak's "Cookie not
+found" page. A browser tab does not show this, because Chrome treats
+`http://localhost` as a secure context and the webview does not. A plain-HTTP
+`start-dev` Keycloak is therefore fine for the cockpit and the browser trade
+app, and unusable from the desktop shell.
+
 ## Troubleshooting
 
 | Symptom | Cause |

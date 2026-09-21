@@ -80,10 +80,33 @@ app already authenticated, or at the identity provider's login page)_
 4. **A good address navigates.** Enter the running OMS; the window goes to
    its `/trade/` app.
 
-5. **Session auth survives the shell.** Sign in to Keycloak *inside the app
-   window* and confirm you land back in the trade app authenticated. This is
-   the whole premise of the thin-shell approach — that the cookie story is
-   unchanged — and it has never been exercised in a real window.
+5. **Session auth survives the shell. Requires an HTTPS identity provider —
+   a plain-`http://` dev Keycloak cannot pass this, and the failure is not
+   your setup.** Sign in *inside the app window* and confirm you land back in
+   the trade app authenticated. This is the whole premise of the thin-shell
+   approach — that the cookie story is unchanged.
+
+   Attempted 2026-09-21 against `start-dev` Keycloak on `http://localhost:8083`
+   and it failed with Keycloak's own page: *"Cookie not found. Please make
+   sure cookies are enabled in your browser."* The cause is not the shell.
+   Keycloak issues its login-flow cookies as:
+
+   ```
+   Set-Cookie: AUTH_SESSION_ID=…;Path=/realms/…/;Secure;HttpOnly;SameSite=None
+   Set-Cookie: KC_RESTART=…;Path=/realms/…/;Secure;HttpOnly;SameSite=None
+   ```
+
+   `SameSite=None` forces `Secure`, and a `Secure` cookie sent over `http://`
+   is discarded — so the login POST arrives with no `KC_RESTART` and Keycloak
+   rejects it. A browser tab hides this: Chrome treats `http://localhost` as a
+   secure context and stores the cookie anyway (verified). The webview does
+   not extend that exemption to localhost. Same Keycloak, same OMS, different
+   cookie jar.
+
+   So run this item against an identity provider served over real HTTPS — a
+   staging deployment, or a local Keycloak with `--https-certificate-file` and
+   an `https://` issuer. Until then item 5 is **untested**, and items 6 and 11
+   (which need a logged-in session) are blocked behind it.
 
 6. **Submitting an order works.** This is the one that proves the CSRF
    origin check passes from a webview, not just from a browser tab — its
