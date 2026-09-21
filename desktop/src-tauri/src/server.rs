@@ -52,21 +52,40 @@ pub enum ProbeFailure {
     Connect,
 }
 
-/// Trim whitespace, strip trailing slashes, and require an explicit
-/// `http://` or `https://` scheme.
+/// Trim whitespace and trailing slashes, parse the result as a URL, and
+/// require it to name nothing more than an `http://` or `https://` origin:
+/// no userinfo, query, fragment, or path beyond `/`.
 ///
 /// This never guesses a scheme: silently prefixing `https://` onto a bare
 /// hostname would point a session cookie at a server the user never named.
+/// And it never trusts string prefixes either — `format!("{url}/health")`
+/// downstream means anything `normalise` lets through ends up on the wire,
+/// so userinfo, a query string, or a fragment all have to be caught here.
 pub fn normalise(raw: &str) -> Result<String, ConnectError> {
-    let trimmed = raw.trim();
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+    let trimmed = raw.trim().trim_end_matches('/');
+
+    let parsed = url::Url::parse(trimmed).map_err(|_| ConnectError::BadScheme)?;
+
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(ConnectError::BadScheme);
     }
-    let without_trailing_slashes = trimmed.trim_end_matches('/');
-    if without_trailing_slashes.is_empty() {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(ConnectError::BadScheme);
     }
-    Ok(without_trailing_slashes.to_string())
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(ConnectError::BadScheme);
+    }
+    let path = parsed.path();
+    if !path.is_empty() && path != "/" {
+        return Err(ConnectError::BadScheme);
+    }
+    let host = parsed.host_str().ok_or(ConnectError::BadScheme)?;
+
+    let mut origin = format!("{}://{host}", parsed.scheme());
+    if let Some(port) = parsed.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    Ok(origin)
 }
 
 /// Turn a probe's raw outcome (an HTTP status, or a `ProbeFailure`) into a
@@ -180,6 +199,51 @@ mod tests {
         assert!(matches!(normalise("file:///etc/passwd"), Err(ConnectError::BadScheme)));
         assert!(matches!(normalise(""), Err(ConnectError::BadScheme)));
         assert!(matches!(normalise("   "), Err(ConnectError::BadScheme)));
+    }
+
+    #[test]
+    fn userinfo_is_refused() {
+        // reqwest would contact evil.com, not oms.example.com.
+        assert!(matches!(
+            normalise("https://oms.example.com@evil.com"),
+            Err(ConnectError::BadScheme)
+        ));
+    }
+
+    #[test]
+    fn a_query_string_is_refused() {
+        // format!("{url}/health") on this would probe the origin root and
+        // then navigate to a URL that is not the trade app.
+        assert!(matches!(normalise("https://host/?a=b"), Err(ConnectError::BadScheme)));
+    }
+
+    #[test]
+    fn a_fragment_is_refused() {
+        // The fragment never reaches the server, so the probe would
+        // genuinely succeed against the bare origin while navigate lands
+        // somewhere the user never asked for.
+        assert!(matches!(normalise("https://host#f"), Err(ConnectError::BadScheme)));
+    }
+
+    #[test]
+    fn a_non_root_path_is_refused() {
+        assert!(matches!(normalise("https://host/some/path"), Err(ConnectError::BadScheme)));
+    }
+
+    #[test]
+    fn a_file_url_is_refused() {
+        assert!(matches!(normalise("file:///etc/passwd"), Err(ConnectError::BadScheme)));
+    }
+
+    #[test]
+    fn an_explicit_port_is_kept() {
+        assert_eq!(normalise("http://localhost:3001/").unwrap(), "http://localhost:3001");
+    }
+
+    #[test]
+    fn a_bare_origin_with_or_without_a_trailing_slash_is_accepted() {
+        assert_eq!(normalise("https://host").unwrap(), "https://host");
+        assert_eq!(normalise("https://host/").unwrap(), "https://host");
     }
 
     #[test]

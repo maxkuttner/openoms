@@ -42,16 +42,26 @@ fn navigate_to_trade_app(app: &tauri::AppHandle, url: &str) -> Result<(), String
         .map_err(|e| format!("Couldn't open the trade app: {e}"))
 }
 
+/// Decide what a saved address is worth navigating to at launch. Re-runs
+/// `normalise` over whatever `store::load` returned, so a hand-edited or
+/// otherwise externally written `server.json` — valid JSON, a parseable but
+/// no longer acceptable URL, another host, a `file://` path — fails closed
+/// into `None` rather than being trusted the way `store::save` already
+/// trusted it once, at connect time.
+fn startup_target(stored: Option<String>) -> Option<String> {
+    stored.and_then(|url| server::normalise(&url).ok())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![connect])
         .setup(|app| {
-            // A previously saved, already-probed address sends the window
-            // straight to the trade app; otherwise the bundled connection
-            // page (already loaded) is left showing.
+            // A previously saved address that still passes `normalise`
+            // sends the window straight to the trade app; otherwise the
+            // bundled connection page (already loaded) is left showing.
             if let Ok(config_dir) = app.path().app_config_dir() {
-                if let Some(url) = store::load(&config_dir) {
+                if let Some(url) = startup_target(store::load(&config_dir)) {
                     let _ = navigate_to_trade_app(app.handle(), &url);
                 }
             }
@@ -59,4 +69,30 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running the openOMS trader desktop application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nothing_stored_leaves_the_connection_page_showing() {
+        assert_eq!(startup_target(None), None);
+    }
+
+    #[test]
+    fn a_stored_value_that_still_passes_normalise_is_navigated_to() {
+        assert_eq!(startup_target(Some("https://host/".to_string())), Some("https://host".to_string()));
+    }
+
+    #[test]
+    fn a_stored_value_failing_normalise_is_not_navigated_to() {
+        // A hand-edited server.json can hold valid JSON with a URL that no
+        // longer passes normalise's stricter rules, or was never valid: a
+        // query string, another host via userinfo, or a file:// path.
+        // Launch must fail closed rather than navigate anyway.
+        assert_eq!(startup_target(Some("https://host/?a=b".to_string())), None);
+        assert_eq!(startup_target(Some("file:///etc/passwd".to_string())), None);
+        assert_eq!(startup_target(Some("not a url at all".to_string())), None);
+    }
 }
