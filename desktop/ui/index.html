@@ -112,5 +112,26 @@
       <button id="connect">Connect</button>
       <div id="error"></div>
     </main>
+    <script>
+      const input = document.getElementById("server-url");
+      const button = document.getElementById("connect");
+      const error = document.getElementById("error");
+
+      button.addEventListener("click", async () => {
+        error.textContent = "";
+        button.disabled = true;
+        try {
+          // Raw Tauri v2 IPC bridge: always present regardless of the
+          // `withGlobalTauri` setting, so this needs no bundled JS API
+          // package for a static, un-built page like this one.
+          await window.__TAURI_INTERNALS__.invoke("connect", { url: input.value });
+          // On success the command navigates the window itself.
+        } catch (message) {
+          error.textContent = String(message);
+        } finally {
+          button.disabled = false;
+        }
+      });
+    </script>
   </body>
 </html>
