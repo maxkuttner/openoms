@@ -87,7 +87,7 @@ pub fn classify(result: Result<u16, ProbeFailure>) -> Result<(), ConnectError> {
 /// `ReqwestProbe` for real use, and by test doubles to exercise
 /// `classify`/`probe` without a network.
 #[async_trait::async_trait]
-pub trait Probe {
+pub trait Probe: Sync {
     async fn get_status(&self, url: &str) -> Result<u16, ProbeFailure>;
 }
 

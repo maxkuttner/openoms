@@ -6,7 +6,6 @@
 mod server;
 mod store;
 
-use server::Probe as _;
 use tauri::{Manager, Url};
 
 /// Validate, probe and (only then) persist a server address, then navigate
@@ -16,17 +15,9 @@ use tauri::{Manager, Url};
 async fn connect(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let normalised = server::normalise(&url).map_err(|e| e.message().to_string())?;
 
-    // `server::probe` takes `&dyn Probe`, and `dyn Probe` has no `Sync`
-    // bound, so `&dyn Probe` is not `Send` — held across this `.await`
-    // inside an async Tauri command, that makes the whole command future
-    // non-Send, which `invoke_handler` requires. Calling `get_status` on
-    // the concrete `ReqwestProbe` (not a trait object) and classifying the
-    // result with `server::classify` uses the exact same tested pieces
-    // `server::probe` composes, without the unsizing coercion that breaks
-    // `Send`. `server.rs` is out of scope to change (owned by Task 2).
     let http = server::ReqwestProbe::new();
-    let health_url = format!("{normalised}/health");
-    server::classify(http.get_status(&health_url).await)
+    server::probe(&normalised, &http)
+        .await
         .map_err(|e| e.message().to_string())?;
 
     let config_dir = app
