@@ -120,13 +120,14 @@ jobs:
       # its own Cargo.lock (see desktop/src-tauri/Cargo.toml), so the root
       # `cargo test` job above never touches it. Building tauri on Linux
       # needs webkit2gtk and friends — packages per Tauri's own documented
-      # v2 CI prerequisites.
+      # v2 CI prerequisites, minus the appindicator dev package: that one is
+      # only needed for the `tray-icon` feature, which this shell does not
+      # enable, and its package name differs across Ubuntu releases.
       - name: install tauri's Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
             librsvg2-dev \
             patchelf
 

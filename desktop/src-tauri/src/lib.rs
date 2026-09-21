@@ -90,7 +90,9 @@ fn go_to_connection_page(app: &tauri::AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Internal error: no main window".to_string())?;
-    let connection_page = app.state::<ConnectionPage>();
+    let connection_page = app
+        .try_state::<ConnectionPage>()
+        .ok_or_else(|| "Internal error: no connection page to return to".to_string())?;
     window
         .navigate(connection_page.0.clone())
         .map_err(|e| format!("Couldn't return to the connection page: {e}"))
@@ -144,10 +146,18 @@ pub fn run() {
             // somewhere correct to go back to no matter how this build is
             // serving local assets (bundled `tauri://` in release, or
             // `build.devUrl` under `cargo tauri dev`).
-            let window = app
-                .get_webview_window("main")
-                .ok_or("no \"main\" window at setup")?;
-            app.manage(ConnectionPage(window.url()?));
+            // Deliberately tolerant: `window.url()` bottoms out in an
+            // `unwrap_or_default()` on WebKitGTK, so it can hand back an
+            // empty string that fails to parse. Returning `Err` from
+            // `setup` does not abort cleanly — Tauri panics from its Ready
+            // handler with the window already on screen — and what is at
+            // stake is one menu item, so a missing connection page makes
+            // "Change server…" a no-op instead of killing the app.
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(url) = window.url() {
+                    app.manage(ConnectionPage(url));
+                }
+            }
 
             // A previously saved address that still passes `normalise`
             // sends the window straight to the trade app; otherwise the
@@ -203,9 +213,9 @@ mod tests {
         use tauri::webview::InvokeRequest;
         use tauri::WebviewWindowBuilder;
 
-        fn request(origin: &str, body: serde_json::Value) -> InvokeRequest {
+        fn request(cmd: &str, origin: &str, body: serde_json::Value) -> InvokeRequest {
             InvokeRequest {
-                cmd: "connect".into(),
+                cmd: cmd.into(),
                 callback: CallbackFn(0),
                 error: CallbackFn(1),
                 url: origin.parse().expect("test origin must parse as a URL"),
@@ -224,7 +234,10 @@ mod tests {
         // Info.plist embed uses a single fixed, non-mangled symbol name) —
         // it does not touch capabilities or ACL resolution.
         let app = mock_builder()
-            .invoke_handler(tauri::generate_handler![connect])
+            // Both commands, matching `run()` — the capability grants two,
+            // so the mock must offer two or the remote-origin half only ever
+            // exercises the shape of a single-command grant.
+            .invoke_handler(tauri::generate_handler![connect, stored_server])
             .build(tauri::generate_context!(test = true))
             .expect("the app builds against its real config under the mock runtime");
         let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
@@ -246,7 +259,7 @@ mod tests {
         };
         let local_err = get_ipc_response(
             &webview,
-            request(local_origin, serde_json::json!({ "url": "not a url" })),
+            request("connect", local_origin, serde_json::json!({ "url": "not a url" })),
         )
         .expect_err("connect(\"not a url\") always fails, just not by ACL refusal");
         let local_message = local_err.as_str().unwrap_or_default();
@@ -269,6 +282,7 @@ mod tests {
         let remote_err = get_ipc_response(
             &webview,
             request(
+                "connect",
                 "https://evil.example.com/trade/",
                 serde_json::json!({ "url": "https://oms.example.com" }),
             ),
@@ -278,6 +292,26 @@ mod tests {
         assert!(
             remote_message.contains("not allowed on window \"main\""),
             "expected an ACL refusal naming window \"main\", got: {remote_message}"
+        );
+
+        // The capability grants two commands, so the boundary has to hold
+        // for both. `stored_server` leaks where the trader's OMS lives and
+        // takes no arguments, so a remote page calling it would not fail on
+        // its own terms the way `connect` does — the ACL is the only thing
+        // stopping it.
+        let remote_store_err = get_ipc_response(
+            &webview,
+            request(
+                "stored_server",
+                "https://evil.example.com/trade/",
+                serde_json::json!({}),
+            ),
+        )
+        .expect_err("a remote page must never be able to invoke stored_server");
+        let remote_store_message = remote_store_err.as_str().unwrap_or_default();
+        assert!(
+            remote_store_message.contains("not allowed on window \"main\""),
+            "expected an ACL refusal naming window \"main\", got: {remote_store_message}"
         );
     }
 }
