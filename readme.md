@@ -477,6 +477,40 @@ signed in, the app shows only the portfolios that principal has been granted
 same grants `/auth/me` reports) — never the full portfolio list an admin sees in
 the cockpit.
 
+### The desktop shell
+
+`desktop/` is a thin Tauri v2 window around `/trade/` — not a separate client,
+just a native shell for it. Build and run it with `cargo tauri dev` /
+`cargo tauri build` from `desktop/src-tauri`; it has its own `Cargo.toml` and
+`Cargo.lock` and is excluded from the workspace, so it never touches the `oms`
+binary build.
+
+On first run it shows a bundled connection page asking for the OMS server
+address; once that address is validated and probed, the window navigates to
+that server's `/trade/` and remembers the address for next launch. A "Change
+server…" menu item comes back to this page.
+
+**Enter the server's canonical public address** — the same origin the OMS is
+configured to serve as `public_base_url` — not an IP address or an alternate
+DNS name that merely happens to reach it. Login relocates the window to that
+canonical origin, and the session's CSRF check is exact string equality, so
+connecting through a non-canonical address stores an address that will fail
+writes with 403 after every sign-in.
+
+**Login happens inside the webview** — the identity provider's login page
+renders in the same window, not a system browser. An IdP that refuses to be
+embedded in an iframe/webview will not work here: Keycloak is fine, Google is
+not.
+
+**The identity provider must be served over HTTPS**, including in development.
+Keycloak issues its login-flow cookies (`AUTH_SESSION_ID`, `KC_RESTART`) with
+`SameSite=None`, which forces `Secure`, and the webview discards a `Secure`
+cookie delivered over `http://` — login then fails with Keycloak's "Cookie not
+found" page. A browser tab does not show this, because Chrome treats
+`http://localhost` as a secure context and the webview does not. A plain-HTTP
+`start-dev` Keycloak is therefore fine for the cockpit and the browser trade
+app, and unusable from the desktop shell.
+
 ## Troubleshooting
 
 | Symptom | Cause |
