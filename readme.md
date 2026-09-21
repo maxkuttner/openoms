@@ -477,6 +477,24 @@ signed in, the app shows only the portfolios that principal has been granted
 same grants `/auth/me` reports) — never the full portfolio list an admin sees in
 the cockpit.
 
+### The desktop shell
+
+`desktop/` is a thin Tauri v2 window around `/trade/` — not a separate client,
+just a native shell for it. Build and run it with `cargo tauri dev` /
+`cargo tauri build` from `desktop/src-tauri`; it has its own `Cargo.toml` and
+`Cargo.lock` and is excluded from the workspace, so it never touches the `oms`
+binary build.
+
+On first run it shows a bundled connection page asking for the OMS server
+address; once that address is validated and probed, the window navigates to
+that server's `/trade/` and remembers the address for next launch. A "Change
+server…" menu item comes back to this page.
+
+**Login happens inside the webview** — the identity provider's login page
+renders in the same window, not a system browser. An IdP that refuses to be
+embedded in an iframe/webview will not work here: Keycloak is fine, Google is
+not.
+
 ## Troubleshooting
 
 | Symptom | Cause |
