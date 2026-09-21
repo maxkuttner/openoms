@@ -1,11 +1,12 @@
 //! Validate a user-typed server address, probe it, and classify the result.
 //!
 //! This module is the whole testable surface behind the connection page:
-//! turning a typed address into a normalised URL or a `BadScheme` refusal,
-//! and turning a `/health` probe's outcome into one of five distinct,
-//! user-facing failures (or success). The `Probe` trait is the seam that
-//! lets `classify`/`probe` be exercised without a network — the real
-//! implementation, `ReqwestProbe`, wraps `reqwest` with a 5 second timeout.
+//! turning a typed address into a normalised URL or a `BadScheme`/
+//! `NotJustAnAddress` refusal, and turning a `/health` probe's outcome into
+//! one of four distinct, user-facing failures (or success). The `Probe`
+//! trait is the seam that lets `classify`/`probe` be exercised without a
+//! network — the real implementation, `ReqwestProbe`, wraps `reqwest` with a
+//! 5 second timeout.
 
 use std::time::Duration;
 
@@ -14,9 +15,15 @@ use std::time::Duration;
 /// cannot tell a typo from a dead server wastes an afternoon.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectError {
-    /// The address was empty, unparseable, or did not start with `http://`
-    /// or `https://`.
+    /// The address was empty, unparseable, a scheme other than http/https,
+    /// or named no host.
     BadScheme,
+    /// The address parsed and named a usable host, but also carried
+    /// userinfo, a query string, or a fragment — something more than just a
+    /// server address. A path is fine and silently discarded (see
+    /// `normalise`); those three are not, because each would otherwise
+    /// change what actually gets contacted or navigated to.
+    NotJustAnAddress,
     /// The TCP connection could not be established (refused, DNS failure,
     /// host down).
     Unreachable,
@@ -33,6 +40,7 @@ impl ConnectError {
     pub fn message(&self) -> &'static str {
         match self {
             ConnectError::BadScheme => "Enter a full address starting with https://",
+            ConnectError::NotJustAnAddress => "Enter just the server address, like https://oms.example.com",
             ConnectError::Unreachable => "Can't reach that address",
             ConnectError::Tls => "Secure connection failed",
             ConnectError::NotAnOms => "Reachable, but that doesn't look like an OMS",
@@ -54,7 +62,11 @@ pub enum ProbeFailure {
 
 /// Trim whitespace and trailing slashes, parse the result as a URL, and
 /// require it to name nothing more than an `http://` or `https://` origin:
-/// no userinfo, query, fragment, or path beyond `/`.
+/// no userinfo, query, or fragment. A path is accepted and silently
+/// discarded — the likeliest first paste is a full trade-app URL like
+/// `https://oms.example.com/trade/`, and a path is never itself meaningful
+/// as a server address, so there is nothing to gain by rejecting it; the
+/// probe against `/health` already catches a genuinely wrong host.
 ///
 /// This never guesses a scheme: silently prefixing `https://` onto a bare
 /// hostname would point a session cookie at a server the user never named.
@@ -70,14 +82,10 @@ pub fn normalise(raw: &str) -> Result<String, ConnectError> {
         return Err(ConnectError::BadScheme);
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(ConnectError::BadScheme);
+        return Err(ConnectError::NotJustAnAddress);
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(ConnectError::BadScheme);
-    }
-    let path = parsed.path();
-    if !path.is_empty() && path != "/" {
-        return Err(ConnectError::BadScheme);
+        return Err(ConnectError::NotJustAnAddress);
     }
     let host = parsed.host_str().ok_or(ConnectError::BadScheme)?;
 
@@ -206,7 +214,7 @@ mod tests {
         // reqwest would contact evil.com, not oms.example.com.
         assert!(matches!(
             normalise("https://oms.example.com@evil.com"),
-            Err(ConnectError::BadScheme)
+            Err(ConnectError::NotJustAnAddress)
         ));
     }
 
@@ -214,7 +222,7 @@ mod tests {
     fn a_query_string_is_refused() {
         // format!("{url}/health") on this would probe the origin root and
         // then navigate to a URL that is not the trade app.
-        assert!(matches!(normalise("https://host/?a=b"), Err(ConnectError::BadScheme)));
+        assert!(matches!(normalise("https://host/?a=b"), Err(ConnectError::NotJustAnAddress)));
     }
 
     #[test]
@@ -222,12 +230,25 @@ mod tests {
         // The fragment never reaches the server, so the probe would
         // genuinely succeed against the bare origin while navigate lands
         // somewhere the user never asked for.
-        assert!(matches!(normalise("https://host#f"), Err(ConnectError::BadScheme)));
+        assert!(matches!(normalise("https://host#f"), Err(ConnectError::NotJustAnAddress)));
     }
 
     #[test]
-    fn a_non_root_path_is_refused() {
-        assert!(matches!(normalise("https://host/some/path"), Err(ConnectError::BadScheme)));
+    fn a_non_root_path_is_accepted_and_discarded() {
+        // The likeliest first paste is a full trade-app URL, not a bare
+        // origin — reject that and the trader is told to do the thing they
+        // just did.
+        assert_eq!(normalise("https://host/some/path").unwrap(), "https://host");
+    }
+
+    #[test]
+    fn a_pasted_trade_app_url_is_accepted() {
+        assert_eq!(normalise("https://oms.example.com/trade/").unwrap(), "https://oms.example.com");
+    }
+
+    #[test]
+    fn a_query_string_is_refused_even_alongside_a_path() {
+        assert!(matches!(normalise("https://host/a/b?c=d"), Err(ConnectError::NotJustAnAddress)));
     }
 
     #[test]
@@ -248,10 +269,11 @@ mod tests {
 
     #[test]
     fn every_failure_says_something_different() {
-        // The point of the enum: five distinct causes, five distinct messages.
+        // The point of the enum: six distinct causes, six distinct messages.
         // A trader who cannot tell a typo from a dead server wastes an afternoon.
         let all = [
             ConnectError::BadScheme,
+            ConnectError::NotJustAnAddress,
             ConnectError::Unreachable,
             ConnectError::Tls,
             ConnectError::NotAnOms,
