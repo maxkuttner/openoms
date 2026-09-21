@@ -29,3 +29,5 @@ url = "2"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
 tempfile = "3"
+# Dev-dependency only: `tauri::test` must not compile into the shipped binary.
+tauri = { version = "2", features = ["test"] }

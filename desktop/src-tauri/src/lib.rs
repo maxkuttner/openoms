@@ -7,16 +7,28 @@ mod server;
 mod store;
 
 use tauri::menu::{Menu, MenuItem, Submenu};
-use tauri::{Manager, Url};
+use tauri::{Manager, Runtime, Url};
 
 /// Id of the "Change server..." menu item, matched in `on_menu_event`.
 const CHANGE_SERVER_MENU_ID: &str = "change-server";
 
+/// The origin the bundled connection page was actually served from at
+/// launch — `tauri://localhost/index.html` in a release build, or whatever
+/// `build.devUrl` points at under `cargo tauri dev`. Captured once in
+/// `setup`, before any startup navigation, and managed as app state so the
+/// "Change server…" menu handler has a real place to go back to instead of
+/// a hardcoded guess.
+struct ConnectionPage(Url);
+
 /// Validate, probe and (only then) persist a server address, then navigate
 /// the main window to its trade app. Never stores a URL that has not
 /// already probed successfully.
+///
+/// Generic over `Runtime` (rather than the concrete Wry-backed
+/// `tauri::AppHandle`) so it can be registered on `tauri::test::MockRuntime`
+/// too — see the `the_remote_page_cannot_invoke_connect` test below.
 #[tauri::command]
-async fn connect(app: tauri::AppHandle, url: String) -> Result<(), String> {
+async fn connect<R: Runtime>(app: tauri::AppHandle<R>, url: String) -> Result<(), String> {
     let normalised = server::normalise(&url).map_err(|e| e.message().to_string())?;
 
     let http = server::ReqwestProbe::new();
@@ -35,7 +47,7 @@ async fn connect(app: tauri::AppHandle, url: String) -> Result<(), String> {
 }
 
 /// Navigate the main window to `{url}/trade/`.
-fn navigate_to_trade_app(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+fn navigate_to_trade_app<R: Runtime>(app: &tauri::AppHandle<R>, url: &str) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Internal error: no main window".to_string())?;
@@ -46,24 +58,6 @@ fn navigate_to_trade_app(app: &tauri::AppHandle, url: &str) -> Result<(), String
         .map_err(|e| format!("Couldn't open the trade app: {e}"))
 }
 
-/// The `tauri://` origin the bundled connection page is served from.
-///
-/// Tauri has no public API to resolve this: the equivalent internal helper,
-/// `AppManager::get_app_url`, is `pub(crate)` (confirmed by reading tauri
-/// 2.11.5's `src/manager/mod.rs`). This mirrors it directly. Everywhere but
-/// Windows and Android it is `tauri://localhost`; there, since a custom
-/// `tauri://` scheme can't be registered, wry serves the same content over
-/// `http://tauri.localhost` instead (`https://` only if `useHttpsScheme` is
-/// set in `tauri.conf.json`, which this app leaves unset).
-fn local_page_url() -> Url {
-    let origin = if cfg!(windows) {
-        "http://tauri.localhost"
-    } else {
-        "tauri://localhost"
-    };
-    Url::parse(&format!("{origin}/index.html")).expect("hardcoded local page URL must parse")
-}
-
 /// Navigate the main window back to the bundled connection page. Used by
 /// the "Change server..." menu item so a trader who typed a wrong-but-
 /// reachable address, or simply wants to point at a different server, has a
@@ -72,8 +66,9 @@ fn go_to_connection_page(app: &tauri::AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or_else(|| "Internal error: no main window".to_string())?;
+    let connection_page = app.state::<ConnectionPage>();
     window
-        .navigate(local_page_url())
+        .navigate(connection_page.0.clone())
         .map_err(|e| format!("Couldn't return to the connection page: {e}"))
 }
 
@@ -90,6 +85,10 @@ fn startup_target(stored: Option<String>) -> Option<String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // A command added here must also be added to `AppManifest::commands`
+        // in build.rs and granted in `capabilities/default.json` — miss
+        // either and it still builds, then fails at runtime with
+        // "Command <name> not allowed by ACL".
         .invoke_handler(tauri::generate_handler![connect])
         .menu(|handle| {
             // Keep the platform's standard menu (Quit, Edit, Window, ...)
@@ -116,6 +115,16 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Capture the connection page's real URL before any startup
+            // navigation below might replace it, so "Change server…" has
+            // somewhere correct to go back to no matter how this build is
+            // serving local assets (bundled `tauri://` in release, or
+            // `build.devUrl` under `cargo tauri dev`).
+            let window = app
+                .get_webview_window("main")
+                .ok_or("no \"main\" window at setup")?;
+            app.manage(ConnectionPage(window.url()?));
+
             // A previously saved address that still passes `normalise`
             // sends the window straight to the trade app; otherwise the
             // bundled connection page (already loaded) is left showing.
@@ -153,5 +162,88 @@ mod tests {
         assert_eq!(startup_target(Some("https://host/?a=b".to_string())), None);
         assert_eq!(startup_target(Some("file:///etc/passwd".to_string())), None);
         assert_eq!(startup_target(Some("not a url at all".to_string())), None);
+    }
+
+    /// The permanent record of the reviewer's throwaway proof: this app's
+    /// central security property is that only the bundled local connection
+    /// page can invoke `connect`, never whatever remote `/trade/` page the
+    /// window later navigates to. It also catches the failure mode where a
+    /// command is added to `generate_handler!` but not to `build.rs`'s
+    /// `AppManifest::commands` or to `capabilities/default.json` — that
+    /// compiles and runs, then refuses the command for every origin,
+    /// local included.
+    #[test]
+    fn the_remote_page_cannot_invoke_connect() {
+        use tauri::ipc::{CallbackFn, InvokeBody};
+        use tauri::test::{get_ipc_response, mock_builder, INVOKE_KEY};
+        use tauri::webview::InvokeRequest;
+        use tauri::WebviewWindowBuilder;
+
+        fn request(origin: &str, body: serde_json::Value) -> InvokeRequest {
+            InvokeRequest {
+                cmd: "connect".into(),
+                callback: CallbackFn(0),
+                error: CallbackFn(1),
+                url: origin.parse().expect("test origin must parse as a URL"),
+                body: InvokeBody::Json(body),
+                headers: Default::default(),
+                invoke_key: INVOKE_KEY.to_string(),
+            }
+        }
+
+        // Build against this crate's real `tauri.conf.json` and
+        // `capabilities/default.json` (via `generate_context!()`), on the
+        // `MockRuntime` (via `mock_builder()`), so the ACL enforced here is
+        // the one that ships, without needing a GUI. `test = true` only
+        // skips codegen that cannot coexist with the real `generate_context!()`
+        // already expanded in `run()` above within the same binary (macOS's
+        // Info.plist embed uses a single fixed, non-mangled symbol name) —
+        // it does not touch capabilities or ACL resolution.
+        let app = mock_builder()
+            .invoke_handler(tauri::generate_handler![connect])
+            .build(tauri::generate_context!(test = true))
+            .expect("the app builds against its real config under the mock runtime");
+        let webview = WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("a window labelled \"main\" is what capabilities/default.json grants");
+
+        // Local origin: `capabilities/default.json` grants `allow-connect`
+        // to the local page, so this gets past the ACL and reaches
+        // `connect`'s own logic, which then fails on its own terms (an
+        // unparseable "url" argument) — that failure, not an ACL refusal,
+        // is the distinguishing marker that it was dispatched at all.
+        let local_origin = if cfg!(any(windows, target_os = "android")) {
+            "http://tauri.localhost"
+        } else {
+            "tauri://localhost"
+        };
+        let local_err = get_ipc_response(
+            &webview,
+            request(local_origin, serde_json::json!({ "url": "not a url" })),
+        )
+        .expect_err("connect(\"not a url\") always fails, just not by ACL refusal");
+        let local_message = local_err.as_str().unwrap_or_default();
+        assert!(
+            !local_message.contains("not allowed on window"),
+            "the local connection page was refused by the ACL instead of reaching connect: {local_message}"
+        );
+
+        // Remote origin: there is no `remote` block in
+        // `capabilities/default.json`, so nothing extends `allow-connect`
+        // to any server address the window might later navigate to. This
+        // is the property the whole shell's security model rests on.
+        let remote_err = get_ipc_response(
+            &webview,
+            request(
+                "https://evil.example.com/trade/",
+                serde_json::json!({ "url": "https://oms.example.com" }),
+            ),
+        )
+        .expect_err("a remote page must never be able to invoke connect");
+        let remote_message = remote_err.as_str().unwrap_or_default();
+        assert!(
+            remote_message.contains("not allowed on window \"main\""),
+            "expected an ACL refusal naming window \"main\", got: {remote_message}"
+        );
     }
 }
