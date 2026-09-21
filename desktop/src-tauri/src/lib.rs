@@ -46,7 +46,25 @@ async fn connect<R: Runtime>(app: tauri::AppHandle<R>, url: String) -> Result<()
     navigate_to_trade_app(&app, &normalised)
 }
 
-/// Navigate the main window to `{url}/trade/`.
+/// Return the saved server address, if any, with no probe and no
+/// re-validation beyond what `startup_target` already applies at launch.
+/// Used by the connection page to prefill its field and decide whether to
+/// show a "Cancel" control, so two windows against different servers are
+/// distinguishable instead of always presenting a blank field.
+///
+/// A command added here must ALSO be added to `AppManifest::commands` in
+/// build.rs and granted in `capabilities/default.json` — miss either and it
+/// still builds, then fails at runtime with "Command <name> not allowed by
+/// ACL".
+#[tauri::command]
+fn stored_server<R: Runtime>(app: tauri::AppHandle<R>) -> Option<String> {
+    let config_dir = app.path().app_config_dir().ok()?;
+    store::load(&config_dir)
+}
+
+/// Navigate the main window to `{url}/trade/`, and set the window title to
+/// `openOMS Trade — {host}` so two windows against different servers (prod
+/// vs. UAT) are distinguishable.
 fn navigate_to_trade_app<R: Runtime>(app: &tauri::AppHandle<R>, url: &str) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
@@ -54,8 +72,14 @@ fn navigate_to_trade_app<R: Runtime>(app: &tauri::AppHandle<R>, url: &str) -> Re
     let target = format!("{url}/trade/");
     let target_url = Url::parse(&target).map_err(|e| format!("Invalid server address: {e}"))?;
     window
-        .navigate(target_url)
-        .map_err(|e| format!("Couldn't open the trade app: {e}"))
+        .navigate(target_url.clone())
+        .map_err(|e| format!("Couldn't open the trade app: {e}"))?;
+    if let Some(host) = target_url.host_str() {
+        window
+            .set_title(&format!("openOMS Trade — {host}"))
+            .map_err(|e| format!("Couldn't set the window title: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Navigate the main window back to the bundled connection page. Used by
@@ -89,7 +113,7 @@ pub fn run() {
         // in build.rs and granted in `capabilities/default.json` — miss
         // either and it still builds, then fails at runtime with
         // "Command <name> not allowed by ACL".
-        .invoke_handler(tauri::generate_handler![connect])
+        .invoke_handler(tauri::generate_handler![connect, stored_server])
         .menu(|handle| {
             // Keep the platform's standard menu (Quit, Edit, Window, ...)
             // and add one "Server" submenu on top of it, rather than
@@ -210,8 +234,11 @@ mod tests {
         // Local origin: `capabilities/default.json` grants `allow-connect`
         // to the local page, so this gets past the ACL and reaches
         // `connect`'s own logic, which then fails on its own terms (an
-        // unparseable "url" argument) — that failure, not an ACL refusal,
-        // is the distinguishing marker that it was dispatched at all.
+        // unparseable "url" argument). Assert on that exact message
+        // (`ConnectError::BadScheme`, positively) rather than only the
+        // absence of an ACL-refusal string — a missing string would also
+        // pass against an everything-denied configuration, proving nothing
+        // about whether dispatch actually happened.
         let local_origin = if cfg!(any(windows, target_os = "android")) {
             "http://tauri.localhost"
         } else {
@@ -223,15 +250,22 @@ mod tests {
         )
         .expect_err("connect(\"not a url\") always fails, just not by ACL refusal");
         let local_message = local_err.as_str().unwrap_or_default();
-        assert!(
-            !local_message.contains("not allowed on window"),
-            "the local connection page was refused by the ACL instead of reaching connect: {local_message}"
+        assert_eq!(
+            local_message,
+            crate::server::ConnectError::BadScheme.message(),
+            "expected connect's own BadScheme message, meaning it was actually dispatched, got: {local_message}"
         );
 
         // Remote origin: there is no `remote` block in
         // `capabilities/default.json`, so nothing extends `allow-connect`
         // to any server address the window might later navigate to. This
         // is the property the whole shell's security model rests on.
+        //
+        // This assertion is on a Tauri debug-build ACL-refusal string
+        // ("not allowed on window ..."), which is not a stable, documented
+        // API — it is the only signal `tauri::test` exposes for "refused by
+        // ACL" versus any other failure, so it is kept, but a future Tauri
+        // upgrade could change its wording.
         let remote_err = get_ipc_response(
             &webview,
             request(

@@ -11,7 +11,7 @@ fn main() {
     // miss one and the app builds and runs, then rejects the command by ACL.
     tauri_build::try_build(
         tauri_build::Attributes::new()
-            .app_manifest(tauri_build::AppManifest::new().commands(&["connect"])),
+            .app_manifest(tauri_build::AppManifest::new().commands(&["connect", "stored_server"])),
     )
     .expect("error while configuring the tauri build");
 }

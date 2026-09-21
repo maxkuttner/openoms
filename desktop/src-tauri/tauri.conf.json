@@ -17,7 +17,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {

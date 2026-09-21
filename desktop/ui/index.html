@@ -96,6 +96,14 @@
         opacity: 0.9;
       }
 
+      button#cancel {
+        background: transparent;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        margin-top: 8px;
+        display: none;
+      }
+
       #error {
         margin-top: 12px;
         font-size: 12px;
@@ -110,26 +118,43 @@
       <label for="server-url">Server address</label>
       <input id="server-url" type="text" placeholder="https://oms.example.com" />
       <button id="connect">Connect</button>
+      <button id="cancel">Cancel</button>
       <div id="error"></div>
     </main>
     <script>
       const input = document.getElementById("server-url");
       const button = document.getElementById("connect");
+      const cancel = document.getElementById("cancel");
       const error = document.getElementById("error");
 
-      button.addEventListener("click", async () => {
+      // Raw Tauri v2 IPC bridge: always present regardless of the
+      // `withGlobalTauri` setting, so this needs no bundled JS API package
+      // for a static, un-built page like this one.
+      async function attempt(button, url) {
         error.textContent = "";
         button.disabled = true;
         try {
-          // Raw Tauri v2 IPC bridge: always present regardless of the
-          // `withGlobalTauri` setting, so this needs no bundled JS API
-          // package for a static, un-built page like this one.
-          await window.__TAURI_INTERNALS__.invoke("connect", { url: input.value });
+          await window.__TAURI_INTERNALS__.invoke("connect", { url });
           // On success the command navigates the window itself.
         } catch (message) {
           error.textContent = String(message);
         } finally {
           button.disabled = false;
+        }
+      }
+
+      button.addEventListener("click", () => attempt(button, input.value));
+
+      // Prefill from whatever address was last saved, so a window that has
+      // already connected once — or a trader who chose "Change server…" and
+      // changed their mind — isn't staring at a blank field with no way
+      // back. No stored address means no Cancel control at all.
+      window.__TAURI_INTERNALS__.invoke("stored_server").then((stored) => {
+        if (stored) {
+          input.value = stored;
+          input.focus();
+          cancel.style.display = "block";
+          cancel.addEventListener("click", () => attempt(cancel, stored));
         }
       });
     </script>
