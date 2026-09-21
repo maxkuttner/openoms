@@ -19,8 +19,18 @@ as untested rather than skipping it silently.
 2. **The error line says something useful.** Enter, in turn: an address that
    is syntactically invalid; one that is well-formed but unreachable; one
    that is reachable but is not an OMS (a plain web server); one behind a
-   self-signed certificate. Confirm each produces a *distinct*, plain-language
-   line. The self-signed case is the one to watch — TLS-versus-unreachable is
+   self-signed certificate. Each has one exact expected line, so check the
+   wording rather than just that the four differ:
+
+   | Address | Expected line |
+   |---|---|
+   | not a URL, or `ftp://…`, or carrying a path/query/fragment/userinfo | `Enter a full address starting with https://` |
+   | well-formed, nothing listening | `Can't reach that address` |
+   | reachable, but not an OMS | `Reachable, but that doesn't look like an OMS` |
+   | reachable, but slow to answer | `No response — the server may be starting up` |
+   | self-signed certificate | `Secure connection failed` |
+
+   The self-signed case is the one to watch — TLS-versus-unreachable is
    decided by string-matching the reqwest error chain for
    "tls"/"certificate"/"ssl", which is nobody's stable API and is covered by
    no test. A self-signed cert reported as "Can't reach that address" is the
@@ -86,7 +96,9 @@ as untested rather than skipping it silently.
 
 11. **A real order submit**, end to end, and the **409
     duplicate-idempotency-key path** — the one that must not report "Order
-    sent" when nothing was sent.
+    sent" when nothing was sent. The submit itself is item 6 above; do both
+    in one sitting, and treat that item's 403 and this item's 409 as separate
+    outcomes to look for rather than one pass/fail.
 
 12. **Cancel shows "cancelling…"** and settles.
 
