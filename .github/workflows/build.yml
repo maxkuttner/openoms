@@ -110,6 +110,35 @@ jobs:
           test -s cockpit/dist/trade.html \
             || { echo "cockpit/dist/trade.html missing — the /trade/ shell tests all no-op'd"; exit 1; }
 
+  desktop:
+    name: desktop shell tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # desktop/src-tauri is excluded from the root cargo workspace and has
+      # its own Cargo.lock (see desktop/src-tauri/Cargo.toml), so the root
+      # `cargo test` job above never touches it. Building tauri on Linux
+      # needs webkit2gtk and friends — packages per Tauri's own documented
+      # v2 CI prerequisites.
+      - name: install tauri's Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: test
+        working-directory: desktop/src-tauri
+        run: cargo test
+
   shellcheck:
     name: shellcheck install.sh
     runs-on: ubuntu-22.04

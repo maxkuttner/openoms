@@ -9,7 +9,18 @@ before trusting a release build.
 Record the platform you tested on, and mark anything you could not exercise
 as untested rather than skipping it silently.
 
-**Platform tested:** _(fill in — OS and version)_
+**Linux must be a separate run, not implied by a macOS pass.** The spec
+requires the session's CSRF origin check to hold on both WKWebView (macOS)
+and WebKitGTK (Linux) — two different engines with their own quirks around
+origin headers and embedded logins. Run the whole checklist once per
+platform and record each one below; do not assume a WebKitGTK pass from a
+WKWebView one.
+
+**Platform tested:** _(fill in — OS and version; repeat this whole checklist
+for each platform, macOS and Linux at minimum)_
+
+**Relaunch behaviour (item 7):** _(fill in per platform — lands in the trade
+app already authenticated, or at the identity provider's login page)_
 
 ## Desktop shell
 
@@ -17,24 +28,52 @@ as untested rather than skipping it silently.
    bundled page appears, with the address field and the connect button.
 
 2. **The error line says something useful.** Enter, in turn: an address that
-   is syntactically invalid; one that is well-formed but unreachable; one
-   that is reachable but is not an OMS (a plain web server); one behind a
-   self-signed certificate. Each has one exact expected line, so check the
-   wording rather than just that the four differ:
+   is syntactically invalid; one carrying userinfo, a query string, or a
+   fragment; one that is well-formed but unreachable; one that is reachable
+   but is not an OMS (a plain web server); one behind a self-signed
+   certificate. Each has one exact expected line, so check the wording
+   rather than just that the entries differ:
 
    | Address | Expected line |
    |---|---|
-   | not a URL, or `ftp://…`, or carrying a path/query/fragment/userinfo | `Enter a full address starting with https://` |
+   | not a URL, `ftp://…`, or otherwise unparseable/no host | `Enter a full address starting with https://` |
+   | well-formed but carrying userinfo, a query string, or a fragment (e.g. `https://user@host`, `https://host/?a=b`, `https://host#f`) | `Enter just the server address, like https://oms.example.com` |
    | well-formed, nothing listening | `Can't reach that address` |
    | reachable, but not an OMS | `Reachable, but that doesn't look like an OMS` |
    | reachable, but slow to answer | `No response — the server may be starting up` |
    | self-signed certificate | `Secure connection failed` |
+
+   A pasted trade-app URL — `https://oms.example.com/trade/` — is now a
+   SUCCESS case, not an error: the path is accepted and discarded, and the
+   window should navigate normally. This used to be rejected with the
+   `Enter a full address starting with https://` line, telling the trader
+   to do the thing they just did; confirm that is no longer what happens.
 
    The self-signed case is the one to watch — TLS-versus-unreachable is
    decided by string-matching the reqwest error chain for
    "tls"/"certificate"/"ssl", which is nobody's stable API and is covered by
    no test. A self-signed cert reported as "Can't reach that address" is the
    known failure mode.
+
+2a. **A private/internal CA is trusted.** A server whose certificate chains
+    to an internal CA that the OS trusts (not a public CA, and not
+    self-signed). Before the rustls-tls-native-roots fix this failed at the
+    probe with `Secure connection failed` even though the webview would have
+    loaded the same page fine — the probe only trusted reqwest's bundled
+    Mozilla roots. After the fix it should connect normally. Worth an
+    explicit check because it is the normal shape for a self-hosted
+    deployment behind a corporate or internal CA.
+
+2b. **A reachable but non-canonical address is a trap, not a pass.**
+    Connect using an address that answers `/health` but is not the server's
+    configured `public_base_url` — an IP address, or an alternate DNS name
+    for the same server. `/health` will answer 200 and the address will
+    store successfully, but the OIDC callback relocates the webview to the
+    canonical origin, and the session's CSRF origin check is exact string
+    equality — so any write attempted before that relocation fails with 403,
+    and the stored address stays wrong until "Change server…" is used.
+    **Always enter the server's canonical address.** Treat a redirect away
+    from what you typed as the signal that you used the wrong one.
 
 3. **The button disables while probing** and re-enables after a failure.
 
@@ -57,14 +96,20 @@ as untested rather than skipping it silently.
    or back at the identity provider's login page determines whether the
    cookie jar persists across restarts. Note which one you saw; both are
    plausible outcomes of a correct implementation, but only one is the
-   deliberate design, and the answer isn't obvious in advance.
+   deliberate design, and the answer isn't obvious in advance. **Record the
+   answer in this file**, in the "Relaunch behaviour" field near the top —
+   this has never had anywhere to be written down before.
 
 8. **The capability boundary holds.** Mostly closed already — it is now
    *proven by an automated test*, not merely argued: `the_remote_page_cannot_invoke_connect`
    in `desktop/src-tauri/src/lib.rs` asserts that a local-origin invoke of
    `connect` reaches the handler while a remote-origin one is refused by the
-   ACL. If you still want to see it live, do **not** check
-   `window.__TAURI__`: `withGlobalTauri` is unset, so that property is
+   ACL. This test now runs in CI (`.github/workflows/build.yml`, the
+   `desktop` job), so it is proven on every push, not just proven once and
+   left to bit-rot — though its remote-origin assertion matches a Tauri
+   debug-build ACL-refusal string ("not allowed on window …"), which is not
+   documented as stable API. If you still want to see it live, do **not**
+   check `window.__TAURI__`: `withGlobalTauri` is unset, so that property is
    `undefined` on every page — including the working local one — and
    checking it would give a false pass. Evaluate this instead, on the remote
    page:

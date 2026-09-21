@@ -490,6 +490,13 @@ address; once that address is validated and probed, the window navigates to
 that server's `/trade/` and remembers the address for next launch. A "Change
 server…" menu item comes back to this page.
 
+**Enter the server's canonical public address** — the same origin the OMS is
+configured to serve as `public_base_url` — not an IP address or an alternate
+DNS name that merely happens to reach it. Login relocates the window to that
+canonical origin, and the session's CSRF check is exact string equality, so
+connecting through a non-canonical address stores an address that will fail
+writes with 403 after every sign-in.
+
 **Login happens inside the webview** — the identity provider's login page
 renders in the same window, not a system browser. An IdP that refuses to be
 embedded in an iframe/webview will not work here: Keycloak is fine, Google is
