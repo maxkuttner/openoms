@@ -523,6 +523,13 @@ fn build_http_client() -> Result<openidconnect::reqwest::Client, OidcError> {
         // Following redirects here would let a malicious or compromised IdP
         // response redirect these requests anywhere (SSRF).
         .redirect(openidconnect::reqwest::redirect::Policy::none())
+        // Trust the host's own CA store, not just the roots `openidconnect`
+        // compiles in. A self-hosted OMS normally sits beside a Keycloak whose
+        // certificate chains to a corporate or internal CA; with only the
+        // bundled Mozilla roots, discovery fails and login is disabled for the
+        // entire run. The feature this needs is unified in via the `reqwest012`
+        // dependency in Cargo.toml.
+        .tls_built_in_native_certs(true)
         .build()
         .map_err(|e| OidcError::ProviderUnavailable(format!("failed to build HTTP client: {e}")))
 }

@@ -29,6 +29,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.13.1", features = ["json"] }
+# `openidconnect` pulls in reqwest 0.12 and enables only `webpki-roots` on it,
+# so the OIDC client trusts Mozilla's bundled roots and nothing else — an IdP
+# behind a corporate or internal CA then fails discovery with "Request failed"
+# and login is disabled for the whole run. Declaring 0.12 here unifies the
+# feature set of that same shared crate so `tls_built_in_native_certs` in
+# `oidc::build_http_client` has native roots available. Not used directly.
+reqwest012 = { package = "reqwest", version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 base64 = "0.22"
 bcrypt = "0.15"
 # Session cookie values are hashed, not bcrypted: see src/sessions.rs.
