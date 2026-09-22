@@ -96,7 +96,7 @@ export function PositionsPage({ me }: { me: Me }) {
           </SimpleGrid>
           {unpriced > 0 && (
             <Text size="xs" c="dimmed">
-              {unpriced} of {rows.length} position{unpriced === 1 ? "" : "s"} {unpriced === 1 ? "has" : "have"} no
+              {unpriced} of {rows.length} position{rows.length === 1 ? "" : "s"} {unpriced === 1 ? "has" : "have"} no
               live mark and {unpriced === 1 ? "is" : "are"} excluded from these totals.
             </Text>
           )}
