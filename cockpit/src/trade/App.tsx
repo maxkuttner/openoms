@@ -2,10 +2,8 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
 import { Routes, Route, Navigate } from "react-router-dom";
-import { NavLink } from "react-router-dom";
 import { tradeApi, onLoginUnavailable, API_BASE } from "./api/client";
 import { TradePage } from "./pages/Trade";
-import { PositionsPage } from "./pages/Positions";
 
 /// Reachability of the OMS, polled on its own rather than inferred from whichever
 /// screen happens to be mounted. `/health` is unauthenticated, so this answers
@@ -41,15 +39,6 @@ function ConnectionDot() {
     </Tooltip>
   );
 }
-
-const navLinkStyle = ({ isActive }: { isActive: boolean }) => ({
-  color: isActive ? "var(--mantine-color-text)" : "var(--mantine-color-dimmed)",
-  textDecoration: "none",
-  fontSize: "var(--mantine-font-size-sm)",
-  fontWeight: isActive ? 600 : 400,
-  paddingBottom: 2,
-  borderBottom: `2px solid ${isActive ? "var(--mantine-color-depth-6)" : "transparent"}`,
-});
 
 export type GrantedPortfolio = {
   portfolio_id: string;
@@ -111,17 +100,7 @@ export function TradeApp() {
     <AppShell header={{ height: 48 }} padding="md">
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between" wrap="nowrap">
-          <Group gap="lg" wrap="nowrap">
-            <Text fw={700}>openOMS</Text>
-            <Group gap="md" wrap="nowrap">
-              <NavLink to="/" end style={navLinkStyle}>
-                Trade
-              </NavLink>
-              <NavLink to="/positions" style={navLinkStyle}>
-                Positions
-              </NavLink>
-            </Group>
-          </Group>
+          <Text fw={700}>openOMS</Text>
           <Group gap="xs" wrap="nowrap">
             <ConnectionDot />
             <Text size="sm" c="dimmed">
@@ -133,7 +112,6 @@ export function TradeApp() {
       <AppShell.Main>
         <Routes>
           <Route path="/" element={<TradePage me={me.data!} />} />
-          <Route path="/positions" element={<PositionsPage me={me.data!} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AppShell.Main>

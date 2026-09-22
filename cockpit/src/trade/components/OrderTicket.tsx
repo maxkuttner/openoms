@@ -146,6 +146,15 @@ export function OrderTicket({
     Number(quantity) > 0 &&
     (orderType === "market" || Number(limitPrice) > 0);
 
+  // Quantity × limit price only — there is no live quote feed wired into this
+  // screen, so a market order has no reference price to estimate against.
+  // Never invented from a stale or unrelated price: null means "not shown",
+  // not "zero".
+  const notional =
+    orderType === "limit" && Number(quantity) > 0 && Number(limitPrice) > 0
+      ? Number(quantity) * Number(limitPrice)
+      : null;
+
   // Clears every field AND rolls the idempotency key. Called both for an
   // explicit reset and right after a submit lands (success or the 409 that
   // means "already landed") — a ticket that starts a new order must never
@@ -407,6 +416,19 @@ export function OrderTicket({
           />
         )}
 
+        {Number(quantity) > 0 && (
+          <Paper withBorder p="xs" bg="var(--mantine-color-dark-6)">
+            <Group justify="space-between" wrap="nowrap">
+              <Text size="sm" c="dimmed">
+                Est. notional
+              </Text>
+              <Text size="sm" fw={600}>
+                {notional !== null ? notional.toFixed(2) : "Set by the venue (market order)"}
+              </Text>
+            </Group>
+          </Paper>
+        )}
+
         <Group justify="flex-end">
           <Button variant="subtle" onClick={reset}>
             Reset
@@ -426,6 +448,7 @@ export function OrderTicket({
           <Text>
             {side === "buy" ? "Buy" : "Sell"} {quantity} {instrumentLabel}
             {orderType === "limit" ? ` · limit ${limitPrice}` : " · market"} · {tif} · portfolio {portfolioLabel}
+            {notional !== null && ` · est. notional ${notional.toFixed(2)}`}
           </Text>
           <Group justify="flex-end">
             <Button variant="default" onClick={() => setConfirmOpen(false)} disabled={submitting}>
