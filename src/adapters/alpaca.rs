@@ -11,6 +11,26 @@ use super::{
 };
 use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
+/// Alpaca's market-data API is a separate host from the trading API
+/// (`api.alpaca.markets`/`paper-api.alpaca.markets`) and is not
+/// environment-specific — the same data host serves both live and paper
+/// accounts.
+const ALPACA_DATA_URL: &str = "https://data.alpaca.markets";
+
+/// Pulls `prevDailyBar.c` (previous close) out of a
+/// `GET /v2/stocks/snapshots` response. A symbol with no `prevDailyBar` (a
+/// brand-new listing, or one Alpaca hasn't backfilled yet) is skipped, never
+/// reported as a zero previous close.
+fn parse_alpaca_snapshots(body: &serde_json::Value) -> Vec<(String, f64)> {
+    let Some(map) = body.as_object() else { return Vec::new() };
+    map.iter()
+        .filter_map(|(symbol, snapshot)| {
+            let prev_close = snapshot.get("prevDailyBar")?.get("c")?.as_f64()?;
+            Some((symbol.clone(), prev_close))
+        })
+        .collect()
+}
+
 /// Map Alpaca's `exchange` label to the ISO 10383 MIC used by `public.venue`.
 ///
 /// `None` means we have no MIC for that label. The caller drops the instrument and
@@ -389,6 +409,36 @@ impl BrokerAdapter for AlpacaAdapter {
             Err(BrokerError::BrokerRejected(err_body))
         }
     }
+
+    async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!(
+            "{}/v2/stocks/snapshots?symbols={}",
+            ALPACA_DATA_URL,
+            symbols.join(",")
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(format!(
+                "snapshot request failed: {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_alpaca_snapshots(&body))
+    }
 }
 
 #[cfg(test)]
@@ -427,5 +477,29 @@ mod tests {
     #[test]
     fn declines_a_bare_mic() {
         assert_eq!(alpaca_exchange_to_mic("XNAS"), None);
+    }
+
+    #[test]
+    fn parses_prev_close_from_snapshot_response() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{
+                "AAPL": {"prevDailyBar": {"c": 227.16}},
+                "MSFT": {"prevDailyBar": {"c": 414.10}}
+            }"#,
+        )
+        .unwrap();
+        let mut stats = parse_alpaca_snapshots(&body);
+        stats.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(stats, vec![("AAPL".to_string(), 227.16), ("MSFT".to_string(), 414.10)]);
+    }
+
+    #[test]
+    fn a_symbol_missing_prev_daily_bar_is_skipped_not_zeroed() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"AAPL": {"prevDailyBar": {"c": 227.16}}, "NEWLIST": {}}"#,
+        )
+        .unwrap();
+        let stats = parse_alpaca_snapshots(&body);
+        assert_eq!(stats, vec![("AAPL".to_string(), 227.16)]);
     }
 }
