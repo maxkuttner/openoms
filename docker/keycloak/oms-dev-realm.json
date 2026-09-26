@@ -13,8 +13,11 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "serviceAccountsEnabled": false,
-      "redirectUris": ["http://localhost:3001/auth/callback"],
-      "webOrigins": ["http://localhost:3001"]
+      "redirectUris": [
+        "http://localhost:3001/auth/callback",
+        "https://fedora-8gb-fsn1-1.tail291892.ts.net/auth/callback"
+      ],
+      "webOrigins": ["http://localhost:3001", "https://fedora-8gb-fsn1-1.tail291892.ts.net"]
     }
   ],
   "users": [

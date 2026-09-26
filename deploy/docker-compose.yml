@@ -8,7 +8,9 @@
 # Expects, on the host running this:
 #   ~/oms-deploy/config/oms.toml   — same master_key as whatever wrote the
 #                                    target database's encrypted columns
-#   ~/oms-deploy/config/.env       — POSTGRES_PASSWORD=...
+#   ~/oms-deploy/config/.env       — POSTGRES_PASSWORD=..., OMS_PASSWORD=...,
+#                                    and (with [auth.oidc] configured)
+#                                    OMS_OIDC_CLIENT_SECRET=oms-dev-secret
 services:
   oms:
     build:
@@ -20,4 +22,22 @@ services:
       - ${OMS_DEPLOY_CONFIG_DIR:-/home/max/oms-deploy/config}/.env
     volumes:
       - ${OMS_DEPLOY_CONFIG_DIR:-/home/max/oms-deploy/config}/oms.toml:/app/oms.toml:ro
+    restart: unless-stopped
+
+  # Same disposable dev IdP as the local docker-compose.yml at the repo root
+  # (identical realm import), so /trade/ has something to log in against here
+  # too. The realm's "oms" client has this box's tailscale HTTPS name
+  # pre-registered as a second valid redirect URI alongside localhost's.
+  keycloak:
+    container_name: oms-test-keycloak
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      # Port 8080 is already taken by something else on this box.
+      KC_HTTP_PORT: "8090"
+    network_mode: host
+    volumes:
+      - ../docker/keycloak/oms-dev-realm.json:/opt/keycloak/data/import/oms-dev-realm.json:ro
     restart: unless-stopped
