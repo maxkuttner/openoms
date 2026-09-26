@@ -39,6 +39,7 @@ use axum::{
     response::Html,
     routing::get,
     routing::post,
+    routing::delete,
     middleware,
     Extension,
     Router
@@ -1248,6 +1249,12 @@ async fn serve() {
         .route("/orders/:id/events", get(order_events::get_order_events))
         .route("/orders", get(handlers::list_orders))
         .route("/portfolios", get(handlers::list_portfolios))
+        .route(
+            "/watchlist",
+            get(handlers::list_watchlist).post(handlers::add_watchlist_item),
+        )
+        .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
+        .route("/marks", get(handlers::get_marks))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
         .route(
             "/orders/:id/allocations",

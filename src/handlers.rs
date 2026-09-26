@@ -40,6 +40,7 @@ fn actor_for(auth: &AuthContext) -> String {
 }
 
 // Generic api error struct
+#[derive(Debug)]
 pub struct ApiError {
     
     pub status: StatusCode,
@@ -1764,6 +1765,143 @@ fn domain_event_to_new_event(event: &OrderDomainEvent) -> Result<NewOrderEvent, 
     })
 }
 
+#[derive(serde::Serialize)]
+pub struct WatchlistRow {
+    pub instrument_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AddWatchlistItem {
+    pub instrument_id: String,
+}
+
+pub async fn list_watchlist(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<WatchlistRow>>, ApiError> {
+    let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT instrument_id, created_at FROM watchlist_item \
+         WHERE principal_id = $1 ORDER BY created_at",
+    )
+    .bind(auth.principal_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to list watchlist: {err:?}"),
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(instrument_id, created_at)| WatchlistRow { instrument_id, created_at })
+            .collect(),
+    ))
+}
+
+pub async fn add_watchlist_item(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(body): Json<AddWatchlistItem>,
+) -> Result<StatusCode, ApiError> {
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM instrument WHERE id::text = $1 AND status = 'ACTIVE')",
+    )
+    .bind(&body.instrument_id)
+    .fetch_one(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to check instrument: {err:?}"),
+    })?;
+    if !exists {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("no active instrument {}", body.instrument_id),
+        });
+    }
+
+    sqlx::query(
+        "INSERT INTO watchlist_item (principal_id, instrument_id) VALUES ($1, $2) \
+         ON CONFLICT (principal_id, instrument_id) DO NOTHING",
+    )
+    .bind(auth.principal_id)
+    .bind(&body.instrument_id)
+    .execute(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to add watchlist item: {err:?}"),
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn remove_watchlist_item(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(instrument_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    sqlx::query("DELETE FROM watchlist_item WHERE principal_id = $1 AND instrument_id = $2")
+        .bind(auth.principal_id)
+        .bind(&instrument_id)
+        .execute(state.pool())
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to remove watchlist item: {err:?}"),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+pub struct MarksQuery {
+    pub instrument_ids: String, // comma-separated, e.g. "1,2,3"
+}
+
+#[derive(serde::Serialize)]
+pub struct MarkRow {
+    pub instrument_id: i64,
+    pub bid: Option<f64>,
+    pub ask: Option<f64>,
+    pub mid: Option<f64>,
+    pub prev_close: Option<f64>,
+    pub pct_change: Option<f64>,
+}
+
+pub async fn get_marks(
+    State(state): State<AppState>,
+    Query(query): Query<MarksQuery>,
+) -> Result<Json<Vec<MarkRow>>, ApiError> {
+    let ids: Vec<i64> = query
+        .instrument_ids
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    let rows = ids
+        .into_iter()
+        .map(|instrument_id| {
+            let mark = state.marks().get(instrument_id);
+            let daily = state.daily_stats().get(instrument_id);
+            let mid = mark.map(|m| m.mid());
+            let pct_change = match (mid, daily) {
+                (Some(mid), Some(d)) if d.prev_close != 0.0 => {
+                    Some((mid - d.prev_close) / d.prev_close * 100.0)
+                }
+                _ => None,
+            };
+            MarkRow {
+                instrument_id,
+                bid: mark.map(|m| m.bid),
+                ask: mark.map(|m| m.ask),
+                mid,
+                prev_close: daily.map(|d| d.prev_close),
+                pct_change,
+            }
+        })
+        .collect();
+    Ok(Json(rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2014,6 +2152,131 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn watchlist_add_list_remove_round_trips() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "watch-roundtrip").await;
+        let instrument_id = seed_instrument(&pool, "RT").await.to_string();
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+
+        add_watchlist_item(
+            State(state.clone()),
+            Extension(auth.clone()),
+            Json(AddWatchlistItem { instrument_id: instrument_id.clone() }),
+        )
+        .await
+        .expect("add should succeed");
+
+        let listed = list_watchlist(State(state.clone()), Extension(auth.clone()))
+            .await
+            .expect("list should succeed")
+            .0;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].instrument_id, instrument_id);
+
+        remove_watchlist_item(State(state.clone()), Extension(auth.clone()), Path(instrument_id.clone()))
+            .await
+            .expect("remove should succeed");
+
+        let listed = list_watchlist(State(state), Extension(auth)).await.expect("list should succeed").0;
+        assert!(listed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adding_a_nonexistent_instrument_is_404() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "watch-404").await;
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+
+        let result = add_watchlist_item(
+            State(state),
+            Extension(auth),
+            Json(AddWatchlistItem { instrument_id: "999999999".to_string() }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ApiError { status: StatusCode::NOT_FOUND, .. })));
+    }
+
+    #[tokio::test]
+    async fn adding_the_same_instrument_twice_is_idempotent_not_an_error() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "watch-dup").await;
+        let instrument_id = seed_instrument(&pool, "DUP").await.to_string();
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+
+        add_watchlist_item(State(state.clone()), Extension(auth.clone()), Json(AddWatchlistItem { instrument_id: instrument_id.clone() }))
+            .await
+            .expect("first add succeeds");
+        add_watchlist_item(State(state), Extension(auth), Json(AddWatchlistItem { instrument_id }))
+            .await
+            .expect("second add is idempotent, not an error");
+    }
+
+    #[tokio::test]
+    async fn one_principal_cannot_see_or_remove_anothers_watchlist_item() {
+        let pool = test_pool().await;
+        let (principal_a, code_a) = seed_principal(&pool, "watch-a").await;
+        let (principal_b, code_b) = seed_principal(&pool, "watch-b").await;
+        let instrument_id = seed_instrument(&pool, "XOWN").await.to_string();
+        let state = test_app_state(pool);
+
+        add_watchlist_item(
+            State(state.clone()),
+            Extension(AuthContext { principal_id: principal_a, principal_code: code_a.clone() }),
+            Json(AddWatchlistItem { instrument_id: instrument_id.clone() }),
+        )
+        .await
+        .expect("a adds");
+
+        let b_list = list_watchlist(
+            State(state.clone()),
+            Extension(AuthContext { principal_id: principal_b, principal_code: code_b.clone() }),
+        )
+        .await
+        .expect("list succeeds")
+        .0;
+        assert!(b_list.is_empty(), "b must not see a's watchlist item");
+
+        // b's delete of an item that exists (for a, not b) must not error — it's
+        // scoped to b's own rows, so it's a no-op, and a's row survives.
+        remove_watchlist_item(
+            State(state.clone()),
+            Extension(AuthContext { principal_id: principal_b, principal_code: code_b }),
+            Path(instrument_id.clone()),
+        )
+        .await
+        .expect("no-op delete still succeeds");
+        let a_list = list_watchlist(
+            State(state),
+            Extension(AuthContext { principal_id: principal_a, principal_code: code_a }),
+        )
+        .await
+        .expect("list succeeds")
+        .0;
+        assert_eq!(a_list.len(), 1, "a's item must survive b's no-op delete");
+    }
+
+    #[tokio::test]
+    async fn marks_returns_null_fields_for_unpriced_instruments_not_zero() {
+        let pool = test_pool().await;
+        let instrument_id = seed_instrument(&pool, "UNPRICED").await;
+        let state = test_app_state(pool);
+        // Deliberately: no MarkStore.set, no DailyStatsStore.set for this id.
+
+        let result = get_marks(State(state), Query(MarksQuery { instrument_ids: instrument_id.to_string() }))
+            .await
+            .expect("should succeed even with nothing priced")
+            .0;
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].bid.is_none());
+        assert!(result[0].prev_close.is_none());
+    }
+
     // ── test plumbing ────────────────────────────────────────────────────────
     // Copied from `sessions.rs`'s test module, for the same reasons given there.
 
@@ -2053,6 +2316,58 @@ mod tests {
         .await
         .expect("seed principal");
         (id, code)
+    }
+
+    async fn seed_instrument(pool: &sqlx::PgPool, symbol_suffix: &str) -> i64 {
+        let venue: String = sqlx::query_scalar("SELECT code FROM venue ORDER BY code LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .expect("a seeded venue");
+        let currency: String = sqlx::query_scalar("SELECT code FROM currency ORDER BY code LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .expect("a seeded currency");
+        sqlx::query_scalar(
+            "INSERT INTO instrument \
+                 (symbol, venue, name, asset_class, instrument_class, currency, status, \
+                  price_precision, price_increment) \
+             VALUES ($1, $2, 'Watchlist test instrument', 'EQUITY', 'SPOT', $3, 'ACTIVE', 2, 0.01) \
+             RETURNING id",
+        )
+        .bind(format!("WATCH{symbol_suffix}"))
+        .bind(&venue)
+        .bind(&currency)
+        .fetch_one(pool)
+        .await
+        .expect("seed instrument")
+    }
+
+    /// Mirrors the existing actor-attribution test's `AppState::new(...)` call
+    /// exactly (src/handlers.rs, the test just above this one) — empty registry,
+    /// no Kafka, a throwaway quote channel. Nothing in these tests routes an
+    /// order or reads the registry, so an empty one is correct, not a stub.
+    fn test_app_state(pool: sqlx::PgPool) -> AppState {
+        use crate::adapters::BrokerRegistry;
+        use crate::stream_health::StreamHealthRegistry;
+        use symbology::{Identifier, InMemoryCache, OpenFigiClient};
+
+        let (quote_tx, _quote_rx) = tokio::sync::mpsc::channel(1);
+        AppState::new(
+            pool,
+            "test-admin-token".to_string(),
+            false,
+            BrokerRegistry::new(),
+            None,
+            Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
+            StreamHealthRegistry::new(),
+            None,
+            quote_tx,
+            crate::sessions::SessionConfig {
+                cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
+                ttl: crate::sessions::SessionTtl::default(),
+                public_base_url: None,
+            },
+        )
     }
 }
 
