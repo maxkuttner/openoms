@@ -19,6 +19,7 @@
   ],
   "users": [
     {
+      "id": "e8f0b5a2-6e91-4b3f-9c1a-2d7f4a8b5c60",
       "username": "trader",
       "email": "trader@example.com",
       "emailVerified": true,
