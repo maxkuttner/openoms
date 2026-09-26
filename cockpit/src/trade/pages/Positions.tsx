@@ -4,6 +4,7 @@ import { Loader, Paper, Select, SimpleGrid, Stack, Table, Text, Title, Group } f
 import { tradeApi } from "../api/client";
 import { numeric, columnHeader } from "../table";
 import type { Me } from "../App";
+import type { MarkRow } from "../types";
 
 // Mirrors src/positions.rs Position. mark, market_value, unrealized_pnl and
 // mark_ts are None when no live mark exists for the instrument — an
@@ -70,6 +71,36 @@ export function PositionsPage({ me }: { me: Me }) {
     .reduce((sum, p) => sum + (p.market_value as number), 0);
   const unpriced = rows.length - pricedRows.length;
 
+  const heldInstrumentIds = rows.map((p) => p.instrument_id);
+  const marks = useQuery<MarkRow[]>({
+    queryKey: ["/marks", heldInstrumentIds],
+    queryFn: () => tradeApi.get<MarkRow[]>(`/marks?instrument_ids=${heldInstrumentIds.join(",")}`),
+    enabled: heldInstrumentIds.length > 0,
+    refetchInterval: 3000,
+  });
+  const markByInstrument = new Map((marks.data ?? []).map((m) => [String(m.instrument_id), m]));
+
+  // Day P&L: qty * (mark - prev_close), summed only over positions where
+  // BOTH a live mark and a previous close exist — same "excluded, not
+  // zeroed" rule this file already applies to unrealized P&L above.
+  const dayPnlRows = rows.filter((p) => {
+    const mark = markByInstrument.get(p.instrument_id);
+    return mark?.mid != null && mark?.prev_close != null;
+  });
+  const dayPnlTotal = dayPnlRows.reduce((sum, p) => {
+    const mark = markByInstrument.get(p.instrument_id)!;
+    return sum + Number(p.net_qty) * (mark.mid! - mark.prev_close!);
+  }, 0);
+  const dayPnlUnpriced = rows.length - dayPnlRows.length;
+
+  // Net exposure: sum of |market value| — pure computation over data this
+  // page already fetched, no new store involved. Only defined over
+  // positions that already have a market_value (same exclusion as the
+  // existing marketValueTotal above).
+  const netExposure = rows
+    .filter((p) => p.market_value !== null)
+    .reduce((sum, p) => sum + Math.abs(p.market_value as number), 0);
+
   return (
     <Stack>
       <Group justify="space-between" align="flex-end">
@@ -89,15 +120,23 @@ export function PositionsPage({ me }: { me: Me }) {
 
       {rows.length > 0 && (
         <Stack gap={4}>
-          <SimpleGrid cols={{ base: 1, sm: 3 }}>
+          <SimpleGrid cols={{ base: 1, sm: 5 }}>
             <SummaryCard label="Unrealized P&L" value={unrealizedTotal.toFixed(2)} pnlColor />
             <SummaryCard label="Realized P&L" value={realizedTotal.toFixed(2)} pnlColor />
             <SummaryCard label="Market value" value={marketValueTotal.toFixed(2)} />
+            <SummaryCard label="Day P&L" value={dayPnlTotal.toFixed(2)} pnlColor />
+            <SummaryCard label="Net exposure" value={netExposure.toFixed(2)} />
           </SimpleGrid>
           {unpriced > 0 && (
             <Text size="xs" c="dimmed">
               {unpriced} of {rows.length} position{rows.length === 1 ? "" : "s"} {unpriced === 1 ? "has" : "have"} no
               live mark and {unpriced === 1 ? "is" : "are"} excluded from these totals.
+            </Text>
+          )}
+          {dayPnlUnpriced > 0 && (
+            <Text size="xs" c="dimmed">
+              {dayPnlUnpriced} of {rows.length} position{rows.length === 1 ? "" : "s"} {dayPnlUnpriced === 1 ? "is" : "are"} missing
+              a live mark or a previous close and {dayPnlUnpriced === 1 ? "is" : "are"} excluded from Day P&L.
             </Text>
           )}
         </Stack>
