@@ -100,7 +100,9 @@ export function TradeApp() {
     <AppShell header={{ height: 48 }} padding="md">
       <AppShell.Header>
         <Group h="100%" px="md" justify="space-between" wrap="nowrap">
-          <Text fw={700}>openOMS</Text>
+          <Text fw={700} ff="var(--mantine-font-family-headings)">
+            openOMS
+          </Text>
           <Group gap="xs" wrap="nowrap">
             <ConnectionDot />
             <Text size="sm" c="dimmed">
