@@ -148,6 +148,17 @@ pub trait BrokerAdapter: Send + Sync {
             "order status not supported by this adapter".to_string(),
         ))
     }
+
+    /// Previous close per symbol, for day-change display — not part of order
+    /// routing or reconciliation. Adapters that don't support it return
+    /// `NotConfigured` (the default) and are silently skipped by the poller
+    /// that calls this (`daily_stats_poller`); one adapter having no snapshot
+    /// endpoint must never stop another's from updating.
+    async fn daily_stats(&self, _symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
+        Err(BrokerError::NotConfigured(
+            "daily stats not supported by this adapter".to_string(),
+        ))
+    }
 }
 
 /// Composes two adapters: order routing (`writer`) over one transport, reconciliation
@@ -219,5 +230,29 @@ impl BrokerRegistry {
 
     pub fn get_alpaca(&self, environment: &str) -> Option<Arc<AlpacaAdapter>> {
         self.alpaca_adapters.get(environment).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct BareAdapter;
+
+    #[async_trait::async_trait]
+    impl BrokerAdapter for BareAdapter {
+        async fn submit_order(&self, _req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+            unimplemented!()
+        }
+        async fn cancel_order(&self, _external_order_id: &str, _symbol: &str) -> Result<(), BrokerError> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn daily_stats_defaults_to_not_configured() {
+        let adapter = BareAdapter;
+        let result = adapter.daily_stats(&["AAPL".to_string()]).await;
+        assert!(matches!(result, Err(BrokerError::NotConfigured(_))));
     }
 }
