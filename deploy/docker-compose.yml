@@ -37,6 +37,12 @@ services:
       KEYCLOAK_ADMIN_PASSWORD: admin
       # Port 8080 is already taken by something else on this box.
       KC_HTTP_PORT: "8090"
+      # openidconnect (src/oidc.rs) refuses to trust a provider whose
+      # advertised endpoints are neither https:// nor loopback. Keycloak sits
+      # behind `tailscale serve --https=8443 8090`, so it must advertise ITS
+      # https front door, not the plain-http address it actually listens on.
+      KC_HOSTNAME: "https://fedora-8gb-fsn1-1.tail291892.ts.net:8443"
+      KC_PROXY_HEADERS: "xforwarded"
     network_mode: host
     volumes:
       - ../docker/keycloak/oms-dev-realm.json:/opt/keycloak/data/import/oms-dev-realm.json:ro
