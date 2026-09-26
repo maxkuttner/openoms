@@ -63,6 +63,7 @@ mod opra_stream;
 mod stream_supervisor;
 mod quote_feed;
 mod mark_router;
+mod daily_stats_poller;
 mod binance_feed;
 mod bybit_feed;
 mod feeds;

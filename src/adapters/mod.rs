@@ -207,6 +207,14 @@ impl BrokerRegistry {
         }
     }
 
+    /// Every registered (broker_code, environment, adapter) triple. Used by
+    /// tasks that want to try something on all of them and skip the ones
+    /// that don't support it (`daily_stats_poller`), as opposed to `get`,
+    /// which needs to already know which one it wants.
+    pub fn iter(&self) -> impl Iterator<Item = (&(String, String), &Arc<dyn BrokerAdapter>)> {
+        self.adapters.iter()
+    }
+
     pub fn register(
         &mut self,
         broker_code: &str,
