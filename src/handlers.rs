@@ -2277,6 +2277,30 @@ mod tests {
         assert!(result[0].prev_close.is_none());
     }
 
+    /// `daily_stats` and marks are populated independently (different feeds,
+    /// different cadences) — one being present must never depend on, or be
+    /// blocked by, the other. Here only `daily_stats` has data.
+    #[tokio::test]
+    async fn marks_reports_prev_close_with_no_live_mark() {
+        let pool = test_pool().await;
+        let instrument_id = seed_instrument(&pool, "NOMARK").await;
+        let state = test_app_state(pool);
+        state.daily_stats().set(instrument_id, 100.0);
+        // Deliberately: no MarkStore.set for this id.
+
+        let result = get_marks(State(state), Query(MarksQuery { instrument_ids: instrument_id.to_string() }))
+            .await
+            .expect("should succeed with only daily_stats populated")
+            .0;
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].bid.is_none());
+        assert!(result[0].ask.is_none());
+        assert!(result[0].mid.is_none());
+        assert_eq!(result[0].prev_close, Some(100.0));
+        assert!(result[0].pct_change.is_none());
+    }
+
     // ── test plumbing ────────────────────────────────────────────────────────
     // Copied from `sessions.rs`'s test module, for the same reasons given there.
 
@@ -2334,7 +2358,7 @@ mod tests {
              VALUES ($1, $2, 'Watchlist test instrument', 'EQUITY', 'SPOT', $3, 'ACTIVE', 2, 0.01) \
              RETURNING id",
         )
-        .bind(format!("WATCH{symbol_suffix}"))
+        .bind(format!("WATCH{symbol_suffix}{}", Uuid::new_v4().simple()))
         .bind(&venue)
         .bind(&currency)
         .fetch_one(pool)
