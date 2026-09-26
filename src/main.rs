@@ -58,6 +58,7 @@ mod alpaca_stream;
 mod binance_stream;
 mod stream_health;
 mod marks;
+mod daily_stats;
 mod opra_stream;
 mod stream_supervisor;
 mod quote_feed;
