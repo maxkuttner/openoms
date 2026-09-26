@@ -1768,6 +1768,9 @@ fn domain_event_to_new_event(event: &OrderDomainEvent) -> Result<NewOrderEvent, 
 #[derive(serde::Serialize)]
 pub struct WatchlistRow {
     pub instrument_id: String,
+    pub symbol: String,
+    pub venue: String,
+    pub name: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -1780,9 +1783,15 @@ pub async fn list_watchlist(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<WatchlistRow>>, ApiError> {
-    let rows = sqlx::query_as::<_, (String, chrono::DateTime<chrono::Utc>)>(
-        "SELECT instrument_id, created_at FROM watchlist_item \
-         WHERE principal_id = $1 ORDER BY created_at",
+    // Joined against instrument so the trade screen can show "SYMBOL@VENUE"
+    // instead of a bare numeric id — the id alone doesn't let a trader tell
+    // rows apart. w.instrument_id is TEXT (see 0025_CREATE_WATCHLIST_ITEM_TABLE.sql,
+    // no cross-schema FK), so it's cast to bigint on the join side rather than
+    // casting i.id to text, so the instrument PK index is still usable.
+    let rows = sqlx::query_as::<_, (String, String, String, String, chrono::DateTime<chrono::Utc>)>(
+        "SELECT w.instrument_id, i.symbol, i.venue, i.name, w.created_at \
+         FROM watchlist_item w JOIN instrument i ON i.id = w.instrument_id::bigint \
+         WHERE w.principal_id = $1 ORDER BY w.created_at",
     )
     .bind(auth.principal_id)
     .fetch_all(state.pool())
@@ -1793,7 +1802,13 @@ pub async fn list_watchlist(
     })?;
     Ok(Json(
         rows.into_iter()
-            .map(|(instrument_id, created_at)| WatchlistRow { instrument_id, created_at })
+            .map(|(instrument_id, symbol, venue, name, created_at)| WatchlistRow {
+                instrument_id,
+                symbol,
+                venue,
+                name,
+                created_at,
+            })
             .collect(),
     ))
 }
@@ -1803,10 +1818,21 @@ pub async fn add_watchlist_item(
     Extension(auth): Extension<AuthContext>,
     Json(body): Json<AddWatchlistItem>,
 ) -> Result<StatusCode, ApiError> {
+    // Parsed to i64 first so the bind compares against instrument.id natively
+    // (uses the PK index) instead of casting the indexed column to text. An
+    // instrument_id that doesn't even parse is the same "not found" outcome as
+    // one that parses but doesn't exist.
+    let Ok(parsed_id) = body.instrument_id.parse::<i64>() else {
+        return Err(ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("no active instrument {}", body.instrument_id),
+        });
+    };
+
     let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM instrument WHERE id::text = $1 AND status = 'ACTIVE')",
+        "SELECT EXISTS (SELECT 1 FROM instrument WHERE id = $1 AND status = 'ACTIVE')",
     )
-    .bind(&body.instrument_id)
+    .bind(parsed_id)
     .fetch_one(state.pool())
     .await
     .map_err(|err| ApiError {

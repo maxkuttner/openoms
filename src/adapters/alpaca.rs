@@ -77,8 +77,15 @@ impl AlpacaAdapter {
         } else {
             "https://paper-api.alpaca.markets"
         };
+        // Matches BinanceAdapter's client (see binance.rs): the poller now
+        // calls every registered adapter in sequence, so a hung request here
+        // would stall every later adapter's refresh that poll cycle.
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
         Self {
-            client: Client::new(),
+            client,
             api_key,
             api_secret,
             base_url,

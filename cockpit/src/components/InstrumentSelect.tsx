@@ -24,6 +24,7 @@ export function InstrumentSelect({
   placeholder,
   basePath = "/admin/instruments",
   apiGet,
+  externalSelection,
 }: {
   value: string | null;
   onChange: (v: string | null) => void;
@@ -48,6 +49,14 @@ export function InstrumentSelect({
   // it required turns that into a compile error instead. The cockpit passes
   // `api.get`; the trade app passes `tradeApi.get`.
   apiGet: (path: string) => Promise<unknown>;
+  // An instrument selected OUTSIDE this component's own search (e.g. a
+  // Watchlist row elsewhere on the page) that `value` may now point at. This
+  // endpoint only returns a page of up to 50 rows (or the active search), so
+  // that instrument won't generally be among `rows` — without this, `value`
+  // would resolve to no matching option and the Select would render
+  // blank/wrong even though the caller's state is correct. Merged into
+  // `data` below only when `rows` doesn't already contain it.
+  externalSelection?: { id: string; symbol: string; name: string } | null;
 }) {
   const [search, setSearch] = useState("");
   const [debounced] = useDebouncedValue(search, 250);
@@ -60,6 +69,9 @@ export function InstrumentSelect({
   });
   const rows = q.data ?? [];
   const data = rows.map((i) => ({ value: String(i.id), label: `${i.symbol} · ${i.name}` }));
+  if (externalSelection && !rows.some((i) => String(i.id) === externalSelection.id)) {
+    data.push({ value: externalSelection.id, label: `${externalSelection.symbol} · ${externalSelection.name}` });
+  }
   return (
     <Select
       label={label}

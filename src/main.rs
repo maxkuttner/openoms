@@ -1043,8 +1043,8 @@ async fn serve() {
     // means spawning another feed here — nothing downstream changes.
     tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
 
-    // Periodically refresh previous-close data for the interesting set (open
-    // orders + watchlist) so Day P&L has a baseline even before a live quote
+    // Periodically refresh previous-close data for the interesting set (held
+    // positions + watchlist) so Day P&L has a baseline even before a live quote
     // arrives. See `daily_stats_poller` for cadence and selection.
     tokio::spawn(daily_stats_poller::run(
         state.pool().clone(),

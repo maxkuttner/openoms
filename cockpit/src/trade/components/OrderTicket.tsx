@@ -30,6 +30,14 @@ const RECORDED_NOT_ROUTED =
   "The order was RECORDED but NOT routed to the broker — nothing was sent to the venue. " +
   "Cancel it in the blotter to clear it.";
 
+// Only what this ticket actually renders from a selected instrument: the
+// confirmation label ("SYMBOL@VENUE") and, if the pick came from outside
+// InstrumentSelect's own search (a Watchlist row), enough to also show it as
+// selected inside InstrumentSelect's own dropdown ("SYMBOL · name"). A
+// strict subset of Instrument — never fabricates asset_class/status, which a
+// Watchlist row (see Watchlist.tsx's WatchlistRow) doesn't carry.
+type InstrumentLabel = Pick<Instrument, "symbol" | "venue" | "name">;
+
 /// Buy and sell as two halves of one control, coloured from the book's own
 /// pair: `depth` for bids, `offer` for asks.
 ///
@@ -88,15 +96,22 @@ function SideSelector({ value, onChange }: { value: Side; onChange: (s: Side) =>
 export function OrderTicket({
   portfolios,
   onSubmitted,
-  selectedInstrumentId,
+  selectedWatchlistInstrument,
 }: {
   portfolios: GrantedPortfolio[];
   onSubmitted: (orderId: string) => void;
-  // Set by TradePage when the trader clicks a row in the Watchlist. This
-  // component still owns instrumentId itself (the InstrumentSelect dropdown,
-  // clearing/reset, etc.) — this just adopts an externally-picked value on
-  // change, it does not make the field fully controlled.
-  selectedInstrumentId?: string | null;
+  // Set by TradePage when the trader clicks a row in the Watchlist — the
+  // full row (id/symbol/venue/name), not just the id: this effect must set
+  // BOTH instrumentId AND selectedInstrument, since the confirmation modal's
+  // label (instrumentLabel, below) is built from selectedInstrument, not
+  // instrumentId. Setting only the id left the modal (and success toast)
+  // naming whatever instrument was selected before, not the one just
+  // clicked — the ticket's one safety step stating the wrong instrument.
+  // This component still owns instrumentId/selectedInstrument itself (the
+  // InstrumentSelect dropdown, clearing/reset, etc.) — this just adopts an
+  // externally-picked value on change, it does not make the fields fully
+  // controlled.
+  selectedWatchlistInstrument?: { id: string; symbol: string; venue: string; name: string } | null;
 }) {
   // 403 from the server should be unreachable because of this filter — see the
   // 403 branch below, which treats it as a bug report rather than a routine
@@ -112,20 +127,32 @@ export function OrderTicket({
   );
   const [instrumentId, setInstrumentId] = useState<string | null>(null);
 
-  // Adopts a Watchlist click: TradePage passes the clicked row's instrument_id
-  // down as selectedInstrumentId, and this effect pulls it into local state.
-  // instrumentId still exists independently and is what InstrumentSelect (and
-  // everything below) reads — this only writes to it, on change.
-  useEffect(() => {
-    if (selectedInstrumentId) setInstrumentId(selectedInstrumentId);
-  }, [selectedInstrumentId]);
+  // The full row for the currently selected instrument — either handed up by
+  // InstrumentSelect's onSelected alongside its onChange (it already holds
+  // this in memory from the search results, so there is no second fetch), or
+  // adopted from a Watchlist click below. Since it can only ever be a row the
+  // user just picked, this is correct for ANY instrument, not just a sample
+  // of the catalog.
+  const [selectedInstrument, setSelectedInstrument] = useState<InstrumentLabel | null>(null);
 
-  // The full row for the currently selected instrument, handed up by
-  // InstrumentSelect's onSelected alongside its onChange — it already holds
-  // this in memory from the search results, so there is no second fetch.
-  // Since it can only ever be a row the user just picked from the dropdown,
-  // this is correct for ANY instrument, not just a sample of the catalog.
-  const [selectedInstrument, setSelectedInstrument] = useState<Instrument | null>(null);
+  // Adopts a Watchlist click: TradePage passes the clicked row down as
+  // selectedWatchlistInstrument, and this effect pulls it into local state —
+  // BOTH instrumentId AND selectedInstrument, together. instrumentId alone
+  // drives the actual order (instrument_id on the POST below); selectedInstrument
+  // alone drives instrumentLabel, which the confirmation modal and success
+  // toast are built from. Setting only one of the two is exactly the bug this
+  // effect used to have: the modal would keep showing whatever instrument was
+  // selected before, while the POST silently used the newly clicked one.
+  useEffect(() => {
+    if (selectedWatchlistInstrument) {
+      setInstrumentId(selectedWatchlistInstrument.id);
+      setSelectedInstrument({
+        symbol: selectedWatchlistInstrument.symbol,
+        venue: selectedWatchlistInstrument.venue,
+        name: selectedWatchlistInstrument.name,
+      });
+    }
+  }, [selectedWatchlistInstrument]);
   const [side, setSide] = useState<Side>("buy");
   const [quantity, setQuantity] = useState<number | string>("");
   const [orderType, setOrderType] = useState<OrderType>("market");
@@ -387,6 +414,15 @@ export function OrderTicket({
           value={instrumentId}
           onChange={setInstrumentId}
           onSelected={setSelectedInstrument}
+          // A Watchlist-picked instrument may not be on InstrumentSelect's own
+          // current search-result page (first 50 rows, or the active search) —
+          // without this it would render blank/wrong in this dropdown even
+          // though instrumentId and selectedInstrument are both correct.
+          externalSelection={
+            instrumentId && selectedInstrument
+              ? { id: instrumentId, symbol: selectedInstrument.symbol, name: selectedInstrument.name }
+              : null
+          }
           basePath="/instruments"
           apiGet={tradeApi.get}
         />

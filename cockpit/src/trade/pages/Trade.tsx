@@ -24,21 +24,29 @@ export function TradePage({ me }: { me: Me }) {
   // that is where `followOrderId` becomes visible.
   const [activeTab, setActiveTab] = useState<string | null>("orders");
 
-  // The instrument a trader last clicked in the Watchlist. Handed down to
-  // OrderTicket as selectedInstrumentId, which adopts it into its own
-  // internal instrumentId state (see OrderTicket.tsx) — this does not make
-  // the ticket's instrument field fully controlled from here.
-  const [selectedInstrumentId, setSelectedInstrumentId] = useState<string | null>(null);
+  // The instrument a trader last clicked in the Watchlist — the full row
+  // (id/symbol/venue/name), not just the id: OrderTicket needs the full
+  // shape to set BOTH its instrumentId and selectedInstrument (the
+  // confirmation modal's label is built from the latter, not the id). Handed
+  // down to OrderTicket as selectedInstrument, which adopts it into its own
+  // internal state (see OrderTicket.tsx) — this does not make the ticket's
+  // instrument field fully controlled from here.
+  const [selectedInstrument, setSelectedInstrument] = useState<{
+    id: string;
+    symbol: string;
+    venue: string;
+    name: string;
+  } | null>(null);
 
   return (
     <Grid>
       <Grid.Col span={{ base: 12, md: 3 }}>
-        <Watchlist onSelectInstrument={setSelectedInstrumentId} />
+        <Watchlist onSelectInstrument={setSelectedInstrument} />
       </Grid.Col>
       <Grid.Col span={{ base: 12, md: 3 }}>
         <OrderTicket
           portfolios={me.portfolios}
-          selectedInstrumentId={selectedInstrumentId}
+          selectedWatchlistInstrument={selectedInstrument}
           onSubmitted={(orderId) => {
             setFollowOrderId(orderId);
             setActiveTab("orders");
