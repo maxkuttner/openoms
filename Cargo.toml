@@ -1,10 +1,5 @@
 [workspace]
 members = [".", "crates/symbology", "crates/dataprovider"]
-# The desktop shell is a Tauri app with a webview dependency tree of its own.
-# The OMS build already needs cmake and OpenSSL for the C++ FIX engine; pulling
-# webview crates into every root `cargo test` would slow the main development
-# loop for no benefit. It builds from desktop/ when asked, and never otherwise.
-exclude = ["desktop/src-tauri"]
 resolver = "2"
 
 [package]
