@@ -54,14 +54,15 @@ services:
   # `oms.toml` at it:
   #
   #     [auth.oidc]
-  #     issuer = "http://localhost:8080/realms/oms-dev"
+  #     issuer = "http://localhost:8090/realms/oms-dev"
   #     client_id = "oms"
   #     public_base_url = "http://localhost:3001"
   #
   # then open http://localhost:3001/auth/login and sign in as `trader` /
   # `trader`. `start-dev` is Keycloak's own non-production mode — fine for
-  # this, not for anything real. Admin console at localhost:8080, `admin` /
-  # `admin`.
+  # this, not for anything real. Admin console at localhost:8090, `admin` /
+  # `admin`. (Host port 8090, not Keycloak's default 8080 — that's a common
+  # port for other local dev stacks to already hold.)
   keycloak:
     container_name: oms-keycloak
     image: quay.io/keycloak/keycloak:26.0
@@ -71,7 +72,7 @@ services:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8090:8080"
     volumes:
       - ./docker/keycloak/oms-dev-realm.json:/opt/keycloak/data/import/oms-dev-realm.json:ro
     security_opt:

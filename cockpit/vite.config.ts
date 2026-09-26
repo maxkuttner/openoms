@@ -18,6 +18,11 @@ export default defineConfig(({ command }) => ({
     port: 5173,
     proxy: {
       "/api": { target, changeOrigin: true, rewrite: (p) => p.replace(/^\/api/, "") },
+      // The trade app's own client-side redirect to a missing session
+      // (cockpit/src/trade/api/client.ts) navigates to `/auth/login`
+      // relative to whatever origin it's running on. Without this, that
+      // lands on vite's own dev server, which has no such route.
+      "/auth": { target, changeOrigin: true },
     },
   },
 }));
