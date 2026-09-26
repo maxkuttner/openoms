@@ -36,6 +36,7 @@ echo
 echo "trade app:  http://localhost:5173/trade.html  (sign in as trader / trader)"
 echo "admin console: http://localhost:5173/"
 echo "keycloak admin: http://localhost:8090  (admin / admin)"
+echo "documentation page: https://maxkuttner.github.io/openoms/ (docs)"
 echo
 echo "OMS log: /tmp/oms-server.log · vite log: /tmp/cockpit-dev.log"
 echo "ctrl-c to stop the OMS and vite (postgres/keycloak stay up)"
