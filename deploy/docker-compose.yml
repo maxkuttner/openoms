@@ -1,0 +1,23 @@
+# Manual test-server deploy — run by hand (or via deploy/deploy.sh), never by
+# CI. Points at the box's own already-running native Postgres, so there is no
+# database service here.
+#
+#     docker compose -f deploy/docker-compose.yml build
+#     docker compose -f deploy/docker-compose.yml up -d
+#
+# Expects, on the host running this:
+#   ~/oms-deploy/config/oms.toml   — same master_key as whatever wrote the
+#                                    target database's encrypted columns
+#   ~/oms-deploy/config/.env       — POSTGRES_PASSWORD=...
+services:
+  oms:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: oms-test-deploy
+    network_mode: host
+    env_file:
+      - ${OMS_DEPLOY_CONFIG_DIR:-/home/max/oms-deploy/config}/.env
+    volumes:
+      - ${OMS_DEPLOY_CONFIG_DIR:-/home/max/oms-deploy/config}/oms.toml:/app/oms.toml:ro
+    restart: unless-stopped
