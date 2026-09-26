@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { notifications } from "@mantine/notifications";
 import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title, UnstyledButton } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
@@ -88,9 +88,15 @@ function SideSelector({ value, onChange }: { value: Side; onChange: (s: Side) =>
 export function OrderTicket({
   portfolios,
   onSubmitted,
+  selectedInstrumentId,
 }: {
   portfolios: GrantedPortfolio[];
   onSubmitted: (orderId: string) => void;
+  // Set by TradePage when the trader clicks a row in the Watchlist. This
+  // component still owns instrumentId itself (the InstrumentSelect dropdown,
+  // clearing/reset, etc.) — this just adopts an externally-picked value on
+  // change, it does not make the field fully controlled.
+  selectedInstrumentId?: string | null;
 }) {
   // 403 from the server should be unreachable because of this filter — see the
   // 403 branch below, which treats it as a bug report rather than a routine
@@ -105,6 +111,15 @@ export function OrderTicket({
     tradeable.length === 1 ? tradeable[0].portfolio_id : null,
   );
   const [instrumentId, setInstrumentId] = useState<string | null>(null);
+
+  // Adopts a Watchlist click: TradePage passes the clicked row's instrument_id
+  // down as selectedInstrumentId, and this effect pulls it into local state.
+  // instrumentId still exists independently and is what InstrumentSelect (and
+  // everything below) reads — this only writes to it, on change.
+  useEffect(() => {
+    if (selectedInstrumentId) setInstrumentId(selectedInstrumentId);
+  }, [selectedInstrumentId]);
+
   // The full row for the currently selected instrument, handed up by
   // InstrumentSelect's onSelected alongside its onChange — it already holds
   // this in memory from the search results, so there is no second fetch.
