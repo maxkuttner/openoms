@@ -134,6 +134,7 @@ pub struct AppState {
     symbology: Arc<SymbologyEngine>,
     stream_health: StreamHealthRegistry,
     marks: MarkStore,
+    daily_stats: crate::daily_stats::DailyStatsStore,
     /// Handles for Databento and Alpaca/Binance REST execution tasks. Public
     /// Binance/Bybit market-data feeds are never registered here.
     streams: StreamRegistry,
@@ -179,6 +180,7 @@ impl AppState {
             symbology: Arc::new(symbology),
             stream_health,
             marks: MarkStore::new(),
+            daily_stats: crate::daily_stats::DailyStatsStore::new(),
             streams: StreamRegistry::new(),
             doorbells: DoorbellRegistry::new(),
             position_changed_tx,
@@ -221,6 +223,15 @@ impl AppState {
     }
 
     pub fn marks(&self) -> &MarkStore { &self.marks }
+
+    pub fn daily_stats(&self) -> &crate::daily_stats::DailyStatsStore { &self.daily_stats }
+
+    /// The registry's own swappable handle, for a long-running task
+    /// (`daily_stats_poller::run`) that needs to `.load()` fresh on every
+    /// iteration rather than holding one `Guard` for its whole lifetime.
+    pub fn registry_handle(&self) -> Arc<ArcSwap<BrokerRegistry>> {
+        self.registry.clone()
+    }
 
     pub fn streams(&self) -> &StreamRegistry {
         &self.streams

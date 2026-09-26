@@ -1042,6 +1042,15 @@ async fn serve() {
     // means spawning another feed here — nothing downstream changes.
     tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
 
+    // Periodically refresh previous-close data for the interesting set (open
+    // orders + watchlist) so Day P&L has a baseline even before a live quote
+    // arrives. See `daily_stats_poller` for cadence and selection.
+    tokio::spawn(daily_stats_poller::run(
+        state.pool().clone(),
+        state.registry_handle(),
+        state.daily_stats().clone(),
+    ));
+
     // Retire dated contracts once their expiry instant passes, so the feeds below
     // stop resubscribing to them and the order path stops accepting them. Not
     // supervised: `stream_supervisor` exists to reconnect streams, and treats a clean
