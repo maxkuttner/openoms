@@ -303,6 +303,42 @@ impl BrokerAdapter for BinanceAdapter {
         };
         Ok(BrokerOrderState { outcome, executed_qty, avg_px })
     }
+
+    async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Public endpoint — no signing needed, same as exchangeInfo.
+        let symbols_json = serde_json::to_string(symbols).unwrap_or_default();
+        // Inline URL-encoding fallback: replace JSON special chars for URL safety.
+        let encoded_json = symbols_json
+            .replace('"', "%22")
+            .replace(',', "%2C")
+            .replace('[', "%5B")
+            .replace(']', "%5D");
+        let url = format!(
+            "{}/api/v3/ticker/24hr?symbols={}",
+            self.base_url,
+            encoded_json
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(format!(
+                "24hr ticker request failed: {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_binance_24hr_stats(&body))
+    }
 }
 
 /// Parse `(executed_qty, avg_px)` from a Binance order JSON. `avg_px` is the executed
@@ -316,6 +352,22 @@ fn exec_stats(order: &serde_json::Value) -> (f64, f64) {
     (executed_qty, avg_px)
 }
 
+/// `GET /api/v3/ticker/24hr?symbols=[...]` returns an array; `prevClosePrice`
+/// is a string (Binance quotes all prices as strings to avoid float
+/// round-tripping ambiguity). An entry whose price doesn't parse is skipped,
+/// never reported as a zero previous close.
+fn parse_binance_24hr_stats(body: &serde_json::Value) -> Vec<(String, f64)> {
+    let Some(entries) = body.as_array() else { return Vec::new() };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let symbol = entry.get("symbol")?.as_str()?.to_string();
+            let price: f64 = entry.get("prevClosePrice")?.as_str()?.parse().ok()?;
+            Some((symbol, price))
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl InstrumentProvider for BinanceAdapter {
     /// Binance has no separate option catalog on the spot venue; `option_underlyings`
@@ -325,5 +377,37 @@ impl InstrumentProvider for BinanceAdapter {
         _option_underlyings: &[String],
     ) -> Result<Vec<BrokerInstrument>, BrokerError> {
         self.list_spot_instruments().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_binance_24hr_stats;
+
+    #[test]
+    fn parses_prev_close_price_from_24hr_ticker_array() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"symbol": "BTCUSDT", "prevClosePrice": "64000.50"},
+                {"symbol": "ETHUSDT", "prevClosePrice": "3200.10"}
+            ]"#,
+        )
+        .unwrap();
+        let mut stats = parse_binance_24hr_stats(&body);
+        stats.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            stats,
+            vec![("BTCUSDT".to_string(), 64000.50), ("ETHUSDT".to_string(), 3200.10)]
+        );
+    }
+
+    #[test]
+    fn an_entry_with_unparseable_price_is_skipped_not_zeroed() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"[{"symbol": "BTCUSDT", "prevClosePrice": "64000.50"}, {"symbol": "BROKEN", "prevClosePrice": "not-a-number"}]"#,
+        )
+        .unwrap();
+        let stats = parse_binance_24hr_stats(&body);
+        assert_eq!(stats, vec![("BTCUSDT".to_string(), 64000.50)]);
     }
 }
