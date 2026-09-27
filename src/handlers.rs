@@ -1308,6 +1308,125 @@ pub async fn get_portfolio_positions(
     Ok(Json(positions))
 }
 
+/// One (broker_instrument, broker_connection) pair's usability for a
+/// specific portfolio. Checked in this exact order — the response always
+/// names the single most fundamental blocker, not every applicable one.
+/// `connection_status` is `None` both when no broker_connection row exists
+/// at all for this broker_code, and when sqlx reads a NULL from the LEFT
+/// JOIN — both cases mean "nothing to route through", same as an inactive
+/// connection.
+fn classify_venue(
+    is_tradeable: bool,
+    connection_status: Option<&str>,
+    has_account: bool,
+) -> (bool, Option<&'static str>) {
+    if !is_tradeable {
+        return (false, Some("not tradeable on this broker"));
+    }
+    if connection_status != Some("ACTIVE") {
+        return (false, Some("broker connection is not active"));
+    }
+    if !has_account {
+        return (false, Some("no account on this connection for this portfolio"));
+    }
+    (true, None)
+}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct VenueOption {
+    pub broker_code: String,
+    pub environment: Option<String>,
+    pub broker_connection_code: Option<String>,
+    pub account_id: Option<Uuid>,
+    pub eligible: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+pub struct VenuesQuery {
+    pub instrument_id: String,
+}
+
+#[utoipa::path(
+    get, path = "/portfolios/{id}/venues", tag = "orders",
+    params(
+        ("id" = Uuid, Path, description = "Portfolio ID"),
+        VenuesQuery,
+    ),
+    responses(
+        (status = 200, description = "OK", body = [VenueOption]),
+        (status = 403, description = "No view grant for principal/portfolio"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_portfolio_venues(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(portfolio_id): Path<Uuid>,
+    Query(query): Query<VenuesQuery>,
+) -> Result<Json<Vec<VenueOption>>, ApiError> {
+    let can_view: bool = query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant \
+         WHERE principal_id = $1 AND portfolio_id = $2 AND can_view = true)",
+    )
+    .bind(auth.principal_id)
+    .bind(portfolio_id)
+    .fetch_one(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to check grant: {:?}", err),
+    })?;
+    if !can_view {
+        return Err(ApiError { status: StatusCode::FORBIDDEN, message: "unauthorized".to_string() });
+    }
+
+    // An unparseable instrument_id has no venues, same as a real but
+    // never-synced one — excluded, not an error.
+    let Ok(instrument_id) = query.instrument_id.parse::<i64>() else {
+        return Ok(Json(Vec::new()));
+    };
+
+    let rows = sqlx::query(
+        "SELECT bi.broker_code, bi.is_tradeable, bc.environment, \
+                bc.code AS broker_connection_code, bc.status AS connection_status, \
+                a.id AS account_id \
+         FROM broker_instrument bi \
+         LEFT JOIN broker_connection bc ON bc.broker_code = bi.broker_code \
+         LEFT JOIN account a ON a.broker_connection_code = bc.code AND a.portfolio_id = $2 \
+         WHERE bi.instrument_id = $1",
+    )
+    .bind(instrument_id)
+    .bind(portfolio_id)
+    .fetch_all(state.pool())
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load venues: {:?}", err),
+    })?;
+
+    let options = rows
+        .into_iter()
+        .map(|row| {
+            let is_tradeable: bool = row.get("is_tradeable");
+            let connection_status: Option<String> = row.get("connection_status");
+            let account_id: Option<Uuid> = row.get("account_id");
+            let (eligible, reason) =
+                classify_venue(is_tradeable, connection_status.as_deref(), account_id.is_some());
+            VenueOption {
+                broker_code: row.get("broker_code"),
+                environment: row.get("environment"),
+                broker_connection_code: row.get("broker_connection_code"),
+                account_id,
+                eligible,
+                reason: reason.map(str::to_string),
+            }
+        })
+        .collect();
+
+    Ok(Json(options))
+}
+
 // ── Post-trade allocation ─────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -1932,6 +2051,41 @@ pub async fn get_marks(
 mod tests {
     use super::*;
 
+    #[test]
+    fn not_tradeable_wins_over_every_other_reason() {
+        let (eligible, reason) = classify_venue(false, Some("ACTIVE"), true);
+        assert!(!eligible);
+        assert_eq!(reason, Some("not tradeable on this broker"));
+    }
+
+    #[test]
+    fn missing_connection_is_the_same_as_inactive() {
+        let (eligible, reason) = classify_venue(true, None, true);
+        assert!(!eligible);
+        assert_eq!(reason, Some("broker connection is not active"));
+    }
+
+    #[test]
+    fn inactive_connection_beats_missing_account() {
+        let (eligible, reason) = classify_venue(true, Some("SUSPENDED"), false);
+        assert!(!eligible);
+        assert_eq!(reason, Some("broker connection is not active"));
+    }
+
+    #[test]
+    fn no_account_is_the_last_reason_checked() {
+        let (eligible, reason) = classify_venue(true, Some("ACTIVE"), false);
+        assert!(!eligible);
+        assert_eq!(reason, Some("no account on this connection for this portfolio"));
+    }
+
+    #[test]
+    fn everything_present_is_eligible_with_no_reason() {
+        let (eligible, reason) = classify_venue(true, Some("ACTIVE"), true);
+        assert!(eligible);
+        assert_eq!(reason, None);
+    }
+
     /// The case the shorthand exists for: an OSI symbol qualified by its venue.
     #[test]
     fn splits_symbol_at_venue() {
@@ -2424,6 +2578,142 @@ mod tests {
                 public_base_url: None,
             },
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn venues_reports_eligible_and_ineligible_rows_with_reasons() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "venues-test").await;
+        let instrument_id = seed_instrument(&pool, "VENUETEST").await;
+
+        // Broker A: active connection, this portfolio HAS an account on it -> eligible.
+        let broker_a = format!("VENUEA{}", Uuid::new_v4().simple());
+        let conn_a = format!("venue-test-conn-a-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')",
+        )
+        .bind(&conn_a)
+        .bind(&broker_a)
+        .execute(&pool)
+        .await
+        .expect("seed broker_connection a");
+        sqlx::query(
+            "INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'VENUETEST', true)",
+        )
+        .bind(instrument_id)
+        .bind(&broker_a)
+        .execute(&pool)
+        .await
+        .expect("seed broker_instrument a");
+
+        let portfolio_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'Venues test portfolio', 'ACTIVE')",
+        )
+        .bind(portfolio_id)
+        .bind(format!("venues-test-portfolio-{portfolio_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed portfolio");
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
+             VALUES ($1, $2, $3, 'EXT', 'ACTIVE', $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(format!("venues-test-account-{portfolio_id}"))
+        .bind(&conn_a)
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .expect("seed account");
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view) VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .expect("seed grant");
+
+        // Broker B: also cataloged, but no account for this portfolio -> ineligible.
+        let broker_b = format!("VENUEB{}", Uuid::new_v4().simple());
+        let conn_b = format!("venue-test-conn-b-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')",
+        )
+        .bind(&conn_b)
+        .bind(&broker_b)
+        .execute(&pool)
+        .await
+        .expect("seed broker_connection b");
+        sqlx::query(
+            "INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'VENUETEST', true)",
+        )
+        .bind(instrument_id)
+        .bind(&broker_b)
+        .execute(&pool)
+        .await
+        .expect("seed broker_instrument b");
+
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+
+        let result = get_portfolio_venues(
+            State(state),
+            Extension(auth),
+            Path(portfolio_id),
+            Query(VenuesQuery { instrument_id: instrument_id.to_string() }),
+        )
+        .await
+        .expect("should succeed")
+        .0;
+
+        assert_eq!(result.len(), 2);
+        let a = result.iter().find(|v| v.broker_code == broker_a).expect("broker a present");
+        assert!(a.eligible);
+        assert_eq!(a.reason, None);
+        let b = result.iter().find(|v| v.broker_code == broker_b).expect("broker b present");
+        assert!(!b.eligible);
+        assert_eq!(b.reason.as_deref(), Some("no account on this connection for this portfolio"));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn venues_for_an_uncataloged_instrument_is_an_empty_list_not_an_error() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "venues-empty").await;
+        let portfolio_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'Empty test portfolio', 'ACTIVE')")
+            .bind(portfolio_id)
+            .bind(format!("venues-empty-portfolio-{portfolio_id}"))
+            .execute(&pool)
+            .await
+            .expect("seed portfolio");
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view) VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .expect("seed grant");
+
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+        let result = get_portfolio_venues(
+            State(state),
+            Extension(auth),
+            Path(portfolio_id),
+            Query(VenuesQuery { instrument_id: "999999999".to_string() }),
+        )
+        .await
+        .expect("should succeed")
+        .0;
+
+        assert!(result.is_empty());
     }
 }
 

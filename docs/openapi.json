@@ -2801,6 +2801,57 @@
           }
         ]
       }
+    },
+    "/portfolios/{id}/venues": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "get_portfolio_venues",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Portfolio ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "instrument_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/VenueOption"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "No view grant for principal/portfolio"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -4607,6 +4658,38 @@
             "nullable": true
           },
           "trading_state": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "VenueOption": {
+        "type": "object",
+        "required": [
+          "broker_code",
+          "eligible"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid",
+            "nullable": true
+          },
+          "broker_code": {
+            "type": "string"
+          },
+          "broker_connection_code": {
+            "type": "string",
+            "nullable": true
+          },
+          "eligible": {
+            "type": "boolean"
+          },
+          "environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "reason": {
             "type": "string",
             "nullable": true
           }

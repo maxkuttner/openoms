@@ -91,6 +91,7 @@ mod reload_tests;
         handlers::list_orders,
         handlers::list_portfolios,
         handlers::get_portfolio_positions,
+        handlers::get_portfolio_venues,
         handlers::create_allocations,
         handlers::list_allocations,
         handlers::get_orders_blotter,
@@ -153,6 +154,7 @@ mod reload_tests;
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
         crate::positions::Position,
+        handlers::VenueOption,
         Allocation, CreateAllocations, AllocationSplit, BlotterRow,
         order_events::OrderEventView,
         handlers::GrantedPortfolio,
@@ -1256,6 +1258,7 @@ async fn serve() {
         .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
         .route("/marks", get(handlers::get_marks))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
+        .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
         .route(
             "/orders/:id/allocations",
             post(handlers::create_allocations).get(handlers::list_allocations),
