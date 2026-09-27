@@ -9,3 +9,15 @@ export interface MarkRow {
   prev_close: number | null;
   pct_change: number | null;
 }
+
+// Mirrors src/handlers.rs's VenueOption. `reason` is set only when
+// `eligible` is false — never both null-checked independently, since they
+// always agree by construction on the server.
+export interface VenueOption {
+  broker_code: string;
+  environment: string | null;
+  broker_connection_code: string | null;
+  account_id: string | null;
+  eligible: boolean;
+  reason: string | null;
+}

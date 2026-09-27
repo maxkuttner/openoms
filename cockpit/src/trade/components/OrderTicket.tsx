@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
 import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title, UnstyledButton } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
 import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
 import type { GrantedPortfolio } from "../App";
+import type { VenueOption } from "../types";
 
 type Side = "buy" | "sell";
 type OrderType = "market" | "limit";
@@ -135,6 +137,8 @@ export function OrderTicket({
   // of the catalog.
   const [selectedInstrument, setSelectedInstrument] = useState<InstrumentLabel | null>(null);
 
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+
   // Adopts a Watchlist click: TradePage passes the clicked row down as
   // selectedWatchlistInstrument, and this effect pulls it into local state —
   // BOTH instrumentId AND selectedInstrument, together. instrumentId alone
@@ -153,6 +157,17 @@ export function OrderTicket({
       });
     }
   }, [selectedWatchlistInstrument]);
+
+  const venues = useQuery<VenueOption[]>({
+    queryKey: ["/portfolios", portfolioId, "venues", instrumentId],
+    queryFn: () => tradeApi.get<VenueOption[]>(`/portfolios/${portfolioId}/venues?instrument_id=${instrumentId}`),
+    enabled: !!portfolioId && !!instrumentId,
+  });
+
+  useEffect(() => {
+    setSelectedAccountId(null);
+  }, [portfolioId, instrumentId]);
+
   const [side, setSide] = useState<Side>("buy");
   const [quantity, setQuantity] = useState<number | string>("");
   const [orderType, setOrderType] = useState<OrderType>("market");
@@ -204,6 +219,7 @@ export function OrderTicket({
   function reset() {
     setInstrumentId(null);
     setSelectedInstrument(null);
+    setSelectedAccountId(null);
     setSide("buy");
     setQuantity("");
     setOrderType("market");
@@ -284,6 +300,7 @@ export function OrderTicket({
         order_type: orderType,
         time_in_force: tif,
         limit_price: orderType === "limit" ? Number(limitPrice) : undefined,
+        account_id: selectedAccountId || undefined,
       });
       notifications.show({
         color: "green",
@@ -427,6 +444,21 @@ export function OrderTicket({
           apiGet={tradeApi.get}
         />
 
+        {venues.data && venues.data.length > 0 && (
+          <Select
+            label="Venue"
+            placeholder="Default (portfolio's own account)"
+            data={venues.data.map((v) => ({
+              value: v.account_id ?? "",
+              label: `${v.broker_code}${v.environment ? ` (${v.environment})` : ""}`,
+              disabled: !v.eligible,
+            }))}
+            value={selectedAccountId}
+            onChange={setSelectedAccountId}
+            clearable
+          />
+        )}
+
         <SideSelector value={side} onChange={setSide} />
 
         <NumberInput label="Quantity" required min={0} value={quantity} onChange={setQuantity} />
@@ -499,6 +531,11 @@ export function OrderTicket({
           <Text>
             {side === "buy" ? "Buy" : "Sell"} {quantity} {instrumentLabel}
             {orderType === "limit" ? ` · limit ${limitPrice}` : " · market"} · {tif} · portfolio {portfolioLabel}
+            {selectedAccountId &&
+              (() => {
+                const venue = venues.data?.find((v) => v.account_id === selectedAccountId);
+                return venue ? ` · via ${venue.broker_code}` : "";
+              })()}
             {notional !== null && ` · est. notional ${notional.toFixed(2)}`}
           </Text>
           <Group justify="flex-end">
