@@ -814,6 +814,22 @@ pub async fn orders_submit(
             version: row.get::<i64, _>("version"),
         };
 
+        if current_state.status.is_terminal() {
+            // The broker already reported a fill (or the order was canceled
+            // concurrently) before we got here — same race MAX_ROUTE_ATTEMPTS
+            // guards against, just resolved in execution.rs's favor entirely.
+            // RouteOrder is meaningless on a closed order; the broker call
+            // already succeeded and the terminal event is already persisted,
+            // so this is success, not a failure to report to the client.
+            info!(
+                order_id = %order_id,
+                status = ?current_state.status,
+                "order reached a terminal state before routing could persist (raced a concurrent fill/cancel) — treating as routed"
+            );
+            route_events = Vec::new();
+            break;
+        }
+
         let expected_version = current_state.version;
         let mut applied = OrderAggregate::from_state(current_state);
 
