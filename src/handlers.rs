@@ -342,6 +342,9 @@ pub async fn orders_submit(
         message: "portfolio_id must be a UUID".to_string(),
     })?;
     // Resolve the account: explicit override if given, else the portfolio's default route.
+    // Captured before `req` is moved into `cmd` below; drives the ownership
+    // check further down (an explicit account_id must belong to portfolio_id).
+    let account_id_was_explicit = req.account_id.is_some();
     let account_id: Uuid = match req.account_id.as_deref() {
         Some(a) => Uuid::parse_str(a).map_err(|_| ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -375,7 +378,8 @@ pub async fn orders_submit(
     // (broker_code, environment) + the custodial ref, so we can validate the instrument
     // mapping before committing anything to the event store. Requires an ACTIVE connection.
     let account_row_pre = sqlx::query(
-        "SELECT bc.broker_code, bc.environment, bc.code AS broker_connection_code, a.external_account_ref \
+        "SELECT bc.broker_code, bc.environment, bc.code AS broker_connection_code, \
+                a.external_account_ref, a.portfolio_id AS account_portfolio_id \
          FROM account a \
          JOIN broker_connection bc ON bc.code = a.broker_connection_code \
          WHERE a.id = $1 AND bc.status = 'ACTIVE'"
@@ -391,6 +395,19 @@ pub async fn orders_submit(
         status: StatusCode::BAD_REQUEST,
         message: "account not found or its broker connection is not active".to_string(),
     })?;
+
+    // Only when the caller explicitly supplied an account_id: an omitted one
+    // always resolved from portfolio.default_account_id, which is inherently
+    // correct and needs no re-check.
+    if account_id_was_explicit {
+        let account_portfolio_id: Option<Uuid> = account_row_pre.get("account_portfolio_id");
+        if account_portfolio_id != Some(portfolio_id) {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "account does not belong to this portfolio".to_string(),
+            });
+        }
+    }
 
     let broker_code: String = account_row_pre.get("broker_code");
     let environment: String = account_row_pre.get("environment");
@@ -2329,6 +2346,229 @@ mod tests {
             actors,
             vec![principal_code.clone()],
             "the OrderSubmitted event must name the principal, not 'oms'"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn an_account_from_another_portfolio_is_rejected() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "ownership-test").await;
+
+        let venue: String = sqlx::query_scalar("SELECT code FROM venue ORDER BY code LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded venue");
+        let currency: String = sqlx::query_scalar("SELECT code FROM currency ORDER BY code LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("a seeded currency");
+        let symbol = format!("OWNERTEST{}", Uuid::new_v4().simple());
+        let instrument_id: i64 = sqlx::query_scalar(
+            "INSERT INTO instrument \
+                 (symbol, venue, name, asset_class, instrument_class, currency, status, \
+                  price_precision, price_increment) \
+             VALUES ($1, $2, 'Ownership test instrument', 'EQUITY', 'SPOT', $3, 'ACTIVE', 2, 0.01) \
+             RETURNING id",
+        )
+        .bind(&symbol)
+        .bind(&venue)
+        .bind(&currency)
+        .fetch_one(&pool)
+        .await
+        .expect("seed instrument");
+
+        let broker_code = format!("OWNERTEST{}", Uuid::new_v4().simple());
+        let conn_code = format!("owner-test-conn-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
+            .bind(&conn_code)
+            .bind(&broker_code)
+            .execute(&pool)
+            .await
+            .expect("seed broker_connection");
+        sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, $3, true)")
+            .bind(instrument_id)
+            .bind(&broker_code)
+            .bind(&symbol)
+            .execute(&pool)
+            .await
+            .expect("seed broker_instrument");
+
+        // Portfolio A owns account_a.
+        let portfolio_a = Uuid::new_v4();
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'Portfolio A', 'ACTIVE')")
+            .bind(portfolio_a)
+            .bind(format!("owner-test-a-{portfolio_a}"))
+            .execute(&pool)
+            .await
+            .expect("seed portfolio a");
+        let account_a = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
+             VALUES ($1, $2, $3, 'EXT-A', 'ACTIVE', $4)",
+        )
+        .bind(account_a)
+        .bind(format!("owner-test-account-a-{account_a}"))
+        .bind(&conn_code)
+        .bind(portfolio_a)
+        .execute(&pool)
+        .await
+        .expect("seed account a");
+
+        // Portfolio B is the one on the request, with a grant to trade — but the
+        // request names portfolio A's account.
+        let portfolio_b = Uuid::new_v4();
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'Portfolio B', 'ACTIVE')")
+            .bind(portfolio_b)
+            .bind(format!("owner-test-b-{portfolio_b}"))
+            .execute(&pool)
+            .await
+            .expect("seed portfolio b");
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade) VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_b)
+        .execute(&pool)
+        .await
+        .expect("seed grant");
+
+        let state = test_app_state(pool);
+        let _ = principal_code; // unused here; kept for symmetry with other tests' destructuring
+
+        let request = SubmitOrderRequest {
+            order_id: Uuid::new_v4().to_string(),
+            client_order_id: "ownership-test-1".to_string(),
+            portfolio_id: portfolio_b.to_string(),
+            account_id: Some(account_a.to_string()),
+            instrument_id: Some(instrument_id.to_string()),
+            symbol: None,
+            venue: None,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            quantity: 1.0,
+        };
+
+        let result = orders_submit(
+            State(state),
+            Extension(AuthContext { principal_id, principal_code: "irrelevant".to_string() }),
+            Json(request),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(
+            err.status,
+            StatusCode::BAD_REQUEST,
+            "expected rejection for cross-portfolio account, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("does not belong to this portfolio"),
+            "expected an ownership-mismatch message, got: {}",
+            err.message
+        );
+    }
+
+    /// Regression guard: a request with no `account_id` must take exactly the
+    /// same `default_account_id` fallback path as before Task 4, with no new
+    /// ownership check applying. Mirrors the actor-attribution test's seeding
+    /// (a portfolio with a `default_account_id`, an empty `BrokerRegistry` so
+    /// nothing can actually route) — the point is that the failure here is the
+    /// pre-existing "no adapter registered" routing failure, not a new
+    /// ownership rejection.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn omitting_account_id_is_completely_unaffected() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "default-account-test").await;
+        let instrument_id = seed_instrument(&pool, "DEFACCT").await;
+
+        let broker_code = format!("DEFACCT{}", Uuid::new_v4().simple());
+        let conn_code = format!("defacct-test-conn-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
+            .bind(&conn_code)
+            .bind(&broker_code)
+            .execute(&pool)
+            .await
+            .expect("seed broker_connection");
+        sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'DEFACCT', true)")
+            .bind(instrument_id)
+            .bind(&broker_code)
+            .execute(&pool)
+            .await
+            .expect("seed broker_instrument");
+
+        let account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) \
+             VALUES ($1, $2, $3, 'EXT-DEFAULT', 'ACTIVE')",
+        )
+        .bind(account_id)
+        .bind(format!("defacct-test-account-{account_id}"))
+        .bind(&conn_code)
+        .execute(&pool)
+        .await
+        .expect("seed account");
+
+        let portfolio_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO portfolio (id, code, name, status, default_account_id) \
+             VALUES ($1, $2, 'Default account test portfolio', 'ACTIVE', $3)",
+        )
+        .bind(portfolio_id)
+        .bind(format!("defacct-test-portfolio-{portfolio_id}"))
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .expect("seed portfolio");
+
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade) VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .expect("seed grant");
+
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+
+        let request = SubmitOrderRequest {
+            order_id: Uuid::new_v4().to_string(),
+            client_order_id: "default-account-test-1".to_string(),
+            portfolio_id: portfolio_id.to_string(),
+            account_id: None,
+            instrument_id: Some(instrument_id.to_string()),
+            symbol: None,
+            venue: None,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            quantity: 1.0,
+        };
+
+        let result = orders_submit(State(state), Extension(auth), Json(request)).await;
+
+        let err = result.err().expect("no adapter is registered, so routing must fail");
+        assert_eq!(
+            err.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no new ownership rejection should appear here — expected the pre-existing \
+             no-adapter routing failure, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("does not belong to this portfolio"),
+            "the default_account_id fallback path must not trigger the new ownership check, got: {}",
+            err.message
         );
     }
 
