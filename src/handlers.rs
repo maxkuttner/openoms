@@ -396,15 +396,32 @@ pub async fn orders_submit(
         message: "account not found or its broker connection is not active".to_string(),
     })?;
 
-    // Only when the caller explicitly supplied an account_id: an omitted one
-    // always resolved from portfolio.default_account_id, which is inherently
-    // correct and needs no re-check.
+    // account.portfolio_id and portfolio.default_account_id are two
+    // independent, both-mutable sources of truth (admin CRUD can repoint
+    // either one without touching the other) — so both paths that can land
+    // here need the ownership check, not just the explicit one.
+    let account_portfolio_id: Option<Uuid> = account_row_pre.get("account_portfolio_id");
     if account_id_was_explicit {
-        let account_portfolio_id: Option<Uuid> = account_row_pre.get("account_portfolio_id");
+        // Explicit account_id: must belong to this portfolio. NULL (not yet
+        // backfilled) does not count as belonging — an explicit pick is a
+        // deliberate cross-check, so require an exact match.
         if account_portfolio_id != Some(portfolio_id) {
             return Err(ApiError {
                 status: StatusCode::BAD_REQUEST,
                 message: "account does not belong to this portfolio".to_string(),
+            });
+        }
+    } else if let Some(other_portfolio_id) = account_portfolio_id {
+        // Default-account path (portfolio.default_account_id). Unlike the
+        // explicit path, NULL is fine here — it means this account predates
+        // the portfolio_id backfill, not that it belongs to someone else — so
+        // only reject a default account that is affirmatively owned by a
+        // DIFFERENT portfolio, which is the exact cross-portfolio misroute
+        // this check exists to catch.
+        if other_portfolio_id != portfolio_id {
+            return Err(ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: "portfolio's default account belongs to a different portfolio".to_string(),
             });
         }
     }
@@ -2474,13 +2491,18 @@ mod tests {
         );
     }
 
-    /// Regression guard: a request with no `account_id` must take exactly the
-    /// same `default_account_id` fallback path as before Task 4, with no new
-    /// ownership check applying. Mirrors the actor-attribution test's seeding
-    /// (a portfolio with a `default_account_id`, an empty `BrokerRegistry` so
-    /// nothing can actually route) — the point is that the failure here is the
-    /// pre-existing "no adapter registered" routing failure, not a new
-    /// ownership rejection.
+    /// Regression guard: a request with no `account_id`, whose default
+    /// account has no `portfolio_id` set (NULL — the pre-backfill state most
+    /// existing default accounts are in), must still take the same
+    /// `default_account_id` fallback path as before Task 4/I1: the ownership
+    /// check on this path (see `orders_submit`) treats NULL as "not yet
+    /// backfilled, trust it" rather than rejecting. Mirrors the
+    /// actor-attribution test's seeding (a portfolio with a
+    /// `default_account_id`, an empty `BrokerRegistry` so nothing can
+    /// actually route) — the point is that the failure here is the
+    /// pre-existing "no adapter registered" routing failure, not the
+    /// ownership rejection covered separately by
+    /// `default_account_belonging_to_another_portfolio_is_rejected` below.
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn omitting_account_id_is_completely_unaffected() {
@@ -2567,7 +2589,118 @@ mod tests {
         );
         assert!(
             !err.message.contains("does not belong to this portfolio"),
-            "the default_account_id fallback path must not trigger the new ownership check, got: {}",
+            "the default_account_id fallback path must not trigger the explicit-path ownership check, got: {}",
+            err.message
+        );
+    }
+
+    /// I1 regression: `account.portfolio_id` and `portfolio.default_account_id`
+    /// are two independent, both-mutable sources of truth — admin CRUD can
+    /// repoint a portfolio's `default_account_id` at an account that actually
+    /// belongs (via `account.portfolio_id`) to some OTHER portfolio, without
+    /// anything enforcing they stay in sync. Before this fix, an omitted
+    /// `account_id` blindly trusted `default_account_id` and never re-checked
+    /// ownership, so this state let an order silently misroute across
+    /// portfolios via the default path — exactly the class of bug the
+    /// explicit-path check (`an_account_from_another_portfolio_is_rejected`)
+    /// exists to prevent, just reachable a different way.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn default_account_belonging_to_another_portfolio_is_rejected() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "default-misroute-test").await;
+        let instrument_id = seed_instrument(&pool, "DEFMISROUTE").await;
+
+        let broker_code = format!("DEFMISROUTE{}", Uuid::new_v4().simple());
+        let conn_code = format!("defmisroute-test-conn-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
+            .bind(&conn_code)
+            .bind(&broker_code)
+            .execute(&pool)
+            .await
+            .expect("seed broker_connection");
+        sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'DEFMISROUTE', true)")
+            .bind(instrument_id)
+            .bind(&broker_code)
+            .execute(&pool)
+            .await
+            .expect("seed broker_instrument");
+
+        // The account actually belongs to portfolio_owner...
+        let portfolio_owner = Uuid::new_v4();
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'Owner portfolio', 'ACTIVE')")
+            .bind(portfolio_owner)
+            .bind(format!("defmisroute-owner-{portfolio_owner}"))
+            .execute(&pool)
+            .await
+            .expect("seed owner portfolio");
+        let account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
+             VALUES ($1, $2, $3, 'EXT-DEFMISROUTE', 'ACTIVE', $4)",
+        )
+        .bind(account_id)
+        .bind(format!("defmisroute-account-{account_id}"))
+        .bind(&conn_code)
+        .bind(portfolio_owner)
+        .execute(&pool)
+        .await
+        .expect("seed account");
+
+        // ...but portfolio_requester's default_account_id was (mis)pointed at
+        // it anyway — the drift this fix catches.
+        let portfolio_requester = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO portfolio (id, code, name, status, default_account_id) \
+             VALUES ($1, $2, 'Requester portfolio', 'ACTIVE', $3)",
+        )
+        .bind(portfolio_requester)
+        .bind(format!("defmisroute-requester-{portfolio_requester}"))
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .expect("seed requester portfolio");
+
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade) VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_requester)
+        .execute(&pool)
+        .await
+        .expect("seed grant");
+
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+
+        let request = SubmitOrderRequest {
+            order_id: Uuid::new_v4().to_string(),
+            client_order_id: "default-misroute-test-1".to_string(),
+            portfolio_id: portfolio_requester.to_string(),
+            account_id: None,
+            instrument_id: Some(instrument_id.to_string()),
+            symbol: None,
+            venue: None,
+            side: OrderSide::Buy,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Day,
+            limit_price: None,
+            quantity: 1.0,
+        };
+
+        let result = orders_submit(State(state), Extension(auth), Json(request)).await;
+
+        let err = result.err().expect("cross-portfolio default account must be rejected");
+        assert_eq!(
+            err.status,
+            StatusCode::BAD_REQUEST,
+            "expected rejection for a default account owned by another portfolio, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("belongs to a different portfolio"),
+            "expected an ownership-mismatch message, got: {}",
             err.message
         );
     }
