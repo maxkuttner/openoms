@@ -2179,6 +2179,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
     async fn watchlist_add_list_remove_round_trips() {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "watch-roundtrip").await;
@@ -2210,6 +2211,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
     async fn adding_a_nonexistent_instrument_is_404() {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "watch-404").await;
@@ -2227,6 +2229,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
     async fn adding_the_same_instrument_twice_is_idempotent_not_an_error() {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "watch-dup").await;
@@ -2243,6 +2246,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
     async fn one_principal_cannot_see_or_remove_anothers_watchlist_item() {
         let pool = test_pool().await;
         let (principal_a, code_a) = seed_principal(&pool, "watch-a").await;
@@ -2287,6 +2291,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
     async fn marks_returns_null_fields_for_unpriced_instruments_not_zero() {
         let pool = test_pool().await;
         let instrument_id = seed_instrument(&pool, "UNPRICED").await;
@@ -2307,6 +2312,7 @@ mod tests {
     /// different cadences) — one being present must never depend on, or be
     /// blocked by, the other. Here only `daily_stats` has data.
     #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
     async fn marks_reports_prev_close_with_no_live_mark() {
         let pool = test_pool().await;
         let instrument_id = seed_instrument(&pool, "NOMARK").await;
