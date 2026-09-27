@@ -2679,6 +2679,86 @@ mod tests {
         assert_eq!(b.reason.as_deref(), Some("no account on this connection for this portfolio"));
     }
 
+    /// `broker_connection` is UNIQUE(broker_code, environment), not UNIQUE(broker_code)
+    /// — the same broker can have a PAPER and a LIVE connection side by side, and a
+    /// single broker_instrument row (one per instrument+broker) must fan out to both.
+    /// Guards against a future join "simplification" (DISTINCT ON broker_code, a
+    /// scalar subquery, …) silently collapsing the two environments into one.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn venues_fans_out_across_environments_of_the_same_broker() {
+        let pool = test_pool().await;
+        let (principal_id, principal_code) = seed_principal(&pool, "venues-envs").await;
+        let instrument_id = seed_instrument(&pool, "VENUEENV").await;
+
+        let broker = format!("VENUEENV{}", Uuid::new_v4().simple());
+        let conn_paper = format!("venue-env-conn-paper-{}", Uuid::new_v4());
+        let conn_live = format!("venue-env-conn-live-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')",
+        )
+        .bind(&conn_paper)
+        .bind(&broker)
+        .execute(&pool)
+        .await
+        .expect("seed broker_connection paper");
+        sqlx::query(
+            "INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'LIVE', 'ACTIVE')",
+        )
+        .bind(&conn_live)
+        .bind(&broker)
+        .execute(&pool)
+        .await
+        .expect("seed broker_connection live");
+        sqlx::query(
+            "INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'VENUEENV', true)",
+        )
+        .bind(instrument_id)
+        .bind(&broker)
+        .execute(&pool)
+        .await
+        .expect("seed broker_instrument");
+
+        let portfolio_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'Venues envs test portfolio', 'ACTIVE')",
+        )
+        .bind(portfolio_id)
+        .bind(format!("venues-envs-portfolio-{portfolio_id}"))
+        .execute(&pool)
+        .await
+        .expect("seed portfolio");
+        sqlx::query(
+            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view) VALUES ($1, $2, $3, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .expect("seed grant");
+
+        let state = test_app_state(pool);
+        let auth = AuthContext { principal_id, principal_code };
+
+        let result = get_portfolio_venues(
+            State(state),
+            Extension(auth),
+            Path(portfolio_id),
+            Query(VenuesQuery { instrument_id: instrument_id.to_string() }),
+        )
+        .await
+        .expect("should succeed")
+        .0;
+
+        assert_eq!(result.len(), 2, "one row per environment, not one per broker_code");
+        assert!(result.iter().all(|v| v.broker_code == broker));
+        let paper = result.iter().find(|v| v.environment.as_deref() == Some("PAPER")).expect("paper row present");
+        assert_eq!(paper.broker_connection_code.as_deref(), Some(conn_paper.as_str()));
+        let live = result.iter().find(|v| v.environment.as_deref() == Some("LIVE")).expect("live row present");
+        assert_eq!(live.broker_connection_code.as_deref(), Some(conn_live.as_str()));
+    }
+
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn venues_for_an_uncataloged_instrument_is_an_empty_list_not_an_error() {
