@@ -300,7 +300,13 @@ export function OrderTicket({
         order_type: orderType,
         time_in_force: tif,
         limit_price: orderType === "limit" ? Number(limitPrice) : undefined,
-        account_id: selectedAccountId || undefined,
+        // selectedAccountId may hold a synthetic `none:...` value picked from
+        // a disabled option (see the Venue Select above) — never send that as
+        // account_id. Only an ELIGIBLE row's account_id is ever a real
+        // account to route through; checking `eligible` here (not just
+        // matching the id) keeps this true even if the ids ever collided.
+        account_id:
+          venues.data?.find((v) => v.eligible && v.account_id === selectedAccountId)?.account_id ?? undefined,
       });
       notifications.show({
         color: "green",
@@ -448,9 +454,22 @@ export function OrderTicket({
           <Select
             label="Venue"
             placeholder="Default (portfolio's own account)"
+            // Every option needs a UNIQUE value. Eligible rows always carry a
+            // real account_id (see classify_venue in src/handlers.rs), but
+            // ineligible rows all have account_id: null — mapping every one of
+            // them to the same "" would hand Mantine's Select/Combobox
+            // duplicate option values, which it throws on (unmounting the
+            // whole app) as soon as ≥2 ineligible rows exist, e.g. two
+            // brokers with no account, or one broker with two environments
+            // and no account on either. Give each ineligible row its own
+            // synthetic, collision-free value instead; it is never sent
+            // anywhere (see selectedAccountId's uses below, which only ever
+            // treat it as a real account id when it matches an ELIGIBLE row).
             data={venues.data.map((v) => ({
-              value: v.account_id ?? "",
-              label: `${v.broker_code}${v.environment ? ` (${v.environment})` : ""}`,
+              value: v.account_id ?? `none:${v.broker_code}:${v.broker_connection_code ?? ""}`,
+              label: `${v.broker_code}${v.environment ? ` (${v.environment})` : ""}${
+                !v.eligible && v.reason ? ` — ${v.reason}` : ""
+              }`,
               disabled: !v.eligible,
             }))}
             value={selectedAccountId}
@@ -533,8 +552,13 @@ export function OrderTicket({
             {orderType === "limit" ? ` · limit ${limitPrice}` : " · market"} · {tif} · portfolio {portfolioLabel}
             {selectedAccountId &&
               (() => {
-                const venue = venues.data?.find((v) => v.account_id === selectedAccountId);
-                return venue ? ` · via ${venue.broker_code}` : "";
+                // Same defensive `eligible` check as the submit payload above
+                // — never resolve a synthetic `none:...` value back to a
+                // venue. Environment is included: ambiguous otherwise when a
+                // portfolio has eligible accounts on both PAPER and LIVE of
+                // the same broker, on the last screen before submission.
+                const venue = venues.data?.find((v) => v.eligible && v.account_id === selectedAccountId);
+                return venue ? ` · via ${venue.broker_code}${venue.environment ? ` (${venue.environment})` : ""}` : "";
               })()}
             {notional !== null && ` · est. notional ${notional.toFixed(2)}`}
           </Text>
