@@ -62,6 +62,7 @@ pub struct CreateAccount {
     pub broker_connection_code: String,
     pub external_account_ref: String,
     pub status: String,
+    pub portfolio_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -70,6 +71,7 @@ pub struct UpdateAccount {
     pub broker_connection_code: Option<String>,
     pub external_account_ref: Option<String>,
     pub status: Option<String>,
+    pub portfolio_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -430,9 +432,10 @@ pub async fn create_account(
             code,
             broker_connection_code,
             external_account_ref,
-            status
-        ) VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
+            status,
+            portfolio_id
+        ) VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, code, broker_connection_code, external_account_ref, status, portfolio_id, created_at, updated_at
         "#,
     )
     .bind(id)
@@ -440,6 +443,7 @@ pub async fn create_account(
     .bind(payload.broker_connection_code)
     .bind(payload.external_account_ref)
     .bind(payload.status)
+    .bind(payload.portfolio_id)
     .fetch_one(state.pool())
     .await
     .map_err(map_db_error)?;
@@ -460,7 +464,7 @@ pub async fn list_accounts(
     info!("admin list accounts");
     let records = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_connection_code, external_account_ref, status, portfolio_id, created_at, updated_at
         FROM account
         ORDER BY created_at DESC
         "#,
@@ -488,7 +492,7 @@ pub async fn get_account(
     info!(account_id = %id, "admin get account");
     let record = sqlx::query_as::<_, Account>(
         r#"
-        SELECT id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
+        SELECT id, code, broker_connection_code, external_account_ref, status, portfolio_id, created_at, updated_at
         FROM account
         WHERE id = $1
         "#,
@@ -526,15 +530,17 @@ pub async fn update_account(
             broker_connection_code = COALESCE($2, broker_connection_code),
             external_account_ref = COALESCE($3, external_account_ref),
             status = COALESCE($4, status),
+            portfolio_id = COALESCE($5, portfolio_id),
             updated_at = now()
-        WHERE id = $5
-        RETURNING id, code, broker_connection_code, external_account_ref, status, created_at, updated_at
+        WHERE id = $6
+        RETURNING id, code, broker_connection_code, external_account_ref, status, portfolio_id, created_at, updated_at
         "#,
     )
     .bind(payload.code)
     .bind(payload.broker_connection_code)
     .bind(payload.external_account_ref)
     .bind(payload.status)
+    .bind(payload.portfolio_id)
     .bind(id)
     .fetch_optional(state.pool())
     .await

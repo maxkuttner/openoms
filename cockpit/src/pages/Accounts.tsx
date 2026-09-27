@@ -15,6 +15,7 @@ export function AccountsPage() {
         { key: "code", label: "Code" },
         { key: "broker_connection_code", label: "Broker connection" },
         { key: "external_account_ref", label: "External ref" },
+        { key: "portfolio_id", label: "Portfolio" },
         { key: "status", label: "Status" },
       ]}
       fields={[
@@ -29,6 +30,14 @@ export function AccountsPage() {
           optionLabel: "code",
         },
         { name: "external_account_ref", label: "External account ref", required: true },
+        {
+          name: "portfolio_id",
+          label: "Portfolio",
+          type: "select",
+          optionsPath: "/admin/portfolios",
+          optionValue: "id",
+          optionLabel: "code",
+        },
         { name: "status", label: "Status", type: "select", required: true, options: STATUS },
       ]}
     />

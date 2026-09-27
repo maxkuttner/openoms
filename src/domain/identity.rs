@@ -44,6 +44,7 @@ pub struct Account {
     pub broker_connection_code: String,
     pub external_account_ref: String,
     pub status: String,
+    pub portfolio_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
