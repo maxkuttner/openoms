@@ -14,8 +14,17 @@ const queryClient = new QueryClient({
 });
 
 // BASE_URL is the shared ASSET base (/ui/), not this app's path. The trade
-// shell is served at /trade/, so that is its router basename.
-const basename = import.meta.env.DEV ? "/" : "/trade/";
+// shell is served at /trade/, so that is its router basename in production.
+//
+// In dev both apps are served by one vite server with no path split (each
+// is its own top-level .html: index.html vs trade.html) — a basename of "/"
+// here would let react-router rewrite the address bar down to a bare "/",
+// losing "trade.html" from the URL. Reloading that bare "/" then hits
+// vite's default entry (index.html, the ADMIN app), whose own router
+// redirects "/" elsewhere — landing you in a different app entirely.
+// Keeping "/trade.html" as the dev basename keeps it in the URL, so a
+// reload re-resolves to this app's own entry file.
+const basename = import.meta.env.DEV ? "/trade.html" : "/trade/";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
