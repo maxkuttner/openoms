@@ -19,6 +19,10 @@ tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "migrate", "uuid", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Tri-state (Option<Option<T>>) JSON deserialization for PATCH DTOs: lets an
+# admin update endpoint tell "field omitted" (keep the existing value) apart
+# from "field explicitly set to null" (clear it) — see UpdateAccount::portfolio_id.
+serde_with = "3"
 tower = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

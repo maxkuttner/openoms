@@ -71,7 +71,14 @@ pub struct UpdateAccount {
     pub broker_connection_code: Option<String>,
     pub external_account_ref: Option<String>,
     pub status: Option<String>,
-    pub portfolio_id: Option<Uuid>,
+    // Tri-state: `None` (key omitted from the JSON body) means "leave as is";
+    // `Some(None)` (key present, value `null`) means "clear it"; `Some(Some(id))`
+    // means "set it". A plain `Option<Uuid>` cannot tell the first two apart,
+    // which is exactly why Accounts.tsx's clearable portfolio Select used to
+    // silently no-op instead of clearing — see update_account below.
+    #[serde(default, deserialize_with = "serde_with::rust::double_option::deserialize")]
+    #[schema(value_type = Option<Uuid>, nullable)]
+    pub portfolio_id: Option<Option<Uuid>>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -522,6 +529,14 @@ pub async fn update_account(
     Json(payload): Json<UpdateAccount>,
 ) -> Result<Json<Account>, AdminError> {
     info!(account_id = %id, "admin update account");
+    // portfolio_id is tri-state (see UpdateAccount above): `None` means the
+    // field was omitted (preserve the existing value), `Some(_)` means it was
+    // present in the body and must be written verbatim — including `Some(None)`,
+    // an explicit clear to NULL. COALESCE can't express that (it can't tell
+    // "omitted" from "present but null"), so the write is gated by an explicit
+    // "was this field present" flag instead.
+    let portfolio_id_present = payload.portfolio_id.is_some();
+    let portfolio_id_value: Option<Uuid> = payload.portfolio_id.flatten();
     let record = sqlx::query_as::<_, Account>(
         r#"
         UPDATE account
@@ -530,9 +545,9 @@ pub async fn update_account(
             broker_connection_code = COALESCE($2, broker_connection_code),
             external_account_ref = COALESCE($3, external_account_ref),
             status = COALESCE($4, status),
-            portfolio_id = COALESCE($5, portfolio_id),
+            portfolio_id = CASE WHEN $5 THEN $6 ELSE portfolio_id END,
             updated_at = now()
-        WHERE id = $6
+        WHERE id = $7
         RETURNING id, code, broker_connection_code, external_account_ref, status, portfolio_id, created_at, updated_at
         "#,
     )
@@ -540,7 +555,8 @@ pub async fn update_account(
     .bind(payload.broker_connection_code)
     .bind(payload.external_account_ref)
     .bind(payload.status)
-    .bind(payload.portfolio_id)
+    .bind(portfolio_id_present)
+    .bind(portfolio_id_value)
     .bind(id)
     .fetch_optional(state.pool())
     .await
@@ -3219,6 +3235,112 @@ mod tests {
     }
 
     // ── Session revocation ──────────────────────────────────────────────
+
+    /// I2 regression: `update_account`'s `portfolio_id` is tri-state (see
+    /// `UpdateAccount`). Omitting the field must preserve the existing value;
+    /// sending it explicitly as `null` must clear it — the exact distinction
+    /// a plain `Option<Uuid>` + `COALESCE` could never make, which is why
+    /// Accounts.tsx's clearable portfolio Select used to silently no-op.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn portfolio_id_can_be_explicitly_cleared_but_survives_when_omitted() {
+        let pool = test_pool().await;
+
+        // A broker_code unique to this test, not the fixed 'IBKR' other tests
+        // in this module use — broker_connection has a UNIQUE(broker_code,
+        // environment), so a shared literal would collide under parallel
+        // test execution.
+        let broker_code = format!("I2TEST{}", Uuid::new_v4().simple());
+        let conn_code = format!("i2-test-conn-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
+            .bind(&conn_code)
+            .bind(&broker_code)
+            .execute(&pool)
+            .await
+            .expect("seed broker_connection");
+
+        let portfolio_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'I2 test portfolio', 'ACTIVE')")
+            .bind(portfolio_id)
+            .bind(format!("i2-test-portfolio-{portfolio_id}"))
+            .execute(&pool)
+            .await
+            .expect("seed portfolio");
+
+        let account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
+             VALUES ($1, $2, $3, 'EXT-I2', 'ACTIVE', $4)",
+        )
+        .bind(account_id)
+        .bind(format!("i2-test-account-{account_id}"))
+        .bind(&conn_code)
+        .bind(portfolio_id)
+        .execute(&pool)
+        .await
+        .expect("seed account");
+
+        let pool_for_cleanup = pool.clone();
+        let state = test_app_state(pool);
+
+        // Field omitted (deserialized from `{}`, not constructed with a
+        // `None` literal, so this exercises the real `#[serde(default, ...)]`
+        // path): the existing portfolio_id must survive untouched.
+        let omitted: UpdateAccount = serde_json::from_str("{}").expect("deserialize empty body");
+        assert_eq!(omitted.portfolio_id, None, "field omitted must deserialize to the outer None");
+        let after_omit = update_account(State(state.clone()), Path(account_id), Json(omitted))
+            .await
+            .expect("update with omitted field");
+        assert_eq!(
+            after_omit.0.portfolio_id,
+            Some(portfolio_id),
+            "omitting portfolio_id must preserve the existing value"
+        );
+
+        // Field explicitly present as `null`: must clear it to NULL, not no-op.
+        let clearing: UpdateAccount = serde_json::from_str(r#"{"portfolio_id": null}"#).expect("deserialize null body");
+        assert_eq!(
+            clearing.portfolio_id,
+            Some(None),
+            "an explicit JSON null must deserialize to the tri-state's inner None"
+        );
+        let after_clear = update_account(State(state), Path(account_id), Json(clearing))
+            .await
+            .expect("update with explicit null");
+        assert_eq!(
+            after_clear.0.portfolio_id, None,
+            "an explicit null in the request body must actually clear portfolio_id"
+        );
+
+        // Leave the tables as we found them.
+        sqlx::query("DELETE FROM account WHERE id = $1").bind(account_id).execute(&pool_for_cleanup).await.expect("cleanup account");
+        sqlx::query("DELETE FROM portfolio WHERE id = $1").bind(portfolio_id).execute(&pool_for_cleanup).await.expect("cleanup portfolio");
+        sqlx::query("DELETE FROM broker_connection WHERE code = $1").bind(&conn_code).execute(&pool_for_cleanup).await.expect("cleanup broker_connection");
+    }
+
+    fn test_app_state(pool: sqlx::PgPool) -> AppState {
+        use crate::adapters::BrokerRegistry;
+        use crate::stream_health::StreamHealthRegistry;
+        use symbology::{Identifier, InMemoryCache, OpenFigiClient};
+
+        let (quote_tx, _quote_rx) = tokio::sync::mpsc::channel(1);
+        AppState::new(
+            pool,
+            "test-admin-token".to_string(),
+            false,
+            BrokerRegistry::new(),
+            None,
+            Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
+            StreamHealthRegistry::new(),
+            None,
+            quote_tx,
+            crate::sessions::SessionConfig {
+                cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
+                ttl: crate::sessions::SessionTtl::default(),
+                public_base_url: None,
+            },
+        )
+    }
 
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
