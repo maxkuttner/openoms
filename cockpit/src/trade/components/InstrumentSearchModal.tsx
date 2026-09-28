@@ -55,7 +55,7 @@ export function InstrumentSearchModal({
 }: {
   opened: boolean;
   onClose: () => void;
-  onPickSingle: (instrument: { id: string; symbol: string; venue: string; name: string }) => void;
+  onPickSingle: (instrument: { id: string; symbol: string; venue: string; name: string; side?: "buy" | "sell" }) => void;
   onPickLegs: (legs: StrategyLeg[]) => void;
 }) {
   const [step, setStep] = useState<Step>("search");
@@ -64,6 +64,10 @@ export function InstrumentSearchModal({
   const [underlying, setUnderlying] = useState<SearchInstrument | null>(null);
   const [expiry, setExpiry] = useState<string | null>(null);
   const [legs, setLegs] = useState<StrategyLeg[]>([]);
+  // Set when a template pick's own fetches (outside useQuery, so they need
+  // their own error handling) fail, or resolve to nothing buildable — shown
+  // inline rather than left as a silent no-op click.
+  const [templateError, setTemplateError] = useState<string | null>(null);
 
   function resetAndClose() {
     setStep("search");
@@ -71,6 +75,7 @@ export function InstrumentSearchModal({
     setUnderlying(null);
     setExpiry(null);
     setLegs([]);
+    setTemplateError(null);
     onClose();
   }
 
@@ -164,58 +169,82 @@ export function InstrumentSearchModal({
 
   async function pickTemplate(templateKey: string) {
     if (!underlying) return;
-    const dates = expiries.data ?? (await tradeApi.get<string[]>(`/instruments/options/expiries?underlying=${underlying.symbol}`));
-    if (dates.length === 0) return;
-    const nearest = dates[0];
+    setTemplateError(null);
+    try {
+      const dates =
+        expiries.data ??
+        (await tradeApi.get<string[]>(`/instruments/options/expiries?underlying=${encodeURIComponent(underlying.symbol)}`));
+      if (dates.length === 0) {
+        setTemplateError(`${underlying.symbol} has no active option expiries.`);
+        return;
+      }
+      const nearest = dates[0];
 
-    if (templateKey === "custom") {
+      if (templateKey === "custom") {
+        setExpiry(nearest);
+        setLegs([]);
+        setStep("chain");
+        return;
+      }
+
+      const rows = await tradeApi.get<ChainRow[]>(
+        `/instruments/options/chain?underlying=${encodeURIComponent(underlying.symbol)}&expiry=${nearest}`,
+      );
+      if (rows.length === 0) {
+        setTemplateError(`No strikes found for ${underlying.symbol} on ${nearest}.`);
+        return;
+      }
+
+      // ATM proxy: the middle strike of the returned ladder. This is a known
+      // approximation — a real broker-sourced ladder is not always centered
+      // on spot, so this can land meaningfully away from the money. A better
+      // version would fetch the underlying's own mark and pick the nearest
+      // strike to it; deferred rather than done here to keep this fix pass
+      // scoped to the reviewed defects.
+      const atmIndex = Math.floor(rows.length / 2);
+      const atmRow = rows[atmIndex];
+
+      let built: StrategyLeg[] = [];
+      if (templateKey === "call") {
+        const leg = legFromChainRow(atmRow, "call", "buy", nearest, false);
+        if (leg) built = [leg];
+      } else if (templateKey === "put") {
+        const leg = legFromChainRow(atmRow, "put", "buy", nearest, false);
+        if (leg) built = [leg];
+      } else if (templateKey === "straddle") {
+        const call = legFromChainRow(atmRow, "call", "buy", nearest, false);
+        const put = legFromChainRow(atmRow, "put", "buy", nearest, false);
+        built = [call, put].filter((l): l is StrategyLeg => l !== null);
+      } else if (templateKey === "strangle") {
+        const lowerIndex = Math.max(0, atmIndex - 1);
+        const upperIndex = Math.min(rows.length - 1, atmIndex + 1);
+        const put = legFromChainRow(rows[lowerIndex], "put", "buy", nearest, false);
+        const call = legFromChainRow(rows[upperIndex], "call", "buy", nearest, false);
+        built = [call, put].filter((l): l is StrategyLeg => l !== null);
+      } else if (templateKey === "vertical") {
+        const upperIndex = Math.min(rows.length - 1, atmIndex + 1);
+        const buyCall = legFromChainRow(atmRow, "call", "buy", nearest, false);
+        const sellCall = legFromChainRow(rows[upperIndex], "call", "sell", nearest, false);
+        built = [buyCall, sellCall].filter((l): l is StrategyLeg => l !== null);
+      }
+
+      if (built.length === 0) {
+        setTemplateError(`Could not build ${templateKey} for ${underlying.symbol} on ${nearest}.`);
+        return;
+      }
+
       setExpiry(nearest);
-      setLegs([]);
+      setLegs(built);
       setStep("chain");
-      return;
+    } catch (err) {
+      setTemplateError(notifyableMessage(err));
     }
-
-    const rows = await tradeApi.get<ChainRow[]>(
-      `/instruments/options/chain?underlying=${underlying.symbol}&expiry=${nearest}`,
-    );
-    if (rows.length === 0) return;
-
-    // ATM proxy: the middle strike of the returned ladder (the ladder is
-    // sorted by strike and, for the seeded test chain, centered on spot —
-    // a real broker-sourced chain may not be perfectly centered, but the
-    // middle strike is always a reasonable near-the-money starting point).
-    const atmIndex = Math.floor(rows.length / 2);
-    const atmRow = rows[atmIndex];
-
-    let built: StrategyLeg[] = [];
-    if (templateKey === "call") {
-      const leg = legFromChainRow(atmRow, "call", "buy", nearest, false);
-      if (leg) built = [leg];
-    } else if (templateKey === "put") {
-      const leg = legFromChainRow(atmRow, "put", "buy", nearest, false);
-      if (leg) built = [leg];
-    } else if (templateKey === "straddle") {
-      const call = legFromChainRow(atmRow, "call", "buy", nearest, false);
-      const put = legFromChainRow(atmRow, "put", "buy", nearest, false);
-      built = [call, put].filter((l): l is StrategyLeg => l !== null);
-    } else if (templateKey === "strangle") {
-      const lowerIndex = Math.max(0, atmIndex - 1);
-      const upperIndex = Math.min(rows.length - 1, atmIndex + 1);
-      const put = legFromChainRow(rows[lowerIndex], "put", "buy", nearest, false);
-      const call = legFromChainRow(rows[upperIndex], "call", "buy", nearest, false);
-      built = [call, put].filter((l): l is StrategyLeg => l !== null);
-    } else if (templateKey === "vertical") {
-      const upperIndex = Math.min(rows.length - 1, atmIndex + 1);
-      const buyCall = legFromChainRow(atmRow, "call", "buy", nearest, false);
-      const sellCall = legFromChainRow(rows[upperIndex], "call", "sell", nearest, false);
-      built = [buyCall, sellCall].filter((l): l is StrategyLeg => l !== null);
-    }
-
-    setExpiry(nearest);
-    setLegs(built);
-    setStep("chain");
   }
 
+  const pricedChainLegs = legs.filter(
+    (l) => l.referencePrice != null || marks.data?.[Number(l.instrumentId)] != null,
+  );
+  const allChainLegsPriced = pricedChainLegs.length === legs.length && legs.length > 0;
   const netPremium = legs.reduce((sum, l) => {
     const price = l.referencePrice ?? marks.data?.[Number(l.instrumentId)]?.[l.side === "buy" ? "ask" : "bid"] ?? 0;
     return sum + (l.side === "buy" ? price : -price);
@@ -233,7 +262,7 @@ export function InstrumentSearchModal({
     }));
     if (resolved.length === 1) {
       const leg = resolved[0];
-      onPickSingle({ id: leg.instrumentId, symbol: leg.symbol, venue: "OPRA", name: leg.symbol });
+      onPickSingle({ id: leg.instrumentId, symbol: leg.symbol, venue: "OPRA", name: leg.symbol, side: leg.side });
     } else {
       onPickLegs(resolved);
     }
@@ -292,14 +321,32 @@ export function InstrumentSearchModal({
           <>
             <Group justify="space-between">
               <Title order={4}>{underlying.symbol}</Title>
-              <Button variant="subtle" onClick={() => setStep("search")}>
-                ← Back to search
-              </Button>
+              <Group gap="xs">
+                <Button
+                  variant="light"
+                  onClick={() =>
+                    onPickSingle({
+                      id: String(underlying.id),
+                      symbol: underlying.symbol,
+                      venue: underlying.venue,
+                      name: underlying.name,
+                    })
+                  }
+                >
+                  Trade {underlying.symbol} directly
+                </Button>
+                <Button variant="subtle" onClick={() => { setTemplateError(null); setStep("search"); }}>
+                  ← Back to search
+                </Button>
+              </Group>
             </Group>
             {expiries.isLoading && <Loader size="sm" />}
+            {expiries.error && <Alert color="red">{notifyableMessage(expiries.error)}</Alert>}
+            {templateError && <Alert color="red">{templateError}</Alert>}
             {expiries.data && expiries.data.length === 0 && (
               <Alert color="yellow">
-                {underlying.symbol} has no active option expiries right now — nothing to build a strategy from.
+                {underlying.symbol} has no active option expiries right now — use "Trade {underlying.symbol} directly"
+                above, or check back later.
               </Alert>
             )}
             {expiries.data && expiries.data.length > 0 && (
@@ -332,7 +379,7 @@ export function InstrumentSearchModal({
               <Title order={4}>
                 {underlying.symbol} chain — {expiry}
               </Title>
-              <Button variant="subtle" onClick={() => setStep("underlying")}>
+              <Button variant="subtle" onClick={() => { setTemplateError(null); setStep("underlying"); }}>
                 ← Back to templates
               </Button>
             </Group>
@@ -349,6 +396,10 @@ export function InstrumentSearchModal({
               ))}
             </Group>
             {chain.isLoading && <Loader size="sm" />}
+            {chain.error && <Alert color="red">{notifyableMessage(chain.error)}</Alert>}
+            {chain.data && chain.data.length === 0 && !chain.isLoading && (
+              <Alert color="yellow">No strikes listed for {underlying.symbol} on {expiry}.</Alert>
+            )}
             <Text size="xs" c="dimmed">
               Click a price to add that leg — Ask buys, Bid sells. Click again to remove it.
             </Text>
@@ -420,7 +471,10 @@ export function InstrumentSearchModal({
             <Group justify="space-between">
               <Text>
                 {legs.length} leg{legs.length === 1 ? "" : "s"} selected
-                {legs.length > 0 && ` · net ${netPremium >= 0 ? "debit" : "credit"} ${Math.abs(netPremium).toFixed(2)}`}
+                {legs.length > 0 &&
+                  (allChainLegsPriced
+                    ? ` · net ${netPremium >= 0 ? "debit" : "credit"} ${Math.abs(netPremium).toFixed(2)}`
+                    : " · net premium unavailable (not all legs priced)")}
               </Text>
               <Button disabled={legs.length === 0} onClick={useCombo}>
                 Use this combo

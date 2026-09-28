@@ -94,7 +94,7 @@ export function OrderTicket({
   // InstrumentSelect dropdown, clearing/reset, etc.) — this just adopts an
   // externally-picked value on change, it does not make the fields fully
   // controlled.
-  selectedWatchlistInstrument?: { id: string; symbol: string; venue: string; name: string } | null;
+  selectedWatchlistInstrument?: { id: string; symbol: string; venue: string; name: string; side?: Side } | null;
 }) {
   // 403 from the server should be unreachable because of this filter — see the
   // 403 branch below, which treats it as a bug report rather than a routine
@@ -136,6 +136,11 @@ export function OrderTicket({
         venue: selectedWatchlistInstrument.venue,
         name: selectedWatchlistInstrument.name,
       });
+      // A single-leg pick from the option chain carries the side the trader
+      // actually clicked (a Bid means sell) — defaulting to "buy" here would
+      // silently flip that intent. A Watchlist click never carries a side,
+      // so it keeps the ticket's existing default.
+      if (selectedWatchlistInstrument.side) setSide(selectedWatchlistInstrument.side);
     }
   }, [selectedWatchlistInstrument]);
 

@@ -8,7 +8,7 @@ import { StrategyTicket } from "../components/StrategyTicket";
 import { InstrumentSearchModal } from "../components/InstrumentSearchModal";
 import { Watchlist } from "../components/Watchlist";
 import { PositionsPage } from "./Positions";
-import type { StrategyLeg } from "../types";
+import type { Side, StrategyLeg } from "../types";
 
 export function TradePage({ me }: { me: Me }) {
   const queryClient = useQueryClient();
@@ -39,6 +39,7 @@ export function TradePage({ me }: { me: Me }) {
     symbol: string;
     venue: string;
     name: string;
+    side?: Side;
   } | null>(null);
 
   // Set only when InstrumentSearchModal returns more than one leg — while
@@ -74,12 +75,18 @@ export function TradePage({ me }: { me: Me }) {
         </Grid.Col>
         <Grid.Col span={{ base: 12, md: 3 }}>
           {pendingLegs ? (
+            // Keyed by the combo's own legs so a new "Use this combo" pick
+            // mounts a fresh ticket (fresh order ids, fresh per-leg status)
+            // instead of reusing one still showing a previous attempt's
+            // results. The ticket itself decides when it's done — it stays
+            // mounted after submit so the trader can read every leg's real
+            // outcome; only its own "Close" button (onCancel) dismisses it.
             <StrategyTicket
+              key={pendingLegs.map((l) => l.instrumentId + l.side).join(",")}
               portfolios={me.portfolios}
               legs={pendingLegs}
               onCancel={() => setPendingLegs(null)}
               onSubmitted={(orderIds) => {
-                setPendingLegs(null);
                 if (orderIds.length > 0) onOrdersSubmitted(orderIds[orderIds.length - 1]);
               }}
             />
