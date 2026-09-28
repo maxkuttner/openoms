@@ -7,6 +7,7 @@ pub mod database;
 pub mod import_env;
 pub mod init;
 pub mod rotate;
+pub mod test_data;
 
 /// Postgres connection string for the runtime pool (the `oms` role), built the
 /// same way `serve()` builds it: host/port/database from `POSTGRES_*` (or their

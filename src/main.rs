@@ -381,6 +381,9 @@ enum Command {
 enum SetupCmd {
     /// Seed the master instrument catalog + broker_instrument mapping from a broker.
     SyncBroker(setup::brokers::Args),
+    /// Seed a synthetic SPY option chain — no broker, no network. For exercising
+    /// instrument search / the option chain UI without a live catalog sync.
+    SeedTestChain(setup::test_data::Args),
 }
 
 #[derive(clap::Subcommand)]
@@ -509,6 +512,12 @@ async fn main() {
         Some(Command::Setup(SetupCmd::SyncBroker(args))) => {
             if let Err(e) = setup::brokers::run(args).await {
                 error!("setup sync-broker failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Setup(SetupCmd::SeedTestChain(args))) => {
+            if let Err(e) = setup::test_data::run(args).await {
+                error!("setup seed-test-chain failed: {e}");
                 std::process::exit(1);
             }
         }
