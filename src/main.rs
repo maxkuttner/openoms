@@ -1273,6 +1273,8 @@ async fn serve() {
             post(handlers::create_allocations).get(handlers::list_allocations),
         )
         .route("/instruments", get(instruments_api::list_instruments_for_trader))
+        .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
+        .route("/instruments/options/chain", get(instruments_api::get_option_chain))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes (protected by static bearer token only)

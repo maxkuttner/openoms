@@ -7,8 +7,11 @@
 
 use axum::{
     extract::{Query, State},
+    http::StatusCode,
     Json,
 };
+use chrono::NaiveDate;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::admin::{InstrumentSearch, InstrumentSummary};
@@ -67,6 +70,134 @@ pub async fn list_instruments_for_trader(
             status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             message: format!("failed to search instruments: {err:?}"),
         })
+}
+
+/// One instrument on one side of one strike, for a chain row.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ChainLeg {
+    pub instrument_id: i64,
+    pub symbol: String,
+}
+
+/// One strike of an option chain. `call`/`put` are independently nullable —
+/// a venue can list only one side of a strike, and this must say so rather
+/// than omit the row or invent the missing leg.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct ChainRow {
+    pub strike: f64,
+    pub call: Option<ChainLeg>,
+    pub put: Option<ChainLeg>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChainSqlRow {
+    strike_price: f64,
+    call_id: Option<i64>,
+    call_symbol: Option<String>,
+    put_id: Option<i64>,
+    put_symbol: Option<String>,
+}
+
+/// Sorted, distinct expiry dates for an underlying's active option contracts.
+pub async fn option_expiries(pool: &PgPool, underlying: &str) -> Result<Vec<NaiveDate>, sqlx::Error> {
+    sqlx::query_scalar::<_, NaiveDate>(
+        "SELECT DISTINCT d.expiry_date \
+         FROM public.instrument_derivative d \
+         JOIN public.instrument i ON i.id = d.instrument_id \
+         WHERE i.status = 'ACTIVE' AND d.underlying_symbol = $1 AND d.expiry_date IS NOT NULL \
+         ORDER BY 1",
+    )
+    .bind(underlying)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row per distinct strike for `underlying` at `expiry`, call and put
+/// self-joined side by side. A strike missing one side comes back with that
+/// side `None` — never dropped, never fabricated.
+pub async fn option_chain(
+    pool: &PgPool,
+    underlying: &str,
+    expiry: NaiveDate,
+) -> Result<Vec<ChainRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, ChainSqlRow>(
+        "SELECT strikes.strike_price::double precision AS strike_price, \
+                call_i.id AS call_id, call_i.symbol AS call_symbol, \
+                put_i.id  AS put_id,  put_i.symbol  AS put_symbol \
+         FROM (SELECT DISTINCT strike_price FROM public.instrument_derivative \
+               WHERE underlying_symbol = $1 AND expiry_date = $2) strikes \
+         LEFT JOIN public.instrument_derivative call_d \
+                ON call_d.underlying_symbol = $1 AND call_d.expiry_date = $2 \
+               AND call_d.strike_price = strikes.strike_price AND call_d.option_kind = 'CALL' \
+         LEFT JOIN public.instrument call_i ON call_i.id = call_d.instrument_id AND call_i.status = 'ACTIVE' \
+         LEFT JOIN public.instrument_derivative put_d \
+                ON put_d.underlying_symbol = $1 AND put_d.expiry_date = $2 \
+               AND put_d.strike_price = strikes.strike_price AND put_d.option_kind = 'PUT' \
+         LEFT JOIN public.instrument put_i ON put_i.id = put_d.instrument_id AND put_i.status = 'ACTIVE' \
+         ORDER BY strikes.strike_price",
+    )
+    .bind(underlying)
+    .bind(expiry)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ChainRow {
+            strike: r.strike_price,
+            call: match (r.call_id, r.call_symbol) {
+                (Some(instrument_id), Some(symbol)) => Some(ChainLeg { instrument_id, symbol }),
+                _ => None,
+            },
+            put: match (r.put_id, r.put_symbol) {
+                (Some(instrument_id), Some(symbol)) => Some(ChainLeg { instrument_id, symbol }),
+                _ => None,
+            },
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct UnderlyingQuery {
+    pub underlying: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct ChainQuery {
+    pub underlying: String,
+    pub expiry: NaiveDate,
+}
+
+#[utoipa::path(
+    get, path = "/instruments/options/expiries", tag = "orders",
+    params(UnderlyingQuery),
+    responses((status = 200, description = "Sorted distinct expiry dates", body = [String])),
+    security(("basic_auth" = []), ("bearer_token" = []))
+)]
+pub async fn list_option_expiries(
+    State(state): State<AppState>,
+    Query(q): Query<UnderlyingQuery>,
+) -> Result<Json<Vec<NaiveDate>>, ApiError> {
+    option_expiries(state.pool(), &q.underlying).await.map(Json).map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load expiries: {err:?}"),
+    })
+}
+
+#[utoipa::path(
+    get, path = "/instruments/options/chain", tag = "orders",
+    params(ChainQuery),
+    responses((status = 200, description = "Strike-sorted chain rows", body = [ChainRow])),
+    security(("basic_auth" = []), ("bearer_token" = []))
+)]
+pub async fn get_option_chain(
+    State(state): State<AppState>,
+    Query(q): Query<ChainQuery>,
+) -> Result<Json<Vec<ChainRow>>, ApiError> {
+    option_chain(state.pool(), &q.underlying, q.expiry).await.map(Json).map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load chain: {err:?}"),
+    })
 }
 
 #[cfg(test)]
@@ -183,6 +314,86 @@ mod tests {
             search_instruments(&pool, Some(&without_symbol), None).await.expect("search");
         let without_row = without_rows.iter().find(|r| r.id == without_options).expect("found");
         assert!(!without_row.has_options, "an instrument with no derivative row must not");
+    }
+
+    /// Seeds one option leg with an explicit strike/expiry/kind, returning its
+    /// instrument id and symbol.
+    async fn seed_chain_leg(
+        pool: &sqlx::PgPool,
+        underlying_symbol: &str,
+        kind: &str,
+        strike: f64,
+        expiry: chrono::NaiveDate,
+    ) -> (i64, String) {
+        let leg_id = seed_instrument(pool, &format!("{underlying_symbol}{kind}{}", strike as i64), "ACTIVE").await;
+        let symbol: String = sqlx::query_scalar("SELECT symbol FROM public.instrument WHERE id = $1")
+            .bind(leg_id)
+            .fetch_one(pool)
+            .await
+            .expect("symbol");
+        sqlx::query(
+            "INSERT INTO public.instrument_derivative \
+                (instrument_id, underlying_symbol, option_kind, strike_price, expiry_date) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(leg_id)
+        .bind(underlying_symbol)
+        .bind(kind)
+        .bind(strike)
+        .bind(expiry)
+        .execute(pool)
+        .await
+        .expect("seed instrument_derivative");
+        (leg_id, symbol)
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn option_expiries_returns_sorted_distinct_dates_for_the_underlying() {
+        let pool = test_pool().await;
+        let underlying = format!("ZZEXP{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let near = chrono::Utc::now().date_naive() + chrono::Duration::days(7);
+        let far = chrono::Utc::now().date_naive() + chrono::Duration::days(30);
+        seed_chain_leg(&pool, &underlying, "CALL", 100.0, far).await;
+        seed_chain_leg(&pool, &underlying, "PUT", 100.0, far).await; // same date, must not duplicate
+        seed_chain_leg(&pool, &underlying, "CALL", 105.0, near).await;
+
+        let dates = option_expiries(&pool, &underlying).await.expect("expiries");
+        assert_eq!(dates, vec![near, far], "sorted, distinct, nearest first");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn option_expiries_is_empty_for_an_underlying_with_no_contracts() {
+        let pool = test_pool().await;
+        let dates = option_expiries(&pool, "ZZNOCHAIN_NONEXISTENT").await.expect("expiries");
+        assert!(dates.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn option_chain_returns_null_for_a_side_that_was_never_listed() {
+        let pool = test_pool().await;
+        let underlying = format!("ZZCHAIN{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let expiry = chrono::Utc::now().date_naive() + chrono::Duration::days(14);
+        // 100: both sides. 105: call-only.
+        let (call100_id, call100_sym) = seed_chain_leg(&pool, &underlying, "CALL", 100.0, expiry).await;
+        let (put100_id, put100_sym) = seed_chain_leg(&pool, &underlying, "PUT", 100.0, expiry).await;
+        let (call105_id, call105_sym) = seed_chain_leg(&pool, &underlying, "CALL", 105.0, expiry).await;
+
+        let rows = option_chain(&pool, &underlying, expiry).await.expect("chain");
+        assert_eq!(rows.len(), 2, "one row per distinct strike");
+
+        let row100 = rows.iter().find(|r| r.strike == 100.0).expect("strike 100");
+        assert_eq!(row100.call.as_ref().unwrap().instrument_id, call100_id);
+        assert_eq!(row100.call.as_ref().unwrap().symbol, call100_sym);
+        assert_eq!(row100.put.as_ref().unwrap().instrument_id, put100_id);
+        assert_eq!(row100.put.as_ref().unwrap().symbol, put100_sym);
+
+        let row105 = rows.iter().find(|r| r.strike == 105.0).expect("strike 105");
+        assert_eq!(row105.call.as_ref().unwrap().instrument_id, call105_id);
+        assert_eq!(row105.call.as_ref().unwrap().symbol, call105_sym);
+        assert!(row105.put.is_none(), "no put was ever listed at 105 — must be null, not omitted or erroring");
     }
 
     // ── test plumbing ────────────────────────────────────────────────────────
