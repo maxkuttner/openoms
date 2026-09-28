@@ -33,10 +33,12 @@ pub async fn search_instruments(
     let limit = clamp_limit(limit);
 
     sqlx::query_as::<_, InstrumentSummary>(
-        "SELECT id, symbol, name, venue, asset_class, status \
-         FROM public.instrument \
-         WHERE status = 'ACTIVE' AND ($1::text IS NULL OR symbol ILIKE $1 OR name ILIKE $1) \
-         ORDER BY symbol \
+        "SELECT i.id, i.symbol, i.name, i.venue, i.asset_class, i.instrument_class, i.status, \
+                EXISTS (SELECT 1 FROM public.instrument_derivative d \
+                        WHERE d.underlying_id = i.id OR d.underlying_symbol = i.symbol) AS has_options \
+         FROM public.instrument i \
+         WHERE i.status = 'ACTIVE' AND ($1::text IS NULL OR i.symbol ILIKE $1 OR i.name ILIKE $1) \
+         ORDER BY i.symbol \
          LIMIT $2",
     )
     .bind(pattern)
@@ -130,6 +132,57 @@ mod tests {
 
         assert!(by_symbol.iter().any(|r| r.id == id));
         assert!(by_name.iter().any(|r| r.id == id));
+    }
+
+    /// Gives `symbol` (already seeded via `seed_instrument`) one option leg as
+    /// its underlying — enough for `has_options` to flip true. The option leg
+    /// itself doesn't need to be a valid tradeable contract, just a row in
+    /// `instrument_derivative` naming this symbol.
+    async fn seed_option_leg(pool: &sqlx::PgPool, underlying_symbol: &str) -> i64 {
+        let leg_id = seed_instrument(pool, &format!("{underlying_symbol}LEG"), "ACTIVE").await;
+        sqlx::query(
+            "INSERT INTO public.instrument_derivative \
+                (instrument_id, underlying_symbol, option_kind, strike_price, expiry_date) \
+             VALUES ($1, $2, 'CALL', 100.0, CURRENT_DATE + 30)",
+        )
+        .bind(leg_id)
+        .bind(underlying_symbol)
+        .execute(pool)
+        .await
+        .expect("seed instrument_derivative");
+        leg_id
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn has_options_is_true_only_for_an_instrument_with_a_derivative_row() {
+        let pool = test_pool().await;
+        let with_options = seed_instrument(&pool, "ZZHASOPT", "ACTIVE").await;
+        let without_options = seed_instrument(&pool, "ZZNOOPT", "ACTIVE").await;
+
+        let with_symbol: String =
+            sqlx::query_scalar("SELECT symbol FROM public.instrument WHERE id = $1")
+                .bind(with_options)
+                .fetch_one(&pool)
+                .await
+                .expect("symbol");
+        seed_option_leg(&pool, &with_symbol).await;
+
+        let with_rows = search_instruments(&pool, Some(&with_symbol), None).await.expect("search");
+        let with_row = with_rows.iter().find(|r| r.id == with_options).expect("found");
+        assert!(with_row.has_options, "an instrument with a derivative row must show has_options");
+        assert_eq!(with_row.instrument_class, "SPOT");
+
+        let without_symbol: String =
+            sqlx::query_scalar("SELECT symbol FROM public.instrument WHERE id = $1")
+                .bind(without_options)
+                .fetch_one(&pool)
+                .await
+                .expect("symbol");
+        let without_rows =
+            search_instruments(&pool, Some(&without_symbol), None).await.expect("search");
+        let without_row = without_rows.iter().find(|r| r.id == without_options).expect("found");
+        assert!(!without_row.has_options, "an instrument with no derivative row must not");
     }
 
     // ── test plumbing ────────────────────────────────────────────────────────

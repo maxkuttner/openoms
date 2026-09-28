@@ -2524,7 +2524,12 @@ pub struct InstrumentSummary {
     pub name: String,
     pub venue: String,
     pub asset_class: String,
+    pub instrument_class: String,
     pub status: String,
+    /// Whether any `instrument_derivative` row names this instrument as its
+    /// underlying — lets a search UI offer "view option chain" without a
+    /// second round trip.
+    pub has_options: bool,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
