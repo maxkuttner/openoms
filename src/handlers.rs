@@ -1779,11 +1779,15 @@ pub struct BlotterFilter {
     pub until: Option<DateTime<Utc>>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// Free-text reference set at submit time — not unique, so this can
+    /// match several rows sharing one strategy's generated tag.
+    pub client_order_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BlotterRow {
     pub order_id: Uuid,
+    pub client_order_id: String,
     pub principal_id: Uuid,
     pub principal_code: String,
     pub portfolio_id: Uuid,
@@ -1823,7 +1827,7 @@ async fn load_blotter(
     scope: BlotterScope,
 ) -> Result<Vec<BlotterRow>, ApiError> {
     let mut qb = QueryBuilder::<Postgres>::new(
-        "SELECT os.order_id, os.principal_id, p.code AS principal_code, \
+        "SELECT os.order_id, os.client_order_id, os.principal_id, p.code AS principal_code, \
                 os.portfolio_id, pf.code AS portfolio_code, os.account_id, \
                 os.broker_connection_code, os.instrument_id, \
                 i.symbol AS instrument_symbol, i.name AS instrument_name, \
@@ -1860,6 +1864,7 @@ async fn load_blotter(
     if let Some(v) = &f.status { qb.push(" AND os.status = ").push_bind(v.clone()); }
     if let Some(v) = f.portfolio_id { qb.push(" AND os.portfolio_id = ").push_bind(v); }
     if let Some(v) = &f.instrument_id { qb.push(" AND os.instrument_id = ").push_bind(v.clone()); }
+    if let Some(v) = &f.client_order_id { qb.push(" AND os.client_order_id = ").push_bind(v.clone()); }
     if let Some(v) = &f.broker_connection_code {
         qb.push(" AND os.broker_connection_code = ").push_bind(v.clone());
     }
@@ -1880,6 +1885,7 @@ async fn load_blotter(
         .iter()
         .map(|r| BlotterRow {
             order_id: r.get("order_id"),
+            client_order_id: r.get("client_order_id"),
             principal_id: r.get("principal_id"),
             principal_code: r.get("principal_code"),
             portfolio_id: r.get("portfolio_id"),
@@ -3026,6 +3032,124 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("seed instrument")
+    }
+
+    /// Minimal order_state row plus the portfolio/broker_connection/account it
+    /// references — nothing here is seeded elsewhere in this file, since
+    /// load_blotter has had no tests of its own until now. Returns the new
+    /// order's id.
+    async fn seed_order_state(
+        pool: &sqlx::PgPool,
+        principal_id: Uuid,
+        instrument_id: i64,
+        client_order_id: &str,
+    ) -> Uuid {
+        let unique = &uuid::Uuid::new_v4().to_string()[..8];
+
+        let portfolio_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, $2, 'ACTIVE')")
+            .bind(portfolio_id)
+            .bind(format!("ZZPORT{unique}"))
+            .execute(pool)
+            .await
+            .expect("seed portfolio");
+
+        let broker_code = format!("ZZBROKER{unique}");
+        sqlx::query(
+            "INSERT INTO broker_connection (code, broker_code, environment, status) \
+             VALUES ($1, $1, 'PAPER', 'ACTIVE')",
+        )
+        .bind(&broker_code)
+        .execute(pool)
+        .await
+        .expect("seed broker_connection");
+
+        let account_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) \
+             VALUES ($1, $2, $3, $2, 'ACTIVE')",
+        )
+        .bind(account_id)
+        .bind(format!("ZZACCT{unique}"))
+        .bind(&broker_code)
+        .execute(pool)
+        .await
+        .expect("seed account");
+
+        let order_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO order_state \
+                (order_id, client_order_id, principal_id, portfolio_id, account_id, \
+                 broker_connection_code, instrument_id, side, order_type, time_in_force, \
+                 original_qty, leaves_qty, cum_qty, status, version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'buy', 'market', 'day', 1, 1, 0, 'submitted', 1)",
+        )
+        .bind(order_id)
+        .bind(client_order_id)
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .bind(account_id)
+        .bind(&broker_code)
+        .bind(instrument_id.to_string())
+        .execute(pool)
+        .await
+        .expect("seed order_state");
+
+        order_id
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn client_order_id_is_returned_and_filterable() {
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "blotter-tag").await;
+        let instrument_id = seed_instrument(&pool, "BLOTTAG").await;
+        let tag = format!("combo-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let tagged = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        // An order NOT sharing the tag must not show up when filtering by it.
+        seed_order_state(&pool, principal_id, instrument_id, "solo-order").await;
+
+        let state = test_app_state(pool);
+        let filter = BlotterFilter {
+            status: None,
+            portfolio_id: None,
+            instrument_id: None,
+            principal_id: None,
+            broker_connection_code: None,
+            side: None,
+            since: None,
+            until: None,
+            limit: None,
+            offset: None,
+            client_order_id: Some(tag.clone()),
+        };
+        let rows = load_blotter(&state, &filter, BlotterScope::All).await.expect("load blotter");
+
+        assert_eq!(rows.len(), 1, "only the tagged order must come back");
+        assert_eq!(rows[0].order_id, tagged);
+        assert_eq!(rows[0].client_order_id, tag);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn client_order_id_filter_with_no_match_returns_empty_not_an_error() {
+        let pool = test_pool().await;
+        let state = test_app_state(pool);
+        let filter = BlotterFilter {
+            status: None,
+            portfolio_id: None,
+            instrument_id: None,
+            principal_id: None,
+            broker_connection_code: None,
+            side: None,
+            since: None,
+            until: None,
+            limit: None,
+            offset: None,
+            client_order_id: Some("no-such-tag-anywhere".to_string()),
+        };
+        let rows = load_blotter(&state, &filter, BlotterScope::All).await.expect("load blotter");
+        assert!(rows.is_empty());
     }
 
     /// Mirrors the existing actor-attribution test's `AppState::new(...)` call
