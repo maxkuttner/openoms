@@ -1,13 +1,117 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
-import { Alert, Badge, Button, Group, Paper, Select, Stack, Text, Title } from "@mantine/core";
+import { Alert, Badge, Button, Group, Paper, Select, SimpleGrid, Stack, Text, Title } from "@mantine/core";
 import { tradeApi } from "../api/client";
 import { submitOrder, RECORDED_NOT_ROUTED, type SubmitOutcome } from "../api/submitOrder";
 import type { GrantedPortfolio } from "../App";
 import type { StrategyLeg, VenueOption, OrderType, TimeInForce } from "../types";
 
 type LegStatus = "pending" | "sending" | SubmitOutcome["kind"];
+
+type Payoff = {
+  points: { s: number; pnl: number }[];
+  loRange: number;
+  hiRange: number;
+  maxLoss: number | "unlimited";
+  maxProfit: number | "unlimited";
+  breakevens: number[];
+};
+
+const PAYOFF_STEPS = 120;
+
+// Payoff-at-expiry is pure algebra from strike/side/kind/premium — no greeks
+// or IV needed, so it stays correct even though those stay out of scope.
+// Only called once every leg has a real premium (see allLegsPriced below).
+function computePayoff(legs: StrategyLeg[]): Payoff {
+  const strikes = legs.map((l) => l.strike);
+  const minStrike = Math.min(...strikes);
+  const maxStrike = Math.max(...strikes);
+  const span = Math.max(maxStrike - minStrike, minStrike * 0.1, 10);
+  const loRange = Math.max(0, minStrike - span);
+  const hiRange = maxStrike + span;
+
+  function legPnl(leg: StrategyLeg, s: number): number {
+    const intrinsic = leg.optionKind === "CALL" ? Math.max(s - leg.strike, 0) : Math.max(leg.strike - s, 0);
+    const premium = leg.referencePrice!;
+    return leg.side === "buy" ? intrinsic - premium : premium - intrinsic;
+  }
+
+  function totalPnl(s: number): number {
+    return legs.reduce((sum, l) => sum + legPnl(l, s), 0);
+  }
+
+  const points = Array.from({ length: PAYOFF_STEPS + 1 }, (_, i) => {
+    const s = loRange + ((hiRange - loRange) * i) / PAYOFF_STEPS;
+    return { s, pnl: totalPnl(s) };
+  });
+
+  // Exact asymptotic slopes (not finite-differenced): below every strike only
+  // puts move (call intrinsic is flat at 0 there); above every strike only
+  // calls move (put intrinsic is flat at 0 there).
+  let lowSlope = 0;
+  let highSlope = 0;
+  for (const leg of legs) {
+    const sign = leg.side === "buy" ? 1 : -1;
+    if (leg.optionKind === "CALL") highSlope += sign;
+    else lowSlope += -sign;
+  }
+
+  const sampledPnls = points.map((p) => p.pnl);
+  const maxProfit = highSlope > 0 || lowSlope < 0 ? "unlimited" : Math.max(...sampledPnls);
+  const maxLoss = highSlope < 0 || lowSlope > 0 ? "unlimited" : Math.min(...sampledPnls);
+
+  const breakevens: number[] = [];
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    if ((a.pnl <= 0 && b.pnl > 0) || (a.pnl >= 0 && b.pnl < 0)) {
+      const t = a.pnl === b.pnl ? 0 : -a.pnl / (b.pnl - a.pnl);
+      breakevens.push(a.s + t * (b.s - a.s));
+    }
+  }
+
+  return { points, loRange, hiRange, maxLoss, maxProfit, breakevens };
+}
+
+function money(v: number | "unlimited"): string {
+  return v === "unlimited" ? "Unlimited" : `$${Math.abs(v).toFixed(2)}`;
+}
+
+function PayoffDiagram({ payoff }: { payoff: Payoff }) {
+  const W = 400;
+  const H = 140;
+  const pad = 4;
+  const pnls = payoff.points.map((p) => p.pnl);
+  const minPnl = Math.min(...pnls, 0);
+  const maxPnl = Math.max(...pnls, 0);
+  const pnlRange = Math.max(maxPnl - minPnl, 0.01);
+
+  const x = (s: number) => pad + ((s - payoff.loRange) / (payoff.hiRange - payoff.loRange)) * (W - 2 * pad);
+  const y = (pnl: number) => H - pad - ((pnl - minPnl) / pnlRange) * (H - 2 * pad);
+
+  const path = payoff.points.map((p, i) => `${i === 0 ? "M" : "L"}${x(p.s).toFixed(1)},${y(p.pnl).toFixed(1)}`).join(" ");
+  const zeroY = y(0);
+
+  return (
+    <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img" aria-label="Payoff at expiry">
+      <line x1={0} y1={zeroY} x2={W} y2={zeroY} stroke="var(--mantine-color-dark-3)" strokeWidth={1} />
+      {payoff.breakevens.map((be) => (
+        <line
+          key={be}
+          x1={x(be)}
+          y1={0}
+          x2={x(be)}
+          y2={H}
+          stroke="var(--mantine-color-dark-2)"
+          strokeWidth={1}
+          strokeDasharray="3 3"
+        />
+      ))}
+      <path d={path} fill="none" stroke="var(--mantine-color-depth-6)" strokeWidth={2} strokeLinejoin="round" />
+    </svg>
+  );
+}
 
 // Outcomes where the order is actually live at the venue — the only ones
 // worth calling "sent" in the summary toast/title.
@@ -101,6 +205,7 @@ export function StrategyTicket({
     0,
   );
   const allLegsPriced = pricedLegs.length === legs.length;
+  const payoff = allLegsPriced && legs.length > 0 ? computePayoff(legs) : null;
 
   async function confirmSubmit() {
     if (!portfolioId) return;
@@ -203,11 +308,49 @@ export function StrategyTicket({
           );
         })}
 
-        <Text size="sm" c="dimmed">
-          {allLegsPriced
-            ? `Net ${netPremium >= 0 ? "debit" : "credit"} ${Math.abs(netPremium).toFixed(2)} (reference only)`
-            : "Net premium unavailable — not every leg has a live price"}
-        </Text>
+        {payoff ? (
+          <>
+            <PayoffDiagram payoff={payoff} />
+            <SimpleGrid cols={4} spacing="xs">
+              <Stack gap={0} align="center">
+                <Text size="xs" c="dimmed">
+                  Max loss
+                </Text>
+                <Text size="sm" c="offer" fw={600}>
+                  {money(payoff.maxLoss)}
+                </Text>
+              </Stack>
+              <Stack gap={0} align="center">
+                <Text size="xs" c="dimmed">
+                  Max profit
+                </Text>
+                <Text size="sm" c="depth" fw={600}>
+                  {money(payoff.maxProfit)}
+                </Text>
+              </Stack>
+              <Stack gap={0} align="center">
+                <Text size="xs" c="dimmed">
+                  Breakeven{payoff.breakevens.length === 1 ? "" : "s"}
+                </Text>
+                <Text size="sm" fw={600}>
+                  {payoff.breakevens.length > 0 ? payoff.breakevens.map((b) => b.toFixed(2)).join(" / ") : "—"}
+                </Text>
+              </Stack>
+              <Stack gap={0} align="center">
+                <Text size="xs" c="dimmed">
+                  Net {netPremium >= 0 ? "debit" : "credit"}
+                </Text>
+                <Text size="sm" fw={600}>
+                  ${Math.abs(netPremium).toFixed(2)}
+                </Text>
+              </Stack>
+            </SimpleGrid>
+          </>
+        ) : (
+          <Text size="sm" c="dimmed">
+            Payoff diagram needs a live price on every leg — unavailable right now.
+          </Text>
+        )}
 
         {phase !== "done" && (
           <>

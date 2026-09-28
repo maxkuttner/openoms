@@ -411,11 +411,11 @@ export function InstrumentSearchModal({
             <Table striped highlightOnHover>
               <Table.Thead>
                 <Table.Tr>
-                  <Table.Th colSpan={2} ta="center">
+                  <Table.Th colSpan={2} ta="center" c="depth">
                     Calls
                   </Table.Th>
                   <Table.Th ta="center">Strike</Table.Th>
-                  <Table.Th colSpan={2} ta="center">
+                  <Table.Th colSpan={2} ta="center" c="offer">
                     Puts
                   </Table.Th>
                 </Table.Tr>
@@ -441,6 +441,7 @@ export function InstrumentSearchModal({
                         style={{ cursor: row.call ? "pointer" : "default" }}
                         onClick={() => row.call && toggleLeg(row, "call", "sell")}
                         bg={has("call", "sell") ? "var(--mantine-color-offer-light)" : undefined}
+                        c={row.call ? "depth" : "dimmed"}
                       >
                         {row.call ? callMark?.bid ?? "—" : "—"}
                       </Table.Td>
@@ -448,16 +449,19 @@ export function InstrumentSearchModal({
                         style={{ cursor: row.call ? "pointer" : "default" }}
                         onClick={() => row.call && toggleLeg(row, "call", "buy")}
                         bg={has("call", "buy") ? "var(--mantine-color-depth-light)" : undefined}
+                        c={row.call ? "depth" : "dimmed"}
+                        fw={600}
                       >
                         {row.call ? callMark?.ask ?? "—" : "—"}
                       </Table.Td>
-                      <Table.Td ta="center" fw={600}>
+                      <Table.Td ta="center" fw={700}>
                         {row.strike}
                       </Table.Td>
                       <Table.Td
                         style={{ cursor: row.put ? "pointer" : "default" }}
                         onClick={() => row.put && toggleLeg(row, "put", "sell")}
                         bg={has("put", "sell") ? "var(--mantine-color-offer-light)" : undefined}
+                        c={row.put ? "offer" : "dimmed"}
                       >
                         {row.put ? putMark?.bid ?? "—" : "—"}
                       </Table.Td>
@@ -465,6 +469,8 @@ export function InstrumentSearchModal({
                         style={{ cursor: row.put ? "pointer" : "default" }}
                         onClick={() => row.put && toggleLeg(row, "put", "buy")}
                         bg={has("put", "buy") ? "var(--mantine-color-depth-light)" : undefined}
+                        c={row.put ? "offer" : "dimmed"}
+                        fw={600}
                       >
                         {row.put ? putMark?.ask ?? "—" : "—"}
                       </Table.Td>
