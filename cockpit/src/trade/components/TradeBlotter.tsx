@@ -229,9 +229,16 @@ export function TradeBlotter({
                 >
                   <Table.Td>{new Date(o.created_at).toLocaleString()}</Table.Td>
                   <Table.Td>
-                    <Tooltip label={o.instrument_name ?? `id ${o.instrument_id}`} disabled={!o.instrument_name}>
-                      <Text size="sm">{o.instrument_symbol ?? o.instrument_id}</Text>
-                    </Tooltip>
+                    <Stack gap={0}>
+                      <Tooltip label={o.instrument_name ?? `id ${o.instrument_id}`} disabled={!o.instrument_name}>
+                        <Text size="sm">{o.instrument_symbol ?? o.instrument_id}</Text>
+                      </Tooltip>
+                      {o.client_order_id.startsWith("combo-") && (
+                        <Badge size="xs" variant="dot" color="gray">
+                          {o.client_order_id}
+                        </Badge>
+                      )}
+                    </Stack>
                   </Table.Td>
                   <Table.Td>
                     <Badge color={sideColor(o.side)} variant="light">

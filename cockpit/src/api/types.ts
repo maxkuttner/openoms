@@ -182,6 +182,7 @@ export interface RiskLimit {
 
 export interface BlotterRow {
   order_id: string;
+  client_order_id: string;
   principal_id: string;
   principal_code: string;
   portfolio_id: string;

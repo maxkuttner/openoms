@@ -1,11 +1,14 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Grid, Tabs } from "@mantine/core";
+import { Button, Grid, Tabs } from "@mantine/core";
 import type { Me } from "../App";
 import { TradeBlotter } from "../components/TradeBlotter";
 import { OrderTicket } from "../components/OrderTicket";
+import { StrategyTicket } from "../components/StrategyTicket";
+import { InstrumentSearchModal } from "../components/InstrumentSearchModal";
 import { Watchlist } from "../components/Watchlist";
 import { PositionsPage } from "./Positions";
+import type { StrategyLeg } from "../types";
 
 export function TradePage({ me }: { me: Me }) {
   const queryClient = useQueryClient();
@@ -27,10 +30,10 @@ export function TradePage({ me }: { me: Me }) {
   // The instrument a trader last clicked in the Watchlist — the full row
   // (id/symbol/venue/name), not just the id: OrderTicket needs the full
   // shape to set BOTH its instrumentId and selectedInstrument (the
-  // confirmation modal's label is built from the latter, not the id). Handed
-  // down to OrderTicket as selectedInstrument, which adopts it into its own
-  // internal state (see OrderTicket.tsx) — this does not make the ticket's
-  // instrument field fully controlled from here.
+  // confirmation modal's label is built from selectedInstrument, not
+  // instrumentId). Handed down to OrderTicket as selectedInstrument, which
+  // adopts it into its own internal state (see OrderTicket.tsx) — this does
+  // not make the ticket's instrument field fully controlled from here.
   const [selectedInstrument, setSelectedInstrument] = useState<{
     id: string;
     symbol: string;
@@ -38,39 +41,71 @@ export function TradePage({ me }: { me: Me }) {
     name: string;
   } | null>(null);
 
+  // Set only when InstrumentSearchModal returns more than one leg — while
+  // set, StrategyTicket renders in the order-ticket slot instead of
+  // OrderTicket. A single-leg pick (search or Watchlist) always goes through
+  // the unmodified OrderTicket via selectedInstrument above.
+  const [pendingLegs, setPendingLegs] = useState<StrategyLeg[] | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  function onOrdersSubmitted(latestOrderId: string) {
+    setFollowOrderId(latestOrderId);
+    setActiveTab("orders");
+    queryClient.invalidateQueries({ queryKey: ["/orders"] });
+  }
+
   return (
-    <Grid>
-      <Grid.Col span={{ base: 12, md: 3 }}>
-        <Watchlist onSelectInstrument={setSelectedInstrument} />
-      </Grid.Col>
-      <Grid.Col span={{ base: 12, md: 3 }}>
-        <OrderTicket
-          portfolios={me.portfolios}
-          selectedWatchlistInstrument={selectedInstrument}
-          onSubmitted={(orderId) => {
-            setFollowOrderId(orderId);
-            setActiveTab("orders");
-            // Nudge the blotter's own poll (queryKey ["/orders"], see
-            // TradeBlotter.tsx) to refetch right away instead of waiting out
-            // its interval.
-            queryClient.invalidateQueries({ queryKey: ["/orders"] });
-          }}
-        />
-      </Grid.Col>
-      <Grid.Col span={{ base: 12, md: 6 }}>
-        <Tabs value={activeTab} onChange={setActiveTab}>
-          <Tabs.List>
-            <Tabs.Tab value="orders">Orders</Tabs.Tab>
-            <Tabs.Tab value="positions">Positions</Tabs.Tab>
-          </Tabs.List>
-          <Tabs.Panel value="orders" pt="md">
-            <TradeBlotter portfolios={me.portfolios} followOrderId={followOrderId} />
-          </Tabs.Panel>
-          <Tabs.Panel value="positions" pt="md">
-            <PositionsPage me={me} />
-          </Tabs.Panel>
-        </Tabs>
-      </Grid.Col>
-    </Grid>
+    <>
+      <InstrumentSearchModal
+        opened={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        onPickSingle={(instrument) => {
+          setPendingLegs(null);
+          setSelectedInstrument(instrument);
+        }}
+        onPickLegs={(legs) => setPendingLegs(legs)}
+      />
+      <Grid>
+        <Grid.Col span={{ base: 12, md: 3 }}>
+          <Button fullWidth variant="light" mb="sm" onClick={() => setSearchOpen(true)}>
+            Search instruments
+          </Button>
+          <Watchlist onSelectInstrument={setSelectedInstrument} />
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 3 }}>
+          {pendingLegs ? (
+            <StrategyTicket
+              portfolios={me.portfolios}
+              legs={pendingLegs}
+              onCancel={() => setPendingLegs(null)}
+              onSubmitted={(orderIds) => {
+                setPendingLegs(null);
+                if (orderIds.length > 0) onOrdersSubmitted(orderIds[orderIds.length - 1]);
+              }}
+            />
+          ) : (
+            <OrderTicket
+              portfolios={me.portfolios}
+              selectedWatchlistInstrument={selectedInstrument}
+              onSubmitted={onOrdersSubmitted}
+            />
+          )}
+        </Grid.Col>
+        <Grid.Col span={{ base: 12, md: 6 }}>
+          <Tabs value={activeTab} onChange={setActiveTab}>
+            <Tabs.List>
+              <Tabs.Tab value="orders">Orders</Tabs.Tab>
+              <Tabs.Tab value="positions">Positions</Tabs.Tab>
+            </Tabs.List>
+            <Tabs.Panel value="orders" pt="md">
+              <TradeBlotter portfolios={me.portfolios} followOrderId={followOrderId} />
+            </Tabs.Panel>
+            <Tabs.Panel value="positions" pt="md">
+              <PositionsPage me={me} />
+            </Tabs.Panel>
+          </Tabs>
+        </Grid.Col>
+      </Grid>
+    </>
   );
 }
