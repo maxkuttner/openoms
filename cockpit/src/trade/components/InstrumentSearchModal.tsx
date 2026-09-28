@@ -241,9 +241,14 @@ export function InstrumentSearchModal({
     }
   }
 
-  const pricedChainLegs = legs.filter(
-    (l) => l.referencePrice != null || marks.data?.[Number(l.instrumentId)] != null,
-  );
+  // A marks.data entry always exists for every chain instrument once the
+  // query resolves (the modal seeds { bid: null, ask: null } per id), so its
+  // mere presence proves nothing — only the actual bid/ask value does.
+  const pricedChainLegs = legs.filter((l) => {
+    const mark = marks.data?.[Number(l.instrumentId)];
+    const resolvedPrice = l.referencePrice ?? (l.side === "buy" ? mark?.ask : mark?.bid) ?? null;
+    return resolvedPrice != null;
+  });
   const allChainLegsPriced = pricedChainLegs.length === legs.length && legs.length > 0;
   const netPremium = legs.reduce((sum, l) => {
     const price = l.referencePrice ?? marks.data?.[Number(l.instrumentId)]?.[l.side === "buy" ? "ask" : "bid"] ?? 0;
