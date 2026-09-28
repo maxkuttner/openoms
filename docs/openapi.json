@@ -960,6 +960,16 @@
               "format": "int64",
               "nullable": true
             }
+          },
+          {
+            "name": "client_order_id",
+            "in": "query",
+            "description": "Free-text reference set at submit time — not unique, so this can\nmatch several rows sharing one strategy's generated tag.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
           }
         ],
         "responses": {
@@ -2302,6 +2312,97 @@
         ]
       }
     },
+    "/instruments/options/chain": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "get_option_chain",
+        "parameters": [
+          {
+            "name": "underlying",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "expiry",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Strike-sorted chain rows",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ChainRow"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/instruments/options/expiries": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "list_option_expiries",
+        "parameters": [
+          {
+            "name": "underlying",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sorted distinct expiry dates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/orders": {
       "get": {
         "tags": [
@@ -2404,6 +2505,16 @@
             "schema": {
               "type": "integer",
               "format": "int64",
+              "nullable": true
+            }
+          },
+          {
+            "name": "client_order_id",
+            "in": "query",
+            "description": "Free-text reference set at submit time — not unique, so this can\nmatch several rows sharing one strategy's generated tag.",
+            "required": false,
+            "schema": {
+              "type": "string",
               "nullable": true
             }
           }
@@ -3037,6 +3148,7 @@
         "type": "object",
         "required": [
           "order_id",
+          "client_order_id",
           "principal_id",
           "principal_code",
           "portfolio_id",
@@ -3064,6 +3176,9 @@
             "nullable": true
           },
           "broker_connection_code": {
+            "type": "string"
+          },
+          "client_order_id": {
             "type": "string"
           },
           "created_at": {
@@ -3171,6 +3286,52 @@
           "reason": {
             "type": "string",
             "nullable": true
+          }
+        }
+      },
+      "ChainLeg": {
+        "type": "object",
+        "description": "One instrument on one side of one strike, for a chain row.",
+        "required": [
+          "instrument_id",
+          "symbol"
+        ],
+        "properties": {
+          "instrument_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "ChainRow": {
+        "type": "object",
+        "description": "One strike of an option chain. `call`/`put` are independently nullable —\na venue can list only one side of a strike, and this must say so rather\nthan omit the row or invent the missing leg.",
+        "required": [
+          "strike"
+        ],
+        "properties": {
+          "call": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChainLeg"
+              }
+            ],
+            "nullable": true
+          },
+          "put": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ChainLeg"
+              }
+            ],
+            "nullable": true
+          },
+          "strike": {
+            "type": "number",
+            "format": "double"
           }
         }
       },
@@ -3576,15 +3737,24 @@
           "name",
           "venue",
           "asset_class",
-          "status"
+          "instrument_class",
+          "status",
+          "has_options"
         ],
         "properties": {
           "asset_class": {
             "type": "string"
           },
+          "has_options": {
+            "type": "boolean",
+            "description": "Whether any `instrument_derivative` row names this instrument as its\nunderlying — lets a search UI offer \"view option chain\" without a\nsecond round trip."
+          },
           "id": {
             "type": "integer",
             "format": "int64"
+          },
+          "instrument_class": {
+            "type": "string"
           },
           "name": {
             "type": "string"
