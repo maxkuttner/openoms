@@ -1,3 +1,7 @@
+export type Side = "buy" | "sell";
+export type OrderType = "market" | "limit";
+export type TimeInForce = "day" | "gtc" | "ioc" | "fok";
+
 // Mirrors src/handlers.rs's MarkRow. A field is null when that half of the
 // data (live mark, or previous close) hasn't been populated for this
 // instrument yet — never a fabricated 0, so callers must not `?? 0` these.

@@ -3,34 +3,15 @@ import { useQuery } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
 import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title, UnstyledButton } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
+import { submitOrder, RECORDED_NOT_ROUTED } from "../api/submitOrder";
 import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
 import type { GrantedPortfolio } from "../App";
-import type { VenueOption } from "../types";
-
-type Side = "buy" | "sell";
-type OrderType = "market" | "limit";
-type TimeInForce = "day" | "gtc" | "ioc" | "fok";
+import type { VenueOption, Side, OrderType, TimeInForce } from "../types";
 
 function notifyError(err: unknown) {
   const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
   notifications.show({ message, color: "red" });
 }
-
-// What GET /orders/{id} answers with; only the status matters here.
-// Mirrors OrderAggregateState in src/domain/orders/state.rs.
-type OrderState = { order_id: string; status: string };
-
-// The statuses that mean the venue has the order. Anything else — notably
-// `submitted` — means the OMS wrote the order down but the broker does not
-// (yet) have it.
-const LIVE_AT_VENUE = new Set(["routed", "partially_filled", "filled"]);
-
-// Said whenever an order exists in the OMS but was never handed to a broker.
-// Nothing downstream will move it, so it sits at `submitted` forever unless
-// someone cancels it; the local cancel path (no external_order_id) works.
-const RECORDED_NOT_ROUTED =
-  "The order was RECORDED but NOT routed to the broker — nothing was sent to the venue. " +
-  "Cancel it in the blotter to clear it.";
 
 // Only what this ticket actually renders from a selected instrument: the
 // confirmation label ("SYMBOL@VENUE") and, if the pick came from outside
@@ -228,172 +209,114 @@ export function OrderTicket({
     setOrderId(crypto.randomUUID());
   }
 
-  // Reads an order back and says what it actually is. Used for 409, where the
-  // only honest answer is the server's own view of that order_id — a 409 can
-  // mean "your retry landed on a live order" or "you are re-sending an id that
-  // was recorded but never routed", and those are opposite outcomes.
-  async function reportExistingOrder(id: string) {
-    let status: string | null = null;
-    try {
-      const order = await tradeApi.get<OrderState>(`/orders/${id}`);
-      status = order?.status ?? null;
-    } catch {
-      // Could not read it back. Say exactly that rather than pick a story.
-      status = null;
-    }
-
-    if (status === null) {
-      notifications.show({
-        color: "orange",
-        title: "Already submitted — status unknown",
-        message:
-          "An order with this id already exists, but reading it back failed. " +
-          "Check the blotter before sending anything else.",
-        autoClose: false,
-      });
-      return;
-    }
-
-    if (LIVE_AT_VENUE.has(status)) {
-      notifications.show({
-        color: "green",
-        title: "Order sent",
-        message: `${side === "buy" ? "Buy" : "Sell"} ${quantity} ${instrumentLabel} — status ${status}.`,
-      });
-      return;
-    }
-
-    if (status === "submitted") {
-      notifications.show({
-        color: "orange",
-        title: "Order NOT sent",
-        message: `This order id already exists and is still \`submitted\`. ${RECORDED_NOT_ROUTED}`,
-        autoClose: false,
-      });
-      return;
-    }
-
-    // rejected / canceled / expired / suspended — it exists and it is not live.
-    notifications.show({
-      color: "red",
-      title: `Order NOT sent — already ${status}`,
-      message: `An order with this id already exists and its status is ${status}. See the blotter.`,
-      autoClose: false,
-    });
-  }
-
   async function confirmSubmit() {
     setSubmitting(true);
     try {
-      await tradeApi.post("/orders/submit", {
-        order_id: orderId,
-        // The server requires its own free-text reference distinct from the
-        // idempotency key (client_order_id: String, not optional — see
-        // SubmitOrderRequest in src/handlers.rs). Nothing in this UI needs a
-        // second identity for an order it only ever submits once, so it
-        // reuses order_id here too.
-        client_order_id: orderId,
-        portfolio_id: portfolioId,
-        instrument_id: instrumentId,
+      const outcome = await submitOrder({
+        orderId,
+        clientOrderId: orderId,
+        portfolioId: portfolioId!,
+        accountId:
+          venues.data?.find((v) => v.eligible && v.account_id === selectedAccountId)?.account_id ?? undefined,
+        instrumentId: instrumentId!,
         side,
         quantity: Number(quantity),
-        order_type: orderType,
-        time_in_force: tif,
-        limit_price: orderType === "limit" ? Number(limitPrice) : undefined,
-        // selectedAccountId may hold a synthetic `none:...` value picked from
-        // a disabled option (see the Venue Select above) — never send that as
-        // account_id. Only an ELIGIBLE row's account_id is ever a real
-        // account to route through; checking `eligible` here (not just
-        // matching the id) keeps this true even if the ids ever collided.
-        account_id:
-          venues.data?.find((v) => v.eligible && v.account_id === selectedAccountId)?.account_id ?? undefined,
+        orderType,
+        timeInForce: tif,
+        limitPrice: orderType === "limit" ? Number(limitPrice) : undefined,
       });
-      notifications.show({
-        color: "green",
-        title: "Order sent",
-        message: `${side === "buy" ? "Buy" : "Sell"} ${quantity} ${instrumentLabel}`,
-      });
-      setConfirmOpen(false);
-      onSubmitted(orderId);
-      reset();
-    } catch (err) {
-      if (err instanceof ApiError) {
-        switch (err.status) {
-          case 409:
-            // This exact order_id already exists. That is USUALLY the
-            // idempotency contract absorbing a repeat (double-click, retry,
-            // dropped-then-resent connection) — but it is NOT automatically
-            // success, and asserting that it is, is how this screen came to
-            // tell a trader an order was sent when it was not.
-            //
-            // The server commits the order row before it routes (see
-            // orders_submit in src/handlers.rs), so a 502 ("broker rejected")
-            // or 503 ("no adapter registered") leaves the order persisted at
-            // `submitted` with the same order_id. Re-confirming after such a
-            // failure — say, with a corrected limit price — then answers 409,
-            // and the old code showed "Order sent".
-            //
-            // So we do not guess: we read the order back and report its real
-            // status. The id is spent either way, hence reset().
-            setConfirmOpen(false);
-            await reportExistingOrder(orderId);
-            onSubmitted(orderId);
-            reset();
-            break;
-          case 422:
-            // Unknown/inactive instrument, no tradeable broker mapping, or a
-            // pre-trade risk rejection. The server's message carries the
-            // reason (e.g. "risk check failed [...]: notional limit
-            // breached") and is shown verbatim — it is information the
-            // trader needs, not a generic failure.
-            notifications.show({ color: "red", title: "Rejected", message: err.message });
-            break;
-          case 502:
-            // Broker rejected the order; the venue's own message, verbatim —
-            // plus what the trader cannot see from the blotter, because no
-            // route-failure event is written: the order row already exists and
-            // is stuck at `submitted`, indistinguishable from a live one.
-            notifications.show({
-              color: "red",
-              title: "Broker rejected — order NOT sent",
-              message: `${err.message} ${RECORDED_NOT_ROUTED}`,
-              autoClose: false,
-            });
-            // The order exists, so point the blotter at it: that row is the
-            // one the trader has to cancel.
-            onSubmitted(orderId);
-            break;
-          case 503:
-            notifications.show({
-              color: "orange",
-              title: "No broker configured — order NOT sent",
-              message: `An operator needs to configure a broker connection. ${RECORDED_NOT_ROUTED}`,
-              autoClose: false,
-            });
-            onSubmitted(orderId);
-            break;
-          case 403:
-            // portfolios is already filtered to can_trade above, so this
-            // should be unreachable. Presented as a bug to report, not a
-            // routine rejection.
-            notifications.show({
-              color: "red",
-              title: "Not permitted",
-              message: "This portfolio is not tradeable by your account. Please report this.",
-            });
-            break;
-          default:
-            notifyError(err);
-        }
-      } else {
-        notifyError(err);
+
+      switch (outcome.kind) {
+        case "sent":
+          notifications.show({
+            color: "green",
+            title: "Order sent",
+            message: `${side === "buy" ? "Buy" : "Sell"} ${quantity} ${instrumentLabel}`,
+          });
+          setConfirmOpen(false);
+          onSubmitted(orderId);
+          reset();
+          break;
+        case "idempotent_live":
+          notifications.show({
+            color: "green",
+            title: "Order sent",
+            message: `${side === "buy" ? "Buy" : "Sell"} ${quantity} ${instrumentLabel} — status ${outcome.status}.`,
+          });
+          setConfirmOpen(false);
+          onSubmitted(orderId);
+          reset();
+          break;
+        case "idempotent_recorded":
+          notifications.show({
+            color: "orange",
+            title: "Order NOT sent",
+            message: `This order id already exists and is still \`submitted\`. ${RECORDED_NOT_ROUTED}`,
+            autoClose: false,
+          });
+          setConfirmOpen(false);
+          onSubmitted(orderId);
+          reset();
+          break;
+        case "idempotent_terminal":
+          notifications.show({
+            color: "red",
+            title: `Order NOT sent — already ${outcome.status}`,
+            message: `An order with this id already exists and its status is ${outcome.status}. See the blotter.`,
+            autoClose: false,
+          });
+          setConfirmOpen(false);
+          onSubmitted(orderId);
+          reset();
+          break;
+        case "idempotent_unknown":
+          notifications.show({
+            color: "orange",
+            title: "Already submitted — status unknown",
+            message:
+              "An order with this id already exists, but reading it back failed. " +
+              "Check the blotter before sending anything else.",
+            autoClose: false,
+          });
+          setConfirmOpen(false);
+          onSubmitted(orderId);
+          reset();
+          break;
+        case "rejected":
+          notifications.show({ color: "red", title: "Rejected", message: outcome.message });
+          break;
+        case "broker_rejected":
+          notifications.show({
+            color: "red",
+            title: "Broker rejected — order NOT sent",
+            message: `${outcome.message} ${RECORDED_NOT_ROUTED}`,
+            autoClose: false,
+          });
+          onSubmitted(orderId);
+          break;
+        case "no_broker":
+          notifications.show({
+            color: "orange",
+            title: "No broker configured — order NOT sent",
+            message: `An operator needs to configure a broker connection. ${RECORDED_NOT_ROUTED}`,
+            autoClose: false,
+          });
+          onSubmitted(orderId);
+          break;
+        case "not_permitted":
+          // portfolios is already filtered to can_trade above, so this
+          // should be unreachable. Presented as a bug to report, not a
+          // routine rejection.
+          notifications.show({
+            color: "red",
+            title: "Not permitted",
+            message: "This portfolio is not tradeable by your account. Please report this.",
+          });
+          break;
+        case "unknown_error":
+          notifications.show({ message: outcome.message, color: "red" });
+          break;
       }
-      // No case for 401: tradeApi redirects to the identity provider on 401
-      // and returns a promise that never resolves, so this catch never runs
-      // for it — accepted behaviour, not worked around. The page navigates
-      // away entirely; on return from a fresh login this component remounts,
-      // so every field (and the idempotency key) starts empty rather than
-      // replaying an order the trader may no longer intend.
     } finally {
       setSubmitting(false);
     }
@@ -542,7 +465,7 @@ export function OrderTicket({
       </Stack>
 
       {/* The confirmation is the only path to the API: no other button here
-          ever calls tradeApi.post. It restates the resolved order in words so
+          ever calls submitOrder. It restates the resolved order in words so
           the trader confirms what will actually be sent, not just that they
           clicked a button. */}
       <Modal opened={confirmOpen} onClose={() => !submitting && setConfirmOpen(false)} title="Confirm order">
