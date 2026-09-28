@@ -25,3 +25,41 @@ export interface VenueOption {
   eligible: boolean;
   reason: string | null;
 }
+
+// Mirrors src/admin.rs's InstrumentSummary (GET /instruments).
+export interface SearchInstrument {
+  id: number;
+  symbol: string;
+  name: string;
+  venue: string;
+  asset_class: string;
+  instrument_class: string;
+  status: string;
+  has_options: boolean;
+}
+
+// Mirrors src/instruments_api.rs's ChainLeg/ChainRow (GET /instruments/options/chain).
+export interface ChainLeg {
+  instrument_id: number;
+  symbol: string;
+}
+export interface ChainRow {
+  strike: number;
+  call: ChainLeg | null;
+  put: ChainLeg | null;
+}
+
+// One leg of a strategy assembled in InstrumentSearchModal, handed to
+// StrategyTicket on "Use this combo".
+export interface StrategyLeg {
+  instrumentId: string;
+  symbol: string;
+  optionKind: "CALL" | "PUT";
+  strike: number;
+  expiry: string; // YYYY-MM-DD
+  side: Side;
+  // The touched bid/ask at pick time, shown on the ticket for reference —
+  // never sent to the server. submitOrder always trades at whatever
+  // order type/price the ticket itself is set to.
+  referencePrice: number | null;
+}
