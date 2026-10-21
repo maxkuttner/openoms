@@ -1,5 +1,4 @@
 use std::env;
-use std::time::Duration;
 
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
@@ -125,24 +124,91 @@ pub async fn publish_events(
             .key(order_id)
             .payload(payload.as_str());
 
-        match client.producer.send(record, Duration::from_secs(5)).await {
-            Ok((partition, offset)) => {
-                tracing::info!(
-                    order_id = %order_id,
-                    event_type = %event.event_type.as_str(),
-                    partition,
-                    offset,
-                    "published event to Kafka"
-                );
+        // Enqueue without awaiting delivery. `send(..).await` waits until the
+        // broker acks or librdkafka's `message.timeout.ms` (300s) expires, and
+        // every caller — order submit, cancel, fills off the broker streams —
+        // sits on that await, so a down Kafka stalled each order ~5 minutes
+        // before it reached the broker. Publishing is non-fatal; the delivery
+        // outcome is only logged, from a detached task. Enqueueing here, in
+        // call order, keeps the per-order event order on the partition.
+        let event_type = event.event_type.as_str();
+        match client.producer.send_result(record) {
+            Ok(delivery) => {
+                let order_id = order_id.to_string();
+                tokio::spawn(async move {
+                    match delivery.await {
+                        Ok(Ok((partition, offset))) => tracing::info!(
+                            order_id = %order_id,
+                            event_type = %event_type,
+                            partition,
+                            offset,
+                            "published event to Kafka"
+                        ),
+                        Ok(Err((err, _msg))) => tracing::error!(
+                            order_id = %order_id,
+                            event_type = %event_type,
+                            error = ?err,
+                            "failed to publish event to Kafka (non-fatal)"
+                        ),
+                        Err(_canceled) => tracing::error!(
+                            order_id = %order_id,
+                            event_type = %event_type,
+                            "Kafka producer dropped before delivery (non-fatal)"
+                        ),
+                    }
+                });
             }
-            Err((err, _msg)) => {
+            Err((err, _record)) => {
                 tracing::error!(
                     order_id = %order_id,
-                    event_type = %event.event_type.as_str(),
+                    event_type = %event_type,
                     error = ?err,
-                    "failed to publish event to Kafka (non-fatal)"
+                    "failed to enqueue event for Kafka (non-fatal)"
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload, OrderEventType};
+    use crate::domain::orders::state::OrderStatus;
+
+    /// Regression: with the broker unreachable, `publish_events` used to await
+    /// delivery until librdkafka's `message.timeout.ms` (300s default) — and
+    /// every caller (order submit, cancel, fills off the broker streams) sits
+    /// on that await, so a down Kafka stalled each order ~5 minutes before it
+    /// reached the broker. Publishing is non-fatal by design; it must not wait.
+    #[tokio::test]
+    async fn publish_does_not_wait_for_an_unreachable_broker() {
+        let config = KafkaConfig {
+            brokers: "127.0.0.1:1".to_string(),
+            client_id: "publish-test".to_string(),
+            orders_topic: "orders".to_string(),
+            projector_group_id: "unused".to_string(),
+        };
+        let client = KafkaClient::new(&config).expect("producer builds without a broker");
+        let event = OrderDomainEvent {
+            event_id: "e-1".to_string(),
+            event_type: OrderEventType::OrderCanceled,
+            order_id: "o-1".to_string(),
+            timestamp: chrono::Utc::now(),
+            actor: "test".to_string(),
+            payload: OrderEventPayload::OrderCanceled { reason: None },
+            version: 1,
+            status_after: OrderStatus::Canceled,
+        };
+
+        let started = std::time::Instant::now();
+        publish_events(Some(&client), "o-1", &[event.clone(), event]).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "publish_events blocked for {:?}",
+            started.elapsed()
+        );
     }
 }
