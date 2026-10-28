@@ -6,7 +6,7 @@
 //! admin token.
 
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     http::StatusCode,
     Json,
 };
@@ -16,6 +16,7 @@ use sqlx::PgPool;
 
 use crate::admin::{InstrumentSearch, InstrumentSummary};
 use crate::app_state::AppState;
+use crate::auth::AuthContext;
 use crate::handlers::ApiError;
 
 /// Default to 50, clamp into `[1, 200]` — a zero, negative or absent limit
@@ -26,26 +27,64 @@ fn clamp_limit(limit: Option<i64>) -> i64 {
     limit.unwrap_or(50).clamp(1, 200)
 }
 
+/// The query as a literal inside an ILIKE pattern: `%`, `_` and the escape
+/// character itself would otherwise act as wildcards.
+fn escape_like(search: &str) -> String {
+    search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 /// The one query behind both the admin and trader endpoints.
+///
+/// Ranked the way trading terminals rank a symbol search, strongest first:
+/// 1. match quality — exact symbol, symbol prefix, a word of the name
+///    starting with the query, then plain substring;
+/// 2. the searching principal's own instruments (watched, held in a
+///    portfolio it may view, or ordered) — `None` for the admin catalog;
+/// 3. option contracts after everything else, so a popular underlying's
+///    thousands of contracts never crowd its stock/ETF matches off the page;
+/// 4. shorter symbols, then alphabetical.
 pub async fn search_instruments(
     pool: &PgPool,
     search: Option<&str>,
     limit: Option<i64>,
+    principal: Option<uuid::Uuid>,
 ) -> Result<Vec<InstrumentSummary>, sqlx::Error> {
-    let pattern = search.map(|s| format!("%{s}%"));
     let limit = clamp_limit(limit);
 
     sqlx::query_as::<_, InstrumentSummary>(
-        "SELECT i.id, i.symbol, i.name, i.venue, i.asset_class, i.instrument_class, i.status, \
+        "WITH mine AS ( \
+             SELECT instrument_id FROM watchlist_item WHERE principal_id = $3 \
+             UNION \
+             SELECT p.instrument_id FROM position p \
+             JOIN principal_portfolio_grant g ON g.portfolio_id = p.portfolio_id \
+             WHERE g.principal_id = $3 AND g.can_view AND p.net_qty <> 0 \
+             UNION \
+             SELECT instrument_id FROM order_state WHERE principal_id = $3 \
+         ) \
+         SELECT i.id, i.symbol, i.name, i.venue, i.asset_class, i.instrument_class, i.status, \
                 EXISTS (SELECT 1 FROM public.instrument_derivative d \
                         WHERE d.underlying_id = i.id OR d.underlying_symbol = i.symbol) AS has_options \
          FROM public.instrument i \
-         WHERE i.status = 'ACTIVE' AND ($1::text IS NULL OR i.symbol ILIKE $1 OR i.name ILIKE $1) \
-         ORDER BY i.symbol \
+         WHERE i.status = 'ACTIVE' \
+           AND ($1::text IS NULL OR i.symbol ILIKE '%' || $1 || '%' OR i.name ILIKE '%' || $1 || '%') \
+         ORDER BY \
+           CASE \
+             WHEN $1::text IS NULL THEN 0 \
+             WHEN upper(i.symbol) = upper($4) THEN 0 \
+             WHEN i.symbol ILIKE $1 || '%' THEN 1 \
+             WHEN i.name ILIKE $1 || '%' OR i.name ILIKE '% ' || $1 || '%' THEN 2 \
+             ELSE 3 \
+           END, \
+           CASE WHEN i.id::text IN (SELECT instrument_id FROM mine) THEN 0 ELSE 1 END, \
+           CASE WHEN i.instrument_class = 'OPTION' THEN 1 ELSE 0 END, \
+           length(i.symbol), \
+           i.symbol \
          LIMIT $2",
     )
-    .bind(pattern)
+    .bind(search.map(escape_like))
     .bind(limit)
+    .bind(principal)
+    .bind(search)
     .fetch_all(pool)
     .await
 }
@@ -61,9 +100,10 @@ pub async fn search_instruments(
 )]
 pub async fn list_instruments_for_trader(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Query(params): Query<InstrumentSearch>,
 ) -> Result<Json<Vec<InstrumentSummary>>, ApiError> {
-    search_instruments(state.pool(), params.search.as_deref(), params.limit)
+    search_instruments(state.pool(), params.search.as_deref(), params.limit, Some(auth.principal_id))
         .await
         .map(Json)
         .map_err(|err| ApiError {
@@ -217,7 +257,7 @@ mod tests {
         let active = seed_instrument(&pool, "ZZTESTA", "ACTIVE").await;
         let inactive = seed_instrument(&pool, "ZZTESTI", "INACTIVE").await;
 
-        let rows = search_instruments(&pool, Some("ZZTEST"), None).await.expect("search");
+        let rows = search_instruments(&pool, Some("ZZTEST"), None, None).await.expect("search");
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
 
         assert!(ids.contains(&active), "an ACTIVE instrument must be findable");
@@ -228,6 +268,14 @@ mod tests {
     /// pinned, independent of what any particular search happens to match.
     /// A vacuous search-based assertion (previously used here) would pass
     /// even with `.clamp()` deleted entirely — see fix-round-1 report.
+    #[test]
+    fn like_wildcards_in_a_query_are_literal() {
+        assert_eq!(escape_like("BRK_B"), "BRK\\_B");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like(r"A\B"), r"A\\B");
+        assert_eq!(escape_like("AAPL"), "AAPL");
+    }
+
     #[test]
     fn the_limit_is_clamped_to_the_documented_range() {
         assert_eq!(clamp_limit(None), 50, "default is 50");
@@ -247,7 +295,7 @@ mod tests {
             seed_instrument(&pool, &format!("{prefix}{i}"), "ACTIVE").await;
         }
 
-        let rows = search_instruments(&pool, Some(&prefix), Some(2)).await.expect("search");
+        let rows = search_instruments(&pool, Some(&prefix), Some(2), None).await.expect("search");
         assert_eq!(rows.len(), 2, "LIMIT 2 must return exactly 2 of the 3 matching rows");
     }
 
@@ -258,11 +306,135 @@ mod tests {
         let id = seed_instrument(&pool, "ZZNAMEHUNT", "ACTIVE").await;
 
         // seed_instrument sets name = "Test <symbol>", so both paths are covered.
-        let by_symbol = search_instruments(&pool, Some("ZZNAMEHUNT"), None).await.expect("symbol");
-        let by_name = search_instruments(&pool, Some("Test ZZNAMEHUNT"), None).await.expect("name");
+        let by_symbol = search_instruments(&pool, Some("ZZNAMEHUNT"), None, None).await.expect("symbol");
+        let by_name = search_instruments(&pool, Some("Test ZZNAMEHUNT"), None, None).await.expect("name");
 
         assert!(by_symbol.iter().any(|r| r.id == id));
         assert!(by_name.iter().any(|r| r.id == id));
+    }
+
+    /// "AAPL" used to come back as AAPB, AAPD, AAPE … AAPL — alphabetical, so
+    /// the exact ticker sank below every longer symbol containing it. Ranking
+    /// is by match quality: exact symbol, symbol prefix, a word of the name
+    /// starting with the query, then plain substring.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn results_rank_by_match_quality_not_alphabet() {
+        let pool = test_pool().await;
+        let q = unique_query("ZZRANK");
+        // Seeded so that alphabetical order would be the exact reverse.
+        let substring = seed_named(&pool, &format!("A{q}"), "Unrelated", "SPOT").await;
+        let name_word = seed_named(&pool, &unique_query("ZZRNAME"), &format!("Fund {q} Trust"), "SPOT").await;
+        let prefix = seed_named(&pool, &format!("{q}A"), "Unrelated", "SPOT").await;
+        let exact = seed_named(&pool, &q, "Unrelated", "SPOT").await;
+        let seeded = [substring, name_word, prefix, exact];
+
+        let ids = ranked_ids(&search_instruments(&pool, Some(&q.to_lowercase()), None, None).await.expect("search"), &seeded);
+        cleanup(&pool, &seeded, None).await;
+
+        assert_eq!(ids, vec![exact, prefix, name_word, substring]);
+    }
+
+    /// An option contract on a popular underlying (SPY has ~6,800) must not
+    /// crowd stocks/ETFs out of the first page, but stays findable by its
+    /// own symbol — ranked last within its match tier rather than hidden.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn options_rank_after_non_options_in_the_same_tier() {
+        let pool = test_pool().await;
+        let q = unique_query("ZZOPTR");
+        let option = seed_named(&pool, &format!("{q}A"), "Unrelated", "OPTION").await;
+        let spot = seed_named(&pool, &format!("{q}B"), "Unrelated", "SPOT").await;
+        let seeded = [option, spot];
+
+        let ids = ranked_ids(&search_instruments(&pool, Some(&q), None, None).await.expect("search"), &seeded);
+        cleanup(&pool, &seeded, None).await;
+
+        assert_eq!(ids, vec![spot, option]);
+    }
+
+    /// Within one match tier, what the searching trader already watches,
+    /// holds or has ordered comes first. Never outranks a better match.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn the_traders_own_instruments_rank_first_within_a_tier() {
+        let pool = test_pool().await;
+        let q = unique_query("ZZMINE");
+        let exact = seed_named(&pool, &q, "Unrelated", "SPOT").await;
+        let other = seed_named(&pool, &format!("{q}A"), "Unrelated", "SPOT").await;
+        let watched = seed_named(&pool, &format!("{q}B"), "Unrelated", "SPOT").await;
+        let seeded = [exact, other, watched];
+
+        let principal = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, $2, 'HUMAN', 'ACTIVE')")
+            .bind(principal)
+            .bind(format!("zzmine-{principal}"))
+            .execute(&pool)
+            .await
+            .expect("seed principal");
+        sqlx::query("INSERT INTO watchlist_item (principal_id, instrument_id) VALUES ($1, $2)")
+            .bind(principal)
+            .bind(watched.to_string())
+            .execute(&pool)
+            .await
+            .expect("seed watchlist");
+
+        let mine = ranked_ids(&search_instruments(&pool, Some(&q), None, Some(principal)).await.expect("search"), &seeded);
+        let anyone = ranked_ids(&search_instruments(&pool, Some(&q), None, None).await.expect("search"), &seeded);
+        cleanup(&pool, &seeded, Some(principal)).await;
+
+        assert_eq!(mine, vec![exact, watched, other], "watched beats unwatched, never the exact match");
+        assert_eq!(anyone, vec![exact, other, watched], "no principal, no boost");
+    }
+
+    /// A symbol no seeded or catalog row could share, so ranking assertions
+    /// only ever see this test's own rows.
+    fn unique_query(prefix: &str) -> String {
+        format!("{prefix}{}", &uuid::Uuid::new_v4().simple().to_string()[..8]).to_uppercase()
+    }
+
+    /// The seeded ids in the order the search returned them.
+    fn ranked_ids(rows: &[InstrumentSummary], seeded: &[i64]) -> Vec<i64> {
+        rows.iter().map(|r| r.id).filter(|id| seeded.contains(id)).collect()
+    }
+
+    async fn seed_named(pool: &sqlx::PgPool, symbol: &str, name: &str, class: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO public.instrument \
+                 (symbol, name, venue, asset_class, instrument_class, currency, status, \
+                  price_precision, price_increment) \
+             VALUES ($1, $2, (SELECT code FROM public.venue ORDER BY code LIMIT 1), 'EQUITY', $3, \
+                     (SELECT code FROM public.currency ORDER BY code LIMIT 1), 'ACTIVE', 2, 0.01) \
+             RETURNING id",
+        )
+        .bind(symbol)
+        .bind(name)
+        .bind(class)
+        .fetch_one(pool)
+        .await
+        .expect("seed instrument")
+    }
+
+    /// Ranking tests remove what they seed — they run against the dev
+    /// database, and leftover rows would show up in a trader's real searches.
+    async fn cleanup(pool: &sqlx::PgPool, ids: &[i64], principal: Option<uuid::Uuid>) {
+        if let Some(principal) = principal {
+            sqlx::query("DELETE FROM watchlist_item WHERE principal_id = $1")
+                .bind(principal)
+                .execute(pool)
+                .await
+                .expect("cleanup watchlist");
+            sqlx::query("DELETE FROM principal WHERE id = $1")
+                .bind(principal)
+                .execute(pool)
+                .await
+                .expect("cleanup principal");
+        }
+        sqlx::query("DELETE FROM public.instrument WHERE id = ANY($1)")
+            .bind(ids)
+            .execute(pool)
+            .await
+            .expect("cleanup instruments");
     }
 
     /// Gives `symbol` (already seeded via `seed_instrument`) one option leg as
@@ -299,7 +471,7 @@ mod tests {
                 .expect("symbol");
         seed_option_leg(&pool, &with_symbol).await;
 
-        let with_rows = search_instruments(&pool, Some(&with_symbol), None).await.expect("search");
+        let with_rows = search_instruments(&pool, Some(&with_symbol), None, None).await.expect("search");
         let with_row = with_rows.iter().find(|r| r.id == with_options).expect("found");
         assert!(with_row.has_options, "an instrument with a derivative row must show has_options");
         assert_eq!(with_row.instrument_class, "SPOT");
@@ -311,7 +483,7 @@ mod tests {
                 .await
                 .expect("symbol");
         let without_rows =
-            search_instruments(&pool, Some(&without_symbol), None).await.expect("search");
+            search_instruments(&pool, Some(&without_symbol), None, None).await.expect("search");
         let without_row = without_rows.iter().find(|r| r.id == without_options).expect("found");
         assert!(!without_row.has_options, "an instrument with no derivative row must not");
     }

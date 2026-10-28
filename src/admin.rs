@@ -2552,6 +2552,7 @@ pub async fn list_instruments(
         state.pool(),
         params.search.as_deref(),
         params.limit,
+        None,
     )
     .await
     .map_err(map_db_error)?;
