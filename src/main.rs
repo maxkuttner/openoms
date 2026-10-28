@@ -378,6 +378,15 @@ enum Command {
     },
     /// Print the OpenAPI spec as JSON, for the docs build and for scripting.
     Openapi,
+    /// Replace this binary with the latest release (or --version), verified.
+    Update {
+        /// Release tag to install instead of the latest, e.g. v0.2.0. May be older (a rollback).
+        #[arg(long)]
+        version: Option<String>,
+        /// Only report whether an update is available.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -679,6 +688,12 @@ async fn main() {
             }
         }
         Some(Command::Openapi) => println!("{}", openapi_json()),
+        Some(Command::Update { version, check }) => {
+            if let Err(e) = setup::update::run(setup::update::Args { version, check }).await {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         None => serve().await,
     }
 }

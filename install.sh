@@ -111,6 +111,8 @@ main() {
 
 	then open http://localhost:3001/cockpit/
 
+	Later, `oms update` installs the newest release in place.
+
 	No Postgres yet? From a clone of the repo, `docker compose up -d` brings one up on
 	127.0.0.1:5432 with the defaults `oms database init` already assumes.
 	EOF

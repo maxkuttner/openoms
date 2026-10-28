@@ -39,6 +39,10 @@ base64 = "0.22"
 bcrypt = "0.15"
 # Session cookie values are hashed, not bcrypted: see src/sessions.rs.
 sha2 = "0.10"
+# `oms update`: unpack the release tarball and compare release versions.
+flate2 = "1"
+tar = "0.4"
+semver = "1"
 toml = "0.8"
 rpassword = "7"
 rand = "0.8"
@@ -97,6 +101,8 @@ quickfix = { version = "0.2", features = ["build-with-ssl"] }
 openidconnect = "4"
 
 [dev-dependencies]
+# Test-only: scratch install dirs for src/setup/update.rs.
+tempfile = "3"
 # Test-only: mints an in-process RSA key pair for src/oidc.rs's TestSigner, so
 # ID-token verification can be tested against real signatures without an IdP.
 # Already an indirect dependency of openidconnect; pinned here to use it directly.
