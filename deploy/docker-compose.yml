@@ -6,9 +6,9 @@
 #     docker compose -f deploy/docker-compose.yml up -d
 #
 # Expects, on the host running this:
-#   ~/oms-deploy/config/oms.toml   — same master_key as whatever wrote the
+#   /opt/oms/config/oms.toml       — same master_key as whatever wrote the
 #                                    target database's encrypted columns
-#   ~/oms-deploy/config/.env       — POSTGRES_PASSWORD=..., OMS_PASSWORD=...,
+#   /opt/oms/config/.env           — POSTGRES_PASSWORD=..., OMS_PASSWORD=...,
 #                                    and (with [auth.oidc] configured)
 #                                    OMS_OIDC_CLIENT_SECRET=oms-dev-secret
 services:
@@ -19,9 +19,9 @@ services:
     container_name: oms-test-deploy
     network_mode: host
     env_file:
-      - ${OMS_DEPLOY_CONFIG_DIR:-/home/max/oms-deploy/config}/.env
+      - ${OMS_DEPLOY_CONFIG_DIR:-/opt/oms/config}/.env
     volumes:
-      - ${OMS_DEPLOY_CONFIG_DIR:-/home/max/oms-deploy/config}/oms.toml:/app/oms.toml:ro
+      - ${OMS_DEPLOY_CONFIG_DIR:-/opt/oms/config}/oms.toml:/app/oms.toml:ro
     restart: unless-stopped
 
   # Same disposable dev IdP as the local docker-compose.yml at the repo root

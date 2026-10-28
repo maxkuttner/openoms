@@ -8,9 +8,9 @@ embedded in, per `src/cockpit.rs`) in Docker and runs it with
 ## One-time setup on the target box
 
 ```
-ssh <host> mkdir -p ~/oms-deploy/config
-scp oms.toml <host>:~/oms-deploy/config/oms.toml   # same master_key as prod/dev — see below
-ssh <host> 'cat > ~/oms-deploy/config/.env' <<'EOF'
+ssh <host> 'sudo mkdir -p /opt/oms && sudo chown "$USER" /opt/oms && mkdir -p /opt/oms/config'
+scp oms.toml <host>:/opt/oms/config/oms.toml   # same master_key as prod/dev — see below
+ssh <host> 'cat > /opt/oms/config/.env' <<'EOF'
 POSTGRES_PASSWORD=<the real value>
 EOF
 ```
@@ -53,5 +53,5 @@ are untouched by this — they live outside the shipped tree.
 ## Teardown
 
 ```
-ssh <host> 'cd ~/oms-deploy/src && docker compose -f deploy/docker-compose.yml down'
+ssh <host> 'cd /opt/oms/src && docker compose -f deploy/docker-compose.yml down'
 ```
