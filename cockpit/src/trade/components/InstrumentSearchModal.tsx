@@ -118,12 +118,16 @@ export function InstrumentSearchModal({
     enabled: step === "chain" && !!chain.data && chain.data.length > 0,
   });
 
-  function pickUnderlying(instrument: SearchInstrument) {
-    if (!instrument.has_options) {
-      onPickSingle({ id: String(instrument.id), symbol: instrument.symbol, venue: instrument.venue, name: instrument.name });
-      resetAndClose();
-      return;
-    }
+  // A row click always means "trade this instrument": the server ranks the
+  // exact symbol first, so typing SPY and clicking the top row puts SPY
+  // itself on the ticket. The options flow is the row's own Options button
+  // (openOptions), never the default.
+  function pickInstrument(instrument: SearchInstrument) {
+    onPickSingle({ id: String(instrument.id), symbol: instrument.symbol, venue: instrument.venue, name: instrument.name });
+    resetAndClose();
+  }
+
+  function openOptions(instrument: SearchInstrument) {
     setUnderlying(instrument);
     setStep("underlying");
   }
@@ -291,34 +295,30 @@ export function InstrumentSearchModal({
             {debounced.length > 0 && !results.isLoading && (results.data ?? []).length === 0 && (
               <Text c="dimmed">No instruments match "{debounced}".</Text>
             )}
-            {(["Underlyings", "Equity / other"] as const).map((group) => {
-              const rows = (results.data ?? []).filter((r) =>
-                group === "Underlyings" ? r.has_options : !r.has_options,
-              );
-              if (rows.length === 0) return null;
-              return (
-                <Stack key={group} gap={4}>
-                  <Text size="xs" c="dimmed" fw={600} tt="uppercase">
-                    {group}
-                  </Text>
-                  {rows.map((r) => (
-                    <UnstyledButton key={r.id} onClick={() => pickUnderlying(r)}>
-                      <Paper withBorder p="sm">
-                        <Group justify="space-between">
-                          <Group gap="xs">
-                            <Text fw={600}>{r.symbol}</Text>
-                            <Text c="dimmed" size="sm">
-                              {r.name} · {r.venue}
-                            </Text>
-                          </Group>
-                          {r.has_options && <Badge color="depth">Options</Badge>}
-                        </Group>
-                      </Paper>
+            {/* One list, in the server's ranked order (see search_instruments
+                in src/instruments_api.rs) — never regrouped here, or the exact
+                match can be pushed below a section header. */}
+            <Stack gap={4}>
+              {(results.data ?? []).map((r) => (
+                <Paper key={r.id} withBorder p={0}>
+                  <Group justify="space-between" wrap="nowrap" gap={0}>
+                    <UnstyledButton onClick={() => pickInstrument(r)} p="sm" style={{ flex: 1, minWidth: 0 }}>
+                      <Group gap="xs" wrap="nowrap">
+                        <Text fw={600}>{r.symbol}</Text>
+                        <Text c="dimmed" size="sm" truncate>
+                          {r.name} · {r.venue}
+                        </Text>
+                      </Group>
                     </UnstyledButton>
-                  ))}
-                </Stack>
-              );
-            })}
+                    {r.has_options && (
+                      <Button variant="light" color="depth" size="xs" mr="sm" onClick={() => openOptions(r)}>
+                        Options
+                      </Button>
+                    )}
+                  </Group>
+                </Paper>
+              ))}
+            </Stack>
           </>
         )}
 
@@ -327,17 +327,7 @@ export function InstrumentSearchModal({
             <Group justify="space-between">
               <Title order={4}>{underlying.symbol}</Title>
               <Group gap="xs">
-                <Button
-                  variant="light"
-                  onClick={() =>
-                    onPickSingle({
-                      id: String(underlying.id),
-                      symbol: underlying.symbol,
-                      venue: underlying.venue,
-                      name: underlying.name,
-                    })
-                  }
-                >
+                <Button variant="light" onClick={() => pickInstrument(underlying)}>
                   Trade {underlying.symbol} directly
                 </Button>
                 <Button variant="subtle" onClick={() => { setTemplateError(null); setStep("search"); }}>
