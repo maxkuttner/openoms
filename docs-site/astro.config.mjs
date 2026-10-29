@@ -54,7 +54,13 @@ export default defineConfig({
         { label: "Tutorials", items: ["tutorials/opra-marks-pnl"] },
         {
           label: "Operations",
-          items: ["operations/updating", "operations/service", "operations/master-key-and-backups"],
+          items: [
+            "operations/updating",
+            "operations/service",
+            "operations/database",
+            "operations/master-key-and-backups",
+            "operations/troubleshooting",
+          ],
         },
         ...openAPISidebarGroups,
       ],

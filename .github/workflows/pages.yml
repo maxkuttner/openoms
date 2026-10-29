@@ -4,11 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - "site/**"
+      - "docs-site/**"
       - "install.sh"
-      - "assets/screenshot*.png"
       - "docs/openapi.json"
-      - "cockpit/public/favicon.svg"
+      # The docs' CLI-reference test reads the subcommands from here.
+      - "src/main.rs"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -27,53 +27,30 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
+    defaults:
+      run:
+        working-directory: docs-site
     steps:
       - uses: actions/checkout@v4
-
-      - name: assemble the site
-        run: |
-          mkdir -p _site/assets
-          cp site/index.html site/style.css _site/
-          # Served from the same origin as the page telling people to pipe it into
-          # a shell. The repo copy stays canonical; this is a second URL for it.
-          cp install.sh _site/install.sh
-          cp assets/screenshot01.png assets/screenshot02.png _site/assets/
-          cp cockpit/public/favicon.svg _site/favicon.svg
 
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
 
-      # CI-only dependency: it pulls headless Chromium, which is why it is not in
-      # any committed manifest and not a devDependency of the cockpit.
-      #
-      # Pinned: the rendered SVGs are the published artifact and their
-      # appearance is version-dependent (11.17 reads rowOdd/rowEven where
-      # 11.16 read attributeBackgroundColorOdd/Even — see site/diagrams/
-      # mermaid-config.json). 11.17.0 is the exact version the diagrams were
-      # rehearsed and visually checked against; bump deliberately, not by
-      # letting an unrelated push silently re-render against latest.
-      - name: render the diagrams
-        run: |
-          npm i -g @mermaid-js/mermaid-cli@11.17.0
-          mkdir -p _site/diagrams
-          for f in site/diagrams/*.mmd; do
-            n="$(basename "$f" .mmd)"
-            mmdc -i "$f" -o "_site/diagrams/$n.svg" -c site/diagrams/mermaid-config.json -b transparent -I "$n"
-          done
-          ls -la _site/diagrams
+      - run: npm ci
 
-      - name: build the docs pages
-        run: node site/build-docs.mjs _site
-
-      - name: drop the intermediate SVGs
-        run: "rm -rf _site/diagrams"
+      # Builds the Starlight site into docs-site/dist — install.sh is copied in
+      # from the repo root by the prebuild step, so the root copy stays the
+      # only one — and runs the docs tests against it before anything ships.
+      - run: npm run check
 
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: docs-site/dist
 
       - id: deploy
         uses: actions/deploy-pages@v4

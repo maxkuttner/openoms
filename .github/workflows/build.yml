@@ -118,8 +118,8 @@ jobs:
       # shellcheck is preinstalled on the GitHub Ubuntu images.
       - run: shellcheck install.sh cockpit/check-api-base.sh
 
-  site:
-    name: site build script tests
+  docs-site:
+    name: docs site build and checks
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -127,9 +127,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
 
-      # No package.json here on purpose: node's built-in test runner needs none.
-      # The files are listed by shell glob rather than passing the directory:
-      # `node --test site/` only discovers tests in newer Node, and on the
-      # runner's 22.x it tries to load `site` as a module and dies.
-      - run: node --test site/*.test.mjs
+      # Builds the Starlight site (links validated during the build) and runs
+      # docs-site/test: install.sh served byte-identical, every link resolving
+      # under /openoms/, the generated API reference complete, and every `oms`
+      # command in the docs a real subcommand.
+      - run: npm ci
+        working-directory: docs-site
+      - run: npm run check
+        working-directory: docs-site
