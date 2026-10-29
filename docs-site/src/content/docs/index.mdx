@@ -1,0 +1,47 @@
+---
+title: openoms
+description: An open source multi-client order management system. One command to install.
+template: splash
+hero:
+  tagline: An open source multi-client order management system — order routing across brokers over FIX and REST, with a web cockpit built into one binary.
+  image:
+    file: ../../assets/logo.svg
+  actions:
+    - text: Get started
+      link: /openoms/getting-started/installation/
+      icon: right-arrow
+---
+
+import { Card, CardGrid, Code } from "@astrojs/starlight/components";
+
+## Install
+
+<Code code="curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh" lang="sh" />
+
+[Read the script](/openoms/install.sh) before you pipe it into a shell — it downloads one
+checksummed binary into `~/.local/bin` and stops there. No sudo, nothing started, nothing
+configured. Prebuilt for macOS on Apple Silicon and Linux on x86_64; anything else
+[builds from source](/openoms/getting-started/installation/#build-from-source).
+
+## What you get
+
+<CardGrid>
+  <Card title="Multi-broker routing" icon="random">
+    Orders routed to Alpaca, Binance, Bybit and Interactive Brokers, over FIX and REST.
+  </Card>
+  <Card title="A cockpit in the binary" icon="laptop">
+    Blotter, positions, connections and a trade ticket — served by the OMS itself.
+  </Card>
+  <Card title="Scoped trading access" icon="approve-check">
+    Traders and tokens see only the portfolios they are granted.
+  </Card>
+  <Card title="Risk and reconciliation" icon="warning">
+    Pre-trade risk checks, and order reconciliation whenever a broker reconnects.
+  </Card>
+</CardGrid>
+
+## The cockpit
+
+![The openoms order blotter](../../assets/screenshot01.png)
+
+![An openoms detail view](../../assets/screenshot02.png)

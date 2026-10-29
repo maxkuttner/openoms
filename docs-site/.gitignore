@@ -1,0 +1,6 @@
+dist/
+node_modules/
+.astro/
+# Copied from the repo root at build time (scripts/copy-install.mjs) — the
+# root install.sh is canonical; never commit a second copy.
+public/install.sh

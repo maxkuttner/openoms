@@ -1,0 +1,11 @@
+/* The cockpit's green accent (site/style.css --accent: #25b083), in both schemes. */
+:root {
+  --sl-color-accent-low: #0b2e22;
+  --sl-color-accent: #1f9a72;
+  --sl-color-accent-high: #a8ecd2;
+}
+:root[data-theme="light"] {
+  --sl-color-accent-low: #c8f1e1;
+  --sl-color-accent: #14805d;
+  --sl-color-accent-high: #0b3d2c;
+}
