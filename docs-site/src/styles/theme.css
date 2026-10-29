@@ -9,3 +9,23 @@
   --sl-color-accent: #14805d;
   --sl-color-accent-high: #0b3d2c;
 }
+
+/* Landing page only (Starlight marks it data-has-hero), dark scheme only: the
+   image is near-black, so in light mode the page keeps its plain background. */
+:root[data-theme="dark"][data-has-hero] {
+  background-color: #000;
+  background-image: url("/openoms/landing-bg.webp");
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+}
+:root[data-theme="dark"][data-has-hero] body,
+:root[data-theme="dark"][data-has-hero] .page,
+:root[data-theme="dark"][data-has-hero] .main-frame {
+  background: transparent;
+}
+/* Let the gradient show through the top bar too, with enough tint to read it. */
+:root[data-theme="dark"][data-has-hero] header.header {
+  background-color: rgb(0 0 0 / 0.35);
+  backdrop-filter: blur(8px);
+}

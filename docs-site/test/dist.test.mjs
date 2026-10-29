@@ -113,3 +113,15 @@ test("operation pages show cURL, Python and Rust samples, not JavaScript", () =>
   assert.ok(html.includes("reqwest::Client::new()"), "no Rust sample");
   assert.ok(!html.includes("fetch(url, options)"), "JavaScript sample still present");
 });
+
+test("the landing page has its background image, in dark mode only", () => {
+  const css = readdirSync(join(DIST, "_astro"))
+    .filter((f) => f.endsWith(".css"))
+    .map((f) => readFileSync(join(DIST, "_astro", f), "utf8"))
+    .join("\n");
+  const rule = css.match(/\[data-theme=["']?dark["']?\]\[data-has-hero\][^{]*\{[^}]*background-image:url\(([^)]+)\)/);
+  assert.ok(rule, "no dark-mode, landing-only background rule");
+  const url = rule[1].replace(/["']/g, "");
+  assert.ok(url.startsWith(BASE), `background url ${url} is not under ${BASE}`);
+  assert.ok(existsSync(join(DIST, url.slice(BASE.length))), `${url} is not built`);
+});
