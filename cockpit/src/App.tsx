@@ -4,6 +4,7 @@ import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "
 import { useQuery } from "@tanstack/react-query";
 import { api, setToken, API_BASE } from "./api/client";
 import { Logo } from "./components/Logo";
+import { JobsIndicator } from "./components/JobsIndicator";
 import { LoginPage } from "./pages/Login";
 import { PrincipalsPage } from "./pages/Principals";
 import { PortfoliosPage } from "./pages/Portfolios";
@@ -50,6 +51,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
         <Group h="100%" px="md" justify="space-between">
           <Logo />
           <Group gap="md">
+            <JobsIndicator />
             <ConnectionDot />
             <Button variant="subtle" size="xs" color="gray" onClick={onLogout}>
               Log out
