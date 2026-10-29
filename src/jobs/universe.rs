@@ -291,6 +291,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_universe_load_job_succeeds_with_its_report() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let tag = uuid::Uuid::new_v4().simple().to_string()[..6].to_uppercase();
         let (subject, prefix) = (format!("test-{tag}"), format!("ZZUJ{tag}"));
@@ -313,6 +314,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_failing_provider_fails_the_job_with_its_error() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let tag = uuid::Uuid::new_v4().simple().to_string()[..6].to_uppercase();
         let (subject, prefix) = (format!("test-{tag}"), format!("ZZUJ{tag}"));
@@ -332,6 +334,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_panicking_provider_fails_the_job() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let subject = format!("test-{}", uuid::Uuid::new_v4().simple());
         let h = new_job(&pool, &subject).await;
@@ -347,6 +350,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_hanging_provider_fails_the_job_on_timeout() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let subject = format!("test-{}", uuid::Uuid::new_v4().simple());
         let h = new_job(&pool, &subject).await;

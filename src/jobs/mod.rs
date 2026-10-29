@@ -152,40 +152,50 @@ pub async fn create(
     started_by: &str,
     params: Value,
 ) -> Result<Uuid, CreateError> {
-    let id = Uuid::new_v4();
-    let inserted = sqlx::query(
-        "INSERT INTO job (id, kind, subject, started_by, params, status) VALUES ($1, $2, $3, $4, $5, 'queued')",
-    )
-    .bind(id)
-    .bind(kind.as_str())
-    .bind(subject)
-    .bind(started_by)
-    .bind(params)
-    .execute(pool)
-    .await;
-    match inserted {
-        Ok(_) => Ok(id),
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
-            // The active job that blocked this one: of the same kind, or — for a
-            // universe writer — of either universe-writing kind.
-            let kinds: Vec<&str> = if kind.writes_universe() {
-                UNIVERSE_WRITERS.iter().map(|k| k.as_str()).collect()
-            } else {
-                vec![kind.as_str()]
-            };
-            let active: Uuid = sqlx::query_scalar(
-                "SELECT id FROM job WHERE kind = ANY($1) AND subject IS NOT DISTINCT FROM $2 \
-                 AND status IN ('queued', 'running')",
-            )
-            .bind(&kinds)
-            .bind(subject)
-            .fetch_one(pool)
-            .await
-            .map_err(CreateError::Db)?;
-            Err(CreateError::AlreadyRunning(active))
+    // The active job that blocks this one: of the same kind, or — for a
+    // universe writer — of either universe-writing kind.
+    let blocking_kinds: Vec<&str> = if kind.writes_universe() {
+        UNIVERSE_WRITERS.iter().map(|k| k.as_str()).collect()
+    } else {
+        vec![kind.as_str()]
+    };
+    // Twice at most: if the blocking job finishes between the refused insert and
+    // the look-up of its id, nothing blocks any more and the insert is retried —
+    // rather than answering with an error for a conflict that no longer exists.
+    for _ in 0..2 {
+        let id = Uuid::new_v4();
+        let inserted = sqlx::query(
+            "INSERT INTO job (id, kind, subject, started_by, params, status) VALUES ($1, $2, $3, $4, $5, 'queued')",
+        )
+        .bind(id)
+        .bind(kind.as_str())
+        .bind(subject)
+        .bind(started_by)
+        .bind(&params)
+        .execute(pool)
+        .await;
+        match inserted {
+            Ok(_) => return Ok(id),
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                let active: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM job WHERE kind = ANY($1) AND subject IS NOT DISTINCT FROM $2 \
+                     AND status IN ('queued', 'running')",
+                )
+                .bind(&blocking_kinds)
+                .bind(subject)
+                .fetch_optional(pool)
+                .await
+                .map_err(CreateError::Db)?;
+                if let Some(active) = active {
+                    return Err(CreateError::AlreadyRunning(active));
+                }
+            }
+            Err(e) => return Err(CreateError::Db(e)),
         }
-        Err(e) => Err(CreateError::Db(e)),
     }
+    Err(CreateError::Db(sqlx::Error::Protocol(
+        "a conflicting job kept appearing and finishing; try again".into(),
+    )))
 }
 
 /// Updates one job's row as its work progresses.
@@ -348,6 +358,22 @@ pub async fn latest(pool: &PgPool, kind: JobKind, subject: &str) -> Result<Optio
     .await
 }
 
+/// The job tests share one database with each other — and one of them marks
+/// every active job interrupted, as boot does. It takes this lock exclusively;
+/// every other job test takes it shared, so it never runs among them.
+#[cfg(test)]
+pub(crate) mod test_lock {
+    static LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+    pub async fn shared() -> tokio::sync::RwLockReadGuard<'static, ()> {
+        LOCK.read().await
+    }
+
+    pub async fn exclusive() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+        LOCK.write().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +412,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_job_runs_through_its_lifecycle() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = subject();
         let id = create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
@@ -412,6 +439,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_second_active_universe_load_for_the_same_connection_is_refused() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = subject();
         let first = create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
@@ -427,6 +455,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn jobs_left_running_are_marked_interrupted() {
+        let _jobs = crate::jobs::test_lock::exclusive().await;
         let pool = test_pool().await;
         let (a, b, c) = (subject(), subject(), subject());
         let running = create(&pool, JobKind::UniverseLoad, Some(&a), "test", json!({})).await.unwrap();
@@ -450,6 +479,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_job_log_keeps_only_the_newest_500_lines() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = subject();
         let id = create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
@@ -467,6 +497,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn failing_a_job_records_the_error() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = subject();
         let id = create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
@@ -482,6 +513,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn an_enrichment_and_a_universe_load_for_the_same_connection_exclude_each_other() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = subject();
         let load = create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
@@ -501,6 +533,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn the_latest_universe_job_includes_enrichments() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = subject();
         let load = create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
@@ -514,6 +547,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn other_kinds_still_allow_one_active_job_each() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = subject();
         create(&pool, JobKind::SymbologyBackfill, Some(&s), "test", json!({})).await.unwrap();

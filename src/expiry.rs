@@ -160,6 +160,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_scheduled_sweep_that_expires_nothing_writes_no_job() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         dotenvy::dotenv().ok();
         let cfg = crate::setup::database::config::resolve(Default::default());
         let pool = sqlx::postgres::PgPoolOptions::new()

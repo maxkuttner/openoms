@@ -450,6 +450,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn load_endpoint_404s_an_unknown_connection() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let master = crate::config::master_key(crate::config::load()).and_then(Result::ok);
         let err = start_load(&pool, master.as_ref(), "no-such-connection").await.unwrap_err();
@@ -459,6 +460,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn load_endpoint_refuses_unconfigured_credentials() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let master = crate::config::master_key(crate::config::load()).and_then(Result::ok);
         let code = bare_connection(&pool).await;
@@ -476,6 +478,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn load_endpoint_refuses_while_one_is_running() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let master = crate::config::master_key(crate::config::load()).and_then(Result::ok);
         let code = bare_connection(&pool).await;
@@ -493,6 +496,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn list_jobs_returns_newest_first_and_honours_limit() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = format!("test-{}", uuid::Uuid::new_v4().simple());
         let mut ids = Vec::new();
@@ -523,6 +527,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn get_job_returns_its_log_oldest_first() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = format!("test-{}", uuid::Uuid::new_v4().simple());
         let id = super::super::create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
@@ -540,6 +545,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn get_job_404s_an_unknown_id() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         assert!(job_detail(&pool, uuid::Uuid::new_v4()).await.unwrap().is_none());
     }
@@ -547,6 +553,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn expiry_sweep_endpoint_answers_202_with_a_job() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let id = start_expiry_sweep(&pool, "test").await.unwrap();
         // The sweep runs in the background; it is quick.
@@ -570,6 +577,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn enrich_endpoint_refuses_unconfigured_credentials() {
+        let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let master = crate::config::master_key(crate::config::load()).and_then(Result::ok);
         let code = bare_connection(&pool).await;
