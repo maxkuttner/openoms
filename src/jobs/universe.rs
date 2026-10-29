@@ -18,6 +18,11 @@ use crate::setup::brokers::{self, Broker, LoadOptions, LoadProgress};
 /// Cockpit and boot loads: base instruments only, no OpenFIGI enrichment (that
 /// is its own job), and a load that skips some instruments still completes —
 /// it reports them, and the connection shows "partial" with the reason.
+/// Upper bound on one load, so a broker call that never returns cannot leave
+/// its job "running" — which would also refuse every retry for the connection.
+/// Generous: an enrichment pass through a rate-limited OpenFIGI is slow.
+pub const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 fn default_options() -> LoadOptions {
     LoadOptions { no_enrich: true, allow_skips: true, underlyings: Vec::new() }
 }
@@ -53,22 +58,22 @@ async fn spawn_load(
     let params = serde_json::json!({ "broker": broker.code(), "no_enrich": opts.no_enrich });
     let id = create(&pool, kind, Some(&broker.connection_code()), started_by, params).await?;
     let handle = JobHandle::new(pool.clone(), id);
+    // Kept to record a failure from here if the load's own runtime cannot start.
+    let server = tokio::runtime::Handle::current();
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
                 error!("universe load {id}: could not start a runtime: {e}");
+                let message = format!("could not start: {e}");
+                server.spawn(async move { record(&handle, Err(message)).await });
                 return;
             }
         };
         rt.block_on(async move {
             match brokers::provider_for(&pool, broker).await {
-                Ok(provider) => run_job(&handle, provider.as_ref(), broker, &opts).await,
-                Err(e) => {
-                    if let Err(db) = handle.fail(&e.to_string()).await {
-                        error!("universe load {id}: could not record failure ({e}): {db}");
-                    }
-                }
+                Ok(provider) => run_job(&handle, provider.as_ref(), broker, &opts, LOAD_TIMEOUT).await,
+                Err(e) => record(&handle, Err(e.to_string())).await,
             }
         });
     });
@@ -78,7 +83,19 @@ async fn spawn_load(
 /// Run one universe load against `provider` and record it on `handle`'s job:
 /// running → progress and log lines as it goes → succeeded with the report, or
 /// failed with the error.
-pub async fn run_job(handle: &JobHandle, provider: &dyn InstrumentProvider, broker: Broker, opts: &LoadOptions) {
+///
+/// Every way the load can end is recorded — an error, a panic inside the
+/// adapter, or running past `timeout` — because a job left "running" also
+/// refuses every retry for its connection until the OMS restarts.
+pub async fn run_job(
+    handle: &JobHandle,
+    provider: &dyn InstrumentProvider,
+    broker: Broker,
+    opts: &LoadOptions,
+    timeout: std::time::Duration,
+) {
+    use futures_util::FutureExt;
+
     if let Err(e) = handle.start().await {
         error!("universe load {}: could not mark running: {e}", handle.id);
     }
@@ -101,24 +118,51 @@ pub async fn run_job(handle: &JobHandle, provider: &dyn InstrumentProvider, brok
     });
 
     let progress = ChannelProgress(tx);
-    let outcome = brokers::load_universe(handle.pool(), broker, provider, opts, &progress).await;
+    let load = tokio::time::timeout(timeout, brokers::load_universe(handle.pool(), broker, provider, opts, &progress));
+    let outcome = match std::panic::AssertUnwindSafe(load).catch_unwind().await {
+        Ok(Ok(Ok(report))) => {
+            info!("universe load {}: {} fetched, {} mapped", handle.id, report.fetched, report.mapped);
+            Ok(serde_json::to_value(&report).unwrap_or_default())
+        }
+        Ok(Ok(Err(e))) => Err(e.to_string()),
+        Ok(Err(_elapsed)) => Err(format!("timed out after {} minutes", timeout.as_secs() / 60)),
+        Err(panic) => Err(format!("the load crashed: {}", panic_message(&panic))),
+    };
     // Dropping the only sender lets the writer drain what is queued and exit.
     drop(progress);
     let _ = writer.await;
 
-    let recorded = match outcome {
-        Ok(report) => {
-            info!("universe load {}: {} fetched, {} mapped", handle.id, report.fetched, report.mapped);
-            handle.succeed(serde_json::to_value(&report).unwrap_or_default()).await
-        }
-        Err(e) => {
-            warn!("universe load {} failed: {e}", handle.id);
-            handle.fail(&e.to_string()).await
-        }
-    };
-    if let Err(e) = recorded {
-        error!("universe load {}: could not record its outcome: {e}", handle.id);
+    if let Err(e) = &outcome {
+        warn!("universe load {} failed: {e}", handle.id);
     }
+    record(handle, outcome).await;
+}
+
+/// Write a job's final status, retrying once: a job left "running" by one
+/// failed write blocks every retry for its connection until a restart.
+async fn record(handle: &JobHandle, outcome: Result<serde_json::Value, String>) {
+    for attempt in 0..2 {
+        let written = match &outcome {
+            Ok(report) => handle.succeed(report.clone()).await,
+            Err(e) => handle.fail(e).await,
+        };
+        match written {
+            Ok(()) => return,
+            Err(e) if attempt == 0 => {
+                warn!("universe load {}: could not record its outcome, retrying: {e}", handle.id);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            Err(e) => error!("universe load {}: could not record its outcome: {e}", handle.id),
+        }
+    }
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_string())
 }
 
 enum Update {
@@ -155,6 +199,28 @@ mod tests {
             }
         }
     }
+
+    /// A broker call that panics (an adapter `unwrap` on an unexpected reply).
+    struct PanickingProvider;
+
+    #[async_trait::async_trait]
+    impl InstrumentProvider for PanickingProvider {
+        async fn list_instruments(&self, _u: &[String]) -> Result<Vec<BrokerInstrument>, BrokerError> {
+            panic!("unexpected catalog reply");
+        }
+    }
+
+    /// A broker call that never returns.
+    struct HangingProvider;
+
+    #[async_trait::async_trait]
+    impl InstrumentProvider for HangingProvider {
+        async fn list_instruments(&self, _u: &[String]) -> Result<Vec<BrokerInstrument>, BrokerError> {
+            std::future::pending().await
+        }
+    }
+
+    const LONG: std::time::Duration = std::time::Duration::from_secs(600);
 
     fn fake(symbol: &str, venue: &str) -> BrokerInstrument {
         BrokerInstrument {
@@ -234,7 +300,7 @@ mod tests {
         ]));
         let h = new_job(&pool, &subject).await;
 
-        run_job(&h, &provider, Broker::Alpaca, &opts()).await;
+        run_job(&h, &provider, Broker::Alpaca, &opts(), LONG).await;
 
         let (job, log) = get(&pool, h.id).await.unwrap().unwrap();
         cleanup(&pool, &subject, &prefix).await;
@@ -253,11 +319,44 @@ mod tests {
         let provider = FakeProvider(Err("401 unauthorized".to_string()));
         let h = new_job(&pool, &subject).await;
 
-        run_job(&h, &provider, Broker::Alpaca, &opts()).await;
+        run_job(&h, &provider, Broker::Alpaca, &opts(), LONG).await;
 
         let (job, _) = get(&pool, h.id).await.unwrap().unwrap();
         cleanup(&pool, &subject, &prefix).await;
         assert_eq!(job.status, JobStatus::Failed);
         assert!(job.error.as_deref().unwrap_or("").contains("401 unauthorized"), "{:?}", job.error);
     }
+
+    /// A panic in the load must still end the job, or the row stays "running"
+    /// and the one-active-load index refuses every retry until a restart.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_panicking_provider_fails_the_job() {
+        let pool = test_pool().await;
+        let subject = format!("test-{}", uuid::Uuid::new_v4().simple());
+        let h = new_job(&pool, &subject).await;
+
+        run_job(&h, &PanickingProvider, Broker::Alpaca, &opts(), LONG).await;
+
+        let (job, _) = get(&pool, h.id).await.unwrap().unwrap();
+        cleanup(&pool, &subject, "ZZNOTHING").await;
+        assert_eq!(job.status, JobStatus::Failed);
+        assert!(job.error.as_deref().unwrap_or("").contains("unexpected catalog reply"), "{:?}", job.error);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_hanging_provider_fails_the_job_on_timeout() {
+        let pool = test_pool().await;
+        let subject = format!("test-{}", uuid::Uuid::new_v4().simple());
+        let h = new_job(&pool, &subject).await;
+
+        run_job(&h, &HangingProvider, Broker::Alpaca, &opts(), std::time::Duration::from_millis(300)).await;
+
+        let (job, _) = get(&pool, h.id).await.unwrap().unwrap();
+        cleanup(&pool, &subject, "ZZNOTHING").await;
+        assert_eq!(job.status, JobStatus::Failed);
+        assert!(job.error.as_deref().unwrap_or("").contains("timed out"), "{:?}", job.error);
+    }
 }
+

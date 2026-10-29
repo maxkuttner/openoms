@@ -126,7 +126,13 @@ async fn check_loadable(pool: &PgPool, master: Option<&MasterKey>, code: &str, k
         .map_err(|e| LoadRefusal::Internal(format!("could not read broker connections: {e}")))?;
     let conn = connections.into_iter().find(|c| c.code == code).ok_or(LoadRefusal::NotFound)?;
 
-    if let Some(job) = latest(pool, kind, code).await.map_err(|e| LoadRefusal::Internal(e.to_string()))? {
+    // A load and an enrichment write the same rows: either one active blocks both.
+    let latest_job = if kind.writes_universe() {
+        super::latest_universe_job(pool, code).await
+    } else {
+        latest(pool, kind, code).await
+    };
+    if let Some(job) = latest_job.map_err(|e| LoadRefusal::Internal(e.to_string()))? {
         if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
             return Err(LoadRefusal::AlreadyRunning(job.id));
         }
@@ -196,7 +202,7 @@ pub async fn get_connection_universe(
         .fetch_one(pool)
         .await
         .map_err(internal)?;
-    let last_job = latest(pool, JobKind::UniverseLoad, &code).await.map_err(internal)?;
+    let last_job = super::latest_universe_job(pool, &code).await.map_err(internal)?;
     let (state, reason) = derive_universe_state(last_job.as_ref(), count);
     Ok(Json(UniverseStatus { state, count, reason, last_job }))
 }
@@ -268,9 +274,16 @@ pub async fn start_expiry_sweep(pool: &PgPool, started_by: &str) -> Result<Uuid,
     let handle = super::JobHandle::new(pool.clone(), id);
     tokio::spawn(async move {
         let _ = handle.start().await;
-        let recorded = match crate::expiry::run_once(handle.pool()).await {
-            Ok((recomputed, expired)) => handle.succeed(json!({ "recomputed": recomputed, "expired": expired })).await,
-            Err(e) => handle.fail(&e.to_string()).await,
+        // In a task of its own so a panic is seen here and still ends the job.
+        let pool = handle.pool().clone();
+        let outcome = match tokio::spawn(async move { crate::expiry::run_once(&pool).await }).await {
+            Ok(Ok((recomputed, expired))) => Ok(json!({ "recomputed": recomputed, "expired": expired })),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(e) => Err(format!("the sweep crashed: {e}")),
+        };
+        let recorded = match outcome {
+            Ok(result) => handle.succeed(result).await,
+            Err(e) => handle.fail(&e).await,
         };
         if let Err(e) = recorded {
             tracing::error!("expiry sweep job {}: could not record its outcome: {e}", handle.id);

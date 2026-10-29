@@ -29,7 +29,15 @@ pub enum JobKind {
     ExpirySweep,
 }
 
+/// Kinds that write a broker connection's instruments and mappings. At most one
+/// of them runs per connection at a time (`uq_job_active_universe_writer`).
+pub const UNIVERSE_WRITERS: [JobKind; 2] = [JobKind::UniverseLoad, JobKind::Enrichment];
+
 impl JobKind {
+    pub fn writes_universe(self) -> bool {
+        UNIVERSE_WRITERS.contains(&self)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::UniverseLoad => "universe_load",
@@ -158,11 +166,18 @@ pub async fn create(
     match inserted {
         Ok(_) => Ok(id),
         Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+            // The active job that blocked this one: of the same kind, or — for a
+            // universe writer — of either universe-writing kind.
+            let kinds: Vec<&str> = if kind.writes_universe() {
+                UNIVERSE_WRITERS.iter().map(|k| k.as_str()).collect()
+            } else {
+                vec![kind.as_str()]
+            };
             let active: Uuid = sqlx::query_scalar(
-                "SELECT id FROM job WHERE kind = $1 AND subject IS NOT DISTINCT FROM $2 \
+                "SELECT id FROM job WHERE kind = ANY($1) AND subject IS NOT DISTINCT FROM $2 \
                  AND status IN ('queued', 'running')",
             )
-            .bind(kind.as_str())
+            .bind(&kinds)
             .bind(subject)
             .fetch_one(pool)
             .await
@@ -309,6 +324,19 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<(JobRecord, Vec<JobLo
     Ok(Some((job, log)))
 }
 
+/// The most recent universe load or enrichment for a connection, whatever its
+/// status — the job that says where the connection's universe stands.
+pub async fn latest_universe_job(pool: &PgPool, subject: &str) -> Result<Option<JobRecord>, sqlx::Error> {
+    let kinds: Vec<&str> = UNIVERSE_WRITERS.iter().map(|k| k.as_str()).collect();
+    sqlx::query_as::<_, JobRecord>(&format!(
+        "SELECT {COLUMNS} FROM job WHERE kind = ANY($1) AND subject = $2 ORDER BY created_at DESC LIMIT 1"
+    ))
+    .bind(&kinds)
+    .bind(subject)
+    .fetch_optional(pool)
+    .await
+}
+
 /// The most recent job of `kind` for `subject`, whatever its status.
 pub async fn latest(pool: &PgPool, kind: JobKind, subject: &str) -> Result<Option<JobRecord>, sqlx::Error> {
     sqlx::query_as::<_, JobRecord>(&format!(
@@ -448,4 +476,53 @@ mod tests {
         assert_eq!(r.error.as_deref(), Some("bad key"));
         cleanup(&pool, &s).await;
     }
+
+    /// Both re-fetch the broker's list and write the same instrument and
+    /// mapping rows, so one connection may run only one of them at a time.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn an_enrichment_and_a_universe_load_for_the_same_connection_exclude_each_other() {
+        let pool = test_pool().await;
+        let s = subject();
+        let load = create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
+        match create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await {
+            Err(CreateError::AlreadyRunning(id)) => assert_eq!(id, load),
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        JobHandle::new(pool.clone(), load).succeed(json!({})).await.unwrap();
+        let enrich = create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
+        match create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await {
+            Err(CreateError::AlreadyRunning(id)) => assert_eq!(id, enrich),
+            other => panic!("expected AlreadyRunning, got {other:?}"),
+        }
+        cleanup(&pool, &s).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn the_latest_universe_job_includes_enrichments() {
+        let pool = test_pool().await;
+        let s = subject();
+        let load = create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
+        JobHandle::new(pool.clone(), load).fail("bad key").await.unwrap();
+        let enrich = create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
+        let latest = latest_universe_job(&pool, &s).await.unwrap().unwrap();
+        cleanup(&pool, &s).await;
+        assert_eq!(latest.id, enrich);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn other_kinds_still_allow_one_active_job_each() {
+        let pool = test_pool().await;
+        let s = subject();
+        create(&pool, JobKind::SymbologyBackfill, Some(&s), "test", json!({})).await.unwrap();
+        assert!(create(&pool, JobKind::ExpirySweep, Some(&s), "test", json!({})).await.is_ok());
+        assert!(matches!(
+            create(&pool, JobKind::SymbologyBackfill, Some(&s), "test", json!({})).await,
+            Err(CreateError::AlreadyRunning(_))
+        ));
+        cleanup(&pool, &s).await;
+    }
 }
+

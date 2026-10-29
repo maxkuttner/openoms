@@ -109,13 +109,25 @@ pub async fn pending_boot_loads(pool: &PgPool, credentialed: &[Broker]) -> Vec<B
             .bind(broker.code())
             .fetch_one(pool)
             .await;
-        match n {
-            Ok(0) => pending.push(broker),
-            Ok(_) => {}
-            Err(e) => error!("boot: could not count {} instruments, not loading: {e}", broker.code()),
+        let last = crate::jobs::latest_universe_job(pool, &broker.connection_code()).await;
+        match (n, last) {
+            (Ok(count), Ok(last)) if boot_load_needed(count, last.as_ref()) => pending.push(broker),
+            (Ok(_), Ok(_)) => {}
+            (Err(e), _) | (_, Err(e)) => {
+                error!("boot: could not check {}'s instrument universe, not loading: {e}", broker.code())
+            }
         }
     }
     pending
+}
+
+/// Whether a connection's universe loads at boot: only when nothing is mapped
+/// and no load is waiting on the admin. A failed or interrupted load is never
+/// re-run automatically (the cockpit offers Retry / Load again) — re-running a
+/// load that failed on bad credentials would only add a failed job per restart.
+pub fn boot_load_needed(count: i64, last: Option<&crate::jobs::JobRecord>) -> bool {
+    use crate::jobs::JobStatus;
+    count == 0 && !matches!(last.map(|j| j.status), Some(JobStatus::Failed | JobStatus::Interrupted))
 }
 
 #[cfg(test)]
@@ -127,6 +139,38 @@ mod tests {
     // credentials from the store like everything else, so there is no more
     // env-reading cred-detection path for this module to test. `has_creds`, the
     // store-based check, is covered in `setup::brokers::tests` instead.
+
+    fn job(status: crate::jobs::JobStatus) -> crate::jobs::JobRecord {
+        crate::jobs::JobRecord {
+            id: uuid::Uuid::nil(),
+            kind: "universe_load".into(),
+            subject: Some("alpaca-paper".into()),
+            started_by: "system".into(),
+            params: serde_json::json!({}),
+            status,
+            progress_done: None,
+            progress_total: None,
+            result: None,
+            error: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// The spec: interrupted and failed loads are never re-run automatically —
+    /// the admin does that with Load again / Retry. Only a universe that was
+    /// never attempted loads at boot.
+    #[test]
+    fn boot_loads_only_a_universe_never_attempted() {
+        use crate::jobs::JobStatus::*;
+        assert!(boot_load_needed(0, None), "never attempted");
+        assert!(!boot_load_needed(14329, None), "loaded by the CLI");
+        assert!(!boot_load_needed(0, Some(&job(Failed))), "failed: the admin retries");
+        assert!(!boot_load_needed(0, Some(&job(Interrupted))), "interrupted: the admin loads again");
+        assert!(boot_load_needed(0, Some(&job(Succeeded))), "succeeded with nothing, e.g. instruments since removed");
+        assert!(!boot_load_needed(14329, Some(&job(Succeeded))));
+    }
 
     #[test]
     fn sync_on_boot_defaults_on_and_only_never_disables() {

@@ -2662,9 +2662,13 @@ pub async fn backfill_symbology(
     let handle = crate::jobs::JobHandle::new(state.pool().clone(), job_id);
     tokio::spawn(async move {
         let _ = handle.start().await;
-        let recorded = match run_backfill(&state, limit, &handle).await {
-            Ok(result) => handle.succeed(serde_json::to_value(result).unwrap_or_default()).await,
-            Err(e) => handle.fail(&e.to_string()).await,
+        // In a task of its own so a panic is seen here and still ends the job.
+        let (task_state, task_handle) = (state.clone(), handle.clone());
+        let outcome = tokio::spawn(async move { run_backfill(&task_state, limit, &task_handle).await }).await;
+        let recorded = match outcome {
+            Ok(Ok(result)) => handle.succeed(serde_json::to_value(result).unwrap_or_default()).await,
+            Ok(Err(e)) => handle.fail(&e.to_string()).await,
+            Err(e) => handle.fail(&format!("the backfill crashed: {e}")).await,
         };
         if let Err(e) = recorded {
             tracing::error!("symbology backfill job {}: could not record its outcome: {e}", handle.id);
