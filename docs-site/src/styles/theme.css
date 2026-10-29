@@ -29,3 +29,15 @@
   background-color: rgb(0 0 0 / 0.35);
   backdrop-filter: blur(8px);
 }
+
+/* Light scheme: the grain canvas (GrainBackground.astro) draws a light
+   variant, so the page layers go transparent here too. */
+:root[data-theme="light"][data-has-hero] body,
+:root[data-theme="light"][data-has-hero] .page,
+:root[data-theme="light"][data-has-hero] .main-frame {
+  background: transparent;
+}
+:root[data-theme="light"][data-has-hero] header.header {
+  background-color: rgb(255 255 255 / 0.5);
+  backdrop-filter: blur(8px);
+}

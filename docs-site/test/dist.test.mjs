@@ -147,3 +147,19 @@ test("the landing background never moves: no animation loop, no pointer tracking
   assert.ok(!/requestAnimationFrame/.test(grain[0]), "grain background still animates");
   assert.ok(!/pointermove/.test(grain[0]), "grain background still follows the pointer");
 });
+
+test("the grain background shows in light mode too", () => {
+  const html = readFileSync(join(DIST, "index.html"), "utf8");
+  // Astro inlines a small component stylesheet into the page; check both.
+  const css = readdirSync(join(DIST, "_astro"))
+    .filter((f) => f.endsWith(".css"))
+    .map((f) => readFileSync(join(DIST, "_astro", f), "utf8"))
+    .concat([...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map((m) => m[1]))
+    .join("\n");
+  // The reveal rule must not be limited to the dark theme.
+  // Astro scopes component styles: #grain-bg:where(.astro-…)[data-ready].
+  const reveal = css.match(/([^{}]*)#grain-bg(?::where\([^)]*\))?\[data-ready\][^{]*\{[^}]*opacity:\s*1/);
+  assert.ok(reveal, "no rule revealing the drawn canvas");
+  assert.ok(!/data-theme=["']?dark/.test(reveal[1]), `reveal rule is dark-only: ${reveal[1].trim()}`);
+  assert.match(html, /uniform float light/, "shader has no light-scheme variant");
+});
