@@ -12,7 +12,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials};
+use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials, RedactedField};
 use crate::credentials_api::{self, CredentialSubmission, TestOutcome};
 use crate::reload;
 use crate::stream_health::StreamHealth;
@@ -109,7 +109,7 @@ pub struct RedactedCredentials {
     pub code: String,
     /// "configured" | "unconfigured" | "error"
     pub state: String,
-    pub fields: Vec<crate::credentials::RedactedField>,
+    pub fields: Vec<RedactedField>,
     /// The reason a stored blob could not be used — set only when
     /// `state == "error"`, and always a description, never the payload.
     pub message: Option<String>,

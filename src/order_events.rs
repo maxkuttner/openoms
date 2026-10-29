@@ -206,6 +206,7 @@ fn parse_order_id(raw: &str) -> Result<Uuid, ApiError> {
     })
 }
 
+/// Get an order's event history
 #[utoipa::path(
     get, path = "/orders/{id}/events", tag = "orders",
     params(("id" = Uuid, Path, description = "Order ID")),

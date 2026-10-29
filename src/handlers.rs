@@ -310,6 +310,7 @@ async fn resolve_instrument_ref(
     }
 }
 
+/// Submit an order
 #[utoipa::path(
     post, path = "/orders/submit", tag = "orders",
     request_body = SubmitOrderRequest,
@@ -949,6 +950,7 @@ pub async fn orders_submit(
 
 
 
+/// Cancel an order
 #[utoipa::path(
     post, path = "/orders/cancel", tag = "orders",
     request_body = CancelOrder,
@@ -1218,6 +1220,7 @@ pub async fn orders_cancel(
 }
 
 
+/// Get an order's current state
 #[utoipa::path(
     get, path = "/orders/{id}", tag = "orders",
     params(("id" = Uuid, Path, description = "Order ID")),
@@ -1355,6 +1358,7 @@ pub async fn list_portfolios(
     ))
 }
 
+/// List a portfolio's positions
 #[utoipa::path(
     get, path = "/portfolios/{id}/positions", tag = "orders",
     params(("id" = Uuid, Path, description = "Portfolio ID")),
@@ -1484,6 +1488,7 @@ pub struct VenuesQuery {
     pub instrument_id: String,
 }
 
+/// List the venues a portfolio can route an instrument to
 #[utoipa::path(
     get, path = "/portfolios/{id}/venues", tag = "orders",
     params(
@@ -1589,6 +1594,7 @@ pub struct Allocation {
     pub created_at: DateTime<Utc>,
 }
 
+/// Allocate a block order's fills across portfolios
 #[utoipa::path(
     post, path = "/orders/{id}/allocations", tag = "orders",
     params(("id" = Uuid, Path, description = "Block order ID")),
@@ -1725,6 +1731,7 @@ pub async fn create_allocations(
     Ok(Json(created))
 }
 
+/// List an order's allocations
 #[utoipa::path(
     get, path = "/orders/{id}/allocations", tag = "orders",
     params(("id" = Uuid, Path, description = "Order ID")),

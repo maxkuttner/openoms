@@ -2,6 +2,7 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 import starlightLinksValidator from "starlight-links-validator";
+import starlightOpenAPI, { openAPISidebarGroups } from "starlight-openapi";
 
 // Served as a GitHub Pages project site: https://maxkuttner.github.io/openoms/
 export default defineConfig({
@@ -16,7 +17,15 @@ export default defineConfig({
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/maxkuttner/openoms" }],
       editLink: { baseUrl: "https://github.com/maxkuttner/openoms/edit/main/docs-site/" },
       customCss: ["./src/styles/theme.css"],
-      plugins: [starlightLinksValidator()],
+      plugins: [
+        // Generated from the committed spec — never hand-written, so it cannot
+        // drift from the server (the_committed_openapi_spec_is_current keeps
+        // docs/openapi.json itself in step with the code).
+        starlightOpenAPI([{ base: "api", schema: "../docs/openapi.json", sidebar: { label: "API Reference" } }]),
+        // Generated API pages are invisible to the validator; test/dist.test.mjs
+        // checks links into them against the built files instead.
+        starlightLinksValidator({ exclude: ["/openoms/api", "/openoms/api/**"] }),
+      ],
       sidebar: [
         {
           label: "Getting Started",
@@ -47,6 +56,7 @@ export default defineConfig({
           label: "Operations",
           items: ["operations/updating", "operations/service", "operations/master-key-and-backups"],
         },
+        ...openAPISidebarGroups,
       ],
     }),
   ],

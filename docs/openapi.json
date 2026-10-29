@@ -2262,6 +2262,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "Search instruments",
         "operationId": "list_instruments_for_trader",
         "parameters": [
           {
@@ -2317,6 +2318,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "Get an option chain for an underlying and expiry",
         "operationId": "get_option_chain",
         "parameters": [
           {
@@ -2367,6 +2369,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "List option expiries for an underlying",
         "operationId": "list_option_expiries",
         "parameters": [
           {
@@ -2549,6 +2552,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "Cancel an order",
         "operationId": "orders_cancel",
         "requestBody": {
           "content": {
@@ -2589,6 +2593,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "Submit an order",
         "operationId": "orders_submit",
         "requestBody": {
           "content": {
@@ -2638,6 +2643,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "Get an order's current state",
         "operationId": "get_order",
         "parameters": [
           {
@@ -2684,6 +2690,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "List an order's allocations",
         "operationId": "list_allocations",
         "parameters": [
           {
@@ -2725,6 +2732,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "Allocate a block order's fills across portfolios",
         "operationId": "create_allocations",
         "parameters": [
           {
@@ -2787,6 +2795,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "Get an order's event history",
         "operationId": "get_order_events",
         "parameters": [
           {
@@ -2872,6 +2881,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "List a portfolio's positions",
         "operationId": "get_portfolio_positions",
         "parameters": [
           {
@@ -2918,6 +2928,7 @@
         "tags": [
           "orders"
         ],
+        "summary": "List the venues a portfolio can route an instrument to",
         "operationId": "get_portfolio_venues",
         "parameters": [
           {
@@ -3789,7 +3800,7 @@
           "portfolios": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/handlers.GrantedPortfolio"
+              "$ref": "#/components/schemas/GrantedPortfolio"
             }
           },
           "principal_id": {
@@ -3943,6 +3954,19 @@
         "enum": [
           "buy",
           "sell"
+        ]
+      },
+      "OrderStatus": {
+        "type": "string",
+        "enum": [
+          "submitted",
+          "routed",
+          "partially_filled",
+          "filled",
+          "rejected",
+          "canceled",
+          "expired",
+          "suspended"
         ]
       },
       "OrderType": {
@@ -4113,7 +4137,7 @@
           "fields": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/crate.credentials.RedactedField"
+              "$ref": "#/components/schemas/RedactedField"
             }
           },
           "message": {

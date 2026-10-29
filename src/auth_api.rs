@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
+use crate::handlers::GrantedPortfolio;
 use crate::handlers::{self, ApiError};
 use crate::oidc::{OidcError, Provider, VerifiedIdentity};
 use crate::sessions::{self, CookiePolicy};
@@ -543,7 +544,7 @@ pub struct MeResponse {
     pub principal_id: String,
     pub code: String,
     pub display_name: Option<String>,
-    pub portfolios: Vec<handlers::GrantedPortfolio>,
+    pub portfolios: Vec<GrantedPortfolio>,
 }
 
 /// Who the caller is signed in as, and what they can act on.

@@ -89,6 +89,7 @@ pub async fn search_instruments(
     .await
 }
 
+/// Search instruments
 #[utoipa::path(
     get, path = "/instruments", tag = "orders",
     params(InstrumentSearch),
@@ -208,6 +209,7 @@ pub struct ChainQuery {
     pub expiry: NaiveDate,
 }
 
+/// List option expiries for an underlying
 #[utoipa::path(
     get, path = "/instruments/options/expiries", tag = "orders",
     params(UnderlyingQuery),
@@ -224,6 +226,7 @@ pub async fn list_option_expiries(
     })
 }
 
+/// Get an option chain for an underlying and expiry
 #[utoipa::path(
     get, path = "/instruments/options/chain", tag = "orders",
     params(ChainQuery),

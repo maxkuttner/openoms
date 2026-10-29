@@ -49,3 +49,35 @@ test("every internal href in dist resolves to a built file", () => {
   }
   assert.deepEqual(broken, []);
 });
+
+// The trading endpoints a reader of "Your first API call" needs. Each must have
+// its own generated page, so a plugin change or a spec-shape the plugin skips
+// cannot silently drop them from the reference.
+const TRADING_OPERATIONS = [
+  ["post", "/orders/submit"],
+  ["post", "/orders/cancel"],
+  ["get", "/orders"],
+  ["get", "/orders/{id}"],
+];
+
+test("the API reference has a page for each trading endpoint", () => {
+  const spec = JSON.parse(readFileSync(new URL("../../docs/openapi.json", import.meta.url), "utf8"));
+  const pages = htmlFiles(join(DIST, "api")).map((f) => readFileSync(f, "utf8"));
+  for (const [method, path] of TRADING_OPERATIONS) {
+    const op = spec.paths[path]?.[method];
+    assert.ok(op, `${method.toUpperCase()} ${path} is not in docs/openapi.json`);
+    const title = op.summary ?? op.operationId;
+    const page = pages.find((html) => html.includes(`<title>${title}`) && html.includes(path));
+    assert.ok(page, `no API page titled "${title}" showing ${path}`);
+  }
+});
+
+test("every operation in the spec has a page", () => {
+  const spec = JSON.parse(readFileSync(new URL("../../docs/openapi.json", import.meta.url), "utf8"));
+  const operations = Object.values(spec.paths).reduce((n, ops) => n + Object.keys(ops).length, 0);
+  const operationPages = htmlFiles(join(DIST, "api", "operations"));
+  assert.ok(
+    operationPages.length >= operations,
+    `${operationPages.length} operation pages for ${operations} operations`,
+  );
+});

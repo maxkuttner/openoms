@@ -155,6 +155,7 @@ mod reload_tests;
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
+        crate::domain::orders::state::OrderStatus,
         crate::positions::Position,
         handlers::VenueOption,
         Allocation, CreateAllocations, AllocationSplit, BlotterRow,
@@ -1667,6 +1668,47 @@ mod tests {
             "expected /orders/submit in the spec, got: {:?}",
             spec["paths"].as_object().map(|p| p.keys().collect::<Vec<_>>())
         );
+    }
+
+    /// Every `$ref` in the spec must name a schema the spec defines. A dangling
+    /// one (a type registered under a different name than the one fields refer
+    /// to it by, or never registered) renders as "unknown" in Swagger UI and
+    /// makes the docs site's API reference build fail outright.
+    #[test]
+    fn every_schema_ref_in_the_openapi_spec_resolves() {
+        let spec: serde_json::Value = serde_json::from_str(&super::openapi_json()).unwrap();
+        let defined: std::collections::BTreeSet<&str> = spec["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let text = spec.to_string();
+        let dangling: std::collections::BTreeSet<&str> = text
+            .split("\"#/components/schemas/")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap())
+            .filter(|name| !defined.contains(name))
+            .collect();
+        assert!(dangling.is_empty(), "dangling schema refs: {dangling:?}");
+    }
+
+    /// The trading endpoints are what the public API reference leads with, and
+    /// a missing summary titles the page by the Rust function name instead
+    /// (`orders_submit`). A `///` doc comment on the handler supplies it.
+    #[test]
+    fn every_trading_operation_has_a_summary() {
+        let spec: serde_json::Value = serde_json::from_str(&super::openapi_json()).unwrap();
+        let mut missing = Vec::new();
+        for (path, ops) in spec["paths"].as_object().unwrap() {
+            for (method, op) in ops.as_object().unwrap() {
+                let trading = op["tags"].as_array().is_some_and(|t| t.iter().any(|t| t == "orders"));
+                if trading && op["summary"].as_str().map_or(true, str::is_empty) {
+                    missing.push(format!("{} {path}", method.to_uppercase()));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "trading operations without a summary: {missing:?}");
     }
 
     #[test]
