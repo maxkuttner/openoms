@@ -1711,6 +1711,26 @@ mod tests {
         assert!(missing.is_empty(), "trading operations without a summary: {missing:?}");
     }
 
+    /// Two handlers with the same function name get the same operationId, and
+    /// the docs site's API reference then builds one page for both — the
+    /// trader's `GET /portfolios` was published as the admin endpoint's page.
+    #[test]
+    fn every_operation_id_is_unique() {
+        let spec: serde_json::Value = serde_json::from_str(&super::openapi_json()).unwrap();
+        let mut seen = std::collections::BTreeMap::<String, String>::new();
+        let mut dupes = Vec::new();
+        for (path, ops) in spec["paths"].as_object().unwrap() {
+            for (method, op) in ops.as_object().unwrap() {
+                let id = op["operationId"].as_str().unwrap_or_default().to_string();
+                let here = format!("{} {path}", method.to_uppercase());
+                if let Some(first) = seen.insert(id.clone(), here.clone()) {
+                    dupes.push(format!("{id}: {first} and {here}"));
+                }
+            }
+        }
+        assert!(dupes.is_empty(), "duplicate operationIds: {dupes:?}");
+    }
+
     #[test]
     fn cli_reports_its_version() {
         use clap::CommandFactory;

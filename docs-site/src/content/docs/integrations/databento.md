@@ -21,6 +21,8 @@ One API key. Enter it in the cockpit under **Data feeds → databento-opra →
 Credentials** (**Test**, then **Save**), then reload:
 
 ```sh
+export OMS_ADMIN=$(sed -n 's/^admin_password = "\(.*\)"/\1/p' ~/.config/oms/oms.toml)
+
 curl -s -X POST localhost:3001/admin/connections/reload -H "Authorization: Bearer $OMS_ADMIN"
 ```
 

@@ -1318,7 +1318,7 @@ pub struct GrantedPortfolio {
 /// read the admin surface, which is exactly the authority a trading token must not
 /// have). Scope is the principal's own grants — there is no filter to widen it.
 #[utoipa::path(
-    get, path = "/portfolios", tag = "orders",
+    get, path = "/portfolios", tag = "orders", operation_id = "list_my_portfolios",
     responses((status = 200, description = "OK", body = [GrantedPortfolio])),
     security(("basic_auth" = []), ("bearer_token" = []))
 )]

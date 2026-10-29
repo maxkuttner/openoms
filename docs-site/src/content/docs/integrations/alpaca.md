@@ -28,6 +28,8 @@ Enter them in the cockpit under **Broker connections → alpaca-paper → Creden
 running server without a restart:
 
 ```sh
+export OMS_ADMIN=$(sed -n 's/^admin_password = "\(.*\)"/\1/p' ~/.config/oms/oms.toml)
+
 curl -s -X POST localhost:3001/admin/connections/reload -H "Authorization: Bearer $OMS_ADMIN"
 ```
 

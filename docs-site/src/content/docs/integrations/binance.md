@@ -31,6 +31,8 @@ Enter them in the cockpit under **Broker connections → binance-paper → Crede
 For FIX, also fill in the FIX host, port, `SenderCompID` and `TargetCompID`. Then reload:
 
 ```sh
+export OMS_ADMIN=$(sed -n 's/^admin_password = "\(.*\)"/\1/p' ~/.config/oms/oms.toml)
+
 curl -s -X POST localhost:3001/admin/connections/reload -H "Authorization: Bearer $OMS_ADMIN"
 ```
 

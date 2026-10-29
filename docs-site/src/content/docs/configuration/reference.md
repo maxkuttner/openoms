@@ -39,7 +39,7 @@ credential can drop the database — so those commands prompt for it or take it 
 
 | Key | Flag | Environment | Default |
 |---|---|---|---|
-| `password` | `--oms-password` | `OMS_PASSWORD` | `openoms-dev` |
+| `password` | `--oms-password` (`oms database init` only) | `OMS_PASSWORD` | `openoms-dev` |
 | `master_key` | — | `OMS_MASTER_KEY` | *(none)* |
 
 - **`password`** — the `oms` role the server connects to Postgres as. `oms init`

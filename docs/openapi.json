@@ -2850,7 +2850,7 @@
         ],
         "summary": "The portfolios this principal may act on.",
         "description": "Exists so a trading token is self-sufficient: every other trading route needs a\nportfolio UUID, and without this the caller has to be handed one out of band (or\nread the admin surface, which is exactly the authority a trading token must not\nhave). Scope is the principal's own grants — there is no filter to widen it.",
-        "operationId": "list_portfolios",
+        "operationId": "list_my_portfolios",
         "responses": {
           "200": {
             "description": "OK",

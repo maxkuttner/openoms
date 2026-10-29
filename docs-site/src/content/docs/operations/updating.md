@@ -9,6 +9,12 @@ description: Move to a new release with oms update, migrate, restart — or roll
 oms update
 ```
 
+:::note[On v0.2.0?]
+`oms update` arrived after v0.2.0. On that version, update once by re-running the
+installer (`curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh`); from then
+on, `oms update` works.
+:::
+
 It looks up the latest release, downloads the binary for your platform with the
 release's `SHA256SUMS`, and refuses on a checksum mismatch. It then runs the new binary to
 check it reports the expected version, and only then swaps it in place of the running

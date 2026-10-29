@@ -54,6 +54,7 @@ test("every internal href in dist resolves to a built file", () => {
 // its own generated page, so a plugin change or a spec-shape the plugin skips
 // cannot silently drop them from the reference.
 const TRADING_OPERATIONS = [
+  ["get", "/portfolios"],
   ["post", "/orders/submit"],
   ["post", "/orders/cancel"],
   ["get", "/orders"],
@@ -72,14 +73,13 @@ test("the API reference has a page for each trading endpoint", () => {
   }
 });
 
-test("every operation in the spec has a page", () => {
+test("every operation in the spec has its own page", () => {
   const spec = JSON.parse(readFileSync(new URL("../../docs/openapi.json", import.meta.url), "utf8"));
-  const operations = Object.values(spec.paths).reduce((n, ops) => n + Object.keys(ops).length, 0);
-  const operationPages = htmlFiles(join(DIST, "api", "operations"));
-  assert.ok(
-    operationPages.length >= operations,
-    `${operationPages.length} operation pages for ${operations} operations`,
-  );
+  const ids = Object.values(spec.paths).flatMap((ops) => Object.values(ops).map((op) => op.operationId));
+  // Pages are keyed by operationId: two operations sharing one get one page.
+  assert.equal(new Set(ids).size, ids.length, "duplicate operationIds in docs/openapi.json");
+  const missing = ids.filter((id) => !existsSync(join(DIST, "api", "operations", id, "index.html")));
+  assert.deepEqual(missing, []);
 });
 
 test("the architecture page renders all three diagrams", () => {
@@ -97,3 +97,16 @@ test("the OPRA tutorial is published", () => {
   const html = readFileSync(join(DIST, "tutorials/opra-marks-pnl/index.html"), "utf8");
   assert.ok(!html.includes("This page is being written."), "still the placeholder");
 });
+
+// The old hand-built site's pages. Every shipped cockpit links to
+// /openoms/architecture.html, so these must keep resolving.
+for (const [old, target] of [
+  ["architecture.html", "/openoms/concepts/architecture/"],
+  ["api.html", "/openoms/api/"],
+]) {
+  test(`the old /openoms/${old} redirects to ${target}`, () => {
+    const html = readFileSync(join(DIST, old), "utf8");
+    assert.match(html, new RegExp(`<meta http-equiv="refresh" content="0; url=${target}"`));
+    assert.ok(existsSync(join(DIST, target.slice(BASE.length), "index.html")), `${target} is not built`);
+  });
+}

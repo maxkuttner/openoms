@@ -30,7 +30,7 @@ The cockpit password is a different credential: it is for `/admin` and the cockp
 
 | Call | What it does |
 |---|---|
-| [`GET /portfolios`](/openoms/api/operations/list_portfolios/) | Portfolios this token may act on |
+| [`GET /portfolios`](/openoms/api/operations/list_my_portfolios/) | Portfolios this token may act on |
 | [`GET /instruments?search=AAPL`](/openoms/api/operations/list_instruments_for_trader/) | Search the catalog, best match first |
 | [`POST /orders/submit`](/openoms/api/operations/orders_submit/) | Place an order |
 | [`GET /orders`](/openoms/api/operations/list_orders/) | Your blotter, newest first |
