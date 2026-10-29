@@ -25,6 +25,7 @@ pub trait Prompter {
     fn note(&mut self, line: &str);
 }
 
+#[derive(Debug)]
 pub enum DbChoice {
     Docker,
     Existing(Prompts),
@@ -35,6 +36,16 @@ pub enum AdminPassword {
     Generated(String),
 }
 
+// Hand-written: the password itself never reaches a `{:?}`.
+impl std::fmt::Debug for AdminPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AdminPassword::Typed(_) => "Typed(<redacted>)",
+            AdminPassword::Generated(_) => "Generated(<redacted>)",
+        })
+    }
+}
+
 impl AdminPassword {
     pub fn value(&self) -> &str {
         match self {
@@ -43,6 +54,7 @@ impl AdminPassword {
     }
 }
 
+#[derive(Debug)]
 pub struct Answers {
     pub db: DbChoice,
     pub admin: AdminPassword,

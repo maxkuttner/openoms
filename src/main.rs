@@ -382,6 +382,15 @@ enum Command {
         /// Take values from flags and the environment instead of prompting.
         #[arg(long)]
         non_interactive: bool,
+        /// Where the database lives: start PostgreSQL 16 in Docker, or use an existing one [default: existing]
+        #[arg(long, value_enum)]
+        postgres: Option<setup::init::rules::DbSource>,
+        /// Cockpit admin password, at least 12 characters [env: OMS_ADMIN_PASSWORD] [default: generated]
+        #[arg(long)]
+        admin_password: Option<String>,
+        /// Address the server listens on [env: OMS_BIND_ADDR] [default: localhost:3001]
+        #[arg(long)]
+        bind: Option<String>,
         #[command(flatten)]
         db: DbArgs,
     },
@@ -418,6 +427,8 @@ enum ConfigCmd {
     /// command returns, so losing the printed key before it is saved loses every
     /// stored credential; keep the old key around until the new one is in place.
     RotateKey,
+    /// Print the path of the config file in use; exit 1 when there is none.
+    Path,
 }
 
 /// Connection flags shared by every database subcommand. Each falls back to its
@@ -567,6 +578,13 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::Config(ConfigCmd::Path)) => {
+            let path = config::path();
+            if !path.exists() {
+                std::process::exit(1);
+            }
+            println!("{}", config::absolute(path).display());
+        }
         Some(Command::Config(ConfigCmd::RotateKey)) => {
             let old_key = match config::master_key(config::load()) {
                 Some(Ok(key)) => key,
@@ -639,7 +657,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Init { non_interactive, db }) => {
+        Some(Command::Init { non_interactive, postgres, admin_password, bind, db }) => {
             // Checked here too, not only inside `run()`: `resolve()` below calls
             // `config::load()`, which exits the process over a *malformed*
             // oms.toml before `run()`'s own check ever runs — and interactively,
@@ -654,16 +672,58 @@ async fn main() {
             }
 
             let interactive = !non_interactive;
-            let prompts = if non_interactive {
+            let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+            // Checked before any prompt, in both modes: a bad value should not
+            // cost the operator a round of typing first. Each error names where
+            // the value came from — the environment may hold one (often from a
+            // `.env`) the operator forgot about.
+            let from = |flag: Option<String>, name: &str, var: &str| -> (Option<String>, String) {
+                match flag {
+                    Some(v) => (Some(v), format!("--{name}")),
+                    None => (env(var), var.to_string()),
+                }
+            };
+            let (admin_password, admin_src) = from(admin_password, "admin-password", "OMS_ADMIN_PASSWORD");
+            let (bind, bind_src) = from(bind, "bind", "OMS_BIND_ADDR");
+            let checked = admin_password.as_deref().map_or(Ok(()), setup::init::rules::check_admin_password)
+                .map_err(|e| format!("{admin_src}: {e}"))
+                .and(bind.as_deref().map_or(Ok(()), |b| setup::init::rules::parse_bind(b).map(|_| ()))
+                    .map_err(|e| format!("{bind_src}: {e}")));
+            if let Err(e) = checked {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            let flags = setup::init::InitFlags { source: postgres, admin_password, bind };
+            let answers = if non_interactive {
                 let cfg = setup::database::config::resolve(db.into());
-                setup::init::Prompts {
+                let prompts = setup::init::Prompts {
                     host: cfg.host,
                     port: cfg.port,
                     database: cfg.database,
                     username: cfg.username,
                     password: cfg.password,
+                };
+                match setup::init::answers_from_flags(&flags, prompts) {
+                    Ok(a) => {
+                        if let Some(w) = setup::init::rules::exposure_warning(&a.bind) {
+                            eprintln!("{w}");
+                        }
+                        a
+                    }
+                    Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 }
             } else {
+                // dialoguer needs a terminal; without one it fails on the first
+                // prompt with an error that names neither the cause nor the way out.
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                    eprintln!(
+                        "error: oms init asks its questions on a terminal, and none is attached.\n\
+                         \x20        Take every value from flags and the environment instead:\n\
+                         \x20          oms init --non-interactive [--postgres docker] [--password '<superuser password>']"
+                    );
+                    std::process::exit(1);
+                }
                 // Seed the interactive prompts' defaults from whatever was passed
                 // on the command line (and the environment, via the same
                 // resolve() precedence non-interactive mode uses) — otherwise
@@ -680,30 +740,30 @@ async fn main() {
                 // to type.
                 let password_override = db.password.clone();
                 let cfg = setup::database::config::resolve(db.into());
-                use setup::init::docker::DockerOps;
                 let defaults = setup::init::prompts::Defaults {
                     host: cfg.host,
                     port: cfg.port,
                     database: cfg.database,
                     username: cfg.username,
                     superuser_password: password_override,
-                    admin_password: None,
-                    bind: "localhost:3001".into(),
-                    source: None,
+                    admin_password: flags.admin_password,
+                    bind: flags.bind.unwrap_or_else(|| setup::init::DEFAULT_BIND.into()),
+                    source: flags.source,
                 };
-                let status = setup::init::docker::Cli.status();
+                use setup::init::docker::DockerOps;
+                // Probed only when the menu will be shown: `docker info` can take
+                // seconds against a stopped Docker Desktop.
+                let status = if defaults.source.is_some() {
+                    setup::init::rules::DockerStatus::Usable
+                } else {
+                    setup::init::docker::Cli.status()
+                };
                 match setup::init::prompts::collect(&mut setup::init::prompts::Terminal::new(), &defaults, status) {
-                    Ok(a) => match a.db {
-                        setup::init::prompts::DbChoice::Existing(p) => p,
-                        setup::init::prompts::DbChoice::Docker => {
-                            eprintln!("error: Docker setup is not wired yet");
-                            std::process::exit(1);
-                        }
-                    },
+                    Ok(a) => a,
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 }
             };
-            if let Err(e) = setup::init::run(prompts, interactive).await {
+            if let Err(e) = setup::init::run(answers, &setup::init::docker::Cli, interactive).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -1521,6 +1581,35 @@ async fn serve() {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn init_takes_the_guided_setup_flags() {
+        use clap::Parser;
+        use crate::{setup, Cli, Command, ConfigCmd};
+        let cli = Cli::try_parse_from([
+            "oms", "init", "--non-interactive", "--postgres", "docker",
+            "--admin-password", "twelve-chars-ok", "--bind", "localhost:4000",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Init { non_interactive, postgres, admin_password, bind, .. }) => {
+                assert!(non_interactive);
+                assert_eq!(postgres, Some(setup::init::rules::DbSource::Docker));
+                assert_eq!(admin_password.as_deref(), Some("twelve-chars-ok"));
+                assert_eq!(bind.as_deref(), Some("localhost:4000"));
+            }
+            _ => panic!("not init"),
+        }
+        assert!(Cli::try_parse_from(["oms", "init", "--postgres", "kubernetes"]).is_err());
+    }
+
+    #[test]
+    fn config_path_is_a_command() {
+        use clap::Parser;
+        use crate::{setup, Cli, Command, ConfigCmd};
+        let cli = Cli::try_parse_from(["oms", "config", "path"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Config(ConfigCmd::Path))));
+    }
     use super::bind_is_loopback;
     use super::{admin_password_from_env, nothing_decrypted, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
     use crate::config::FileConfig;

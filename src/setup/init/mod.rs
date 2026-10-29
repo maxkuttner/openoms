@@ -15,6 +15,9 @@ pub mod docker;
 pub mod prompts;
 pub mod rules;
 
+use prompts::{AdminPassword, Answers, DbChoice};
+use rules::DbSource;
+
 /// 32 bytes — the AES-256 key size the credential store expects.
 pub fn generate_master_key() -> String {
     let mut raw = [0u8; 32];
@@ -69,7 +72,7 @@ impl std::fmt::Debug for Prompts {
 /// the raw value for its success message, and generating it there — then
 /// assigning it into the config — is one step, versus generating it here and
 /// making the caller claw it back out of an `Option` afterwards.
-pub fn build_file_config(p: &Prompts) -> (FileConfig, String) {
+pub fn build_file_config(p: &Prompts, bind: &str) -> (FileConfig, String) {
     let role_password = generate_password();
     let mut cfg = FileConfig::default();
     cfg.database.host = Some(p.host.clone());
@@ -78,7 +81,7 @@ pub fn build_file_config(p: &Prompts) -> (FileConfig, String) {
     cfg.database.database = Some(p.database.clone());
     cfg.oms.password = Some(role_password.clone());
     cfg.oms.master_key = Some(generate_master_key());
-    cfg.server.bind_addr = Some("localhost:3001".to_string());
+    cfg.server.bind_addr = Some(bind.to_string());
     (cfg, role_password)
 }
 
@@ -97,6 +100,45 @@ pub fn already_initialized_message(path: &std::path::Path) -> String {
     )
 }
 
+/// Flag and environment values for `oms init`; in non-interactive mode they are
+/// the whole answer, interactively they skip the matching prompt.
+pub struct InitFlags {
+    pub source: Option<DbSource>,
+    pub admin_password: Option<String>,
+    pub bind: Option<String>,
+}
+
+pub const DEFAULT_BIND: &str = "localhost:3001";
+
+/// Non-interactive answers: `--postgres` defaults to `existing` (what scripts
+/// written before the flag existed expect), an absent admin password is
+/// generated, an absent bind is `localhost:3001`. Values are checked by the same
+/// rules the prompts use, so a script cannot write what a human could not type.
+pub fn answers_from_flags(f: &InitFlags, db: Prompts) -> Result<Answers, String> {
+    let db = match f.source.unwrap_or(DbSource::Existing) {
+        DbSource::Docker => DbChoice::Docker,
+        DbSource::Existing => DbChoice::Existing(db),
+    };
+    let admin = match &f.admin_password {
+        Some(pw) => {
+            rules::check_admin_password(pw)?;
+            AdminPassword::Typed(pw.clone())
+        }
+        None => AdminPassword::Generated(generate_password()),
+    };
+    let bind = rules::parse_bind(f.bind.as_deref().unwrap_or(DEFAULT_BIND))?;
+    Ok(Answers { db, admin, bind })
+}
+
+pub fn docker_cleanup_hint() -> String {
+    format!(
+        "The {c} container is still running. To start over:\n\
+         \x20     docker rm -f {c} && docker volume rm {v}",
+        c = docker::CONTAINER,
+        v = docker::VOLUME
+    )
+}
+
 /// The whole `oms init` flow.
 ///
 /// `interactive` controls only whether the generated cockpit password is printed:
@@ -104,15 +146,63 @@ pub fn already_initialized_message(path: &std::path::Path) -> String {
 /// operator, so it must be shown; false (`--non-interactive`) is the mode most
 /// likely to run under CI/Ansible with stdout captured into a durable log, which
 /// is exactly what "secrets are never logged" rules out.
-pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    answers: Answers,
+    docker: &dyn docker::DockerOps,
+    interactive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_timeout(
+        answers,
+        docker,
+        interactive,
+        docker::READY_TIMEOUT,
+        config::path(),
+        config::init_target(),
+    )
+    .await
+}
+
+/// `run`, with the readiness timeout and both config paths passed in so tests
+/// never touch `OMS_CONFIG` or the working directory's `oms.toml`.
+async fn run_with_timeout(
+    answers: Answers,
+    docker: &dyn docker::DockerOps,
+    interactive: bool,
+    ready: std::time::Duration,
+    existing_cfg: std::path::PathBuf,
+    target_cfg: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Refuse over a config found in ANY searched location, not just the one
     // this run would write: a second file elsewhere would be silently shadowed
     // by (or shadow) the first, with a different master key in each.
-    let existing = config::path();
-    if existing.exists() {
-        return Err(already_initialized_message(&config::absolute(existing)).into());
+    if existing_cfg.exists() {
+        return Err(already_initialized_message(&config::absolute(existing_cfg)).into());
     }
-    let cfg_path = config::absolute(config::init_target());
+    let cfg_path = config::absolute(target_cfg);
+
+    let Answers { db, admin, bind } = answers;
+    let started_docker = matches!(db, DbChoice::Docker);
+    let prompts = match db {
+        DbChoice::Existing(p) => p,
+        DbChoice::Docker => {
+            docker::preflight(docker).map_err(|e| format!("error: {e}"))?;
+            println!("  starting {} ({}) ...", docker::CONTAINER, docker::IMAGE);
+            let (p, note) = docker::start(docker).map_err(|e| format!("error: {e}"))?;
+            if let Some(note) = note {
+                println!("  {note}");
+            }
+            docker::wait_ready(&p, ready)
+                .await
+                .map_err(|e| format!("error: {e}\n\n{}", docker_cleanup_hint()))?;
+            println!("  {} is ready on 127.0.0.1:{}", docker::CONTAINER, p.port);
+            p
+        }
+    };
+    // Every failure from here on, after a container was started, also says how
+    // to remove it: its superuser password was never shown to anyone.
+    let cleanup = |e: String| -> Box<dyn std::error::Error> {
+        if started_docker { format!("{e}\n\n{}", docker_cleanup_hint()).into() } else { e.into() }
+    };
 
     // Test connectivity before writing anything: a wrong password should cost
     // nothing, not leave a half-made install behind. `PgConnection` (a single
@@ -129,13 +219,12 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
     };
     let conn = sqlx::PgConnection::connect(&probe.url_for("postgres"))
         .await
-        .map_err(|e| format!("error: could not connect to {}:{} — {e}", prompts.host, prompts.port))?;
+        .map_err(|e| cleanup(format!("error: could not connect to {}:{} — {e}", prompts.host, prompts.port)))?;
     conn.close().await.ok();
     println!("  connected to {}:{}", prompts.host, prompts.port);
 
-    let (mut file_cfg, role_password) = build_file_config(&prompts);
-    let admin_password = generate_password();
-    file_cfg.server.admin_password = Some(admin_password.clone());
+    let (mut file_cfg, role_password) = build_file_config(&prompts, &bind);
+    file_cfg.server.admin_password = Some(admin.value().to_string());
 
     // Written before provisioning: if provisioning fails halfway, the generated
     // secrets survive and `oms database init --resume` can finish the job.
@@ -148,9 +237,9 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
             .recursive(true)
             .mode(0o700)
             .create(dir)
-            .map_err(|e| format!("error: could not create {}: {e}", dir.display()))?;
+            .map_err(|e| cleanup(format!("error: could not create {}: {e}", dir.display())))?;
     }
-    config::write_new(&cfg_path, &file_cfg).map_err(|e| format!("error: {e}"))?;
+    config::write_new(&cfg_path, &file_cfg).map_err(|e| cleanup(format!("error: {e}")))?;
     println!("  wrote {} (mode 0600)", cfg_path.display());
     // Only a file written into the current directory can land in a checkout.
     if std::env::current_dir().is_ok_and(|cwd| cfg_path.parent() == Some(cwd.as_path())) {
@@ -184,10 +273,12 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
         )
     })?;
 
-    let admin_line = if interactive {
-        format!("Cockpit login password: {admin_password}")
-    } else {
-        "Cockpit login password: written to oms.toml".to_string()
+    // Only a generated password is ever printed, and only to a human at a
+    // terminal: one the operator typed they already know.
+    let admin_line = match (&admin, interactive) {
+        (AdminPassword::Typed(_), _) => "Cockpit login password: the one you chose".to_string(),
+        (AdminPassword::Generated(pw), true) => format!("Cockpit login password: {pw}"),
+        (AdminPassword::Generated(_), false) => "Cockpit login password: written to oms.toml".to_string(),
     };
     // Absolute (cfg_path already is): this message may be read after the
     // operator has `cd`ed elsewhere, and a relative path then points at nothing.
@@ -196,10 +287,23 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
         "\nBack up {}. The master key in it is the only thing that can\n\
          decrypt stored broker credentials — lose it and they are gone.\n\n\
          {admin_line}\n\n\
-         Start the server:  oms",
-        abs_path.display()
+         Start the server:  oms\n\
+         Then open:         {}",
+        abs_path.display(),
+        cockpit_url(&bind)
     );
     Ok(())
+}
+
+/// Where to point a browser for `bind`: a wildcard address is not one a
+/// browser can open, so it becomes `localhost`.
+pub fn cockpit_url(bind: &str) -> String {
+    let (host, port) = bind.rsplit_once(':').unwrap_or((bind, "3001"));
+    let host = match host {
+        "0.0.0.0" | "[::]" => "localhost",
+        h => h,
+    };
+    format!("http://{host}:{port}/cockpit/")
 }
 
 /// Append the config filename to `.gitignore` if it is not already covered.
@@ -289,7 +393,7 @@ mod tests {
             username: "admin".into(),
             password: "super-secret".into(),
         };
-        let (cfg, role_pw) = build_file_config(&p);
+        let (cfg, role_pw) = build_file_config(&p, "localhost:3001");
 
         assert_eq!(cfg.database.host.as_deref(), Some("db.internal"));
         assert_eq!(cfg.database.port, Some(6543));
@@ -306,4 +410,122 @@ mod tests {
             "superuser password must never reach the file:\n{rendered}"
         );
     }
+    fn sample_prompts() -> Prompts {
+        Prompts {
+            host: "localhost".into(),
+            port: 5432,
+            database: "ods".into(),
+            username: "postgres".into(),
+            password: "pw".into(),
+        }
+    }
+
+    fn flags(admin: Option<&str>, bind: Option<&str>) -> InitFlags {
+        InitFlags { source: None, admin_password: admin.map(Into::into), bind: bind.map(Into::into) }
+    }
+
+    #[test]
+    fn build_file_config_writes_the_chosen_bind() {
+        let (cfg, _) = build_file_config(&sample_prompts(), "0.0.0.0:4000");
+        assert_eq!(cfg.server.bind_addr.as_deref(), Some("0.0.0.0:4000"));
+    }
+
+    #[test]
+    fn non_interactive_defaults_to_existing_localhost_and_a_generated_password() {
+        let a = answers_from_flags(&flags(None, None), sample_prompts()).unwrap();
+        assert!(matches!(a.db, DbChoice::Existing(_)));
+        assert!(matches!(a.admin, AdminPassword::Generated(_)));
+        assert_eq!(a.bind, "localhost:3001");
+    }
+
+    #[test]
+    fn non_interactive_docker_and_a_chosen_password_carry_through() {
+        let f = InitFlags { source: Some(DbSource::Docker), ..flags(Some("twelve-chars-ok"), Some("0.0.0.0:3001")) };
+        let a = answers_from_flags(&f, sample_prompts()).unwrap();
+        assert!(matches!(a.db, DbChoice::Docker));
+        assert!(matches!(a.admin, AdminPassword::Typed(ref p) if p == "twelve-chars-ok"));
+        assert_eq!(a.bind, "0.0.0.0:3001");
+    }
+
+    #[test]
+    fn short_admin_password_flag_is_refused() {
+        let e = answers_from_flags(&flags(Some("short"), None), sample_prompts()).unwrap_err();
+        assert!(e.contains("12"), "{e}");
+    }
+
+    #[test]
+    fn a_bad_bind_flag_is_refused() {
+        assert!(answers_from_flags(&flags(None, Some(":3001")), sample_prompts()).is_err());
+    }
+
+    /// A Docker that "starts" a container nobody listens for: readiness fails
+    /// after the container exists, so the error must say how to clean up.
+    struct StartsButNeverListens;
+
+    impl docker::DockerOps for StartsButNeverListens {
+        fn status(&self) -> rules::DockerStatus { rules::DockerStatus::Usable }
+        fn container_exists(&self, _: &str) -> bool { false }
+        fn volume_exists(&self, _: &str) -> bool { false }
+        // Skip to a port nothing on this machine listens on.
+        fn port_free(&self, port: u16) -> bool { port == 5531 }
+        fn run_postgres(&self, _: u16, _: &str) -> Result<(), String> { Ok(()) }
+    }
+
+    #[tokio::test]
+    async fn docker_failure_after_start_names_cleanup() {
+        let tmp = std::env::temp_dir().join(format!("oms-init-test-{}", std::process::id()));
+        let a = Answers {
+            db: DbChoice::Docker,
+            admin: AdminPassword::Generated("x".repeat(24)),
+            bind: "localhost:3001".into(),
+        };
+        let e = run_with_timeout(
+            a,
+            &StartsButNeverListens,
+            false,
+            std::time::Duration::from_millis(500),
+            tmp.join("none.toml"),
+            tmp.join("oms.toml"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("docker rm -f oms-postgres && docker volume rm oms-pgdata"), "{e}");
+        assert!(!tmp.join("oms.toml").exists(), "nothing written before the database answered");
+    }
+
+    #[tokio::test]
+    async fn an_existing_config_is_refused_before_docker_runs() {
+        struct Panics;
+        impl docker::DockerOps for Panics {
+            fn status(&self) -> rules::DockerStatus { rules::DockerStatus::Usable }
+            fn container_exists(&self, _: &str) -> bool { panic!("docker touched") }
+            fn volume_exists(&self, _: &str) -> bool { panic!("docker touched") }
+            fn port_free(&self, _: u16) -> bool { panic!("docker touched") }
+            fn run_postgres(&self, _: u16, _: &str) -> Result<(), String> { panic!("docker touched") }
+        }
+        let existing = std::env::temp_dir().join(format!("oms-init-existing-{}.toml", std::process::id()));
+        std::fs::write(&existing, "").unwrap();
+        let a = Answers { db: DbChoice::Docker, admin: AdminPassword::Generated("x".repeat(24)), bind: "localhost:3001".into() };
+        let e = run_with_timeout(a, &Panics, false, std::time::Duration::from_millis(100), existing.clone(), existing.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        std::fs::remove_file(&existing).ok();
+        assert!(e.contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn the_cockpit_url_opens_in_a_browser() {
+        assert_eq!(cockpit_url("localhost:3001"), "http://localhost:3001/cockpit/");
+        assert_eq!(cockpit_url("0.0.0.0:4000"), "http://localhost:4000/cockpit/");
+    }
+
+    #[test]
+    fn answers_debug_never_shows_the_admin_password() {
+        let a = answers_from_flags(&flags(Some("very-secret-admin"), None), sample_prompts()).unwrap();
+        let d = format!("{a:?}");
+        assert!(!d.contains("very-secret-admin") && !d.contains("\"pw\""), "{d}");
+    }
+
 }

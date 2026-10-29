@@ -102,16 +102,17 @@ pub fn preflight(ops: &dyn DockerOps) -> Result<(), String> {
     if !container && !volume {
         return Ok(());
     }
-    let found = match (container, volume) {
-        (true, true) => format!("a container named {CONTAINER} and a volume named {VOLUME} already exist"),
-        (true, false) => format!("a container named {CONTAINER} already exists"),
-        _ => format!("a volume named {VOLUME} already exists"),
+    let (found, it) = match (container, volume) {
+        (true, true) => (format!("a container named {CONTAINER} and a volume named {VOLUME} already exist"), "they"),
+        (true, false) => (format!("a container named {CONTAINER} already exists"), "it"),
+        _ => (format!("a volume named {VOLUME} already exists"), "it"),
     };
     Err(format!(
-        "{found}. They may hold an earlier database, so oms init will not reuse or remove them.\n\
-         \x20 Use it as an existing PostgreSQL instead, or remove both and run oms init again:\n\
+        "{found}; {it} may hold an earlier database, so oms init will not reuse or remove {obj}.\n\
+         \x20 Choose \"Use an existing PostgreSQL 16\" to keep it, or remove both and run oms init again:\n\
          \x20     docker rm -f {CONTAINER}\n\
-         \x20     docker volume rm {VOLUME}"
+         \x20     docker volume rm {VOLUME}",
+        obj = if it == "they" { "them" } else { "it" }
     ))
 }
 
