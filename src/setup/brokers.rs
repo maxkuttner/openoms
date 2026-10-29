@@ -130,13 +130,58 @@ pub struct Args {
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&super::database_url()?).await?;
+    let provider = provider_for(&pool, args.broker).await?;
 
-    // Credentials come from the store — the same load `serve()` and
-    // `config import-env` use — so this command and boot-time adapter
-    // registration can never disagree about what a broker is configured with.
-    // Same three-way key handling as `serve()`: absent-and-nothing-stored is a
-    // normal fresh install, absent-with-credentials-stored is fatal, and an
-    // invalid key is fatal.
+    let underlyings: Vec<String> = args
+        .underlyings
+        .split(',')
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if args.dry_run {
+        info!("fetching {} catalog …", args.broker.code());
+        let catalog = provider.list_instruments(&underlyings).await?;
+        info!("fetched {} tradeable instrument(s) from {}", catalog.len(), args.broker.code());
+        for bi in catalog.iter().take(20) {
+            info!(
+                "  {}@{} -> broker_symbol={} tradeable={}",
+                bi.definition.symbol, bi.definition.venue, bi.broker_symbol, bi.is_tradeable
+            );
+        }
+        info!("dry run complete: {} instrument(s), no write", catalog.len());
+        return Ok(());
+    }
+
+    let opts = LoadOptions { no_enrich: args.no_enrich, allow_skips: args.allow_skips, underlyings };
+    let report = load_universe(&pool, args.broker, provider.as_ref(), &opts, &TracingProgress).await?;
+
+    // Loud by default. `upsert_catalog` already named the offending venues and
+    // currencies; make them consequential so a half-seeded catalog cannot pass for
+    // a finished one in a script or CI step.
+    if report.skipped > 0 && !args.allow_skips {
+        return Err(format!(
+            "{} instrument(s) skipped on a missing venue/currency — see the warnings above. \
+             Seed the missing rows, or pass --allow-skips to accept a partial catalog.",
+            report.skipped
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The broker's catalog source, built from its credential in the store.
+///
+/// Credentials come from the store — the same load `serve()` and
+/// `config import-env` use — so a CLI sync, a job and boot-time adapter
+/// registration can never disagree about what a broker is configured with.
+/// Same three-way key handling as `serve()`: absent-and-nothing-stored is a
+/// normal fresh install, absent-with-credentials-stored is fatal, and an
+/// invalid key is fatal.
+pub async fn provider_for(
+    pool: &PgPool,
+    broker: Broker,
+) -> Result<Box<dyn InstrumentProvider>, Box<dyn std::error::Error>> {
     let master = match crate::config::master_key(crate::config::load()) {
         Some(Ok(k)) => Some(k),
         Some(Err(e)) => return Err(format!("invalid master key: {e}").into()),
@@ -146,7 +191,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // Fail safe, not fail open: a query failure must not silently disarm
         // this the way `.unwrap_or(false)` would — see the identical reasoning
         // in `serve()`.
-        let might_be_stored = match crate::credentials::any_credentials_stored(&pool).await {
+        let might_be_stored = match crate::credentials::any_credentials_stored(pool).await {
             Ok(b) => b,
             Err(e) => {
                 warn!("could not determine whether credentials are stored, assuming they may be: {e}");
@@ -162,8 +207,8 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let code = args.broker.connection_code();
-    let connections = crate::credentials::load_brokers(&pool, master.as_ref()).await?;
+    let code = broker.connection_code();
+    let connections = crate::credentials::load_brokers(pool, master.as_ref()).await?;
     let creds = match connections.into_iter().find(|c| c.code == code) {
         Some(Connection { credentials: CredentialState::Configured(creds), .. }) => creds,
         Some(Connection { credentials: CredentialState::Unconfigured, .. }) => {
@@ -185,57 +230,100 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let underlyings: Vec<String> = args
-        .underlyings
-        .split(',')
-        .map(|s| s.trim().to_uppercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let provider: Box<dyn InstrumentProvider> = match args.broker {
+    Ok(match broker {
         Broker::Alpaca => Box::new(build_alpaca(&creds)?),
         Broker::Binance => Box::new(build_binance(&creds)?),
-    };
+    })
+}
 
-    info!("fetching {} catalog …", args.broker.code());
-    let catalog = provider.list_instruments(&underlyings).await?;
-    info!("fetched {} tradeable instrument(s) from {}", catalog.len(), args.broker.code());
+/// How a universe load is run. `allow_skips` is honoured by the caller (the CLI
+/// fails a skipping load unless it is set); the load itself always completes and
+/// reports what it skipped.
+pub struct LoadOptions {
+    pub no_enrich: bool,
+    pub allow_skips: bool,
+    /// Option chains to seed alongside the base instruments. Empty for cockpit
+    /// and boot loads.
+    pub underlyings: Vec<String>,
+}
 
-    if args.dry_run {
-        for bi in catalog.iter().take(20) {
-            info!(
-                "  {}@{} -> broker_symbol={} tradeable={}",
-                bi.definition.symbol, bi.definition.venue, bi.broker_symbol, bi.is_tradeable
-            );
+/// What a universe load did, as stored on its job and shown in the cockpit.
+#[derive(Debug, serde::Serialize)]
+pub struct UniverseLoadReport {
+    pub fetched: usize,
+    pub upserted: usize,
+    pub mapped: usize,
+    /// Instruments dropped because their venue or currency is unknown.
+    pub skipped: usize,
+    /// Why, as the distinct codes: e.g. "unknown venue TXSE".
+    pub skipped_reasons: Vec<String>,
+}
+
+/// Where a universe load reports progress: a job row, or the log for the CLI.
+pub trait LoadProgress {
+    fn progress(&self, done: i64, total: i64);
+    fn log(&self, level: &str, message: &str);
+}
+
+/// The CLI's progress sink: the log lines `sync-broker` always printed.
+struct TracingProgress;
+
+impl LoadProgress for TracingProgress {
+    fn progress(&self, _done: i64, _total: i64) {}
+    fn log(&self, level: &str, message: &str) {
+        if level == "warn" {
+            warn!("{message}");
+        } else {
+            info!("{message}");
         }
-        info!("dry run complete: {} instrument(s), no write", catalog.len());
-        return Ok(());
     }
+}
+
+/// Fetch `broker`'s catalog from `provider`, upsert it into the master
+/// instrument catalog, and map every landed instrument to the broker.
+///
+/// Progress counts instruments mapped against the number fetched, reported after
+/// each batch, so a caller can show `done / total` once the fetch returns.
+pub async fn load_universe(
+    pool: &PgPool,
+    broker: Broker,
+    provider: &dyn InstrumentProvider,
+    opts: &LoadOptions,
+    p: &dyn LoadProgress,
+) -> Result<UniverseLoadReport, Box<dyn std::error::Error>> {
+    p.log("info", &format!("fetching {} catalog …", broker.code()));
+    let catalog = provider.list_instruments(&opts.underlyings).await?;
+    let fetched = catalog.len();
+    p.log("info", &format!("fetched {fetched} tradeable instrument(s) from {}", broker.code()));
+    p.progress(0, fetched as i64);
     if catalog.is_empty() {
-        warn!("empty catalog; nothing to seed");
-        return Ok(());
+        p.log("warn", "empty catalog; nothing to seed");
+        return Ok(UniverseLoadReport { fetched, upserted: 0, mapped: 0, skipped: 0, skipped_reasons: Vec::new() });
     }
 
     // 1) Create/refresh the master instrument catalog from the broker's definitions.
     let defs: Vec<InstrumentDef> = catalog.iter().map(|bi| bi.definition.clone()).collect();
-    let enrichers: Vec<Box<dyn Enricher>> = if args.no_enrich {
+    let enrichers: Vec<Box<dyn Enricher>> = if opts.no_enrich {
         Vec::new()
     } else {
         vec![Box::new(OpenFigiEnricher::new(env::var("OPENFIGI_API_KEY").ok()))]
     };
-    let (summary, ids) = catalog::upsert_catalog(&pool, &defs, &enrichers).await?;
-    info!(
-        "master: upserted={} skipped_fk={} skipped_expired={} derivatives={} dated={} enriched={}",
-        summary.upserted,
-        summary.skipped_fk(),
-        summary.skipped_expired,
-        summary.derivatives,
-        summary.dated,
-        summary.enriched
+    let (summary, ids) = catalog::upsert_catalog(pool, &defs, &enrichers).await?;
+    p.log(
+        "info",
+        &format!(
+            "master: upserted={} skipped_fk={} skipped_expired={} derivatives={} dated={} enriched={}",
+            summary.upserted,
+            summary.skipped_fk(),
+            summary.skipped_expired,
+            summary.derivatives,
+            summary.dated,
+            summary.enriched
+        ),
     );
 
     // 2) Attach the broker routing mapping for every instrument that landed.
-    let broker_code = args.broker.code();
+    let broker_code = broker.code();
     let rows: Vec<BrokerRow> = catalog
         .iter()
         .filter_map(|bi| {
@@ -243,28 +331,33 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             ids.get(&key).map(|&id| BrokerRow::from(id, bi))
         })
         .collect();
-    info!("mapping {} instrument(s) to {broker_code}", rows.len());
+    p.log("info", &format!("mapping {} instrument(s) to {broker_code}", rows.len()));
 
     let mut tx = pool.begin().await?;
-    let mut n = 0usize;
+    let mut mapped = 0usize;
     for chunk in rows.chunks(BATCH) {
-        n += bulk_upsert_broker_instrument(&mut tx, broker_code, chunk).await?;
+        mapped += bulk_upsert_broker_instrument(&mut tx, broker_code, chunk).await?;
+        p.progress(mapped as i64, fetched as i64);
     }
     tx.commit().await?;
-    info!("sync-broker done: upserted {n} {broker_code} broker_instrument row(s)");
+    // Instruments that never landed (skipped) are never mapped; count the load
+    // as done against what was fetched.
+    p.progress(fetched as i64, fetched as i64);
+    p.log("info", &format!("sync-broker done: upserted {mapped} {broker_code} broker_instrument row(s)"));
 
-    // Loud by default. `upsert_catalog` already named the offending venues and
-    // currencies; make them consequential so a half-seeded catalog cannot pass for
-    // a finished one in a script or CI step.
-    let skipped = summary.skipped_fk();
-    if skipped > 0 && !args.allow_skips {
-        return Err(format!(
-            "{skipped} instrument(s) skipped on a missing venue/currency — see the warnings above. \
-             Seed the missing rows, or pass --allow-skips to accept a partial catalog."
-        )
-        .into());
-    }
-    Ok(())
+    let skipped_reasons: Vec<String> = summary
+        .unknown_venues
+        .iter()
+        .map(|v| format!("unknown venue {v}"))
+        .chain(summary.unknown_currencies.iter().map(|c| format!("unknown currency {c}")))
+        .collect();
+    Ok(UniverseLoadReport {
+        fetched,
+        upserted: summary.upserted as usize,
+        mapped,
+        skipped: summary.skipped_fk() as usize,
+        skipped_reasons,
+    })
 }
 
 /// Build an `AlpacaAdapter` from a store credential. `ALPACA_ENV` still selects
@@ -475,4 +568,129 @@ mod tests {
 
         assert_eq!(result, vec![Broker::Alpaca]);
     }
+
+    // --- load_universe -------------------------------------------------------
+
+    /// A broker whose catalog is a fixed list of (symbol, venue) — no network.
+    struct FakeProvider(Vec<(String, String)>);
+
+    #[async_trait::async_trait]
+    impl InstrumentProvider for FakeProvider {
+        async fn list_instruments(
+            &self,
+            _option_underlyings: &[String],
+        ) -> Result<Vec<BrokerInstrument>, crate::adapters::BrokerError> {
+            Ok(self.0.iter().map(|(sym, venue)| fake(sym, venue)).collect())
+        }
+    }
+
+    /// Records every progress and log call, in order.
+    #[derive(Default)]
+    struct Recorder {
+        progress: std::sync::Mutex<Vec<(i64, i64)>>,
+        logs: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LoadProgress for Recorder {
+        fn progress(&self, done: i64, total: i64) {
+            self.progress.lock().unwrap().push((done, total));
+        }
+        fn log(&self, _level: &str, message: &str) {
+            self.logs.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    fn fake(symbol: &str, venue: &str) -> BrokerInstrument {
+        BrokerInstrument {
+            definition: InstrumentDef {
+                symbol: symbol.to_string(),
+                venue: venue.to_string(),
+                currency: "USD".to_string(),
+                asset_class: "EQUITY".to_string(),
+                instrument_class: "SPOT".to_string(),
+                name: Some(format!("{symbol} test instrument")),
+                price_precision: 2,
+                price_increment: 0.01,
+                size_increment: 1.0,
+                lot_size: None,
+                contract_size: 1.0,
+                native_id: None,
+                provider_exchange: None,
+                derivative: None,
+                identifiers: Default::default(),
+            },
+            broker_symbol: symbol.to_string(),
+            broker_exchange: None,
+            is_tradeable: true,
+            min_quantity: None,
+            max_quantity: None,
+            min_notional: None,
+            max_notional: None,
+        }
+    }
+
+    async fn test_pool() -> PgPool {
+        dotenvy::dotenv().ok();
+        let cfg = crate::setup::database::config::resolve(Default::default());
+        sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .expect("connect")
+    }
+
+    async fn remove(pool: &PgPool, prefix: &str) {
+        let like = format!("{prefix}%");
+        sqlx::query(
+            "DELETE FROM broker_instrument WHERE instrument_id IN (SELECT id FROM instrument WHERE symbol LIKE $1)",
+        )
+        .bind(&like)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM instrument WHERE symbol LIKE $1").bind(&like).execute(pool).await.unwrap();
+    }
+
+    fn opts() -> LoadOptions {
+        LoadOptions { no_enrich: true, allow_skips: true, underlyings: Vec::new() }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn progress_counts_up_to_the_fetched_total() {
+        let pool = test_pool().await;
+        let prefix = format!("ZZLU{}", &uuid::Uuid::new_v4().simple().to_string()[..6]).to_uppercase();
+        let provider = FakeProvider((0..3).map(|i| (format!("{prefix}{i}"), "XNAS".to_string())).collect());
+        let rec = Recorder::default();
+
+        let report = load_universe(&pool, Broker::Alpaca, &provider, &opts(), &rec).await.unwrap();
+        remove(&pool, &prefix).await;
+
+        assert_eq!((report.fetched, report.mapped), (3, 3));
+        assert_eq!(rec.progress.lock().unwrap().last().copied(), Some((3, 3)));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn skipped_instruments_are_reported_with_their_reason() {
+        let pool = test_pool().await;
+        let prefix = format!("ZZLU{}", &uuid::Uuid::new_v4().simple().to_string()[..6]).to_uppercase();
+        let provider = FakeProvider(vec![
+            (format!("{prefix}0"), "XNAS".to_string()),
+            (format!("{prefix}1"), "ZZZZ".to_string()),
+        ]);
+        let rec = Recorder::default();
+
+        let report = load_universe(&pool, Broker::Alpaca, &provider, &opts(), &rec).await.unwrap();
+        remove(&pool, &prefix).await;
+
+        assert_eq!(report.skipped, 1);
+        assert!(report.skipped_reasons.iter().any(|r| r.contains("ZZZZ")), "{:?}", report.skipped_reasons);
+    }
 }
+
