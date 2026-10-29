@@ -93,11 +93,6 @@ test("the architecture page renders all three diagrams", () => {
   assert.ok(html.includes("flowchart LR") && html.includes("erDiagram"), "diagram source not shipped");
 });
 
-test("the OPRA tutorial is published", () => {
-  const html = readFileSync(join(DIST, "tutorials/opra-marks-pnl/index.html"), "utf8");
-  assert.ok(!html.includes("This page is being written."), "still the placeholder");
-});
-
 // The old hand-built site's pages. Every shipped cockpit links to
 // /openoms/architecture.html, so these must keep resolving.
 for (const [old, target] of [

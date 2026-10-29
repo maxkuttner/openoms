@@ -1,13 +1,4 @@
----
-title: "OPRA live marks → unrealized P&L"
-description: Contributor walkthrough of how Databento OPRA quotes become marks and mark-to-market P&L.
-sidebar:
-  label: OPRA marks and P&L (contributors)
----
-
-:::note[For contributors]
-This is a walkthrough of how live OPRA marks were built into the OMS, step by step through the code. It is for people reading or changing the source. To **use** OPRA prices, see [Databento / OPRA](/openoms/integrations/databento/).
-:::
+# Tutorial: OPRA live marks → unrealized P&L
 
 Implement mark-to-market valuation: feed Databento OPRA live quotes into a marks
 store, then value open positions (unrealized P&L). The heavy accounting already

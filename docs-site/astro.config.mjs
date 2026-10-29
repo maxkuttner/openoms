@@ -51,7 +51,6 @@ export default defineConfig({
             "integrations/databento",
           ],
         },
-        { label: "Tutorials", items: ["tutorials/opra-marks-pnl"] },
         {
           label: "Operations",
           items: [

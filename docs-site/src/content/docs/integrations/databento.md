@@ -27,8 +27,3 @@ curl -s -X POST localhost:3001/admin/connections/reload -H "Authorization: Beare
 ```
 
 `databento-opra` should report `Registered`.
-
-## Go deeper
-
-[OPRA marks and P&L](/openoms/tutorials/opra-marks-pnl/) walks through how the feed,
-the marks store and the P&L valuation are built, for contributors.
