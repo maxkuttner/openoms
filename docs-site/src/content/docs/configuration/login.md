@@ -39,8 +39,8 @@ Login is **off** by default: with no `[auth.oidc]` block, `/auth/*` and `/trade/
 
 The first time someone signs in, the OMS creates a principal for them automatically,
 keyed by the provider's subject — and with **no grants**. They can sign in but see and
-trade nothing until an admin grants that principal a portfolio (cockpit → Principals →
-Grants, or `POST /admin/principals/{id}/grants`). An existing service or strategy
+trade nothing until an admin grants that principal a portfolio (on the cockpit's
+Principals page, or `POST /admin/principals/{id}/grants`). An existing service or strategy
 principal, or a disabled one, can never be taken over by a login.
 
 If the provider is misconfigured or unreachable, login stays off for that run and the
