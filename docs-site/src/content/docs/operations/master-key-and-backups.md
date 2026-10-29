@@ -31,8 +31,9 @@ database.
   credentials again.
 - **Point two installs at one database** and they must share the same key, or each will
   fail to decrypt what the other wrote.
-- **A wrong key** is reported at startup — the OMS does not silently treat it as "no
-  credentials".
+- **A wrong key** is caught at startup: each credential that fails to decrypt is logged,
+  and if credentials exist but none decrypt, the server refuses to start rather than run
+  as if none were configured.
 
 ## Rotating the master key
 
