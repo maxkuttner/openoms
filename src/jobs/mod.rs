@@ -14,6 +14,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod api;
 pub mod universe;
 
 /// Newest log lines kept per job; older ones are dropped as new ones arrive,

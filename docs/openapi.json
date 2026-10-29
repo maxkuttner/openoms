@@ -508,6 +508,92 @@
         ]
       }
     },
+    "/admin/broker-connections/{code}/universe": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Get a broker connection's instrument universe status",
+        "operationId": "get_connection_universe",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UniverseStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/broker-connections/{code}/universe/load": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Load or reload a broker connection's instrument universe",
+        "operationId": "load_connection_universe",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Started; follow it at /admin/jobs/{job_id}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStarted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "A load for this connection is already running; its job_id is in the body"
+          },
+          "422": {
+            "description": "No usable credentials, a broker without a catalog, or not the active connection"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/connections/reload": {
       "post": {
         "tags": [
@@ -3781,6 +3867,113 @@
           }
         }
       },
+      "JobLogLine": {
+        "type": "object",
+        "required": [
+          "at",
+          "level",
+          "message"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "level": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "JobRecord": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "started_by",
+          "params",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kind": {
+            "type": "string",
+            "description": "`universe_load`, `enrichment`, `symbology_backfill` or `expiry_sweep`."
+          },
+          "params": {},
+          "progress_done": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "progress_total": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "result": {
+            "nullable": true
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "started_by": {
+            "type": "string",
+            "description": "`system` for work the OMS started itself, else the admin action."
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "subject": {
+            "type": "string",
+            "description": "What the job is about, e.g. a broker connection code.",
+            "nullable": true
+          }
+        }
+      },
+      "JobStarted": {
+        "type": "object",
+        "required": [
+          "job_id"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed",
+          "interrupted"
+        ]
+      },
       "MeResponse": {
         "type": "object",
         "description": "The signed-in principal plus its granted portfolios — the shape a\nfront end needs to render itself without a second round trip.",
@@ -4714,6 +4907,47 @@
           "principal_name": {
             "type": "string",
             "nullable": true
+          }
+        }
+      },
+      "UniverseState": {
+        "type": "string",
+        "description": "Where a broker connection's instrument universe stands.",
+        "enum": [
+          "not_loaded",
+          "loading",
+          "loaded",
+          "partial",
+          "failed"
+        ]
+      },
+      "UniverseStatus": {
+        "type": "object",
+        "required": [
+          "state",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Instruments currently mapped to this connection's broker."
+          },
+          "last_job": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/JobRecord"
+              }
+            ],
+            "nullable": true
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why the state is `partial` or `failed`: \"interrupted\", \"10 skipped: …\", or\nthe load's error.",
+            "nullable": true
+          },
+          "state": {
+            "$ref": "#/components/schemas/UniverseState"
           }
         }
       },

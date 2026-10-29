@@ -130,6 +130,8 @@ mod reload_tests;
         admin::get_broker_connection_credentials,
         admin::put_broker_connection_credentials,
         admin::delete_broker_connection_credentials,
+        jobs::api::get_connection_universe,
+        jobs::api::load_connection_universe,
         admin::test_broker_connection_credentials,
         admin::list_feed_connections,
         admin::get_feed_connection_credentials,
@@ -168,6 +170,8 @@ mod reload_tests;
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
         admin::RedactedCredentials, crate::credentials::RedactedField,
+        jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
+        jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
@@ -1386,6 +1390,8 @@ async fn serve() {
             "/admin/broker-connections/:code/credentials/test",
             post(admin::test_broker_connection_credentials),
         )
+        .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
+        .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
         .route("/admin/feed-connections", get(admin::list_feed_connections))
         .route(
             "/admin/feed-connections/:code/credentials",
