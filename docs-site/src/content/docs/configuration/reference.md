@@ -57,12 +57,12 @@ credential can drop the database — so those commands prompt for it or take it 
 | `bind_addr` | `OMS_BIND_ADDR` | `localhost:3001` |
 | `admin_password` | `OMS_ADMIN_PASSWORD` | `openoms-dev` (loopback only) |
 
-- **`bind_addr`** — where the HTTP server listens: the cockpit, the trading API and the
+- **`bind_addr`** — set by `oms init`'s "Listen on" question; where the HTTP server listens: the cockpit, the trading API and the
   admin API, all on one port. The default only accepts connections from the same machine.
   To serve other machines, bind to an address they can reach (`0.0.0.0:3001`) — and read
   the rules below first.
 - **`admin_password`** — the cockpit login, also accepted as a bearer token on `/admin`.
-  `oms init` generates one. With none configured, the server uses `openoms-dev` on a
+  `oms init` asks for one (or generates one when you press Enter). With none configured, the server uses `openoms-dev` on a
   loopback bind and **refuses to start** on any other.
 
 `OMS_ADMIN_AUTH_ENABLED=false` turns the cockpit login off entirely. Only do that when
@@ -93,6 +93,7 @@ These have no `oms.toml` key.
 | Variable | Effect |
 |---|---|
 | `OMS_CONFIG` | Path to the config file; overrides the search. |
+| `OMS_NO_INIT` | `1` stops the installer from offering to run `oms init`. |
 | `OMS_SYNC_ON_BOOT` | `never` stops the automatic instrument load at startup — otherwise each broker connection with credentials whose instruments were never loaded gets one, as a background job. |
 | `ALPACA_ENV`, `BINANCE_ENV` | `PAPER` (default) or `LIVE`: which of the broker's connections the OMS routes to. |
 | `BINANCE_PAPER_TRANSPORT`, `BINANCE_LIVE_TRANSPORT` | `rest` (default) or `fix`: how Binance orders are sent. |

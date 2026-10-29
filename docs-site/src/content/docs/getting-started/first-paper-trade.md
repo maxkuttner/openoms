@@ -5,7 +5,7 @@ description: Connect Alpaca paper in the cockpit, load its instruments, set up a
 
 This guide takes a fresh install to a real order at Alpaca's paper-trading venue: one
 share of AAPL. Everything until the order itself happens in the cockpit. No market-data
-subscription is needed. It assumes the server is running ([First run](/openoms/getting-started/first-run/))
+subscription is needed. It assumes the server is running ([Getting started](/openoms/getting-started/))
 and you are logged in to the cockpit at `http://localhost:3001/cockpit/`.
 
 :::tip[On a remote server?]

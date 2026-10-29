@@ -98,6 +98,8 @@ test("the architecture page renders all three diagrams", () => {
 for (const [old, target] of [
   ["architecture.html", "/openoms/concepts/architecture/"],
   ["api.html", "/openoms/api/"],
+  ["getting-started/installation/index.html", "/openoms/getting-started/"],
+  ["getting-started/first-run/index.html", "/openoms/getting-started/"],
 ]) {
   test(`the old /openoms/${old} redirects to ${target}`, () => {
     const html = readFileSync(join(DIST, old), "utf8");
@@ -130,7 +132,7 @@ test("the landing page ships the interactive grain canvas", () => {
   const html = readFileSync(join(DIST, "index.html"), "utf8");
   assert.match(html, /<canvas[^>]*id="grain-bg"/, "no grain canvas on the landing page");
   assert.match(html, /aria-hidden="true"/, "the decorative canvas must be hidden from screen readers");
-  const other = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
+  const other = readFileSync(join(DIST, "getting-started/index.html"), "utf8");
   assert.ok(!other.includes('id="grain-bg"'), "grain canvas leaked onto a docs page");
 });
 
@@ -162,4 +164,12 @@ test("the grain background shows in light mode too", () => {
   assert.ok(reveal, "no rule revealing the drawn canvas");
   assert.ok(!/data-theme=["']?dark/.test(reveal[1]), `reveal rule is dark-only: ${reveal[1].trim()}`);
   assert.match(html, /uniform float light/, "shader has no light-scheme variant");
+});
+
+test("getting started has OS tabs and links the installer source, not the raw script", () => {
+  const html = readFileSync(join(DIST, "getting-started/index.html"), "utf8");
+  for (const tab of ["macOS", "Linux", "From source"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
+  assert.ok(html.includes('data-sync-key="os"'), "tabs not synced across pages");
+  assert.ok(html.includes("https://github.com/maxkuttner/openoms/blob/main/install.sh"));
+  assert.ok(!html.includes('href="/openoms/install.sh"'), "still links the raw script");
 });
