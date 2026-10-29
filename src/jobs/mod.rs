@@ -14,6 +14,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod universe;
+
 /// Newest log lines kept per job; older ones are dropped as new ones arrive,
 /// so a job that logs per batch over 14,000 symbols cannot grow without bound.
 pub const LOG_CAP: i64 = 500;
@@ -180,6 +182,10 @@ pub struct JobHandle {
 impl JobHandle {
     pub fn new(pool: PgPool, id: Uuid) -> Self {
         Self { pool, id }
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     pub async fn start(&self) -> Result<(), sqlx::Error> {

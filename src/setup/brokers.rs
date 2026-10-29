@@ -63,8 +63,8 @@ impl Broker {
     ///
     /// This is now the single source of truth for "can we sync this broker":
     /// `run` (below) sources `build_alpaca`/`build_binance`'s credential from the
-    /// same store, so cred *detection* (`bootstrap::will_sync_on_boot`/
-    /// `spawn_sync`) and cred *use* (`run`) can never disagree — mirroring the
+    /// same store, so cred *detection* (`bootstrap::pending_boot_loads`) and
+    /// cred *use* (`provider_for`) can never disagree — mirroring the
     /// guarantee this method's doc comment made before the credential store
     /// existed, when both sides read the environment instead.
     pub fn has_creds(self, connections: &[Connection<BrokerCredentials>]) -> bool {
@@ -75,8 +75,9 @@ impl Broker {
 }
 
 /// Every broker in `Broker::ALL` whose store credential is `Configured`.
-/// Computed once by `serve()` and reused for both `will_sync_on_boot` and
-/// `spawn_sync`, so the two cannot disagree about which brokers are eligible.
+/// Computed once by `serve()` and reused for both preflight and the boot loads
+/// (`bootstrap::pending_boot_loads`), so the two cannot disagree about which
+/// brokers are eligible.
 pub fn brokers_with_creds(connections: &[Connection<BrokerCredentials>]) -> Vec<Broker> {
     Broker::ALL.iter().copied().filter(|b| b.has_creds(connections)).collect()
 }
@@ -159,7 +160,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Loud by default. `upsert_catalog` already named the offending venues and
     // currencies; make them consequential so a half-seeded catalog cannot pass for
     // a finished one in a script or CI step.
-    if report.skipped > 0 && !args.allow_skips {
+    if report.skipped > 0 && !opts.allow_skips {
         return Err(format!(
             "{} instrument(s) skipped on a missing venue/currency — see the warnings above. \
              Seed the missing rows, or pass --allow-skips to accept a partial catalog.",

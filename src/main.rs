@@ -778,6 +778,14 @@ async fn serve() {
     setup::bootstrap::ensure_broker_connections(&pool).await;
     setup::bootstrap::ensure_feed_connections(&pool).await;
 
+    // Any job still queued or running belonged to a process that is gone. Before
+    // anything below can start a new one.
+    match jobs::mark_interrupted(&pool).await {
+        Ok(0) => {}
+        Ok(n) => warn!("{n} background job(s) were interrupted by the last shutdown"),
+        Err(e) => error!("could not mark interrupted jobs: {e}"),
+    }
+
     // Every broker/feed connection, credentials decoded under `master` (or left
     // `Unconfigured`/`Error` when there is none — see `decode` in credentials.rs).
     // Loaded once, here, and reused by catalog auto-sync eligibility below, by
@@ -841,16 +849,18 @@ async fn serve() {
         std::process::exit(1);
     }
 
-    // Which of those brokers the *store* currently credentials — computed once so
-    // `will_sync_on_boot` (below) and `spawn_sync` (near the end, once the catalog
-    // is confirmed empty) cannot disagree about who is eligible.
+    // Which of those brokers the *store* currently credentials, and of those, whose
+    // instrument universe was never loaded — computed once so preflight (below)
+    // and the boot loads (near the end) cannot disagree about who is eligible.
     let synced_brokers = setup::brokers::brokers_with_creds(&broker_connections);
+    let boot_loads = setup::bootstrap::pending_boot_loads(&pool, &synced_brokers).await;
+    let boot_pool = pool.clone();
 
     // Refuse to start on a catalog that cannot work, and name what is merely
     // degraded. Before any feed spawns, so a broken catalog surfaces here rather
     // than as a feed that quietly subscribes to nothing. An empty catalog is not
-    // fatal when a background sync is about to fill it.
-    let auto_sync_pending = setup::bootstrap::will_sync_on_boot(&pool, &synced_brokers).await;
+    // fatal when a background load is about to fill it.
+    let auto_sync_pending = !boot_loads.is_empty();
     if let Err(e) = preflight::run(&pool, auto_sync_pending).await {
         error!("preflight failed: {e}");
         return;
@@ -1220,12 +1230,14 @@ async fn serve() {
         }
     });
 
-    // Populate an empty catalog from brokers in the background, so the minutes-long
-    // option-chain fetch never delays the server binding below. `auto_sync_pending`
-    // and `synced_brokers` were both computed above (catalog empty + which brokers
-    // the store credentials).
-    if auto_sync_pending {
-        setup::bootstrap::spawn_sync(synced_brokers);
+    // Load each credentialed broker's never-loaded instrument universe as a
+    // background job, after everything above so the load never delays the server
+    // binding below. `boot_loads` was computed before preflight.
+    for broker in boot_loads {
+        match jobs::universe::spawn_universe_load(boot_pool.clone(), broker, "system").await {
+            Ok(id) => info!("boot: loading {} instrument universe (job {id})", broker.code()),
+            Err(e) => warn!("boot: {} instrument universe not loaded: {e}", broker.code()),
+        }
     }
 
     // OIDC login. `config.oidc()` is `None` unless `[auth.oidc]` has every

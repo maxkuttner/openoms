@@ -11,12 +11,7 @@ use std::env;
 use sqlx::PgPool;
 use tracing::{error, info};
 
-use crate::setup::brokers::{self, Broker};
-
-async fn catalog_nonempty(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM instrument").fetch_one(pool).await?;
-    Ok(n > 0)
-}
+use crate::setup::brokers::Broker;
 
 /// Ensure a `broker_connection` exists for every broker in `Broker::ALL`.
 ///
@@ -97,62 +92,30 @@ pub fn sync_on_boot_enabled() -> bool {
     !env::var("OMS_SYNC_ON_BOOT").is_ok_and(|v| v.eq_ignore_ascii_case("never"))
 }
 
-/// Whether a boot-time sync will run: enabled, catalog empty, and `synced_brokers`
-/// (the store-credentialed subset `serve()` already computed via
-/// `brokers::brokers_with_creds`, so this and [`spawn_sync`] can never disagree
-/// about which brokers are eligible) is non-empty. The caller uses this to tell
-/// preflight an empty catalog is expected.
-pub async fn will_sync_on_boot(pool: &PgPool, synced_brokers: &[Broker]) -> bool {
-    sync_on_boot_enabled() && !synced_brokers.is_empty() && !catalog_nonempty(pool).await.unwrap_or(true)
-}
-
-/// Populate the instrument catalog from every broker in `pending` (the
-/// store-credentialed set from [`will_sync_on_boot`]), on a dedicated background
-/// thread.
+/// The credentialed brokers whose instrument universe was never loaded — no
+/// `broker_instrument` row for their broker code — and so get a `system` universe
+/// load at boot. Empty when `OMS_SYNC_ON_BOOT=never`.
 ///
-/// A separate thread with its own current-thread runtime, not `tokio::spawn`: the
-/// sync path threads a non-`Send` boxed error across its awaits, and this keeps that
-/// contained instead of forcing `Send + Sync` through every adapter's error type.
-/// The job is genuinely independent — `setup::brokers::run` opens its own pool as
-/// the `oms` role — so nothing is shared with the server runtime. Caller checks
-/// [`will_sync_on_boot`] first.
-pub fn spawn_sync(pending: Vec<Broker>) {
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("bootstrap: could not start sync runtime: {e}");
-                return;
-            }
-        };
-        rt.block_on(sync_all_brokers(pending));
-    });
-}
-
-/// Run `sync-broker` for each broker in `pending`. Each is independent: one being
-/// unreachable logs and does not stop the others, nor the server.
-///
-/// `pending` reflects the store's view of who is credentialed (from
-/// [`will_sync_on_boot`]); `brokers::run` sources its own credential from the same
-/// store, so there is nothing to re-filter here — a broker in `pending` is
-/// guaranteed to have a `Configured` credential `run` can read.
-async fn sync_all_brokers(pending: Vec<Broker>) {
-    let underlyings = env::var("OMS_SYNC_UNDERLYINGS").unwrap_or_default();
-    info!("bootstrap: catalog empty — syncing {} broker(s) in background", pending.len());
-
-    for broker in pending {
-        let args = brokers::Args {
-            broker,
-            underlyings: underlyings.clone(),
-            no_enrich: false,
-            dry_run: false,
-            allow_skips: true, // a partial catalog beats none; preflight still warns
-        };
-        match brokers::run(args).await {
-            Ok(()) => info!("bootstrap: {} sync complete", broker.code()),
-            Err(e) => error!("bootstrap: {} sync failed (server stays up): {e}", broker.code()),
+/// Per broker, not "is the whole catalog empty": once Alpaca is loaded, a
+/// Binance connection given credentials later must still load at the next boot.
+/// A failed count is treated as "loaded" — never start a write on a guess.
+pub async fn pending_boot_loads(pool: &PgPool, credentialed: &[Broker]) -> Vec<Broker> {
+    if !sync_on_boot_enabled() {
+        return Vec::new();
+    }
+    let mut pending = Vec::new();
+    for &broker in credentialed {
+        let n: Result<i64, _> = sqlx::query_scalar("SELECT count(*) FROM broker_instrument WHERE broker_code = $1")
+            .bind(broker.code())
+            .fetch_one(pool)
+            .await;
+        match n {
+            Ok(0) => pending.push(broker),
+            Ok(_) => {}
+            Err(e) => error!("boot: could not count {} instruments, not loading: {e}", broker.code()),
         }
     }
+    pending
 }
 
 #[cfg(test)]
