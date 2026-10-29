@@ -117,6 +117,19 @@ pub async fn run_once(pool: &PgPool) -> Result<(u64, u64), sqlx::Error> {
     Ok((recomputed, expired))
 }
 
+/// Record a scheduled pass as a `system` job — only when it expired something.
+/// An hourly no-op would bury every other job in the cockpit's Task Center; a
+/// pass that retired instruments changed what can be traded, and must be visible.
+pub async fn record_scheduled_sweep(pool: &PgPool, recomputed: u64, expired: u64) -> Result<Option<uuid::Uuid>, sqlx::Error> {
+    if expired == 0 {
+        return Ok(None);
+    }
+    let result = serde_json::json!({ "recomputed": recomputed, "expired": expired });
+    crate::jobs::record_finished(pool, crate::jobs::JobKind::ExpirySweep, None, "system", result)
+        .await
+        .map(Some)
+}
+
 /// Background task: sweep at boot, then once an interval, forever.
 ///
 /// A failed pass is logged and the loop continues. The alternative — letting the task
@@ -130,9 +143,41 @@ pub async fn run(pool: PgPool) {
             Ok((0, 0)) => {}
             Ok((recomputed, expired)) => {
                 info!(recomputed, expired, "expiry sweep");
+                if let Err(e) = record_scheduled_sweep(&pool, recomputed, expired).await {
+                    error!(error = %e, "could not record the expiry sweep as a job");
+                }
             }
             Err(e) => error!(error = %e, "expiry sweep failed; retrying next interval"),
         }
         tokio::time::sleep(SWEEP_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_scheduled_sweep_that_expires_nothing_writes_no_job() {
+        dotenvy::dotenv().ok();
+        let cfg = crate::setup::database::config::resolve(Default::default());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .unwrap();
+        assert_eq!(record_scheduled_sweep(&pool, 5, 0).await.unwrap(), None);
+        let id = record_scheduled_sweep(&pool, 0, 2).await.unwrap().expect("a sweep that expired something is recorded");
+        let (job, _) = crate::jobs::get(&pool, id).await.unwrap().unwrap();
+        sqlx::query("DELETE FROM job WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        assert_eq!((job.kind.as_str(), job.started_by.as_str()), ("expiry_sweep", "system"));
+        assert_eq!(job.status, crate::jobs::JobStatus::Succeeded);
+        assert_eq!(job.result.unwrap()["expired"], 2);
     }
 }

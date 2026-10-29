@@ -248,6 +248,31 @@ impl JobHandle {
     }
 }
 
+/// Record work that already finished, as a `succeeded` job — for something that
+/// ran without a job row of its own and only matters once it changed something
+/// (a scheduled expiry sweep that expired instruments).
+pub async fn record_finished(
+    pool: &PgPool,
+    kind: JobKind,
+    subject: Option<&str>,
+    started_by: &str,
+    result: Value,
+) -> Result<Uuid, sqlx::Error> {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO job (id, kind, subject, started_by, status, result, started_at, finished_at) \
+         VALUES ($1, $2, $3, $4, 'succeeded', $5, now(), now())",
+    )
+    .bind(id)
+    .bind(kind.as_str())
+    .bind(subject)
+    .bind(started_by)
+    .bind(result)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
 /// At boot: anything left queued or running belonged to a process that is gone.
 pub async fn mark_interrupted(pool: &PgPool) -> Result<u64, sqlx::Error> {
     sqlx::query(

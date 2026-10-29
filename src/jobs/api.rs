@@ -9,7 +9,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{latest, CreateError, JobKind, JobRecord, JobStatus};
+use super::{latest, CreateError, JobKind, JobLogLine, JobRecord, JobStatus};
 use crate::app_state::AppState;
 use crate::credentials::CredentialState;
 use crate::secrets::MasterKey;
@@ -102,12 +102,31 @@ impl IntoResponse for LoadRefusal {
 /// can this broker be loaded at all, is it the connection the OMS routes to.
 /// Nothing is written unless all pass.
 pub async fn start_load(pool: &PgPool, master: Option<&MasterKey>, code: &str) -> Result<Uuid, LoadRefusal> {
+    let broker = check_loadable(pool, master, code, JobKind::UniverseLoad).await?;
+    super::universe::spawn_universe_load(pool.clone(), broker, "admin").await.map_err(refusal)
+}
+
+/// Check `code` can be enriched now, then start an `enrichment` job: the same
+/// checks as a universe load.
+pub async fn start_enrichment(pool: &PgPool, master: Option<&MasterKey>, code: &str) -> Result<Uuid, LoadRefusal> {
+    let broker = check_loadable(pool, master, code, JobKind::Enrichment).await?;
+    super::universe::spawn_enrichment(pool.clone(), broker, "admin").await.map_err(refusal)
+}
+
+fn refusal(e: CreateError) -> LoadRefusal {
+    match e {
+        CreateError::AlreadyRunning(id) => LoadRefusal::AlreadyRunning(id),
+        CreateError::Db(e) => LoadRefusal::Internal(e.to_string()),
+    }
+}
+
+async fn check_loadable(pool: &PgPool, master: Option<&MasterKey>, code: &str, kind: JobKind) -> Result<Broker, LoadRefusal> {
     let connections = crate::credentials::load_brokers(pool, master)
         .await
         .map_err(|e| LoadRefusal::Internal(format!("could not read broker connections: {e}")))?;
     let conn = connections.into_iter().find(|c| c.code == code).ok_or(LoadRefusal::NotFound)?;
 
-    if let Some(job) = latest(pool, JobKind::UniverseLoad, code).await.map_err(|e| LoadRefusal::Internal(e.to_string()))? {
+    if let Some(job) = latest(pool, kind, code).await.map_err(|e| LoadRefusal::Internal(e.to_string()))? {
         if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
             return Err(LoadRefusal::AlreadyRunning(job.id));
         }
@@ -138,10 +157,7 @@ pub async fn start_load(pool: &PgPool, master: Option<&MasterKey>, code: &str) -
         )));
     }
 
-    super::universe::spawn_universe_load(pool.clone(), broker, "admin").await.map_err(|e| match e {
-        CreateError::AlreadyRunning(id) => LoadRefusal::AlreadyRunning(id),
-        CreateError::Db(e) => LoadRefusal::Internal(e.to_string()),
-    })
+    Ok(broker)
 }
 
 fn master_key() -> Result<Option<MasterKey>, LoadRefusal> {
@@ -183,6 +199,106 @@ pub async fn get_connection_universe(
     let last_job = latest(pool, JobKind::UniverseLoad, &code).await.map_err(internal)?;
     let (state, reason) = derive_universe_state(last_job.as_ref(), count);
     Ok(Json(UniverseStatus { state, count, reason, last_job }))
+}
+
+/// `?limit=` for the job list: 50 by default, 1 to 200.
+pub fn clamp_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 200)
+}
+
+pub async fn list_jobs_page(pool: &PgPool, limit: Option<i64>) -> Result<Vec<JobRecord>, sqlx::Error> {
+    super::list_recent(pool, clamp_limit(limit)).await
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct JobDetail {
+    pub job: JobRecord,
+    /// The job's own log, oldest line first (the newest 500 are kept).
+    pub log: Vec<JobLogLine>,
+}
+
+pub async fn job_detail(pool: &PgPool, id: Uuid) -> Result<Option<JobDetail>, sqlx::Error> {
+    Ok(super::get(pool, id).await?.map(|(job, log)| JobDetail { job, log }))
+}
+
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+pub struct JobListQuery {
+    /// How many, newest first: default 50, at most 200.
+    pub limit: Option<i64>,
+}
+
+/// List recent background jobs
+#[utoipa::path(
+    get, path = "/admin/jobs", tag = "admin",
+    operation_id = "list_jobs",
+    params(JobListQuery),
+    responses((status = 200, description = "Newest first", body = [JobRecord])),
+    security(("bearer_token" = []))
+)]
+pub async fn list_jobs(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<JobListQuery>,
+) -> Result<Json<Vec<JobRecord>>, LoadRefusal> {
+    list_jobs_page(state.pool(), q.limit).await.map(Json).map_err(|e| LoadRefusal::Internal(e.to_string()))
+}
+
+/// Get a background job and its log
+#[utoipa::path(
+    get, path = "/admin/jobs/{id}", tag = "admin",
+    operation_id = "get_job",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "OK", body = JobDetail),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn get_job(State(state): State<AppState>, Path(id): Path<Uuid>) -> Response {
+    match job_detail(state.pool(), id).await {
+        Ok(Some(detail)) => Json(detail).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "job not found").into_response(),
+        Err(e) => LoadRefusal::Internal(e.to_string()).into_response(),
+    }
+}
+
+/// Start an expiry sweep as a job: derive missing expiry instants, then retire
+/// what has passed (`expiry::run_once`, the same pass the hourly task runs).
+pub async fn start_expiry_sweep(pool: &PgPool, started_by: &str) -> Result<Uuid, LoadRefusal> {
+    let id = super::create(pool, JobKind::ExpirySweep, None, started_by, json!({})).await.map_err(refusal)?;
+    let handle = super::JobHandle::new(pool.clone(), id);
+    tokio::spawn(async move {
+        let _ = handle.start().await;
+        let recorded = match crate::expiry::run_once(handle.pool()).await {
+            Ok((recomputed, expired)) => handle.succeed(json!({ "recomputed": recomputed, "expired": expired })).await,
+            Err(e) => handle.fail(&e.to_string()).await,
+        };
+        if let Err(e) = recorded {
+            tracing::error!("expiry sweep job {}: could not record its outcome: {e}", handle.id);
+        }
+    });
+    Ok(id)
+}
+
+/// Enrich a broker connection's instruments with FIGIs
+#[utoipa::path(
+    post, path = "/admin/broker-connections/{code}/universe/enrich", tag = "admin",
+    operation_id = "enrich_connection_universe",
+    params(("code" = String, Path, description = "Broker connection code")),
+    responses(
+        (status = 202, description = "Started; follow it at /admin/jobs/{job_id}", body = JobStarted),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Enrichment for this connection is already running; its job_id is in the body"),
+        (status = 422, description = "No usable credentials, a broker without a catalog, or not the active connection"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn enrich_connection_universe(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<(StatusCode, Json<JobStarted>), LoadRefusal> {
+    let master = master_key()?;
+    let job_id = start_enrichment(state.pool(), master.as_ref(), &code).await?;
+    Ok((StatusCode::ACCEPTED, Json(JobStarted { job_id })))
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -358,4 +474,95 @@ mod tests {
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
     }
+
+    // --- job list / detail, sweep, enrichment ---------------------------------
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn list_jobs_returns_newest_first_and_honours_limit() {
+        let pool = test_pool().await;
+        let s = format!("test-{}", uuid::Uuid::new_v4().simple());
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let id = super::super::create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
+            super::super::JobHandle::new(pool.clone(), id).succeed(json!({})).await.unwrap();
+            ids.push(id);
+        }
+        // Other tests create jobs concurrently in the same database, so the
+        // global list is checked for its shape, and this test's own jobs for
+        // their order within it.
+        let two = list_jobs_page(&pool, Some(2)).await.unwrap();
+        let all = list_jobs_page(&pool, Some(200)).await.unwrap();
+        sqlx::query("DELETE FROM job WHERE subject = $1").bind(&s).execute(&pool).await.unwrap();
+        assert_eq!(two.len(), 2, "limit honoured");
+        assert!(all.windows(2).all(|w| w[0].created_at >= w[1].created_at), "newest first");
+        let mine: Vec<_> = all.iter().filter(|j| j.subject.as_deref() == Some(s.as_str())).map(|j| j.id).collect();
+        assert_eq!(mine, [ids[2], ids[1], ids[0]]);
+    }
+
+    #[test]
+    fn the_job_list_limit_defaults_to_50_and_caps_at_200() {
+        assert_eq!(clamp_limit(None), 50);
+        assert_eq!(clamp_limit(Some(0)), 1);
+        assert_eq!(clamp_limit(Some(1000)), 200);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn get_job_returns_its_log_oldest_first() {
+        let pool = test_pool().await;
+        let s = format!("test-{}", uuid::Uuid::new_v4().simple());
+        let id = super::super::create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
+        let h = super::super::JobHandle::new(pool.clone(), id);
+        h.log("info", "first").await.unwrap();
+        h.log("warn", "second").await.unwrap();
+        let detail = job_detail(&pool, id).await.unwrap();
+        sqlx::query("DELETE FROM job WHERE subject = $1").bind(&s).execute(&pool).await.unwrap();
+        let detail = detail.expect("job exists");
+        assert_eq!(detail.job.id, id);
+        let messages: Vec<&str> = detail.log.iter().map(|l| l.message.as_str()).collect();
+        assert_eq!(messages, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn get_job_404s_an_unknown_id() {
+        let pool = test_pool().await;
+        assert!(job_detail(&pool, uuid::Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn expiry_sweep_endpoint_answers_202_with_a_job() {
+        let pool = test_pool().await;
+        let id = start_expiry_sweep(&pool, "test").await.unwrap();
+        // The sweep runs in the background; it is quick.
+        let mut job = None;
+        for _ in 0..50 {
+            let j = super::super::get(&pool, id).await.unwrap().unwrap().0;
+            if j.status != JobStatus::Queued && j.status != JobStatus::Running {
+                job = Some(j);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        sqlx::query("DELETE FROM job WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        let job = job.expect("sweep finished");
+        assert_eq!(job.status, JobStatus::Succeeded, "{:?}", job.error);
+        assert_eq!(job.kind, "expiry_sweep");
+        let result = job.result.unwrap();
+        assert!(result["recomputed"].is_u64() && result["expired"].is_u64(), "{result}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn enrich_endpoint_refuses_unconfigured_credentials() {
+        let pool = test_pool().await;
+        let master = crate::config::master_key(crate::config::load()).and_then(Result::ok);
+        let code = bare_connection(&pool).await;
+        let err = start_enrichment(&pool, master.as_ref(), &code).await.unwrap_err();
+        drop_connection(&pool, &code).await;
+        assert!(matches!(&err, LoadRefusal::Unprocessable(m) if m.contains("add credentials first")), "{err:?}");
+    }
 }
+

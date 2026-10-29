@@ -30,8 +30,28 @@ fn default_options() -> LoadOptions {
 /// the boot-time sync always has: the sync path threads non-`Send` boxed errors
 /// across its awaits, which `tokio::spawn` on the server runtime would reject.
 pub async fn spawn_universe_load(pool: PgPool, broker: Broker, started_by: &str) -> Result<Uuid, CreateError> {
-    let params = serde_json::json!({ "broker": broker.code(), "no_enrich": true });
-    let id = create(&pool, JobKind::UniverseLoad, Some(&broker.connection_code()), started_by, params).await?;
+    spawn_load(pool, broker, started_by, JobKind::UniverseLoad, default_options()).await
+}
+
+/// Look up FIGIs for `broker`'s instruments through OpenFIGI, as an
+/// `enrichment` job: the same load with enrichment on. It re-fetches the
+/// broker's list (seconds) because the enricher works on the broker's own
+/// instrument definitions; the slow part is OpenFIGI, rate-limited without
+/// `OPENFIGI_API_KEY`.
+pub async fn spawn_enrichment(pool: PgPool, broker: Broker, started_by: &str) -> Result<Uuid, CreateError> {
+    let opts = LoadOptions { no_enrich: false, ..default_options() };
+    spawn_load(pool, broker, started_by, JobKind::Enrichment, opts).await
+}
+
+async fn spawn_load(
+    pool: PgPool,
+    broker: Broker,
+    started_by: &str,
+    kind: JobKind,
+    opts: LoadOptions,
+) -> Result<Uuid, CreateError> {
+    let params = serde_json::json!({ "broker": broker.code(), "no_enrich": opts.no_enrich });
+    let id = create(&pool, kind, Some(&broker.connection_code()), started_by, params).await?;
     let handle = JobHandle::new(pool.clone(), id);
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -43,7 +63,7 @@ pub async fn spawn_universe_load(pool: PgPool, broker: Broker, started_by: &str)
         };
         rt.block_on(async move {
             match brokers::provider_for(&pool, broker).await {
-                Ok(provider) => run_job(&handle, provider.as_ref(), broker, &default_options()).await,
+                Ok(provider) => run_job(&handle, provider.as_ref(), broker, &opts).await,
                 Err(e) => {
                     if let Err(db) = handle.fail(&e.to_string()).await {
                         error!("universe load {id}: could not record failure ({e}): {db}");

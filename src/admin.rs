@@ -12,6 +12,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
+use crate::jobs::api::JobStarted;
 use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials, RedactedField};
 use crate::credentials_api::{self, CredentialSubmission, TestOutcome};
 use crate::reload;
@@ -2633,26 +2634,58 @@ pub async fn resolve_symbology(
     Ok(Json(outcome))
 }
 
+/// Backfill FIGIs for instruments that have none, as a job
+///
+/// Runs in the background and answers at once with the job id; the counts that
+/// used to be the response body are the job's result.
 #[utoipa::path(
     post, path = "/admin/symbology/backfill", tag = "admin",
     request_body = BackfillRequest,
-    responses((status = 200, description = "Backfill summary", body = BackfillResult)),
+    responses((status = 202, description = "Started; follow it at /admin/jobs/{job_id}; the result is a BackfillResult", body = JobStarted)),
     security(("bearer_token" = []))
 )]
 pub async fn backfill_symbology(
     State(state): State<AppState>,
     Json(req): Json<BackfillRequest>,
-) -> Result<Json<BackfillResult>, AdminError> {
+) -> Result<(StatusCode, Json<JobStarted>), AdminError> {
     let limit = req.limit.unwrap_or(50).clamp(1, 500);
     info!(limit, "admin symbology backfill");
+    let job_id = crate::jobs::create(
+        state.pool(),
+        crate::jobs::JobKind::SymbologyBackfill,
+        None,
+        "admin",
+        serde_json::json!({ "limit": limit }),
+    )
+    .await
+    .map_err(|e| AdminError { status: StatusCode::INTERNAL_SERVER_ERROR, message: e.to_string() })?;
+    let handle = crate::jobs::JobHandle::new(state.pool().clone(), job_id);
+    tokio::spawn(async move {
+        let _ = handle.start().await;
+        let recorded = match run_backfill(&state, limit, &handle).await {
+            Ok(result) => handle.succeed(serde_json::to_value(result).unwrap_or_default()).await,
+            Err(e) => handle.fail(&e.to_string()).await,
+        };
+        if let Err(e) = recorded {
+            tracing::error!("symbology backfill job {}: could not record its outcome: {e}", handle.id);
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(JobStarted { job_id })))
+}
+
+async fn run_backfill(
+    state: &AppState,
+    limit: i64,
+    handle: &crate::jobs::JobHandle,
+) -> Result<BackfillResult, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT id, symbol, venue FROM instrument \
          WHERE figi IS NULL AND status = 'ACTIVE' ORDER BY id LIMIT $1",
     )
     .bind(limit)
     .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
+    .await?;
+    let total = rows.len() as i64;
 
     let mut result = BackfillResult { scanned: 0, stamped: 0, ambiguous: 0, unresolved: 0 };
     for row in rows {
@@ -2671,26 +2704,30 @@ pub async fn backfill_symbology(
             Ok(ResolveOutcome::Ambiguous { .. }) => result.ambiguous += 1,
             _ => result.unresolved += 1,
         }
+        handle.progress(result.scanned, Some(total)).await?;
     }
-    Ok(Json(result))
+    Ok(result)
 }
 
-/// Run the instrument expiry pass now, instead of waiting for the hourly tick.
+/// Run the instrument expiry pass now, as a job, instead of waiting for the hourly tick
 ///
-/// Same function the background job calls, so an on-demand run and a scheduled one
+/// Same function the background task calls, so an on-demand run and a scheduled one
 /// cannot diverge. Useful right after seeding a calendar (every dated contract gets
-/// its instant immediately) and for confirming a correction took effect.
+/// its instant immediately) and for confirming a correction took effect. Answers at
+/// once with the job id; the counts are the job's result.
 #[utoipa::path(
     post, path = "/admin/instruments/expiry-sweep", tag = "admin",
-    responses((status = 200, description = "Expiry sweep summary", body = ExpirySweepResult)),
+    responses((status = 202, description = "Started; follow it at /admin/jobs/{job_id}; the result is an ExpirySweepResult", body = JobStarted)),
     security(("bearer_token" = []))
 )]
 pub async fn expiry_sweep(
     State(state): State<AppState>,
-) -> Result<Json<ExpirySweepResult>, AdminError> {
+) -> Result<(StatusCode, Json<JobStarted>), AdminError> {
     info!("admin expiry sweep");
-    let (recomputed, expired) = crate::expiry::run_once(state.pool()).await.map_err(map_db_error)?;
-    Ok(Json(ExpirySweepResult { recomputed, expired }))
+    let job_id = crate::jobs::api::start_expiry_sweep(state.pool(), "admin")
+        .await
+        .map_err(|e| AdminError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:?}") })?;
+    Ok((StatusCode::ACCEPTED, Json(JobStarted { job_id })))
 }
 
 // ── Setup status ───────────────────────────────────────────────────────────

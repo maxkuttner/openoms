@@ -132,6 +132,9 @@ mod reload_tests;
         admin::delete_broker_connection_credentials,
         jobs::api::get_connection_universe,
         jobs::api::load_connection_universe,
+        jobs::api::enrich_connection_universe,
+        jobs::api::list_jobs,
+        jobs::api::get_job,
         admin::test_broker_connection_credentials,
         admin::list_feed_connections,
         admin::get_feed_connection_credentials,
@@ -171,7 +174,7 @@ mod reload_tests;
         CreateBrokerConnection, UpdateBrokerConnection,
         admin::RedactedCredentials, crate::credentials::RedactedField,
         jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
-        jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted,
+        jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted, jobs::api::JobDetail,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
@@ -1392,6 +1395,9 @@ async fn serve() {
         )
         .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
         .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
+        .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
+        .route("/admin/jobs", get(jobs::api::list_jobs))
+        .route("/admin/jobs/:id", get(jobs::api::get_job))
         .route("/admin/feed-connections", get(admin::list_feed_connections))
         .route(
             "/admin/feed-connections/:code/credentials",

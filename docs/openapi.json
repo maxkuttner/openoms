@@ -548,6 +548,52 @@
         ]
       }
     },
+    "/admin/broker-connections/{code}/universe/enrich": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Enrich a broker connection's instruments with FIGIs",
+        "operationId": "enrich_connection_universe",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Broker connection code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Started; follow it at /admin/jobs/{job_id}",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStarted"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Enrichment for this connection is already running; its job_id is in the body"
+          },
+          "422": {
+            "description": "No usable credentials, a broker without a catalog, or not the active connection"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/broker-connections/{code}/universe/load": {
       "post": {
         "tags": [
@@ -922,19 +968,102 @@
         "tags": [
           "admin"
         ],
-        "summary": "Run the instrument expiry pass now, instead of waiting for the hourly tick.",
-        "description": "Same function the background job calls, so an on-demand run and a scheduled one\ncannot diverge. Useful right after seeding a calendar (every dated contract gets\nits instant immediately) and for confirming a correction took effect.",
+        "summary": "Run the instrument expiry pass now, as a job, instead of waiting for the hourly tick",
+        "description": "Same function the background task calls, so an on-demand run and a scheduled one\ncannot diverge. Useful right after seeding a calendar (every dated contract gets\nits instant immediately) and for confirming a correction took effect. Answers at\nonce with the job id; the counts are the job's result.",
         "operationId": "expiry_sweep",
         "responses": {
-          "200": {
-            "description": "Expiry sweep summary",
+          "202": {
+            "description": "Started; follow it at /admin/jobs/{job_id}; the result is an ExpirySweepResult",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ExpirySweepResult"
+                  "$ref": "#/components/schemas/JobStarted"
                 }
               }
             }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/jobs": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List recent background jobs",
+        "operationId": "list_jobs",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "path",
+            "description": "How many, newest first: default 50, at most 200.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JobRecord"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/jobs/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Get a background job and its log",
+        "operationId": "get_job",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Job id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
           }
         },
         "security": [
@@ -2032,6 +2161,8 @@
         "tags": [
           "admin"
         ],
+        "summary": "Backfill FIGIs for instruments that have none, as a job",
+        "description": "Runs in the background and answers at once with the job id; the counts that\nused to be the response body are the job's result.",
         "operationId": "backfill_symbology",
         "requestBody": {
           "content": {
@@ -2044,12 +2175,12 @@
           "required": true
         },
         "responses": {
-          "200": {
-            "description": "Backfill summary",
+          "202": {
+            "description": "Started; follow it at /admin/jobs/{job_id}; the result is a BackfillResult",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BackfillResult"
+                  "$ref": "#/components/schemas/JobStarted"
                 }
               }
             }
@@ -3864,6 +3995,25 @@
           },
           "venue": {
             "type": "string"
+          }
+        }
+      },
+      "JobDetail": {
+        "type": "object",
+        "required": [
+          "job",
+          "log"
+        ],
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/JobRecord"
+          },
+          "log": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JobLogLine"
+            },
+            "description": "The job's own log, oldest line first (the newest 500 are kept)."
           }
         }
       },
