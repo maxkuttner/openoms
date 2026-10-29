@@ -105,3 +105,11 @@ for (const [old, target] of [
     assert.ok(existsSync(join(DIST, target.slice(BASE.length), "index.html")), `${target} is not built`);
   });
 }
+
+test("operation pages show cURL, Python and Rust samples, not JavaScript", () => {
+  const html = readFileSync(join(DIST, "api/operations/orders_submit/index.html"), "utf8");
+  assert.ok(html.includes("curl --request POST"), "no cURL sample");
+  assert.ok(html.includes("requests.post("), "no Python sample");
+  assert.ok(html.includes("reqwest::Client::new()"), "no Rust sample");
+  assert.ok(!html.includes("fetch(url, options)"), "JavaScript sample still present");
+});

@@ -3,9 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "predev": "node scripts/copy-install.mjs",
+    "predev": "node scripts/copy-install.mjs && node scripts/openapi-samples.mjs",
     "dev": "astro dev",
-    "prebuild": "node scripts/copy-install.mjs",
+    "prebuild": "node scripts/copy-install.mjs && node scripts/openapi-samples.mjs",
     "build": "astro build",
     "preview": "astro preview",
     "test": "node --test test/*.test.mjs",
@@ -14,6 +14,7 @@
   "dependencies": {
     "@astrojs/starlight": "0.42.7",
     "astro": "7.4.4",
+    "httpsnippet": "3.0.10",
     "mermaid": "12.2.0",
     "sharp": "0.35.5",
     "starlight-links-validator": "0.27.0",

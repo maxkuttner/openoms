@@ -21,7 +21,9 @@ export default defineConfig({
         // Generated from the committed spec — never hand-written, so it cannot
         // drift from the server (the_committed_openapi_spec_is_current keeps
         // docs/openapi.json itself in step with the code).
-        starlightOpenAPI([{ base: "api", schema: "../docs/openapi.json", sidebar: { label: "API Reference" } }]),
+        // .generated/openapi.json is docs/openapi.json plus cURL, Python and Rust
+        // samples per operation (scripts/openapi-samples.mjs, run by prebuild).
+        starlightOpenAPI([{ base: "api", schema: "./.generated/openapi.json", sidebar: { label: "API Reference" } }]),
         // Generated API pages are invisible to the validator; test/dist.test.mjs
         // checks links into them against the built files instead.
         starlightLinksValidator({ exclude: ["/openoms/api", "/openoms/api/**"] }),
