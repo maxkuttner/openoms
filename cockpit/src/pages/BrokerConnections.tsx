@@ -3,6 +3,7 @@ import { Button, Drawer, Stack } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
 import { CredentialsPanel } from "../components/CredentialsPanel";
 import { StreamHealthStrip } from "../components/StreamHealthStrip";
+import { UniverseStatus } from "../components/UniverseStatus";
 import type { BrokerConnection } from "../api/types";
 
 const STATUS = [
@@ -35,6 +36,11 @@ export function BrokerConnectionsPage() {
         { key: "broker_code", label: "Broker" },
         { key: "environment", label: "Environment" },
         { key: "status", label: "Status" },
+        {
+          key: "universe",
+          label: "Instrument universe",
+          render: (row: BrokerConnection) => <UniverseStatus code={row.code} />,
+        },
       ]}
       fields={[
         { name: "code", label: "Code", required: true, inEdit: false },

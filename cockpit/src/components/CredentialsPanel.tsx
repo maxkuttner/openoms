@@ -8,6 +8,7 @@ import {
   Checkbox,
   Group,
   Loader,
+  Modal,
   PasswordInput,
   Stack,
   Text,
@@ -17,8 +18,17 @@ import {
 import { api, ApiError } from "../api/client";
 import { notifyError, notifyOk } from "../api/hooks";
 import type { ConnectionOutcome, RedactedCredentials, SaveResponse, TestResponse } from "../api/types";
+import type { UniverseStatus } from "../api/jobs";
+import { loadUniverse } from "./UniverseStatus";
 
 export type CredentialsKind = "broker" | "feed";
+
+// The post-save prompt's wording per broker: the name and roughly what loading
+// the universe brings in.
+const UNIVERSE_COPY: Record<string, { name: string; what: string }> = {
+  ALPACA: { name: "Alpaca", what: "About 14,400 stocks and ETFs" },
+  BINANCE: { name: "Binance", what: "About 2,000 spot pairs" },
+};
 
 type Props = {
   kind: CredentialsKind;
@@ -130,6 +140,11 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
     queryFn: () => api.get<RedactedCredentials>(credPath),
   });
 
+  // Offered once, right after a broker credential is saved, when that
+  // connection's instrument universe was never loaded.
+  const [offerLoad, setOfferLoad] = useState(false);
+  const universeCopy = UNIVERSE_COPY[providerCode];
+
   // `required` on an input only renders an asterisk; enforcement is this
   // validator. It fires only when there is nothing stored to fall back on —
   // once a credential is configured, an empty field means "keep", which is
@@ -205,6 +220,12 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
       qc.invalidateQueries({ queryKey: [credPath] });
       const testNote = resp.tested ? "Credential verified." : `Not tested before save (${resp.message}).`;
       notifyOk(`Saved. ${testNote} ${describeReload(resp.reload)}.`);
+      if (kind === "broker" && universeCopy) {
+        api
+          .get<UniverseStatus>(`${basePath}/${code}/universe`)
+          .then((u) => setOfferLoad(u.state === "not_loaded"))
+          .catch(() => {});
+      }
     },
     onError: notifyError,
   });
@@ -348,6 +369,33 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
           {lastSave.tested ? "Credential verified. " : `Not tested before save (${lastSave.message}). `}
           {describeReload(lastSave.reload)}.
         </Alert>
+      )}
+
+      {universeCopy && (
+        <Modal opened={offerLoad} onClose={() => setOfferLoad(false)} title="Credentials saved ✓" centered>
+          <Stack>
+            <Text>Load {universeCopy.name}'s instrument universe now?</Text>
+            <Text fz="sm" c="dimmed">
+              {universeCopy.what} — runs in the background.
+            </Text>
+            <Group justify="flex-end">
+              <Button variant="default" onClick={() => setOfferLoad(false)}>
+                Later
+              </Button>
+              <Button
+                onClick={async () => {
+                  setOfferLoad(false);
+                  if (await loadUniverse(code)) {
+                    qc.invalidateQueries({ queryKey: ["/admin/broker-connections", code, "universe"] });
+                    qc.invalidateQueries({ queryKey: ["/admin/jobs"] });
+                  }
+                }}
+              >
+                Load now
+              </Button>
+            </Group>
+          </Stack>
+        </Modal>
       )}
     </Stack>
   );

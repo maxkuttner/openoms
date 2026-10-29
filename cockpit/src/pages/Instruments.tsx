@@ -1,12 +1,13 @@
 import { useState } from "react";
-import { Group, Table, Text, TextInput, Title, Badge, Loader } from "@mantine/core";
+import { Anchor, Group, Table, Text, TextInput, Title, Badge, Loader } from "@mantine/core";
+import { Link as RouterLink } from "react-router-dom";
 import { useDebouncedValue } from "@mantine/hooks";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type { InstrumentSummary } from "../api/types";
 
 // Read-only browser over the seeded master catalog. Instruments are seeded
-// broker-first (`oms setup sync-broker`); pricing coverage is derived per feed at
+// broker-first (a universe load per broker connection); pricing coverage is derived per feed at
 // startup, not seeded — there is no in-UI seeding flow. Server-side search
 // (debounced) against /admin/instruments.
 export function InstrumentsPage() {
@@ -27,8 +28,8 @@ export function InstrumentsPage() {
         {isLoading && <Loader size="sm" />}
       </Group>
       <Text size="sm" c="dimmed" mb="md">
-        Seeded from a broker's catalog (<code>make sync-broker BROKER=alpaca</code>). Which of these
-        a data feed can price is derived from the feed's own symbology at startup.
+        Loaded from each broker's catalog — see the instrument universe on Broker connections. Which
+        of these a data feed can price is derived from the feed's own symbology at startup.
       </Text>
       <TextInput
         placeholder="Search symbol or name…"
@@ -66,7 +67,11 @@ export function InstrumentsPage() {
             <Table.Tr>
               <Table.Td colSpan={5}>
                 <Text c="dimmed" ta="center" py="md">
-                  No instruments seeded. Run <code>make sync-broker</code> to seed a broker's catalog.
+                  No instruments yet — load a broker's universe from{" "}
+                  <Anchor component={RouterLink} to="/broker-connections">
+                    Broker connections
+                  </Anchor>
+                  .
                 </Text>
               </Table.Td>
             </Table.Tr>
