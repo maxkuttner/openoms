@@ -8,7 +8,7 @@ hero:
     file: ../../assets/logo.svg
   actions:
     - text: Get started
-      link: /openoms/getting-started/installation/
+      link: /openoms/getting-started/
       icon: right-arrow
     - text: API reference
       link: /openoms/api/
@@ -24,10 +24,10 @@ import GrainBackground from "../../components/GrainBackground.astro";
 
 <Code code="curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh" lang="sh" />
 
-[Read the script](/openoms/install.sh) before you pipe it into a shell — it downloads one
-checksummed binary into `~/.local/bin` and stops there. No sudo, nothing started, nothing
-configured. Prebuilt for macOS on Apple Silicon and Linux on x86_64; anything else
-[builds from source](/openoms/getting-started/installation/#build-from-source).
+[Read the script on GitHub](https://github.com/maxkuttner/openoms/blob/main/install.sh) before you pipe it into a shell — it downloads one
+checksummed binary into `~/.local/bin`, then offers to run `oms init`. No sudo, nothing
+started or configured without asking. Prebuilt for macOS on Apple Silicon and Linux on x86_64; anything else
+[builds from source](/openoms/getting-started/#1-install).
 
 ## What you get
 
