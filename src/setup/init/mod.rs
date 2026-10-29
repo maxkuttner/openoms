@@ -11,6 +11,7 @@ use std::io::{BufRead, Write};
 
 use crate::config::{self, FileConfig};
 
+pub mod docker;
 pub mod rules;
 
 /// 32 bytes — the AES-256 key size the credential store expects.
