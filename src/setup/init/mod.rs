@@ -130,9 +130,40 @@ pub fn answers_from_flags(f: &InitFlags, db: Prompts) -> Result<Answers, String>
     Ok(Answers { db, admin, bind })
 }
 
+/// What to do when provisioning fails after `oms.toml` was written. For a
+/// Docker database the superuser password was generated and never shown, so
+/// the resume line fetches it from the container.
+pub fn provision_failure_message(cfg_path: &std::path::Path, err: &str, docker: bool) -> String {
+    let resume = if docker {
+        format!(
+            "POSTGRES_PASSWORD=\"$(docker exec {c} printenv POSTGRES_PASSWORD)\" oms database init --resume",
+            c = docker::CONTAINER
+        )
+    } else {
+        "oms database init --resume".to_string()
+    };
+    let mut m = format!(
+        "error: the database could not be created: {err}\n\n\
+         \x20        {} was already written and holds your generated credentials —\n\
+         \x20        it has not been lost. Fix the cause above, then finish with:\n\n\
+         \x20            {resume}",
+        cfg_path.display()
+    );
+    if docker {
+        m.push_str(&format!(
+            "\n\n\x20        Or start over from nothing:\n\n\
+             \x20            docker rm -f {c} && docker volume rm {v} && rm {p}",
+            c = docker::CONTAINER,
+            v = docker::VOLUME,
+            p = cfg_path.display()
+        ));
+    }
+    m
+}
+
 pub fn docker_cleanup_hint() -> String {
     format!(
-        "The {c} container is still running. To start over:\n\
+        "The {c} container may still exist. To start over:\n\
          \x20     docker rm -f {c} && docker volume rm {v}",
         c = docker::CONTAINER,
         v = docker::VOLUME
@@ -186,8 +217,11 @@ async fn run_with_timeout(
         DbChoice::Existing(p) => p,
         DbChoice::Docker => {
             docker::preflight(docker).map_err(|e| format!("error: {e}"))?;
-            println!("  starting {} ({}) ...", docker::CONTAINER, docker::IMAGE);
-            let (p, note) = docker::start(docker).map_err(|e| format!("error: {e}"))?;
+            println!("  {}", docker::starting_line());
+            // A failed `docker run` can still have created the container (it is
+            // created before the port is published), so say how to remove it.
+            let (p, note) = docker::start(docker)
+                .map_err(|e| format!("error: {e}\n\n{}", docker_cleanup_hint()))?;
             if let Some(note) = note {
                 println!("  {note}");
             }
@@ -263,15 +297,9 @@ async fn run_with_timeout(
     // database it just created. `--resume` skips that and re-runs the remaining
     // steps, all of which tolerate re-application — see `database::init`'s doc
     // comment for why.
-    crate::setup::database::init(overrides, Some(role_password), false).await.map_err(|e| {
-        format!(
-            "error: the database could not be created: {e}\n\n\
-             \x20        {} was already written and holds your generated credentials —\n\
-             \x20        it has not been lost. Fix the cause above, then finish with:\n\n\
-             \x20            oms database init --resume",
-            cfg_path.display()
-        )
-    })?;
+    crate::setup::database::init(overrides, Some(role_password), false)
+        .await
+        .map_err(|e| provision_failure_message(&cfg_path, &e.to_string(), started_docker))?;
 
     // Only a generated password is ever printed, and only to a human at a
     // terminal: one the operator typed they already know.
@@ -526,6 +554,37 @@ mod tests {
         let a = answers_from_flags(&flags(Some("very-secret-admin"), None), sample_prompts()).unwrap();
         let d = format!("{a:?}");
         assert!(!d.contains("very-secret-admin") && !d.contains("\"pw\""), "{d}");
+    }
+
+    #[test]
+    fn a_docker_provisioning_failure_says_how_to_resume_and_how_to_start_over() {
+        let cfg = std::path::Path::new("/home/u/.config/oms/oms.toml");
+        let m = provision_failure_message(cfg, "boom", true);
+        assert!(m.contains("POSTGRES_PASSWORD=\"$(docker exec oms-postgres printenv POSTGRES_PASSWORD)\" oms database init --resume"), "{m}");
+        assert!(m.contains("docker rm -f oms-postgres && docker volume rm oms-pgdata && rm /home/u/.config/oms/oms.toml"), "{m}");
+        let plain = provision_failure_message(cfg, "boom", false);
+        assert!(plain.contains("oms database init --resume") && !plain.contains("printenv"), "{plain}");
+    }
+
+    struct RunFails;
+
+    impl docker::DockerOps for RunFails {
+        fn status(&self) -> rules::DockerStatus { rules::DockerStatus::Usable }
+        fn container_exists(&self, _: &str) -> bool { false }
+        fn volume_exists(&self, _: &str) -> bool { false }
+        fn port_free(&self, _: u16) -> bool { true }
+        fn run_postgres(&self, _: u16, _: &str) -> Result<(), String> { Err("docker run failed: port is already allocated".into()) }
+    }
+
+    #[tokio::test]
+    async fn a_failed_docker_run_names_cleanup() {
+        let tmp = std::env::temp_dir().join(format!("oms-init-runfails-{}", std::process::id()));
+        let a = Answers { db: DbChoice::Docker, admin: AdminPassword::Generated("x".repeat(24)), bind: "localhost:3001".into() };
+        let e = run_with_timeout(a, &RunFails, false, std::time::Duration::from_millis(100), tmp.join("none.toml"), tmp.join("oms.toml"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("port is already allocated") && e.contains("docker rm -f oms-postgres"), "{e}");
     }
 
 }

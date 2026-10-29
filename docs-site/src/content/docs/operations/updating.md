@@ -35,6 +35,13 @@ Then finish the update yourself — `oms update` deliberately does neither step:
    oms database migrate
    ```
 
+   It connects as the Postgres superuser. If `oms init` started PostgreSQL in Docker
+   for you, that password was generated and lives in the container:
+
+   ```sh
+   POSTGRES_PASSWORD="$(docker exec oms-postgres printenv POSTGRES_PASSWORD)" oms database migrate
+   ```
+
 2. **Restart the server**, so it runs the new binary. A running server keeps executing
    the old one until then.
 

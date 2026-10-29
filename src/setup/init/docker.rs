@@ -63,7 +63,12 @@ impl DockerOps for Cli {
     }
 
     fn port_free(&self, port: u16) -> bool {
-        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        // Both: a server listening on all interfaces does not always stop a
+        // loopback-only bind from succeeding (SO_REUSEADDR on macOS), but it
+        // does make `docker run -p 127.0.0.1:<port>` fail.
+        ["127.0.0.1", "0.0.0.0"]
+            .iter()
+            .all(|host| std::net::TcpListener::bind((*host, port)).is_ok())
     }
 
     fn run_postgres(&self, port: u16, superuser_password: &str) -> Result<(), String> {
@@ -96,6 +101,10 @@ fn quiet(args: &[&str]) -> bool {
 
 /// Refuse over a container or volume of ours that already exists: it may hold
 /// someone's data, so it is never reused or removed silently.
+pub fn starting_line() -> String {
+    format!("starting {CONTAINER} ({IMAGE}) — the first run downloads the image, which can take a few minutes ...")
+}
+
 pub fn preflight(ops: &dyn DockerOps) -> Result<(), String> {
     let container = ops.container_exists(CONTAINER);
     let volume = ops.volume_exists(VOLUME);
@@ -281,4 +290,16 @@ pub(crate) mod tests {
         let _ = Command::new("docker").args(["volume", "rm", VOLUME]).output();
         ready.unwrap();
     }
+    #[test]
+    fn cli_port_free_sees_a_wildcard_listener() {
+        let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        assert!(!Cli.port_free(port), "port {port} is held on 0.0.0.0");
+    }
+
+    #[test]
+    fn the_start_line_warns_about_the_first_pull() {
+        assert!(starting_line().contains("download"), "{}", starting_line());
+    }
+
 }

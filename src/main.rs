@@ -716,7 +716,10 @@ async fn main() {
                 // dialoguer needs a terminal; without one it fails on the first
                 // prompt with an error that names neither the cause nor the way out.
                 use std::io::IsTerminal;
-                if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                if !setup::init::prompts::can_prompt(
+                    std::io::stdin().is_terminal(),
+                    std::io::stderr().is_terminal(),
+                ) {
                     eprintln!(
                         "error: oms init asks its questions on a terminal, and none is attached.\n\
                          \x20        Take every value from flags and the environment instead:\n\

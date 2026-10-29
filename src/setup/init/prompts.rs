@@ -74,6 +74,17 @@ pub struct Defaults {
     pub source: Option<DbSource>,
 }
 
+/// dialoguer reads stdin and draws on stderr; both must be a terminal.
+pub fn can_prompt(stdin: bool, stderr: bool) -> bool {
+    stdin && stderr
+}
+
+/// What the admin password field accepts as typed: empty (generate one) or a
+/// password the rules allow. Checked before the confirmation is asked.
+pub fn admin_password_field(pw: &str) -> Result<(), String> {
+    if pw.is_empty() { Ok(()) } else { check_admin_password(pw) }
+}
+
 pub fn collect(p: &mut dyn Prompter, d: &Defaults, docker: DockerStatus) -> io::Result<Answers> {
     let source = match d.source {
         Some(s) => s,
@@ -199,13 +210,25 @@ impl Prompter for Terminal {
             .map_err(io_err)
     }
 
+    /// With `confirm`, this is the admin password: checked as typed (empty
+    /// means generate), and confirmed only when something was typed.
     fn password(&mut self, label: &str, confirm: bool) -> io::Result<String> {
-        let mut prompt = dialoguer::Password::with_theme(&self.theme);
-        prompt = prompt.with_prompt(label).allow_empty_password(true);
-        if confirm {
-            prompt = prompt.with_confirmation("Confirm", "The passwords don't match — try again");
+        let ask = |prompt: &str, validate: bool| {
+            let mut p = dialoguer::Password::with_theme(&self.theme)
+                .with_prompt(prompt)
+                .allow_empty_password(true);
+            if validate {
+                p = p.validate_with(|v: &String| admin_password_field(v));
+            }
+            p.interact().map_err(io_err)
+        };
+        loop {
+            let pw = ask(label, confirm)?;
+            if !confirm || pw.is_empty() || ask("Confirm", false)? == pw {
+                return Ok(pw);
+            }
+            println!("  The passwords don't match — try again");
         }
-        prompt.interact().map_err(io_err)
     }
 
     fn note(&mut self, line: &str) {
@@ -407,4 +430,18 @@ mod tests {
         collect(&mut s, &defaults(), DockerStatus::Usable).unwrap();
         assert_eq!(s.notes.iter().filter(|n| n.contains("network")).count(), 1);
     }
+    #[test]
+    fn prompting_needs_stdin_and_stderr_on_a_terminal() {
+        assert!(can_prompt(true, true));
+        assert!(!can_prompt(false, true));
+        assert!(!can_prompt(true, false));
+    }
+
+    #[test]
+    fn the_admin_password_field_takes_empty_or_twelve_plus() {
+        assert!(admin_password_field("").is_ok());
+        assert!(admin_password_field("short").is_err());
+        assert!(admin_password_field("long-enough-pw").is_ok());
+    }
+
 }
