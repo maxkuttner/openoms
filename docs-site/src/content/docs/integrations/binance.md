@@ -18,7 +18,7 @@ testnet, is still to come.
 | Order entry | REST (default) or FIX |
 | Executions | The user-data stream (REST) or FIX execution reports |
 | Instruments | Spot pairs |
-| Catalog | `oms setup sync-broker --broker binance` |
+| Catalog | Broker connections → **Instrument universe** in the cockpit |
 | Prices | Binance's public spot book; [Bybit](/openoms/integrations/bybit/) as backup |
 
 ## Credentials
@@ -48,6 +48,6 @@ that a restart is required, and the new credentials apply at the next start.
 
 ## Loading instruments
 
-```sh
-oms setup sync-broker --broker binance --no-enrich
-```
+Saving the credentials offers to load Binance's spot pairs as a background job; the
+**Instrument universe** column on **Broker connections** shows its state and has
+**Load** / **Reload**. From a terminal: `oms setup sync-broker --broker binance --no-enrich`.

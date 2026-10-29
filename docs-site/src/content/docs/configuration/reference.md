@@ -93,8 +93,7 @@ These have no `oms.toml` key.
 | Variable | Effect |
 |---|---|
 | `OMS_CONFIG` | Path to the config file; overrides the search. |
-| `OMS_SYNC_ON_BOOT` | `never` stops the automatic catalog sync when the catalog is empty at startup. |
-| `OMS_SYNC_UNDERLYINGS` | Comma-separated option underlyings that automatic sync seeds chains for, e.g. `SPY,QQQ`. |
+| `OMS_SYNC_ON_BOOT` | `never` stops the automatic instrument load at startup — otherwise each broker connection with credentials whose instruments were never loaded gets one, as a background job. |
 | `ALPACA_ENV`, `BINANCE_ENV` | `PAPER` (default) or `LIVE`: which of the broker's connections the OMS routes to. |
 | `BINANCE_PAPER_TRANSPORT`, `BINANCE_LIVE_TRANSPORT` | `rest` (default) or `fix`: how Binance orders are sent. |
 | `OPENFIGI_API_KEY` | Raises the OpenFIGI rate limit used when enriching the catalog. |

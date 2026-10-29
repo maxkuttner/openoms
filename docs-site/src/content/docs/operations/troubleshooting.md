@@ -11,7 +11,8 @@ description: Common startup and setup errors, and what to do about them.
 | SQL errors such as `column … does not exist` or `relation … does not exist` | The database is behind the binary — the server does not migrate on its own. Run `oms database migrate`; `oms database status` shows what is pending. |
 | `refusing to start: credentials are stored but none of them could be decrypted` | `master_key` doesn't match the key the credentials were stored with. See [Master key and backups](/openoms/operations/master-key-and-backups/). |
 | `400 no account_id given and portfolio has no default account` | Set the portfolio's default account — see [your first paper trade](/openoms/getting-started/first-paper-trade/#4-set-up-a-trader). |
-| `422 instrument not found` | The catalog has no such instrument. Load it with `oms setup sync-broker`. |
+| `422 instrument not found` | The catalog has no such instrument. Load the broker's instruments from **Broker connections** in the cockpit (the **Instrument universe** column). |
+| A load shows ✕ Failed or ◑ Partial | Open **Jobs** in the cockpit's top bar: the job's error and log say why. ◑ Partial "interrupted" means the OMS restarted mid-load — click **Load again**. |
 | The server can't connect, and the log says no config file was found | It is looking in the wrong place. The error lists every location searched — see [Config file locations](/openoms/configuration/file-locations/). |
 | `/cockpit/` returns 404 on a source build | The cockpit bundle wasn't built before `cargo build`. See [Build from source](/openoms/getting-started/installation/#build-from-source). |
 | Link error mentioning `-lssl` on macOS (source build) | `brew install openssl@3`, or set `OPENSSL_DIR`. |

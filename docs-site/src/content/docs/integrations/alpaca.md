@@ -14,7 +14,7 @@ trade](/openoms/getting-started/first-paper-trade/) walks through it end to end.
 | Order entry | REST |
 | Executions | Alpaca's trade-updates stream: fills, partial fills, cancels, rejects |
 | Instruments | US equities and ETFs; US equity options for the underlyings you choose |
-| Catalog | `oms setup sync-broker --broker alpaca` |
+| Catalog | Broker connections → **Instrument universe** in the cockpit |
 | Prices | Not from Alpaca — see [Limits](#limits) |
 
 ## Credentials
@@ -47,23 +47,27 @@ ALPACA_ENV=LIVE
 
 ## Loading instruments
 
+Saving the credentials offers to load Alpaca's instrument universe — every tradable US
+equity and ETF it lists, about 14,400 — as a background job that takes a few seconds.
+After that, the **Instrument universe** column on **Broker connections** shows its state
+(○ Not loaded, ◐ Loading, ● Loaded, ◑ Partial, ✕ Failed) with **Load**, **Reload**,
+**Load again** or **Retry**. **Jobs** in the top bar has each load's progress and log.
+
+At startup, a connection with credentials whose instruments were never loaded gets a
+load automatically; `OMS_SYNC_ON_BOOT=never` turns that off.
+
+From a terminal, the same load is:
+
 ```sh
 oms setup sync-broker --broker alpaca --no-enrich
 ```
 
-This loads every tradable US equity and ETF Alpaca lists (about 14,400) in a few seconds.
-Options are not loaded wholesale; name the underlyings whose chains you want:
+Option chains are not part of the universe. To seed chains for particular underlyings
+from the terminal: `oms setup sync-broker --broker alpaca --underlyings SPY,QQQ --no-enrich`.
 
-```sh
-oms setup sync-broker --broker alpaca --underlyings SPY,QQQ --no-enrich
-```
-
-Drop `--no-enrich` to also look up FIGIs through OpenFIGI. That is slow without an
-`OPENFIGI_API_KEY`. `--dry-run` fetches and counts without writing anything.
-
-With credentials stored and an empty catalog, the server runs this sync itself at
-startup. `OMS_SYNC_ON_BOOT=never` turns that off; `OMS_SYNC_UNDERLYINGS=SPY,QQQ` chooses the
-option chains it seeds.
+FIGI enrichment through OpenFIGI is a separate job,
+`POST /admin/broker-connections/alpaca-paper/universe/enrich` — slow without an
+`OPENFIGI_API_KEY`.
 
 ## Accounts
 
