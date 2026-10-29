@@ -6,10 +6,12 @@
 # Downloads the released `oms` binary for this platform, verifies it against the
 # release's SHA256SUMS, and installs it into ~/.local/bin. That is all it does: no
 # sudo, no package manager, no Postgres, no config file, no server started. It
-# prints the commands to run next.
+# prints the commands to run next — then, if a person is at the terminal, offers
+# to run `oms init` (which asks before it creates anything).
 #
 #   OMS_VERSION      release tag to install (default: latest)
 #   OMS_INSTALL_DIR  where the binary lands (default: $HOME/.local/bin)
+#   OMS_NO_INIT=1    do not offer to run `oms init` at the end
 
 set -eu
 
@@ -106,16 +108,34 @@ main() {
 
 	next:
 
-	    oms database init     # creates the database and oms.toml — needs a Postgres 16
-	    oms                   # starts the OMS on localhost:3001
+	    oms init     # asks where the database lives (it can start one in Docker),
+	                 # sets the cockpit password, writes oms.toml
+	    oms          # starts the OMS
 
 	then open http://localhost:3001/cockpit/
 
 	Later, `oms update` installs the newest release in place.
-
-	No Postgres yet? From a clone of the repo, `docker compose up -d` brings one up on
-	127.0.0.1:5432 with the defaults `oms database init` already assumes.
 	EOF
+
+	offer_init
+}
+
+# Ask once whether to run `oms init` now. Only when a person can answer: under
+# `curl | sh` stdin is the script itself, so the question goes to /dev/tty, and
+# with no terminal at all (CI, provisioning) there is nothing to ask.
+offer_init() {
+	[ "${OMS_NO_INIT:-}" = "1" ] && return 0
+	if "$INSTALL_DIR/oms" config path >/dev/null 2>&1; then
+		printf '\nexisting config found — skipping oms init\n'
+		return 0
+	fi
+	(: </dev/tty) 2>/dev/null || return 0
+	printf '\nRun oms init now? [Y/n] ' >/dev/tty
+	read -r ans </dev/tty || return 0
+	case "$ans" in
+	"" | y | Y | yes | YES) "$INSTALL_DIR/oms" init </dev/tty >/dev/tty 2>&1 || true ;;
+	*) ;;
+	esac
 }
 
 main "$@"
