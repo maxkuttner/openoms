@@ -505,6 +505,7 @@ enum DatabaseCmd {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
+    config::load_env_beside();
     // `RUST_LOG` is honoured when set (e.g. `RUST_LOG=fix::wire=debug` to see
     // the redacted FIX wire log — see `fix::mod`'s doc comment); with no
     // `RUST_LOG` at all this falls back to plain `info`, so anyone who sets
@@ -637,7 +638,7 @@ async fn main() {
             // a no-echo prompt only to be refused a moment later. `run()` keeps
             // its own check regardless; that one is the actual guarantee, this
             // one just fails earlier and more kindly.
-            let cfg_path = config::path();
+            let cfg_path = config::absolute(config::path());
             if cfg_path.exists() {
                 eprintln!("{}", setup::init::already_initialized_message(&cfg_path));
                 std::process::exit(1);
@@ -730,14 +731,20 @@ async fn serve() {
         Ok(pool) => pool,
         Err(e) => {
             error!("Failed to connect to the database: {e}");
-            // `oms.toml` is resolved relative to the CWD, so a connection failure
-            // from a directory other than the one it was written in looks
-            // identical to "never initialized" unless the message names the path
-            // that was actually searched.
-            error!(
-                "config file searched: {} (set OMS_CONFIG to point elsewhere)",
-                config::path_abs().display()
-            );
+            // A connection failure with no config file found looks identical to
+            // "never initialized" unless the message names where it was looked for.
+            if config::load().is_some() {
+                error!("config file: {}", config::path_abs().display());
+            } else {
+                let searched: Vec<_> = config::search_paths()
+                    .into_iter()
+                    .map(|p| config::absolute(p).display().to_string())
+                    .collect();
+                error!(
+                    "no config file found; searched {} (set OMS_CONFIG to point elsewhere)",
+                    searched.join(", ")
+                );
+            }
             error!("If this database has not been created yet, run: oms database init");
             return;
         }

@@ -38,7 +38,7 @@ Then open <http://localhost:3001/cockpit/>.
 ```sh
 git clone git@github.com:maxkuttner/openoms.git && cd openoms
 docker compose up -d  # a local Postgres; skip if you already have one
-cargo run -- init     # prompts for your Postgres, writes oms.toml, creates the database
+cargo run -- init     # prompts for your Postgres, writes ~/.config/oms/oms.toml, creates the database
 cargo run             # start the OMS on localhost:3001
 ```
 
@@ -73,8 +73,17 @@ brew install cmake openssl@3 node               # + postgresql@16 if not using D
 
 ## Configuration
 
-Everything lives in `oms.toml`, written by `oms init`. Flags and env vars
-override it, in that order:
+Everything lives in `oms.toml`, written by `oms init` to
+`~/.config/oms/oms.toml` (or `$XDG_CONFIG_HOME/oms/oms.toml`). `oms` uses the
+first file it finds, so commands work from any directory:
+
+1. `$OMS_CONFIG`, if set
+2. `./oms.toml` in the current directory
+3. `~/.config/oms/oms.toml`
+4. `/etc/oms/oms.toml`
+
+A `.env` beside the file found is loaded too (after `./.env`; neither overrides
+variables already set). Flags and env vars override the file, in that order:
 
 | Setting | `oms.toml` | Flag | Environment |
 |---|---|---|---|

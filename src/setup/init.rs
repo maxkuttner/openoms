@@ -197,10 +197,14 @@ pub fn already_initialized_message(path: &std::path::Path) -> String {
 /// likely to run under CI/Ansible with stdout captured into a durable log, which
 /// is exactly what "secrets are never logged" rules out.
 pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let cfg_path = config::path();
-    if cfg_path.exists() {
-        return Err(already_initialized_message(&cfg_path).into());
+    // Refuse over a config found in ANY searched location, not just the one
+    // this run would write: a second file elsewhere would be silently shadowed
+    // by (or shadow) the first, with a different master key in each.
+    let existing = config::path();
+    if existing.exists() {
+        return Err(already_initialized_message(&config::absolute(existing)).into());
     }
+    let cfg_path = config::absolute(config::init_target());
 
     // Test connectivity before writing anything: a wrong password should cost
     // nothing, not leave a half-made install behind. `PgConnection` (a single
@@ -230,9 +234,20 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
     // Mapped to add the "error: " prefix every other failure path in this
     // function already carries — `ConfigError`'s `Display` does not include it,
     // since it is also used in contexts that add their own.
+    if let Some(dir) = cfg_path.parent() {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("error: could not create {}: {e}", dir.display()))?;
+    }
     config::write_new(&cfg_path, &file_cfg).map_err(|e| format!("error: {e}"))?;
     println!("  wrote {} (mode 0600)", cfg_path.display());
-    ensure_gitignored(&cfg_path);
+    // Only a file written into the current directory can land in a checkout.
+    if std::env::current_dir().is_ok_and(|cwd| cfg_path.parent() == Some(cwd.as_path())) {
+        ensure_gitignored(&cfg_path);
+    }
 
     let overrides = crate::setup::database::config::PostgresOverrides {
         host: Some(prompts.host.clone()),
@@ -266,10 +281,9 @@ pub async fn run(prompts: Prompts, interactive: bool) -> Result<(), Box<dyn std:
     } else {
         "Cockpit login password: written to oms.toml".to_string()
     };
-    // Absolute, not just what was passed to `--config`/`OMS_CONFIG`: this message
-    // may be read after the operator has `cd`ed elsewhere, and a relative path
-    // then points at nothing.
-    let abs_path = config::path_abs();
+    // Absolute (cfg_path already is): this message may be read after the
+    // operator has `cd`ed elsewhere, and a relative path then points at nothing.
+    let abs_path = &cfg_path;
     println!(
         "\nBack up {}. The master key in it is the only thing that can\n\
          decrypt stored broker credentials — lose it and they are gone.\n\n\

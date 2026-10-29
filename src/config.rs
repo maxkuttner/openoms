@@ -54,9 +54,13 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-/// Where the file lives when `OMS_CONFIG` says nothing. There is no `--config`
-/// flag — only the environment variable.
+/// The file's name in every location it is searched for. There is no
+/// `--config` flag — `OMS_CONFIG` is the only override.
 pub const DEFAULT_FILENAME: &str = "oms.toml";
+
+/// The machine-wide location, searched last and never written by `oms init`
+/// (that would need root); an operator who wants it puts the file there.
+pub const SYSTEM_PATH: &str = "/etc/oms/oms.toml";
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -194,15 +198,77 @@ pub fn parse(toml_str: &str) -> Result<FileConfig, ConfigError> {
     })
 }
 
-/// The configured path: `OMS_CONFIG` if set, else `DEFAULT_FILENAME` in the
-/// current directory. This is the only way to relocate the file — there is no
-/// `--config` flag.
+/// The per-user location: `$XDG_CONFIG_HOME/oms/oms.toml`, else
+/// `~/.config/oms/oms.toml`. `None` only when neither variable is set.
+fn user_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("oms").join(DEFAULT_FILENAME))
+}
+
+/// Every location searched when `OMS_CONFIG` is unset, in precedence order:
+/// the current directory (a checkout, or an install that keeps its config next
+/// to where it is started), the per-user location `oms init` writes to, then
+/// the machine-wide one.
+pub fn search_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(DEFAULT_FILENAME)];
+    paths.extend(user_path());
+    paths.push(PathBuf::from(SYSTEM_PATH));
+    paths
+}
+
+/// `OMS_CONFIG` if set; else the first of `candidates` that exists; else the
+/// first candidate, so "not found" still names a concrete path. Split out of
+/// `path()` so precedence is testable without touching the real filesystem.
+fn resolve(from_env: Option<String>, candidates: &[PathBuf], exists: impl Fn(&Path) -> bool) -> PathBuf {
+    if let Some(p) = from_env.filter(|v| !v.is_empty()) {
+        return PathBuf::from(p);
+    }
+    candidates
+        .iter()
+        .find(|p| exists(p))
+        .or(candidates.first())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_FILENAME))
+}
+
+/// The config file in effect: `OMS_CONFIG` if set, else the first existing
+/// file among `search_paths()`. Searching beyond the current directory is what
+/// lets `oms …` work from any directory, under systemd, cron or `sudo`, without
+/// every caller having to export a variable first.
 pub fn path() -> PathBuf {
+    resolve(std::env::var("OMS_CONFIG").ok(), &search_paths(), |p| p.exists())
+}
+
+/// Where `oms init` creates a new file: `OMS_CONFIG` if set, else the per-user
+/// location, so the result is found again from any directory. Falls back to
+/// the current directory only when there is no home to write under.
+pub fn init_target() -> PathBuf {
     std::env::var("OMS_CONFIG")
         .ok()
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
+        .or_else(user_path)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_FILENAME))
+}
+
+/// Load the `.env` that sits beside the config file in effect, if any.
+///
+/// `main` already loads `./.env`; a config found elsewhere (`~/.config/oms`,
+/// `/etc/oms`, the `/opt/oms/config` deploy) keeps its `.env` next to it, and
+/// that one must be found from any directory too. Variables already set —
+/// from the real environment or from `./.env` — win, as with every dotenv load.
+pub fn load_env_beside() {
+    let p = path_abs();
+    if let Some(env) = p.parent().map(|d| d.join(".env")).filter(|e| e.is_file()) {
+        let _ = dotenvy::from_path(env);
+    }
 }
 
 /// Absolute form of `path()`, for messages that might be read after the process
@@ -211,7 +277,11 @@ pub fn path() -> PathBuf {
 /// was actually searched for. Falls back to the relative path if the CWD cannot
 /// be read, which beats failing the message entirely over it.
 pub fn path_abs() -> PathBuf {
-    let p = path();
+    absolute(path())
+}
+
+/// `p` joined onto the current directory when it is relative.
+pub fn absolute(p: PathBuf) -> PathBuf {
     if p.is_absolute() {
         return p;
     }
@@ -334,6 +404,48 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn paths(v: &[&str]) -> Vec<PathBuf> {
+        v.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn oms_config_wins_even_when_it_does_not_exist() {
+        let c = paths(&["oms.toml", "/home/me/.config/oms/oms.toml"]);
+        assert_eq!(resolve(Some("/srv/x.toml".into()), &c, |_| true), PathBuf::from("/srv/x.toml"));
+    }
+
+    #[test]
+    fn the_first_existing_location_is_used() {
+        let c = paths(&["oms.toml", "/home/me/.config/oms/oms.toml", SYSTEM_PATH]);
+        let only = |want: &'static str| move |p: &Path| p == Path::new(want);
+        assert_eq!(resolve(None, &c, only(SYSTEM_PATH)), PathBuf::from(SYSTEM_PATH));
+        assert_eq!(
+            resolve(None, &c, only("/home/me/.config/oms/oms.toml")),
+            PathBuf::from("/home/me/.config/oms/oms.toml")
+        );
+        // The current directory beats both: an existing checkout keeps working.
+        assert_eq!(resolve(None, &c, |_| true), PathBuf::from("oms.toml"));
+    }
+
+    #[test]
+    fn nothing_found_names_the_current_directory() {
+        let c = paths(&["oms.toml", "/home/me/.config/oms/oms.toml", SYSTEM_PATH]);
+        assert_eq!(resolve(Some(String::new()), &c, |_| false), PathBuf::from("oms.toml"));
+    }
+
+    #[test]
+    fn the_user_location_follows_xdg_then_home() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (xdg, home) = (std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"));
+        std::env::set_var("HOME", "/home/me");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(user_path(), Some(PathBuf::from("/home/me/.config/oms/oms.toml")));
+        std::env::set_var("XDG_CONFIG_HOME", "/xdg");
+        assert_eq!(user_path(), Some(PathBuf::from("/xdg/oms/oms.toml")));
+        match xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
+        match home { Some(v) => std::env::set_var("HOME", v), None => std::env::remove_var("HOME") }
+    }
 
     /// Every field is optional: a partial file must parse, because the missing
     /// pieces fall through to env or the built-in defaults.
