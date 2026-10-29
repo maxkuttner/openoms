@@ -1,0 +1,127 @@
+---
+// The landing page's background: the static gradient (public/landing-bg.webp)
+// redrawn by a WebGL shader at the screen's full resolution — a green glow
+// bottom-left, an orange glow top-right, and film grain one CSS pixel per dot,
+// crisp on any display where the 1344px image would be stretched soft.
+//
+// Nothing moves: it draws once, and again only when the window is resized or
+// the theme switches to dark. Dark scheme only, like the image it replaces;
+// that image stays underneath (theme.css) for browsers without WebGL or JS.
+---
+
+<canvas id="grain-bg" aria-hidden="true"></canvas>
+
+<script>
+  const VERTEX = `
+    attribute vec2 p;
+    void main() { gl_Position = vec4(p, 0.0, 1.0); }
+  `;
+
+  // Colours sampled from the source image.
+  const FRAGMENT = `
+    // highp where available: the hash loses its randomness at mediump for
+    // the large pixel coordinates of a high-resolution canvas.
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    #else
+    precision mediump float;
+    #endif
+    uniform vec2 res;
+    uniform float dpr;
+
+    float hash(vec2 q) {
+      return fract(sin(dot(q, vec2(12.9898, 78.233))) * 43758.5453);
+    }
+
+    float glow(vec2 uv, vec2 c, float r) {
+      vec2 d = uv - c;
+      d.x *= res.x / res.y;
+      return exp(-dot(d, d) / (r * r));
+    }
+
+    void main() {
+      vec2 uv = gl_FragCoord.xy / res;
+
+      vec3 col = vec3(0.0);
+      col += vec3(0.08, 0.55, 0.28) * glow(uv, vec2(-0.05, -0.05), 0.55);
+      col += vec3(0.85, 0.48, 0.08) * glow(uv, vec2(1.05, 1.05), 0.58);
+      float lit = max(col.r, max(col.g, col.b));
+
+      // Grain: one value per CSS pixel, strongest where it's lit, as in the source.
+      float g = hash(floor(gl_FragCoord.xy / dpr)) - 0.5;
+      col += g * (0.03 + 0.22 * lit);
+
+      gl_FragColor = vec4(max(col, 0.0), 1.0);
+    }
+  `;
+
+  const canvas = document.getElementById("grain-bg") as HTMLCanvasElement | null;
+  // preserveDrawingBuffer: it is drawn once and must survive the browser
+  // recompositing the page.
+  const gl = canvas?.getContext("webgl", { antialias: false, alpha: false, preserveDrawingBuffer: true });
+
+  if (canvas && gl) {
+    const compile = (type: number, src: string) => {
+      const s = gl.createShader(type)!;
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      return s;
+    };
+    const prog = gl.createProgram()!;
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERTEX));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAGMENT));
+    gl.linkProgram(prog);
+
+    if (gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      gl.useProgram(prog);
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+      const loc = gl.getAttribLocation(prog, "p");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      const uRes = gl.getUniformLocation(prog, "res");
+      const uDpr = gl.getUniformLocation(prog, "dpr");
+
+      const draw = () => {
+        if (document.documentElement.dataset.theme !== "dark") return;
+        const dpr = devicePixelRatio || 1;
+        canvas.width = Math.round(innerWidth * dpr);
+        canvas.height = Math.round(innerHeight * dpr);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.uniform2f(uRes, canvas.width, canvas.height);
+        gl.uniform1f(uDpr, dpr);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        // Revealed only once drawn: an undrawn canvas is black, and would hide
+        // the static image underneath.
+        canvas.dataset.ready = "";
+      };
+
+      let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+      addEventListener("resize", () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(draw, 150);
+      });
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-theme"],
+      });
+      draw();
+    }
+  }
+</script>
+
+<style>
+  #grain-bg {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: -1;
+    pointer-events: none;
+    /* Hidden until drawn, so a failure leaves the static image showing. */
+    opacity: 0;
+  }
+  :global(:root[data-theme="dark"]) #grain-bg[data-ready] {
+    opacity: 1;
+  }
+</style>

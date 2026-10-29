@@ -125,3 +125,25 @@ test("the landing page has its background image, in dark mode only", () => {
   assert.ok(url.startsWith(BASE), `background url ${url} is not under ${BASE}`);
   assert.ok(existsSync(join(DIST, url.slice(BASE.length))), `${url} is not built`);
 });
+
+test("the landing page ships the interactive grain canvas", () => {
+  const html = readFileSync(join(DIST, "index.html"), "utf8");
+  assert.match(html, /<canvas[^>]*id="grain-bg"/, "no grain canvas on the landing page");
+  assert.match(html, /aria-hidden="true"/, "the decorative canvas must be hidden from screen readers");
+  const other = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
+  assert.ok(!other.includes('id="grain-bg"'), "grain canvas leaked onto a docs page");
+});
+
+test("the landing background never moves: no animation loop, no pointer tracking", () => {
+  const html = readFileSync(join(DIST, "index.html"), "utf8");
+  // Only the script that draws the grain: Starlight's own scripts on the page
+  // (code blocks, search) legitimately use requestAnimationFrame.
+  const inline = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  const bundled = [...html.matchAll(/<script[^>]*src="\/openoms\/(_astro\/[^"]+\.js)"/g)].map((m) =>
+    readFileSync(join(DIST, m[1]), "utf8"),
+  );
+  const grain = inline.concat(bundled).filter((src) => src.includes("grain-bg"));
+  assert.equal(grain.length, 1, "expected exactly one script drawing the grain background");
+  assert.ok(!/requestAnimationFrame/.test(grain[0]), "grain background still animates");
+  assert.ok(!/pointermove/.test(grain[0]), "grain background still follows the pointer");
+});
