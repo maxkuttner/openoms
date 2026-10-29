@@ -1,0 +1,104 @@
+---
+// A Mermaid diagram, rendered in the browser so CI needs no headless Chromium.
+// Colours come from here, per colour scheme, not from the .mmd source: the
+// source only tags nodes (:::core / :::exec / :::feed) and this component
+// supplies the classDefs and theme for whichever scheme Starlight is showing,
+// re-rendering when the reader toggles it.
+interface Props {
+  name: string;
+  code: string;
+  caption?: string;
+}
+const { name, code, caption } = Astro.props;
+---
+
+<figure class="diagram" data-diagram={name}>
+  <pre class="mermaid" data-source={code}>{code}</pre>
+  {caption && <figcaption>{caption}</figcaption>}
+</figure>
+
+<script>
+  import mermaid from "mermaid";
+
+  // Accent strokes are the cockpit's; fills and text follow the page scheme.
+  const PALETTE = {
+    dark: { fill: "#151a20", alt: "#1a1e26", text: "#d7dce3", border: "#2a2f38", line: "#8b949e" },
+    light: { fill: "#f6f8fa", alt: "#eef1f4", text: "#1f2328", border: "#d0d7de", line: "#57606a" },
+  };
+
+  function classDefs(p: (typeof PALETTE)["dark"]) {
+    return [
+      `classDef core fill:${p.fill},stroke:#25b083,color:${p.text};`,
+      `classDef exec fill:${p.alt},stroke:#ce9a3b,color:${p.text};`,
+      `classDef feed fill:${p.fill},stroke:#0e7490,color:${p.text};`,
+    ].join("\n");
+  }
+
+  async function render() {
+    const scheme = document.documentElement.dataset.theme === "light" ? "light" : "dark";
+    const p = PALETTE[scheme];
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: "base",
+      // Natural size, not squeezed to the column: the wide left-to-right
+      // overview is unreadable when scaled down. The figure scrolls instead.
+      flowchart: { useMaxWidth: false },
+      themeVariables: {
+        background: "transparent",
+        mainBkg: p.fill,
+        primaryColor: p.fill,
+        primaryTextColor: p.text,
+        primaryBorderColor: p.border,
+        secondaryColor: p.alt,
+        tertiaryColor: p.alt,
+        textColor: p.text,
+        nodeTextColor: p.text,
+        lineColor: p.line,
+        edgeLabelBackground: p.fill,
+        clusterBkg: p.fill,
+        clusterBorder: p.border,
+        rowOdd: p.fill,
+        rowEven: p.alt,
+        attributeBackgroundColorOdd: p.fill,
+        attributeBackgroundColorEven: p.alt,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+      },
+    });
+    const nodes = [...document.querySelectorAll<HTMLElement>("pre.mermaid")];
+    for (const el of nodes) {
+      const src = el.dataset.source ?? "";
+      // classDef only applies to flowcharts; erDiagram is themed by the variables.
+      el.textContent = src.startsWith("flowchart") ? `${src}\n${classDefs(p)}` : src;
+      el.removeAttribute("data-processed");
+    }
+    await mermaid.run({ nodes });
+  }
+
+  render();
+  new MutationObserver(render).observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["data-theme"],
+  });
+</script>
+
+<style>
+  .diagram {
+    margin: 1.5rem 0;
+    overflow-x: auto;
+  }
+  .diagram pre.mermaid {
+    background: transparent;
+    border: none;
+    padding: 0;
+    text-align: center;
+  }
+  /* Starlight caps content SVGs at the column width; a diagram scrolls instead. */
+  .diagram :global(svg) {
+    max-width: none;
+  }
+  figcaption {
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-sm);
+    text-align: center;
+  }
+</style>

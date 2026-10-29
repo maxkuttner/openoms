@@ -81,3 +81,19 @@ test("every operation in the spec has a page", () => {
     `${operationPages.length} operation pages for ${operations} operations`,
   );
 });
+
+test("the architecture page renders all three diagrams", () => {
+  const html = readFileSync(join(DIST, "concepts/architecture/index.html"), "utf8");
+  for (const name of ["overview", "er", "runtime"]) {
+    assert.ok(html.includes(`data-diagram="${name}"`), `diagram "${name}" missing`);
+  }
+  // Rendered in the browser (no headless Chromium in CI): the page must ship
+  // the source for mermaid to render, not an empty placeholder.
+  assert.equal(html.match(/<pre class="mermaid\b/g)?.length, 3, "expected three mermaid blocks");
+  assert.ok(html.includes("flowchart LR") && html.includes("erDiagram"), "diagram source not shipped");
+});
+
+test("the OPRA tutorial is published", () => {
+  const html = readFileSync(join(DIST, "tutorials/opra-marks-pnl/index.html"), "utf8");
+  assert.ok(!html.includes("This page is being written."), "still the placeholder");
+});

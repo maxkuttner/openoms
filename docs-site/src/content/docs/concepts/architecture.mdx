@@ -1,0 +1,59 @@
+---
+title: Architecture
+description: How the instrument catalog, broker routing and price feeds fit together.
+---
+
+import Mermaid from "../../../components/Mermaid.astro";
+import overview from "../../../diagrams/overview.mmd?raw";
+import er from "../../../diagrams/er.mmd?raw";
+import runtime from "../../../diagrams/runtime.mmd?raw";
+
+## Instrument model
+
+One canonical instrument catalog sits in the middle, with two independent
+mappings off it: a broker's tradable handle (`broker_instrument`, a table) and a
+data feed's pricing symbol (`FeedSymbology`, derived in code). Whether an
+instrument can be **priced** and whether it can be **traded** are independent.
+
+| | What it is |
+|---|---|
+| **Master** — `instrument` | Canonical identity, keyed `(symbol, venue)`. Asset and instrument class, microstructure, FIGI. Option legs live in `instrument_derivative`. |
+| **Execution** — `broker_instrument` | The tradable mapping: one row per instrument per broker, with `broker_symbol`, `native_id` and limits. Written by `oms setup sync-broker` from the broker adapter's instrument list. A row existing means the instrument is tradable through that broker. |
+| **Market data** — `FeedSymbology` | The pricing mapping, one-to-many — and a pure function, not a table. `candidates()` picks the slice of the catalog a feed covers; `to_feed_symbol()` renames each hit into the feed's own symbol. One symbol can price the same pair on several venues. Evaluated at subscribe time. |
+
+## End to end
+
+One catalog in the middle, an adapter at each end. **Brokers write it:**
+`sync-broker` asks each broker what it lists and stores that as an `instrument`
+plus a `broker_instrument` routing row. **Feeds only read it:** at subscribe
+time, `FeedSymbology.candidates()` picks the slice of the catalog that feed
+covers and `to_feed_symbol()` renames each instrument into whatever that feed
+calls it.
+
+That second mapping is computed, not stored — there is no feed table anywhere.
+It is rebuilt from the catalog on every subscription, which is why a broker
+sync that adds instruments needs no follow-up step to make them priceable, and
+why nothing can go stale. Each adapter owns its own symbology, so neither end
+knows the other exists.
+
+<Mermaid name="overview" code={overview} caption="Brokers write the catalog; feeds read it and rename in memory." />
+
+## Tables and relationships
+
+Foreign keys are shown. `broker_instrument` references the master
+`instrument`. There is no feed table: the pricing mapping is derived in code.
+Two links are soft, by code rather than foreign key: `broker_code` →
+`broker_connection`, and `feed_code`, which is ranked for failover in
+`provider_feed_policy`.
+
+<Mermaid name="er" code={er} caption="Tables and foreign keys, with instrument at the centre." />
+
+## Runtime — the two paths
+
+Pricing derives its symbols through `FeedSymbology`; order routing reads
+`broker_instrument`. The two never cross — a feed can price an instrument no
+broker trades, and a broker can trade an instrument no feed prices.
+
+<Mermaid name="runtime" code={runtime} caption="The pricing path and the execution path never cross." />
+
+See also the [API reference](/openoms/api/).
