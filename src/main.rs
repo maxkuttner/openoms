@@ -680,15 +680,26 @@ async fn main() {
                 // to type.
                 let password_override = db.password.clone();
                 let cfg = setup::database::config::resolve(db.into());
-                let defaults = setup::init::PromptDefaults {
+                use setup::init::docker::DockerOps;
+                let defaults = setup::init::prompts::Defaults {
                     host: cfg.host,
                     port: cfg.port,
                     database: cfg.database,
                     username: cfg.username,
-                    password: password_override,
+                    superuser_password: password_override,
+                    admin_password: None,
+                    bind: "localhost:3001".into(),
+                    source: None,
                 };
-                match setup::init::prompt(&defaults) {
-                    Ok(p) => p,
+                let status = setup::init::docker::Cli.status();
+                match setup::init::prompts::collect(&mut setup::init::prompts::Terminal::new(), &defaults, status) {
+                    Ok(a) => match a.db {
+                        setup::init::prompts::DbChoice::Existing(p) => p,
+                        setup::init::prompts::DbChoice::Docker => {
+                            eprintln!("error: Docker setup is not wired yet");
+                            std::process::exit(1);
+                        }
+                    },
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 }
             };

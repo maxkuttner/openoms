@@ -7,11 +7,12 @@
 
 use base64::Engine;
 use rand::RngCore;
-use std::io::{BufRead, Write};
+
 
 use crate::config::{self, FileConfig};
 
 pub mod docker;
+pub mod prompts;
 pub mod rules;
 
 /// 32 bytes — the AES-256 key size the credential store expects.
@@ -54,102 +55,6 @@ impl std::fmt::Debug for Prompts {
             .field("password", &"<redacted>")
             .finish()
     }
-}
-
-/// Defaults the interactive prompts show, and what Enter takes. Seeded from
-/// `--host`/`--port`/etc. (and the environment, via the same precedence
-/// non-interactive mode uses) so a flag actually changes the prompt instead of
-/// being silently discarded until `--non-interactive` — `oms init --host
-/// db.internal` must show `Postgres host [db.internal]:`, not `[localhost]:`.
-///
-/// `password: Some(_)` skips the password prompt entirely and uses that value:
-/// a superuser password already given via `--password`/`POSTGRES_PASSWORD` must
-/// not be typed twice, and must not be the reason a value that already reached
-/// the process winds up in shell history for nothing.
-pub struct PromptDefaults {
-    pub host: String,
-    pub port: u16,
-    pub database: String,
-    pub username: String,
-    pub password: Option<String>,
-}
-
-impl Default for PromptDefaults {
-    fn default() -> Self {
-        Self {
-            host: "localhost".into(),
-            port: 5432,
-            database: "ods".into(),
-            username: "postgres".into(),
-            password: None,
-        }
-    }
-}
-
-/// Prompt against arbitrary input, with the password read through a supplied
-/// closure. Split this way so the whole flow is testable — `rpassword` reads the
-/// tty directly and cannot be driven from a test.
-pub fn prompt_with<R: BufRead>(
-    input: &mut R,
-    defaults: &PromptDefaults,
-    read_password: impl FnOnce() -> std::io::Result<String>,
-) -> std::io::Result<Prompts> {
-    fn ask<R: BufRead>(input: &mut R, label: &str, default: &str) -> std::io::Result<String> {
-        print!("{label} [{default}]: ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        let n = input.read_line(&mut line)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("unexpected end of input while reading {label} — use `oms init --non-interactive` for scripted setup"),
-            ));
-        }
-        let trimmed = line.trim();
-        Ok(if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() })
-    }
-
-    let host = ask(input, "Postgres host     ", &defaults.host)?;
-    let port_input = ask(input, "Postgres port     ", &defaults.port.to_string())?;
-    // A typo here should cost one field, not the whole session — but a silent
-    // fallback means the operator sees a connection failure against an address
-    // they never chose, so say so.
-    let port: u16 = port_input.parse().unwrap_or_else(|_| {
-        println!("  ({port_input:?} is not a valid port — using {})", defaults.port);
-        defaults.port
-    });
-    let database = ask(input, "Database name     ", &defaults.database)?;
-    let username = ask(input, "Superuser name    ", &defaults.username)?;
-    let password = match &defaults.password {
-        Some(p) => p.clone(),
-        None => read_password()?,
-    };
-
-    Ok(Prompts { host, port, database, username, password })
-}
-
-/// The real thing: stdin plus a no-echo password read (skipped when `defaults`
-/// already carries one).
-pub fn prompt(defaults: &PromptDefaults) -> std::io::Result<Prompts> {
-    let stdin = std::io::stdin();
-    let mut locked = stdin.lock();
-    prompt_with(&mut locked, defaults, || {
-        // `rpassword` reads the terminal directly, so with no tty attached it
-        // fails with a bare "Device not configured" that names neither the cause
-        // nor the way out. Scripted callers land here, and they have two.
-        rpassword::prompt_password("Superuser password: ").map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "could not read the superuser password from the terminal ({e}).\n\
-                     \x20        With no terminal attached, pass it explicitly:\n\
-                     \x20          oms init --password '<superuser password>'\n\
-                     \x20        or take every value from flags and the environment:\n\
-                     \x20          oms init --non-interactive"
-                ),
-            )
-        })
-    })
 }
 
 /// Assemble the file from the prompts plus freshly generated secrets. Returns the
@@ -353,79 +258,6 @@ mod tests {
         );
     }
 
-    use std::io::BufReader;
-
-    /// Pressing Enter through every prompt must yield a working localhost setup —
-    /// that is what makes the happy path zero-decision.
-    #[test]
-    fn empty_input_takes_every_default() {
-        let mut input = BufReader::new(&b"\n\n\n\n"[..]);
-        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("secret".into())).expect("prompt");
-        assert_eq!(p.host, "localhost");
-        assert_eq!(p.port, 5432);
-        assert_eq!(p.database, "ods");
-        assert_eq!(p.username, "postgres");
-        assert_eq!(p.password, "secret");
-    }
-
-    #[test]
-    fn typed_values_override_the_defaults() {
-        let mut input = BufReader::new(&b"db.internal\n6543\ntrading\nadmin\n"[..]);
-        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect("prompt");
-        assert_eq!(p.host, "db.internal");
-        assert_eq!(p.port, 6543);
-        assert_eq!(p.database, "trading");
-        assert_eq!(p.username, "admin");
-    }
-
-    /// `oms init --host db.internal` must change what Enter takes, not just be
-    /// discarded until `--non-interactive` — the whole point of this parameter.
-    #[test]
-    fn defaults_seed_what_enter_takes() {
-        let defaults = PromptDefaults {
-            host: "db.internal".into(),
-            port: 6543,
-            database: "trading".into(),
-            username: "admin".into(),
-            password: None,
-        };
-        let mut input = BufReader::new(&b"\n\n\n\n"[..]);
-        let p = prompt_with(&mut input, &defaults, || Ok("pw".into())).expect("prompt");
-        assert_eq!(p.host, "db.internal");
-        assert_eq!(p.port, 6543);
-        assert_eq!(p.database, "trading");
-        assert_eq!(p.username, "admin");
-    }
-
-    /// A password already supplied (via `--password`/`POSTGRES_PASSWORD`) must
-    /// skip the prompt entirely — the closure must never be called, and the
-    /// value used must be the one from `defaults`, not stdin.
-    #[test]
-    fn a_supplied_password_skips_the_prompt() {
-        let defaults = PromptDefaults { password: Some("from-flag".into()), ..PromptDefaults::default() };
-        let mut input = BufReader::new(&b"\n\n\n\n"[..]);
-        let p = prompt_with(&mut input, &defaults, || panic!("password prompt must be skipped"))
-            .expect("prompt");
-        assert_eq!(p.password, "from-flag");
-    }
-
-    /// Surrounding whitespace is a paste artefact, not part of a hostname.
-    #[test]
-    fn trims_surrounding_whitespace() {
-        let mut input = BufReader::new(&b"  db.internal  \n\n\n\n"[..]);
-        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect("prompt");
-        assert_eq!(p.host, "db.internal");
-    }
-
-    /// A non-numeric port falls back to the default rather than aborting the whole
-    /// interactive session over one typo.
-    #[test]
-    fn unparseable_port_falls_back_to_the_default() {
-        let mut input = BufReader::new(&b"\nnot-a-number\n\n\n"[..]);
-        let p = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect("prompt");
-        assert_eq!(p.port, 5432);
-    }
-
     /// Debug output must not print the superuser password. A stray `{:?}` in a log
     /// line, panic message, or `expect` on a Result<Prompts, _> cannot reveal a
     /// credential that can drop the database.
@@ -447,19 +279,6 @@ mod tests {
         assert!(rendered.contains("superuser"));
     }
 
-    /// EOF (premature stdin closure) must be treated as an error, not as pressing
-    /// Enter. A script with closed stdin must not silently walk through all
-    /// prompts taking defaults — that would provision a database without asking.
-    #[test]
-    fn eof_before_all_prompts_returns_error() {
-        let mut input = BufReader::new(&b"\n\n"[..]);
-        let err = prompt_with(&mut input, &PromptDefaults::default(), || Ok("pw".into())).expect_err("should be an error");
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-        assert!(err.to_string().contains("unexpected end of input"));
-    }
-
-    /// The file we hand to `database init` must contain the generated secrets and
-    /// the prompted connection — and must NOT contain the superuser password,
     /// which is the credential that can drop the database.
     #[test]
     fn builds_a_file_config_without_the_superuser_password() {
