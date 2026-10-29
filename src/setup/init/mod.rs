@@ -11,6 +11,8 @@ use std::io::{BufRead, Write};
 
 use crate::config::{self, FileConfig};
 
+pub mod rules;
+
 /// 32 bytes — the AES-256 key size the credential store expects.
 pub fn generate_master_key() -> String {
     let mut raw = [0u8; 32];
