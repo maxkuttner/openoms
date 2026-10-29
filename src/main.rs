@@ -74,6 +74,7 @@ mod secrets;
 mod credentials;
 mod credentials_api;
 mod expiry;
+mod jobs;
 mod fix;
 mod reload;
 mod cockpit;
