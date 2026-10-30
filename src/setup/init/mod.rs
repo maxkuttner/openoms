@@ -110,6 +110,14 @@ pub struct InitFlags {
 
 pub const DEFAULT_BIND: &str = "localhost:3001";
 
+/// What skips the interactive superuser-password prompt. On a host only an
+/// explicit `--password` does: `POSTGRES_PASSWORD` describes the database the
+/// application connects to, not the one being provisioned. In the container it
+/// is the provisioning password: compose passes the one it gave Postgres.
+pub fn superuser_password_default(flag: Option<String>, env: Option<String>, container: bool) -> Option<String> {
+    flag.or(if container { env } else { None })
+}
+
 /// Non-interactive answers: `--postgres` defaults to `existing` (what scripts
 /// written before the flag existed expect), an absent admin password is
 /// generated, an absent bind is `localhost:3001`. Values are checked by the same
@@ -356,6 +364,15 @@ fn ensure_gitignored(cfg_path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_takes_superuser_password_from_env() {
+        let env = || Some("from-env".to_string());
+        assert_eq!(superuser_password_default(None, env(), true), Some("from-env".into()));
+        assert_eq!(superuser_password_default(None, env(), false), None, "host: the env describes the app's database");
+        assert_eq!(superuser_password_default(Some("flag".into()), env(), true), Some("flag".into()));
+        assert_eq!(superuser_password_default(Some("flag".into()), env(), false), Some("flag".into()));
+    }
     use base64::Engine;
 
     /// 32 bytes is the AES-256 key size the credential store will expect. Getting

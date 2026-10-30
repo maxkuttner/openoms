@@ -694,6 +694,7 @@ async fn main() {
                 std::process::exit(1);
             }
             let flags = setup::init::InitFlags { source: postgres, admin_password, bind };
+            let container = setup::init::rules::container_mode(env("OMS_CONTAINER").as_deref());
             let answers = if non_interactive {
                 let cfg = setup::database::config::resolve(db.into());
                 let prompts = setup::init::Prompts {
@@ -705,7 +706,9 @@ async fn main() {
                 };
                 match setup::init::answers_from_flags(&flags, prompts) {
                     Ok(a) => {
-                        if let Some(w) = setup::init::rules::exposure_warning(&a.bind) {
+                        // In the container the port is published on the host's
+                        // loopback by compose; the warning would be wrong there.
+                        if let Some(w) = setup::init::rules::exposure_warning(&a.bind).filter(|_| !container) {
                             eprintln!("{w}");
                         }
                         a
@@ -741,7 +744,14 @@ async fn main() {
                 // with the wrong credential and never asked — the operator saw a
                 // bare auth failure for a password they were never given a chance
                 // to type.
-                let password_override = db.password.clone();
+                //
+                // In the published container the rule flips: there the variable
+                // is the password compose gave its own Postgres.
+                let password_override = setup::init::superuser_password_default(
+                    db.password.clone(),
+                    env("POSTGRES_PASSWORD"),
+                    container,
+                );
                 let cfg = setup::database::config::resolve(db.into());
                 let defaults = setup::init::prompts::Defaults {
                     host: cfg.host,
@@ -752,11 +762,12 @@ async fn main() {
                     admin_password: flags.admin_password,
                     bind: flags.bind.unwrap_or_else(|| setup::init::DEFAULT_BIND.into()),
                     source: flags.source,
+                    container,
                 };
                 use setup::init::docker::DockerOps;
                 // Probed only when the menu will be shown: `docker info` can take
                 // seconds against a stopped Docker Desktop.
-                let status = if defaults.source.is_some() {
+                let status = if defaults.source.is_some() || container {
                     setup::init::rules::DockerStatus::Usable
                 } else {
                     setup::init::docker::Cli.status()
