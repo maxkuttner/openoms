@@ -11,9 +11,6 @@
 
 *An* open source multi-client order management system.
 
-![./assets/screenshot01.png](./assets/screenshot01.png)
-![./assets/screenshot02.png](./assets/screenshot02.png)
-
 ---
 
 ## Install

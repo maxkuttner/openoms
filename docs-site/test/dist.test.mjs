@@ -32,6 +32,31 @@ test("the home page carries the install one-liner", () => {
   );
 });
 
+// The docs site's --oms-* tokens are copies of cockpit/src/palette.ts, the one
+// list of openoms colours; CSS cannot import it, so this keeps them equal.
+test("the docs site's colour tokens match the palette", () => {
+  const palette = readFileSync(new URL("../../cockpit/src/palette.ts", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../src/styles/theme.css", import.meta.url), "utf8");
+  const tokens = [...css.matchAll(/--oms-([a-z-]+):\s*(#[0-9a-f]{6})/gi)];
+  assert.ok(tokens.length >= 5, "theme.css defines no --oms-* colour tokens");
+  for (const [, name, hex] of tokens) {
+    const key = name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    const m = palette.match(new RegExp(`\\b${key}:\\s*"(#[0-9a-f]{6})"`, "i"));
+    assert.ok(m, `--oms-${name} has no ${key} in palette.ts`);
+    assert.equal(hex.toLowerCase(), m[1].toLowerCase(), `--oms-${name} differs from palette.ts`);
+  }
+});
+
+test("the home page shows the supported brokers, not screenshots", () => {
+  const html = readFileSync(join(DIST, "index.html"), "utf8");
+  const strip = html.match(/<section class="brokers[ "][\s\S]*?<\/section>/)?.[0] ?? "";
+  assert.ok(strip, "no broker carousel on the home page");
+  for (const name of ["Alpaca", "Binance", "Bybit", "Interactive Brokers"]) {
+    assert.ok(strip.includes(name), `broker carousel lacks ${name}`);
+  }
+  assert.ok(!/screenshot/i.test(html), "the home page still references a screenshot");
+});
+
 test("getting started points to Installation instead of repeating it", () => {
   const html = readFileSync(join(DIST, "getting-started/index.html"), "utf8");
   assert.ok(!html.includes("install.sh"), "getting started repeats the install script");

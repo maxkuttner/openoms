@@ -15,6 +15,7 @@ import { BlotterPage } from "./pages/Blotter";
 import { InstrumentsPage } from "./pages/Instruments";
 import { DataFeedsPage } from "./pages/DataFeeds";
 import { ApiPage } from "./pages/Api";
+import { palette } from "./palette";
 
 const NAV = [
   { to: "/principals", label: "Principals" },
@@ -36,8 +37,8 @@ function ConnectionDot() {
   });
   return (
     <Group gap={6}>
-      <span style={{ width: 7, height: 7, borderRadius: "50%", background: ok ? "#22ae6c" : "#e0524d" }} />
-      <Text fz={12} c="#9aa3af">{ok ? "connected" : "offline"}</Text>
+      <span style={{ width: 7, height: 7, borderRadius: "50%", background: ok ? palette.buy : palette.red }} />
+      <Text fz={12} c={palette.muted}>{ok ? "connected" : "offline"}</Text>
     </Group>
   );
 }
@@ -47,7 +48,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
   const { pathname } = useLocation();
   return (
     <AppShell header={{ height: 56 }} navbar={{ width: 220, breakpoint: "sm" }} padding="md">
-      <AppShell.Header style={{ background: "#0d1014", borderColor: "#2a2f38" }}>
+      <AppShell.Header style={{ background: palette.black, borderColor: palette.border }}>
         <Group h="100%" px="md" justify="space-between">
           <Logo />
           <Group gap="md">
@@ -133,7 +134,7 @@ export function App() {
 
   if (status === "checking") {
     return (
-      <Center h="100vh" bg="#0d1014">
+      <Center h="100vh" bg={palette.black}>
         <Loader />
       </Center>
     );

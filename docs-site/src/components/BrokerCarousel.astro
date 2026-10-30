@@ -1,0 +1,123 @@
+---
+// The landing page's strip of supported brokers, drifting slowly sideways in
+// a loop. Each broker shows its mark from src/assets/brokers/<file>.svg when
+// that file exists, and its name either way, so a broker without a logo file
+// still appears. Marks are inlined so a monochrome one (fill="currentColor")
+// follows the theme's text colour.
+//
+// The list is rendered twice and the track moves by exactly one copy, so the
+// loop has no seam; screen readers get each broker once. Hover
+// pauses it, and with reduced motion it is a static, wrapping row.
+
+const brokers = [
+  { name: "Alpaca", file: "alpaca" },
+  { name: "Binance", file: "binance" },
+  { name: "Bybit", file: "bybit" },
+  { name: "Interactive Brokers", file: "ibkr" },
+];
+
+const marks = import.meta.glob<string>("../assets/brokers/*.svg", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+const markFor = (file: string) => marks[`../assets/brokers/${file}.svg`];
+
+// Four names are narrower than the content column, so each copy repeats them
+// until it is wider than any viewport; otherwise the loop shows a gap.
+const strip = [...brokers, ...brokers, ...brokers];
+---
+
+<section class="brokers" aria-label="Supported adapters">
+  <p class="brokers-title">Supported Adapters</p>
+  <div class="brokers-viewport">
+    <div class="brokers-track">
+      {[false, true].map((hidden) => (
+        <ul class="brokers-list" aria-hidden={hidden ? "true" : undefined}>
+          {strip.map((b, i) => (
+            <li class="broker" aria-hidden={!hidden && i >= brokers.length ? "true" : undefined}>
+              {markFor(b.file) && <span class="broker-mark" set:html={markFor(b.file)} />}
+              <span class="broker-name">{b.name}</span>
+            </li>
+          ))}
+        </ul>
+      ))}
+    </div>
+  </div>
+</section>
+
+<style>
+  .brokers {
+    margin-block: 2.5rem;
+  }
+  .brokers-title {
+    text-align: center;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-3);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .brokers-viewport {
+    overflow: hidden;
+    mask-image: linear-gradient(to right, transparent, #000 12%, #000 88%, transparent);
+  }
+  .brokers-track {
+    display: flex;
+    width: max-content;
+    animation: brokers-drift 30s linear infinite;
+  }
+  .brokers-viewport:hover .brokers-track {
+    animation-play-state: paused;
+  }
+  .brokers-list {
+    display: flex;
+    gap: 4rem;
+    padding: 0 2rem;
+    margin: 0;
+    list-style: none;
+  }
+  .brokers-list li {
+    margin: 0;
+  }
+  .broker {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    white-space: nowrap;
+    font-size: var(--sl-text-xl);
+    font-weight: 600;
+    color: var(--sl-color-gray-2);
+    opacity: 0.85;
+  }
+  .broker-mark {
+    display: inline-flex;
+  }
+  .broker-mark :global(svg) {
+    height: 1.75rem;
+    width: auto;
+  }
+  @keyframes brokers-drift {
+    to {
+      transform: translateX(-50%);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .brokers-viewport {
+      mask-image: none;
+    }
+    .brokers-track {
+      animation: none;
+      width: auto;
+      justify-content: center;
+    }
+    .brokers-list {
+      flex-wrap: wrap;
+      justify-content: center;
+      row-gap: 1.5rem;
+    }
+    .brokers-list[aria-hidden],
+    .broker[aria-hidden] {
+      display: none;
+    }
+  }
+</style>

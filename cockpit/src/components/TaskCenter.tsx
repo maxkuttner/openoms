@@ -11,6 +11,7 @@ import {
   type JobDetail,
   type JobRecord,
 } from "../api/jobs";
+import { palette } from "../palette";
 
 function JobLog({ id }: { id: string }) {
   const { data, isLoading } = useQuery<JobDetail>({
@@ -46,7 +47,7 @@ function JobRow({ job }: { job: JobRecord }) {
   }
 
   return (
-    <Stack gap={4} py={8} style={{ borderBottom: "1px solid #2a2f38" }}>
+    <Stack gap={4} py={8} style={{ borderBottom: `1px solid ${palette.border}` }}>
       <UnstyledButton onClick={() => setOpen((o) => !o)}>
         <Group justify="space-between" wrap="nowrap">
           <Stack gap={0}>

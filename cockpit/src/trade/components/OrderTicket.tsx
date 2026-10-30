@@ -254,7 +254,7 @@ export function OrderTicket({
           break;
         case "idempotent_recorded":
           notifications.show({
-            color: "orange",
+            color: "amber",
             title: "Order NOT sent",
             message: `This order id already exists and is still \`submitted\`. ${RECORDED_NOT_ROUTED}`,
             autoClose: false,
@@ -276,7 +276,7 @@ export function OrderTicket({
           break;
         case "idempotent_unknown":
           notifications.show({
-            color: "orange",
+            color: "amber",
             title: "Already submitted — status unknown",
             message:
               "An order with this id already exists, but reading it back failed. " +
@@ -301,7 +301,7 @@ export function OrderTicket({
           break;
         case "no_broker":
           notifications.show({
-            color: "orange",
+            color: "amber",
             title: "No broker configured — order NOT sent",
             message: `An operator needs to configure a broker connection. ${RECORDED_NOT_ROUTED}`,
             autoClose: false,

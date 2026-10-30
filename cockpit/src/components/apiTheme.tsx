@@ -1,17 +1,18 @@
 import { Box, CopyButton, Group, Text, Tooltip } from "@mantine/core";
+import { palette } from "../palette";
 
 // Shared terminal / "Databento" visual tokens + primitives, used by the API
 // tokens page and the API reference. Green "bids", amber "asks", near-black ink.
 export const C = {
-  panel: "#1a1e26",
-  inset: "#0b0d10",
-  border: "#2a2f38",
-  ink: "#eff1f4",
-  muted: "#9aa3af",
-  faint: "#6b7280",
-  green: "#22ae6c",
-  amber: "#ce9a3b",
-  red: "#b0554f",
+  panel: palette.raised,
+  inset: palette.surface,
+  border: palette.border,
+  ink: palette.ink,
+  muted: palette.muted,
+  faint: palette.faint,
+  green: palette.buy,
+  amber: palette.amber,
+  red: palette.red,
 };
 
 export function Eyebrow({ children }: { children: React.ReactNode }) {

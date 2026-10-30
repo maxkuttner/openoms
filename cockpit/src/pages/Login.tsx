@@ -1,18 +1,19 @@
 import { useState } from "react";
 import { Box, Button, Group, PasswordInput, Stack, Text, TextInput } from "@mantine/core";
 import { Logo } from "../components/Logo";
+import { palette } from "../palette";
 
-// Brand tokens (theme.ts): green "bids", amber "asks", near-black terminal ink.
+// Brand tokens (palette.ts): green "bids", amber "asks", black terminal.
 const C = {
-  bg: "#0d1014",
-  panel: "#1a1e26",
-  inset: "#0b0d10",
-  border: "#2a2f38",
-  ink: "#eff1f4",
-  muted: "#9aa3af",
-  faint: "#6b7280",
-  green: "#22ae6c",
-  amber: "#ce9a3b",
+  bg: palette.black,
+  panel: palette.raised,
+  inset: palette.surface,
+  border: palette.border,
+  ink: palette.ink,
+  muted: palette.muted,
+  faint: palette.faint,
+  green: palette.buy,
+  amber: palette.amber,
 };
 
 /**

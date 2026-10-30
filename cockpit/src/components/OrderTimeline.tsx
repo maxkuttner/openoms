@@ -9,7 +9,7 @@ const STATUS_COLOR: Record<string, string> = {
   partially_filled: "teal",
   routed: "blue",
   submitted: "gray",
-  canceled: "orange",
+  canceled: "amber",
   rejected: "red",
   expired: "yellow",
   suspended: "grape",

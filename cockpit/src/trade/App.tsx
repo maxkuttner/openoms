@@ -75,7 +75,7 @@ export function TradeApp() {
   if (loginUnavailable) {
     return (
       <Container size="sm" py="xl">
-        <Alert color="orange" title="Sign-in is unavailable">
+        <Alert color="amber" title="Sign-in is unavailable">
           <Stack gap="sm" align="flex-start">
             <Text size="sm">
               This screen needs a signed-in session, but the OMS is not serving its sign-in

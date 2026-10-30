@@ -4,6 +4,36 @@
   --sl-color-accent: #1f9a72;
   --sl-color-accent-high: #a8ecd2;
 }
+/* The openoms colour scheme. Copies of cockpit/src/palette.ts, the one list of
+   openoms colours; a docs test (dist.test.mjs) fails if they drift apart. The
+   landing page's glows (GrainBackground.astro) are glow-green and orange. */
+:root {
+  --oms-black: #000000;
+  --oms-surface: #0d0d0d;
+  --oms-raised: #161616;
+  --oms-border: #262626;
+  --oms-green: #25b083;
+  --oms-amber: #ce9a3b;
+  --oms-orange: #d97a14;
+  --oms-glow-green: #148c47;
+}
+
+/* Dark scheme: pure black surfaces instead of Starlight's blue-grey. */
+:root[data-theme="dark"] {
+  --sl-color-black: var(--oms-black);
+  --sl-color-bg-nav: var(--oms-black);
+  --sl-color-bg-sidebar: var(--oms-black);
+  --sl-color-bg-inline-code: var(--oms-raised);
+}
+/* Code blocks: a neutral near-black a step above the page, not the theme's blue. */
+:root[data-theme="dark"] .expressive-code {
+  --ec-codeBg: var(--oms-surface) !important;
+  --ec-frm-edBg: var(--oms-surface) !important;
+  --ec-frm-trmBg: var(--oms-surface) !important;
+  --ec-frm-edTabBarBg: var(--oms-raised) !important;
+  --ec-frm-edActTabBg: var(--oms-surface) !important;
+  --ec-frm-trmTtbBg: var(--oms-raised) !important;
+}
 :root[data-theme="light"] {
   --sl-color-accent-low: #c8f1e1;
   --sl-color-accent: #14805d;
@@ -13,7 +43,7 @@
 /* Landing page only (Starlight marks it data-has-hero), dark scheme only: the
    image is near-black, so in light mode the page keeps its plain background. */
 :root[data-theme="dark"][data-has-hero] {
-  background-color: #000;
+  background-color: var(--oms-black);
   background-image: url("/openoms/landing-bg.webp");
   background-size: cover;
   background-position: center;

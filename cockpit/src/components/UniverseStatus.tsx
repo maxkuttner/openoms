@@ -8,7 +8,7 @@ const SYMBOL: Record<Status["state"], { sym: string; color: string; label: strin
   not_loaded: { sym: "○", color: "dimmed", label: "Not loaded" },
   loading: { sym: "◐", color: "yellow", label: "Loading" },
   loaded: { sym: "●", color: "green", label: "Loaded" },
-  partial: { sym: "◑", color: "orange", label: "Partial" },
+  partial: { sym: "◑", color: "amber", label: "Partial" },
   failed: { sym: "✕", color: "red", label: "Failed" },
 };
 

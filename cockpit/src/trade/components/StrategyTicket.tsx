@@ -132,17 +132,17 @@ function describeOutcome(outcome: SubmitOutcome): { color: string; message: stri
     case "idempotent_live":
       return { color: "green", message: `Sent — status ${outcome.status}` };
     case "idempotent_recorded":
-      return { color: "orange", message: `Not routed. ${RECORDED_NOT_ROUTED}` };
+      return { color: "amber", message: `Not routed. ${RECORDED_NOT_ROUTED}` };
     case "idempotent_terminal":
       return { color: "red", message: `Already ${outcome.status}` };
     case "idempotent_unknown":
-      return { color: "orange", message: "Status unknown — check the blotter" };
+      return { color: "amber", message: "Status unknown — check the blotter" };
     case "rejected":
       return { color: "red", message: outcome.message };
     case "broker_rejected":
       return { color: "red", message: `${outcome.message} ${RECORDED_NOT_ROUTED}` };
     case "no_broker":
-      return { color: "orange", message: `No broker configured. ${RECORDED_NOT_ROUTED}` };
+      return { color: "amber", message: `No broker configured. ${RECORDED_NOT_ROUTED}` };
     case "not_permitted":
       return { color: "red", message: "Not permitted" };
     case "unknown_error":
@@ -250,7 +250,7 @@ export function StrategyTicket({
       });
     } else if (followIds.length > 0) {
       notifications.show({
-        color: "orange",
+        color: "amber",
         title: `${liveOrderIds.length}/${legs.length} legs sent`,
         message: `${persistedOrderIds.length} recorded but NOT routed, ${
           legs.length - followIds.length

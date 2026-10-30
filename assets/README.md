@@ -1,3 +1,3 @@
 # assets
 
-Brand and marketing images referenced by the root `readme.md` and the public site (`site/`) — logo/banner SVGs, the brand sheet, and the two README screenshots.
+Brand images referenced by the root `readme.md` and the docs site: logo and banner SVGs and the brand sheet.

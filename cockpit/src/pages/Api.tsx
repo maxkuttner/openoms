@@ -228,7 +228,7 @@ export function ApiPage() {
                   <Box w={60} style={{ textAlign: "right" }}>
                     <Text
                       fz={11}
-                      c="#b0554f"
+                      c={C.red}
                       onClick={() => revoke(t.key_id)}
                       style={{ cursor: "pointer", letterSpacing: 0.5 }}
                     >

@@ -44,7 +44,7 @@ export const JOB_STATUS_COLOR: Record<JobStatus, string> = {
   running: "blue",
   succeeded: "green",
   failed: "red",
-  interrupted: "orange",
+  interrupted: "amber",
 };
 
 export const isActive = (j: JobRecord) => j.status === "queued" || j.status === "running";
