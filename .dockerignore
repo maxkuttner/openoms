@@ -1,0 +1,10 @@
+# Build context for the root Dockerfile: sources only.
+.git
+.superpowers
+target
+**/node_modules
+cockpit/dist
+docs-site
+docs
+.env
+oms.toml
