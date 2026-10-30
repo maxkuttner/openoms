@@ -125,8 +125,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Only the binaries: docker/build-push-action also uploads its own
+      # *.dockerbuild build records as artifacts, which do not download as zips.
       - uses: actions/download-artifact@v4
         with:
+          pattern: oms-*
           path: dist
           merge-multiple: true
 
