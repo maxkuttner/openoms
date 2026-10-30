@@ -127,6 +127,8 @@ async fn trade_asset(UrlPath(path): UrlPath<String>) -> Response {
 /// static bundle. Authentication happens where it already did, on `/admin/*`.
 pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
+        // Someone opening `localhost:3001` lands in the cockpit, not on a 404.
+        .route("/", get(redirect_to_slash))
         .route("/ui/*path", get(ui_asset))
         // axum's `*path` wildcard needs at least one character after the slash, so
         // `/cockpit/` itself gets its own route.
@@ -303,6 +305,11 @@ mod tests {
             .build()
             .unwrap();
         let base = format!("http://{addr}");
+
+        // 0. The site root sends a browser to the cockpit rather than a 404.
+        let res = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[reqwest::header::LOCATION], "/cockpit/");
 
         // 1. The bare path is reached and redirects to the trailing slash.
         let res = client.get(format!("{base}/cockpit")).send().await.unwrap();
