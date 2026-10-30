@@ -24,12 +24,9 @@ test("install.sh in dist is byte-identical to the repo copy", () => {
   assert.deepEqual(built, repo);
 });
 
-test("the home page carries the install one-liner", () => {
+test("the home page sends people to Getting started", () => {
   const html = readFileSync(join(DIST, "index.html"), "utf8");
-  assert.ok(
-    html.includes("curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh"),
-    "install command missing from the home page",
-  );
+  assert.ok(html.includes('href="/openoms/getting-started/"'), "no Get started link on the home page");
 });
 
 // The docs site's --oms-* tokens are copies of cockpit/src/palette.ts, the one
