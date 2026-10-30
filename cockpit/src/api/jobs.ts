@@ -41,7 +41,7 @@ export const JOB_KIND_LABEL: Record<string, string> = {
 
 export const JOB_STATUS_COLOR: Record<JobStatus, string> = {
   queued: "gray",
-  running: "blue",
+  running: "brand",
   succeeded: "green",
   failed: "red",
   interrupted: "amber",

@@ -395,7 +395,7 @@ export function StrategyTicket({
 
         {phase === "confirm" && (
           <>
-            <Alert color="blue" title="Confirm strategy">
+            <Alert color="brand" title="Confirm strategy">
               <Stack gap={4}>
                 <Text size="sm">
                   {legs.length} leg{legs.length === 1 ? "" : "s"} · {orderType} · {tif} · portfolio{" "}

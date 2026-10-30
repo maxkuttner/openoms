@@ -12,5 +12,5 @@ export const theme = createTheme({
   primaryColor: "depth",
   primaryShade: { light: 6, dark: 6 },
   defaultRadius: "sm",
-  colors: { depth: scales.depth, offer: scales.offer, amber: scales.amber, dark: scales.dark },
+  colors: { depth: scales.depth, offer: scales.offer, amber: scales.amber, brand: scales.orange, dark: scales.dark },
 });

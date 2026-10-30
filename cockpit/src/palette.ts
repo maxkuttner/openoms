@@ -55,8 +55,10 @@ export const scales = {
     "#d3a040", "#ce9a3b", "#b3832d", "#966c22", "#7a5618",
   ] as MantineColorsTuple,
 
-  // The trader UI's accent (tabs, focus, selection) — never buy or sell, so a
-  // selected row and an order side are never the same colour; 6 is palette.orange.
+  // Registered as `brand` in both UIs: the trader UI's accent (tabs, focus,
+  // selection), routed orders, running jobs and info notices. Never buy or
+  // sell, so a selected row and an order side never share a colour; 6 is
+  // palette.orange.
   orange: [
     "#fdf0e3", "#fadbbb", "#f4bd85", "#ee9f4f", "#e88a2c",
     "#e2801c", "#d97a14", "#bb680f", "#9b560b", "#7c4408",

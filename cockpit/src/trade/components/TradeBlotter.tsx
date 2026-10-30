@@ -15,7 +15,7 @@ import type { GrantedPortfolio } from "../App";
 const STATUS_COLOR: Record<string, string> = {
   filled: "green",
   partially_filled: "teal",
-  routed: "blue",
+  routed: "brand",
   submitted: "gray",
   canceled: "amber",
   rejected: "red",
@@ -121,7 +121,7 @@ export function TradeBlotter({
       // Either 202 or 204: in both cases the row keeps polling until the
       // order's own status changes. We never render "cancelled" on our own
       // authority.
-      notifications.show({ message: "Cancel sent", color: "blue" });
+      notifications.show({ message: "Cancel sent", color: "brand" });
     } catch (err) {
       setCancelling((s) => {
         const n = new Set(s);
@@ -225,7 +225,7 @@ export function TradeBlotter({
                   key={o.order_id}
                   onClick={() => setSelected(o)}
                   style={{ cursor: "pointer" }}
-                  bg={o.order_id === followOrderId ? "var(--mantine-color-blue-light)" : undefined}
+                  bg={o.order_id === followOrderId ? "var(--mantine-color-brand-light)" : undefined}
                 >
                   <Table.Td>{new Date(o.created_at).toLocaleString()}</Table.Td>
                   <Table.Td>

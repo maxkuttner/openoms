@@ -7,7 +7,7 @@ import type { OrderEvent } from "../api/types";
 const STATUS_COLOR: Record<string, string> = {
   filled: "green",
   partially_filled: "teal",
-  routed: "blue",
+  routed: "brand",
   submitted: "gray",
   canceled: "amber",
   rejected: "red",

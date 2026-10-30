@@ -13,7 +13,7 @@ const STATUSES = ["submitted", "routed", "partially_filled", "filled", "canceled
 const STATUS_COLOR: Record<string, string> = {
   filled: "green",
   partially_filled: "teal",
-  routed: "blue",
+  routed: "brand",
   submitted: "gray",
   canceled: "amber",
   rejected: "red",

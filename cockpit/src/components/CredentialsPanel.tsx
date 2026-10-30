@@ -365,7 +365,7 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
       )}
 
       {lastSave && (
-        <Alert color="blue" title="Save result">
+        <Alert color="brand" title="Save result">
           {lastSave.tested ? "Credential verified. " : `Not tested before save (${lastSave.message}). `}
           {describeReload(lastSave.reload)}.
         </Alert>
