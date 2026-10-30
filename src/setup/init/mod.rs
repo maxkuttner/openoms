@@ -110,6 +110,14 @@ pub struct InitFlags {
 
 pub const DEFAULT_BIND: &str = "localhost:3001";
 
+/// What skips the interactive superuser-password prompt. On a host only an
+/// explicit `--password` does: `POSTGRES_PASSWORD` describes the database the
+/// application connects to, not the one being provisioned. In the container it
+/// is the provisioning password: compose passes the one it gave Postgres.
+pub fn superuser_password_default(flag: Option<String>, env: Option<String>, container: bool) -> Option<String> {
+    flag.or(if container { env } else { None })
+}
+
 /// Non-interactive answers: `--postgres` defaults to `existing` (what scripts
 /// written before the flag existed expect), an absent admin password is
 /// generated, an absent bind is `localhost:3001`. Values are checked by the same
@@ -308,19 +316,39 @@ async fn run_with_timeout(
         (AdminPassword::Generated(pw), true) => format!("Cockpit login password: {pw}"),
         (AdminPassword::Generated(_), false) => "Cockpit login password: written to oms.toml".to_string(),
     };
-    // Absolute (cfg_path already is): this message may be read after the
-    // operator has `cd`ed elsewhere, and a relative path then points at nothing.
-    let abs_path = &cfg_path;
-    println!(
-        "\nBack up {}. The master key in it is the only thing that can\n\
-         decrypt stored broker credentials — lose it and they are gone.\n\n\
-         {admin_line}\n\n\
-         Start the server:  oms\n\
-         Then open:         {}",
-        abs_path.display(),
-        cockpit_url(&bind)
-    );
+    let container = rules::container_mode(std::env::var("OMS_CONTAINER").ok().as_deref());
+    println!("{}", closing_lines(&cfg_path, &admin_line, &bind, container));
     Ok(())
+}
+
+/// The summary after a successful init: what to back up, how to start, where
+/// to log in. In the published container the config lives in a compose
+/// volume and the server is started by compose, so both commands differ.
+pub fn closing_lines(cfg_path: &std::path::Path, admin_line: &str, bind: &str, container: bool) -> String {
+    let url = cockpit_url(bind);
+    if container {
+        format!(
+            "\nBack up oms.toml from the oms-config volume once the server runs:\n\
+             \x20   docker compose cp oms:{} ./oms.toml.backup\n\
+             The master key in it is the only thing that can decrypt stored broker\n\
+             credentials — lose it and they are gone.\n\n\
+             {admin_line}\n\n\
+             Start the server:  docker compose up -d\n\
+             Then open:         {url}",
+            cfg_path.display()
+        )
+    } else {
+        // Absolute (cfg_path already is): this message may be read after the
+        // operator has `cd`ed elsewhere, and a relative path then points at nothing.
+        format!(
+            "\nBack up {}. The master key in it is the only thing that can\n\
+             decrypt stored broker credentials — lose it and they are gone.\n\n\
+             {admin_line}\n\n\
+             Start the server:  oms\n\
+             Then open:         {url}",
+            cfg_path.display()
+        )
+    }
 }
 
 /// Where to point a browser for `bind`: a wildcard address is not one a
@@ -356,6 +384,32 @@ fn ensure_gitignored(cfg_path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_summary_names_compose_commands() {
+        let out = closing_lines(std::path::Path::new("/config/oms.toml"), "Cockpit login password: x", "0.0.0.0:3001", true);
+        assert!(out.contains("docker compose up -d"), "{out}");
+        assert!(out.contains("docker compose cp oms:/config/oms.toml"), "{out}");
+        assert!(out.contains("http://localhost:3001/cockpit/"), "{out}");
+        assert!(!out.contains("Start the server:  oms\n"), "{out}");
+    }
+
+    #[test]
+    fn host_summary_is_unchanged() {
+        let out = closing_lines(std::path::Path::new("/home/me/.config/oms/oms.toml"), "Cockpit login password: x", "localhost:3001", false);
+        assert!(out.contains("Back up /home/me/.config/oms/oms.toml."), "{out}");
+        assert!(out.contains("Start the server:  oms"), "{out}");
+        assert!(!out.contains("docker compose"), "{out}");
+    }
+
+    #[test]
+    fn container_takes_superuser_password_from_env() {
+        let env = || Some("from-env".to_string());
+        assert_eq!(superuser_password_default(None, env(), true), Some("from-env".into()));
+        assert_eq!(superuser_password_default(None, env(), false), None, "host: the env describes the app's database");
+        assert_eq!(superuser_password_default(Some("flag".into()), env(), true), Some("flag".into()));
+        assert_eq!(superuser_password_default(Some("flag".into()), env(), false), Some("flag".into()));
+    }
     use base64::Engine;
 
     /// 32 bytes is the AES-256 key size the credential store will expect. Getting

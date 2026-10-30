@@ -98,7 +98,6 @@ test("the architecture page renders all three diagrams", () => {
 for (const [old, target] of [
   ["architecture.html", "/openoms/concepts/architecture/"],
   ["api.html", "/openoms/api/"],
-  ["getting-started/installation/index.html", "/openoms/getting-started/"],
   ["getting-started/first-run/index.html", "/openoms/getting-started/"],
 ]) {
   test(`the old /openoms/${old} redirects to ${target}`, () => {
@@ -166,10 +165,25 @@ test("the grain background shows in light mode too", () => {
   assert.match(html, /uniform float light/, "shader has no light-scheme variant");
 });
 
-test("getting started has OS tabs and links the installer source, not the raw script", () => {
-  const html = readFileSync(join(DIST, "getting-started/index.html"), "utf8");
-  for (const tab of ["macOS", "Linux", "From source"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
+test("installation has OS tabs and links the installer source, not the raw script", () => {
+  const html = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
+  for (const tab of ["macOS &amp; Linux", "Windows", "Package Managers", "Docker"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
   assert.ok(html.includes('data-sync-key="os"'), "tabs not synced across pages");
   assert.ok(html.includes("https://github.com/maxkuttner/openoms/blob/main/install.sh"));
   assert.ok(!html.includes('href="/openoms/install.sh"'), "still links the raw script");
+});
+
+test("installation's Package Managers and Docker tabs give real commands", () => {
+  const html = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
+  // The first tab group's panels, in label order: macOS & Linux, Windows, Package Managers, Docker.
+  const panels = html.split(/<div[^>]*role="tabpanel"/).slice(1, 5);
+  const [, , pkg, docker] = panels;
+  assert.ok(pkg.includes("brew install maxkuttner/tap/openoms"), "no Homebrew command");
+  assert.ok(docker.includes("docker compose run --rm oms init"), "no compose flow");
+  assert.ok(docker.includes("compose.yaml"), "compose.yaml not linked");
+  assert.ok(!docker.includes("To be implemented"), "Docker tab still says To be implemented");
+  assert.ok(existsSync(join(DIST, "compose.yaml")), "compose.yaml is not published");
+  // Re-running the block must not replace the password the Postgres volume already holds.
+  assert.ok(docker.includes("[ -f .env ] ||"), ".env is overwritten on a re-run");
+  assert.ok(docker.includes("docker compose cp oms:/config/oms.toml"), "no way to back up the master key");
 });

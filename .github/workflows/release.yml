@@ -116,8 +116,11 @@ jobs:
             oms-${{ matrix.target }}.tar.gz
             oms-${{ matrix.target }}.sha256
 
+  # Nothing a user sees moves until every artifact built: the per-arch image
+  # tags are staging only, and the release, the multi-arch tags and the tap
+  # all wait on both builds.
   publish:
-    needs: build
+    needs: [build, docker]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -143,3 +146,107 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
+
+  # ghcr.io/maxkuttner/openoms, one native build per arch (the C++ FIX engine is
+  # far too slow under QEMU), merged into one multi-arch tag by docker-manifest.
+  docker:
+    name: image ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: openoms:ci
+          build-args: VERSION=${{ github.ref_name }}
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+
+      - name: the image reports the tag's version
+        run: |
+          got="$(docker run --rm openoms:ci --version | awk '{print $NF}')"
+          [ "$got" = "${GITHUB_REF_NAME#v}" ] || {
+            echo "image reports $got, tag is $GITHUB_REF_NAME"; exit 1; }
+
+      - name: push the per-arch tag
+        run: |
+          ref="ghcr.io/maxkuttner/openoms:${GITHUB_REF_NAME#v}-${{ matrix.arch }}"
+          docker tag openoms:ci "$ref"
+          docker push "$ref"
+
+  docker-manifest:
+    needs: [docker, publish]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: tag X.Y.Z, X.Y and latest across both arches
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          img=ghcr.io/maxkuttner/openoms
+          docker buildx imagetools create \
+            -t "$img:$v" -t "$img:${v%.*}" -t "$img:latest" \
+            "$img:$v-amd64" "$img:$v-arm64"
+          docker buildx imagetools inspect "$img:$v"
+
+  # Formula/openoms.rb in maxkuttner/homebrew-tap, rendered from this release's
+  # SHA256SUMS. HOMEBREW_TAP_TOKEN: a fine-grained token with contents write on
+  # the tap repo only.
+  homebrew:
+    needs: [publish, docker-manifest]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: render the formula from the release's SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" -p SHA256SUMS
+          sh packaging/homebrew/render.sh "${GITHUB_REF_NAME#v}" SHA256SUMS > openoms.rb
+          grep -q "releases/download/$GITHUB_REF_NAME/" openoms.rb
+          cat openoms.rb
+
+      - name: push to maxkuttner/homebrew-tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          [ -n "$TAP_TOKEN" ] || { echo "secret HOMEBREW_TAP_TOKEN is not set"; exit 1; }
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/maxkuttner/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp openoms.rb tap/Formula/openoms.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/openoms.rb
+          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
+          msg="openoms ${GITHUB_REF_NAME#v}"
+          git commit -m "$msg"
+          git push

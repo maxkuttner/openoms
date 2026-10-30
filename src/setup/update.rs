@@ -58,6 +58,45 @@ fn is_cargo_build(exe: &Path) -> bool {
         .any(|w| w[0] == "target" && (w[1] == "debug" || w[1] == "release"))
 }
 
+/// A binary inside a Homebrew Cellar belongs to brew: replacing it would break
+/// brew's own checksums and be undone by the next `brew upgrade`.
+fn is_homebrew_install(exe: &Path) -> bool {
+    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
+    parts.windows(2).any(|w| w[0] == "Cellar" && w[1] == "openoms")
+}
+
+/// Set by the published Docker image. A container's binary is replaced by
+/// pulling a new image, never in place.
+fn in_container() -> bool {
+    crate::setup::init::rules::container_mode(std::env::var("OMS_CONTAINER").ok().as_deref())
+}
+
+/// Why this binary must not replace itself, naming what updates it instead.
+fn managed_refusal(exe: &Path, in_container: bool) -> Option<String> {
+    if in_container {
+        Some("oms runs in a container — update it with: docker compose pull && docker compose run --rm oms database migrate && docker compose up -d".into())
+    } else if is_homebrew_install(exe) {
+        Some("oms was installed by Homebrew — update it with: brew upgrade openoms".into())
+    } else if is_cargo_build(exe) {
+        Some(format!(
+            "{} was built from source — update it with `git pull && cargo build --release` instead",
+            exe.display()
+        ))
+    } else {
+        None
+    }
+}
+
+/// `--check` compares tags only; installing needs this platform's tarball.
+fn needs_target(check: bool) -> bool {
+    !check
+}
+
+/// `--check` only reads, so it reports whoever owns the binary.
+fn update_refusal(exe: &Path, in_container: bool, check: bool) -> Option<String> {
+    if check { None } else { managed_refusal(exe, in_container) }
+}
+
 /// The expected hash for `file` in a `sha256sum`-format listing. Accepts the
 /// binary-mode `*name` marker too, since `shasum` may write it.
 fn expected_sha256<'a>(sums: &'a str, file: &str) -> Option<&'a str> {
@@ -192,14 +231,14 @@ fn hex(bytes: &[u8]) -> String {
 pub async fn run(args: Args) -> Result<(), BoxError> {
     let current = parse_version(env!("CARGO_PKG_VERSION"))?;
     let exe = std::fs::canonicalize(std::env::current_exe()?)?;
-    if is_cargo_build(&exe) {
-        return Err(format!(
-            "{} was built from source — update it with `git pull && cargo build --release` instead",
-            exe.display()
-        )
-        .into());
+    if let Some(refusal) = update_refusal(&exe, in_container(), args.check) {
+        return Err(refusal.into());
     }
-    let target = target().ok_or("no prebuilt release exists for this platform")?;
+    // An arm64 container has no release tarball but can still --check.
+    let target = match (needs_target(args.check), target()) {
+        (true, None) => return Err("no prebuilt release exists for this platform".into()),
+        (_, t) => t,
+    };
     let client = http_client()?;
 
     let tag = match &args.version {
@@ -219,6 +258,7 @@ pub async fn run(args: Args) -> Result<(), BoxError> {
         return Ok(());
     }
 
+    let target = target.expect("resolved above whenever not --check");
     println!("updating oms {current} → {wanted} ({target})");
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
     install(&client, &base, target, &wanted, &exe).await?;
@@ -248,6 +288,44 @@ mod tests {
         assert!(is_cargo_build(Path::new("/src/oms/target/debug/oms")));
         assert!(!is_cargo_build(Path::new("/home/me/.local/bin/oms")));
         assert!(!is_cargo_build(Path::new("/opt/target/oms")));
+    }
+
+    #[test]
+    fn a_homebrew_install_is_refused_with_brew_upgrade() {
+        let m = managed_refusal(Path::new("/opt/homebrew/Cellar/openoms/0.6.0/bin/oms"), false).unwrap();
+        assert!(m.contains("brew upgrade openoms"), "{m}");
+        assert!(managed_refusal(Path::new("/home/linuxbrew/.linuxbrew/Cellar/openoms/0.6.0/bin/oms"), false).is_some());
+        assert!(managed_refusal(Path::new("/home/me/.local/bin/oms"), false).is_none());
+        assert!(managed_refusal(Path::new("/opt/Cellar-backup/oms"), false).is_none());
+    }
+
+    #[test]
+    fn a_container_install_is_refused_with_compose_pull() {
+        let m = managed_refusal(Path::new("/usr/local/bin/oms"), true).unwrap();
+        assert!(
+            m.contains("docker compose pull && docker compose run --rm oms database migrate && docker compose up -d"),
+            "the server never migrates on its own: {m}"
+        );
+    }
+
+    #[test]
+    fn a_cargo_build_is_still_refused_with_git_pull() {
+        let m = managed_refusal(Path::new("/src/oms/target/release/oms"), false).unwrap();
+        assert!(m.contains("git pull && cargo build --release"), "{m}");
+    }
+
+    #[test]
+    fn check_needs_no_release_target() {
+        // --check only compares tags; an arm64 container has no tarball target.
+        assert!(needs_target(false));
+        assert!(!needs_target(true));
+    }
+
+    #[test]
+    fn check_still_reports_when_managed() {
+        let cellar = Path::new("/opt/homebrew/Cellar/openoms/0.6.0/bin/oms");
+        assert!(update_refusal(cellar, true, true).is_none(), "--check only reads");
+        assert!(update_refusal(cellar, false, false).is_some());
     }
 
     #[test]

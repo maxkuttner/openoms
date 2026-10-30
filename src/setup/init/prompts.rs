@@ -72,6 +72,9 @@ pub struct Defaults {
     pub admin_password: Option<String>,
     pub bind: String,
     pub source: Option<DbSource>,
+    /// Inside the published image (`OMS_CONTAINER=1`): compose supplies the
+    /// database and publishes the port, so only the admin password is asked.
+    pub container: bool,
 }
 
 /// dialoguer reads stdin and draws on stderr; both must be a terminal.
@@ -88,16 +91,24 @@ pub fn admin_password_field(pw: &str) -> Result<(), String> {
 pub fn collect(p: &mut dyn Prompter, d: &Defaults, docker: DockerStatus) -> io::Result<Answers> {
     let source = match d.source {
         Some(s) => s,
+        None if d.container => DbSource::Existing,
         None => choose_source(p, docker)?,
     };
     let db = match source {
         DbSource::Docker => DbChoice::Docker,
+        DbSource::Existing if d.container => DbChoice::Existing(compose_postgres(p, d)?),
         DbSource::Existing => DbChoice::Existing(existing_postgres(p, d)?),
     };
     let admin = match &d.admin_password {
         Some(pw) => AdminPassword::Typed(pw.clone()),
         None => admin_password(p)?,
     };
+    if d.container {
+        // Bound on all interfaces inside the container; compose publishes it on
+        // the host's loopback only, so the exposure warning would be wrong.
+        let bind = parse_bind(&d.bind).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        return Ok(Answers { db, admin, bind });
+    }
     let bind = p.input("Listen on", &d.bind, &|v| parse_bind(v).map(|_| ()))?;
     let bind = parse_bind(&bind).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     if let Some(w) = exposure_warning(&bind) {
@@ -126,6 +137,22 @@ fn choose_source(p: &mut dyn Prompter, docker: DockerStatus) -> io::Result<DbSou
     }
 }
 
+/// The compose service's connection, from the environment compose sets. Asks
+/// for the superuser password only if compose did not pass one.
+fn compose_postgres(p: &mut dyn Prompter, d: &Defaults) -> io::Result<Prompts> {
+    let password = match &d.superuser_password {
+        Some(pw) => pw.clone(),
+        None => superuser_password(p)?,
+    };
+    Ok(Prompts {
+        host: d.host.clone(),
+        port: d.port,
+        database: d.database.clone(),
+        username: d.username.clone(),
+        password,
+    })
+}
+
 fn existing_postgres(p: &mut dyn Prompter, d: &Defaults) -> io::Result<Prompts> {
     let host = p.input("Postgres host", &d.host, &|v| non_empty(v, "host"))?;
     let port = p.input("Postgres port", &d.port.to_string(), &|v| {
@@ -135,13 +162,7 @@ fn existing_postgres(p: &mut dyn Prompter, d: &Defaults) -> io::Result<Prompts> 
     let username = p.input("Superuser name", &d.username, &|v| non_empty(v, "superuser name"))?;
     let password = match &d.superuser_password {
         Some(pw) => pw.clone(),
-        None => loop {
-            let pw = p.password("Superuser password", false)?;
-            if !pw.is_empty() {
-                break pw;
-            }
-            p.note("the superuser password is needed once, to create the database and the oms role");
-        },
+        None => superuser_password(p)?,
     };
     Ok(Prompts {
         host: host.trim().to_string(),
@@ -150,6 +171,16 @@ fn existing_postgres(p: &mut dyn Prompter, d: &Defaults) -> io::Result<Prompts> 
         username: username.trim().to_string(),
         password,
     })
+}
+
+fn superuser_password(p: &mut dyn Prompter) -> io::Result<String> {
+    loop {
+        let pw = p.password("Superuser password", false)?;
+        if !pw.is_empty() {
+            return Ok(pw);
+        }
+        p.note("the superuser password is needed once, to create the database and the oms role");
+    }
 }
 
 fn non_empty(v: &str, what: &str) -> Result<(), String> {
@@ -335,7 +366,33 @@ mod tests {
             admin_password: None,
             bind: "localhost:3001".into(),
             source: None,
+            container: false,
         }
+    }
+
+    #[test]
+    fn container_asks_only_the_admin_password() {
+        let d = Defaults {
+            container: true,
+            host: "postgres".into(),
+            superuser_password: Some("pg-secret".into()),
+            bind: "0.0.0.0:3001".into(),
+            ..defaults()
+        };
+        let mut s = Script::new().password("");
+        let a = collect(&mut s, &d, DockerStatus::NotFound).unwrap();
+        match &a.db {
+            DbChoice::Existing(p) => {
+                assert_eq!(p.host, "postgres");
+                assert_eq!(p.password, "pg-secret");
+            }
+            other => panic!("expected the compose database, got {other:?}"),
+        }
+        assert!(matches!(a.admin, AdminPassword::Generated(_)));
+        assert_eq!(a.bind, "0.0.0.0:3001");
+        assert_eq!((s.selects, s.passwords), (0, 1), "only the admin password is asked");
+        assert!(s.replies.is_empty());
+        assert!(s.notes.is_empty(), "no exposure warning in a container: {:?}", s.notes);
     }
 
     #[test]

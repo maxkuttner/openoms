@@ -1,0 +1,276 @@
+---
+title: Installation
+description: Install oms with the install script, or build it from source. Add it to your PATH, upgrade, pin a version, download a release directly, or uninstall.
+---
+
+import { Tabs, TabItem, Aside, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+
+openoms ships as one `oms` binary. Install it with one command, or build it from source.
+
+## Overview
+
+`oms` is a single executable: the server, the web cockpit and the command-line tool in one
+file. It needs no runtime, and the cockpit is embedded. Its only outside dependency is a
+PostgreSQL 16 database, which [`oms init`](/openoms/getting-started/) can start for you in
+Docker.
+
+## Installation
+
+<Tabs syncKey="os">
+<TabItem label="macOS & Linux">
+
+```sh
+curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+```
+
+<Aside type="note" title="Supported systems">
+macOS on Apple Silicon (M1 or newer), and Linux x86_64 with glibc and OpenSSL 3, as on
+Ubuntu 22.04, Debian 12 or newer. Ubuntu 20.04, RHEL 8 and Amazon Linux 2 ship OpenSSL
+1.1, and Intel Macs have no prebuilt binary: [build from source](#build-from-source)
+there.
+</Aside>
+
+</TabItem>
+<TabItem label="Windows">
+
+<Aside type="caution" title="To be implemented">
+There is no native Windows build yet. Until there is, install inside
+[WSL 2](https://learn.microsoft.com/windows/wsl/install) with Ubuntu 22.04 or newer and
+follow the **macOS & Linux** tab.
+</Aside>
+
+</TabItem>
+<TabItem label="Package Managers">
+
+**Homebrew** (macOS on Apple Silicon, Linux x86_64):
+
+```sh
+brew install maxkuttner/tap/openoms
+```
+
+Or add the tap once, then use the short name:
+
+```sh
+brew tap maxkuttner/tap
+brew install openoms
+```
+
+The formula is named `openoms`; the command it installs is `oms`, already on your `PATH`.
+
+<Aside type="caution" title="pip: to be implemented">
+`pip install openoms` is planned. Until then, use Homebrew or the **macOS & Linux** tab.
+</Aside>
+
+</TabItem>
+<TabItem label="Docker">
+
+Runs openoms and PostgreSQL 16 together with Docker Compose:
+
+```sh
+mkdir openoms && cd openoms
+curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
+[ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
+docker compose run --rm oms init
+docker compose up -d
+```
+
+`oms init` asks one thing, the cockpit admin password (Enter generates one). Then open
+`http://localhost:3001/cockpit/`.
+
+- [compose.yaml](https://maxkuttner.github.io/openoms/compose.yaml) runs the
+  `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
+- The cockpit is published on this machine only (`127.0.0.1:3001`). On a remote server,
+  reach it through an SSH tunnel or Tailscale.
+- Data lives in two volumes: `openoms_oms-config` (`oms.toml` and its master key) and
+  `openoms_oms-pgdata` (the database). Keep `.env`: it holds the database superuser
+  password, and the `.env` line above never replaces an existing one.
+- Back up the master key once the server runs:
+  `docker compose cp oms:/config/oms.toml ./oms.toml.backup`.
+
+</TabItem>
+</Tabs>
+
+The install script downloads the latest release for your platform, checks it against the
+release's `SHA256SUMS`, and puts it in `~/.local/bin`. It needs no sudo and starts
+nothing. [Read install.sh on GitHub](https://github.com/maxkuttner/openoms/blob/main/install.sh)
+before you pipe it into a shell. When it finishes, it offers to run `oms init`.
+
+To check that `oms` was installed:
+
+```sh
+oms --version
+```
+
+### Add oms to your PATH
+
+If `oms --version` says `command not found`, `~/.local/bin` is not on your `PATH`.
+
+<Tabs syncKey="os">
+<TabItem label="macOS & Linux">
+
+<Steps>
+
+1. Add the directory to your shell profile: `~/.zshrc` for zsh (the macOS default),
+   `~/.bashrc` for bash (most Linux distributions):
+
+   ```sh
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+   ```
+
+2. Open a new terminal and check:
+
+   ```sh
+   oms --version
+   ```
+
+</Steps>
+
+</TabItem>
+<TabItem label="Windows">
+
+Inside WSL 2, follow the **macOS & Linux** tab with `~/.bashrc`.
+
+</TabItem>
+</Tabs>
+
+### Build from source
+
+For any other platform. You need Rust (stable), cmake with a C++ compiler (the embedded
+FIX engine is C++), OpenSSL 3 (`brew install openssl@3` on macOS) and Node 22 for the
+cockpit.
+
+```sh
+git clone https://github.com/maxkuttner/openoms.git && cd openoms
+(cd cockpit && npm ci && npm run build)   # build the cockpit first: it is embedded
+cargo build --release
+cp target/release/oms ~/.local/bin/
+```
+
+A binary built without the cockpit bundle serves a 404 at `/cockpit/`.
+
+## Upgrading
+
+Once installed, `oms` upgrades itself:
+
+```sh
+oms update
+```
+
+`oms update --check` only reports whether a newer release exists. A binary a package
+manager or container owns refuses to overwrite itself and names the command to use:
+
+| Installed with | Upgrade |
+|---|---|
+| Homebrew | `brew upgrade openoms` |
+| Docker Compose | `docker compose pull && docker compose run --rm oms database migrate && docker compose up -d` |
+| From source | `git pull`, then rebuild |
+
+After upgrading outside Docker, apply new database migrations; see
+[Updating](/openoms/operations/updating/).
+
+## Installing older versions
+
+<Tabs syncKey="os">
+<TabItem label="macOS & Linux">
+
+```sh
+curl -fsSL https://maxkuttner.github.io/openoms/install.sh | OMS_VERSION=v0.4.0 sh
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+Inside WSL 2, use the **macOS & Linux** command.
+
+</TabItem>
+</Tabs>
+
+From source: `git checkout v0.4.0`, then build as above.
+
+An installed `oms` can also move to a specific release, older or newer:
+
+```sh
+oms update --version v0.4.0
+```
+
+## Direct downloads
+
+Every release is on the
+[GitHub releases page](https://github.com/maxkuttner/openoms/releases). Download a
+tarball, check it against `SHA256SUMS`, and put `oms` on your `PATH`.
+
+### Latest version downloads
+
+<CardGrid>
+  <LinkCard
+    title="macOS (Apple Silicon)"
+    description="oms-aarch64-apple-darwin.tar.gz — M1 or newer"
+    href="https://github.com/maxkuttner/openoms/releases/latest/download/oms-aarch64-apple-darwin.tar.gz"
+  />
+  <LinkCard
+    title="Linux x64"
+    description="oms-x86_64-unknown-linux-gnu.tar.gz — glibc, OpenSSL 3"
+    href="https://github.com/maxkuttner/openoms/releases/latest/download/oms-x86_64-unknown-linux-gnu.tar.gz"
+  />
+</CardGrid>
+
+- [SHA256SUMS](https://github.com/maxkuttner/openoms/releases/latest/download/SHA256SUMS):
+  checksums for both tarballs. Verify with `shasum -a 256 -c SHA256SUMS --ignore-missing`.
+
+## Requirements
+
+| Platform | Architecture | Minimum |
+|---|---|---|
+| macOS | Apple Silicon (arm64) | macOS on M1 or newer |
+| Linux | x86_64 | glibc and OpenSSL 3 (Ubuntu 22.04, Debian 12 or newer) |
+| Anything else | any | build from source |
+
+The server also needs PostgreSQL 16, either your own or one `oms init` starts in Docker.
+
+## Uninstall
+
+<Tabs syncKey="os">
+<TabItem label="macOS & Linux">
+
+```sh
+rm ~/.local/bin/oms
+```
+
+</TabItem>
+<TabItem label="Windows">
+
+Inside WSL 2, use the **macOS & Linux** command.
+
+</TabItem>
+<TabItem label="Package Managers">
+
+```sh
+brew uninstall openoms
+brew untap maxkuttner/tap
+```
+
+</TabItem>
+<TabItem label="Docker">
+
+In the directory with `compose.yaml`:
+
+```sh
+docker compose down      # stops openoms and Postgres, keeps the volumes
+docker compose down -v   # also deletes the database and oms.toml with its master key
+```
+
+</TabItem>
+</Tabs>
+
+Outside Docker, this leaves your configuration and data. To remove those too:
+
+```sh
+rm -r ~/.config/oms                                       # config and master key
+docker rm -f oms-postgres && docker volume rm oms-pgdata  # only if oms init started Postgres in Docker
+```
+
+<Aside type="caution">
+Deleting `~/.config/oms` deletes the master key. Without it, the broker credentials stored
+in the database cannot be decrypted. Removing the `oms-pgdata` volume deletes the
+database.
+</Aside>

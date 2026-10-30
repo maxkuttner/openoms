@@ -116,7 +116,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # shellcheck is preinstalled on the GitHub Ubuntu images.
-      - run: shellcheck install.sh cockpit/check-api-base.sh
+      - run: shellcheck install.sh cockpit/check-api-base.sh packaging/homebrew/*.sh
+      - name: the Homebrew formula renders from SHA256SUMS
+        run: sh packaging/homebrew/render_test.sh
 
   docs-site:
     name: docs site build and checks
@@ -138,3 +140,6 @@ jobs:
         working-directory: docs-site
       - run: npm run check
         working-directory: docs-site
+      # Published at /openoms/compose.yaml for the Docker install.
+      - name: compose.yaml is valid
+        run: POSTGRES_PASSWORD=ci docker compose -f docs-site/public/compose.yaml config -q

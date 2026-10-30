@@ -94,9 +94,24 @@ pub fn docker_fix_hint(s: DockerStatus) -> Option<&'static str> {
     }
 }
 
+/// `OMS_CONTAINER=1`, set by the published Docker image: compose supplies the
+/// database and publishes the port, so `oms init` asks only the admin password
+/// and `oms update` defers to `docker compose pull`.
+pub fn container_mode(var: Option<&str>) -> bool {
+    var == Some("1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_mode_is_only_an_exact_1() {
+        assert!(container_mode(Some("1")));
+        assert!(!container_mode(None));
+        assert!(!container_mode(Some("0")));
+        assert!(!container_mode(Some("")));
+    }
 
     #[test]
     fn docker_is_the_default_only_when_usable() {
