@@ -85,7 +85,7 @@ jobs:
         run: |
           mkdir openoms && cd openoms
           curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
-          echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
+          [ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
           docker compose run --rm oms init --non-interactive
           docker compose up -d
 

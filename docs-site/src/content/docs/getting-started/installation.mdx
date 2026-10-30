@@ -69,7 +69,7 @@ Runs openoms and PostgreSQL 16 together with Docker Compose:
 ```sh
 mkdir openoms && cd openoms
 curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
+[ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
 docker compose run --rm oms init
 docker compose up -d
 ```
@@ -81,8 +81,11 @@ docker compose up -d
   `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
 - The cockpit is published on this machine only (`127.0.0.1:3001`). On a remote server,
   reach it through an SSH tunnel or Tailscale.
-- Data lives in two volumes: `oms-config` (`oms.toml` and its master key) and `oms-pgdata`
-  (the database). Keep `.env`: it holds the database superuser password.
+- Data lives in two volumes: `openoms_oms-config` (`oms.toml` and its master key) and
+  `openoms_oms-pgdata` (the database). Keep `.env`: it holds the database superuser
+  password, and the `.env` line above never replaces an existing one.
+- Back up the master key once the server runs:
+  `docker compose cp oms:/config/oms.toml ./oms.toml.backup`.
 
 </TabItem>
 </Tabs>

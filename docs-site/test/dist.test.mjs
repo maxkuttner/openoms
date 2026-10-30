@@ -183,4 +183,7 @@ test("installation's Package Managers and Docker tabs give real commands", () =>
   assert.ok(docker.includes("compose.yaml"), "compose.yaml not linked");
   assert.ok(!docker.includes("To be implemented"), "Docker tab still says To be implemented");
   assert.ok(existsSync(join(DIST, "compose.yaml")), "compose.yaml is not published");
+  // Re-running the block must not replace the password the Postgres volume already holds.
+  assert.ok(docker.includes("[ -f .env ] ||"), ".env is overwritten on a re-run");
+  assert.ok(docker.includes("docker compose cp oms:/config/oms.toml"), "no way to back up the master key");
 });

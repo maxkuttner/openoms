@@ -134,7 +134,7 @@ Published next to `install.sh` at `https://maxkuttner.github.io/openoms/compose.
 ```sh
 mkdir openoms && cd openoms
 curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
-echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
+[ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
 docker compose run --rm oms init
 docker compose up -d
 ```

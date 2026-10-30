@@ -116,8 +116,11 @@ jobs:
             oms-${{ matrix.target }}.tar.gz
             oms-${{ matrix.target }}.sha256
 
+  # Nothing a user sees moves until every artifact built: the per-arch image
+  # tags are staging only, and the release, the multi-arch tags and the tap
+  # all wait on both builds.
   publish:
-    needs: build
+    needs: [build, docker]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -192,7 +195,7 @@ jobs:
           docker push "$ref"
 
   docker-manifest:
-    needs: docker
+    needs: [docker, publish]
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -217,7 +220,7 @@ jobs:
   # SHA256SUMS. HOMEBREW_TAP_TOKEN: a fine-grained token with contents write on
   # the tap repo only.
   homebrew:
-    needs: publish
+    needs: [publish, docker-manifest]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
