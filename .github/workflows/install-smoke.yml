@@ -48,3 +48,62 @@ jobs:
           # check in this workflow.
           grep -qa 'oms-cockpit\|<div id="root">' "$HOME/.local/bin/oms" \
             || { echo "no cockpit bundle found in the released binary"; exit 1; }
+
+  brew:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: macos-14
+    steps:
+      - name: install exactly the way the docs say to
+        run: brew install maxkuttner/tap/openoms
+
+      - name: the formula installs the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          got="$(oms --version | awk '{print $NF}')"
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          echo "installed $got, latest release $tag"
+          [ "$got" = "${tag#v}" ] || { echo "formula does not install the latest release"; exit 1; }
+
+      - run: brew test openoms
+
+      - name: oms update defers to brew
+        run: |
+          if out="$(oms update 2>&1)"; then echo "oms update replaced a brew-owned binary"; exit 1; fi
+          echo "$out"
+          echo "$out" | grep -q "brew upgrade openoms"
+
+  docker:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: run exactly the way the docs say to
+        run: |
+          mkdir openoms && cd openoms
+          curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
+          docker compose run --rm oms init --non-interactive
+          docker compose up -d
+
+      - name: the cockpit answers on 127.0.0.1:3001
+        run: |
+          for _ in $(seq 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:3001/cockpit/ && exit 0
+            sleep 2
+          done
+          cd openoms && docker compose logs oms
+          exit 1
+
+      - name: the image is the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd openoms
+          got="$(docker compose run --rm --no-deps oms --version | awk '{print $NF}')"
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          echo "image $got, latest release $tag"
+          [ "$got" = "${tag#v}" ] || { echo "latest image is not the latest release"; exit 1; }
