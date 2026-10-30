@@ -8,19 +8,22 @@
    openoms colours; a docs test (dist.test.mjs) fails if they drift apart. The
    landing page's glows (GrainBackground.astro) are glow-green and orange. */
 :root {
-  --oms-black: #000000;
-  --oms-surface: #0d0d0d;
-  --oms-raised: #161616;
-  --oms-border: #262626;
+  --oms-black: #0d0a0c;
+  --oms-surface: #131012;
+  --oms-raised: #1b181a;
+  --oms-border: #3e3e42;
   --oms-green: #25b083;
   --oms-amber: #ce9a3b;
   --oms-orange: #d97a14;
   --oms-glow-green: #148c47;
 }
 
-/* Dark scheme: pure black surfaces instead of Starlight's blue-grey. */
+/* Dark scheme: soft black surfaces instead of Starlight's blue-grey, and
+   visible hairlines, so the sidebar and the top bar have a dividing line. */
 :root[data-theme="dark"] {
   --sl-color-black: var(--oms-black);
+  --sl-color-hairline: var(--oms-border);
+  --sl-color-hairline-shade: var(--oms-border);
   --sl-color-bg-nav: var(--oms-black);
   --sl-color-bg-sidebar: var(--oms-black);
   --sl-color-bg-inline-code: var(--oms-raised);

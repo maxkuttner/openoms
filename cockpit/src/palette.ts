@@ -1,18 +1,19 @@
 import type { MantineColorsTuple } from "@mantine/core";
 
 // The openoms colour scheme: the one list of colours the cockpit, the trader
-// UI and the docs site are drawn from. It follows the landing page: pure black,
+// UI and the docs site are drawn from. It follows the landing page: a soft black,
 // a green and an orange glow, and the logo's green and amber.
 //
 // check-palette.sh fails the build on a hex colour anywhere else in src/. The
 // docs site cannot import this file, so docs-site/src/styles/theme.css copies
 // the named colours below as --oms-* tokens, and a docs test keeps them equal.
 export const palette = {
-  // Surfaces, darkest first. Dark mode is pure black.
-  black: "#000000",
-  surface: "#0d0d0d", // insets, inputs, code blocks
-  raised: "#161616", // panels, headers, hover
-  border: "#262626",
+  // Surfaces, darkest first. Dark mode is a soft, slightly warm black (as on
+  // bun.com) rather than pure #000, which reads too stark.
+  black: "#0d0a0c",
+  surface: "#131012", // insets, inputs, code blocks
+  raised: "#1b181a", // panels, headers, hover
+  border: "#3e3e42",
 
   // Text.
   ink: "#ededed",
@@ -67,7 +68,7 @@ export const scales = {
   // Surfaces and text in Mantine's dark scheme: 0 text, 2 dimmed, 4–5 borders,
   // 6 inputs and panels, 7 the page.
   dark: [
-    "#ededed", "#c4c4c4", "#a3a3a3", "#737373", "#3a3a3a",
-    "#262626", "#161616", "#000000", "#000000", "#000000",
+    "#ededed", "#c4c4c4", "#a3a3a3", "#737373", "#4a474a",
+    "#3e3e42", "#1b181a", "#0d0a0c", "#0d0a0c", "#0d0a0c",
   ] as MantineColorsTuple,
 };
