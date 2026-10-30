@@ -172,3 +172,15 @@ test("installation has OS tabs and links the installer source, not the raw scrip
   assert.ok(html.includes("https://github.com/maxkuttner/openoms/blob/main/install.sh"));
   assert.ok(!html.includes('href="/openoms/install.sh"'), "still links the raw script");
 });
+
+test("installation's Package Managers and Docker tabs give real commands", () => {
+  const html = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
+  // The first tab group's panels, in label order: macOS & Linux, Windows, Package Managers, Docker.
+  const panels = html.split(/<div[^>]*role="tabpanel"/).slice(1, 5);
+  const [, , pkg, docker] = panels;
+  assert.ok(pkg.includes("brew install maxkuttner/tap/openoms"), "no Homebrew command");
+  assert.ok(docker.includes("docker compose run --rm oms init"), "no compose flow");
+  assert.ok(docker.includes("compose.yaml"), "compose.yaml not linked");
+  assert.ok(!docker.includes("To be implemented"), "Docker tab still says To be implemented");
+  assert.ok(existsSync(join(DIST, "compose.yaml")), "compose.yaml is not published");
+});

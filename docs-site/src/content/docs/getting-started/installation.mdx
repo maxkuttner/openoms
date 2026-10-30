@@ -42,20 +42,47 @@ follow the **macOS & Linux** tab.
 </TabItem>
 <TabItem label="Package Managers">
 
-<Aside type="caution" title="To be implemented">
-openoms is not on any package manager yet. Planned: Homebrew
-(`brew install oms`) and pip (`pip install oms`). Until then, use the
-**macOS & Linux** tab.
+**Homebrew** (macOS on Apple Silicon, Linux x86_64):
+
+```sh
+brew install maxkuttner/tap/openoms
+```
+
+Or add the tap once, then use the short name:
+
+```sh
+brew tap maxkuttner/tap
+brew install openoms
+```
+
+The formula is named `openoms`; the command it installs is `oms`, already on your `PATH`.
+
+<Aside type="caution" title="pip: to be implemented">
+`pip install openoms` is planned. Until then, use Homebrew or the **macOS & Linux** tab.
 </Aside>
 
 </TabItem>
 <TabItem label="Docker">
 
-<Aside type="caution" title="To be implemented">
-There is no published openoms image yet. Planned: one image on the GitHub Container
-Registry that runs the server. Until then, use the **macOS & Linux** tab; `oms init` can
-still run PostgreSQL in Docker for you.
-</Aside>
+Runs openoms and PostgreSQL 16 together with Docker Compose:
+
+```sh
+mkdir openoms && cd openoms
+curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
+echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
+docker compose run --rm oms init
+docker compose up -d
+```
+
+`oms init` asks one thing, the cockpit admin password (Enter generates one). Then open
+`http://localhost:3001/cockpit/`.
+
+- [compose.yaml](https://maxkuttner.github.io/openoms/compose.yaml) runs the
+  `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
+- The cockpit is published on this machine only (`127.0.0.1:3001`). On a remote server,
+  reach it through an SSH tunnel or Tailscale.
+- Data lives in two volumes: `oms-config` (`oms.toml` and its master key) and `oms-pgdata`
+  (the database). Keep `.env`: it holds the database superuser password.
 
 </TabItem>
 </Tabs>
@@ -126,9 +153,17 @@ Once installed, `oms` upgrades itself:
 oms update
 ```
 
-`oms update --check` only reports whether a newer release exists. A source build refuses to
-overwrite itself: run `git pull` and rebuild instead. After upgrading, apply new database
-migrations; see [Updating](/openoms/operations/updating/).
+`oms update --check` only reports whether a newer release exists. A binary a package
+manager or container owns refuses to overwrite itself and names the command to use:
+
+| Installed with | Upgrade |
+|---|---|
+| Homebrew | `brew upgrade openoms` |
+| Docker Compose | `docker compose pull && docker compose run --rm oms database migrate && docker compose up -d` |
+| From source | `git pull`, then rebuild |
+
+After upgrading outside Docker, apply new database migrations; see
+[Updating](/openoms/operations/updating/).
 
 ## Installing older versions
 
@@ -206,12 +241,25 @@ Inside WSL 2, use the **macOS & Linux** command.
 </TabItem>
 <TabItem label="Package Managers">
 
-Not available yet: see [Installation](#installation).
+```sh
+brew uninstall openoms
+brew untap maxkuttner/tap
+```
+
+</TabItem>
+<TabItem label="Docker">
+
+In the directory with `compose.yaml`:
+
+```sh
+docker compose down      # stops openoms and Postgres, keeps the volumes
+docker compose down -v   # also deletes the database and oms.toml with its master key
+```
 
 </TabItem>
 </Tabs>
 
-This leaves your configuration and data. To remove those too:
+Outside Docker, this leaves your configuration and data. To remove those too:
 
 ```sh
 rm -r ~/.config/oms                                       # config and master key
