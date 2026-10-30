@@ -32,6 +32,16 @@ test("the home page carries the install one-liner", () => {
   );
 });
 
+test("getting started points to Installation instead of repeating it", () => {
+  const html = readFileSync(join(DIST, "getting-started/index.html"), "utf8");
+  assert.ok(!html.includes("install.sh"), "getting started repeats the install script");
+  assert.ok(!html.includes("brew install"), "getting started repeats the brew install");
+  assert.ok(
+    html.includes('href="/openoms/getting-started/installation/"'),
+    "getting started does not link to Installation",
+  );
+});
+
 test("every internal href in dist resolves to a built file", () => {
   const broken = [];
   for (const file of htmlFiles(DIST)) {

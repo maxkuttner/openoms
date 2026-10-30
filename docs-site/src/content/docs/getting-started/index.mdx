@@ -6,40 +6,26 @@ description: Install the oms binary, let oms init set up the database and cockpi
 import { Aside } from "@astrojs/starlight/components";
 
 openoms is a single `oms` binary: the server, the web cockpit and the command-line tool in
-one file. Four steps take you from nothing to a logged-in cockpit.
+one file. Follow the steps to go from installation to running managing the `openoms` cockpit.
 
 ## 1. Install
 
-```sh
-curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
-```
-
-macOS (Apple Silicon) and Linux x86_64. Or `brew install maxkuttner/tap/openoms`, or run
-it with Docker Compose. For PATH setup, Docker, older versions and direct downloads, see
-[Installation](/openoms/getting-started/installation/).
+Install `oms` as described on [Installation](/openoms/getting-started/installation/), then
+come back here.
 
 ## 2. Set up
+
+Run the following command to setup `openoms` for the first time.
 
 ```sh
 oms init
 ```
 
-It asks three things. Arrow keys choose, Enter takes the default:
+The program will prompt you to answer some basic questions on
 
-```text
-? Database
-❯ Start PostgreSQL 16 in Docker for me   (Docker found)
-  Use an existing PostgreSQL 16
-? Cockpit admin password (Enter = generate)
-? Listen on (localhost:3001)
-```
-
-| Question | What your answer does |
-|---|---|
-| **Database: Docker** | Starts `postgres:16` as container `oms-postgres` (data in volume `oms-pgdata`), reachable only from this machine. If port 5432 is taken it uses the next free one and says so. |
-| **Database: existing** | Asks for host, port, database name, and a superuser login. The superuser password is used once, to create the database and the `oms` role, and never stored. |
-| **Admin password** | Your cockpit login, at least 12 characters, typed twice. Press Enter instead and one is generated and shown at the end. |
-| **Listen on** | Where the cockpit and API listen. Keep `localhost:3001` and reach a remote server through an SSH tunnel or Tailscale; `0.0.0.0:3001` exposes it to the network, and `oms init` warns you. |
+- whether to use your own PostgresSQL (16.0) database or whether you would like to use the pre-configured docker image
+- which administrator password you would like to set for the `admin cockpit` ui
+- which port the oms should listen on for requests
 
 Then it writes `~/.config/oms/oms.toml` (mode `0600`), creates the database, applies every
 migration and loads reference data (currencies, ~2,800 venues, trading calendars).
@@ -48,10 +34,12 @@ migration and loads reference data (currencies, ~2,800 venues, trading calendars
 The master key in `oms.toml` is the only thing that can decrypt the broker credentials you
 store later. Lose it and they are gone. See
 [Master key and backups](/openoms/operations/master-key-and-backups/).
+
+TODO: Come up with better system than master key.
 </Aside>
 
-`oms init` refuses if a config already exists in any
-[location it searches](/openoms/configuration/file-locations/). To upgrade an existing
+There a couple of commands that let you work and setup the database for this application (see)
+To upgrade an existing
 database, use `oms database migrate` — with a Docker database, see
 [Updating](/openoms/operations/updating/) for where its superuser password lives.
 
@@ -75,39 +63,7 @@ ssh -L 3001:localhost:3001 your-server
 
 Forgot a generated password? It is `admin_password` in `~/.config/oms/oms.toml`.
 
-**Next:** [your first paper trade](/openoms/getting-started/first-paper-trade/) — connect
-Alpaca paper in the cockpit and send one share of AAPL.
-
-<details>
-<summary>Scripted installs</summary>
-
-The installer reads:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `OMS_VERSION` | `latest` | Release tag to install, e.g. `v0.4.0` |
-| `OMS_INSTALL_DIR` | `$HOME/.local/bin` | Where the binary goes |
-| `OMS_NO_INIT` | unset | `1` skips the "Run oms init now?" question |
-
-With no terminal attached (CI, provisioning tools) it never asks.
-
-`oms init --non-interactive` asks nothing and takes every answer from flags or the
-environment:
-
-| Flag | Environment | Default |
-|---|---|---|
-| `--postgres docker\|existing` | — | `existing` |
-| `--host`, `--port`, `--database`, `--username`, `--password` | `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DATABASE`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD` | `localhost`, `5432`, `ods`, `postgres`, `postgres` |
-| `--admin-password` | `OMS_ADMIN_PASSWORD` | generated, written to `oms.toml`, never printed |
-| `--bind` | `OMS_BIND_ADDR` | `localhost:3001` |
-
-```sh
-oms init --non-interactive --postgres docker --bind localhost:3001
-```
-
-The same flags work interactively: each one given skips its question.
-
-</details>
+**Next:** [your first paper trade](/openoms/getting-started/first-paper-trade/)
 
 ## Updating
 
