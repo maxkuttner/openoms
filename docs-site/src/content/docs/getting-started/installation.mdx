@@ -3,7 +3,7 @@ title: Installation
 description: Install oms with the install script, or build it from source. Add it to your PATH, upgrade, pin a version, download a release directly, or uninstall.
 ---
 
-import { Tabs, TabItem, Aside, Steps, LinkCard, CardGrid } from "@astrojs/starlight/components";
+import { Tabs, TabItem, Aside, LinkCard, CardGrid } from "@astrojs/starlight/components";
 
 openoms ships as one `oms` binary. Install it with one command, or build it from source.
 
@@ -103,35 +103,14 @@ oms --version
 
 ### Add oms to your PATH
 
-If `oms --version` says `command not found`, `~/.local/bin` is not on your `PATH`.
+The install script adds `~/.local/bin` to your `PATH` in `~/.zshrc`, `~/.bashrc`
+(`~/.bash_profile` on macOS) or fish's `config.fish`. Open a new terminal after installing.
 
-<Tabs syncKey="os">
-<TabItem label="macOS & Linux">
+For another shell, or with `OMS_NO_MODIFY_PATH=1`, add it yourself:
 
-<Steps>
-
-1. Add the directory to your shell profile: `~/.zshrc` for zsh (the macOS default),
-   `~/.bashrc` for bash (most Linux distributions):
-
-   ```sh
-   echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-   ```
-
-2. Open a new terminal and check:
-
-   ```sh
-   oms --version
-   ```
-
-</Steps>
-
-</TabItem>
-<TabItem label="Windows">
-
-Inside WSL 2, follow the **macOS & Linux** tab with `~/.bashrc`.
-
-</TabItem>
-</Tabs>
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ### Build from source
 

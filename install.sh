@@ -4,14 +4,16 @@
 #   curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
 #
 # Downloads the released `oms` binary for this platform, verifies it against the
-# release's SHA256SUMS, and installs it into ~/.local/bin. That is all it does: no
-# sudo, no package manager, no Postgres, no config file, no server started. It
-# prints the commands to run next — then, if a person is at the terminal, offers
-# to run `oms init` (which asks before it creates anything).
+# release's SHA256SUMS, installs it into ~/.local/bin and, if that is not on PATH,
+# adds it in your shell startup file. That is all it does: no sudo, no package
+# manager, no Postgres, no config file, no server started. It prints the commands
+# to run next — then, if a person is at the terminal, offers to run `oms init`
+# (which asks before it creates anything).
 #
-#   OMS_VERSION      release tag to install (default: latest)
-#   OMS_INSTALL_DIR  where the binary lands (default: $HOME/.local/bin)
-#   OMS_NO_INIT=1    do not offer to run `oms init` at the end
+#   OMS_VERSION          release tag to install (default: latest)
+#   OMS_INSTALL_DIR      where the binary lands (default: $HOME/.local/bin)
+#   OMS_NO_INIT=1        do not offer to run `oms init` at the end
+#   OMS_NO_MODIFY_PATH=1 leave shell startup files alone; print the PATH line instead
 
 set -eu
 
@@ -95,14 +97,7 @@ main() {
 	fi
 	printf 'installed %s to %s\n' "$("$INSTALL_DIR/oms" --version)" "$INSTALL_DIR/oms"
 
-	case ":$PATH:" in
-	*":$INSTALL_DIR:"*) ;;
-	*)
-		# shellcheck disable=SC2016 # the literal $PATH is for the user to paste, not to expand here
-		printf '\n%s is not on your PATH. Add it:\n\n    export PATH="%s:$PATH"\n\n(then put that line in ~/.zshrc or ~/.bashrc)\n' \
-			"$INSTALL_DIR" "$INSTALL_DIR"
-		;;
-	esac
+	add_to_path "$(uname -s)"
 
 	cat <<-'EOF'
 
@@ -118,6 +113,44 @@ main() {
 	EOF
 
 	offer_init
+}
+
+# Puts INSTALL_DIR on PATH for new terminals by appending one line to the
+# user's shell startup file, the way the Bun, Deno and rustup installers do.
+# Skips a file that already has the line; OMS_NO_MODIFY_PATH=1 and shells it
+# does not know print the line to add by hand instead. Takes `uname -s`.
+add_to_path() {
+	case ":$PATH:" in
+	*":$INSTALL_DIR:"*) return 0 ;;
+	esac
+
+	# shellcheck disable=SC2016 # the literal $PATH belongs in the startup file
+	line="$(printf 'export PATH="%s:$PATH"' "$INSTALL_DIR")"
+	profile=""
+	if [ "${OMS_NO_MODIFY_PATH:-}" != "1" ]; then
+		case "${SHELL##*/}" in
+		zsh) profile="${ZDOTDIR:-$HOME}/.zshrc" ;;
+		# Terminal on macOS opens login shells, which read .bash_profile only.
+		bash) if [ "$1" = "Darwin" ]; then profile="$HOME/.bash_profile"; else profile="$HOME/.bashrc"; fi ;;
+		fish)
+			profile="$HOME/.config/fish/config.fish"
+			line="fish_add_path \"$INSTALL_DIR\""
+			;;
+		esac
+	fi
+
+	if [ -z "$profile" ]; then
+		printf '\n%s is not on your PATH. Add it to your shell startup file:\n\n    %s\n' \
+			"$INSTALL_DIR" "$line"
+		return 0
+	fi
+
+	if ! grep -qxF "$line" "$profile" 2>/dev/null; then
+		mkdir -p "$(dirname "$profile")"
+		printf '\n# openoms\n%s\n' "$line" >>"$profile"
+	fi
+	printf '\nadded %s to PATH in %s\nopen a new terminal to use oms, or run now:\n\n    %s\n' \
+		"$INSTALL_DIR" "$profile" "$line"
 }
 
 # Ask once whether to run `oms init` now. Only when a person can answer: under
@@ -138,4 +171,5 @@ offer_init() {
 	esac
 }
 
-main "$@"
+# install_test.sh sources this file for its functions.
+[ "${OMS_INSTALL_SH_NO_MAIN:-}" = "1" ] || main "$@"
