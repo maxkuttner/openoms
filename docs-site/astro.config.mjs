@@ -32,6 +32,7 @@ export default defineConfig({
         {
           label: "Getting Started",
           items: [
+            "getting-started/installation",
             "getting-started",
             "getting-started/first-paper-trade",
             "getting-started/first-api-call",

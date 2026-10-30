@@ -98,7 +98,6 @@ test("the architecture page renders all three diagrams", () => {
 for (const [old, target] of [
   ["architecture.html", "/openoms/concepts/architecture/"],
   ["api.html", "/openoms/api/"],
-  ["getting-started/installation/index.html", "/openoms/getting-started/"],
   ["getting-started/first-run/index.html", "/openoms/getting-started/"],
 ]) {
   test(`the old /openoms/${old} redirects to ${target}`, () => {
@@ -166,9 +165,9 @@ test("the grain background shows in light mode too", () => {
   assert.match(html, /uniform float light/, "shader has no light-scheme variant");
 });
 
-test("getting started has OS tabs and links the installer source, not the raw script", () => {
-  const html = readFileSync(join(DIST, "getting-started/index.html"), "utf8");
-  for (const tab of ["macOS", "Linux", "From source"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
+test("installation has OS tabs and links the installer source, not the raw script", () => {
+  const html = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
+  for (const tab of ["macOS &amp; Linux", "Windows", "Package Managers", "Docker"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
   assert.ok(html.includes('data-sync-key="os"'), "tabs not synced across pages");
   assert.ok(html.includes("https://github.com/maxkuttner/openoms/blob/main/install.sh"));
   assert.ok(!html.includes('href="/openoms/install.sh"'), "still links the raw script");
