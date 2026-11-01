@@ -5,7 +5,7 @@
 #
 # Downloads the released `oms` binary for this platform, verifies it against the
 # release's SHA256SUMS, installs it into ~/.local/bin and, if that is not on PATH,
-# adds it in your shell startup file. That is all it does: no sudo, no package
+# offers to add it in your shell startup file. That is all it does: no sudo, no package
 # manager, no Postgres, no config file, no server started. It prints the commands
 # to run next — then, if a person is at the terminal, offers to run `oms init`
 # (which asks before it creates anything).
@@ -115,10 +115,24 @@ main() {
 	offer_init
 }
 
-# Puts INSTALL_DIR on PATH for new terminals by appending one line to the
-# user's shell startup file, the way the Bun, Deno and rustup installers do.
-# Skips a file that already has the line; OMS_NO_MODIFY_PATH=1 and shells it
-# does not know print the line to add by hand instead. Takes `uname -s`.
+# Ask the person at the terminal a yes/no question; Enter means yes. Under
+# `curl | sh` stdin is the script itself, so it goes through /dev/tty. Returns
+# 0 for yes, 1 for no, 2 when there is no terminal to ask (CI, provisioning).
+ask() {
+	(: </dev/tty) 2>/dev/null || return 2
+	printf '\n%s [Y/n] ' "$1" >/dev/tty
+	read -r ans </dev/tty || return 2
+	case "$ans" in
+	"" | y | Y | yes | YES) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+# Offers to put INSTALL_DIR on PATH for new terminals by appending one line to
+# the user's shell startup file, as the Deno installer does: it asks first, and
+# with no answer, no terminal, OMS_NO_MODIFY_PATH=1 or a shell it does not
+# know, it only prints the line to add by hand. A file that already has the
+# line is left alone without asking. Takes `uname -s`.
 add_to_path() {
 	case ":$PATH:" in
 	*":$INSTALL_DIR:"*) return 0 ;;
@@ -139,18 +153,22 @@ add_to_path() {
 		esac
 	fi
 
-	if [ -z "$profile" ]; then
-		printf '\n%s is not on your PATH. Add it to your shell startup file:\n\n    %s\n' \
-			"$INSTALL_DIR" "$line"
+	if [ -n "$profile" ] && grep -qxF "$line" "$profile" 2>/dev/null; then
+		printf '\n%s is already on PATH in %s\nopen a new terminal to use oms, or run now:\n\n    %s\n' \
+			"$INSTALL_DIR" "$profile" "$line"
 		return 0
 	fi
 
-	if ! grep -qxF "$line" "$profile" 2>/dev/null; then
+	if [ -n "$profile" ] && ask "Add $INSTALL_DIR to your PATH in $profile?"; then
 		mkdir -p "$(dirname "$profile")"
 		printf '\n# openoms\n%s\n' "$line" >>"$profile"
+		printf '\nadded %s to PATH in %s\nopen a new terminal to use oms, or run now:\n\n    %s\n' \
+			"$INSTALL_DIR" "$profile" "$line"
+		return 0
 	fi
-	printf '\nadded %s to PATH in %s\nopen a new terminal to use oms, or run now:\n\n    %s\n' \
-		"$INSTALL_DIR" "$profile" "$line"
+
+	printf '\n%s is not on your PATH. Add it to your shell startup file:\n\n    %s\n' \
+		"$INSTALL_DIR" "$line"
 }
 
 # Ask once whether to run `oms init` now. Only when a person can answer: under
@@ -162,13 +180,9 @@ offer_init() {
 		printf '\nexisting config found — skipping oms init\n'
 		return 0
 	fi
-	(: </dev/tty) 2>/dev/null || return 0
-	printf '\nRun oms init now? [Y/n] ' >/dev/tty
-	read -r ans </dev/tty || return 0
-	case "$ans" in
-	"" | y | Y | yes | YES) "$INSTALL_DIR/oms" init </dev/tty >/dev/tty 2>&1 || true ;;
-	*) ;;
-	esac
+	if ask "Run oms init now?"; then
+		"$INSTALL_DIR/oms" init </dev/tty >/dev/tty 2>&1 || true
+	fi
 }
 
 # install_test.sh sources this file for its functions.

@@ -14,7 +14,9 @@ fail() {
 }
 
 # Each case runs add_to_path in a subshell with a fresh HOME, so nothing leaks
-# between cases and nothing touches the real home directory.
+# between cases and nothing touches the real home directory. ANSWER stands in
+# for the person at the terminal: yes, no, or notty (nobody to ask); every
+# question asked is logged to $T/asked.
 run() { # <shell> <os> [env assignments...]
 	shell="$1"
 	os="$2"
@@ -28,6 +30,14 @@ run() { # <shell> <os> [env assignments...]
 		INSTALL_DIR="$HOME/.local/bin"
 		OMS_INSTALL_SH_NO_MAIN=1
 		. ./install.sh
+		ask() {
+			printf '%s\n' "$1" >>"$HOME/asked"
+			case "${ANSWER:-yes}" in
+			yes) return 0 ;;
+			no) return 1 ;;
+			*) return 2 ;;
+			esac
+		}
 		add_to_path "$os"
 	) >"$T/out" 2>&1
 }
@@ -44,6 +54,7 @@ run /bin/zsh Darwin
 grep -qxF "$(line)" "$T/.zshrc" 2>/dev/null || fail "zsh: ~/.zshrc lacks the PATH line"
 grep -q "$T/.zshrc" "$T/out" || fail "zsh: output does not name ~/.zshrc"
 grep -q "new terminal" "$T/out" || fail "zsh: output does not say to open a new terminal"
+grep -q "$T/.zshrc" "$T/asked" 2>/dev/null || fail "zsh: did not ask before editing ~/.zshrc"
 
 # 2. zsh honours ZDOTDIR.
 fresh
@@ -58,6 +69,8 @@ run /bin/zsh Darwin
 run /bin/zsh Darwin
 n="$(grep -cxF "$(line)" "$T/.zshrc")"
 [ "$n" = 1 ] || fail "zsh: PATH line written $n times on reinstall"
+n="$(wc -l <"$T/asked" | tr -d ' ')"
+[ "$n" = 1 ] || fail "zsh: asked $n times; a reinstall with the line present must not ask"
 
 # 4. bash on Linux writes ~/.bashrc.
 fresh
@@ -95,8 +108,20 @@ run /bin/zsh Darwin "PATH=$T/.local/bin:/usr/bin:/bin"
 [ ! -e "$T/.zshrc" ] || fail "on PATH: wrote ~/.zshrc"
 [ ! -s "$T/out" ] || fail "on PATH: printed $(cat "$T/out")"
 
+# 10. Answering no leaves the file alone and prints the line to add by hand.
+fresh
+run /bin/zsh Darwin ANSWER=no
+[ ! -e "$T/.zshrc" ] || fail "answer no: wrote ~/.zshrc"
+grep -qF "$(line)" "$T/out" || fail "answer no: no manual PATH hint"
+
+# 11. With nobody at a terminal (CI, provisioning) nothing is edited either.
+fresh
+run /bin/zsh Darwin ANSWER=notty
+[ ! -e "$T/.zshrc" ] || fail "no tty: wrote ~/.zshrc"
+grep -qF "$(line)" "$T/out" || fail "no tty: no manual PATH hint"
+
 if [ "$fails" -gt 0 ]; then
 	printf '%s failed\n' "$fails"
 	exit 1
 fi
-printf 'install_test: 9 cases ok\n'
+printf 'install_test: 11 cases ok\n'

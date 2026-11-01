@@ -103,10 +103,11 @@ oms --version
 
 ### Add oms to your PATH
 
-The install script adds `~/.local/bin` to your `PATH` in `~/.zshrc`, `~/.bashrc`
-(`~/.bash_profile` on macOS) or fish's `config.fish`. Open a new terminal after installing.
+If `~/.local/bin` is not on your `PATH`, the install script asks before adding it to
+`~/.zshrc`, `~/.bashrc` (`~/.bash_profile` on macOS) or fish's `config.fish`. Say yes and
+open a new terminal.
 
-For another shell, or with `OMS_NO_MODIFY_PATH=1`, add it yourself:
+If you said no, use another shell, or ran the script without a terminal, add it yourself:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
