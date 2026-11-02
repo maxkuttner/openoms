@@ -38,9 +38,10 @@
       return fract(sin(dot(q, vec2(12.9898, 78.233))) * 43758.5453);
     }
 
+    // r is a fraction of the screen's shorter side: on a portrait phone,
+    // sizing by the height would let the glows cover the whole screen.
     float glow(vec2 uv, vec2 c, float r) {
-      vec2 d = uv - c;
-      d.x *= res.x / res.y;
+      vec2 d = (uv - c) * res / min(res.x, res.y);
       return exp(-dot(d, d) / (r * r));
     }
 
