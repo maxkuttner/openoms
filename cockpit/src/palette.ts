@@ -8,12 +8,19 @@ import type { MantineColorsTuple } from "@mantine/core";
 // docs site cannot import this file, so docs-site/src/styles/theme.css copies
 // the named colours below as --oms-* tokens, and a docs test keeps them equal.
 export const palette = {
-  // Surfaces, darkest first. Dark mode is a soft, slightly warm black (as on
-  // bun.com) rather than pure #000, which reads too stark.
-  black: "#0d0a0c",
-  surface: "#131012", // insets, inputs, code blocks
-  raised: "#1b181a", // panels, headers, hover
-  border: "#3e3e42",
+  // Surfaces, darkest first: the logo tile's cool blue-black, soft rather than
+  // pure #000, which reads too stark. raised is the 3D logo's tile top, border
+  // its middle bar.
+  black: "#0d1014",
+  surface: "#13171d", // insets, inputs, code blocks
+  raised: "#1d232c", // panels, headers, hover
+  border: "#2a2f38",
+
+  // The docs site's light scheme: a cool off-white in the same slate family
+  // as the blacks above, rather than plain #fff.
+  paper: "#f5f6f8",
+  paperRaised: "#eceef2", // sidebar, code blocks
+  paperBorder: "#dcdfe5",
 
   // Text.
   ink: "#ededed",
@@ -68,7 +75,7 @@ export const scales = {
   // Surfaces and text in Mantine's dark scheme: 0 text, 2 dimmed, 4–5 borders,
   // 6 inputs and panels, 7 the page.
   dark: [
-    "#ededed", "#c4c4c4", "#a3a3a3", "#737373", "#4a474a",
-    "#3e3e42", "#1b181a", "#0d0a0c", "#0d0a0c", "#0d0a0c",
+    "#ededed", "#c4c4c4", "#a3a3a3", "#737373", "#3a414c",
+    "#2a2f38", "#1d232c", "#0d1014", "#0d1014", "#0d1014",
   ] as MantineColorsTuple,
 };

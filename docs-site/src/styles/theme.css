@@ -8,14 +8,19 @@
    openoms colours; a docs test (dist.test.mjs) fails if they drift apart. The
    landing page's glows (GrainBackground.astro) are glow-green and orange. */
 :root {
-  --oms-black: #0d0a0c;
-  --oms-surface: #131012;
-  --oms-raised: #1b181a;
-  --oms-border: #3e3e42;
+  --oms-black: #0d1014;
+  --oms-surface: #13171d;
+  --oms-raised: #1d232c;
+  --oms-border: #2a2f38;
   --oms-green: #25b083;
   --oms-amber: #ce9a3b;
   --oms-orange: #d97a14;
   --oms-glow-green: #148c47;
+  --oms-logo-tile: #0d1014;
+  --oms-logo-bar: #2a2f38;
+  --oms-paper: #f5f6f8;
+  --oms-paper-raised: #eceef2;
+  --oms-paper-border: #dcdfe5;
 }
 
 /* Dark scheme: soft black surfaces instead of Starlight's blue-grey, and
@@ -36,6 +41,15 @@
   --ec-frm-edTabBarBg: var(--oms-raised) !important;
   --ec-frm-edActTabBg: var(--oms-surface) !important;
   --ec-frm-trmTtbBg: var(--oms-raised) !important;
+}
+/* Light scheme: a cool off-white instead of plain white. */
+:root[data-theme="light"] {
+  --sl-color-black: var(--oms-paper);
+  --sl-color-bg-nav: var(--oms-paper);
+  --sl-color-bg-sidebar: var(--oms-paper-raised);
+  --sl-color-bg-inline-code: var(--oms-paper-raised);
+  --sl-color-hairline: var(--oms-paper-border);
+  --sl-color-hairline-shade: var(--oms-paper-border);
 }
 :root[data-theme="light"] {
   --sl-color-accent-low: #c8f1e1;
@@ -82,4 +96,40 @@
 }
 :root[data-theme="light"] .hero > img {
   box-shadow: 0 10px 22px -8px rgba(13, 16, 20, 0.55), 0 2px 5px rgba(13, 16, 20, 0.18);
+}
+
+/* Landing page feature cards, styled like the 3D logo tile: a dark tile
+   lit from above, a rim highlight along the top edge and a soft drop shadow.
+   Icons sit in small extruded bars, green on the top row and amber below,
+   in the order of the logo's bars. */
+[data-has-hero] .card {
+  border: 1px solid #262b33;
+  border-radius: 14px;
+  background: linear-gradient(180deg, #1d232c, #08090c);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.1),
+    0 12px 26px -8px rgb(0 0 0 / 0.8);
+}
+[data-has-hero] .card .icon {
+  --bar-top: #4fd6a8;
+  --bar: var(--oms-green);
+  --bar-side: #16785a;
+  color: var(--oms-logo-tile);
+  border: 0;
+  border-radius: 6px;
+  background: linear-gradient(180deg, var(--bar-top), var(--bar));
+  box-shadow: 0 3px 0 var(--bar-side), 0 6px 10px -2px rgb(0 0 0 / 0.6);
+}
+[data-has-hero] .card:nth-child(n + 3) .icon {
+  --bar-top: #ebbe68;
+  --bar: var(--oms-amber);
+  --bar-side: #8c6420;
+}
+/* Light scheme: the same tile on white, as in the brand sheet's light row. */
+:root[data-theme="light"][data-has-hero] .card {
+  border-color: #e2e4e8;
+  background: linear-gradient(180deg, #ffffff, #f4f5f7);
+  box-shadow:
+    0 10px 22px -8px rgb(13 16 20 / 0.35),
+    0 2px 5px rgb(13 16 20 / 0.12);
 }
