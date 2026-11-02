@@ -2,8 +2,9 @@
 title: openoms
 description: An open source multi-client order management system. One command to install.
 template: splash
+editUrl: false
 hero:
-  tagline: An open source multi-client order management system — order routing across brokers over FIX and REST, with a web cockpit built into one binary.
+  tagline: An open source multi-client order management system — order routing across brokers over FIX and REST, with a web-based admin UI.
   image:
     file: ../../assets/logo-3d.svg
   actions:
@@ -29,14 +30,14 @@ import BrokerCarousel from "../../components/BrokerCarousel.astro";
   <Card title="Multi-broker routing" icon="random">
     Orders routed to Alpaca, Binance, Bybit and Interactive Brokers, over FIX and REST.
   </Card>
-  <Card title="A cockpit in the binary" icon="laptop">
-    Blotter, positions, connections and a trade ticket — served by the OMS itself.
+  <Card title="Web-based admin UI" icon="laptop">
+    Connections, positions and a blotter in the browser, plus a trader UI with a trade ticket.
   </Card>
-  <Card title="Scoped trading access" icon="approve-check">
+  <Card title="Control trading access" icon="approve-check">
     Traders and tokens see only the portfolios they are granted.
   </Card>
   <Card title="Risk and reconciliation" icon="warning">
-    Pre-trade risk checks, and order reconciliation whenever a broker reconnects.
+    Pre-trade risk checks, and order reconciliation.
   </Card>
 </CardGrid>
 
