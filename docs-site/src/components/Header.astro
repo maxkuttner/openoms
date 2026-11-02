@@ -1,0 +1,34 @@
+---
+// Starlight's header, plus a theme switch for phones on pages without a
+// sidebar. Starlight hides the header's switch below its md breakpoint and
+// puts it in the ☰ menu instead, but a page without a sidebar (the landing
+// page) has no ☰ menu, so phones there had no way to change the theme.
+import Default from "@astrojs/starlight/components/Header.astro";
+import ThemeSelect from "virtual:starlight/components/ThemeSelect";
+
+const { hasSidebar } = Astro.locals.starlightRoute;
+---
+
+<div class="oms-header">
+  <Default />
+  {
+    !hasSidebar && (
+      <div class="phone-theme md:sl-hidden print:hidden">
+        <ThemeSelect />
+      </div>
+    )
+  }
+</div>
+
+<style>
+  .oms-header {
+    display: flex;
+    align-items: center;
+    gap: var(--sl-nav-gap);
+    height: 100%;
+  }
+  .oms-header > :global(.header) {
+    flex: 1;
+    min-width: 0;
+  }
+</style>

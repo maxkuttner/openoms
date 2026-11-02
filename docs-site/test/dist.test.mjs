@@ -29,6 +29,15 @@ test("the home page sends people to Getting started", () => {
   assert.ok(html.includes('href="/openoms/getting-started/"'), "no Get started link on the home page");
 });
 
+// Starlight puts the theme switch in the ☰ menu on phones, and pages without a
+// sidebar (the landing page) have no ☰ menu, so the header carries one there.
+test("phones can switch the theme on the landing page", () => {
+  const count = (page) =>
+    (readFileSync(join(DIST, page), "utf8").match(/<starlight-theme-select/g) ?? []).length;
+  assert.equal(count("index.html"), 2, "the landing page header has no theme switch for phones");
+  assert.equal(count("getting-started/index.html"), 2, "a docs page should keep its two: header and ☰ menu");
+});
+
 // The docs site's --oms-* tokens are copies of cockpit/src/palette.ts, the one
 // list of openoms colours; CSS cannot import it, so this keeps them equal.
 test("the docs site's colour tokens match the palette", () => {

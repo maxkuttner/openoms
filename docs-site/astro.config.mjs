@@ -17,6 +17,7 @@ export default defineConfig({
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/maxkuttner/openoms" }],
       editLink: { baseUrl: "https://github.com/maxkuttner/openoms/edit/main/docs-site/" },
       customCss: ["./src/styles/theme.css"],
+      components: { Header: "./src/components/Header.astro" },
       plugins: [
         // Generated from the committed spec — never hand-written, so it cannot
         // drift from the server (the_committed_openapi_spec_is_current keeps
