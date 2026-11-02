@@ -74,3 +74,12 @@
   background-color: rgb(255 255 255 / 0.5);
   backdrop-filter: blur(8px);
 }
+
+/* The 3D logo tile, lifted off the page as in the brand sheet. */
+.hero > img {
+  border-radius: 12.5%;
+  box-shadow: 0 0 0 1px #262b33, 0 12px 26px -8px rgba(0, 0, 0, 0.8);
+}
+:root[data-theme="light"] .hero > img {
+  box-shadow: 0 10px 22px -8px rgba(13, 16, 20, 0.55), 0 2px 5px rgba(13, 16, 20, 0.18);
+}
