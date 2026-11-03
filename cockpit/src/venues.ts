@@ -43,20 +43,6 @@ export function autoCode(previous: CreateValues, next: CreateValues): string {
   return untouched ? connectionCode(next.broker_code, next.environment) : next.code;
 }
 
-// A LIVE connection always carries a max order value (the server defaults it to
-// 1000 and refuses to remove it); the form shows that default as soon as LIVE
-// is picked, and never overwrites a value the admin typed.
-export const DEFAULT_LIVE_MAX_ORDER_VALUE = 1000;
-
-type CapValues = { environment: string; max_order_value: number | string };
-
-export function autoMaxOrderValue(previous: CapValues, next: CapValues): number | string {
-  const empty = next.max_order_value === "" || next.max_order_value === null || next.max_order_value === undefined;
-  return previous.environment !== "LIVE" && next.environment === "LIVE" && empty
-    ? DEFAULT_LIVE_MAX_ORDER_VALUE
-    : next.max_order_value;
-}
-
 export function venueOptions(venues: Venue[]): Option[] {
   return venues.map((v) => ({ value: v.code, label: `${v.name} — ${v.description}` }));
 }

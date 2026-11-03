@@ -27,13 +27,12 @@ pub async fn ensure_broker_connections(pool: &PgPool) {
     for broker in Broker::ALL.iter().copied() {
         let code = broker.connection_code();
         let res = sqlx::query(
-            "INSERT INTO oms.broker_connection (code, broker_code, environment, status, max_order_value) \
-             VALUES ($1, $2, $3, 'ACTIVE', $4) ON CONFLICT (code) DO NOTHING",
+            "INSERT INTO oms.broker_connection (code, broker_code, environment, status) \
+             VALUES ($1, $2, $3, 'ACTIVE') ON CONFLICT (code) DO NOTHING",
         )
         .bind(&code)
         .bind(broker.code())
         .bind(broker.environment())
-        .bind(crate::domain::orders::risk::default_max_order_value(&broker.environment()))
         .execute(pool)
         .await;
         match res {

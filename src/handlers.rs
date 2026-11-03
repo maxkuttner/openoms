@@ -380,7 +380,6 @@ pub async fn orders_submit(
     // mapping before committing anything to the event store. Requires an ACTIVE connection.
     let account_row_pre = sqlx::query(
         "SELECT bc.broker_code, bc.environment, bc.code AS broker_connection_code, \
-                bc.max_order_value::float8 AS max_order_value, \
                 a.external_account_ref, a.portfolio_id AS account_portfolio_id \
          FROM account a \
          JOIN broker_connection bc ON bc.code = a.broker_connection_code \
@@ -432,7 +431,6 @@ pub async fn orders_submit(
     let environment: String = account_row_pre.get("environment");
     let broker_connection_code: String = account_row_pre.get("broker_connection_code");
     let external_account_ref: String = account_row_pre.get("external_account_ref");
-    let max_order_value: Option<f64> = account_row_pre.get("max_order_value");
 
     // Validate instrument is ACTIVE.
     // Fetch the instrument's status plus the metadata the risk/routing path needs:
@@ -510,29 +508,6 @@ pub async fn orders_submit(
                 message: format!("quantity {} below broker minimum {min}", cmd.quantity),
             });
         }
-    }
-
-    // The broker connection's fat-finger cap (always set on LIVE). A limit order
-    // is valued at its limit; a market order at the higher side of the current
-    // mark, so the estimate never undershoots what a buy can cost.
-    let est_price = cmd.limit_price.or_else(|| {
-        state
-            .marks()
-            .get(instrument_id_bigint)
-            .map(|m| m.bid.max(m.ask))
-            .filter(|p| p.is_finite() && *p > 0.0)
-    });
-    if let Err(rejection) = crate::domain::orders::risk::check_max_order_value(
-        max_order_value,
-        cmd.quantity,
-        est_price,
-        contract_size,
-    ) {
-        warn!(order_id = %order_id, code = %rejection.code, message = %rejection.message, "order rejected by the connection's max order value");
-        return Err(ApiError {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            message: format!("risk check failed [{}]: {}", rejection.code, rejection.message),
-        });
     }
 
     // start of the transaction

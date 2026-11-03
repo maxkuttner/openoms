@@ -4,7 +4,7 @@ import { CrudResource } from "../components/CrudResource";
 import { statusOptions } from "../lifecycle";
 import { api } from "../api/client";
 import { useList } from "../api/hooks";
-import { autoCode, autoMaxOrderValue, environmentOptions, venueOptions, type Venue } from "../venues";
+import { autoCode, environmentOptions, venueOptions, type Venue } from "../venues";
 import { CredentialsPanel } from "../components/CredentialsPanel";
 import { StreamHealthStrip } from "../components/StreamHealthStrip";
 import { UniverseStatus } from "../components/UniverseStatus";
@@ -30,10 +30,7 @@ export function BrokerConnectionsPage() {
       idKey="code"
       editable
       lifecycle={{ resource: "brokerConnection", afterChange: () => api.post("/admin/connections/reload", {}) }}
-      derive={(previous, next) => ({
-        code: autoCode(previous as any, next as any),
-        max_order_value: autoMaxOrderValue(previous as any, next as any),
-      })}
+      derive={(previous, next) => ({ code: autoCode(previous as any, next as any) })}
       // Credentials are the next step for a new connection, so open them.
       onCreated={(row: BrokerConnection) => setSelected(row)}
       rowAction={(row: BrokerConnection) => (
@@ -46,11 +43,6 @@ export function BrokerConnectionsPage() {
         { key: "broker_code", label: "Broker" },
         { key: "environment", label: "Environment" },
         { key: "status", label: "Status" },
-        {
-          key: "max_order_value",
-          label: "Max order value",
-          render: (row: BrokerConnection) => (row.max_order_value == null ? "no cap" : row.max_order_value.toLocaleString()),
-        },
         {
           key: "universe",
           label: "Instrument universe",
@@ -81,12 +73,6 @@ export function BrokerConnectionsPage() {
           description: () => "Your name for this connection; accounts and orders refer to it.",
         },
         { name: "status", label: "Status", type: "select", required: true, options: STATUS, default: "ACTIVE" },
-        {
-          name: "max_order_value",
-          label: "Max order value",
-          type: "number",
-          nullable: true,
-        },
       ]}
       />
 

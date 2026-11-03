@@ -3493,12 +3493,6 @@
           "environment": {
             "type": "string"
           },
-          "max_order_value": {
-            "type": "number",
-            "format": "double",
-            "description": "Fat-finger cap on one order's value through this connection; always set\non a LIVE connection, `None` (no cap) allowed only on PAPER.",
-            "nullable": true
-          },
           "status": {
             "type": "string"
           },
@@ -3628,12 +3622,6 @@
           },
           "environment": {
             "type": "string"
-          },
-          "max_order_value": {
-            "type": "number",
-            "format": "double",
-            "description": "Defaults to 1000 for a LIVE connection, no cap for PAPER.",
-            "nullable": true
           },
           "status": {
             "type": "string"
@@ -5148,11 +5136,6 @@
           },
           "environment": {
             "type": "string",
-            "nullable": true
-          },
-          "max_order_value": {
-            "type": "number",
-            "format": "double",
             "nullable": true
           },
           "status": {
