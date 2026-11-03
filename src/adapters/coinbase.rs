@@ -16,7 +16,13 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand::RngCore;
 use reqwest::Client;
 
-use super::{BrokerError, BrokerInstrument, InstrumentProvider};
+use tracing::info;
+
+use super::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
+use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+
+/// Quantities and prices as plain decimals without float noise — Bybit's rule.
+pub(crate) use super::bybit::decimal;
 
 const HOST: &str = "api.coinbase.com";
 const BASE: &str = "/api/v3/brokerage";
@@ -187,6 +193,173 @@ pub(crate) fn parse_spot_products(body: &serde_json::Value) -> Vec<BrokerInstrum
         .collect()
 }
 
+/// The POST /orders body for an OMS order. Quantities are always in the base coin.
+pub(crate) fn order_body(req: &BrokerOrderRequest) -> Result<serde_json::Value, BrokerError> {
+    let side = if req.side.eq_ignore_ascii_case("sell") { "SELL" } else { "BUY" };
+    let size = decimal(req.quantity);
+    let configuration = match req.order_type.as_str() {
+        "market" => serde_json::json!({ "market_market_ioc": { "base_size": size } }),
+        "limit" => {
+            let price = decimal(
+                req.limit_price
+                    .ok_or_else(|| BrokerError::BrokerRejected("limit order missing limit_price".into()))?,
+            );
+            // Day is meaningless on a 24/7 venue — treat as GTC.
+            match req.time_in_force.to_uppercase().as_str() {
+                "IOC" => serde_json::json!({ "sor_limit_ioc": { "base_size": size, "limit_price": price } }),
+                "FOK" => serde_json::json!({ "limit_limit_fok": { "base_size": size, "limit_price": price } }),
+                _ => serde_json::json!({ "limit_limit_gtc": { "base_size": size, "limit_price": price, "post_only": false } }),
+            }
+        }
+        other => return Err(BrokerError::NotConfigured(format!("unsupported order type: {other}"))),
+    };
+    Ok(serde_json::json!({
+        // Our order UUID, echoed on every user-channel update.
+        "client_order_id": req.order_id,
+        "product_id": req.symbol,
+        "side": side,
+        "order_configuration": configuration,
+    }))
+}
+
+/// Coinbase answers a refused order with `success: false` (HTTP 200).
+pub(crate) fn parse_create(body: &serde_json::Value) -> Result<String, BrokerError> {
+    if body["success"].as_bool() == Some(true) {
+        if let Some(id) = body["success_response"]["order_id"].as_str().filter(|s| !s.is_empty()) {
+            return Ok(id.to_string());
+        }
+    }
+    let e = &body["error_response"];
+    let reason = e["new_order_failure_reason"].as_str().or(e["error"].as_str()).unwrap_or("UNKNOWN");
+    let message = e["message"].as_str().unwrap_or("order not accepted");
+    Err(BrokerError::BrokerRejected(format!("{message} ({reason})")))
+}
+
+pub(crate) fn parse_cancel(body: &serde_json::Value) -> Result<(), BrokerError> {
+    let first = &body["results"][0];
+    if first["success"].as_bool() == Some(true) {
+        Ok(())
+    } else {
+        Err(BrokerError::BrokerRejected(format!(
+            "cancel refused ({})",
+            first["failure_reason"].as_str().unwrap_or("no reason given")
+        )))
+    }
+}
+
+/// Coinbase's order `status` as a reconcile outcome. EXPIRED (a GTD/IOC
+/// remainder) is a cancel; FAILED is a reject.
+pub(crate) fn order_outcome(status: &str) -> BrokerOrderOutcome {
+    match status {
+        "FILLED" => BrokerOrderOutcome::Filled,
+        "CANCELLED" | "EXPIRED" => BrokerOrderOutcome::Canceled,
+        "FAILED" => BrokerOrderOutcome::Rejected,
+        _ => BrokerOrderOutcome::Working, // PENDING / OPEN / CANCEL_QUEUED / QUEUED
+    }
+}
+
+pub(crate) fn parse_order_state(order: &serde_json::Value) -> BrokerOrderState {
+    BrokerOrderState {
+        outcome: order_outcome(order["status"].as_str().unwrap_or("")),
+        executed_qty: num(&order["filled_size"]).unwrap_or(0.0),
+        avg_px: num(&order["average_filled_price"]).unwrap_or(0.0),
+    }
+}
+
+pub(crate) fn parse_open_orders(body: &serde_json::Value) -> Vec<BrokerOpenOrder> {
+    let list = body["orders"].as_array().cloned().unwrap_or_default();
+    list.iter()
+        .filter_map(|o| {
+            Some(BrokerOpenOrder {
+                client_order_id: o["client_order_id"].as_str()?.to_string(),
+                symbol: o["product_id"].as_str()?.to_string(),
+                executed_qty: num(&o["filled_size"]).unwrap_or(0.0),
+            })
+        })
+        .collect()
+}
+
+/// Previous close per wanted product, from the price and its 24h change:
+/// `price / (1 + change% / 100)`. A product missing either is skipped, never
+/// reported as a zero previous close.
+pub(crate) fn parse_prev_prices(body: &serde_json::Value, wanted: &[String]) -> Vec<(String, f64)> {
+    let list = body["products"].as_array().cloned().unwrap_or_default();
+    list.iter()
+        .filter_map(|p| {
+            let id = p["product_id"].as_str()?;
+            if !wanted.iter().any(|w| w == id) {
+                return None;
+            }
+            let price = num(&p["price"])?;
+            let change = num(&p["price_percentage_change_24h"])?;
+            let prev = price / (1.0 + change / 100.0);
+            prev.is_finite().then(|| (id.to_string(), prev))
+        })
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl BrokerAdapter for CoinbaseAdapter {
+    async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        let body = order_body(req)?;
+        info!(symbol = %req.symbol, side = %req.side, "submitting order to Coinbase");
+        let external_order_id = parse_create(&self.post("/orders", &body).await?)?;
+        Ok(BrokerOrderResponse { external_order_id })
+    }
+
+    async fn cancel_order(&self, external_order_id: &str, _symbol: &str) -> Result<(), BrokerError> {
+        let body = serde_json::json!({ "order_ids": [external_order_id] });
+        parse_cancel(&self.post("/orders/batch_cancel", &body).await?)
+    }
+
+    /// GET /orders/historical/batch?order_status=OPEN, following the cursor.
+    async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+        let mut out = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let mut query = "order_status=OPEN&limit=250".to_string();
+            if !cursor.is_empty() {
+                query.push_str(&format!("&cursor={}", urlencoding_minimal(&cursor)));
+            }
+            let body = self.get("/orders/historical/batch", &query, true).await?;
+            out.extend(parse_open_orders(&body));
+            cursor = body["cursor"].as_str().unwrap_or("").to_string();
+            if body["has_next"].as_bool() != Some(true) || cursor.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+
+    async fn order_status(
+        &self,
+        _client_order_id: &str,
+        external_order_id: &str,
+        _symbol: &str,
+    ) -> Result<BrokerOrderState, BrokerError> {
+        let body = self.get(&format!("/orders/historical/{external_order_id}"), "", true).await?;
+        Ok(parse_order_state(&body["order"]))
+    }
+
+    /// Public GET /market/products?product_type=SPOT — one call covers every product.
+    async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = self.get("/market/products", "product_type=SPOT", false).await?;
+        Ok(parse_prev_prices(&body, symbols))
+    }
+}
+
+/// Percent-encode a page cursor for a query string (alphanumerics and `-_.~` pass).
+fn urlencoding_minimal(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl InstrumentProvider for CoinbaseAdapter {
     /// Spot only: `option_underlyings` is ignored.
@@ -203,6 +376,120 @@ mod tests {
     use p256::pkcs8::EncodePrivateKey;
 
     const KEY_NAME: &str = "organizations/org-1/apiKeys/key-1";
+    const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
+
+    fn req(order_type: &str, side: &str, quantity: f64, limit_price: Option<f64>, tif: &str) -> BrokerOrderRequest {
+        BrokerOrderRequest {
+            order_id: ORDER_ID.into(),
+            symbol: "BTC-USD".into(),
+            native_id: Some("BTC".into()),
+            quantity,
+            side: side.into(),
+            order_type: order_type.into(),
+            time_in_force: tif.into(),
+            limit_price,
+            external_account_ref: String::new(),
+        }
+    }
+
+    fn sample(name: &str) -> serde_json::Value {
+        let text = match name {
+            "create_ok" => include_str!("testdata/coinbase/create_ok.json"),
+            "create_failed" => include_str!("testdata/coinbase/create_failed.json"),
+            "cancel_ok" => include_str!("testdata/coinbase/cancel_ok.json"),
+            "cancel_failed" => include_str!("testdata/coinbase/cancel_failed.json"),
+            "orders_open" => include_str!("testdata/coinbase/orders_open.json"),
+            "order_filled" => include_str!("testdata/coinbase/order_filled.json"),
+            other => panic!("no sample {other}"),
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn decimal_drops_float_noise() {
+        assert_eq!(decimal(0.1 + 0.2), "0.3");
+        assert_eq!(decimal(0.0001), "0.0001");
+        assert_eq!(decimal(65000.0), "65000");
+    }
+
+    #[test]
+    fn market_orders_are_sized_in_the_base_coin() {
+        let b = order_body(&req("market", "buy", 0.0001, None, "day")).unwrap();
+        assert_eq!(b["client_order_id"], ORDER_ID);
+        assert_eq!(b["product_id"], "BTC-USD");
+        assert_eq!(b["side"], "BUY");
+        assert_eq!(b["order_configuration"]["market_market_ioc"]["base_size"], "0.0001");
+        assert_eq!(order_body(&req("market", "sell", 1.0, None, "day")).unwrap()["side"], "SELL");
+    }
+
+    #[test]
+    fn limit_tif_maps_to_coinbase_configurations() {
+        let gtc = order_body(&req("limit", "buy", 0.001, Some(30000.5), "day")).unwrap();
+        let cfg = &gtc["order_configuration"]["limit_limit_gtc"];
+        assert_eq!(cfg["base_size"], "0.001");
+        assert_eq!(cfg["limit_price"], "30000.5");
+        assert_eq!(cfg["post_only"], false);
+        let ioc = order_body(&req("limit", "buy", 0.001, Some(1.0), "ioc")).unwrap();
+        assert!(ioc["order_configuration"]["sor_limit_ioc"].is_object());
+        let fok = order_body(&req("limit", "buy", 0.001, Some(1.0), "fok")).unwrap();
+        assert!(fok["order_configuration"]["limit_limit_fok"].is_object());
+        assert!(order_body(&req("limit", "buy", 1.0, None, "gtc")).is_err());
+        assert!(order_body(&req("stop", "buy", 1.0, None, "gtc")).is_err());
+    }
+
+    #[test]
+    fn create_ok_returns_the_order_id() {
+        assert_eq!(parse_create(&sample("create_ok")).unwrap(), "11111111-2222-4333-8444-555555555555");
+    }
+
+    #[test]
+    fn create_failure_is_a_rejection() {
+        let e = parse_create(&sample("create_failed")).unwrap_err();
+        assert!(matches!(e, BrokerError::BrokerRejected(ref m) if m.contains("INSUFFICIENT_FUND")), "{e}");
+    }
+
+    #[test]
+    fn cancel_failure_is_a_rejection() {
+        assert!(parse_cancel(&sample("cancel_ok")).is_ok());
+        let e = parse_cancel(&sample("cancel_failed")).unwrap_err();
+        assert!(e.to_string().contains("UNKNOWN_CANCEL_ORDER"), "{e}");
+    }
+
+    #[test]
+    fn order_status_maps_coinbase_states() {
+        assert_eq!(order_outcome("FILLED"), BrokerOrderOutcome::Filled);
+        assert_eq!(order_outcome("CANCELLED"), BrokerOrderOutcome::Canceled);
+        assert_eq!(order_outcome("EXPIRED"), BrokerOrderOutcome::Canceled);
+        assert_eq!(order_outcome("FAILED"), BrokerOrderOutcome::Rejected);
+        assert_eq!(order_outcome("OPEN"), BrokerOrderOutcome::Working);
+        assert_eq!(order_outcome("PENDING"), BrokerOrderOutcome::Working);
+        assert_eq!(order_outcome("CANCEL_QUEUED"), BrokerOrderOutcome::Working);
+    }
+
+    #[test]
+    fn open_orders_and_order_state_read_cumulative_and_average() {
+        let open = parse_open_orders(&sample("orders_open"));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].client_order_id, ORDER_ID);
+        assert_eq!(open[0].symbol, "BTC-USD");
+        assert_eq!(open[0].executed_qty, 0.0005);
+        let st = parse_order_state(&sample("order_filled")["order"]);
+        assert_eq!(st.outcome, BrokerOrderOutcome::Filled);
+        assert_eq!(st.executed_qty, 0.001);
+        assert_eq!(st.avg_px, 65000.0);
+    }
+
+    #[test]
+    fn previous_close_comes_from_the_24h_change() {
+        let body = serde_json::json!({"products": [
+            {"product_id": "BTC-USD", "price": "102", "price_percentage_change_24h": "2"},
+            {"product_id": "ETH-EUR", "price": "50", "price_percentage_change_24h": ""},
+        ]});
+        let prev = parse_prev_prices(&body, &["BTC-USD".to_string(), "ETH-EUR".to_string()]);
+        assert_eq!(prev.len(), 1);
+        assert_eq!(prev[0].0, "BTC-USD");
+        assert!((prev[0].1 - 100.0).abs() < 1e-9);
+    }
 
     fn key_pair() -> (String, VerifyingKey) {
         let secret = p256::SecretKey::random(&mut rand::thread_rng());
