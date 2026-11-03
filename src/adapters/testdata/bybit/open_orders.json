@@ -1,0 +1,3 @@
+{"retCode":0,"retMsg":"OK","result":{"category":"spot","nextPageCursor":"","list":[
+ {"orderId":"1820000000000000001","orderLinkId":"3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b","symbol":"BTCUSDT","side":"Buy","orderType":"Limit","price":"30000","qty":"0.001","orderStatus":"PartiallyFilled","cumExecQty":"0.0005","avgPrice":"30000"}
+]},"retExtInfo":{},"time":1700000000000}

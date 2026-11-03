@@ -19,7 +19,10 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use sha2::Sha256;
 
-use super::{BrokerError, BrokerInstrument, InstrumentProvider};
+use tracing::info;
+
+use super::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
+use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Bybit's default; how long after `X-BAPI-TIMESTAMP` the request stays valid.
 const RECV_WINDOW: &str = "5000";
@@ -182,6 +185,160 @@ pub(crate) fn parse_spot_instruments(result: &serde_json::Value) -> Vec<BrokerIn
         .collect()
 }
 
+/// A quantity or price as Bybit wants it: plain decimal, no float noise
+/// (`0.1 + 0.2` is "0.3"), no trailing zeros. Bybit rejects excess precision.
+pub(crate) fn decimal(x: f64) -> String {
+    let s = format!("{x:.10}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s.is_empty() || s == "-" { "0".to_string() } else { s.to_string() }
+}
+
+/// The POST /v5/order/create body for an OMS order.
+pub(crate) fn order_body(req: &BrokerOrderRequest) -> Result<serde_json::Value, BrokerError> {
+    let side = if req.side.eq_ignore_ascii_case("sell") { "Sell" } else { "Buy" };
+    let mut body = serde_json::json!({
+        "category": "spot",
+        "symbol": req.symbol,
+        "side": side,
+        "qty": decimal(req.quantity),
+        // Our order UUID (36 chars, Bybit's limit), echoed on every update.
+        "orderLinkId": req.order_id,
+    });
+    match req.order_type.as_str() {
+        // A spot market Buy's qty is in the quote coin unless told otherwise;
+        // OMS quantities are always in the base coin.
+        "market" => {
+            body["orderType"] = "Market".into();
+            body["marketUnit"] = "baseCoin".into();
+        }
+        "limit" => {
+            let price = req
+                .limit_price
+                .ok_or_else(|| BrokerError::BrokerRejected("limit order missing limit_price".into()))?;
+            // Day is meaningless on a 24/7 venue — treat as GTC.
+            let tif = match req.time_in_force.to_uppercase().as_str() {
+                "IOC" => "IOC",
+                "FOK" => "FOK",
+                _ => "GTC",
+            };
+            body["orderType"] = "Limit".into();
+            body["price"] = decimal(price).into();
+            body["timeInForce"] = tif.into();
+        }
+        other => return Err(BrokerError::NotConfigured(format!("unsupported order type: {other}"))),
+    }
+    Ok(body)
+}
+
+/// Bybit's `orderStatus` as a reconcile outcome. `PartiallyFilledCanceled`
+/// keeps its fills; `Deactivated` is an untriggered order the venue cancelled.
+pub(crate) fn order_outcome(status: &str) -> BrokerOrderOutcome {
+    match status {
+        "Filled" => BrokerOrderOutcome::Filled,
+        "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => BrokerOrderOutcome::Canceled,
+        "Rejected" => BrokerOrderOutcome::Rejected,
+        _ => BrokerOrderOutcome::Working, // New / PartiallyFilled / Untriggered — still live
+    }
+}
+
+pub(crate) fn parse_open_orders(result: &serde_json::Value) -> Vec<BrokerOpenOrder> {
+    let list = result["list"].as_array().cloned().unwrap_or_default();
+    list.iter()
+        .filter_map(|o| {
+            Some(BrokerOpenOrder {
+                client_order_id: o["orderLinkId"].as_str()?.to_string(),
+                symbol: o["symbol"].as_str()?.to_string(),
+                executed_qty: num(&o["cumExecQty"]).unwrap_or(0.0),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn parse_order_state(order: &serde_json::Value) -> BrokerOrderState {
+    BrokerOrderState {
+        outcome: order_outcome(order["orderStatus"].as_str().unwrap_or("")),
+        executed_qty: num(&order["cumExecQty"]).unwrap_or(0.0),
+        avg_px: num(&order["avgPrice"]).unwrap_or(0.0),
+    }
+}
+
+/// `prevPrice24h` per wanted symbol from a tickers `result`; an unparseable price
+/// is skipped, never reported as a zero previous close.
+pub(crate) fn parse_prev_prices(result: &serde_json::Value, wanted: &[String]) -> Vec<(String, f64)> {
+    let list = result["list"].as_array().cloned().unwrap_or_default();
+    list.iter()
+        .filter_map(|t| {
+            let symbol = t["symbol"].as_str()?;
+            if !wanted.iter().any(|w| w == symbol) {
+                return None;
+            }
+            Some((symbol.to_string(), num(&t["prevPrice24h"])?))
+        })
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl BrokerAdapter for BybitAdapter {
+    async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        let body = order_body(req)?;
+        info!(symbol = %req.symbol, side = %req.side, "submitting order to Bybit");
+        let result = self.post("/v5/order/create", &body).await?;
+        match result["orderId"].as_str() {
+            Some(id) if !id.is_empty() => Ok(BrokerOrderResponse { external_order_id: id.to_string() }),
+            _ => Err(BrokerError::BrokerRejected(format!("Bybit accepted the order but returned no orderId: {result}"))),
+        }
+    }
+
+    async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError> {
+        let body = serde_json::json!({ "category": "spot", "symbol": symbol, "orderId": external_order_id });
+        self.post("/v5/order/cancel", &body).await.map(|_| ())
+    }
+
+    /// GET /v5/order/realtime — every open spot order, following the page cursor.
+    async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+        let mut out = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let mut query = "category=spot&limit=50&openOnly=0".to_string();
+            if !cursor.is_empty() {
+                query.push_str(&format!("&cursor={cursor}"));
+            }
+            let result = self.get("/v5/order/realtime", &query, true).await?;
+            out.extend(parse_open_orders(&result));
+            cursor = result["nextPageCursor"].as_str().unwrap_or("").to_string();
+            if cursor.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// One order by Bybit id: realtime first (open and recently closed), then history.
+    async fn order_status(
+        &self,
+        _client_order_id: &str,
+        external_order_id: &str,
+        _symbol: &str,
+    ) -> Result<BrokerOrderState, BrokerError> {
+        let query = format!("category=spot&orderId={external_order_id}");
+        for path in ["/v5/order/realtime", "/v5/order/history"] {
+            let result = self.get(path, &query, true).await?;
+            if let Some(order) = result["list"].as_array().and_then(|l| l.first()) {
+                return Ok(parse_order_state(order));
+            }
+        }
+        Err(BrokerError::BrokerRejected(format!("Bybit has no order {external_order_id}")))
+    }
+
+    /// GET /v5/market/tickers?category=spot — public; one call covers every pair.
+    async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        let result = self.get("/v5/market/tickers", "category=spot", false).await?;
+        Ok(parse_prev_prices(&result, symbols))
+    }
+}
+
 #[async_trait::async_trait]
 impl InstrumentProvider for BybitAdapter {
     /// Spot only: `option_underlyings` is ignored.
@@ -193,6 +350,104 @@ impl InstrumentProvider for BybitAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
+
+    fn req(order_type: &str, side: &str, quantity: f64, limit_price: Option<f64>, tif: &str) -> BrokerOrderRequest {
+        BrokerOrderRequest {
+            order_id: ORDER_ID.into(),
+            symbol: "BTCUSDT".into(),
+            native_id: Some("BTC".into()),
+            quantity,
+            side: side.into(),
+            order_type: order_type.into(),
+            time_in_force: tif.into(),
+            limit_price,
+            external_account_ref: String::new(),
+        }
+    }
+
+    fn sample(name: &str) -> serde_json::Value {
+        let text = match name {
+            "open_orders" => include_str!("testdata/bybit/open_orders.json"),
+            "order_history" => include_str!("testdata/bybit/order_history.json"),
+            "tickers_spot" => include_str!("testdata/bybit/tickers_spot.json"),
+            other => panic!("no sample {other}"),
+        };
+        envelope(serde_json::from_str(text).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn decimal_drops_float_noise_and_trailing_zeros() {
+        assert_eq!(decimal(0.1 + 0.2), "0.3");
+        assert_eq!(decimal(0.00001), "0.00001");
+        assert_eq!(decimal(2.0), "2");
+        assert_eq!(decimal(65000.5), "65000.5");
+    }
+
+    #[test]
+    fn market_buy_is_sized_in_the_base_coin() {
+        let b = order_body(&req("market", "buy", 0.001, None, "day")).unwrap();
+        assert_eq!(b["category"], "spot");
+        assert_eq!(b["symbol"], "BTCUSDT");
+        assert_eq!(b["side"], "Buy");
+        assert_eq!(b["orderType"], "Market");
+        assert_eq!(b["qty"], "0.001");
+        assert_eq!(b["marketUnit"], "baseCoin");
+        assert_eq!(b["orderLinkId"], ORDER_ID);
+    }
+
+    #[test]
+    fn limit_carries_price_and_maps_day_to_gtc() {
+        let b = order_body(&req("limit", "sell", 1.5, Some(65000.5), "day")).unwrap();
+        assert_eq!(b["side"], "Sell");
+        assert_eq!(b["orderType"], "Limit");
+        assert_eq!(b["price"], "65000.5");
+        assert_eq!(b["timeInForce"], "GTC");
+        assert_eq!(order_body(&req("limit", "buy", 1.0, Some(1.0), "ioc")).unwrap()["timeInForce"], "IOC");
+        assert_eq!(order_body(&req("limit", "buy", 1.0, Some(1.0), "fok")).unwrap()["timeInForce"], "FOK");
+        assert!(order_body(&req("limit", "buy", 1.0, None, "gtc")).is_err());
+        assert!(order_body(&req("stop", "buy", 1.0, None, "gtc")).is_err());
+    }
+
+    #[test]
+    fn submit_rejection_surfaces_retmsg() {
+        let e = envelope(serde_json::json!({"retCode":170136,"retMsg":"Order quantity exceeded lower limit.","result":{}}))
+            .unwrap_err();
+        assert!(e.to_string().contains("lower limit"), "{e}");
+    }
+
+    #[test]
+    fn order_status_maps_every_bybit_terminal_state() {
+        assert_eq!(order_outcome("Filled"), BrokerOrderOutcome::Filled);
+        assert_eq!(order_outcome("Cancelled"), BrokerOrderOutcome::Canceled);
+        assert_eq!(order_outcome("PartiallyFilledCanceled"), BrokerOrderOutcome::Canceled);
+        assert_eq!(order_outcome("Deactivated"), BrokerOrderOutcome::Canceled);
+        assert_eq!(order_outcome("Rejected"), BrokerOrderOutcome::Rejected);
+        assert_eq!(order_outcome("New"), BrokerOrderOutcome::Working);
+        assert_eq!(order_outcome("PartiallyFilled"), BrokerOrderOutcome::Working);
+    }
+
+    #[test]
+    fn open_orders_and_order_state_read_cum_exec_qty_and_avg_price() {
+        let open = parse_open_orders(&sample("open_orders"));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].client_order_id, ORDER_ID);
+        assert_eq!(open[0].symbol, "BTCUSDT");
+        assert_eq!(open[0].executed_qty, 0.0005);
+
+        let history = sample("order_history");
+        let filled = parse_order_state(&history["list"][0]);
+        assert_eq!(filled.outcome, BrokerOrderOutcome::Filled);
+        assert_eq!(filled.executed_qty, 0.001);
+        assert_eq!(filled.avg_px, 65000.0);
+        let cancelled = parse_order_state(&history["list"][1]);
+        assert_eq!(cancelled.outcome, BrokerOrderOutcome::Canceled);
+        assert_eq!(cancelled.avg_px, 0.0); // avgPrice "" when nothing filled
+
+        let prev = parse_prev_prices(&sample("tickers_spot"), &["BTCUSDT".to_string(), "BADUSDT".to_string()]);
+        assert_eq!(prev, vec![("BTCUSDT".to_string(), 64000.0)]);
+    }
 
     #[test]
     fn signature_matches_a_known_answer() {

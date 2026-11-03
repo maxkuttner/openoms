@@ -1,0 +1,5 @@
+{"retCode":0,"retMsg":"OK","result":{"category":"spot","list":[
+ {"symbol":"BTCUSDT","lastPrice":"65100","prevPrice24h":"64000","price24hPcnt":"0.0171"},
+ {"symbol":"ETHUSDT","lastPrice":"3050","prevPrice24h":"3000","price24hPcnt":"0.0166"},
+ {"symbol":"BADUSDT","lastPrice":"1","prevPrice24h":"","price24hPcnt":"0"}
+]},"retExtInfo":{},"time":1700000000000}
