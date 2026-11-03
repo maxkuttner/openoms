@@ -1085,6 +1085,7 @@ async fn serve() {
         alpaca_creds,
         binance_rest_adapters,
         bybit_adapters,
+        coinbase_adapters,
     } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &registration_deps).await;
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
@@ -1192,6 +1193,9 @@ async fn serve() {
     // the same call a reload makes, so boot and reload cannot drift apart.
     for (env_name, adapter) in bybit_adapters {
         reload::restart_bybit_stream(env_name, adapter, &registration_deps, state.streams()).await;
+    }
+    for (env_name, adapter) in coinbase_adapters {
+        reload::restart_coinbase_stream(env_name, adapter, &registration_deps, state.streams()).await;
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside

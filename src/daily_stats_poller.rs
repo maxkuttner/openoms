@@ -20,7 +20,7 @@ const POLL_INTERVAL_SECS: u64 = 300;
 /// Crypto venue codes seeded outside the ISO 10383 MIC registry (see
 /// `db/scripts/seed_crypto_venues.sql`) — everything else in `instrument.venue`
 /// is an equity MIC.
-const CRYPTO_VENUES: &[&str] = &["BINANCE", "BYBIT"];
+const CRYPTO_VENUES: &[&str] = &["BINANCE", "BYBIT", "COINBASE"];
 
 /// Which venues a broker_code's adapter can actually be asked about.
 ///
@@ -39,6 +39,7 @@ fn broker_serves_venue(broker_code: &str, venue: &str) -> bool {
     match broker_code {
         "BINANCE" => venue == "BINANCE",
         "BYBIT" => venue == "BYBIT",
+        "COINBASE" => venue == "COINBASE",
         "ALPACA" => !CRYPTO_VENUES.contains(&venue),
         // Any other/future broker_code (e.g. IBKR): not wired for daily
         // stats yet, so it serves nothing here rather than guessing.
@@ -243,6 +244,13 @@ pub async fn run(pool: PgPool, registry: Arc<ArcSwap<BrokerRegistry>>, stats: Da
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coinbase_serves_only_coinbase_symbols() {
+        assert!(broker_serves_venue("COINBASE", "COINBASE"));
+        assert!(!broker_serves_venue("COINBASE", "BINANCE"));
+        assert!(!broker_serves_venue("ALPACA", "COINBASE"), "Alpaca must not be asked about Coinbase products");
+    }
 
     #[test]
     fn bybit_serves_only_bybit_symbols_for_daily_stats() {

@@ -18,7 +18,9 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::alpaca_stream;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::bybit::BybitAdapter;
+use crate::adapters::coinbase::CoinbaseAdapter;
 use crate::bybit_stream;
+use crate::coinbase_stream;
 use crate::adapters::{BrokerRegistry, Transport};
 use crate::app_state::{AppState, DoorbellRegistry, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
@@ -78,8 +80,9 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             // REST order entry plus a private WebSocket that `restart_bybit_stream`
             // can stop and start at will: nothing forces a restart, on reload or boot.
             BrokerCredentials::Bybit { .. } => ConnectionOutcome::Registered,
-            // Not wired for trading until registration lands (plan Task 6).
-            BrokerCredentials::Coinbase { .. } => ConnectionOutcome::Failed("Coinbase trading is not wired yet".into()),
+            // Same as Bybit: REST orders plus a private WebSocket that
+            // `restart_coinbase_stream` can stop and start at will.
+            BrokerCredentials::Coinbase { .. } => ConnectionOutcome::Registered,
             BrokerCredentials::IbkrFix { .. } | BrokerCredentials::BinanceFix { .. } => {
                 if is_boot {
                     ConnectionOutcome::Registered
@@ -155,6 +158,9 @@ pub struct RegistrationOutput {
     /// Bybit adapters built fresh this pass, one per environment, whose private
     /// stream the caller (re)starts — on reload as well as at boot.
     pub bybit_adapters: Vec<(&'static str, Arc<BybitAdapter>)>,
+    /// Coinbase adapters built fresh this pass (LIVE only), whose user stream
+    /// the caller (re)starts — on reload as well as at boot.
+    pub coinbase_adapters: Vec<(&'static str, Arc<CoinbaseAdapter>)>,
 }
 
 /// Turn every broker connection into an entry in a fresh `BrokerRegistry`.
@@ -183,6 +189,7 @@ pub async fn build_registry(
     let mut alpaca_creds: HashMap<&'static str, (String, String)> = HashMap::new();
     let mut binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)> = Vec::new();
     let mut bybit_adapters: Vec<(&'static str, Arc<BybitAdapter>)> = Vec::new();
+    let mut coinbase_adapters: Vec<(&'static str, Arc<CoinbaseAdapter>)> = Vec::new();
     let mut report = ReloadReport { connections: Vec::new() };
 
     for conn in connections {
@@ -262,8 +269,20 @@ pub async fn build_registry(
                     );
                 }
                 match creds {
-                    // `classify` reports Failed until plan Task 6 registers it.
-                    BrokerCredentials::Coinbase { .. } => {}
+                    BrokerCredentials::Coinbase { api_key, private_key } => {
+                        match CoinbaseAdapter::new(api_key.clone(), private_key) {
+                            Ok(adapter) => {
+                                let adapter = Arc::new(adapter);
+                                registry.register("COINBASE", env_name, adapter.clone());
+                                coinbase_adapters.push((env_name, adapter));
+                                info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered COINBASE/{env_name} adapter (REST/WS)");
+                            }
+                            Err(e) => {
+                                error!(code = %conn.code, "Coinbase adapter not registered: {e}");
+                                outcome = ConnectionOutcome::Failed(format!("Coinbase adapter not registered: {e}"));
+                            }
+                        }
+                    }
                     BrokerCredentials::Bybit { api_key, api_secret } => {
                         let adapter = Arc::new(BybitAdapter::new(api_key.clone(), api_secret.clone(), env_name));
                         registry.register("BYBIT", env_name, adapter.clone());
@@ -367,7 +386,7 @@ pub async fn build_registry(
         report.connections.push((conn.code.clone(), outcome));
     }
 
-    RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters, bybit_adapters }
+    RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters, bybit_adapters, coinbase_adapters }
 }
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
@@ -441,6 +460,10 @@ pub(crate) fn bybit_exec_stream_code(env_name: &str) -> String {
     format!("bybit-{}:exec", env_name.to_lowercase())
 }
 
+pub(crate) fn coinbase_exec_stream_code(env_name: &str) -> String {
+    format!("coinbase-{}:exec", env_name.to_lowercase())
+}
+
 /// The network boundary of reload. Store reads, classification, serialization,
 /// swaps and stops remain real in integration tests; only new external sessions
 /// are substituted with controlled tasks.
@@ -459,6 +482,14 @@ pub(crate) trait ReloadStreams: Send + Sync + 'static {
         &self,
         environment: &'static str,
         adapter: Arc<BybitAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    );
+
+    async fn coinbase(
+        &self,
+        environment: &'static str,
+        adapter: Arc<CoinbaseAdapter>,
         deps: &RegistrationDeps,
         streams: &StreamRegistry,
     );
@@ -489,6 +520,16 @@ impl ReloadStreams for LiveReloadStreams {
         streams: &StreamRegistry,
     ) {
         restart_bybit_stream(environment, adapter, deps, streams).await;
+    }
+
+    async fn coinbase(
+        &self,
+        environment: &'static str,
+        adapter: Arc<CoinbaseAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    ) {
+        restart_coinbase_stream(environment, adapter, deps, streams).await;
     }
 
     async fn databento(&self, api_key: String, state: &AppState) {
@@ -560,6 +601,29 @@ pub async fn restart_bybit_stream(
     let health = deps.stream_health.handle("BYBIT", env_name, StreamKind::Execution);
     health.set_connecting();
     let handle = tokio::spawn(bybit_stream::run(
+        env_name,
+        deps.pool.clone(),
+        deps.kafka.clone(),
+        adapter,
+        health,
+        deps.position_changed_tx.clone(),
+    ));
+    streams.insert(code, handle);
+}
+
+/// (Re)start the Coinbase user stream against a freshly built `adapter` — the
+/// same shape as `restart_bybit_stream`.
+pub async fn restart_coinbase_stream(
+    env_name: &'static str,
+    adapter: Arc<CoinbaseAdapter>,
+    deps: &RegistrationDeps,
+    streams: &StreamRegistry,
+) {
+    let code = coinbase_exec_stream_code(env_name);
+    streams.abort_and_remove(&code).await;
+    let health = deps.stream_health.handle("COINBASE", env_name, StreamKind::Execution);
+    health.set_connecting();
+    let handle = tokio::spawn(coinbase_stream::run(
         env_name,
         deps.pool.clone(),
         deps.kafka.clone(),
@@ -838,6 +902,44 @@ mod tests {
         );
         assert!(matches!(classify(&c, false), ConnectionOutcome::Registered));
         assert!(matches!(classify(&c, true), ConnectionOutcome::Registered));
+    }
+
+    fn coinbase_conn() -> Connection<BrokerCredentials> {
+        let pem = p256::SecretKey::random(&mut rand::thread_rng())
+            .to_sec1_pem(p256::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let mut c = conn(
+            "coinbase-live",
+            "ACTIVE",
+            CredentialState::Configured(BrokerCredentials::Coinbase { api_key: "organizations/o/apiKeys/k".into(), private_key: pem }),
+        );
+        c.environment = Some("LIVE".into());
+        c
+    }
+
+    #[test]
+    fn a_coinbase_credential_applies_on_reload_without_a_restart() {
+        assert!(matches!(classify(&coinbase_conn(), false), ConnectionOutcome::Registered));
+    }
+
+    #[test]
+    fn coinbase_exec_stream_code_is_its_own() {
+        assert_eq!(coinbase_exec_stream_code("LIVE"), "coinbase-live:exec");
+        assert_ne!(coinbase_exec_stream_code("LIVE"), bybit_exec_stream_code("LIVE"));
+    }
+
+    #[tokio::test]
+    async fn a_configured_coinbase_connection_is_registered_and_handed_back() {
+        let deps = RegistrationDeps {
+            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            stream_health: StreamHealthRegistry::new(),
+            kafka: None,
+            position_changed_tx: None,
+        };
+        let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
+        assert!(out.registry.get("COINBASE", "LIVE").is_some());
+        assert_eq!(out.coinbase_adapters.iter().map(|(env, _)| *env).collect::<Vec<_>>(), ["LIVE"]);
     }
 
     #[test]

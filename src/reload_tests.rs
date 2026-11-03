@@ -108,6 +108,13 @@ impl ReloadStreams for FakeStreams {
         self.spawn(&code, streams);
     }
 
+    async fn coinbase(&self, environment: &'static str, _: Arc<crate::adapters::coinbase::CoinbaseAdapter>,
+        _: &RegistrationDeps, streams: &StreamRegistry) {
+        let code = reload::coinbase_exec_stream_code(environment);
+        streams.abort_and_remove(&code).await;
+        self.spawn(&code, streams);
+    }
+
     async fn databento(&self, _: String, state: &AppState) {
         state.streams().abort_and_remove("databento-opra").await;
         self.spawn("databento-opra", state.streams());

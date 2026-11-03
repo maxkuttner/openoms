@@ -1334,6 +1334,7 @@ async fn apply_reload(
         // outside of boot. Nothing to spawn a stream for.
         binance_rest_adapters: _binance_rest_adapters,
         bybit_adapters,
+        coinbase_adapters,
     } = reload::build_registry(&broker_connections, false, &current, &deps).await;
     drop(current);
 
@@ -1412,6 +1413,10 @@ async fn apply_reload(
     for (env_name, adapter) in bybit_adapters {
         streams.bybit(env_name, adapter, &deps, state.streams()).await;
     }
+    // Coinbase follows the same rule.
+    for (env_name, adapter) in coinbase_adapters {
+        streams.coinbase(env_name, adapter, &deps, state.streams()).await;
+    }
 
     // Reconcile known execution tasks against the resulting registry, not just
     // input rows: a deleted row has no iteration in the loop above. Binance REST
@@ -1425,6 +1430,9 @@ async fn apply_reload(
         }
         if state.registry().get("BYBIT", env_name).is_none() {
             stop_execution_stream(&state, "BYBIT", env_name, &reload::bybit_exec_stream_code(env_name)).await;
+        }
+        if state.registry().get("COINBASE", env_name).is_none() {
+            stop_execution_stream(&state, "COINBASE", env_name, &reload::coinbase_exec_stream_code(env_name)).await;
         }
     }
 

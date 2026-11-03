@@ -66,10 +66,6 @@ impl CoinbaseAdapter {
         Ok(Self { client, key_name, signing_key: SigningKey::from(&secret) })
     }
 
-    pub fn key_name(&self) -> &str {
-        &self.key_name
-    }
-
     /// A fresh ES256 token; `uri` for REST calls, `None` for the WebSocket.
     pub fn jwt(&self, uri: Option<&str>) -> String {
         let mut nonce = [0u8; 16];
