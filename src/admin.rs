@@ -576,6 +576,18 @@ pub async fn update_account(
 /// but doesn't match one of those literals passes reload silently and then
 /// 503s every order routed through it — see `setup::brokers::known_broker_codes`
 /// for why the accepted set is sourced from there rather than repeated here.
+/// A connection may only use an environment its venue offers (Coinbase: LIVE).
+fn validate_environment(broker_code: &str, environment: &str) -> Result<(), AdminError> {
+    if crate::venues::environment_allowed(broker_code, environment) {
+        Ok(())
+    } else {
+        Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("{broker_code} does not offer a {environment} environment"),
+        })
+    }
+}
+
 fn validate_broker_code(code: &str) -> Result<(), AdminError> {
     let known = crate::setup::brokers::known_broker_codes();
     if known.contains(&code) {
@@ -609,6 +621,7 @@ pub async fn create_broker_connection(
         });
     }
     validate_broker_code(&payload.broker_code)?;
+    validate_environment(&payload.broker_code, &payload.environment)?;
     info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
@@ -789,6 +802,21 @@ pub async fn update_broker_connection(
     }
     if let Some(ref broker_code) = payload.broker_code {
         validate_broker_code(broker_code)?;
+    }
+    if payload.broker_code.is_some() || payload.environment.is_some() {
+        // Judge the pair the row will end up with, filling in what isn't changing.
+        let current: Option<(String, String)> =
+            sqlx::query_as("SELECT broker_code, environment FROM broker_connection WHERE code = $1")
+                .bind(&code)
+                .fetch_optional(state.pool())
+                .await
+                .map_err(map_db_error)?;
+        if let Some((broker_code, environment)) = current {
+            validate_environment(
+                payload.broker_code.as_deref().unwrap_or(&broker_code),
+                payload.environment.as_deref().unwrap_or(&environment),
+            )?;
+        }
     }
     info!(broker_connection_code = %code, "admin update broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(

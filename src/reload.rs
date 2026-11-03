@@ -269,6 +269,12 @@ pub async fn build_registry(
                     );
                 }
                 match creds {
+                    // Coinbase has no paper venue: its adapter always talks to live
+                    // api.coinbase.com, so a non-LIVE label would hide real-money orders.
+                    BrokerCredentials::Coinbase { .. } if env_name != "LIVE" => {
+                        error!(code = %conn.code, environment = env_name, "Coinbase connection is not LIVE, adapter not registered");
+                        outcome = ConnectionOutcome::Failed("Coinbase is LIVE only; this connection's environment is not LIVE".into());
+                    }
                     BrokerCredentials::Coinbase { api_key, private_key } => {
                         match CoinbaseAdapter::new(api_key.clone(), private_key) {
                             Ok(adapter) => {
@@ -921,6 +927,22 @@ mod tests {
     #[test]
     fn a_coinbase_credential_applies_on_reload_without_a_restart() {
         assert!(matches!(classify(&coinbase_conn(), false), ConnectionOutcome::Registered));
+    }
+
+    #[tokio::test]
+    async fn coinbase_credentials_on_a_paper_connection_are_refused() {
+        let mut c = coinbase_conn();
+        c.environment = Some("PAPER".into());
+        let deps = RegistrationDeps {
+            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            stream_health: StreamHealthRegistry::new(),
+            kafka: None,
+            position_changed_tx: None,
+        };
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
+        assert!(out.registry.get("COINBASE", "PAPER").is_none());
+        assert!(out.coinbase_adapters.is_empty());
+        assert!(matches!(&out.report.connections[0].1, ConnectionOutcome::Failed(m) if m.contains("LIVE")));
     }
 
     #[test]

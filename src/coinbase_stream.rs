@@ -5,13 +5,12 @@
 //! subscribe to `user` (orders) and `heartbeats` (keeps an idle connection open),
 //! each with a fresh JWT. Coinbase reports **cumulative** order state —
 //! `cumulative_quantity` and `avg_price` — not one message per fill. A fill is
-//! therefore "Coinbase cumulative − what the OMS has booked"
-//! ([`crate::recon_orders::apply_broker_progress`]), so a repeated or replayed
-//! update books nothing; the execution path has no execution-id dedupe to lean
-//! on. A terminal status goes through
+//! therefore "Coinbase cumulative − what the OMS has booked", priced against
+//! the OMS's booked average ([`crate::recon_orders::apply_broker_progress`]), so
+//! a repeated, replayed or reordered update books nothing and needs no memory of
+//! earlier messages; the execution path has no execution-id dedupe to lean on. A terminal status goes through
 //! [`crate::recon_orders::apply_broker_terminal`]: book what's missing, then close.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -110,19 +109,6 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
         .collect()
 }
 
-/// The price of the newly filled quantity, from two cumulative states:
-/// `(avg·cum − avg₀·cum₀) / (cum − cum₀)`; the new average when there is no
-/// earlier state or no new quantity.
-pub(crate) fn fill_price(prev: Option<(f64, f64)>, cum: f64, avg: f64) -> f64 {
-    match prev {
-        Some((cum0, avg0)) if cum - cum0 > 1e-12 => {
-            let price = (avg * cum - avg0 * cum0) / (cum - cum0);
-            if price.is_finite() && price > 0.0 { price } else { avg }
-        }
-        _ => avg,
-    }
-}
-
 async fn connect_and_run(
     adapter: &CoinbaseAdapter,
     pool: &PgPool,
@@ -137,9 +123,6 @@ async fn connect_and_run(
         ws.send(Message::Text(msg.to_string())).await?;
     }
 
-    // Last cumulative (quantity, average) seen per order on this connection, to
-    // price each increment; a fresh connection starts from the averages.
-    let mut last: HashMap<Uuid, (f64, f64)> = HashMap::new();
     let mut live = false;
     let mut sweep = tokio::time::interval(Duration::from_secs(RECONCILE_SECS));
     sweep.tick().await; // consume the immediate first tick
@@ -186,13 +169,9 @@ async fn connect_and_run(
         for (order_id, update) in updates(&v) {
             match update {
                 Update::Progress { cum, avg } => {
-                    let price = fill_price(last.get(&order_id).copied(), cum, avg);
-                    last.insert(order_id, (cum, avg));
-                    apply_broker_progress(pool, kafka, order_id, cum, price, VENUE, "coinbase", position_changed_tx).await;
+                    apply_broker_progress(pool, kafka, order_id, cum, avg, VENUE, "coinbase", position_changed_tx).await;
                 }
-                Update::Terminal(mut st) => {
-                    // Price whatever is still missing at the last increment's price.
-                    st.avg_px = fill_price(last.remove(&order_id), st.executed_qty, st.avg_px);
+                Update::Terminal(st) => {
                     apply_broker_terminal(pool, kafka, order_id, &st, VENUE, "coinbase", position_changed_tx).await;
                 }
             }
@@ -287,12 +266,6 @@ mod tests {
         assert_eq!(missing_qty(0.001, 0.0005), None, "an older update after a newer one");
     }
 
-    #[test]
-    fn fill_price_is_the_price_of_the_increment() {
-        assert!((fill_price(Some((1.0, 100.0)), 3.0, 102.0) - 103.0).abs() < 1e-9);
-        assert_eq!(fill_price(None, 3.0, 102.0), 102.0);
-        assert_eq!(fill_price(Some((3.0, 102.0)), 3.0, 102.0), 102.0, "no new quantity");
-    }
 
     #[test]
     fn a_non_uuid_client_order_id_is_ignored() {

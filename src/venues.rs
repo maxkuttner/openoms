@@ -94,6 +94,16 @@ fn environments(paper: &'static str, paper_keys: Option<&'static str>, live_keys
     ]
 }
 
+/// Whether a broker connection for `broker_code` may run in `environment` —
+/// only the environments its venue offers (Coinbase: LIVE only, so a "PAPER"
+/// Coinbase connection, which would still trade real money, is refused).
+pub fn environment_allowed(broker_code: &str, environment: &str) -> bool {
+    venues()
+        .iter()
+        .find(|v| v.code == broker_code)
+        .is_some_and(|v| v.environments.iter().any(|e| e.code == environment))
+}
+
 pub fn venues() -> Vec<Venue> {
     vec![
         Venue {
@@ -252,6 +262,16 @@ mod tests {
         assert_eq!(fields, [("api_key", "API key", true, None), ("api_secret", "API secret", true, None)]);
         assert_eq!(bybit.environments[0].label, "spot testnet");
         assert_eq!(bybit.environments[0].keys_url, Some("https://testnet.bybit.com/app/user/api-management"));
+    }
+
+    // A Coinbase connection labelled PAPER would still trade real money.
+    #[test]
+    fn a_connection_may_only_use_an_environment_its_venue_offers() {
+        assert!(environment_allowed("COINBASE", "LIVE"));
+        assert!(!environment_allowed("COINBASE", "PAPER"));
+        assert!(environment_allowed("BINANCE", "PAPER"));
+        assert!(environment_allowed("BINANCE", "LIVE"));
+        assert!(!environment_allowed("NOSUCHBROKER", "LIVE"));
     }
 
     #[test]

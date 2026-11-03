@@ -47,6 +47,9 @@ pub struct OmsWorkingOrder {
     /// broker about this order.
     pub ext_id: String,
     pub cum_qty: f64,
+    /// Average price of what the OMS has booked so far (`None` before any fill),
+    /// against which a missed quantity is priced.
+    pub avg_px: Option<f64>,
 }
 
 /// One order the broker currently reports as open, normalized across transports.
@@ -144,6 +147,7 @@ pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<Om
     // rather than two per-order lookups (this runs on every reconnect + a 30s heartbeat).
     let rows = match sqlx::query(
         "SELECT os.order_id, bi.broker_symbol AS symbol, os.cum_qty::float8 AS cum_qty, \
+                os.avg_px::float8 AS avg_px, \
                 (SELECT payload_json->'payload'->>'external_order_id' \
                    FROM order_event \
                   WHERE order_id = os.order_id AND event_type = 'order_routed' \
@@ -176,6 +180,7 @@ pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<Om
             symbol: row.get("symbol"),
             ext_id,
             cum_qty: row.get("cum_qty"),
+            avg_px: row.get("avg_px"),
         });
     }
     out
@@ -208,6 +213,7 @@ pub async fn run_order_reconcile(
         return;
     }
 
+    let booked_avg: HashMap<Uuid, Option<f64>> = oms.iter().map(|o| (o.order_id, o.avg_px)).collect();
     for action in plan_order_recon(&oms, &broker_open) {
         match action {
             ReconAction::ResolveTerminal { order_id, symbol, ext_id, oms_cum } => {
@@ -218,7 +224,8 @@ pub async fn run_order_reconcile(
                         continue;
                     }
                 };
-                apply_terminal(pool, kafka, order_id, oms_cum, &st, broker_code, actor, position_changed_tx)
+                let oms_avg = booked_avg.get(&order_id).copied().flatten();
+                apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, &st, broker_code, actor, position_changed_tx)
                     .await;
             }
             ReconAction::PartialDrift { order_id, oms_cum, broker_executed } => {
@@ -245,15 +252,32 @@ pub(crate) fn missing_qty(oms_cum: f64, broker_cum: f64) -> Option<f64> {
     (missing > EPS).then_some(missing)
 }
 
-/// The OMS's own cumulative fill for one order; `None` (logged) when the order is
-/// unknown or unreadable.
-async fn oms_cum_qty(pool: &PgPool, order_id: Uuid) -> Option<f64> {
-    match sqlx::query_scalar("SELECT cum_qty::float8 FROM order_state WHERE order_id = $1")
-        .bind(order_id)
-        .fetch_optional(pool)
-        .await
+/// The price of the quantity the broker has filled beyond what the OMS booked,
+/// from the two cumulative states: `(avg_b·cum_b − avg_oms·cum_oms) / (cum_b −
+/// cum_oms)`. Falls back to the broker's average when nothing is booked, no
+/// booked price is known, nothing is missing, or the result isn't a positive price.
+pub(crate) fn increment_price(oms_cum: f64, oms_avg: Option<f64>, broker_cum: f64, broker_avg: f64) -> f64 {
+    let missing = broker_cum - oms_cum;
+    match oms_avg {
+        Some(oms_avg) if oms_cum > EPS && missing > EPS => {
+            let price = (broker_avg * broker_cum - oms_avg * oms_cum) / missing;
+            if price.is_finite() && price > 0.0 { price } else { broker_avg }
+        }
+        _ => broker_avg,
+    }
+}
+
+/// The OMS's own booked state for one order — cumulative quantity and average
+/// price; `None` (logged) when the order is unknown or unreadable.
+async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64, Option<f64>)> {
+    match sqlx::query_as::<_, (f64, Option<f64>)>(
+        "SELECT cum_qty::float8, avg_px::float8 FROM order_state WHERE order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
     {
-        Ok(Some(cum)) => Some(cum),
+        Ok(Some(state)) => Some(state),
         Ok(None) => {
             warn!(order_id = %order_id, "broker update for an order the OMS doesn't have");
             None
@@ -278,32 +302,32 @@ pub(crate) async fn apply_broker_terminal(
     actor: &str,
     position_changed_tx: Option<&mpsc::Sender<()>>,
 ) {
-    let Some(oms_cum) = oms_cum_qty(pool, order_id).await else { return };
-    apply_terminal(pool, kafka, order_id, oms_cum, st, venue, actor, position_changed_tx).await;
+    let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
+    apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, st, venue, actor, position_changed_tx).await;
 }
 
 /// Book a still-working order's progress from a venue that reports cumulative
 /// state rather than individual fills (Coinbase): whatever `broker_cum` holds
-/// beyond what the OMS has booked becomes one fill at `fill_price`. A repeated
-/// update books nothing, which is what makes this safe without execution-id
-/// dedupe.
+/// beyond what the OMS has booked becomes one fill, priced against the OMS's
+/// booked average ([`increment_price`]). A repeated update books nothing, which
+/// is what makes this safe without execution-id dedupe.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_broker_progress(
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
     order_id: Uuid,
     broker_cum: f64,
-    fill_price: f64,
+    broker_avg: f64,
     venue: &str,
     actor: &str,
     position_changed_tx: Option<&mpsc::Sender<()>>,
 ) {
-    let Some(oms_cum) = oms_cum_qty(pool, order_id).await else { return };
+    let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
     let Some(fill_qty) = missing_qty(oms_cum, broker_cum) else { return };
     let report = ExecutionReport::Fill {
         execution_id: format!("{venue}-{order_id}-{broker_cum}"),
         fill_qty,
-        fill_price,
+        fill_price: increment_price(oms_cum, oms_avg, broker_cum, broker_avg),
         venue: venue.to_string(),
     };
     if let Err(e) = process_execution_report(pool, kafka, order_id, report, actor, position_changed_tx).await {
@@ -312,14 +336,17 @@ pub(crate) async fn apply_broker_progress(
 }
 
 /// Apply the terminal outcome of an order that dropped out of the open-order set.
-/// Emits the missed fill (full executed − OMS cum) first, then the close, so a
-/// partial-then-canceled order books its trade before releasing the remainder. The
-/// terminal-state guard in [`process_execution_report`] makes every step replay-safe.
+/// Emits the missed fill (full executed − OMS cum, priced against the OMS's
+/// booked average) first, then the close, so a partial-then-canceled order books
+/// its trade before releasing the remainder. The terminal-state guard in
+/// [`process_execution_report`] makes every step replay-safe.
+#[allow(clippy::too_many_arguments)]
 async fn apply_terminal(
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
     order_id: Uuid,
     oms_cum: f64,
+    oms_avg: Option<f64>,
     st: &BrokerOrderState,
     venue: &str,
     actor: &str,
@@ -337,7 +364,7 @@ async fn apply_terminal(
         apply(ExecutionReport::Fill {
             execution_id: format!("recon-{order_id}"),
             fill_qty: missed,
-            fill_price: st.avg_px,
+            fill_price: increment_price(oms_cum, oms_avg, st.executed_qty, st.avg_px),
             venue: venue.to_string(),
         })
         .await;
@@ -367,8 +394,20 @@ async fn apply_terminal(
 mod tests {
     use super::*;
 
+    // The missing quantity is priced from the OMS's own booked state, not from
+    // whatever a connection happened to see: 0.5 booked @100, Coinbase now says
+    // 1.0 @105 average, so the missing 0.5 filled @110.
+    #[test]
+    fn the_missing_quantity_is_priced_against_what_the_oms_booked() {
+        assert!((increment_price(0.5, Some(100.0), 1.0, 105.0) - 110.0).abs() < 1e-9);
+        assert_eq!(increment_price(0.0, None, 1.0, 105.0), 105.0, "nothing booked yet: the broker's average");
+        assert_eq!(increment_price(0.5, None, 1.0, 105.0), 105.0, "no booked price known: the broker's average");
+        assert_eq!(increment_price(1.0, Some(100.0), 1.0, 105.0), 105.0, "no missing quantity");
+        assert_eq!(increment_price(0.5, Some(300.0), 1.0, 105.0), 105.0, "a negative increment price falls back");
+    }
+
     fn oms(id: Uuid, cum: f64) -> OmsWorkingOrder {
-        OmsWorkingOrder { order_id: id, symbol: "BTCUSDT".into(), ext_id: "9".into(), cum_qty: cum }
+        OmsWorkingOrder { order_id: id, symbol: "BTCUSDT".into(), ext_id: "9".into(), cum_qty: cum, avg_px: None }
     }
     fn open(id: &str, executed: f64) -> BrokerOpenOrder {
         BrokerOpenOrder { client_order_id: id.into(), symbol: "BTCUSDT".into(), executed_qty: executed }
