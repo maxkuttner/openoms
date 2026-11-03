@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "@mantine/form";
 import {
+  Accordion,
   Alert,
+  Anchor,
   Badge,
   Button,
   Checkbox,
@@ -16,7 +18,8 @@ import {
   Textarea,
 } from "@mantine/core";
 import { api, ApiError } from "../api/client";
-import { notifyError, notifyOk } from "../api/hooks";
+import { notifyError, notifyOk, useList } from "../api/hooks";
+import { groupFields, initialValues, sectionStartsOpen, type Venue, type VenueField } from "../venues";
 import type { ConnectionOutcome, RedactedCredentials, SaveResponse, TestResponse } from "../api/types";
 import type { UniverseStatus } from "../api/jobs";
 import { loadUniverse } from "./UniverseStatus";
@@ -37,68 +40,30 @@ type Props = {
   /** `broker_code` for a broker connection, `provider` for a feed connection —
    * selects which field list applies. */
   providerCode: string;
+  /** A broker connection's environment: picks the venue's pre-fill and keys page. */
+  environment?: string;
 };
 
-// ---------------------------------------------------------------------------
-// Field map — THE one piece of duplicated knowledge in this design.
-//
-// The server only tells the cockpit the field list when a credential is
-// already `configured` (`RedactedCredentials.fields`). When it is
-// `unconfigured` (or `error`, which is parsed exactly like unconfigured — see
-// `parse_broker`/`parse_feed`'s `existing: None` case in
-// src/credentials_api.rs), the server sends an empty `fields` array and the
-// form has nothing to build itself from. So the client must know, per
-// broker/feed kind, which fields exist and which are secret.
-//
-// This must be kept in sync BY HAND with:
-//   - src/credentials.rs: `BrokerCredentials` / `FeedCredentials` enum
-//     variants (the field names and which exist at all)
-//   - src/credentials.rs: `Redact for BrokerCredentials` / `FeedCredentials`
-//     (`shown(...)` = not secret, `hidden(...)` = secret)
-//   - src/credentials_api.rs: `parse_broker` / `parse_feed` (the `kind`
-//     strings — "ALPACA" / "IBKR" / "BINANCE" / "DATABENTO" — and which
-//     fields are required)
-//
-// Adding a broker or feed provider means adding an entry here too.
-// ---------------------------------------------------------------------------
-
-type FieldSpec = {
-  name: string;
-  label: string;
-  secret: boolean;
-  input: "text" | "checkbox" | "textarea";
-};
-
-const BROKER_FIELDS: Record<string, FieldSpec[]> = {
-  ALPACA: [
-    { name: "key", label: "Key ID", secret: false, input: "text" },
-    { name: "secret", label: "Secret", secret: true, input: "text" },
-  ],
-  IBKR: [
-    { name: "host", label: "Host", secret: false, input: "text" },
-    { name: "port", label: "Port", secret: false, input: "text" },
-    { name: "sender_comp_id", label: "Sender comp ID", secret: false, input: "text" },
-    { name: "target_comp_id", label: "Target comp ID", secret: false, input: "text" },
-    { name: "ssl", label: "SSL", secret: false, input: "checkbox" },
-    { name: "password", label: "Password", secret: true, input: "text" },
-  ],
-  BINANCE: [
-    { name: "host", label: "Host", secret: false, input: "text" },
-    { name: "port", label: "Port", secret: false, input: "text" },
-    { name: "sender_comp_id", label: "Sender comp ID", secret: false, input: "text" },
-    { name: "target_comp_id", label: "Target comp ID", secret: false, input: "text" },
-    { name: "api_key", label: "API key", secret: true, input: "text" },
-    { name: "private_key", label: "Private key (PEM)", secret: true, input: "textarea" },
+// Which fields each credential has and which are secret. A broker
+// connection's come from the server's venue list (`GET /admin/venues`,
+// src/venues.rs), whose tests hold them to `BrokerCredentials`; what each one
+// means is on the venue's docs page, linked at the top of the drawer.
+// Feeds are not in that list yet, so their one entry lives here and must match
+// src/credentials.rs's `FeedCredentials` and src/credentials_api.rs's
+// `parse_feed` by hand.
+const FEED_FIELDS: Record<string, VenueField[]> = {
+  DATABENTO: [
+    {
+      name: "api_key",
+      label: "API key",
+      secret: true,
+      input: "text",
+      section: null,
+      paper: null,
+      live: null,
+    },
   ],
 };
-
-const FEED_FIELDS: Record<string, FieldSpec[]> = {
-  DATABENTO: [{ name: "api_key", label: "API key", secret: true, input: "text" }],
-};
-
-function fieldSpecsFor(kind: CredentialsKind, providerCode: string): FieldSpec[] {
-  return (kind === "broker" ? BROKER_FIELDS : FEED_FIELDS)[providerCode] ?? [];
-}
 
 // ---------------------------------------------------------------------------
 
@@ -128,11 +93,16 @@ const STATE_COLOR: Record<RedactedCredentials["state"], string> = {
   error: "red",
 };
 
-export function CredentialsPanel({ kind, code, providerCode }: Props) {
+export function CredentialsPanel({ kind, code, providerCode, environment = "PAPER" }: Props) {
   const basePath = basePathFor(kind);
   const credPath = `${basePath}/${code}/credentials`;
   const testPath = `${credPath}/test`;
-  const specs = fieldSpecsFor(kind, providerCode);
+  const venues = useList<Venue>("/admin/venues", kind === "broker");
+  const venue = venues.data?.find((v) => v.code === providerCode);
+  const specs = (kind === "broker" ? venue?.fields : FEED_FIELDS[providerCode]) ?? [];
+  const keysUrl = venue?.environments.find((e) => e.code === environment)?.keys_url ?? null;
+  const layout = groupFields(specs);
+  const [openSections, setOpenSections] = useState<string[]>([]);
   const qc = useQueryClient();
 
   const { data, isLoading, isError, error } = useQuery<RedactedCredentials>({
@@ -181,25 +151,19 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
   );
 
   useEffect(() => {
-    const init: Record<string, string> = {};
-    for (const spec of specs) {
-      if (spec.secret) {
-        init[spec.name] = ""; // never prefilled — the server never sends a secret value
-        continue;
-      }
-      // Only a non-null `value` is prefillable. A masked identifier (Alpaca's
-      // key id) arrives with `value: null` and a `hint`, precisely so it is
-      // not prefilled — the merge rule reads any non-empty submission as a
-      // replacement, so a prefilled mask would overwrite the real value the
-      // first time the operator edited some other field.
-      const wire = wireByName.get(spec.name);
-      init[spec.name] = wire?.value ?? (spec.input === "checkbox" ? "true" : "");
-    }
+    // Only a non-null `value` is prefillable. A masked identifier (Alpaca's
+    // key id) arrives with `value: null` and a `hint`, precisely so it is not
+    // prefilled — the merge rule reads any non-empty submission as a
+    // replacement, so a prefilled mask would overwrite the real value the
+    // first time the operator edited some other field. The venue's pre-fill
+    // applies only while nothing is stored, for the same reason.
+    const init = initialValues(specs, isFresh ? environment : null, wireByName);
+    setOpenSections(layout.sections.filter((sec) => sectionStartsOpen(sec.fields, init)).map((sec) => sec.name));
     form.setValues(init);
     setLastTest(null);
     setLastSave(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [code, providerCode, data?.state, JSON.stringify(data?.fields)]);
+  }, [code, providerCode, environment, specs.length, data?.state, JSON.stringify(data?.fields)]);
 
   const testMut = useMutation({
     mutationFn: () => api.post<TestResponse>(testPath, undefined),
@@ -241,17 +205,61 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
     onError: notifyError,
   });
 
-  if (isLoading) return <Loader size="sm" />;
+  if (isLoading || venues.isLoading) return <Loader size="sm" />;
   if (isError || !data) {
     return <Alert color="red">Failed to load credentials{error instanceof ApiError ? `: ${error.message}` : ""}</Alert>;
   }
   if (specs.length === 0) {
     return (
       <Alert color="red">
-        No field definition for {kind} kind "{providerCode}" — add one to CredentialsPanel.tsx's field map.
+        No credential fields known for {kind} "{providerCode}". For a broker, add it to src/venues.rs.
       </Alert>
     );
   }
+
+  const renderField = (spec: VenueField) => {
+    const common = {
+      label: spec.label,
+      required: isFresh,
+      ...form.getInputProps(spec.name),
+    };
+    if (spec.input === "checkbox") {
+      return (
+        <Checkbox
+          key={spec.name}
+          label={spec.label}
+          checked={form.values[spec.name] === "true"}
+          onChange={(e) => form.setFieldValue(spec.name, e.currentTarget.checked ? "true" : "false")}
+        />
+      );
+    }
+    // A withheld field — secret or masked — shows what is installed
+    // (where there is a hint) and says blank means keep.
+    const hint = wireByName.get(spec.name)?.hint ?? null;
+    const placeholder = isFresh
+      ? undefined
+      : hint
+        ? `${hint} — leave blank to keep`
+        : spec.secret
+          ? "leave blank to keep"
+          : undefined;
+    if (spec.input === "textarea") {
+      return (
+        <Textarea
+          key={spec.name}
+          {...common}
+          placeholder={placeholder}
+          autosize
+          minRows={3}
+          styles={{ input: { fontFamily: "monospace" } }}
+        />
+      );
+    }
+    if (spec.secret) {
+      return <PasswordInput key={spec.name} {...common} placeholder={placeholder} />;
+    }
+    return <TextInput key={spec.name} {...common} />;
+  };
 
   const canTest = data.state === "configured";
   const canClear = data.state !== "unconfigured";
@@ -267,6 +275,22 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
         )}
       </Group>
 
+      {venue && (
+        <Text size="sm">
+          <Anchor href={venue.docs_url} target="_blank" rel="noreferrer">
+            Setup guide ↗
+          </Anchor>
+          {keysUrl && (
+            <>
+              {" · "}
+              <Anchor href={keysUrl} target="_blank" rel="noreferrer">
+                {venue.name} API keys ↗
+              </Anchor>
+            </>
+          )}
+        </Text>
+      )}
+
       {data.state === "error" && (
         <Alert color="red" title="Stored credential is unusable">
           {data.message ?? "unknown error"}
@@ -279,49 +303,19 @@ export function CredentialsPanel({ kind, code, providerCode }: Props) {
         })}
       >
         <Stack gap="xs">
-          {specs.map((spec) => {
-            const common = {
-              label: spec.label,
-              required: isFresh,
-              ...form.getInputProps(spec.name),
-            };
-            if (spec.input === "checkbox") {
-              return (
-                <Checkbox
-                  key={spec.name}
-                  label={spec.label}
-                  checked={form.values[spec.name] === "true"}
-                  onChange={(e) => form.setFieldValue(spec.name, e.currentTarget.checked ? "true" : "false")}
-                />
-              );
-            }
-            // A withheld field — secret or masked — shows what is installed
-            // (where there is a hint) and says blank means keep.
-            const hint = wireByName.get(spec.name)?.hint ?? null;
-            const placeholder = isFresh
-              ? undefined
-              : hint
-                ? `${hint} — leave blank to keep`
-                : spec.secret
-                  ? "leave blank to keep"
-                  : undefined;
-            if (spec.input === "textarea") {
-              return (
-                <Textarea
-                  key={spec.name}
-                  {...common}
-                  placeholder={placeholder}
-                  autosize
-                  minRows={3}
-                  styles={{ input: { fontFamily: "monospace" } }}
-                />
-              );
-            }
-            if (spec.secret) {
-              return <PasswordInput key={spec.name} {...common} placeholder={placeholder} />;
-            }
-            return <TextInput key={spec.name} {...common} />;
-          })}
+          {layout.main.map(renderField)}
+          {layout.sections.length > 0 && (
+            <Accordion multiple variant="contained" value={openSections} onChange={setOpenSections}>
+              {layout.sections.map((sec) => (
+                <Accordion.Item key={sec.name} value={sec.name}>
+                  <Accordion.Control>{sec.name}</Accordion.Control>
+                  <Accordion.Panel>
+                    <Stack gap="xs">{sec.fields.map(renderField)}</Stack>
+                  </Accordion.Panel>
+                </Accordion.Item>
+              ))}
+            </Accordion>
+          )}
 
           <Group justify="space-between">
             <Group gap="xs">

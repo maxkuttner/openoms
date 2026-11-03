@@ -37,7 +37,7 @@ export function AccountsPage() {
           optionValue: "id",
           optionLabel: "code",
         },
-        { name: "status", label: "Status", type: "select", required: true, options: STATUS },
+        { name: "status", label: "Status", type: "select", required: true, options: STATUS, default: "ACTIVE" },
       ]}
     />
   );

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import {
   Group, Title, Button, Table, Modal, Stack, TextInput, NumberInput,
   Select, Checkbox, ActionIcon, Text, Loader, Badge,
@@ -9,20 +9,27 @@ import { useList, useApiMutation } from "../api/hooks";
 import { InstrumentSelect } from "./InstrumentSelect";
 import { useLifecycle } from "./Lifecycle";
 import type { Resource } from "../lifecycle";
+import { initialFormValues } from "../crud";
 
 export type Field = {
   name: string;
   label: string;
   type?: "text" | "number" | "select" | "checkbox" | "instrument";
-  options?: { value: string; label: string }[];
+  // Fixed options, or options that depend on the other fields' values.
+  options?: Option[] | ((values: Record<string, any>) => Option[]);
+  // A line under the input; may depend on the other fields' values.
+  description?: (values: Record<string, any>) => ReactNode;
   // Populate a select from another list endpoint, mapping each row to {value,label}.
   optionsPath?: string;
   optionValue?: string;
   optionLabel?: string;
   required?: boolean;
+  default?: string; // starting value for a new row
   inCreate?: boolean; // default true
   inEdit?: boolean; // default true
 };
+
+type Option = { value: string; label: string };
 
 export type Column = { key: string; label: string; render?: (row: any) => ReactNode };
 
@@ -40,12 +47,17 @@ type Props = {
   // Rows are deactivated instead of deleted: checkboxes, a Deactivate bar,
   // inactive rows hidden behind a "Show inactive" switch, and Reactivate.
   lifecycle?: { resource: Resource; afterChange?: () => Promise<unknown> };
+  // Create form only: given the values before and after a change, the fields
+  // to set as a consequence (e.g. a code derived from two selects).
+  derive?: (previous: Record<string, any>, next: Record<string, any>) => Record<string, any>;
+  // Called with the created row once a create succeeds.
+  onCreated?: (row: any) => void;
 };
 
 // Render the value of one field, resolving select options (incl. async optionsPath).
 function FieldInput({ field, form }: { field: Field; form: any }) {
   const remote = useList<any>(field.optionsPath ?? "", !!field.optionsPath);
-  const props = { label: field.label, ...form.getInputProps(field.name) };
+  const props = { label: field.label, description: field.description?.(form.values), ...form.getInputProps(field.name) };
   switch (field.type) {
     case "instrument":
       return (
@@ -60,10 +72,16 @@ function FieldInput({ field, form }: { field: Field; form: any }) {
     case "number":
       return <NumberInput {...props} />;
     case "checkbox":
-      return <Checkbox label={field.label} {...form.getInputProps(field.name, { type: "checkbox" })} />;
+      return (
+        <Checkbox
+          label={field.label}
+          description={props.description}
+          {...form.getInputProps(field.name, { type: "checkbox" })}
+        />
+      );
     case "select": {
       const opts =
-        field.options ??
+        (typeof field.options === "function" ? field.options(form.values) : field.options) ??
         (remote.data ?? []).map((r) => ({
           value: String(r[field.optionValue ?? "id"]),
           label: String(r[field.optionLabel ?? "code"]),
@@ -76,7 +94,7 @@ function FieldInput({ field, form }: { field: Field; form: any }) {
 }
 
 export function CrudResource({
-  title, path, idKey = "id", columns, fields, editable, deletable, rowAction, lifecycle,
+  title, path, idKey = "id", columns, fields, editable, deletable, rowAction, lifecycle, derive, onCreated,
 }: Props) {
   const list = useList<any>(path);
   const life = useLifecycle(list.data, {
@@ -90,15 +108,20 @@ export function CrudResource({
   const [editing, setEditing] = useState<any | null>(null); // row being edited, or {} for create
   const isCreate = editing && !editing[idKey];
 
-  const form = useForm<Record<string, any>>({ initialValues: {} });
+  const creating = useRef(false);
+  creating.current = !!isCreate;
+  const form = useForm<Record<string, any>>({
+    initialValues: {},
+    onValuesChange: (next, previous) => {
+      if (!creating.current || !derive) return;
+      for (const [k, v] of Object.entries(derive(previous, next))) {
+        if (next[k] !== v) form.setFieldValue(k, v);
+      }
+    },
+  });
 
   const open = (row: any | null) => {
-    const init: Record<string, any> = {};
-    fields.forEach((f) => {
-      const v = row ? row[f.name] : f.type === "checkbox" ? false : "";
-      init[f.name] = v ?? (f.type === "checkbox" ? false : "");
-    });
-    form.setValues(init);
+    form.setValues(initialFormValues(fields, row));
     setEditing(row ?? {});
   };
 
@@ -107,7 +130,14 @@ export function CrudResource({
       const body = cleanup(vals, fields, !!isCreate);
       return isCreate ? api.post(path, body) : api.patch(`${path}/${editing[idKey]}`, body);
     },
-    { invalidate: [path], success: isCreate ? "Created" : "Updated", onDone: () => setEditing(null) },
+    {
+      invalidate: [path],
+      success: isCreate ? "Created" : "Updated",
+      onDone: (row) => {
+        setEditing(null);
+        if (isCreate) onCreated?.(row);
+      },
+    },
   );
 
   const remove = useApiMutation((row: any) => api.del(`${path}/${row[idKey]}`), {

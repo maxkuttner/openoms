@@ -628,6 +628,12 @@ pub async fn create_broker_connection(
     Ok(Json(record))
 }
 
+/// The venues a broker connection can point at, with their credential fields:
+/// the cockpit builds its create form and credentials drawer from this.
+pub async fn list_venues() -> Json<Vec<crate::venues::Venue>> {
+    Json(crate::venues::venues())
+}
+
 /// Live health of the broker/exchange WebSocket streams (in-memory, ephemeral).
 pub async fn list_stream_health(State(state): State<AppState>) -> Json<Vec<StreamHealth>> {
     Json(state.stream_health().snapshot())

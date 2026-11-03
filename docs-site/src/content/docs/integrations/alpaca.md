@@ -19,8 +19,15 @@ trade](/openoms/getting-started/first-paper-trade/) walks through it end to end.
 
 ## Credentials
 
-You need an API key ID and secret from the Alpaca dashboard. Paper and live accounts
-have separate keys.
+Create a broker connection with **Alpaca** as the venue; its credentials drawer opens
+with these fields:
+
+| Field | What it is | Where to get it |
+|---|---|---|
+| API key ID | Identifies your key; starts with `PK` for paper, `AK` for live | The API Keys panel on your [paper](https://app.alpaca.markets/paper/dashboard/overview) or [live](https://app.alpaca.markets/brokerage/dashboard/overview) dashboard |
+| Secret key | The key's secret | Shown once, when you generate the key; if you lost it, generate a new key |
+
+Paper and live accounts have separate keys.
 
 Enter them in the cockpit under **Broker connections → alpaca-paper → Credentials**
 (**Test**, then **Save**). They are stored encrypted with your

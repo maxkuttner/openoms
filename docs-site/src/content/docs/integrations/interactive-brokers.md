@@ -15,10 +15,22 @@ for instruments that already have one. Treat this integration as experimental.
 
 ## Credentials
 
-A FIX connection needs the host and port of your IBKR FIX gateway, `SenderCompID`,
-`TargetCompID` (default `IBKR`), a password, and whether to use TLS (on by default).
-IBKR provides these when they enable FIX for your account.
+IBKR gives you the FIX session details when they enable FIX for your account. Create a
+broker connection in the cockpit with **Interactive Brokers** as the venue; its
+credentials drawer asks for:
 
-Create a broker connection with broker code `IBKR` in the cockpit, enter the credentials
-there, and restart the OMS — a FIX session starts at boot and cannot be swapped while
-running.
+| Field | What it is | Default |
+|---|---|---|
+| Password | Your FIX session password | |
+
+and, under **FIX session**:
+
+| Field | What it is | Default |
+|---|---|---|
+| Host | Your IBKR FIX gateway's host | |
+| Port | Its port | |
+| SenderCompID | Your side of the session, assigned by IBKR | |
+| TargetCompID | IBKR's side of the session | `IBKR` |
+| TLS | Encrypt the session; leave on unless IBKR says otherwise | on |
+
+Then restart the OMS: a FIX session starts at boot and cannot be swapped while running.

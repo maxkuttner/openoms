@@ -3,6 +3,8 @@ import { Button, Drawer, Stack } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
 import { statusOptions } from "../lifecycle";
 import { api } from "../api/client";
+import { useList } from "../api/hooks";
+import { autoCode, environmentOptions, venueOptions, type Venue } from "../venues";
 import { CredentialsPanel } from "../components/CredentialsPanel";
 import { StreamHealthStrip } from "../components/StreamHealthStrip";
 import { UniverseStatus } from "../components/UniverseStatus";
@@ -12,6 +14,8 @@ const STATUS = statusOptions("brokerConnection");
 
 export function BrokerConnectionsPage() {
   const [selected, setSelected] = useState<BrokerConnection | null>(null);
+  const venues = useList<Venue>("/admin/venues").data ?? [];
+  const venueOf = (code: string) => venues.find((v) => v.code === code);
 
   return (
     <Stack gap="lg">
@@ -26,6 +30,9 @@ export function BrokerConnectionsPage() {
       idKey="code"
       editable
       lifecycle={{ resource: "brokerConnection", afterChange: () => api.post("/admin/connections/reload", {}) }}
+      derive={(previous, next) => ({ code: autoCode(previous as any, next as any) })}
+      // Credentials are the next step for a new connection, so open them.
+      onCreated={(row: BrokerConnection) => setSelected(row)}
       rowAction={(row: BrokerConnection) => (
         <Button size="xs" variant="light" onClick={() => setSelected(row)}>
           Credentials
@@ -43,19 +50,29 @@ export function BrokerConnectionsPage() {
         },
       ]}
       fields={[
-        { name: "code", label: "Code", required: true, inEdit: false },
-        { name: "broker_code", label: "Broker code", required: true },
+        {
+          name: "broker_code",
+          label: "Venue",
+          type: "select",
+          required: true,
+          inEdit: false,
+          options: venueOptions(venues),
+        },
         {
           name: "environment",
           label: "Environment",
           type: "select",
           required: true,
-          options: [
-            { value: "PAPER", label: "PAPER" },
-            { value: "LIVE", label: "LIVE" },
-          ],
+          options: (values) => environmentOptions(venueOf(values.broker_code)),
         },
-        { name: "status", label: "Status", type: "select", required: true, options: STATUS },
+        {
+          name: "code",
+          label: "Code",
+          required: true,
+          inEdit: false,
+          description: () => "Your name for this connection; accounts and orders refer to it.",
+        },
+        { name: "status", label: "Status", type: "select", required: true, options: STATUS, default: "ACTIVE" },
       ]}
       />
 
@@ -66,7 +83,14 @@ export function BrokerConnectionsPage() {
         position="right"
         size="md"
       >
-        {selected && <CredentialsPanel kind="broker" code={selected.code} providerCode={selected.broker_code} />}
+        {selected && (
+          <CredentialsPanel
+            kind="broker"
+            code={selected.code}
+            providerCode={selected.broker_code}
+            environment={selected.environment}
+          />
+        )}
       </Drawer>
     </Stack>
   );

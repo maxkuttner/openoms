@@ -24,11 +24,29 @@ testnet, is still to come.
 ## Credentials
 
 Binance uses an **Ed25519 API key**: you generate a key pair, register the public key
-with Binance, and give the OMS the API key and the **private key PEM** (its contents, not
-a path). For the testnet, register at the Binance spot testnet.
+with Binance, and give the OMS the API key and the private key. For PAPER, register at
+the [spot testnet](https://testnet.binance.vision/); for LIVE, under
+[API management](https://www.binance.com/en/my/settings/api-management).
 
-Enter them in the cockpit under **Broker connections → binance-paper → Credentials**.
-For FIX, also fill in the FIX host, port, `SenderCompID` and `TargetCompID`. Then reload:
+Create a broker connection with **Binance** as the venue; its credentials drawer opens
+with these fields:
+
+| Field | What it is | PAPER / LIVE value |
+|---|---|---|
+| API key | Shown after you register your public key. For FIX it needs the `FIX_API` permission | yours |
+| Private key (PEM) | The contents of your Ed25519 private key file, starting `-----BEGIN PRIVATE KEY-----`. Not a path; Binance never sees it | yours |
+
+Under **FIX session**, used only when the transport is FIX (REST is the default) and
+filled in for you:
+
+| Field | What it is | PAPER / LIVE value |
+|---|---|---|
+| Host | Binance's FIX order-entry host | `fix-oe.testnet.binance.vision` / `fix-oe.binance.com` |
+| Port | Its port | `9000` |
+| SenderCompID | Any ID you choose: 1-8 letters, digits, `-` or `_`, different for each session open at the same time | `OMS` |
+| TargetCompID | Always `SPOT` for Binance spot | `SPOT` |
+
+Then reload:
 
 ```sh
 export OMS_ADMIN=$(sed -n 's/^admin_password = "\(.*\)"/\1/p' ~/.config/oms/oms.toml)

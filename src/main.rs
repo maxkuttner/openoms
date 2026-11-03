@@ -58,6 +58,7 @@ mod execution;
 mod alpaca_stream;
 mod binance_stream;
 mod stream_health;
+mod venues;
 mod marks;
 mod daily_stats;
 mod opra_stream;
@@ -1465,6 +1466,7 @@ async fn serve() {
             axum::routing::patch(admin::update_account).get(admin::get_account),
         )
         .route("/admin/stream-health", get(admin::list_stream_health))
+        .route("/admin/venues", get(admin::list_venues))
         .route(
             "/admin/broker-connections",
             post(admin::create_broker_connection).get(admin::list_broker_connections),

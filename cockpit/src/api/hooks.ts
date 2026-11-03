@@ -18,15 +18,15 @@ export function notifyOk(message: string) {
 // Mutation that invalidates the given list paths and shows a toast on success/error.
 export function useApiMutation<TArgs>(
   fn: (args: TArgs) => Promise<unknown>,
-  opts: { invalidate: string[]; success: string; onDone?: () => void },
+  opts: { invalidate: string[]; success: string; onDone?: (result: unknown) => void },
 ) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: fn,
-    onSuccess: () => {
+    onSuccess: (result) => {
       opts.invalidate.forEach((p) => qc.invalidateQueries({ queryKey: [p] }));
       notifyOk(opts.success);
-      opts.onDone?.();
+      opts.onDone?.(result);
     },
     onError: notifyError,
   });

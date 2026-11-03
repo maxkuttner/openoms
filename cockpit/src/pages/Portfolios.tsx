@@ -19,7 +19,7 @@ export function PortfoliosPage() {
       fields={[
         { name: "code", label: "Code", required: true },
         { name: "name", label: "Name", required: true },
-        { name: "status", label: "Status", type: "select", required: true, options: STATUS },
+        { name: "status", label: "Status", type: "select", required: true, options: STATUS, default: "ACTIVE" },
         {
           name: "default_account_id",
           label: "Default account (routing)",
