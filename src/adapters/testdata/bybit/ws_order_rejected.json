@@ -1,0 +1,4 @@
+{"id":"5923240c6880ab-c59f-420b-9adb-3639adc9dd91","topic":"order.spot","creationTime":1700000000000,"data":[
+ {"category":"spot","symbol":"BTCUSDT","orderId":"5","orderLinkId":"3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b","orderStatus":"Rejected","cancelType":"UNKNOWN","rejectReason":"EC_InsufficientBalance","cumExecQty":"0","avgPrice":""},
+ {"category":"spot","symbol":"BTCUSDT","orderId":"6","orderLinkId":"placed-in-the-bybit-app","orderStatus":"Rejected","cancelType":"UNKNOWN","rejectReason":"EC_InsufficientBalance","cumExecQty":"0","avgPrice":""}
+]}

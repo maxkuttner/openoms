@@ -1,0 +1,6 @@
+{"id":"5923240c6880ab-c59f-420b-9adb-3639adc9dd90","topic":"order.spot","creationTime":1700000000000,"data":[
+ {"category":"spot","symbol":"BTCUSDT","orderId":"1","orderLinkId":"3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b","orderStatus":"Cancelled","cancelType":"CancelByUser","rejectReason":"EC_NoError","cumExecQty":"0","avgPrice":""},
+ {"category":"spot","symbol":"BTCUSDT","orderId":"2","orderLinkId":"9a8b7c6d-0000-4000-8000-000000000002","orderStatus":"PartiallyFilledCanceled","cancelType":"CancelByUser","rejectReason":"EC_NoError","cumExecQty":"0.0005","avgPrice":"65000"},
+ {"category":"spot","symbol":"BTCUSDT","orderId":"3","orderLinkId":"9a8b7c6d-0000-4000-8000-000000000003","orderStatus":"Deactivated","cancelType":"UNKNOWN","rejectReason":"EC_NoError","cumExecQty":"0","avgPrice":""},
+ {"category":"spot","symbol":"BTCUSDT","orderId":"4","orderLinkId":"9a8b7c6d-0000-4000-8000-000000000004","orderStatus":"New","cancelType":"UNKNOWN","rejectReason":"EC_NoError","cumExecQty":"0","avgPrice":""}
+]}

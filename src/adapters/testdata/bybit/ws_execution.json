@@ -1,0 +1,3 @@
+{"id":"592324803b2785-26fa-4214-9963-bdd4727f07be","topic":"execution.spot","creationTime":1700000000000,"data":[
+ {"category":"spot","symbol":"BTCUSDT","isLeverage":"0","orderId":"1820000000000000002","orderLinkId":"3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b","side":"Buy","orderPrice":"","orderQty":"0.001","leavesQty":"0","orderType":"Market","execFee":"0.000001","execId":"2100000000007764263","execPrice":"65000","execQty":"0.001","execType":"Trade","execValue":"65","execTime":"1700000000000","isMaker":false,"feeRate":"0.001","markPrice":"","closedSize":"","seq":4688002127}
+]}

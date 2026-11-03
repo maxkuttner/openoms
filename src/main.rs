@@ -57,6 +57,7 @@ mod kafka;
 mod execution;
 mod alpaca_stream;
 mod binance_stream;
+mod bybit_stream;
 mod stream_health;
 mod venues;
 mod marks;
