@@ -17,6 +17,8 @@ use tracing::{error, info, warn};
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::alpaca_stream;
 use crate::adapters::binance::BinanceAdapter;
+use crate::adapters::bybit::BybitAdapter;
+use crate::bybit_stream;
 use crate::adapters::{BrokerRegistry, Transport};
 use crate::app_state::{AppState, DoorbellRegistry, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
@@ -73,8 +75,9 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             // transport turns out to be REST is deliberately conservative: a
             // Binance credential change needs a restart even on REST, for now.
             // Narrowing that is a follow-up, not this task.
-            // Not wired for trading until registration lands (plan Task 5).
-            BrokerCredentials::Bybit { .. } => ConnectionOutcome::Failed("Bybit trading is not wired yet".into()),
+            // REST order entry plus a private WebSocket that `restart_bybit_stream`
+            // can stop and start at will: nothing forces a restart, on reload or boot.
+            BrokerCredentials::Bybit { .. } => ConnectionOutcome::Registered,
             BrokerCredentials::IbkrFix { .. } | BrokerCredentials::BinanceFix { .. } => {
                 if is_boot {
                     ConnectionOutcome::Registered
@@ -147,6 +150,9 @@ pub struct RegistrationOutput {
     /// REST-transport Binance adapters actually registered this pass, concrete
     /// type, in registration order.
     pub binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)>,
+    /// Bybit adapters built fresh this pass, one per environment, whose private
+    /// stream the caller (re)starts — on reload as well as at boot.
+    pub bybit_adapters: Vec<(&'static str, Arc<BybitAdapter>)>,
 }
 
 /// Turn every broker connection into an entry in a fresh `BrokerRegistry`.
@@ -174,6 +180,7 @@ pub async fn build_registry(
     let mut registry = BrokerRegistry::new();
     let mut alpaca_creds: HashMap<&'static str, (String, String)> = HashMap::new();
     let mut binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)> = Vec::new();
+    let mut bybit_adapters: Vec<(&'static str, Arc<BybitAdapter>)> = Vec::new();
     let mut report = ReloadReport { connections: Vec::new() };
 
     for conn in connections {
@@ -252,8 +259,12 @@ pub async fn build_registry(
                     );
                 }
                 match creds {
-                    // `classify` reports Failed until plan Task 5 registers it.
-                    BrokerCredentials::Bybit { .. } => {}
+                    BrokerCredentials::Bybit { api_key, api_secret } => {
+                        let adapter = Arc::new(BybitAdapter::new(api_key.clone(), api_secret.clone(), env_name));
+                        registry.register("BYBIT", env_name, adapter.clone());
+                        bybit_adapters.push((env_name, adapter));
+                        info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BYBIT/{env_name} adapter (REST/WS)");
+                    }
                     BrokerCredentials::Alpaca { key, secret } => {
                         registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env_name)));
                         alpaca_creds.insert(env_name, (key.clone(), secret.clone()));
@@ -351,7 +362,7 @@ pub async fn build_registry(
         report.connections.push((conn.code.clone(), outcome));
     }
 
-    RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters }
+    RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters, bybit_adapters }
 }
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
@@ -421,6 +432,10 @@ pub(crate) fn binance_exec_stream_code(env_name: &str) -> String {
     format!("binance-{}:exec", env_name.to_lowercase())
 }
 
+pub(crate) fn bybit_exec_stream_code(env_name: &str) -> String {
+    format!("bybit-{}:exec", env_name.to_lowercase())
+}
+
 /// The network boundary of reload. Store reads, classification, serialization,
 /// swaps and stops remain real in integration tests; only new external sessions
 /// are substituted with controlled tasks.
@@ -431,6 +446,14 @@ pub(crate) trait ReloadStreams: Send + Sync + 'static {
         environment: &'static str,
         credentials: (String, String),
         adapter: Arc<AlpacaAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    );
+
+    async fn bybit(
+        &self,
+        environment: &'static str,
+        adapter: Arc<BybitAdapter>,
         deps: &RegistrationDeps,
         streams: &StreamRegistry,
     );
@@ -451,6 +474,16 @@ impl ReloadStreams for LiveReloadStreams {
         streams: &StreamRegistry,
     ) {
         restart_alpaca_stream(environment, key, secret, adapter, deps, streams).await;
+    }
+
+    async fn bybit(
+        &self,
+        environment: &'static str,
+        adapter: Arc<BybitAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    ) {
+        restart_bybit_stream(environment, adapter, deps, streams).await;
     }
 
     async fn databento(&self, api_key: String, state: &AppState) {
@@ -497,6 +530,32 @@ pub async fn restart_alpaca_stream(
         env_name,
         key,
         secret,
+        deps.pool.clone(),
+        deps.kafka.clone(),
+        adapter,
+        health,
+        deps.position_changed_tx.clone(),
+    ));
+    streams.insert(code, handle);
+}
+
+/// (Re)start one Bybit environment's private stream against a freshly built
+/// `adapter`, replacing any task already registered under
+/// `bybit_exec_stream_code` — the same shape as `restart_alpaca_stream`, and
+/// for the same reason: every reload builds a new adapter for an active,
+/// configured Bybit connection, so the stream must follow it.
+pub async fn restart_bybit_stream(
+    env_name: &'static str,
+    adapter: Arc<BybitAdapter>,
+    deps: &RegistrationDeps,
+    streams: &StreamRegistry,
+) {
+    let code = bybit_exec_stream_code(env_name);
+    streams.abort_and_remove(&code).await;
+    let health = deps.stream_health.handle("BYBIT", env_name, StreamKind::Execution);
+    health.set_connecting();
+    let handle = tokio::spawn(bybit_stream::run(
+        env_name,
         deps.pool.clone(),
         deps.kafka.clone(),
         adapter,
@@ -765,6 +824,42 @@ mod tests {
     /// code — `restart_databento_feed` keys the same `StreamRegistry` by bare
     /// connection code ("databento-opra"), so an execution stream's key must
     /// be shaped so it can never equal one, for any environment.
+    #[test]
+    fn a_bybit_credential_applies_on_reload_without_a_restart() {
+        let c = conn(
+            "bybit-paper",
+            "ACTIVE",
+            CredentialState::Configured(BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() }),
+        );
+        assert!(matches!(classify(&c, false), ConnectionOutcome::Registered));
+        assert!(matches!(classify(&c, true), ConnectionOutcome::Registered));
+    }
+
+    #[test]
+    fn bybit_exec_stream_code_is_per_environment() {
+        assert_eq!(bybit_exec_stream_code("PAPER"), "bybit-paper:exec");
+        assert_eq!(bybit_exec_stream_code("LIVE"), "bybit-live:exec");
+        assert_ne!(bybit_exec_stream_code("PAPER"), binance_exec_stream_code("PAPER"));
+    }
+
+    #[tokio::test]
+    async fn a_configured_bybit_connection_is_registered_and_handed_back_for_its_stream() {
+        let c = conn(
+            "bybit-paper",
+            "ACTIVE",
+            CredentialState::Configured(BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() }),
+        );
+        let deps = RegistrationDeps {
+            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            stream_health: StreamHealthRegistry::new(),
+            kafka: None,
+            position_changed_tx: None,
+        };
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
+        assert!(out.registry.get("BYBIT", "PAPER").is_some());
+        assert_eq!(out.bybit_adapters.iter().map(|(env, _)| *env).collect::<Vec<_>>(), ["PAPER"]);
+    }
+
     #[test]
     fn alpaca_exec_stream_code_cannot_collide_with_a_feed_code() {
         assert_eq!(alpaca_exec_stream_code("PAPER"), "alpaca-paper:exec");

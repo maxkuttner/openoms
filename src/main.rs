@@ -1082,6 +1082,7 @@ async fn serve() {
         report: _report,
         alpaca_creds,
         binance_rest_adapters,
+        bybit_adapters,
     } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &registration_deps).await;
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
@@ -1183,6 +1184,12 @@ async fn serve() {
         let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
         let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
         state.streams().insert(reload::binance_exec_stream_code(env_name), handle);
+    }
+
+    // And the Bybit private stream for every Bybit adapter registered above —
+    // the same call a reload makes, so boot and reload cannot drift apart.
+    for (env_name, adapter) in bybit_adapters {
+        reload::restart_bybit_stream(env_name, adapter, &registration_deps, state.streams()).await;
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside

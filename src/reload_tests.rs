@@ -101,6 +101,13 @@ impl ReloadStreams for FakeStreams {
         self.adapters.lock().unwrap().insert(environment.into(), adapter);
     }
 
+    async fn bybit(&self, environment: &'static str, _: Arc<crate::adapters::bybit::BybitAdapter>,
+        _: &RegistrationDeps, streams: &StreamRegistry) {
+        let code = reload::bybit_exec_stream_code(environment);
+        streams.abort_and_remove(&code).await;
+        self.spawn(&code, streams);
+    }
+
     async fn databento(&self, _: String, state: &AppState) {
         state.streams().abort_and_remove("databento-opra").await;
         self.spawn("databento-opra", state.streams());
@@ -192,6 +199,7 @@ async fn reload_http_lifecycle_against_postgres() {
     insert_broker(&pool, "alpaca-paper", "ALPACA").await;
     insert_broker(&pool, "ibkr-paper", "IBKR").await;
     insert_broker(&pool, "binance-paper", "BINANCE").await;
+    insert_broker(&pool, "bybit-paper", "BYBIT").await;
     credentials::save_broker(&pool, &key(), "alpaca-paper", &BrokerCredentials::Alpaca {
         key: "SYNTHETIC-API-KEY".into(), secret: "SYNTHETIC-SECRET".into(),
     }).await.unwrap();
@@ -202,6 +210,9 @@ async fn reload_http_lifecycle_against_postgres() {
     credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::BinanceFix {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
         target_comp_id: "SPOT".into(), api_key: "SYNTHETIC-BINANCE".into(), private_key: "SYNTHETIC-PEM".into(),
+    }).await.unwrap();
+    credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::Bybit {
+        api_key: "SYNTHETIC-BYBIT".into(), api_secret: "SYNTHETIC-BYBIT-SECRET".into(),
     }).await.unwrap();
     credentials::save_feed(&pool, &key(), "databento-opra", &FeedCredentials::Databento {
         api_key: "SYNTHETIC-DATABENTO".into(),
@@ -220,6 +231,9 @@ async fn reload_http_lifecycle_against_postgres() {
         assert_eq!(outcome(&body, "databento-opra"), "Registered");
         assert_eq!(outcome(&body, "ibkr-paper"), "RestartRequired");
         assert_eq!(outcome(&body, "binance-paper"), "RestartRequired");
+        // Bybit applies on every reload and never runs two streams.
+        assert_eq!(outcome(&body, "bybit-paper"), "Registered");
+        assert_eq!(fake.count("bybit-paper:exec"), 1);
         assert!(!body.to_string().contains("SYNTHETIC"));
         assert!(Arc::ptr_eq(&held_fix, &state.registry().get("IBKR", "PAPER").unwrap()));
         assert!(Arc::ptr_eq(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get_alpaca("PAPER").unwrap()));
@@ -283,19 +297,19 @@ async fn reload_http_lifecycle_against_postgres() {
     assert_eq!(outcome(&body, "databento-opra"), "Unconfigured");
     assert!(state.registry().get_alpaca("PAPER").is_none());
     assert!(state.registry().get("IBKR", "PAPER").is_none());
-    for code in ["alpaca-paper:exec", "binance-paper:exec", "databento-opra"] {
+    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "databento-opra"] {
         assert_eq!(fake.count(code), 0);
     }
     assert!(state.stream_health().snapshot().iter().all(|h| h.state == StreamState::Down));
 
     // Deleted rows have no report iteration, but their old tasks still stop.
-    for code in ["alpaca-paper:exec", "binance-paper:exec", "databento-opra"] {
+    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "databento-opra"] {
         fake.spawn(code, state.streams());
     }
     sqlx::query("DELETE FROM oms.broker_connection").execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM oms.feed_connection").execute(&pool).await.unwrap();
     assert_eq!(post_reload(&url).await, (200, serde_json::json!({"connections": []})));
-    for code in ["alpaca-paper:exec", "binance-paper:exec", "databento-opra"] {
+    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "databento-opra"] {
         assert_eq!(fake.count(code), 0);
     }
 

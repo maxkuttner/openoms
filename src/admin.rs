@@ -1333,6 +1333,7 @@ async fn apply_reload(
         // `build_registry` never takes the "build a fresh REST adapter" branch
         // outside of boot. Nothing to spawn a stream for.
         binance_rest_adapters: _binance_rest_adapters,
+        bybit_adapters,
     } = reload::build_registry(&broker_connections, false, &current, &deps).await;
     drop(current);
 
@@ -1404,6 +1405,14 @@ async fn apply_reload(
         }
     }
 
+    // Bybit, unlike Binance, applies on reload: every connection registered
+    // fresh this pass gets its private stream (re)started on the new adapter.
+    // One carried forward after a decrypt error is not in `bybit_adapters` and
+    // keeps its running stream; one that is gone is stopped just below.
+    for (env_name, adapter) in bybit_adapters {
+        streams.bybit(env_name, adapter, &deps, state.streams()).await;
+    }
+
     // Reconcile known execution tasks against the resulting registry, not just
     // input rows: a deleted row has no iteration in the loop above. Binance REST
     // is restart-required but its existing task must still stop when disabled.
@@ -1413,6 +1422,9 @@ async fn apply_reload(
         }
         if state.registry().get("BINANCE", env_name).is_none() {
             stop_execution_stream(&state, "BINANCE", env_name, &reload::binance_exec_stream_code(env_name)).await;
+        }
+        if state.registry().get("BYBIT", env_name).is_none() {
+            stop_execution_stream(&state, "BYBIT", env_name, &reload::bybit_exec_stream_code(env_name)).await;
         }
     }
 

@@ -38,6 +38,7 @@ const CRYPTO_VENUES: &[&str] = &["BINANCE", "BYBIT"];
 fn broker_serves_venue(broker_code: &str, venue: &str) -> bool {
     match broker_code {
         "BINANCE" => venue == "BINANCE",
+        "BYBIT" => venue == "BYBIT",
         "ALPACA" => !CRYPTO_VENUES.contains(&venue),
         // Any other/future broker_code (e.g. IBKR): not wired for daily
         // stats yet, so it serves nothing here rather than guessing.
@@ -242,6 +243,14 @@ pub async fn run(pool: PgPool, registry: Arc<ArcSwap<BrokerRegistry>>, stats: Da
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bybit_serves_only_bybit_symbols_for_daily_stats() {
+        assert!(broker_serves_venue("BYBIT", "BYBIT"));
+        assert!(!broker_serves_venue("BYBIT", "BINANCE"));
+        assert!(!broker_serves_venue("BINANCE", "BYBIT"));
+        assert!(!broker_serves_venue("ALPACA", "BYBIT"));
+    }
 
     // interesting_instrument_ids is a pure function over two id lists — the
     // union, deduplicated. The SQL that PRODUCES those two lists (watchlist
