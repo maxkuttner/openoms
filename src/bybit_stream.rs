@@ -9,6 +9,13 @@
 //! both topics would double-count them: the execution path does not dedupe by
 //! execution id. Everything is applied through the shared
 //! [`crate::execution::process_execution_report`].
+//!
+//! The two topics are not ordered against each other, so a terminal `order.spot`
+//! update for an order with fills (`cumExecQty > 0`) can overtake those fills.
+//! Closing the order on it would make the terminal guard drop the late Trades;
+//! instead it is resolved like a missed terminal in reconcile
+//! ([`crate::recon_orders::apply_broker_terminal`]): book whatever Bybit filled
+//! that the OMS hasn't yet, then close.
 
 use std::sync::Arc;
 
@@ -24,7 +31,7 @@ use crate::adapters::bybit::BybitAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
 use crate::kafka::KafkaClient;
-use crate::recon_orders::run_order_reconcile;
+use crate::recon_orders::{apply_broker_terminal, run_order_reconcile, BrokerOrderState};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -78,9 +85,18 @@ fn topic_is(msg: &serde_json::Value, name: &str) -> bool {
     msg["topic"].as_str().is_some_and(|t| t == name || t.strip_prefix(name).is_some_and(|rest| rest.starts_with('.')))
 }
 
-/// The OMS execution reports one pushed message carries, by OMS order id.
-/// Entries for orders the OMS didn't place (no UUID `orderLinkId`) are dropped.
-pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, ExecutionReport)> {
+/// What one pushed entry means for its OMS order.
+#[derive(Debug)]
+pub(crate) enum Update {
+    Report(ExecutionReport),
+    /// A terminal order update for an order with fills: apply through reconcile
+    /// so fills it may have overtaken are booked before the close.
+    Terminal(BrokerOrderState),
+}
+
+/// The updates one pushed message carries, by OMS order id. Entries for orders
+/// the OMS didn't place (no UUID `orderLinkId`) are dropped.
+pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
     let data = msg["data"].as_array().cloned().unwrap_or_default();
     let execution = topic_is(msg, "execution");
     let order = topic_is(msg, "order");
@@ -92,15 +108,20 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, ExecutionReport)> {
                 if d["execType"].as_str() != Some("Trade") {
                     return None;
                 }
-                ExecutionReport::Fill {
+                Update::Report(ExecutionReport::Fill {
                     execution_id: d["execId"].as_str()?.to_string(),
                     fill_qty: num("execQty")?,
                     fill_price: num("execPrice")?,
                     venue: VENUE.to_string(),
-                }
+                })
             } else if order {
+                let status = d["orderStatus"].as_str()?;
+                let terminal = matches!(status, "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" | "Rejected");
+                if terminal && num("cumExecQty").unwrap_or(0.0) > 0.0 {
+                    return Some((id, Update::Terminal(crate::adapters::bybit::parse_order_state(d))));
+                }
                 let reason = d["rejectReason"].as_str().filter(|r| !r.is_empty() && *r != "EC_NoError");
-                match d["orderStatus"].as_str()? {
+                Update::Report(match status {
                     "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => ExecutionReport::Canceled {
                         reason: reason.map(String::from),
                         venue: Some(VENUE.to_string()),
@@ -111,7 +132,7 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, ExecutionReport)> {
                     },
                     // New / PartiallyFilled / Filled: fills arrive on execution.spot.
                     _ => return None,
-                }
+                })
             } else {
                 return None;
             };
@@ -164,9 +185,16 @@ async fn connect_and_run(
         };
 
         if v.get("topic").is_some() {
-            for (order_id, report) in reports(&v) {
-                if let Err(e) = process_execution_report(pool, kafka, order_id, report, "bybit", position_changed_tx).await {
-                    error!(order_id = %order_id, error = %e, "Bybit WS: failed to apply execution report");
+            for (order_id, update) in reports(&v) {
+                match update {
+                    Update::Report(report) => {
+                        if let Err(e) = process_execution_report(pool, kafka, order_id, report, "bybit", position_changed_tx).await {
+                            error!(order_id = %order_id, error = %e, "Bybit WS: failed to apply execution report");
+                        }
+                    }
+                    Update::Terminal(st) => {
+                        apply_broker_terminal(pool, kafka, order_id, &st, VENUE, "bybit", position_changed_tx).await;
+                    }
                 }
             }
             continue;
@@ -202,6 +230,7 @@ async fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recon_orders::BrokerOrderOutcome;
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
 
@@ -232,7 +261,7 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0.to_string(), ORDER_ID);
         match &r[0].1 {
-            ExecutionReport::Fill { execution_id, fill_qty, fill_price, venue } => {
+            Update::Report(ExecutionReport::Fill { execution_id, fill_qty, fill_price, venue }) => {
                 assert_eq!(execution_id, "2100000000007764263");
                 assert_eq!(*fill_qty, 0.001);
                 assert_eq!(*fill_price, 65000.0);
@@ -246,16 +275,19 @@ mod tests {
     fn status_partially_filled_canceled_and_deactivated_are_cancels_rejected_is_a_reject() {
         let cancels = reports(&sample("ws_order_cancelled"));
         assert_eq!(cancels.len(), 3, "Cancelled, PartiallyFilledCanceled and Deactivated; New is nothing");
-        for (_, report) in &cancels {
+        // Nothing filled: a plain cancel.
+        for (_, update) in [&cancels[0], &cancels[2]] {
             assert!(
-                matches!(report, ExecutionReport::Canceled { reason: None, venue: Some(v) } if v == "BYBIT"),
-                "{report:?}"
+                matches!(update, Update::Report(ExecutionReport::Canceled { reason: None, venue: Some(v) }) if v == "BYBIT"),
+                "{update:?}"
             );
         }
+        // Filled before it was cancelled: resolved through reconcile (see below).
+        assert!(matches!(&cancels[1].1, Update::Terminal(st) if st.outcome == BrokerOrderOutcome::Canceled), "{:?}", cancels[1].1);
         let rejects = reports(&sample("ws_order_rejected"));
         assert_eq!(rejects.len(), 1);
         assert!(
-            matches!(&rejects[0].1, ExecutionReport::Reject { reason, .. } if reason == "EC_InsufficientBalance"),
+            matches!(&rejects[0].1, Update::Report(ExecutionReport::Reject { reason, .. }) if reason == "EC_InsufficientBalance"),
             "{:?}",
             rejects[0].1
         );
@@ -266,6 +298,25 @@ mod tests {
         // ws_order_rejected.json's second entry was placed in the Bybit app, not by the OMS.
         let r = reports(&sample("ws_order_rejected"));
         assert!(r.iter().all(|(id, _)| id.to_string() == ORDER_ID));
+    }
+
+    // order.spot and execution.spot are separate topics with no ordering between
+    // them: a PartiallyFilledCanceled can arrive before its Trades. Closing the order
+    // on it directly would make the terminal guard drop those late Trades, so it
+    // carries Bybit's own cumulative state for reconcile to book the fills first.
+    #[test]
+    fn a_cancel_that_overtakes_its_fills_carries_them() {
+        let r = reports(&sample("ws_order_cancelled"));
+        let (id, update) = &r[1];
+        assert_eq!(id.to_string(), "9a8b7c6d-0000-4000-8000-000000000002");
+        match update {
+            Update::Terminal(st) => {
+                assert_eq!(st.outcome, BrokerOrderOutcome::Canceled);
+                assert_eq!(st.executed_qty, 0.0005);
+                assert_eq!(st.avg_px, 65000.0);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

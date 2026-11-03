@@ -238,6 +238,36 @@ pub async fn run_order_reconcile(
     }
 }
 
+/// Apply a terminal state the broker pushed for one order, against the OMS's own
+/// cumulative fill — for venues whose order and fill updates arrive on separate,
+/// unordered channels (Bybit), where the close can overtake its fills.
+pub(crate) async fn apply_broker_terminal(
+    pool: &PgPool,
+    kafka: &Option<KafkaClient>,
+    order_id: Uuid,
+    st: &BrokerOrderState,
+    venue: &str,
+    actor: &str,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
+) {
+    let oms_cum: f64 = match sqlx::query_scalar("SELECT cum_qty::float8 FROM order_state WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(cum)) => cum,
+        Ok(None) => {
+            warn!(order_id = %order_id, "broker terminal update for an order the OMS doesn't have");
+            return;
+        }
+        Err(e) => {
+            error!(order_id = %order_id, error = %e, "broker terminal update: could not read the order's fills");
+            return;
+        }
+    };
+    apply_terminal(pool, kafka, order_id, oms_cum, st, venue, actor, position_changed_tx).await;
+}
+
 /// Apply the terminal outcome of an order that dropped out of the open-order set.
 /// Emits the missed fill (full executed − OMS cum) first, then the close, so a
 /// partial-then-canceled order books its trade before releasing the remainder. The
