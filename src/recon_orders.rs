@@ -238,9 +238,37 @@ pub async fn run_order_reconcile(
     }
 }
 
+/// How much of `broker_cum` the OMS hasn't booked yet, or `None` when it is
+/// already booked (a repeated, replayed or older update).
+pub(crate) fn missing_qty(oms_cum: f64, broker_cum: f64) -> Option<f64> {
+    let missing = broker_cum - oms_cum;
+    (missing > EPS).then_some(missing)
+}
+
+/// The OMS's own cumulative fill for one order; `None` (logged) when the order is
+/// unknown or unreadable.
+async fn oms_cum_qty(pool: &PgPool, order_id: Uuid) -> Option<f64> {
+    match sqlx::query_scalar("SELECT cum_qty::float8 FROM order_state WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(Some(cum)) => Some(cum),
+        Ok(None) => {
+            warn!(order_id = %order_id, "broker update for an order the OMS doesn't have");
+            None
+        }
+        Err(e) => {
+            error!(order_id = %order_id, error = %e, "broker update: could not read the order's fills");
+            None
+        }
+    }
+}
+
 /// Apply a terminal state the broker pushed for one order, against the OMS's own
 /// cumulative fill — for venues whose order and fill updates arrive on separate,
-/// unordered channels (Bybit), where the close can overtake its fills.
+/// unordered channels (Bybit), or only as cumulative order state (Coinbase),
+/// where the close can arrive before the OMS has booked every fill.
 pub(crate) async fn apply_broker_terminal(
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
@@ -250,22 +278,37 @@ pub(crate) async fn apply_broker_terminal(
     actor: &str,
     position_changed_tx: Option<&mpsc::Sender<()>>,
 ) {
-    let oms_cum: f64 = match sqlx::query_scalar("SELECT cum_qty::float8 FROM order_state WHERE order_id = $1")
-        .bind(order_id)
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(cum)) => cum,
-        Ok(None) => {
-            warn!(order_id = %order_id, "broker terminal update for an order the OMS doesn't have");
-            return;
-        }
-        Err(e) => {
-            error!(order_id = %order_id, error = %e, "broker terminal update: could not read the order's fills");
-            return;
-        }
-    };
+    let Some(oms_cum) = oms_cum_qty(pool, order_id).await else { return };
     apply_terminal(pool, kafka, order_id, oms_cum, st, venue, actor, position_changed_tx).await;
+}
+
+/// Book a still-working order's progress from a venue that reports cumulative
+/// state rather than individual fills (Coinbase): whatever `broker_cum` holds
+/// beyond what the OMS has booked becomes one fill at `fill_price`. A repeated
+/// update books nothing, which is what makes this safe without execution-id
+/// dedupe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_broker_progress(
+    pool: &PgPool,
+    kafka: &Option<KafkaClient>,
+    order_id: Uuid,
+    broker_cum: f64,
+    fill_price: f64,
+    venue: &str,
+    actor: &str,
+    position_changed_tx: Option<&mpsc::Sender<()>>,
+) {
+    let Some(oms_cum) = oms_cum_qty(pool, order_id).await else { return };
+    let Some(fill_qty) = missing_qty(oms_cum, broker_cum) else { return };
+    let report = ExecutionReport::Fill {
+        execution_id: format!("{venue}-{order_id}-{broker_cum}"),
+        fill_qty,
+        fill_price,
+        venue: venue.to_string(),
+    };
+    if let Err(e) = process_execution_report(pool, kafka, order_id, report, actor, position_changed_tx).await {
+        error!(order_id = %order_id, error = %e, "broker progress: apply failed");
+    }
 }
 
 /// Apply the terminal outcome of an order that dropped out of the open-order set.
@@ -290,8 +333,7 @@ async fn apply_terminal(
         }
     };
 
-    let missed = st.executed_qty - oms_cum;
-    if missed > EPS {
+    if let Some(missed) = missing_qty(oms_cum, st.executed_qty) {
         apply(ExecutionReport::Fill {
             execution_id: format!("recon-{order_id}"),
             fill_qty: missed,
