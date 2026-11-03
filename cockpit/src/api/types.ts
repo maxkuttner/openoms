@@ -57,6 +57,7 @@ export interface BrokerConnection {
   broker_code: string;
   environment: string;
   status: string;
+  max_order_value: number | null;
   created_at: string;
   updated_at: string;
 }

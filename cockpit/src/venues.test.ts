@@ -1,7 +1,7 @@
 // Run with `npm test` (node --test; Node strips the types itself).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { autoCode, connectionCode, environmentOptions, groupFields, initialValues, sectionStartsOpen, venueOptions } from "./venues.ts";
+import { autoCode, autoMaxOrderValue, connectionCode, environmentOptions, groupFields, initialValues, sectionStartsOpen, venueOptions } from "./venues.ts";
 import type { Venue } from "./venues.ts";
 
 const binance: Venue = {
@@ -73,4 +73,13 @@ test("a section starts closed when everything in it is filled in", () => {
   const fix = groupFields(binance.fields).sections[0].fields;
   assert.equal(sectionStartsOpen(fix, { host: "testnet.host", ssl: "false" }), false);
   assert.equal(sectionStartsOpen(fix, { host: "", ssl: "true" }), true);
+});
+
+test("picking LIVE fills in the 1,000 order-value cap unless one was typed", () => {
+  const none = { environment: "", max_order_value: "" };
+  assert.equal(autoMaxOrderValue(none, { ...none, environment: "LIVE" }), 1000);
+  assert.equal(autoMaxOrderValue(none, { ...none, environment: "PAPER" }), "");
+  // Switching back to PAPER leaves the auto-filled cap alone; the admin can clear it.
+  assert.equal(autoMaxOrderValue({ environment: "LIVE", max_order_value: 1000 }, { environment: "PAPER", max_order_value: 1000 }), 1000);
+  assert.equal(autoMaxOrderValue({ environment: "", max_order_value: 250 }, { environment: "LIVE", max_order_value: 250 }), 250);
 });

@@ -33,6 +33,9 @@ pub struct BrokerConnection {
     pub broker_code: String,
     pub environment: String,
     pub status: String,
+    /// Fat-finger cap on one order's value through this connection; always set
+    /// on a LIVE connection, `None` (no cap) allowed only on PAPER.
+    pub max_order_value: Option<f64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

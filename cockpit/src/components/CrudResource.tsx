@@ -9,7 +9,7 @@ import { useList, useApiMutation } from "../api/hooks";
 import { InstrumentSelect } from "./InstrumentSelect";
 import { useLifecycle } from "./Lifecycle";
 import type { Resource } from "../lifecycle";
-import { initialFormValues } from "../crud";
+import { initialFormValues, requestBody } from "../crud";
 
 export type Field = {
   name: string;
@@ -25,6 +25,7 @@ export type Field = {
   optionLabel?: string;
   required?: boolean;
   default?: string; // starting value for a new row
+  nullable?: boolean; // emptied on edit → sent as null, so the server clears it
   inCreate?: boolean; // default true
   inEdit?: boolean; // default true
 };
@@ -127,7 +128,7 @@ export function CrudResource({
 
   const save = useApiMutation(
     (vals: Record<string, any>) => {
-      const body = cleanup(vals, fields, !!isCreate);
+      const body = requestBody(vals, fields, !!isCreate);
       return isCreate ? api.post(path, body) : api.patch(`${path}/${editing[idKey]}`, body);
     },
     {
@@ -246,17 +247,3 @@ function formatCell(v: unknown): ReactNode {
   return String(v);
 }
 
-// Drop empty strings (so optional fields aren't sent as ""), coerce nothing else.
-function cleanup(vals: Record<string, any>, fields: Field[], isCreate: boolean): Record<string, any> {
-  const out: Record<string, any> = {};
-  for (const f of fields) {
-    if (isCreate ? f.inCreate === false : f.inEdit === false) continue;
-    const v = vals[f.name];
-    if (v === "" || v === undefined) {
-      if (isCreate && f.required) out[f.name] = v;
-      continue;
-    }
-    out[f.name] = v;
-  }
-  return out;
-}

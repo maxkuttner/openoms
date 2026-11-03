@@ -113,12 +113,87 @@ pub fn check_limit(
 }
 
 
+/// The cap a new LIVE broker connection starts with: no single order worth more
+/// than this (in the instrument's quote currency) reaches a real-money venue until
+/// an admin raises it. PAPER connections start uncapped. The migration that added
+/// `broker_connection.max_order_value` backfills LIVE rows with the same value.
+pub const DEFAULT_LIVE_MAX_ORDER_VALUE: f64 = 1000.0;
+
+pub fn default_max_order_value(environment: &str) -> Option<f64> {
+    (environment == "LIVE").then_some(DEFAULT_LIVE_MAX_ORDER_VALUE)
+}
+
+/// The broker connection's fat-finger cap: `quantity × est_price × contract_size`
+/// must not exceed `max`. `est_price` is the limit price, or for a market order
+/// the current mark; with a cap set and no price at all the order is refused
+/// rather than let through unvalued.
+pub fn check_max_order_value(
+    max: Option<f64>,
+    quantity: f64,
+    est_price: Option<f64>,
+    contract_size: f64,
+) -> Result<(), RiskRejection> {
+    let Some(max) = max else { return Ok(()) };
+    let Some(price) = est_price else {
+        return Err(RiskRejection {
+            code: "max_order_value_no_price".into(),
+            message: format!("no price to value this order against the connection's max order value {max}"),
+        });
+    };
+    let value = quantity * price * contract_size;
+    if value > max {
+        return Err(RiskRejection {
+            code: "max_order_value".into(),
+            message: format!("order value {value:.2} exceeds the connection's max order value {max}"),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use crate::domain::orders::risk::{
         check_limit, check_trading_state, Exposure, RiskLimits, RiskRejection, TradingState,
     };
     use crate::domain::orders::state::OrderSide;
+    use crate::domain::orders::risk::{check_max_order_value, default_max_order_value};
+
+    // The broker-connection safety net: every LIVE connection caps one order's value.
+    #[test]
+    fn an_order_worth_more_than_the_connection_cap_is_rejected() {
+        let e = check_max_order_value(Some(1000.0), 0.02, Some(65000.0), 1.0).unwrap_err();
+        assert_eq!(e.code, "max_order_value");
+        assert!(e.message.contains("1300") && e.message.contains("1000"), "{}", e.message);
+    }
+
+    #[test]
+    fn an_order_at_or_under_the_cap_passes() {
+        assert!(check_max_order_value(Some(1000.0), 0.01, Some(65000.0), 1.0).is_ok());
+        assert!(check_max_order_value(Some(1000.0), 1.0, Some(1000.0), 1.0).is_ok());
+    }
+
+    #[test]
+    fn the_contract_multiplier_counts_toward_the_value() {
+        // One option contract at 15.00 is a 1,500 order.
+        assert!(check_max_order_value(Some(1000.0), 1.0, Some(15.0), 100.0).is_err());
+    }
+
+    #[test]
+    fn no_price_means_no_order_when_a_cap_is_set() {
+        let e = check_max_order_value(Some(1000.0), 0.001, None, 1.0).unwrap_err();
+        assert_eq!(e.code, "max_order_value_no_price");
+    }
+
+    #[test]
+    fn no_cap_means_no_check() {
+        assert!(check_max_order_value(None, 1e9, None, 1.0).is_ok());
+    }
+
+    #[test]
+    fn live_connections_start_capped_and_paper_ones_do_not() {
+        assert_eq!(default_max_order_value("LIVE"), Some(1000.0));
+        assert_eq!(default_max_order_value("PAPER"), None);
+    }
 
     // --- helpers -----------------------------------------------------------
     // Fresh structs per call, because `check_limit` takes them by value.

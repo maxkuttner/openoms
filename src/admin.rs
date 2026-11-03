@@ -88,6 +88,8 @@ pub struct CreateBrokerConnection {
     pub broker_code: String,
     pub environment: String,
     pub status: String,
+    /// Defaults to 1000 for a LIVE connection, no cap for PAPER.
+    pub max_order_value: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -95,6 +97,12 @@ pub struct UpdateBrokerConnection {
     pub broker_code: Option<String>,
     pub environment: Option<String>,
     pub status: Option<String>,
+    // Tri-state, like `UpdateAccount::portfolio_id`: omitted keeps, `null`
+    // clears (PAPER only — the database refuses an uncapped LIVE connection),
+    // a number sets.
+    #[serde(default, deserialize_with = "serde_with::rust::double_option::deserialize")]
+    #[schema(value_type = Option<f64>, nullable)]
+    pub max_order_value: Option<Option<f64>>,
 }
 
 /// The credential view safe to put on the wire. `state` mirrors
@@ -576,6 +584,16 @@ pub async fn update_account(
 /// but doesn't match one of those literals passes reload silently and then
 /// 503s every order routed through it — see `setup::brokers::known_broker_codes`
 /// for why the accepted set is sourced from there rather than repeated here.
+fn validate_max_order_value(value: Option<f64>) -> Result<(), AdminError> {
+    match value {
+        Some(v) if !(v.is_finite() && v > 0.0) => Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("max_order_value must be a positive number (got {v})"),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn validate_broker_code(code: &str) -> Result<(), AdminError> {
     let known = crate::setup::brokers::known_broker_codes();
     if known.contains(&code) {
@@ -609,18 +627,23 @@ pub async fn create_broker_connection(
         });
     }
     validate_broker_code(&payload.broker_code)?;
+    validate_max_order_value(payload.max_order_value)?;
+    let max_order_value = payload
+        .max_order_value
+        .or_else(|| crate::domain::orders::risk::default_max_order_value(&payload.environment));
     info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
-        INSERT INTO broker_connection (code, broker_code, environment, status)
-        VALUES ($1, $2, $3, $4)
-        RETURNING code, broker_code, environment, status, created_at, updated_at
+        INSERT INTO broker_connection (code, broker_code, environment, status, max_order_value)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING code, broker_code, environment, status, max_order_value::float8 AS max_order_value, created_at, updated_at
         "#,
     )
     .bind(payload.code)
     .bind(payload.broker_code)
     .bind(payload.environment)
     .bind(payload.status)
+    .bind(max_order_value)
     .fetch_one(state.pool())
     .await
     .map_err(map_db_error)?;
@@ -721,7 +744,7 @@ pub async fn list_broker_connections(
     info!("admin list broker connections");
     let records = sqlx::query_as::<_, BrokerConnection>(
         r#"
-        SELECT code, broker_code, environment, status, created_at, updated_at
+        SELECT code, broker_code, environment, status, max_order_value::float8 AS max_order_value, created_at, updated_at
         FROM broker_connection
         ORDER BY code
         "#,
@@ -749,7 +772,7 @@ pub async fn get_broker_connection(
     info!(broker_connection_code = %code, "admin get broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
-        SELECT code, broker_code, environment, status, created_at, updated_at
+        SELECT code, broker_code, environment, status, max_order_value::float8 AS max_order_value, created_at, updated_at
         FROM broker_connection
         WHERE code = $1
         "#,
@@ -790,6 +813,7 @@ pub async fn update_broker_connection(
     if let Some(ref broker_code) = payload.broker_code {
         validate_broker_code(broker_code)?;
     }
+    validate_max_order_value(payload.max_order_value.flatten())?;
     info!(broker_connection_code = %code, "admin update broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
@@ -798,15 +822,23 @@ pub async fn update_broker_connection(
             broker_code = COALESCE($1, broker_code),
             environment = COALESCE($2, environment),
             status = COALESCE($3, status),
+            max_order_value = CASE
+                WHEN $5 THEN $7
+                -- A connection switched to LIVE without a cap gets the default one.
+                WHEN COALESCE($2, environment) = 'LIVE' THEN COALESCE(max_order_value, $6)
+                ELSE max_order_value END,
             updated_at = now()
         WHERE code = $4
-        RETURNING code, broker_code, environment, status, created_at, updated_at
+        RETURNING code, broker_code, environment, status, max_order_value::float8 AS max_order_value, created_at, updated_at
         "#,
     )
     .bind(payload.broker_code)
     .bind(payload.environment)
     .bind(payload.status)
     .bind(code)
+    .bind(payload.max_order_value.is_some())
+    .bind(crate::domain::orders::risk::DEFAULT_LIVE_MAX_ORDER_VALUE)
+    .bind(payload.max_order_value.flatten())
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
@@ -2898,6 +2930,18 @@ impl IntoResponse for AdminError {
     }
 }
 
+/// The admin-facing reason for a CHECK constraint a write can trip by request
+/// (as opposed to a schema invariant that only a bug could break).
+fn constraint_message(constraint: &str) -> Option<&'static str> {
+    match constraint {
+        "broker_connection_live_has_max_order_value" => {
+            Some("a LIVE broker connection always has a max order value; set a different one instead of clearing it")
+        }
+        "broker_connection_max_order_value_positive" => Some("max_order_value must be a positive number"),
+        _ => None,
+    }
+}
+
 fn map_db_error(err: sqlx::Error) -> AdminError {
     if let sqlx::Error::Database(db_err) = &err {
         if db_err.code().as_deref() == Some("23505") {
@@ -2905,6 +2949,9 @@ fn map_db_error(err: sqlx::Error) -> AdminError {
                 status: StatusCode::CONFLICT,
                 message: "resource already exists".to_string(),
             };
+        }
+        if let Some(message) = db_err.constraint().and_then(constraint_message) {
+            return AdminError { status: StatusCode::BAD_REQUEST, message: message.to_string() };
         }
     }
 
@@ -2917,6 +2964,22 @@ fn map_db_error(err: sqlx::Error) -> AdminError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_max_order_value_patch_tells_omitted_from_cleared() {
+        let parse = |body: &str| serde_json::from_str::<UpdateBrokerConnection>(body).unwrap().max_order_value;
+        assert_eq!(parse("{}"), None);
+        assert_eq!(parse(r#"{"max_order_value": null}"#), Some(None));
+        assert_eq!(parse(r#"{"max_order_value": 250}"#), Some(Some(250.0)));
+    }
+
+    #[test]
+    fn clearing_a_live_cap_is_a_bad_request_not_a_server_error() {
+        let msg = constraint_message("broker_connection_live_has_max_order_value").expect("mapped");
+        assert!(msg.contains("LIVE"), "{msg}");
+        assert!(constraint_message("broker_connection_max_order_value_positive").is_some());
+        assert!(constraint_message("some_other_check").is_none());
+    }
 
     fn broker(code: &str, state: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
         Connection {
