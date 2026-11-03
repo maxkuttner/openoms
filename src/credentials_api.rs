@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::bybit::BybitAdapter;
+use crate::adapters::coinbase::CoinbaseAdapter;
 use crate::credentials::{BrokerCredentials, FeedCredentials};
 
 /// A submitted credential form: field name to raw string value, exactly as
@@ -185,6 +186,16 @@ pub fn parse_broker(
                 api_secret: field(sub, "api_secret", existing_secret)?.to_string(),
             })
         }
+        "COINBASE" => {
+            let (existing_key, existing_pem) = match existing {
+                Some(BrokerCredentials::Coinbase { api_key, private_key }) => (Some(api_key.as_str()), Some(private_key.as_str())),
+                _ => (None, None),
+            };
+            Ok(BrokerCredentials::Coinbase {
+                api_key: field(sub, "api_key", existing_key)?.to_string(),
+                private_key: field(sub, "private_key", existing_pem)?.to_string(),
+            })
+        }
         other => Err(CredentialError::UnknownKind(other.to_string())),
     }
 }
@@ -288,6 +299,17 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
         BrokerCredentials::BinanceFix { .. } => {
             TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save")
         }
+        BrokerCredentials::Coinbase { api_key, private_key } => {
+            let adapter = match CoinbaseAdapter::new(api_key.clone(), private_key) {
+                Ok(a) => a,
+                Err(e) => return TestOutcome::Failed(e),
+            };
+            match tokio::time::timeout(TEST_TIMEOUT, adapter.key_permissions()).await {
+                Ok(Ok(permissions)) => judge_coinbase_permissions(&permissions),
+                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
+                Err(_) => timed_out("Coinbase"),
+            }
+        }
         BrokerCredentials::Bybit { api_key, api_secret } => {
             let adapter = BybitAdapter::new(api_key.clone(), api_secret.clone(), environment);
             match tokio::time::timeout(TEST_TIMEOUT, adapter.api_key_info()).await {
@@ -296,6 +318,18 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
                 Err(_) => timed_out("Bybit"),
             }
         }
+    }
+}
+
+/// A Coinbase key is fit for the OMS when it can trade and cannot move money
+/// out: an OMS never needs to withdraw, so a transfer-capable key is refused.
+pub(crate) fn judge_coinbase_permissions(permissions: &serde_json::Value) -> TestOutcome {
+    if permissions["can_transfer"].as_bool() != Some(false) {
+        TestOutcome::Failed("the key can transfer funds; create one with View and Trade permissions only".into())
+    } else if permissions["can_trade"].as_bool() != Some(true) {
+        TestOutcome::Failed("the key cannot trade; give it the Trade permission".into())
+    } else {
+        TestOutcome::Passed
     }
 }
 
@@ -399,6 +433,20 @@ mod tests {
         assert!(!printed.contains("sup3r-s3cret"), "leaked a value: {printed}");
     }
     use super::*;
+
+    #[test]
+    fn a_key_that_can_transfer_fails_the_test() {
+        let judge = |v: serde_json::Value| judge_coinbase_permissions(&v);
+        assert_eq!(judge(serde_json::json!({"can_view": true, "can_trade": true, "can_transfer": false})), TestOutcome::Passed);
+        assert!(matches!(
+            judge(serde_json::json!({"can_view": true, "can_trade": true, "can_transfer": true})),
+            TestOutcome::Failed(m) if m.contains("transfer")
+        ));
+        assert!(matches!(
+            judge(serde_json::json!({"can_view": true, "can_trade": false, "can_transfer": false})),
+            TestOutcome::Failed(m) if m.contains("trade")
+        ));
+    }
     use crate::credentials::{BrokerCredentials, FeedCredentials};
 
     fn sub(pairs: &[(&str, &str)]) -> CredentialSubmission {

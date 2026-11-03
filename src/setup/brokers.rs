@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::bybit::BybitAdapter;
+use crate::adapters::coinbase::CoinbaseAdapter;
 use crate::adapters::{BrokerInstrument, InstrumentProvider};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::setup::catalog;
@@ -30,17 +31,19 @@ pub enum Broker {
     Alpaca,
     Binance,
     Bybit,
+    Coinbase,
 }
 
 impl Broker {
     /// Every broker the app can sync — the set boot-time auto-sync iterates.
-    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance, Broker::Bybit];
+    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance, Broker::Bybit, Broker::Coinbase];
 
     pub fn code(self) -> &'static str {
         match self {
             Broker::Alpaca => "ALPACA",
             Broker::Binance => "BINANCE",
             Broker::Bybit => "BYBIT",
+            Broker::Coinbase => "COINBASE",
         }
     }
 
@@ -52,6 +55,8 @@ impl Broker {
             Broker::Alpaca => alpaca_env(),
             Broker::Binance => binance_env(),
             Broker::Bybit => bybit_env(),
+            // Coinbase has no paper trading (its sandbox returns canned responses).
+            Broker::Coinbase => "LIVE".to_string(),
         }
     }
 
@@ -243,6 +248,7 @@ pub async fn provider_for(
         Broker::Alpaca => Box::new(build_alpaca(&creds)?),
         Broker::Binance => Box::new(build_binance(&creds)?),
         Broker::Bybit => Box::new(build_bybit(&creds)?),
+        Broker::Coinbase => Box::new(build_coinbase(&creds)?),
     })
 }
 
@@ -405,6 +411,15 @@ fn build_bybit(creds: &BrokerCredentials) -> Result<BybitAdapter, Box<dyn std::e
             Ok(BybitAdapter::new(api_key.clone(), api_secret.clone(), &bybit_env()))
         }
         other => Err(format!("bybit-* credential is not a Bybit credential: {other:?}").into()),
+    }
+}
+
+fn build_coinbase(creds: &BrokerCredentials) -> Result<CoinbaseAdapter, Box<dyn std::error::Error>> {
+    match creds {
+        BrokerCredentials::Coinbase { api_key, private_key } => {
+            CoinbaseAdapter::new(api_key.clone(), private_key).map_err(Into::into)
+        }
+        other => Err(format!("coinbase-* credential is not a Coinbase credential: {other:?}").into()),
     }
 }
 

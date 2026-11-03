@@ -78,6 +78,8 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             // REST order entry plus a private WebSocket that `restart_bybit_stream`
             // can stop and start at will: nothing forces a restart, on reload or boot.
             BrokerCredentials::Bybit { .. } => ConnectionOutcome::Registered,
+            // Not wired for trading until registration lands (plan Task 6).
+            BrokerCredentials::Coinbase { .. } => ConnectionOutcome::Failed("Coinbase trading is not wired yet".into()),
             BrokerCredentials::IbkrFix { .. } | BrokerCredentials::BinanceFix { .. } => {
                 if is_boot {
                     ConnectionOutcome::Registered
@@ -251,6 +253,7 @@ pub async fn build_registry(
                     BrokerCredentials::IbkrFix { .. } => "IBKR",
                     BrokerCredentials::BinanceFix { .. } => "BINANCE",
                     BrokerCredentials::Bybit { .. } => "BYBIT",
+                    BrokerCredentials::Coinbase { .. } => "COINBASE",
                 };
                 if conn.kind != expected_kind {
                     warn!(
@@ -259,6 +262,8 @@ pub async fn build_registry(
                     );
                 }
                 match creds {
+                    // `classify` reports Failed until plan Task 6 registers it.
+                    BrokerCredentials::Coinbase { .. } => {}
                     BrokerCredentials::Bybit { api_key, api_secret } => {
                         let adapter = Arc::new(BybitAdapter::new(api_key.clone(), api_secret.clone(), env_name));
                         registry.register("BYBIT", env_name, adapter.clone());

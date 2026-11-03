@@ -43,6 +43,12 @@ pub enum BrokerCredentials {
         api_key: String,
         api_secret: String,
     },
+    /// A Coinbase CDP API key: its name (`organizations/…/apiKeys/…`) and the EC
+    /// private key PEM that signs each request's JWT.
+    Coinbase {
+        api_key: String,
+        private_key: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -118,6 +124,7 @@ impl Redact for BrokerCredentials {
                 hidden("private_key"),
             ],
             BrokerCredentials::Bybit { .. } => vec![hidden("api_key"), hidden("api_secret")],
+            BrokerCredentials::Coinbase { .. } => vec![hidden("api_key"), hidden("private_key")],
         };
         Redacted { fields }
     }
@@ -426,6 +433,16 @@ mod tests {
 
     fn alpaca() -> BrokerCredentials {
         BrokerCredentials::Alpaca { key: "AKTESTKEY123".into(), secret: "SUPERSECRETVALUE".into() }
+    }
+
+    #[test]
+    fn a_coinbase_credential_round_trips_and_redacts_both_fields() {
+        let c = BrokerCredentials::Coinbase { api_key: "organizations/o/apiKeys/k".into(), private_key: "pem".into() };
+        let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(matches!(back, BrokerCredentials::Coinbase { ref api_key, ref private_key } if api_key == "organizations/o/apiKeys/k" && private_key == "pem"));
+        let fields = redacted_fields(&c);
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
     }
 
     #[test]

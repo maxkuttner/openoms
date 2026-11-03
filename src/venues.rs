@@ -143,6 +143,23 @@ pub fn venues() -> Vec<Venue> {
             fields: vec![field("api_key", "API key").secret(), field("api_secret", "API secret").secret()],
         },
         Venue {
+            code: "COINBASE",
+            name: "Coinbase",
+            description: "Crypto spot pairs",
+            docs_url: format!("{DOCS}/coinbase/"),
+            universe: Some("About 900 spot pairs"),
+            // LIVE only: Coinbase's sandbox returns canned responses, not paper trading.
+            environments: vec![Environment {
+                code: "LIVE",
+                label: "live account",
+                keys_url: Some("https://portal.cdp.coinbase.com/projects/api-keys"),
+            }],
+            fields: vec![
+                field("api_key", "API key").secret(),
+                field("private_key", "Private key (PEM)").secret().input(Input::Textarea),
+            ],
+        },
+        Venue {
             code: "IBKR",
             name: "Interactive Brokers",
             description: "Multi-asset over FIX; experimental, no instrument loading",
@@ -202,12 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn every_venue_explains_itself_and_both_environments() {
+    fn every_venue_explains_itself_and_its_environments() {
         for venue in venues() {
             assert!(!venue.name.is_empty() && !venue.description.is_empty(), "{}", venue.code);
             assert!(venue.docs_url.starts_with("https://"), "{}", venue.code);
+            // LIVE always; PAPER first, where the venue offers one.
             let envs: Vec<_> = venue.environments.iter().map(|e| e.code).collect();
-            assert_eq!(envs, ["PAPER", "LIVE"], "{}", venue.code);
+            assert!(envs == ["PAPER", "LIVE"] || envs == ["LIVE"], "{}: {envs:?}", venue.code);
         }
     }
 
@@ -234,6 +252,16 @@ mod tests {
         assert_eq!(fields, [("api_key", "API key", true, None), ("api_secret", "API secret", true, None)]);
         assert_eq!(bybit.environments[0].label, "spot testnet");
         assert_eq!(bybit.environments[0].keys_url, Some("https://testnet.bybit.com/app/user/api-management"));
+    }
+
+    #[test]
+    fn coinbase_is_live_only_with_key_and_private_key() {
+        let cb = venues().into_iter().find(|v| v.code == "COINBASE").expect("COINBASE listed");
+        let envs: Vec<_> = cb.environments.iter().map(|e| e.code).collect();
+        assert_eq!(envs, ["LIVE"]);
+        let fields: Vec<_> = cb.fields.iter().map(|f| (f.name, f.label, f.secret, f.section)).collect();
+        assert_eq!(fields, [("api_key", "API key", true, None), ("private_key", "Private key (PEM)", true, None)]);
+        assert!(matches!(cb.fields[1].input, Input::Textarea));
     }
 
     #[test]

@@ -51,6 +51,7 @@ export default defineConfig({
             "integrations/binance",
             "integrations/interactive-brokers",
             "integrations/bybit",
+            "integrations/coinbase",
             "integrations/databento",
           ],
         },

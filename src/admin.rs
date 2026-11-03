@@ -3272,7 +3272,7 @@ mod tests {
 
     #[test]
     fn an_unknown_broker_code_is_rejected() {
-        let err = validate_broker_code("COINBASE").unwrap_err();
+        let err = validate_broker_code("NOSUCHBROKER").unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
