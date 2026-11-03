@@ -12,6 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::adapters::alpaca::AlpacaAdapter;
+use crate::adapters::bybit::BybitAdapter;
 use crate::credentials::{BrokerCredentials, FeedCredentials};
 
 /// A submitted credential form: field name to raw string value, exactly as
@@ -174,6 +175,16 @@ pub fn parse_broker(
                 private_key: field(sub, "private_key", existing.map(|e| e.5))?.to_string(),
             })
         }
+        "BYBIT" => {
+            let (existing_key, existing_secret) = match existing {
+                Some(BrokerCredentials::Bybit { api_key, api_secret }) => (Some(api_key.as_str()), Some(api_secret.as_str())),
+                _ => (None, None),
+            };
+            Ok(BrokerCredentials::Bybit {
+                api_key: field(sub, "api_key", existing_key)?.to_string(),
+                api_secret: field(sub, "api_secret", existing_secret)?.to_string(),
+            })
+        }
         other => Err(CredentialError::UnknownKind(other.to_string())),
     }
 }
@@ -276,6 +287,14 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
         }
         BrokerCredentials::BinanceFix { .. } => {
             TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save")
+        }
+        BrokerCredentials::Bybit { api_key, api_secret } => {
+            let adapter = BybitAdapter::new(api_key.clone(), api_secret.clone(), environment);
+            match tokio::time::timeout(TEST_TIMEOUT, adapter.api_key_info()).await {
+                Ok(Ok(_)) => TestOutcome::Passed,
+                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
+                Err(_) => timed_out("Bybit"),
+            }
         }
     }
 }

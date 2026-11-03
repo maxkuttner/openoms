@@ -38,6 +38,11 @@ pub enum BrokerCredentials {
         /// credential being configurable from anywhere but the server's shell.
         private_key: String,
     },
+    /// A Bybit v5 HMAC key pair (System-generated API key).
+    Bybit {
+        api_key: String,
+        api_secret: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -112,6 +117,7 @@ impl Redact for BrokerCredentials {
                 hidden("api_key"),
                 hidden("private_key"),
             ],
+            BrokerCredentials::Bybit { .. } => vec![hidden("api_key"), hidden("api_secret")],
         };
         Redacted { fields }
     }
@@ -420,6 +426,16 @@ mod tests {
 
     fn alpaca() -> BrokerCredentials {
         BrokerCredentials::Alpaca { key: "AKTESTKEY123".into(), secret: "SUPERSECRETVALUE".into() }
+    }
+
+    #[test]
+    fn a_bybit_credential_round_trips_and_redacts_both_fields() {
+        let c = BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() };
+        let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(matches!(back, BrokerCredentials::Bybit { ref api_key, ref api_secret } if api_key == "k" && api_secret == "s"));
+        let fields = redacted_fields(&c);
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
     }
 
     fn binance() -> BrokerCredentials {

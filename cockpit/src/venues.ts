@@ -22,6 +22,8 @@ export type Venue = {
   name: string;
   description: string;
   docs_url: string;
+  // What loading its instrument universe brings in; null when there is none.
+  universe: string | null;
   environments: VenueEnvironment[];
   fields: VenueField[];
 };

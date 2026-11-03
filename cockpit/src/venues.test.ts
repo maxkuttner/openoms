@@ -9,6 +9,7 @@ const binance: Venue = {
   name: "Binance",
   description: "Crypto spot pairs",
   docs_url: "https://example.org/binance/",
+  universe: "About 2,000 spot pairs",
   environments: [
     { code: "PAPER", label: "spot testnet", keys_url: "https://testnet.example.org/" },
     { code: "LIVE", label: "live account", keys_url: null },

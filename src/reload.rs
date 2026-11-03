@@ -73,6 +73,8 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             // transport turns out to be REST is deliberately conservative: a
             // Binance credential change needs a restart even on REST, for now.
             // Narrowing that is a follow-up, not this task.
+            // Not wired for trading until registration lands (plan Task 5).
+            BrokerCredentials::Bybit { .. } => ConnectionOutcome::Failed("Bybit trading is not wired yet".into()),
             BrokerCredentials::IbkrFix { .. } | BrokerCredentials::BinanceFix { .. } => {
                 if is_boot {
                     ConnectionOutcome::Registered
@@ -241,6 +243,7 @@ pub async fn build_registry(
                     BrokerCredentials::Alpaca { .. } => "ALPACA",
                     BrokerCredentials::IbkrFix { .. } => "IBKR",
                     BrokerCredentials::BinanceFix { .. } => "BINANCE",
+                    BrokerCredentials::Bybit { .. } => "BYBIT",
                 };
                 if conn.kind != expected_kind {
                     warn!(
@@ -249,6 +252,8 @@ pub async fn build_registry(
                     );
                 }
                 match creds {
+                    // `classify` reports Failed until plan Task 5 registers it.
+                    BrokerCredentials::Bybit { .. } => {}
                     BrokerCredentials::Alpaca { key, secret } => {
                         registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env_name)));
                         alpaca_creds.insert(env_name, (key.clone(), secret.clone()));

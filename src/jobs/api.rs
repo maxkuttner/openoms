@@ -150,6 +150,7 @@ async fn check_loadable(pool: &PgPool, master: Option<&MasterKey>, code: &str, k
     let broker = match conn.kind.as_str() {
         "ALPACA" => Broker::Alpaca,
         "BINANCE" => Broker::Binance,
+        "BYBIT" => Broker::Bybit,
         other => return Err(LoadRefusal::Unprocessable(format!("{other} has no instrument universe to load"))),
     };
     // A load always runs with the broker's active connection (ALPACA_ENV /

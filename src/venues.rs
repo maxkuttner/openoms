@@ -23,6 +23,9 @@ pub struct Venue {
     /// What it trades, in a few words.
     pub description: &'static str,
     pub docs_url: String,
+    /// What loading its instrument universe brings in, for the cockpit's
+    /// "load now?" prompt; `None` when it has no catalog to load.
+    pub universe: Option<&'static str>,
     pub environments: Vec<Environment>,
     /// Credentials first, then any grouped connection settings.
     pub fields: Vec<CredentialField>,
@@ -98,6 +101,7 @@ pub fn venues() -> Vec<Venue> {
             name: "Alpaca",
             description: "US stocks, ETFs and options",
             docs_url: format!("{DOCS}/alpaca/"),
+            universe: Some("About 14,400 stocks and ETFs"),
             environments: environments(
                 "paper trading account",
                 Some("https://app.alpaca.markets/paper/dashboard/overview"),
@@ -110,6 +114,7 @@ pub fn venues() -> Vec<Venue> {
             name: "Binance",
             description: "Crypto spot pairs",
             docs_url: format!("{DOCS}/binance/"),
+            universe: Some("About 2,000 spot pairs"),
             environments: environments(
                 "spot testnet",
                 Some("https://testnet.binance.vision/"),
@@ -125,10 +130,24 @@ pub fn venues() -> Vec<Venue> {
             ],
         },
         Venue {
+            code: "BYBIT",
+            name: "Bybit",
+            description: "Crypto spot pairs",
+            docs_url: format!("{DOCS}/bybit/"),
+            universe: Some("About 800 spot pairs"),
+            environments: environments(
+                "spot testnet",
+                Some("https://testnet.bybit.com/app/user/api-management"),
+                Some("https://www.bybit.com/app/user/api-management"),
+            ),
+            fields: vec![field("api_key", "API key").secret(), field("api_secret", "API secret").secret()],
+        },
+        Venue {
             code: "IBKR",
             name: "Interactive Brokers",
             description: "Multi-asset over FIX; experimental, no instrument loading",
             docs_url: format!("{DOCS}/interactive-brokers/"),
+            universe: None,
             environments: environments("paper account", None, None),
             fields: vec![
                 field("password", "Password").secret(),
@@ -206,6 +225,23 @@ mod tests {
             assert!(first_grouped > 0, "{}: no credential before the settings", venue.code);
             assert!(venue.fields[..first_grouped].iter().any(|f| f.secret), "{}: no secret on top", venue.code);
         }
+    }
+
+    #[test]
+    fn bybit_is_a_key_and_secret_venue_on_its_testnet() {
+        let bybit = venues().into_iter().find(|v| v.code == "BYBIT").expect("BYBIT listed");
+        let fields: Vec<_> = bybit.fields.iter().map(|f| (f.name, f.label, f.secret, f.section)).collect();
+        assert_eq!(fields, [("api_key", "API key", true, None), ("api_secret", "API secret", true, None)]);
+        assert_eq!(bybit.environments[0].label, "spot testnet");
+        assert_eq!(bybit.environments[0].keys_url, Some("https://testnet.bybit.com/app/user/api-management"));
+    }
+
+    #[test]
+    fn the_universe_prompt_copy_lives_with_the_venue() {
+        let universe = |code: &str| venues().into_iter().find(|v| v.code == code).unwrap().universe;
+        assert_eq!(universe("BINANCE"), Some("About 2,000 spot pairs"));
+        assert_eq!(universe("ALPACA"), Some("About 14,400 stocks and ETFs"));
+        assert_eq!(universe("IBKR"), None);
     }
 
     #[test]

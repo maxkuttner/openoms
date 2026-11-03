@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
+use crate::adapters::bybit::BybitAdapter;
 use crate::adapters::{BrokerInstrument, InstrumentProvider};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::setup::catalog;
@@ -28,16 +29,18 @@ const BATCH: usize = 4000;
 pub enum Broker {
     Alpaca,
     Binance,
+    Bybit,
 }
 
 impl Broker {
     /// Every broker the app can sync — the set boot-time auto-sync iterates.
-    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance];
+    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance, Broker::Bybit];
 
     pub fn code(self) -> &'static str {
         match self {
             Broker::Alpaca => "ALPACA",
             Broker::Binance => "BINANCE",
+            Broker::Bybit => "BYBIT",
         }
     }
 
@@ -48,6 +51,7 @@ impl Broker {
         match self {
             Broker::Alpaca => alpaca_env(),
             Broker::Binance => binance_env(),
+            Broker::Bybit => bybit_env(),
         }
     }
 
@@ -105,6 +109,10 @@ fn alpaca_env() -> String {
 
 fn binance_env() -> String {
     env::var("BINANCE_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
+}
+
+fn bybit_env() -> String {
+    env::var("BYBIT_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -234,6 +242,7 @@ pub async fn provider_for(
     Ok(match broker {
         Broker::Alpaca => Box::new(build_alpaca(&creds)?),
         Broker::Binance => Box::new(build_binance(&creds)?),
+        Broker::Bybit => Box::new(build_bybit(&creds)?),
     })
 }
 
@@ -385,6 +394,17 @@ fn build_binance(creds: &BrokerCredentials) -> Result<BinanceAdapter, Box<dyn st
             BinanceAdapter::new(api_key.clone(), private_key, &binance_env()).map_err(Into::into)
         }
         other => Err(format!("binance-* credential is not a Binance credential: {other:?}").into()),
+    }
+}
+
+/// The catalog is public, but the adapter is built from the stored credential
+/// like the others so a sync always runs as the configured connection.
+fn build_bybit(creds: &BrokerCredentials) -> Result<BybitAdapter, Box<dyn std::error::Error>> {
+    match creds {
+        BrokerCredentials::Bybit { api_key, api_secret } => {
+            Ok(BybitAdapter::new(api_key.clone(), api_secret.clone(), &bybit_env()))
+        }
+        other => Err(format!("bybit-* credential is not a Bybit credential: {other:?}").into()),
     }
 }
 
