@@ -3088,6 +3088,7 @@ dependencies = [
  "include_dir",
  "mime_guess",
  "openidconnect",
+ "p256",
  "quickfix",
  "rand 0.8.6",
  "rdkafka",

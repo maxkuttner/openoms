@@ -39,6 +39,8 @@ base64 = "0.22"
 bcrypt = "0.15"
 # Session cookie values are hashed, not bcrypted: see src/sessions.rs.
 sha2 = "0.10"
+# Coinbase Advanced Trade signs every request with an ES256 (P-256) JWT.
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 # Bybit's v5 request signing (HMAC-SHA256); also used by src/oidc.rs's TestSigner.
 hmac = "0.12"
 # `oms update`: unpack the release tarball and compare release versions.

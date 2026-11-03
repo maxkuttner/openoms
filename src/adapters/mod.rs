@@ -1,6 +1,7 @@
 pub mod alpaca;
 pub mod binance;
 pub mod bybit;
+pub mod coinbase;
 
 use std::collections::HashMap;
 use std::sync::Arc;
