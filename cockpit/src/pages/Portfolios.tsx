@@ -1,9 +1,7 @@
 import { CrudResource } from "../components/CrudResource";
+import { statusOptions } from "../lifecycle";
 
-const STATUS = [
-  { value: "ACTIVE", label: "ACTIVE" },
-  { value: "INACTIVE", label: "INACTIVE" },
-];
+const STATUS = statusOptions("portfolio");
 
 export function PortfoliosPage() {
   return (
@@ -11,6 +9,7 @@ export function PortfoliosPage() {
       title="Portfolios"
       path="/admin/portfolios"
       editable
+      lifecycle={{ resource: "portfolio" }}
       columns={[
         { key: "code", label: "Code" },
         { key: "name", label: "Name" },

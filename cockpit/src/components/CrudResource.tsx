@@ -7,6 +7,8 @@ import { useForm } from "@mantine/form";
 import { api } from "../api/client";
 import { useList, useApiMutation } from "../api/hooks";
 import { InstrumentSelect } from "./InstrumentSelect";
+import { useLifecycle } from "./Lifecycle";
+import type { Resource } from "../lifecycle";
 
 export type Field = {
   name: string;
@@ -35,6 +37,9 @@ type Props = {
   // Extra per-row action rendered in the action cell, before Edit. Additive —
   // omit it and nothing changes.
   rowAction?: (row: any) => ReactNode;
+  // Rows are deactivated instead of deleted: checkboxes, a Deactivate bar,
+  // inactive rows hidden behind a "Show inactive" switch, and Reactivate.
+  lifecycle?: { resource: Resource; afterChange?: () => Promise<unknown> };
 };
 
 // Render the value of one field, resolving select options (incl. async optionsPath).
@@ -70,8 +75,18 @@ function FieldInput({ field, form }: { field: Field; form: any }) {
   }
 }
 
-export function CrudResource({ title, path, idKey = "id", columns, fields, editable, deletable, rowAction }: Props) {
+export function CrudResource({
+  title, path, idKey = "id", columns, fields, editable, deletable, rowAction, lifecycle,
+}: Props) {
   const list = useList<any>(path);
+  const life = useLifecycle(list.data, {
+    resource: lifecycle?.resource ?? "principal",
+    path,
+    idKey,
+    label: (r) => String(r.code ?? r[idKey]),
+    afterChange: lifecycle?.afterChange,
+  });
+  const rows = lifecycle ? life.visible : (list.data ?? []);
   const [editing, setEditing] = useState<any | null>(null); // row being edited, or {} for create
   const isCreate = editing && !editing[idKey];
 
@@ -104,8 +119,12 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
     <Stack>
       <Group justify="space-between">
         <Title order={3}>{title}</Title>
-        <Button onClick={() => open(null)}>New</Button>
+        <Group>
+          {lifecycle && life.switchControl}
+          <Button onClick={() => open(null)}>New</Button>
+        </Group>
       </Group>
+      {lifecycle && life.selectionBar}
 
       {list.isLoading ? (
         <Loader />
@@ -113,6 +132,7 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
         <Table striped highlightOnHover withTableBorder>
           <Table.Thead>
             <Table.Tr>
+              {lifecycle && <Table.Th w={40}>{life.headerCheckbox}</Table.Th>}
               {columns.map((c) => (
                 <Table.Th key={c.key}>{c.label}</Table.Th>
               ))}
@@ -120,8 +140,9 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
-            {(list.data ?? []).map((row) => (
-              <Table.Tr key={row[idKey]}>
+            {rows.map((row) => (
+              <Table.Tr key={row[idKey]} c={lifecycle && !life.isActive(row) ? "dimmed" : undefined}>
+                {lifecycle && <Table.Td>{life.rowCheckbox(row)}</Table.Td>}
                 {columns.map((c) => (
                   <Table.Td key={c.key}>{c.render ? c.render(row) : formatCell(row[c.key])}</Table.Td>
                 ))}
@@ -129,11 +150,13 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
                   <Table.Td>
                     <Group gap="xs" justify="flex-end">
                       {rowAction?.(row)}
-                      {editable && (
-                        <Button size="xs" variant="light" onClick={() => open(row)}>
-                          Edit
-                        </Button>
-                      )}
+                      {lifecycle && !life.isActive(row)
+                        ? life.reactivateButton(row)
+                        : editable && (
+                            <Button size="xs" variant="light" onClick={() => open(row)}>
+                              Edit
+                            </Button>
+                          )}
                       {deletable && (
                         <ActionIcon
                           color="red"
@@ -150,9 +173,9 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
                 )}
               </Table.Tr>
             ))}
-            {(list.data ?? []).length === 0 && (
+            {rows.length === 0 && (
               <Table.Tr>
-                <Table.Td colSpan={columns.length + 1}>
+                <Table.Td colSpan={columns.length + 2}>
                   <Text c="dimmed" ta="center" py="md">No rows yet.</Text>
                 </Table.Td>
               </Table.Tr>
@@ -160,6 +183,8 @@ export function CrudResource({ title, path, idKey = "id", columns, fields, edita
           </Table.Tbody>
         </Table>
       )}
+
+      {lifecycle && life.confirmModal}
 
       <Modal
         opened={!!editing}

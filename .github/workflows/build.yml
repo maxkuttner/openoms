@@ -86,7 +86,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           cache: npm
           cache-dependency-path: cockpit/package-lock.json
 
@@ -96,6 +96,9 @@ jobs:
 
       - name: the bundle calls the OMS same-origin
         run: ./cockpit/check-api-base.sh
+      - name: cockpit unit tests
+        working-directory: cockpit
+        run: npm test
       - name: every cockpit colour comes from the palette
         run: ./cockpit/check-palette.sh
 

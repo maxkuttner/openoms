@@ -1,9 +1,7 @@
 import { CrudResource } from "../components/CrudResource";
+import { statusOptions } from "../lifecycle";
 
-const STATUS = [
-  { value: "ACTIVE", label: "ACTIVE" },
-  { value: "INACTIVE", label: "INACTIVE" },
-];
+const STATUS = statusOptions("account");
 
 export function AccountsPage() {
   return (
@@ -11,6 +9,7 @@ export function AccountsPage() {
       title="Accounts"
       path="/admin/accounts"
       editable
+      lifecycle={{ resource: "account" }}
       columns={[
         { key: "code", label: "Code" },
         { key: "broker_connection_code", label: "Broker connection" },

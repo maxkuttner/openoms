@@ -1,15 +1,14 @@
 import { useState } from "react";
 import { Button, Drawer, Stack } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
+import { statusOptions } from "../lifecycle";
+import { api } from "../api/client";
 import { CredentialsPanel } from "../components/CredentialsPanel";
 import { StreamHealthStrip } from "../components/StreamHealthStrip";
 import { UniverseStatus } from "../components/UniverseStatus";
 import type { BrokerConnection } from "../api/types";
 
-const STATUS = [
-  { value: "ACTIVE", label: "ACTIVE" },
-  { value: "INACTIVE", label: "INACTIVE" },
-];
+const STATUS = statusOptions("brokerConnection");
 
 export function BrokerConnectionsPage() {
   const [selected, setSelected] = useState<BrokerConnection | null>(null);
@@ -26,6 +25,7 @@ export function BrokerConnectionsPage() {
       path="/admin/broker-connections"
       idKey="code"
       editable
+      lifecycle={{ resource: "brokerConnection", afterChange: () => api.post("/admin/connections/reload", {}) }}
       rowAction={(row: BrokerConnection) => (
         <Button size="xs" variant="light" onClick={() => setSelected(row)}>
           Credentials

@@ -7,12 +7,20 @@ import { useForm } from "@mantine/form";
 import { api } from "../api/client";
 import { useList, useApiMutation } from "../api/hooks";
 import type { Principal, ApiKeyRecord, Grant, Portfolio } from "../api/types";
+import { useLifecycle } from "../components/Lifecycle";
+import { statusOptions } from "../lifecycle";
 
 const PRINCIPAL_TYPES = ["HUMAN", "SERVICE", "STRATEGY", "DESK"].map((v) => ({ value: v, label: v }));
-const STATUS = ["ACTIVE", "INACTIVE"].map((v) => ({ value: v, label: v }));
+const STATUS = statusOptions("principal");
 
 export function PrincipalsPage() {
   const list = useList<Principal>("/admin/principals");
+  const life = useLifecycle(list.data, {
+    resource: "principal",
+    path: "/admin/principals",
+    idKey: "id",
+    label: (p) => p.code,
+  });
   const [editing, setEditing] = useState<Principal | {} | null>(null);
   const [manage, setManage] = useState<Principal | null>(null);
   const isCreate = editing != null && !("id" in editing);
@@ -46,8 +54,12 @@ export function PrincipalsPage() {
     <Stack>
       <Group justify="space-between">
         <Title order={3}>Principals</Title>
-        <Button onClick={() => openForm(null)}>New</Button>
+        <Group>
+          {life.switchControl}
+          <Button onClick={() => openForm(null)}>New</Button>
+        </Group>
       </Group>
+      {life.selectionBar}
 
       {list.isLoading ? (
         <Loader />
@@ -55,6 +67,7 @@ export function PrincipalsPage() {
         <Table striped highlightOnHover withTableBorder>
           <Table.Thead>
             <Table.Tr>
+              <Table.Th w={40}>{life.headerCheckbox}</Table.Th>
               <Table.Th>Code</Table.Th>
               <Table.Th>Display name</Table.Th>
               <Table.Th>Type</Table.Th>
@@ -63,15 +76,20 @@ export function PrincipalsPage() {
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
-            {(list.data ?? []).map((p) => (
-              <Table.Tr key={p.id}>
+            {life.visible.map((p) => (
+              <Table.Tr key={p.id} c={life.isActive(p) ? undefined : "dimmed"}>
+                <Table.Td>{life.rowCheckbox(p)}</Table.Td>
                 <Table.Td>{p.code}</Table.Td>
                 <Table.Td>{p.display_name ?? <Text c="dimmed">—</Text>}</Table.Td>
                 <Table.Td>{p.principal_type}</Table.Td>
                 <Table.Td><Badge variant="light">{p.status}</Badge></Table.Td>
                 <Table.Td>
                   <Group gap="xs" justify="flex-end">
-                    <Button size="xs" variant="light" onClick={() => openForm(p)}>Edit</Button>
+                    {life.isActive(p) ? (
+                      <Button size="xs" variant="light" onClick={() => openForm(p)}>Edit</Button>
+                    ) : (
+                      life.reactivateButton(p)
+                    )}
                     <Button size="xs" onClick={() => setManage(p)}>Keys &amp; grants</Button>
                   </Group>
                 </Table.Td>
@@ -80,6 +98,8 @@ export function PrincipalsPage() {
           </Table.Tbody>
         </Table>
       )}
+
+      {life.confirmModal}
 
       <Modal opened={!!editing} onClose={() => setEditing(null)} title={isCreate ? "New principal" : "Edit principal"} centered>
         <form onSubmit={form.onSubmit((v) => save.mutate(v))}>
