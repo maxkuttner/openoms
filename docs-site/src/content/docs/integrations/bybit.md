@@ -7,6 +7,11 @@ Bybit spot, for crypto. The OMS routes orders to Bybit over its v5 REST API, rec
 fills on Bybit's private WebSocket, and marks crypto positions from Bybit's public order
 book.
 
+:::note
+This integration is tested against Bybit's documented API responses, but has not yet
+been verified end to end with a real Bybit account.
+:::
+
 ## What it covers
 
 | | |
