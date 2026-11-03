@@ -18,6 +18,7 @@ pub static ALL: &[&dyn FeedSymbology] = &[
     &crate::opra_stream::DatabentoOpraFeed::new(String::new()),
     &crate::binance_feed::BinanceFeed,
     &crate::bybit_feed::BybitFeed,
+    &crate::coinbase_feed::CoinbaseFeed,
 ];
 
 /// The symbology for a feed code, or `None` if this build has no such feed —

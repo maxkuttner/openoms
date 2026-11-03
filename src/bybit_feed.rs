@@ -65,8 +65,10 @@ impl FeedSymbology for BybitFeed {
     }
 
     /// Identity: the master symbol is the pair, matching the `s` field verbatim.
+    /// A dashed symbol is a Coinbase product (`BTC-USD`), not a Bybit pair; an
+    /// unknown topic could fail the whole subscribe request.
     fn to_feed_symbol(&self, symbol: &str) -> Option<String> {
-        Some(symbol.to_string())
+        (!symbol.contains('-')).then(|| symbol.to_string())
     }
 }
 
@@ -220,6 +222,14 @@ fn level(side: &serde_json::Value) -> Option<Option<(f64, f64)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Coinbase products (`BTC-USD`) are crypto spot too, but not Bybit symbols:
+    // an unknown topic can fail Bybit's whole subscribe request.
+    #[test]
+    fn bybit_skips_dashed_symbols() {
+        assert_eq!(BybitFeed.to_feed_symbol("BTC-USD"), None);
+        assert_eq!(BybitFeed.to_feed_symbol("BTCUSDT").as_deref(), Some("BTCUSDT"));
+    }
 
     fn json(s: &str) -> serde_json::Value {
         serde_json::from_str(s).unwrap()

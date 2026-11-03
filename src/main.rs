@@ -70,6 +70,7 @@ mod mark_router;
 mod daily_stats_poller;
 mod binance_feed;
 mod bybit_feed;
+mod coinbase_feed;
 mod feeds;
 mod preflight;
 mod config;
@@ -1323,6 +1324,22 @@ async fn serve() {
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("BYBIT/SPOT", health, session));
+    }
+
+    // Coinbase's public ticker marks Coinbase's own products, which no other feed
+    // prices. Not credential-driven either, so not in `StreamRegistry`.
+    {
+        let (coinbase_pos_tx, coinbase_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
+        state.doorbells().set("COINBASE/SPOT", coinbase_pos_tx);
+        let health = state.stream_health().handle("COINBASE", "SPOT", stream_health::StreamKind::Feed);
+        let session = quote_feed::QuoteFeedSession::new(
+            coinbase_feed::CoinbaseFeed,
+            state.pool().clone(),
+            quote_tx.clone(),
+            coinbase_pos_rx,
+            health.clone(),
+        );
+        tokio::spawn(stream_supervisor::supervise("COINBASE/SPOT", health, session));
     }
 
     // Relay the fill path's single doorbell to every feed. `ring_all`'s
