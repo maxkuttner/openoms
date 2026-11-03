@@ -7,6 +7,7 @@ pub mod database;
 pub mod import_env;
 pub mod init;
 pub mod rotate;
+pub mod status;
 pub mod test_data;
 pub mod update;
 

@@ -9,10 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Connection state of a single broker stream.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamState {
     /// Dialing / authenticating — not yet receiving user-data.
@@ -26,7 +26,7 @@ pub enum StreamState {
 /// What a stream is for — the axis the cockpit splits on. A data `Feed` delivers
 /// market data (quotes); an `Execution` stream carries a broker's order/fill
 /// updates. The same vendor can run both (Binance feed + Binance execution).
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
     Feed,
@@ -35,7 +35,7 @@ pub enum StreamKind {
 
 /// The wire protocol a stream runs over. Lets the cockpit distinguish a FIX
 /// order-entry session from a WebSocket one at a glance.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamTransport {
     WebSocket,
@@ -43,7 +43,7 @@ pub enum StreamTransport {
 }
 
 /// A point-in-time snapshot of one stream's health, returned by the API.
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StreamHealth {
     pub broker_code: String,
     pub environment: String,

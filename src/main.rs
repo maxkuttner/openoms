@@ -394,6 +394,10 @@ enum Command {
         #[command(flatten)]
         db: DbArgs,
     },
+    /// Show what is running on this machine and where: the OMS, its UIs, its dependencies and broker streams.
+    ///
+    /// Exits 1 when anything configured is down.
+    Status,
     /// Print the OpenAPI spec as JSON, for the docs build and for scripting.
     Openapi,
     /// Replace this binary with the latest release (or --version), verified.
@@ -782,6 +786,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::Status) => std::process::exit(setup::status::run().await),
         Some(Command::Openapi) => println!("{}", openapi_json()),
         Some(Command::Update { version, check }) => {
             if let Err(e) = setup::update::run(setup::update::Args { version, check }).await {

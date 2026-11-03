@@ -71,6 +71,35 @@ WantedBy=multi-user.target
 Save it as `/etc/systemd/system/oms.service`, then
 `sudo systemctl daemon-reload && sudo systemctl enable --now oms`.
 
+## Is it running?
+
+`oms status` shows what runs on this machine and where: the OMS and the addresses
+of its admin and trader UIs, then Postgres, the login provider, Kafka and each
+broker stream.
+
+```sh
+oms status
+```
+
+```
+config          /home/you/.config/oms/oms.toml
+
+OMS             up              http://localhost:3001
+  admin UI                      http://localhost:3001/cockpit/
+  trader UI                     http://localhost:3001/trade/
+Postgres        up              localhost:5432/ods
+Login (OIDC)    up              http://localhost:8090/realms/oms
+Kafka           not configured
+Broker streams
+  ALPACA        live            PAPER execution
+  BINANCE       down            SPOT feed                            connection reset
+```
+
+It reads the same `oms.toml` and environment as the server, so run it as the same
+user. Postgres, the login provider and Kafka are checked even when the OMS is down;
+the broker streams come from the running OMS. It exits 1 when anything configured
+is down, so a script or health check can use it.
+
 ## After an update
 
 `oms update` replaces the binary but leaves the running process alone. Migrate, then
