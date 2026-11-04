@@ -1,6 +1,6 @@
 # Adding a connector
 
-A connector is one broker or venue the OMS can trade through. Its code lives in the gateway crate (`crates/gateway`), one directory per connector, and a new one touches these places only:
+A connector is one broker or venue the OMS can trade through. Its code lives in the gateway crate (`crates/gateway`), one directory per connector, and a new one touches these places:
 
 1. **`crates/gateway/src/connectors/<name>/`**: `mod.rs` holds the manifest and the `Connector` implementation; next to it go the files the connector needs: `adapter.rs` (REST orders), `stream.rs` (execution stream), `feed.rs` (public quote feed), `fix.rs` (FIX dialect). Copy the closest existing directory:
    - `okx/` or `bybit/` for a crypto venue with a REST API, a private stream and a public quote feed;
@@ -13,6 +13,11 @@ A connector is one broker or venue the OMS can trade through. Its code lives in 
 4. **A docs page** under `docs-site/src/content/docs/integrations/`. The manifest's `docs_url` points at it. What each credential field means and where to get it goes there, not in the UI.
 
 The gateway has no database and no Kafka: a connector reports what the venue did to the order engine over `gateway::contract` and never books anything itself. Code that needs either belongs in the OMS. `boundary_tests::gateway_depends_on_no_database_or_kafka` keeps it that way.
+
+Beyond those, three tests pin today's list on purpose, so a new connector updates them too:
+- `crates/gateway/src/connectors/testdata/venues.json`: the golden `GET /admin/venues` output; add the new venue's entry.
+- `connectors::tests::every_public_feed_keeps_its_label`: the feed supervisor names; add the new feed's label, if it has a public feed.
+- `feeds::tests::public_feeds_are_the_four_crypto_venues`: the public feed list, likewise.
 
 To import a credential from environment variables (`oms config import-env`), add a block to `src/setup/import_env.rs`. This is optional.
 
