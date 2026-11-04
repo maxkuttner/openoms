@@ -262,7 +262,7 @@ async fn apply_once(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::orders::commands::ExecutionReport;
     use crate::event_bus::{EventBus, OrderLaneEvent};
@@ -281,7 +281,7 @@ mod tests {
     /// `seed_order_state` writes `version = 1` with no events behind it, while the
     /// event store checks versions against the log. `version` picks which side
     /// of that check the order lands on. Returns (order, portfolio, instrument).
-    async fn seeded_order(pool: &PgPool, version: i64) -> (Uuid, Uuid, String) {
+    pub(crate) async fn seeded_order(pool: &PgPool, version: i64) -> (Uuid, Uuid, String) {
         let (principal_id, _) = seed_principal(pool, "bus-fill").await;
         let instrument_id = seed_instrument(pool, "BUSFILL").await;
         let order_id = seed_order_state(pool, principal_id, instrument_id, "bus-fill").await;
@@ -296,11 +296,19 @@ mod tests {
         (order_id, portfolio_id, instrument_id.to_string())
     }
 
-    /// Remove everything `seeded_order` and the fill under test wrote, so runs
-    /// don't pile up held positions in the shared dev DB. The order's events
-    /// stay: `order_event` is append-only and refuses deletes.
-    async fn remove_seeded(pool: &PgPool, order_id: Uuid) {
+    /// Remove everything `seeded_order` and the code under test wrote, so runs
+    /// don't pile up held positions or unpublished outbox rows in the shared dev
+    /// DB. The order's events stay: `order_event` is append-only and refuses deletes.
+    pub(crate) async fn remove_seeded(pool: &PgPool, order_id: Uuid) {
         let mut tx = pool.begin().await.expect("begin cleanup");
+        sqlx::query(
+            "DELETE FROM kafka_outbox WHERE global_position IN \
+             (SELECT global_position FROM order_event WHERE order_id = $1)",
+        )
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await
+        .expect("delete outbox rows");
         let row = sqlx::query(
             "DELETE FROM order_state WHERE order_id = $1 \
              RETURNING principal_id, portfolio_id, account_id, broker_connection_code, instrument_id",

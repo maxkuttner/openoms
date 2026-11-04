@@ -306,7 +306,7 @@ mod tests {
         let store = test_store().await;
         let order_id = Uuid::new_v4();
 
-        store
+        let r = store
             .append_events(
                 order_id,
                 0,
@@ -324,6 +324,7 @@ mod tests {
             .expect("append");
 
         let stream = store.load_stream(order_id).await.expect("load stream");
+        crate::kafka_outbox::ack(&store.pool, &r.global_positions).await.expect("clear outbox");
 
         assert_eq!(stream.len(), 1);
         assert_eq!(stream[0].version, 1);
@@ -345,6 +346,7 @@ mod tests {
             .expect("append");
 
         let stream = store.load_stream(order_id).await.expect("load stream");
+        crate::kafka_outbox::ack(&store.pool, &r.global_positions).await.expect("clear outbox");
         assert_eq!(r.global_positions.len(), 2);
         assert!(r.global_positions[0] < r.global_positions[1]);
         let loaded: Vec<i64> = stream.iter().map(|e| e.global_position).collect();
