@@ -1353,15 +1353,10 @@ async fn apply_reload(
     let reload::RegistrationOutput {
         registry,
         mut report,
-        alpaca_creds,
-        // Always empty on a reload: every active Binance connection classifies
-        // `RestartRequired` here (see `classify`'s doc comment), so
-        // `build_registry` never takes the "build a fresh REST adapter" branch
-        // outside of boot. Nothing to spawn a stream for.
-        binance_rest_adapters: _binance_rest_adapters,
-        bybit_adapters,
-        coinbase_adapters,
-        okx_adapters,
+        // A session-bound connection (FIX, and Binance on either transport)
+        // classifies `RestartRequired` on reload and is carried forward, so it
+        // never appears here outside of boot.
+        exec_streams,
     } = reload::build_registry(&broker_connections, false, &current, &deps).await;
     drop(current);
 
@@ -1383,90 +1378,26 @@ async fn apply_reload(
         "build_registry must report exactly one outcome per input connection, in order"
     );
 
-    // For each broker connection: restart its execution stream if this pass
-    // re-registered it, or stop one still running under a credential that is
-    // no longer live if this pass did not.
-    //
-    // `restarts_execution_stream` is true only for `Registered`, and
-    // `classify` never reports `Registered` for a FIX connection on reload
-    // (see its own doc comment) — so the restart arm only ever fires for
-    // Alpaca. Using it here, rather than re-deriving the same answer from
-    // `alpaca_creds` membership, is what makes this loop follow the outcome
-    // the report already committed to, instead of a second, potentially
-    // diverging judgment call.
-    //
-    // The stop arm covers `Disabled` and `Unconfigured`, and a `Failed` that
-    // truly has nothing running: nothing before this task ever stopped the
-    // *execution stream* for one of them — an operator disabling
-    // `alpaca-paper` because a key leaked would see the report say `Disabled`
-    // while the trade-update websocket kept ingesting fills on the old
-    // credential. `RestartRequired` is deliberately excluded: its adapter is
-    // carried forward and is still meant to be running.
-    //
-    // The condition is "no Alpaca adapter survived this pass for this
-    // environment", not "the outcome wasn't Registered" — those differ for
-    // exactly one case: an `Error`ed Alpaca connection whose credential
-    // failed to decrypt but whose adapter was carried forward from `current`
-    // (see `build_registry`'s `Error` arm, added for the same "one bad row
-    // must not disarm a working connection" reason `RestartRequired` already
-    // gets). Aborting the stream there, on the outcome alone, would stop
-    // fills while orders kept routing through the surviving adapter —
-    // recreating, in miniature, the exact order/fill split Task 4 closed for
-    // the double-stream case, just from the opposite direction (zero streams
-    // instead of two). `alpaca_exec_stream_code` is keyed by environment, not
-    // by broker kind, so checking `get_alpaca` from a non-Alpaca connection's
-    // iteration (e.g. an IBKR row sharing the same environment) is always a
-    // harmless no-op — nothing is ever registered under that key for them.
-    for (conn, (_, outcome)) in broker_connections.iter().zip(report.connections.iter()) {
-        let env_name: &'static str = match conn.environment.as_deref() {
-            Some("PAPER") => "PAPER",
-            Some("LIVE") => "LIVE",
-            _ => continue,
-        };
-        let alpaca_adapter = state.registry().get_alpaca(env_name);
-        if reload::restarts_execution_stream(outcome) {
-            if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), alpaca_adapter) {
-                streams.alpaca(env_name, (key.clone(), secret.clone()), adapter, &deps, state.streams()).await;
-            }
-        } else if should_stop_alpaca_stream(outcome, alpaca_adapter.is_some()) {
-            stop_execution_stream(&state, "ALPACA", env_name, &reload::alpaca_exec_stream_code(env_name)).await;
-        }
-    }
-
-    // Bybit, unlike Binance, applies on reload: every connection registered
-    // fresh this pass gets its private stream (re)started on the new adapter.
-    // One carried forward after a decrypt error is not in `bybit_adapters` and
-    // keeps its running stream; one that is gone is stopped just below.
-    for (env_name, adapter) in bybit_adapters {
-        streams.bybit(env_name, adapter, &deps, state.streams()).await;
-    }
-    // Coinbase follows the same rule.
-    for (env_name, adapter) in coinbase_adapters {
-        streams.coinbase(env_name, adapter, &deps, state.streams()).await;
-    }
-    // And OKX.
-    for (env_name, adapter) in okx_adapters {
-        streams.okx(env_name, adapter, &deps, state.streams()).await;
+    // Every connection built fresh this pass gets its execution stream
+    // (re)started on the new adapter. One carried forward — restart required,
+    // or an unreadable credential whose adapter survived — is not in
+    // `exec_streams` and keeps its running stream.
+    for stream in exec_streams {
+        streams.exec(stream, &deps, state.streams()).await;
     }
 
     // Reconcile known execution tasks against the resulting registry, not just
-    // input rows: a deleted row has no iteration in the loop above. Binance REST
-    // is restart-required but its existing task must still stop when disabled.
-    for env_name in ["PAPER", "LIVE"] {
-        if state.registry().get_alpaca(env_name).is_none() {
-            stop_execution_stream(&state, "ALPACA", env_name, &reload::alpaca_exec_stream_code(env_name)).await;
-        }
-        if state.registry().get("BINANCE", env_name).is_none() {
-            stop_execution_stream(&state, "BINANCE", env_name, &reload::binance_exec_stream_code(env_name)).await;
-        }
-        if state.registry().get("BYBIT", env_name).is_none() {
-            stop_execution_stream(&state, "BYBIT", env_name, &reload::bybit_exec_stream_code(env_name)).await;
-        }
-        if state.registry().get("COINBASE", env_name).is_none() {
-            stop_execution_stream(&state, "COINBASE", env_name, &reload::coinbase_exec_stream_code(env_name)).await;
-        }
-        if state.registry().get("OKX", env_name).is_none() {
-            stop_execution_stream(&state, "OKX", env_name, &reload::okx_exec_stream_code(env_name)).await;
+    // input rows: a deleted row has no iteration in the loop above. A stream is
+    // stopped exactly when no adapter for its connection survived this pass —
+    // not on the outcome alone: an unreadable credential whose adapter was
+    // carried forward must keep its fills flowing while orders still route
+    // through it.
+    for connector in crate::connectors::all().iter().filter(|c| c.manifest().exec_stream) {
+        let code = connector.manifest().code;
+        for env_name in ["PAPER", "LIVE"] {
+            if state.registry().get(code, env_name).is_none() {
+                stop_execution_stream(&state, code, env_name, &reload::exec_stream_code(code, env_name)).await;
+            }
         }
     }
 
@@ -1558,24 +1489,6 @@ fn must_refuse_reload(
     crate::nothing_decrypted(any_configured, any_error)
 }
 
-/// Whether the reload loop should stop an Alpaca environment's execution
-/// stream: true iff this pass did not just restart it (`outcome` is not
-/// `Registered`) *and* nothing survived the swap to keep serving orders under
-/// it either.
-///
-/// The second half is what keeps this different from a plain "outcome wasn't
-/// `Registered`" check: an `Error`ed connection whose credential failed to
-/// decrypt can still have `alpaca_adapter_survived = true`, because
-/// `build_registry`'s `Error` arm carries the previous adapter forward (the
-/// same "one bad row must not disarm a working connection" reasoning
-/// `RestartRequired` already gets). Stopping the stream in that case would
-/// halt fills while orders kept routing through the surviving adapter —
-/// recreating, from the opposite direction, the order/fill split Task 4
-/// closed for the double-stream case.
-fn should_stop_alpaca_stream(outcome: &reload::ConnectionOutcome, alpaca_adapter_survived: bool) -> bool {
-    !reload::restarts_execution_stream(outcome) && !alpaca_adapter_survived
-}
-
 /// Classify one feed connection for the reload report — the feed-side
 /// counterpart to `reload::classify`. Simpler than the broker version: no
 /// feed credential owns a thread with no stop path, so there is no
@@ -1604,8 +1517,8 @@ fn classify_feed(conn: &Connection<FeedCredentials>) -> reload::ConnectionOutcom
 /// Whether the reload loop should stop the Databento feed task: true only for
 /// `Disabled` and `Unconfigured` — deliberate operator states. `Registered` is
 /// handled by `restart_databento_feed` itself; `Failed` is excluded on
-/// purpose, the feed-side mirror of `should_stop_alpaca_stream`'s own
-/// asymmetry for brokers: a decrypt failure on a *stored* row is not evidence
+/// purpose, the feed-side mirror of the broker stop rule's own
+/// asymmetry (stop only when no adapter survived): a decrypt failure on a *stored* row is not evidence
 /// the feed itself stopped working, and a stopped feed means no marks, which
 /// means positions go unpriced. The task is never touched in that case, so
 /// "carry forward" here needs no extra step beyond not calling this.
@@ -3033,35 +2946,6 @@ mod tests {
         let brokers = vec![broker("alpaca-paper", good_alpaca())];
         let feeds = vec![feed("databento-opra", CredentialState::Error("bad key".into()))];
         assert!(!must_refuse_reload(&brokers, &feeds));
-    }
-
-    /// A connection this pass just restarted must never also be stopped,
-    /// regardless of whether an adapter happens to already be there.
-    #[test]
-    fn a_registered_connection_is_never_stopped() {
-        assert!(!should_stop_alpaca_stream(&reload::ConnectionOutcome::Registered, true));
-        assert!(!should_stop_alpaca_stream(&reload::ConnectionOutcome::Registered, false));
-    }
-
-    /// The regression this function exists to prevent: an `Error`ed
-    /// connection whose adapter was carried forward (see `build_registry`'s
-    /// `Error` arm) must keep its execution stream running, or orders route
-    /// while fills silently stop arriving.
-    #[test]
-    fn a_failed_connection_with_a_surviving_adapter_is_not_stopped() {
-        assert!(!should_stop_alpaca_stream(
-            &reload::ConnectionOutcome::Failed("bad key".into()),
-            true,
-        ));
-    }
-
-    /// The ordinary cases this function exists for: `Disabled`, `Unconfigured`,
-    /// and a `Failed` with nothing left running all mean stop.
-    #[test]
-    fn disabled_unconfigured_and_unrecovered_failed_are_stopped() {
-        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Disabled, false));
-        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Unconfigured, false));
-        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Failed("bad key".into()), false));
     }
 
     /// `Disabled` and `Unconfigured` are the deliberate-operator-state cases:

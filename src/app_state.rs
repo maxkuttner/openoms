@@ -214,7 +214,7 @@ mod tests {
             .expect("connect_lazy never actually connects");
         let symbology = Identifier::new(OpenFigiClient::new(None), InMemoryCache::new());
         let mut registry = BrokerRegistry::new();
-        registry.register_alpaca("PAPER", sample_alpaca_adapter());
+        registry.register("ALPACA", "PAPER", sample_alpaca_adapter());
         // Nothing in these tests drains either channel — they only exercise the
         // registry swap and the stream registry, never a real fill or
         // a real quote.
@@ -259,14 +259,14 @@ mod tests {
         let state = sample_state();
 
         let before = state.registry();
-        let had_alpaca = before.get_alpaca("PAPER").is_some();
+        let had_alpaca = before.get("ALPACA", "PAPER").is_some();
 
         state.swap_registry(BrokerRegistry::new()); // empty: everything removed
 
         // The guard taken before the swap still sees the old registry.
-        assert_eq!(before.get_alpaca("PAPER").is_some(), had_alpaca);
+        assert_eq!(before.get("ALPACA", "PAPER").is_some(), had_alpaca);
         // A guard taken after sees the new one.
-        assert!(state.registry().get_alpaca("PAPER").is_none());
+        assert!(state.registry().get("ALPACA", "PAPER").is_none());
     }
 
     /// Two swaps in a row must both land — a writer must not be able to publish a
@@ -276,9 +276,9 @@ mod tests {
         let state = sample_state();
         state.swap_registry(BrokerRegistry::new());
         let mut second = BrokerRegistry::new();
-        second.register_alpaca("LIVE", sample_alpaca_adapter());
+        second.register("ALPACA", "LIVE", sample_alpaca_adapter());
         state.swap_registry(second);
-        assert!(state.registry().get_alpaca("LIVE").is_some());
+        assert!(state.registry().get("ALPACA", "LIVE").is_some());
     }
 
     /// Aborting a feed must actually stop it, and re-inserting under the same

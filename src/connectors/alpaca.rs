@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use crate::credentials::BrokerCredentials;
+use crate::reload::RegistrationDeps;
+
+use super::{typed, Connected};
 use crate::credentials::Shown::{Hidden, Tail};
 use crate::venues::{environments, field, Venue, DOCS};
 
@@ -14,11 +20,25 @@ static MANIFEST: Manifest = Manifest {
     live_only: false,
     universe: true,
     quotes: QuoteScope::NonCrypto,
+    exec_stream: true,
+    session_bound: false,
 };
 
 impl Connector for Alpaca {
     fn manifest(&self) -> &'static Manifest {
         &MANIFEST
+    }
+
+    fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
+        let c: crate::adapters::alpaca::AlpacaCredentials = typed(creds)?;
+        let adapter = Arc::new(crate::adapters::alpaca::AlpacaAdapter::new(c.key.clone(), c.secret.clone(), env));
+        let stream_adapter = adapter.clone();
+        Ok(Connected {
+            adapter,
+            exec_stream: Some(Arc::new(move |health, engine| {
+                Box::pin(crate::alpaca_stream::run(env, c.key.clone(), c.secret.clone(), stream_adapter.clone(), health, engine))
+            })),
+        })
     }
 }
 

@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use crate::credentials::BrokerCredentials;
+use crate::reload::RegistrationDeps;
+
+use super::{typed, Connected};
 use crate::credentials::Shown::Hidden;
 use crate::venues::{field, Environment, Input, Venue, DOCS};
 
@@ -14,11 +20,27 @@ static MANIFEST: Manifest = Manifest {
     live_only: true,
     universe: true,
     quotes: QuoteScope::OwnVenue,
+    exec_stream: true,
+    session_bound: false,
 };
 
 impl Connector for Coinbase {
     fn manifest(&self) -> &'static Manifest {
         &MANIFEST
+    }
+
+    fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
+        let c: crate::adapters::coinbase::CoinbaseCredentials = typed(creds)?;
+        let adapter = crate::adapters::coinbase::CoinbaseAdapter::new(c.api_key, &c.private_key)
+            .map_err(|e| format!("Coinbase adapter not registered: {e}"))?;
+        let adapter = Arc::new(adapter);
+        let stream_adapter = adapter.clone();
+        Ok(Connected {
+            adapter,
+            exec_stream: Some(Arc::new(move |health, engine| {
+                Box::pin(crate::coinbase_stream::run(env, stream_adapter.clone(), health, engine))
+            })),
+        })
     }
 }
 

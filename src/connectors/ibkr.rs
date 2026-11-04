@@ -1,3 +1,7 @@
+use crate::credentials::BrokerCredentials;
+use crate::reload::RegistrationDeps;
+
+use super::Connected;
 use crate::credentials::Shown::{Clear, Hidden};
 use crate::venues::{environments, field, Input, Venue, DOCS};
 
@@ -14,11 +18,20 @@ static MANIFEST: Manifest = Manifest {
     live_only: false,
     universe: false,
     quotes: QuoteScope::None,
+    exec_stream: false,
+    session_bound: true,
 };
 
 impl Connector for Ibkr {
     fn manifest(&self) -> &'static Manifest {
         &MANIFEST
+    }
+
+    /// FIX-only: the session both routes orders and delivers execution reports.
+    fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
+        let adapter = crate::fix::start_ibkr(env, creds, &deps.stream_health, deps.engine.clone())
+            .ok_or_else(|| "IBKR FIX session could not start".to_string())?;
+        Ok(Connected { adapter, exec_stream: None })
     }
 }
 

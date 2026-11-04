@@ -7,7 +7,6 @@
 //! that parks forever with no stop path (`fix::start_session`), so replacing one
 //! would mean a second session logging in against the first.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -15,19 +14,10 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::event_bus::EventBus;
-use crate::adapters::alpaca::{AlpacaAdapter, AlpacaCredentials};
-use crate::alpaca_stream;
-use crate::adapters::binance::{BinanceAdapter, BinanceCredentials};
-use crate::adapters::bybit::{BybitAdapter, BybitCredentials};
-use crate::adapters::coinbase::{CoinbaseAdapter, CoinbaseCredentials};
-use crate::adapters::okx::{OkxAdapter, OkxCredentials};
-use crate::bybit_stream;
-use crate::coinbase_stream;
-use crate::okx_stream;
-use crate::adapters::{BrokerRegistry, Transport};
+use crate::adapters::{BrokerAdapter, BrokerRegistry};
+use crate::connectors::{self, ExecStream};
 use crate::app_state::{AppState, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
-use crate::fix;
 use crate::opra_stream::DatabentoOpraFeed;
 use crate::quote_feed::QuoteFeedSession;
 use crate::stream_health::{StreamHealthRegistry, StreamKind};
@@ -71,52 +61,14 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
     match &conn.credentials {
         CredentialState::Unconfigured => ConnectionOutcome::Unconfigured,
         CredentialState::Error(e) => ConnectionOutcome::Failed(e.clone()),
-        CredentialState::Configured(c) => match c.kind.as_str() {
-            "Alpaca" => ConnectionOutcome::Registered,
-            // `BinanceFix` covers both transports — the REST path is selected at
-            // registration time by `Transport::from_env`, not by which variant the
-            // credential is. Reporting `RestartRequired` here even when the actual
-            // transport turns out to be REST is deliberately conservative: a
-            // Binance credential change needs a restart even on REST, for now.
-            // Narrowing that is a follow-up, not this task.
-            // REST order entry plus a private WebSocket that `restart_bybit_stream`
-            // can stop and start at will: nothing forces a restart, on reload or boot.
-            "Bybit" => ConnectionOutcome::Registered,
-            // Same as Bybit: REST orders plus a private WebSocket that
-            // `restart_coinbase_stream` can stop and start at will.
-            "Coinbase" => ConnectionOutcome::Registered,
-            // Same as Bybit, under `restart_okx_stream`.
-            "Okx" => ConnectionOutcome::Registered,
-            "IbkrFix" | "BinanceFix" => {
-                if is_boot {
-                    ConnectionOutcome::Registered
-                } else {
-                    ConnectionOutcome::RestartRequired
-                }
-            }
-            // no connector claims it; registration reports why
+        // A session that owns a running logon (FIX) cannot be swapped under
+        // itself; at boot nothing is running yet, so it simply starts. A kind no
+        // connector owns is left to registration, which reports why.
+        CredentialState::Configured(c) => match connectors::by_credential_kind(&c.kind) {
+            Some(connector) if connector.manifest().session_bound && !is_boot => ConnectionOutcome::RestartRequired,
             _ => ConnectionOutcome::Registered,
         },
     }
-}
-
-/// True when reloading this connection also means restarting its execution
-/// stream — the task that delivers fills, separate from the adapter that
-/// routes orders. Only Alpaca has one: its trade-update stream is a plain
-/// websocket task spawned alongside the adapter, signing its own auth with a
-/// copy of the credential (`src/alpaca_stream.rs`). A FIX broker's execution
-/// reports arrive over the same session that routes its orders, so there is
-/// nothing separate to restart, and `classify` never reports `Registered` for
-/// one on reload anyway (see its doc comment) — so in practice this is only
-/// ever asked about a connection already known to be Alpaca.
-///
-/// Called by the `/admin/connections/reload` handler (`admin.rs`) to decide,
-/// per connection, whether to restart its execution stream — rather than the
-/// handler re-deriving the same answer from `alpaca_creds` membership, which
-/// would be a second, potentially diverging judgment call on the same
-/// question `classify` already settled.
-pub fn restarts_execution_stream(outcome: &ConnectionOutcome) -> bool {
-    matches!(outcome, ConnectionOutcome::Registered)
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential
@@ -129,52 +81,31 @@ pub struct RegistrationDeps {
     pub engine: crate::order_engine::EngineHandle,
 }
 
-/// Everything `build_registry` produces. `registry` and `report` are the pair
-/// the brief for this task describes; `alpaca_creds` and `binance_rest_adapters`
-/// are carried alongside them for the same reason they were stashed inline in
-/// the old `serve()` loop — the caller still needs to spawn each REST adapter's
-/// execution-report stream, and that needs either the raw (key, secret) pair
-/// (Alpaca signs its websocket auth message with them directly — the adapter
-/// keeps them private) or the concrete adapter type (`BrokerRegistry::get`
-/// erases to `Arc<dyn BrokerAdapter>`, and there is no `get_binance` the way
-/// there is `get_alpaca`). Neither belongs on `ReloadReport`: that type is
-/// serialised straight into an HTTP response in Task 5, and one holds secrets.
+/// Everything `build_registry` produces: the registry, the per-connection report,
+/// and the execution streams the caller must (re)start. The streams are kept off
+/// `ReloadReport`, which is serialised straight into an HTTP response.
 ///
-/// Trap for whoever wires the reload endpoint: `alpaca_creds` is rebuilt in
-/// full on every call, including a reload where nothing about that Alpaca
-/// connection changed — Alpaca is never `RestartRequired`, so it is always
-/// re-registered fresh. `binance_rest_adapters`, by contrast, comes back
-/// *empty* for a Binance connection that classified as `RestartRequired` and
-/// was carried forward (see `build_registry`) — no new adapter was built, so
-/// there is nothing to add to the list. A handler that naively respawns a
-/// trade-update stream for every entry in `alpaca_creds` on every reload will
-/// start a second, redundant Alpaca stream alongside the one still running
-/// from boot (or the previous reload); the corresponding Binance stream, if
-/// coded the same way, would simply — and correctly — not be respawned.
+/// `exec_streams` holds only connections built fresh this pass. A session-bound
+/// connection carried forward on reload (`RestartRequired`) is not in it, so a
+/// handler that restarts every entry restarts exactly what changed — never a
+/// second stream beside one still running.
 pub struct RegistrationOutput {
     pub registry: BrokerRegistry,
     pub report: ReloadReport,
-    /// (key, secret) for each Alpaca environment actually registered this pass.
-    pub alpaca_creds: HashMap<&'static str, (String, String)>,
-    /// REST-transport Binance adapters actually registered this pass, concrete
-    /// type, in registration order.
-    pub binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)>,
-    /// Bybit adapters built fresh this pass, one per environment, whose private
-    /// stream the caller (re)starts — on reload as well as at boot.
-    pub bybit_adapters: Vec<(&'static str, Arc<BybitAdapter>)>,
-    /// Coinbase adapters built fresh this pass (LIVE only), whose user stream
-    /// the caller (re)starts — on reload as well as at boot.
-    pub coinbase_adapters: Vec<(&'static str, Arc<CoinbaseAdapter>)>,
-    /// OKX adapters built fresh this pass, one per environment, whose private
-    /// stream the caller (re)starts — on reload as well as at boot.
-    pub okx_adapters: Vec<(&'static str, Arc<OkxAdapter>)>,
+    /// The execution stream of every connection built fresh this pass, for the
+    /// caller to (re)start — at boot and on reload alike. A connection carried
+    /// forward (restart required, or an unreadable credential) is not in it and
+    /// keeps the stream it already has.
+    pub exec_streams: Vec<ExecStreamStart>,
 }
 
-/// A stored credential whose fields don't fit its own kind — a hand-edited or
-/// half-written row. Reported like any other credential that can't be used.
-fn unreadable(code: &str, e: serde_json::Error) -> ConnectionOutcome {
-    error!(code = %code, "credential fields do not match their kind: {e}");
-    ConnectionOutcome::Failed(format!("credential fields do not match their kind: {e}"))
+/// One connection's execution stream, ready to (re)start.
+pub struct ExecStreamStart {
+    pub code: &'static str,
+    pub env: &'static str,
+    /// The adapter the stream books against — the one just registered.
+    pub adapter: Arc<dyn BrokerAdapter>,
+    pub start: ExecStream,
 }
 
 /// Turn every broker connection into an entry in a fresh `BrokerRegistry`.
@@ -200,11 +131,7 @@ pub async fn build_registry(
     deps: &RegistrationDeps,
 ) -> RegistrationOutput {
     let mut registry = BrokerRegistry::new();
-    let mut alpaca_creds: HashMap<&'static str, (String, String)> = HashMap::new();
-    let mut binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)> = Vec::new();
-    let mut bybit_adapters: Vec<(&'static str, Arc<BybitAdapter>)> = Vec::new();
-    let mut coinbase_adapters: Vec<(&'static str, Arc<CoinbaseAdapter>)> = Vec::new();
-    let mut okx_adapters: Vec<(&'static str, Arc<OkxAdapter>)> = Vec::new();
+    let mut exec_streams = Vec::new();
     let mut report = ReloadReport { connections: Vec::new() };
 
     for conn in connections {
@@ -249,101 +176,40 @@ pub async fn build_registry(
                 // columns), not the credential, identify what to look for in
                 // `current` — the credential itself is exactly what failed to
                 // decode, so it cannot be consulted here.
-                //
-                // Alpaca goes through `register_alpaca`/`get_alpaca`, not the
-                // generic path: `BrokerRegistry` keeps a second, Alpaca-only
-                // map that `restart_alpaca_stream` (via `get_alpaca`) reads
-                // from, and only `register_alpaca` keeps both maps in sync.
-                if conn.kind == "ALPACA" {
-                    if let Some(adapter) = current.get_alpaca(env_name) {
-                        registry.register_alpaca(env_name, adapter);
-                    }
-                } else if let Some(adapter) = current.get(&conn.kind, env_name) {
+                if let Some(adapter) = current.get(&conn.kind, env_name) {
                     registry.register(&conn.kind, env_name, adapter);
                 }
             }
             CredentialState::Configured(creds) => {
-                // `broker_code` and the stored credential's own variant tag are two
-                // independent sources of truth for "what kind of broker is this" —
-                // normally in lockstep, but nothing enforces it (e.g. a credential
-                // hand-imported into the wrong row). Registration below follows the
-                // credential's variant, not `conn.kind`, so this cannot mis-route an
-                // adapter — but the mismatch itself is a real misconfiguration worth
-                // surfacing rather than registering silently.
-                let expected_kind = match creds.kind.as_str() {
-                    "Alpaca" => "ALPACA",
-                    "IbkrFix" => "IBKR",
-                    "BinanceFix" => "BINANCE",
-                    "Bybit" => "BYBIT",
-                    "Coinbase" => "COINBASE",
-                    "Okx" => "OKX",
-                    _ => "",
-                };
-                if conn.kind != expected_kind {
-                    warn!(
-                        code = %conn.code, kind = %conn.kind, credential_kind = expected_kind,
-                        "broker_connection's broker_code does not match its stored credential's kind"
-                    );
-                }
-                match creds.kind.as_str() {
-                    // Coinbase has no paper venue: its adapter always talks to live
-                    // api.coinbase.com, so a non-LIVE label would hide real-money orders.
-                    "Coinbase" if env_name != "LIVE" => {
-                        error!(code = %conn.code, environment = env_name, "Coinbase connection is not LIVE, adapter not registered");
-                        outcome = ConnectionOutcome::Failed("Coinbase is LIVE only; this connection's environment is not LIVE".into());
+                // Registration follows the stored credential's kind, not
+                // `conn.kind` — two independent sources of truth for "what
+                // broker is this", normally in lockstep but not enforced (a
+                // credential hand-imported into the wrong row). The mismatch is
+                // a misconfiguration worth surfacing, not something to route by.
+                match connectors::by_credential_kind(&creds.kind) {
+                    None => {
+                        error!(code = %conn.code, credential_kind = %creds.kind, "no connector for this credential kind, adapter not registered");
+                        outcome = ConnectionOutcome::Failed(format!("no connector for credential kind {}", creds.kind));
                     }
-                    "Coinbase" => {
-                        match creds
-                            .parse::<CoinbaseCredentials>()
-                            .map_err(|e| e.to_string())
-                            .and_then(|c| CoinbaseAdapter::new(c.api_key, &c.private_key).map_err(|e| e.to_string()))
-                        {
-                            Ok(adapter) => {
-                                let adapter = Arc::new(adapter);
-                                registry.register("COINBASE", env_name, adapter.clone());
-                                coinbase_adapters.push((env_name, adapter));
-                                info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered COINBASE/{env_name} adapter (REST/WS)");
-                            }
-                            Err(e) => {
-                                error!(code = %conn.code, "Coinbase adapter not registered: {e}");
-                                outcome = ConnectionOutcome::Failed(format!("Coinbase adapter not registered: {e}"));
-                            }
+                    Some(connector) => {
+                        let m = connector.manifest();
+                        if conn.kind != m.code {
+                            warn!(
+                                code = %conn.code, kind = %conn.kind, credential_kind = m.code,
+                                "broker_connection's broker_code does not match its stored credential's kind"
+                            );
                         }
-                    }
-                    "Okx" => match creds.parse::<OkxCredentials>() {
-                        Ok(c) => {
-                            let adapter = Arc::new(OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, env_name));
-                            registry.register("OKX", env_name, adapter.clone());
-                            okx_adapters.push((env_name, adapter));
-                            info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered OKX/{env_name} adapter (REST/WS)");
-                        }
-                        Err(e) => outcome = unreadable(&conn.code, e),
-                    },
-                    "Bybit" => match creds.parse::<BybitCredentials>() {
-                        Ok(c) => {
-                            let adapter = Arc::new(BybitAdapter::new(c.api_key, c.api_secret, env_name));
-                            registry.register("BYBIT", env_name, adapter.clone());
-                            bybit_adapters.push((env_name, adapter));
-                            info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BYBIT/{env_name} adapter (REST/WS)");
-                        }
-                        Err(e) => outcome = unreadable(&conn.code, e),
-                    },
-                    "Alpaca" => match creds.parse::<AlpacaCredentials>() {
-                        Ok(c) => {
-                            registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(c.key.clone(), c.secret.clone(), env_name)));
-                            alpaca_creds.insert(env_name, (c.key, c.secret));
-                            info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered ALPACA/{env_name} adapter");
-                        }
-                        Err(e) => outcome = unreadable(&conn.code, e),
-                    },
-                    "IbkrFix" => {
-                        // IBKR is FIX-only — the FIX session both routes orders and
-                        // delivers execution reports.
-                        if matches!(outcome, ConnectionOutcome::RestartRequired) {
+                        if m.live_only && env_name != "LIVE" {
+                            // No paper venue: its adapter always talks to the live
+                            // venue, so a non-LIVE label would hide real-money orders.
+                            let name = (m.venue)().name;
+                            error!(code = %conn.code, environment = env_name, "{name} connection is not LIVE, adapter not registered");
+                            outcome = ConnectionOutcome::Failed(format!("{name} is LIVE only; this connection's environment is not LIVE"));
+                        } else if matches!(outcome, ConnectionOutcome::RestartRequired) {
                             // Carry the running session forward rather than starting a
                             // second one against the same venue (see fn doc comment).
-                            match current.get("IBKR", env_name) {
-                                Some(adapter) => registry.register("IBKR", env_name, adapter),
+                            match current.get(m.code, env_name) {
+                                Some(adapter) => registry.register(m.code, env_name, adapter),
                                 // Nothing was actually running to carry forward — a
                                 // materially different state from "restart to pick up
                                 // your change": the operator needs to know there is no
@@ -355,76 +221,20 @@ pub async fn build_registry(
                                 }
                             }
                         } else {
-                            match fix::start_ibkr(
-                                env_name,
-                                creds,
-                                &deps.stream_health,
-                                deps.engine.clone(),
-                            ) {
-                                Some(adapter) => registry.register("IBKR", env_name, adapter),
-                                None => {
-                                    outcome = ConnectionOutcome::Failed("IBKR FIX session could not start".into());
+                            match connector.connect(env_name, creds, deps) {
+                                Ok(connected) => {
+                                    registry.register(m.code, env_name, connected.adapter.clone());
+                                    if let Some(start) = connected.exec_stream {
+                                        exec_streams.push(ExecStreamStart { code: m.code, env: env_name, adapter: connected.adapter, start });
+                                    }
+                                    info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered {}/{env_name} adapter", m.code);
+                                }
+                                Err(reason) => {
+                                    error!(code = %conn.code, "{reason}");
+                                    outcome = ConnectionOutcome::Failed(reason);
                                 }
                             }
                         }
-                    }
-                    "BinanceFix" => {
-                        if matches!(outcome, ConnectionOutcome::RestartRequired) {
-                            // Conservative on purpose (see `classify`): carry forward
-                            // whatever is currently registered, FIX or REST, rather
-                            // than rebuilding — even a REST rebuild is deferred to a
-                            // follow-up, not this task.
-                            match current.get("BINANCE", env_name) {
-                                Some(adapter) => registry.register("BINANCE", env_name, adapter),
-                                None => {
-                                    outcome = ConnectionOutcome::Failed(
-                                        "connection needs a restart to apply this change and has no running adapter to fall back on".into(),
-                                    );
-                                }
-                            }
-                        } else {
-                            // Transport is an explicit choice via BINANCE_{ENV}_TRANSPORT=fix|rest
-                            // (default rest) — a wire-protocol setting, not a secret, so it stays
-                            // on the environment. `fix` runs one FIX session for order entry +
-                            // execution reports; `rest` runs the REST adapter + WS user-data stream,
-                            // built from the same store credential (no more PEM file read).
-                            match Transport::from_env(&format!("BINANCE_{env_name}"), Transport::Rest) {
-                                Transport::Fix => {
-                                    match fix::start_binance(
-                                        env_name,
-                                        creds,
-                                        &deps.stream_health,
-                                        deps.engine.clone(),
-                                    ) {
-                                        Some(adapter) => registry.register("BINANCE", env_name, adapter),
-                                        None => {
-                                            error!(code = %conn.code, "Binance FIX session could not start");
-                                            outcome = ConnectionOutcome::Failed("Binance FIX session could not start".into());
-                                        }
-                                    }
-                                }
-                                Transport::Rest => match creds
-                                    .parse::<BinanceCredentials>()
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|c| BinanceAdapter::new(c.api_key, &c.private_key, env_name).map_err(|e| e.to_string()))
-                                {
-                                    Ok(adapter) => {
-                                        let adapter = Arc::new(adapter);
-                                        registry.register("BINANCE", env_name, adapter.clone());
-                                        binance_rest_adapters.push((env_name, adapter));
-                                        info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BINANCE/{env_name} adapter (REST/WS)");
-                                    }
-                                    Err(e) => {
-                                        error!(code = %conn.code, "Binance adapter not registered: {e}");
-                                        outcome = ConnectionOutcome::Failed(format!("Binance adapter not registered: {e}"));
-                                    }
-                                },
-                            }
-                        }
-                    }
-                    other => {
-                        error!(code = %conn.code, credential_kind = other, "no connector for this credential kind, adapter not registered");
-                        outcome = ConnectionOutcome::Failed(format!("no connector for credential kind {other}"));
                     }
                 }
             }
@@ -432,7 +242,7 @@ pub async fn build_registry(
         report.connections.push((conn.code.clone(), outcome));
     }
 
-    RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters, bybit_adapters, coinbase_adapters, okx_adapters }
+    RegistrationOutput { registry, report, exec_streams }
 }
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
@@ -477,73 +287,14 @@ pub async fn restart_databento_feed(
     streams.insert("databento-opra", handle);
 }
 
-/// The `StreamRegistry` key for one environment's Alpaca execution stream.
-///
-/// Feed codes are connection codes ("databento-opra"); this is deliberately
-/// not one — the ":exec" suffix a connection code can never contain — so an
-/// execution stream can never collide with a feed entry in the same registry,
-/// and aborting one can never accidentally take out the other.
-///
-/// `pub(crate)`, not private: `admin::reload_connections` also needs this key
-/// to stop a stream whose connection is no longer registered (Disabled,
-/// Unconfigured, or Failed), not only to start one.
-pub(crate) fn alpaca_exec_stream_code(env_name: &str) -> String {
-    format!("alpaca-{}:exec", env_name.to_lowercase())
-}
-
-pub(crate) fn binance_exec_stream_code(env_name: &str) -> String {
-    format!("binance-{}:exec", env_name.to_lowercase())
-}
-
-pub(crate) fn bybit_exec_stream_code(env_name: &str) -> String {
-    format!("bybit-{}:exec", env_name.to_lowercase())
-}
-
-pub(crate) fn coinbase_exec_stream_code(env_name: &str) -> String {
-    format!("coinbase-{}:exec", env_name.to_lowercase())
-}
-
-pub(crate) fn okx_exec_stream_code(env_name: &str) -> String {
-    format!("okx-{}:exec", env_name.to_lowercase())
-}
+pub(crate) use crate::connectors::exec_stream_code;
 
 /// The network boundary of reload. Store reads, classification, serialization,
 /// swaps and stops remain real in integration tests; only new external sessions
 /// are substituted with controlled tasks.
 #[async_trait::async_trait]
 pub(crate) trait ReloadStreams: Send + Sync + 'static {
-    async fn alpaca(
-        &self,
-        environment: &'static str,
-        credentials: (String, String),
-        adapter: Arc<AlpacaAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    );
-
-    async fn bybit(
-        &self,
-        environment: &'static str,
-        adapter: Arc<BybitAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    );
-
-    async fn coinbase(
-        &self,
-        environment: &'static str,
-        adapter: Arc<CoinbaseAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    );
-
-    async fn okx(
-        &self,
-        environment: &'static str,
-        adapter: Arc<OkxAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    );
+    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry);
 
     async fn databento(&self, api_key: String, state: &AppState);
 }
@@ -552,45 +303,8 @@ pub(crate) struct LiveReloadStreams;
 
 #[async_trait::async_trait]
 impl ReloadStreams for LiveReloadStreams {
-    async fn alpaca(
-        &self,
-        environment: &'static str,
-        (key, secret): (String, String),
-        adapter: Arc<AlpacaAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    ) {
-        restart_alpaca_stream(environment, key, secret, adapter, deps, streams).await;
-    }
-
-    async fn bybit(
-        &self,
-        environment: &'static str,
-        adapter: Arc<BybitAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    ) {
-        restart_bybit_stream(environment, adapter, deps, streams).await;
-    }
-
-    async fn coinbase(
-        &self,
-        environment: &'static str,
-        adapter: Arc<CoinbaseAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    ) {
-        restart_coinbase_stream(environment, adapter, deps, streams).await;
-    }
-
-    async fn okx(
-        &self,
-        environment: &'static str,
-        adapter: Arc<OkxAdapter>,
-        deps: &RegistrationDeps,
-        streams: &StreamRegistry,
-    ) {
-        restart_okx_stream(environment, adapter, deps, streams).await;
+    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry) {
+        restart_exec_stream(&stream, deps, streams).await;
     }
 
     async fn databento(&self, api_key: String, state: &AppState) {
@@ -599,105 +313,28 @@ impl ReloadStreams for LiveReloadStreams {
     }
 }
 
-/// (Re)start one Alpaca environment's execution-report stream — the task that
-/// delivers fills — against a freshly built `adapter`, registering its handle
-/// in `streams` under `alpaca_exec_stream_code` (see there for why that key,
-/// not the connection code).
+/// (Re)start one connection's execution stream — the task that delivers its
+/// fills — against the adapter just registered, under `exec_stream_code`.
 ///
-/// Unlike `restart_databento_feed`, there is no "nothing changed, skip it"
-/// case to consider: every call to `build_registry` builds a brand new
-/// `AlpacaAdapter` for each active, configured Alpaca connection (`classify`
-/// never reports `RestartRequired` for Alpaca), so this must run every time
-/// that happens. The stream signs its own websocket auth directly with `key`
-/// and `secret`, and holds `adapter` to post fills back through — both fresh
-/// on every call — so skipping the respawn would leave the previous stream's
-/// fills landing against an adapter the registry no longer serves orders
-/// through. That split is exactly what this task exists to close; aborting
-/// first (rather than only inserting) is what makes a reload also cover the
-/// case where nothing is running yet, same as `restart_databento_feed`.
-///
-/// Takes `deps` rather than its individual fields (pool, stream_health,
-/// event_bus) both to stay under clippy's argument-count lint and
-/// because it is the same bundle `build_registry` already draws on — boot and
-/// a later reload share one source for these rather than each re-deriving or
-/// threading them through separately.
-pub async fn restart_alpaca_stream(
-    env_name: &'static str,
-    key: String,
-    secret: String,
-    adapter: Arc<AlpacaAdapter>,
-    deps: &RegistrationDeps,
-    streams: &StreamRegistry,
-) {
-    let code = alpaca_exec_stream_code(env_name);
+/// Every call to `build_registry` builds a brand new adapter for each active,
+/// configured connection it does not carry forward, and the stream books
+/// against that adapter, so it must follow it every time: skipping the respawn
+/// would leave fills landing against an adapter the registry no longer routes
+/// orders through. Aborting first (rather than only inserting) is what makes
+/// boot — where nothing runs yet — the same call as a reload.
+pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry) {
+    let code = exec_stream_code(stream.code, stream.env);
     streams.abort_and_remove(&code).await;
-    let health = deps.stream_health.handle("ALPACA", env_name, StreamKind::Execution);
+    let health = deps.stream_health.handle(stream.code, stream.env, StreamKind::Execution);
     health.set_connecting();
-    let handle = tokio::spawn(alpaca_stream::run(
-        env_name,
-        key,
-        secret,
-        adapter,
-        health,
-        deps.engine.clone(),
-    ));
-    streams.insert(code, handle);
-}
-
-/// (Re)start one Bybit environment's private stream against a freshly built
-/// `adapter`, replacing any task already registered under
-/// `bybit_exec_stream_code` — the same shape as `restart_alpaca_stream`, and
-/// for the same reason: every reload builds a new adapter for an active,
-/// configured Bybit connection, so the stream must follow it.
-pub async fn restart_bybit_stream(
-    env_name: &'static str,
-    adapter: Arc<BybitAdapter>,
-    deps: &RegistrationDeps,
-    streams: &StreamRegistry,
-) {
-    let code = bybit_exec_stream_code(env_name);
-    streams.abort_and_remove(&code).await;
-    let health = deps.stream_health.handle("BYBIT", env_name, StreamKind::Execution);
-    health.set_connecting();
-    let handle = tokio::spawn(bybit_stream::run(env_name, adapter, health, deps.engine.clone()));
-    streams.insert(code, handle);
-}
-
-/// (Re)start the Coinbase user stream against a freshly built `adapter` — the
-/// same shape as `restart_bybit_stream`.
-pub async fn restart_coinbase_stream(
-    env_name: &'static str,
-    adapter: Arc<CoinbaseAdapter>,
-    deps: &RegistrationDeps,
-    streams: &StreamRegistry,
-) {
-    let code = coinbase_exec_stream_code(env_name);
-    streams.abort_and_remove(&code).await;
-    let health = deps.stream_health.handle("COINBASE", env_name, StreamKind::Execution);
-    health.set_connecting();
-    let handle = tokio::spawn(coinbase_stream::run(env_name, adapter, health, deps.engine.clone()));
-    streams.insert(code, handle);
-}
-
-/// (Re)start one OKX environment's private stream against a freshly built
-/// `adapter` — the same shape as `restart_bybit_stream`.
-pub async fn restart_okx_stream(
-    env_name: &'static str,
-    adapter: Arc<OkxAdapter>,
-    deps: &RegistrationDeps,
-    streams: &StreamRegistry,
-) {
-    let code = okx_exec_stream_code(env_name);
-    streams.abort_and_remove(&code).await;
-    let health = deps.stream_health.handle("OKX", env_name, StreamKind::Execution);
-    health.set_connecting();
-    let handle = tokio::spawn(okx_stream::run(env_name, adapter, health, deps.engine.clone()));
+    let handle = tokio::spawn((stream.start)(health, deps.engine.clone()));
     streams.insert(code, handle);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::alpaca::AlpacaAdapter;
     use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 
     fn conn(code: &str, status: &str, state: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
@@ -740,6 +377,45 @@ mod tests {
             stream_health: StreamHealthRegistry::new(),
             engine: crate::order_engine::EngineHandle::new().0,
         }
+    }
+
+    /// The `StreamRegistry` keys as the per-broker functions spelled them before
+    /// connectors: a reload must find and replace streams started by a build
+    /// from before the change.
+    #[test]
+    fn exec_stream_codes_are_unchanged() {
+        assert_eq!(exec_stream_code("ALPACA", "PAPER"), "alpaca-paper:exec");
+        assert_eq!(exec_stream_code("BINANCE", "LIVE"), "binance-live:exec");
+        assert_eq!(exec_stream_code("BYBIT", "PAPER"), "bybit-paper:exec");
+        assert_eq!(exec_stream_code("COINBASE", "LIVE"), "coinbase-live:exec");
+        assert_eq!(exec_stream_code("OKX", "PAPER"), "okx-paper:exec");
+    }
+
+    #[tokio::test]
+    async fn unknown_credential_kind_is_reported_failed() {
+        let c = conn("nasdaq-paper", "ACTIVE", CredentialState::Configured(BrokerCredentials::new("Nasdaq", Default::default())));
+        let out = build_registry(&[c], true, &BrokerRegistry::new(), &stub_deps()).await;
+        assert!(matches!(&out.report.connections[0].1, ConnectionOutcome::Failed(r) if r.contains("Nasdaq")));
+        assert!(out.exec_streams.is_empty());
+    }
+
+    /// Every REST connector's execution stream comes back to the caller to
+    /// (re)start; FIX connectors run their own session and hand back none.
+    #[tokio::test]
+    async fn every_rest_connector_hands_back_an_exec_stream() {
+        let mut coinbase = coinbase_conn();
+        coinbase.environment = Some("LIVE".into());
+        let mut bybit = okx_conn();
+        bybit.kind = "BYBIT".into();
+        bybit.credentials = CredentialState::Configured(BrokerCredentials::from_typed(
+            "Bybit",
+            &crate::adapters::bybit::BybitCredentials { api_key: "k".into(), api_secret: "s".into() },
+        ));
+        let connections = [conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca())), bybit, coinbase, okx_conn()];
+        let out = build_registry(&connections, true, &BrokerRegistry::new(), &stub_deps()).await;
+        let mut codes: Vec<&str> = out.exec_streams.iter().map(|s| s.code).collect();
+        codes.sort_unstable();
+        assert_eq!(codes, ["ALPACA", "BYBIT", "COINBASE", "OKX"]);
     }
 
     fn ibkr_conn(code: &str, status: &str, credentials: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
@@ -902,23 +578,19 @@ mod tests {
         }
     }
 
-    /// The Alpaca-specific half of the same rule: `BrokerRegistry` keeps a
-    /// second, Alpaca-only map (`get_alpaca`) that only `register_alpaca`
-    /// keeps in sync with the generic one — carrying forward through the
-    /// generic `register`/`get` alone would leave `get_alpaca` unable to find
-    /// the carried adapter, which is what `restart_alpaca_stream` (and a
-    /// later reload that *does* decrypt fine) actually calls.
+    /// The same rule for a connection with its own execution stream: the
+    /// carried adapter must be the one the stream keeps booking against.
     #[tokio::test]
-    async fn an_error_alpaca_credential_carries_forward_through_get_alpaca() {
+    async fn an_error_alpaca_credential_carries_its_adapter_forward() {
         let mut current = BrokerRegistry::new();
-        current.register_alpaca("PAPER", stub_adapter());
+        current.register("ALPACA", "PAPER", stub_adapter());
 
         let c = conn("alpaca-paper", "ACTIVE", CredentialState::Error("bad key".into()));
         let output = build_registry(&[c], false, &current, &stub_deps()).await;
 
         assert!(
-            output.registry.get_alpaca("PAPER").is_some(),
-            "get_alpaca must still resolve the carried-forward adapter, not just the generic get()"
+            output.registry.get("ALPACA", "PAPER").is_some(),
+            "the carried-forward adapter must still be registered"
         );
     }
 
@@ -938,13 +610,15 @@ mod tests {
 
     /// Swapping an Alpaca adapter must also restart its execution stream, or
     /// orders route on the new credential while fills arrive on the old one.
-    #[test]
-    fn reloading_alpaca_also_restarts_its_execution_stream() {
+    #[tokio::test]
+    async fn reloading_alpaca_also_restarts_its_execution_stream() {
         let c = conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca()));
-        assert!(restarts_execution_stream(&classify(&c, false)));
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &stub_deps()).await;
+        assert_eq!(out.exec_streams.iter().map(|s| s.code).collect::<Vec<_>>(), ["ALPACA"]);
 
         let disabled = conn("alpaca-paper", "DISABLED", CredentialState::Configured(alpaca()));
-        assert!(!restarts_execution_stream(&classify(&disabled, false)));
+        let out = build_registry(&[disabled], false, &BrokerRegistry::new(), &stub_deps()).await;
+        assert!(out.exec_streams.is_empty());
     }
 
     /// The execution stream's registry key must never collide with a feed
@@ -991,14 +665,14 @@ mod tests {
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "PAPER").is_none());
-        assert!(out.coinbase_adapters.is_empty());
+        assert!(!out.exec_streams.iter().any(|s| s.code == "COINBASE"));
         assert!(matches!(&out.report.connections[0].1, ConnectionOutcome::Failed(m) if m.contains("LIVE")));
     }
 
     #[test]
     fn coinbase_exec_stream_code_is_its_own() {
-        assert_eq!(coinbase_exec_stream_code("LIVE"), "coinbase-live:exec");
-        assert_ne!(coinbase_exec_stream_code("LIVE"), bybit_exec_stream_code("LIVE"));
+        assert_eq!(exec_stream_code("COINBASE", "LIVE"), "coinbase-live:exec");
+        assert_ne!(exec_stream_code("COINBASE", "LIVE"), exec_stream_code("BYBIT", "LIVE"));
     }
 
     #[tokio::test]
@@ -1009,7 +683,7 @@ mod tests {
         };
         let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "LIVE").is_some());
-        assert_eq!(out.coinbase_adapters.iter().map(|(env, _)| *env).collect::<Vec<_>>(), ["LIVE"]);
+        assert_eq!(out.exec_streams.iter().filter(|s| s.code == "COINBASE").map(|s| s.env).collect::<Vec<_>>(), ["LIVE"]);
     }
 
     fn okx_conn() -> Connection<BrokerCredentials> {
@@ -1027,8 +701,8 @@ mod tests {
 
     #[test]
     fn okx_exec_stream_code_is_per_environment() {
-        assert_eq!(okx_exec_stream_code("PAPER"), "okx-paper:exec");
-        assert_eq!(okx_exec_stream_code("LIVE"), "okx-live:exec");
+        assert_eq!(exec_stream_code("OKX", "PAPER"), "okx-paper:exec");
+        assert_eq!(exec_stream_code("OKX", "LIVE"), "okx-live:exec");
     }
 
     #[tokio::test]
@@ -1039,14 +713,14 @@ mod tests {
         };
         let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("OKX", "PAPER").is_some());
-        assert_eq!(out.okx_adapters.iter().map(|(env, _)| *env).collect::<Vec<_>>(), ["PAPER"]);
+        assert_eq!(out.exec_streams.iter().filter(|s| s.code == "OKX").map(|s| s.env).collect::<Vec<_>>(), ["PAPER"]);
     }
 
     #[test]
     fn bybit_exec_stream_code_is_per_environment() {
-        assert_eq!(bybit_exec_stream_code("PAPER"), "bybit-paper:exec");
-        assert_eq!(bybit_exec_stream_code("LIVE"), "bybit-live:exec");
-        assert_ne!(bybit_exec_stream_code("PAPER"), binance_exec_stream_code("PAPER"));
+        assert_eq!(exec_stream_code("BYBIT", "PAPER"), "bybit-paper:exec");
+        assert_eq!(exec_stream_code("BYBIT", "LIVE"), "bybit-live:exec");
+        assert_ne!(exec_stream_code("BYBIT", "PAPER"), exec_stream_code("BINANCE", "PAPER"));
     }
 
     #[tokio::test]
@@ -1062,14 +736,14 @@ mod tests {
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("BYBIT", "PAPER").is_some());
-        assert_eq!(out.bybit_adapters.iter().map(|(env, _)| *env).collect::<Vec<_>>(), ["PAPER"]);
+        assert_eq!(out.exec_streams.iter().filter(|s| s.code == "BYBIT").map(|s| s.env).collect::<Vec<_>>(), ["PAPER"]);
     }
 
     #[test]
     fn alpaca_exec_stream_code_cannot_collide_with_a_feed_code() {
-        assert_eq!(alpaca_exec_stream_code("PAPER"), "alpaca-paper:exec");
-        assert_eq!(alpaca_exec_stream_code("LIVE"), "alpaca-live:exec");
-        assert_ne!(alpaca_exec_stream_code("PAPER"), "databento-opra");
+        assert_eq!(exec_stream_code("ALPACA", "PAPER"), "alpaca-paper:exec");
+        assert_eq!(exec_stream_code("ALPACA", "LIVE"), "alpaca-live:exec");
+        assert_ne!(exec_stream_code("ALPACA", "PAPER"), "databento-opra");
     }
 
     /// The report is an HTTP response body. It must name connections and

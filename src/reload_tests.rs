@@ -41,7 +41,7 @@ fn state(pool: PgPool) -> AppState {
 #[derive(Clone, Default)]
 struct FakeStreams {
     active: Arc<Mutex<HashMap<String, usize>>>,
-    adapters: Arc<Mutex<HashMap<String, Arc<AlpacaAdapter>>>>,
+    adapters: Arc<Mutex<HashMap<String, Arc<dyn crate::adapters::BrokerAdapter>>>>,
     gate: Arc<Mutex<Option<StartGate>>>,
 }
 
@@ -89,44 +89,33 @@ impl FakeStreams {
 
 #[async_trait::async_trait]
 impl ReloadStreams for FakeStreams {
-    async fn alpaca(&self, environment: &'static str, _: (String, String),
-        adapter: Arc<AlpacaAdapter>, _: &RegistrationDeps, streams: &StreamRegistry) {
-        let gate = self.gate.lock().unwrap().take();
-        if let Some(StartGate { entered, release }) = gate {
-            entered.notify_one();
-            release.notified().await;
+    async fn exec(&self, stream: reload::ExecStreamStart, _: &RegistrationDeps, streams: &StreamRegistry) {
+        // the reload-overlap test pauses the Alpaca start; the others never wait
+        if stream.code == "ALPACA" {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(StartGate { entered, release }) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
         }
-        let code = reload::alpaca_exec_stream_code(environment);
+        let code = reload::exec_stream_code(stream.code, stream.env);
         streams.abort_and_remove(&code).await;
         self.spawn(&code, streams);
-        self.adapters.lock().unwrap().insert(environment.into(), adapter);
-    }
-
-    async fn bybit(&self, environment: &'static str, _: Arc<crate::adapters::bybit::BybitAdapter>,
-        _: &RegistrationDeps, streams: &StreamRegistry) {
-        let code = reload::bybit_exec_stream_code(environment);
-        streams.abort_and_remove(&code).await;
-        self.spawn(&code, streams);
-    }
-
-    async fn coinbase(&self, environment: &'static str, _: Arc<crate::adapters::coinbase::CoinbaseAdapter>,
-        _: &RegistrationDeps, streams: &StreamRegistry) {
-        let code = reload::coinbase_exec_stream_code(environment);
-        streams.abort_and_remove(&code).await;
-        self.spawn(&code, streams);
-    }
-
-    async fn okx(&self, environment: &'static str, _: Arc<crate::adapters::okx::OkxAdapter>,
-        _: &RegistrationDeps, streams: &StreamRegistry) {
-        let code = reload::okx_exec_stream_code(environment);
-        streams.abort_and_remove(&code).await;
-        self.spawn(&code, streams);
+        if stream.code == "ALPACA" {
+            self.adapters.lock().unwrap().insert(stream.env.into(), stream.adapter);
+        }
     }
 
     async fn databento(&self, _: String, state: &AppState) {
         state.streams().abort_and_remove("databento-opra").await;
         self.spawn("databento-opra", state.streams());
     }
+}
+
+/// The same adapter instance (compares the data pointer; a `dyn` vtable pointer
+/// may differ between codegen units).
+fn same_adapter(a: &Arc<dyn crate::adapters::BrokerAdapter>, b: &Arc<dyn crate::adapters::BrokerAdapter>) -> bool {
+    std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
 }
 
 async fn serve(state: AppState, fake: FakeStreams) -> (String, tokio::task::JoinHandle<()>) {
@@ -162,7 +151,7 @@ async fn reload_http_auth_and_store_failure_preserve_state() {
     let state = state(pool);
     let before = adapter();
     let mut registry = BrokerRegistry::new();
-    registry.register_alpaca("PAPER", before.clone());
+    registry.register("ALPACA", "PAPER", before.clone());
     state.swap_registry(registry);
     let fake = FakeStreams::default();
     fake.spawn("alpaca-paper:exec", state.streams());
@@ -171,7 +160,7 @@ async fn reload_http_auth_and_store_failure_preserve_state() {
     assert_eq!(client().post(&url).send().await.unwrap().status(), 403);
     assert_eq!(client().post(&url).bearer_auth("wrong").send().await.unwrap().status(), 403);
     assert_eq!(post_reload(&url).await.0, 500);
-    assert!(Arc::ptr_eq(&before, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn crate::adapters::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
 
     state.streams().abort_and_remove("alpaca-paper:exec").await;
@@ -253,7 +242,7 @@ async fn reload_http_lifecycle_against_postgres() {
         assert_eq!(fake.count("okx-paper:exec"), 1);
         assert!(!body.to_string().contains("SYNTHETIC"));
         assert!(Arc::ptr_eq(&held_fix, &state.registry().get("IBKR", "PAPER").unwrap()));
-        assert!(Arc::ptr_eq(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get_alpaca("PAPER").unwrap()));
+        assert!(same_adapter(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get("ALPACA", "PAPER").unwrap()));
         assert_eq!(fake.count("alpaca-paper:exec"), 1);
         assert_eq!(fake.count("databento-opra"), 1);
     }
@@ -265,20 +254,20 @@ async fn reload_http_lifecycle_against_postgres() {
         async move { crate::admin::reload_using(state, Some(key()), fake).await }
     });
     tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
-    let during = state.registry().get_alpaca("PAPER").unwrap();
+    let during = state.registry().get("ALPACA", "PAPER").unwrap();
     let mut second = tokio::spawn({ let url = url.clone(); async move { post_reload(&url).await } });
     assert!(tokio::time::timeout(Duration::from_millis(100), &mut second).await.is_err());
-    assert!(Arc::ptr_eq(&during, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(Arc::ptr_eq(&during, &state.registry().get("ALPACA", "PAPER").unwrap()));
     // Cancel the caller. The owned reload must still finish and release its lock.
     first.abort();
     let _ = first.await;
     release.notify_one();
     assert_eq!(second.await.unwrap().0, 200);
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
-    assert!(Arc::ptr_eq(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get("ALPACA", "PAPER").unwrap()));
 
     // Partial unreadability preserves the exact old adapter and feed task.
-    let before = state.registry().get_alpaca("PAPER").unwrap();
+    let before = state.registry().get("ALPACA", "PAPER").unwrap();
     sqlx::query("UPDATE oms.broker_connection SET credentials = '\\x00'::bytea WHERE code = 'alpaca-paper'")
         .execute(&pool).await.unwrap();
     sqlx::query("UPDATE oms.feed_connection SET credentials = '\\x00'::bytea")
@@ -287,14 +276,14 @@ async fn reload_http_lifecycle_against_postgres() {
     assert_eq!(status, 200);
     assert!(outcome(&body, "alpaca-paper")["Failed"].is_string());
     assert!(outcome(&body, "databento-opra")["Failed"].is_string());
-    assert!(Arc::ptr_eq(&before, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn crate::adapters::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("databento-opra"), 1);
 
     // No readable rows: refuse before swapping or stopping anything.
     sqlx::query("UPDATE oms.broker_connection SET credentials = '\\x00'::bytea")
         .execute(&pool).await.unwrap();
     assert_eq!(post_reload(&url).await.0, 500);
-    assert!(Arc::ptr_eq(&before, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn crate::adapters::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
     assert_eq!(fake.count("binance-paper:exec"), 1);
     assert_eq!(fake.count("databento-opra"), 1);
@@ -312,7 +301,7 @@ async fn reload_http_lifecycle_against_postgres() {
     assert_eq!(status, 200);
     assert_eq!(outcome(&body, "alpaca-paper"), "Disabled");
     assert_eq!(outcome(&body, "databento-opra"), "Unconfigured");
-    assert!(state.registry().get_alpaca("PAPER").is_none());
+    assert!(state.registry().get("ALPACA", "PAPER").is_none());
     assert!(state.registry().get("IBKR", "PAPER").is_none());
     for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {
         assert_eq!(fake.count(code), 0);

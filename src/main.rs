@@ -1086,11 +1086,7 @@ async fn serve() {
         // response body. Every connection's outcome is already logged above by
         // `build_registry`, so there is nothing left to do with it here.
         report: _report,
-        alpaca_creds,
-        binance_rest_adapters,
-        bybit_adapters,
-        coinbase_adapters,
-        okx_adapters,
+        exec_streams,
     } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &registration_deps).await;
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
@@ -1167,43 +1163,14 @@ async fn serve() {
     // before the broker registry so FIX sessions could use them, and before
     // `AppState` so it could be constructed holding them.)
 
-    // Spawn Alpaca trade-update stream tasks (one per configured environment),
-    // registered in `StreamRegistry` under a distinct key
-    // (`reload::restart_alpaca_stream`'s `alpaca_exec_stream_code`) so a later
-    // credential swap can abort and respawn just this task rather than leaving
-    // fills arriving against a credential orders no longer route on — the same
-    // split Plan 2 closed at boot, reintroduced at reload without this. Boot
-    // exercises the exact call a runtime reload will use, same as
-    // `restart_databento_feed` below. Credentials come from `alpaca_creds`,
-    // stashed when the adapter was registered above — a second read of the
-    // store (let alone the environment) here could in principle see a
-    // different answer than what was just registered; reusing the same values
-    // makes that impossible by construction.
-    for env_name in ["PAPER", "LIVE"] {
-        if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), state.registry().get_alpaca(env_name)) {
-            reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &registration_deps, state.streams()).await;
-        }
-    }
-
-    // Spawn the Binance user-data stream for every REST-transport adapter
-    // registered above (`binance_stream::run` needs no credentials of its own —
-    // the adapter already holds them).
-    for (env_name, adapter) in binance_rest_adapters {
-        let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
-        let handle = tokio::spawn(binance_stream::run(env_name, adapter, health, state.engine().clone()));
-        state.streams().insert(reload::binance_exec_stream_code(env_name), handle);
-    }
-
-    // And the Bybit private stream for every Bybit adapter registered above —
-    // the same call a reload makes, so boot and reload cannot drift apart.
-    for (env_name, adapter) in bybit_adapters {
-        reload::restart_bybit_stream(env_name, adapter, &registration_deps, state.streams()).await;
-    }
-    for (env_name, adapter) in coinbase_adapters {
-        reload::restart_coinbase_stream(env_name, adapter, &registration_deps, state.streams()).await;
-    }
-    for (env_name, adapter) in okx_adapters {
-        reload::restart_okx_stream(env_name, adapter, &registration_deps, state.streams()).await;
+    // Start every registered connection's execution stream — the same call a
+    // runtime reload makes (`reload::restart_exec_stream`), so boot and reload
+    // cannot drift apart. Each is registered in `StreamRegistry` under
+    // `exec_stream_code`, so a later credential swap can abort and respawn just
+    // that task rather than leave fills arriving against a credential orders no
+    // longer route on.
+    for stream in &exec_streams {
+        reload::restart_exec_stream(stream, &registration_deps, state.streams()).await;
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside

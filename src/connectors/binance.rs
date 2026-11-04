@@ -1,3 +1,9 @@
+use std::sync::Arc;
+
+use crate::credentials::BrokerCredentials;
+use crate::reload::RegistrationDeps;
+
+use super::{typed, Connected};
 use crate::credentials::Shown::{Clear, Hidden};
 use crate::venues::{environments, field, Input, Venue, DOCS};
 
@@ -14,11 +20,42 @@ static MANIFEST: Manifest = Manifest {
     live_only: false,
     universe: true,
     quotes: QuoteScope::OwnVenue,
+    exec_stream: true,
+    session_bound: true,
 };
 
 impl Connector for Binance {
     fn manifest(&self) -> &'static Manifest {
         &MANIFEST
+    }
+
+    /// Transport is an explicit choice via `BINANCE_{ENV}_TRANSPORT=fix|rest`
+    /// (default rest) — a wire-protocol setting, not a secret, so it stays on the
+    /// environment. `fix` runs one FIX session for order entry and execution
+    /// reports; `rest` runs the REST adapter plus the WS user-data stream, built
+    /// from the same stored credential.
+    fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
+        use crate::adapters::Transport;
+        match Transport::from_env(&format!("BINANCE_{env}"), Transport::Rest) {
+            Transport::Fix => {
+                let adapter = crate::fix::start_binance(env, creds, &deps.stream_health, deps.engine.clone())
+                    .ok_or_else(|| "Binance FIX session could not start".to_string())?;
+                Ok(Connected { adapter, exec_stream: None })
+            }
+            Transport::Rest => {
+                let c: crate::adapters::binance::BinanceCredentials = typed(creds)?;
+                let adapter = crate::adapters::binance::BinanceAdapter::new(c.api_key, &c.private_key, env)
+                    .map_err(|e| format!("Binance adapter not registered: {e}"))?;
+                let adapter = Arc::new(adapter);
+                let stream_adapter = adapter.clone();
+                Ok(Connected {
+                    adapter,
+                    exec_stream: Some(Arc::new(move |health, engine| {
+                        Box::pin(crate::binance_stream::run(env, stream_adapter.clone(), health, engine))
+                    })),
+                })
+            }
+        }
     }
 }
 

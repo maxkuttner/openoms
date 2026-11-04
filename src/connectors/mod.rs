@@ -5,7 +5,15 @@
 //! naming brokers. Adding one is its module here, its line in `all()`, its
 //! migration and its docs page.
 
-use crate::credentials::Shown;
+use std::sync::Arc;
+
+use futures_util::future::BoxFuture;
+
+use crate::adapters::BrokerAdapter;
+use crate::credentials::{BrokerCredentials, Shown};
+use crate::order_engine::EngineHandle;
+use crate::reload::RegistrationDeps;
+use crate::stream_health::StreamHandle;
 use crate::venues::Venue;
 
 mod alpaca;
@@ -49,10 +57,42 @@ pub struct Manifest {
     /// Has an instrument universe to load.
     pub universe: bool,
     pub quotes: QuoteScope,
+    /// Runs an execution stream apart from its adapter (REST connectors), which
+    /// is stopped when the connection goes away.
+    pub exec_stream: bool,
+    /// Its session owns a running logon (FIX): a credential change needs a
+    /// restart, and on reload the running adapter is carried forward instead.
+    pub session_bound: bool,
+}
+
+/// Starts one execution stream; called again on every restart.
+pub type ExecStream = Arc<dyn Fn(StreamHandle, EngineHandle) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// What connecting one configured connection produced.
+pub struct Connected {
+    pub adapter: Arc<dyn BrokerAdapter>,
+    /// The execution stream to (re)start for it; `None` when the session that
+    /// routes orders also delivers fills (FIX).
+    pub exec_stream: Option<ExecStream>,
 }
 
 pub trait Connector: Send + Sync {
     fn manifest(&self) -> &'static Manifest;
+
+    /// Build the adapter (and start a FIX session) for one connection. `Err` is
+    /// the reason the connection is reported failed.
+    fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String>;
+}
+
+/// Read a connector's typed credential, worded the way a failed connection reports it.
+fn typed<T: serde::de::DeserializeOwned>(creds: &BrokerCredentials) -> Result<T, String> {
+    creds.parse().map_err(|e| format!("credential fields do not match their kind: {e}"))
+}
+
+/// The `StreamRegistry` key for one connection's execution stream. Never a
+/// connection code (those carry no ':'), so it cannot collide with a feed entry.
+pub fn exec_stream_code(code: &str, env: &str) -> String {
+    format!("{}-{}:exec", code.to_lowercase(), env.to_lowercase())
 }
 
 /// Every connector, in the order the cockpit lists them.
