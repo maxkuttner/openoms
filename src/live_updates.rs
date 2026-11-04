@@ -27,6 +27,9 @@ const MARKS_FLUSH_MS: u64 = 1000;
 /// An idle socket still gets a frame this often, so a half-open connection is
 /// noticed: the client's watchdog reconnects when frames stop.
 const HEARTBEAT_SECS: u64 = 15;
+/// How often an open browser socket re-checks its session and marks it active.
+/// Well inside the 30-minute idle limit.
+const KEEPALIVE_SECS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -149,6 +152,23 @@ pub async fn pump(
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum KeepAlive {
+    Touch(uuid::Uuid),
+    Close,
+}
+
+/// What an open socket does with the session that opened it. The socket counts
+/// as activity, so idle expiry does not apply while it is open — but a revoked
+/// session (`None`) or one past its absolute cap ends the socket, so it never
+/// outlives its login.
+pub fn keepalive_step(session: Option<&crate::sessions::SessionRecord>, now: chrono::DateTime<chrono::Utc>) -> KeepAlive {
+    match session {
+        Some(s) if now < s.absolute_expires_at => KeepAlive::Touch(s.id),
+        _ => KeepAlive::Close,
+    }
+}
+
 /// `GET /updates`: upgrade to a WebSocket that streams [`UiNotice`]s as JSON
 /// text frames until the client goes away.
 pub async fn ws_updates(ws: WebSocketUpgrade, headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -158,19 +178,44 @@ pub async fn ws_updates(ws: WebSocketUpgrade, headers: HeaderMap, State(state): 
     // subscribe before the handshake completes, so nothing published in between is missed
     let bus = state.event_bus();
     let (order_rx, price_rx) = (bus.subscribe_order(), bus.subscribe_price());
-    ws.on_upgrade(move |socket| serve_socket(socket, order_rx, price_rx))
+    // the browser session that opened the socket, if any (API-key clients have none)
+    let session_hash = crate::sessions::cookie_from_headers(
+        &headers,
+        crate::sessions::cookie_name(&state.session_config.cookie_policy),
+    )
+    .map(|token| crate::sessions::hash_session_token(&token));
+    let pool = state.pool().clone();
+    ws.on_upgrade(move |socket| serve_socket(socket, order_rx, price_rx, pool, session_hash))
 }
 
 async fn serve_socket(
     socket: WebSocket,
     order_rx: broadcast::Receiver<OrderLaneEvent>,
     price_rx: broadcast::Receiver<MarkUpdate>,
+    pool: sqlx::PgPool,
+    session_hash: Option<String>,
 ) {
     let (tx, mut notices) = mpsc::channel(64);
     let pumping = tokio::spawn(pump(order_rx, price_rx, tx));
     let (mut sink, mut incoming) = socket.split();
+    let keepalive_every = Duration::from_secs(KEEPALIVE_SECS);
+    let mut keepalive = tokio::time::interval_at(tokio::time::Instant::now() + keepalive_every, keepalive_every);
     loop {
         tokio::select! {
+            _ = keepalive.tick(), if session_hash.is_some() => {
+                let hash = session_hash.as_deref().unwrap_or_default();
+                // a DB hiccup is not a reason to drop the trader: try again next tick
+                let Ok(session) = crate::sessions::lookup_session(&pool, hash).await else { continue };
+                match keepalive_step(session.as_ref(), chrono::Utc::now()) {
+                    KeepAlive::Touch(id) => {
+                        let _ = crate::sessions::touch_session(&pool, id).await;
+                    }
+                    KeepAlive::Close => {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+            }
             n = notices.recv() => {
                 let Some(n) = n else { break };
                 let text = serde_json::to_string(&n).expect("a notice always serializes");
@@ -298,6 +343,36 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no heartbeat before the interval");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert_eq!(rx.try_recv(), Ok(UiNotice::Heartbeat));
+    }
+
+    fn session(last_seen_mins_ago: i64, expires_in_mins: i64) -> crate::sessions::SessionRecord {
+        let now = chrono::Utc::now();
+        crate::sessions::SessionRecord {
+            id: Uuid::from_u128(7),
+            principal_id: Uuid::nil(),
+            principal_code: "trader".into(),
+            last_seen_at: now - chrono::Duration::minutes(last_seen_mins_ago),
+            absolute_expires_at: now + chrono::Duration::minutes(expires_in_mins),
+        }
+    }
+
+    /// An open socket is activity: a trader watching a quiet market must not be
+    /// idled out, so the session is touched even past the idle limit.
+    #[test]
+    fn open_socket_keeps_an_idle_session_alive() {
+        let r = session(45, 60);
+        assert_eq!(keepalive_step(Some(&r), chrono::Utc::now()), KeepAlive::Touch(Uuid::from_u128(7)));
+    }
+
+    #[test]
+    fn socket_closes_at_the_absolute_session_cap() {
+        let r = session(1, -1);
+        assert_eq!(keepalive_step(Some(&r), chrono::Utc::now()), KeepAlive::Close);
+    }
+
+    #[test]
+    fn socket_closes_when_the_session_is_revoked() {
+        assert_eq!(keepalive_step(None, chrono::Utc::now()), KeepAlive::Close);
     }
 
     #[test]
