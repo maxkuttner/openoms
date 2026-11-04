@@ -55,6 +55,7 @@ use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 mod kafka;
 mod execution;
+mod event_bus;
 mod alpaca_stream;
 mod binance_stream;
 mod bybit_stream;
