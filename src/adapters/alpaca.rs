@@ -62,6 +62,18 @@ struct AlpacaOrderRequest {
     limit_price: Option<String>,
 }
 
+/// An Alpaca API key pair.
+/// Stored as `{"kind":"Alpaca", …}` (see [`crate::credentials::BrokerCredentials`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct AlpacaCredentials {
+    pub key: String,
+    pub secret: String,
+}
+
+impl AlpacaCredentials {
+    pub const KIND: &'static str = "Alpaca";
+}
+
 #[derive(Clone)]
 pub struct AlpacaAdapter {
     client: Client,

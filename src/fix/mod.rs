@@ -299,7 +299,7 @@ pub fn start_session(
 /// credential (see `crate::credentials`). Returns the adapter to register in the
 /// broker registry, or `None` if the session failed to start.
 ///
-/// `creds` must be `BrokerCredentials::IbkrFix` — the caller (`serve()`) only
+/// `creds` must be an `IbkrFix` credential — the caller (`serve()`) only
 /// reaches this function after matching that variant out of the store, so a
 /// mismatch here means a caller bug, not bad operator input; it is logged and
 /// treated as "not started" rather than panicking, so one broken caller cannot
@@ -311,12 +311,15 @@ pub fn start_ibkr(
     stream_health: &StreamHealthRegistry,
     engine: EngineHandle,
 ) -> Option<Arc<FixBrokerAdapter>> {
-    let crate::credentials::BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } =
-        creds
-    else {
+    let parsed = match creds.kind.as_str() {
+        crate::fix::ibkr::IbkrFixCredentials::KIND => creds.parse::<crate::fix::ibkr::IbkrFixCredentials>().ok(),
+        _ => None,
+    };
+    let Some(parsed) = parsed else {
         error!(env = env_name, "start_ibkr called with non-IBKR credentials (programming error)");
         return None;
     };
+    let crate::fix::ibkr::IbkrFixCredentials { host, port, sender_comp_id, target_comp_id, password, ssl } = &parsed;
     let cfg = FixConfig {
         host: host.clone(),
         port: *port,
@@ -336,7 +339,7 @@ pub fn start_ibkr(
 }
 
 /// Wire a Binance Spot FIX order-entry session for `env_name` from an
-/// already-decrypted credential. `creds` must be `BrokerCredentials::BinanceFix`
+/// already-decrypted credential. `creds` must be a `BinanceFix` credential
 /// — see `start_ibkr`'s doc comment for why a mismatch is logged, not panicked.
 /// `private_key` is PEM contents (not a path) — the store holds the key material
 /// itself, so there is nothing to read from disk here.
@@ -347,13 +350,19 @@ pub fn start_binance(
     stream_health: &StreamHealthRegistry,
     engine: EngineHandle,
 ) -> Option<Arc<FixBrokerAdapter>> {
-    let crate::credentials::BrokerCredentials::BinanceFix {
-        host, port, sender_comp_id, target_comp_id, api_key, private_key,
-    } = creds
-    else {
+    let parsed = match creds.kind.as_str() {
+        crate::adapters::binance::BinanceCredentials::KIND => {
+            creds.parse::<crate::adapters::binance::BinanceCredentials>().ok()
+        }
+        _ => None,
+    };
+    let Some(parsed) = parsed else {
         error!(env = env_name, "start_binance called with non-Binance credentials (programming error)");
         return None;
     };
+    let crate::adapters::binance::BinanceCredentials {
+        host, port, sender_comp_id, target_comp_id, api_key, private_key,
+    } = &parsed;
     // A REST-only Binance credential stores an empty host (see `import_env::scan_env`
     // and `save_broker` from the cockpit-to-be — REST never reads a FIX host, so
     // nothing requires one to be set). Asking for FIX transport on such a
@@ -411,18 +420,18 @@ mod tests {
     }
 
     fn alpaca_cred() -> BrokerCredentials {
-        BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() }
+        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "k".into(), secret: "s".into() })
     }
 
     fn ibkr_cred() -> BrokerCredentials {
-        BrokerCredentials::IbkrFix {
+        BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
             host: "h".into(),
             port: 4001,
             sender_comp_id: "S".into(),
             target_comp_id: "T".into(),
             password: "p".into(),
             ssl: true,
-        }
+        })
     }
 
     /// A caller bug (the wrong credential variant reaching `start_ibkr`) must be
@@ -451,14 +460,14 @@ mod tests {
     #[tokio::test]
     async fn start_binance_refuses_an_empty_fix_host() {
         let health = StreamHealthRegistry::new();
-        let creds = BrokerCredentials::BinanceFix {
+        let creds = BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
             host: "".into(),
             port: 9000,
             sender_comp_id: "OMS".into(),
             target_comp_id: "SPOT".into(),
             api_key: "k".into(),
             private_key: "pem".into(),
-        };
+        });
         let result = start_binance("PAPER", &creds, &health, idle_engine());
         assert!(result.is_none());
     }

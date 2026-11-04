@@ -2982,7 +2982,7 @@ mod tests {
     }
 
     fn good_alpaca() -> CredentialState<BrokerCredentials> {
-        CredentialState::Configured(BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() })
+        CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "k".into(), secret: "s".into() }))
     }
 
     /// The gate must never fire on a normal running system or a fresh
@@ -3148,10 +3148,10 @@ mod tests {
     fn the_save_response_carries_no_submitted_secret() {
         let conn = broker(
             "alpaca-paper",
-            CredentialState::Configured(BrokerCredentials::Alpaca {
+            CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials {
                 key: "AKLIVE".into(),
                 secret: "SUPERSECRETVALUE".into(),
-            }),
+            })),
         );
         let body = serde_json::to_string(&SaveResponse {
             redacted: redact_connection(conn),

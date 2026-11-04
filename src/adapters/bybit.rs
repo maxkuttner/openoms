@@ -27,6 +27,18 @@ use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState}
 /// Bybit's default; how long after `X-BAPI-TIMESTAMP` the request stays valid.
 const RECV_WINDOW: &str = "5000";
 
+/// A Bybit v5 HMAC key pair (System-generated API key).
+/// Stored as `{"kind":"Bybit", …}` (see [`crate::credentials::BrokerCredentials`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct BybitCredentials {
+    pub api_key: String,
+    pub api_secret: String,
+}
+
+impl BybitCredentials {
+    pub const KIND: &'static str = "Bybit";
+}
+
 #[derive(Clone)]
 pub struct BybitAdapter {
     client: Client,

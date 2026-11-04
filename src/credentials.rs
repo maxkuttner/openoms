@@ -10,51 +10,41 @@ use sqlx::PgPool;
 
 use crate::secrets::{self, MasterKey};
 
-/// Credentials for one broker connection, tagged by broker so a blob read back
-/// from the database identifies itself.
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(tag = "kind")]
-pub enum BrokerCredentials {
-    Alpaca {
-        key: String,
-        secret: String,
-    },
-    IbkrFix {
-        host: String,
-        port: u16,
-        sender_comp_id: String,
-        target_comp_id: String,
-        password: String,
-        #[serde(default = "default_true")]
-        ssl: bool,
-    },
-    BinanceFix {
-        host: String,
-        port: u16,
-        sender_comp_id: String,
-        target_comp_id: String,
-        api_key: String,
-        /// PEM contents, not a path. A filesystem path is precisely what stops a
-        /// credential being configurable from anywhere but the server's shell.
-        private_key: String,
-    },
-    /// A Bybit v5 HMAC key pair (System-generated API key).
-    Bybit {
-        api_key: String,
-        api_secret: String,
-    },
-    /// A Coinbase CDP API key: its name (`organizations/…/apiKeys/…`) and the EC
-    /// private key PEM that signs each request's JWT.
-    Coinbase {
-        api_key: String,
-        private_key: String,
-    },
-    /// An OKX v5 API key: key, secret and the passphrase chosen when creating it.
-    Okx {
-        api_key: String,
-        api_secret: String,
-        passphrase: String,
-    },
+/// Credentials for one broker connection: its kind tag and its fields, stored as
+/// `{"kind": <tag>, ...fields}` — the same JSON the per-broker enum used to
+/// write, so stored blobs need no migration. Each connector owns the typed shape
+/// of its fields and reads it with [`BrokerCredentials::parse`].
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct BrokerCredentials {
+    pub kind: String,
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl BrokerCredentials {
+    pub fn new(kind: &str, fields: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self { kind: kind.to_string(), fields }
+    }
+
+    /// The connector's own typed view of these fields.
+    pub fn parse<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
+        serde_json::from_value(serde_json::Value::Object(self.fields.clone()))
+    }
+
+    pub fn from_typed<T: Serialize>(kind: &str, typed: &T) -> Self {
+        match serde_json::to_value(typed) {
+            Ok(serde_json::Value::Object(fields)) => Self::new(kind, fields),
+            _ => unreachable!("a credential struct always serializes to a JSON object"),
+        }
+    }
+
+    /// One field's value as text, as a form or a log shows it.
+    pub fn text(&self, name: &str) -> Option<String> {
+        self.fields.get(name).map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -104,35 +94,50 @@ fn masked(name: &str, hint: impl ToString) -> RedactedField {
     RedactedField { name: name.to_string(), value: None, secret: false, hint: Some(hint.to_string()) }
 }
 
+/// How one credential field may be shown.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Shown {
+    /// In the clear (a host, a port).
+    Clear,
+    /// Named, value withheld.
+    Hidden,
+    /// Value withheld, its last four characters given as a hint.
+    Tail,
+}
+
+/// Each kind's fields in display order, and how each may be shown.
+// TEMPORARY: moves into each connector's manifest (phase 5a, Task 2).
+fn redaction(kind: &str) -> &'static [(&'static str, Shown)] {
+    use Shown::*;
+    match kind {
+        "Alpaca" => &[("key", Tail), ("secret", Hidden)],
+        "IbkrFix" => &[
+            ("host", Clear), ("port", Clear), ("sender_comp_id", Clear), ("target_comp_id", Clear),
+            ("ssl", Clear), ("password", Hidden),
+        ],
+        "BinanceFix" => &[
+            ("host", Clear), ("port", Clear), ("sender_comp_id", Clear), ("target_comp_id", Clear),
+            ("api_key", Hidden), ("private_key", Hidden),
+        ],
+        "Bybit" => &[("api_key", Hidden), ("api_secret", Hidden)],
+        "Coinbase" => &[("api_key", Hidden), ("private_key", Hidden)],
+        "Okx" => &[("api_key", Hidden), ("api_secret", Hidden), ("passphrase", Hidden)],
+        _ => &[],
+    }
+}
+
 impl Redact for BrokerCredentials {
     fn redact(&self) -> Redacted {
-        let fields = match self {
-            BrokerCredentials::Alpaca { key, .. } => vec![
+        let fields = redaction(&self.kind)
+            .iter()
+            .map(|&(name, how)| match how {
+                Shown::Clear => shown(name, self.text(name).unwrap_or_default()),
+                Shown::Hidden => hidden(name),
                 // The last four characters identify which key is installed without
                 // being enough to use it — the same trick every payment UI uses.
-                masked("key", format!("…{}", tail4(key))),
-                hidden("secret"),
-            ],
-            BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, ssl, .. } => vec![
-                shown("host", host),
-                shown("port", port),
-                shown("sender_comp_id", sender_comp_id),
-                shown("target_comp_id", target_comp_id),
-                shown("ssl", ssl),
-                hidden("password"),
-            ],
-            BrokerCredentials::BinanceFix { host, port, sender_comp_id, target_comp_id, .. } => vec![
-                shown("host", host),
-                shown("port", port),
-                shown("sender_comp_id", sender_comp_id),
-                shown("target_comp_id", target_comp_id),
-                hidden("api_key"),
-                hidden("private_key"),
-            ],
-            BrokerCredentials::Bybit { .. } => vec![hidden("api_key"), hidden("api_secret")],
-            BrokerCredentials::Coinbase { .. } => vec![hidden("api_key"), hidden("private_key")],
-            BrokerCredentials::Okx { .. } => vec![hidden("api_key"), hidden("api_secret"), hidden("passphrase")],
-        };
+                Shown::Tail => masked(name, format!("…{}", tail4(&self.text(name).unwrap_or_default()))),
+            })
+            .collect();
         Redacted { fields }
     }
 }
@@ -439,14 +444,14 @@ mod tests {
     use crate::secrets::{parse_master_key, seal};
 
     fn alpaca() -> BrokerCredentials {
-        BrokerCredentials::Alpaca { key: "AKTESTKEY123".into(), secret: "SUPERSECRETVALUE".into() }
+        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "AKTESTKEY123".into(), secret: "SUPERSECRETVALUE".into() })
     }
 
     #[test]
     fn a_coinbase_credential_round_trips_and_redacts_both_fields() {
-        let c = BrokerCredentials::Coinbase { api_key: "organizations/o/apiKeys/k".into(), private_key: "pem".into() };
+        let c = BrokerCredentials::from_typed("Coinbase", &crate::adapters::coinbase::CoinbaseCredentials { api_key: "organizations/o/apiKeys/k".into(), private_key: "pem".into() });
         let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
-        assert!(matches!(back, BrokerCredentials::Coinbase { ref api_key, ref private_key } if api_key == "organizations/o/apiKeys/k" && private_key == "pem"));
+        assert!(back.kind == "Coinbase" && matches!(back.parse::<crate::adapters::coinbase::CoinbaseCredentials>().unwrap(), crate::adapters::coinbase::CoinbaseCredentials { ref api_key, ref private_key } if api_key == "organizations/o/apiKeys/k" && private_key == "pem"));
         let fields = redacted_fields(&c);
         assert_eq!(fields.len(), 2);
         assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
@@ -454,9 +459,9 @@ mod tests {
 
     #[test]
     fn an_okx_credential_round_trips_and_redacts_all_three_fields() {
-        let c = BrokerCredentials::Okx { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() };
+        let c = BrokerCredentials::from_typed("Okx", &crate::adapters::okx::OkxCredentials { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() });
         let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
-        assert!(matches!(back, BrokerCredentials::Okx { ref api_key, ref api_secret, ref passphrase } if api_key == "k" && api_secret == "s" && passphrase == "p"));
+        assert!(back.kind == "Okx" && matches!(back.parse::<crate::adapters::okx::OkxCredentials>().unwrap(), crate::adapters::okx::OkxCredentials { ref api_key, ref api_secret, ref passphrase } if api_key == "k" && api_secret == "s" && passphrase == "p"));
         let fields = redacted_fields(&c);
         assert_eq!(fields.len(), 3);
         assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
@@ -464,27 +469,27 @@ mod tests {
 
     #[test]
     fn a_bybit_credential_round_trips_and_redacts_both_fields() {
-        let c = BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() };
+        let c = BrokerCredentials::from_typed("Bybit", &crate::adapters::bybit::BybitCredentials { api_key: "k".into(), api_secret: "s".into() });
         let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
-        assert!(matches!(back, BrokerCredentials::Bybit { ref api_key, ref api_secret } if api_key == "k" && api_secret == "s"));
+        assert!(back.kind == "Bybit" && matches!(back.parse::<crate::adapters::bybit::BybitCredentials>().unwrap(), crate::adapters::bybit::BybitCredentials { ref api_key, ref api_secret } if api_key == "k" && api_secret == "s"));
         let fields = redacted_fields(&c);
         assert_eq!(fields.len(), 2);
         assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
     }
 
     fn binance() -> BrokerCredentials {
-        BrokerCredentials::BinanceFix {
+        BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
             host: "fix-oe.testnet.binance.vision".into(),
             port: 9000,
             sender_comp_id: "OMS".into(),
             target_comp_id: "SPOT".into(),
             api_key: "BNKEY999".into(),
             private_key: "-----BEGIN PRIVATE KEY-----\nMIIBSECRET\n-----END PRIVATE KEY-----".into(),
-        }
+        })
     }
 
     fn ibkr() -> BrokerCredentials {
-        BrokerCredentials::IbkrFix {
+        BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
             host: "ibkr-gateway.example.com".into(),
             port: 4001,
             sender_comp_id: "OMSIB".into(),
@@ -493,7 +498,7 @@ mod tests {
             // Explicitly false so the round-trip test can catch the serde default
             // silently overriding a stored value.
             ssl: false,
-        }
+        })
     }
 
     /// The tag is what tells us which broker a blob belongs to when it comes back
@@ -504,29 +509,36 @@ mod tests {
         // comparing rendered strings would pass even if a secret were lost in the
         // round trip — the one thing this test exists to catch.
         let json = serde_json::to_vec(&alpaca()).expect("serialize");
-        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
-            BrokerCredentials::Alpaca { key, secret } => {
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let crate::adapters::alpaca::AlpacaCredentials { key, secret } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
+            {
                 assert_eq!(key, "AKTESTKEY123");
                 assert_eq!(secret, "SUPERSECRETVALUE");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
 
         let json = serde_json::to_vec(&binance()).expect("serialize");
-        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
-            BrokerCredentials::BinanceFix { host, port, api_key, private_key, target_comp_id, .. } => {
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize");
+            assert_eq!(c.kind, "BinanceFix", "wrong kind: {c:?}");
+            let crate::adapters::binance::BinanceCredentials { host, port, api_key, private_key, target_comp_id, .. } = c.parse::<crate::adapters::binance::BinanceCredentials>().unwrap();
+            {
                 assert_eq!(host, "fix-oe.testnet.binance.vision");
                 assert_eq!(port, 9000);
                 assert_eq!(target_comp_id, "SPOT");
                 assert_eq!(api_key, "BNKEY999");
                 assert!(private_key.contains("MIIBSECRET"), "PEM body must survive intact");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
 
         let json = serde_json::to_vec(&ibkr()).expect("serialize");
-        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
-            BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } => {
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize");
+            assert_eq!(c.kind, "IbkrFix", "wrong kind: {c:?}");
+            let crate::fix::ibkr::IbkrFixCredentials { host, port, sender_comp_id, target_comp_id, password, ssl } = c.parse::<crate::fix::ibkr::IbkrFixCredentials>().unwrap();
+            {
                 assert_eq!(host, "ibkr-gateway.example.com");
                 assert_eq!(port, 4001);
                 assert_eq!(sender_comp_id, "OMSIB");
@@ -536,7 +548,6 @@ mod tests {
                 // as true via the serde default.
                 assert!(!ssl, "explicit ssl:false must survive the round trip");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
 
         let f = FeedCredentials::Databento { api_key: "db-key".into() };
@@ -551,9 +562,11 @@ mod tests {
     #[test]
     fn ibkr_ssl_defaults_to_true_when_absent_from_the_blob() {
         let json = br#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p"}"#;
-        match serde_json::from_slice::<BrokerCredentials>(json).expect("deserialize") {
-            BrokerCredentials::IbkrFix { ssl, .. } => assert!(ssl, "missing ssl must default to true"),
-            other => panic!("wrong variant: {other:?}"),
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(json).expect("deserialize");
+            assert_eq!(c.kind, "IbkrFix", "wrong kind: {c:?}");
+            let crate::fix::ibkr::IbkrFixCredentials { ssl, .. } = c.parse::<crate::fix::ibkr::IbkrFixCredentials>().unwrap();
+            { assert!(ssl, "missing ssl must default to true"); }
         }
     }
 
@@ -664,11 +677,47 @@ mod tests {
         assert!(!r.contains("IBKRPASSWORD777"), "leaked in Debug: {r}");
     }
 
-    /// An unknown tag is data written by a newer version, not garbage to guess at.
+    /// Stored blobs, exactly as the tagged enum wrote them before credentials
+    /// became generic: each must decode and encode back to the same JSON.
     #[test]
-    fn unknown_variant_is_an_error_not_a_panic() {
-        let r: Result<BrokerCredentials, _> = serde_json::from_slice(br#"{"kind":"Nasdaq"}"#);
-        assert!(r.is_err());
+    fn stored_blobs_of_every_kind_round_trip() {
+        let blobs = [
+            r#"{"kind":"Alpaca","key":"AK1","secret":"S1"}"#,
+            r#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p","ssl":false}"#,
+            r#"{"kind":"BinanceFix","host":"h","port":9000,"sender_comp_id":"S","target_comp_id":"T","api_key":"k","private_key":"pem"}"#,
+            r#"{"kind":"Bybit","api_key":"k","api_secret":"s"}"#,
+            r#"{"kind":"Coinbase","api_key":"k","private_key":"pem"}"#,
+            r#"{"kind":"Okx","api_key":"k","api_secret":"s","passphrase":"p"}"#,
+        ];
+        for blob in blobs {
+            let creds: BrokerCredentials = serde_json::from_str(blob).expect(blob);
+            let back = serde_json::to_value(&creds).unwrap();
+            assert_eq!(back, serde_json::from_str::<serde_json::Value>(blob).unwrap(), "{blob}");
+        }
+    }
+
+    #[test]
+    fn ibkr_without_ssl_defaults_to_true() {
+        let json = r#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p"}"#;
+        let creds: BrokerCredentials = serde_json::from_str(json).unwrap();
+        assert!(creds.parse::<crate::fix::ibkr::IbkrFixCredentials>().unwrap().ssl);
+    }
+
+    #[test]
+    fn typed_round_trip_keeps_the_kind_tag() {
+        let okx = crate::adapters::okx::OkxCredentials { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() };
+        let v = serde_json::to_value(BrokerCredentials::from_typed("Okx", &okx)).unwrap();
+        assert_eq!(v["kind"], "Okx");
+        assert_eq!(v["passphrase"], "p");
+    }
+
+    /// A kind no connector knows is data a newer version wrote: it still loads,
+    /// and registration reports it as a failed connection.
+    #[test]
+    fn unknown_kind_still_decodes_but_no_connector_parses_it() {
+        let creds: BrokerCredentials = serde_json::from_slice(br#"{"kind":"Nasdaq"}"#).unwrap();
+        assert_eq!(creds.kind, "Nasdaq");
+        assert!(creds.parse::<crate::adapters::okx::OkxCredentials>().is_err());
     }
 
     /// A key too short to usefully mask must not come back whole — that would
@@ -690,7 +739,8 @@ mod tests {
         let json = serde_json::to_vec(&alpaca()).expect("ser");
         let sealed = seal(&key(), "alpaca-paper", &json);
         match decode_broker(Some(&key()), "alpaca-paper", Some(sealed)) {
-            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, .. }) => {
+            CredentialState::Configured(c) if c.kind == "Alpaca" => {
+                let crate::adapters::alpaca::AlpacaCredentials { key: k, .. } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
                 assert_eq!(k, "AKTESTKEY123");
             }
             other => panic!("expected Configured, got {other:?}"),
@@ -863,7 +913,7 @@ mod tests {
         let new_key = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("key");
 
         let broker_creds =
-            BrokerCredentials::Alpaca { key: "AKROUNDTRIP".into(), secret: "ROUNDTRIPSECRET".into() };
+            BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "AKROUNDTRIP".into(), secret: "ROUNDTRIPSECRET".into() });
         let feed_creds = FeedCredentials::Databento { api_key: "db-roundtrip-key".into() };
 
         save_broker(&pool, &old_key, broker_code, &broker_creds).await.expect("save_broker");
@@ -878,7 +928,8 @@ mod tests {
 
         let brokers = load_brokers(&pool, Some(&old_key)).await.expect("load_brokers");
         match &brokers.iter().find(|c| c.code == broker_code).expect("broker row present").credentials {
-            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, secret: s }) => {
+            CredentialState::Configured(c) if c.kind == "Alpaca" => {
+                let crate::adapters::alpaca::AlpacaCredentials { key: k, secret: s } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
                 assert_eq!(k, "AKROUNDTRIP");
                 assert_eq!(s, "ROUNDTRIPSECRET");
             }
@@ -900,7 +951,8 @@ mod tests {
 
         let brokers_after = load_brokers(&pool, Some(&new_key)).await.expect("load_brokers after rotate");
         match &brokers_after.iter().find(|c| c.code == broker_code).expect("broker row present").credentials {
-            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, secret: s }) => {
+            CredentialState::Configured(c) if c.kind == "Alpaca" => {
+                let crate::adapters::alpaca::AlpacaCredentials { key: k, secret: s } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
                 assert_eq!(k, "AKROUNDTRIP");
                 assert_eq!(s, "ROUNDTRIPSECRET");
             }

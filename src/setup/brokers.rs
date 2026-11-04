@@ -389,14 +389,12 @@ pub async fn load_universe(
 /// *which* environment to sync (PAPER vs LIVE) — that is a mode selector, not a
 /// secret — but the key/secret themselves come from `creds`, not the environment.
 fn build_alpaca(creds: &BrokerCredentials) -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
-    match creds {
-        BrokerCredentials::Alpaca { key, secret } => {
-            Ok(AlpacaAdapter::new(key.clone(), secret.clone(), &alpaca_env()))
-        }
+    match creds.parse::<crate::adapters::alpaca::AlpacaCredentials>() {
+        Ok(c) if creds.kind == "Alpaca" => Ok(AlpacaAdapter::new(c.key, c.secret, &alpaca_env())),
         // `run` looked this credential up by `Broker::Alpaca.connection_code()`,
         // so any other variant here is a programming error (a code/kind
         // mismatch in the store), not something an operator can hit.
-        other => Err(format!("alpaca-* credential is not an Alpaca credential: {other:?}").into()),
+        _ => Err(format!("alpaca-* credential is not an Alpaca credential: {creds:?}").into()),
     }
 }
 
@@ -404,40 +402,32 @@ fn build_alpaca(creds: &BrokerCredentials) -> Result<AlpacaAdapter, Box<dyn std:
 /// (exchangeInfo) is public, but the adapter constructor needs a valid key pair
 /// regardless — `private_key` is PEM contents already (no file read needed).
 fn build_binance(creds: &BrokerCredentials) -> Result<BinanceAdapter, Box<dyn std::error::Error>> {
-    match creds {
-        BrokerCredentials::BinanceFix { api_key, private_key, .. } => {
-            BinanceAdapter::new(api_key.clone(), private_key, &binance_env()).map_err(Into::into)
-        }
-        other => Err(format!("binance-* credential is not a Binance credential: {other:?}").into()),
+    match creds.parse::<crate::adapters::binance::BinanceCredentials>() {
+        Ok(c) if creds.kind == "BinanceFix" => BinanceAdapter::new(c.api_key, &c.private_key, &binance_env()).map_err(Into::into),
+        _ => Err(format!("binance-* credential is not a Binance credential: {creds:?}").into()),
     }
 }
 
 /// The catalog is public, but the adapter is built from the stored credential
 /// like the others so a sync always runs as the configured connection.
 fn build_bybit(creds: &BrokerCredentials) -> Result<BybitAdapter, Box<dyn std::error::Error>> {
-    match creds {
-        BrokerCredentials::Bybit { api_key, api_secret } => {
-            Ok(BybitAdapter::new(api_key.clone(), api_secret.clone(), &bybit_env()))
-        }
-        other => Err(format!("bybit-* credential is not a Bybit credential: {other:?}").into()),
+    match creds.parse::<crate::adapters::bybit::BybitCredentials>() {
+        Ok(c) if creds.kind == "Bybit" => Ok(BybitAdapter::new(c.api_key, c.api_secret, &bybit_env())),
+        _ => Err(format!("bybit-* credential is not a Bybit credential: {creds:?}").into()),
     }
 }
 
 fn build_coinbase(creds: &BrokerCredentials) -> Result<CoinbaseAdapter, Box<dyn std::error::Error>> {
-    match creds {
-        BrokerCredentials::Coinbase { api_key, private_key } => {
-            CoinbaseAdapter::new(api_key.clone(), private_key).map_err(Into::into)
-        }
-        other => Err(format!("coinbase-* credential is not a Coinbase credential: {other:?}").into()),
+    match creds.parse::<crate::adapters::coinbase::CoinbaseCredentials>() {
+        Ok(c) if creds.kind == "Coinbase" => CoinbaseAdapter::new(c.api_key, &c.private_key).map_err(Into::into),
+        _ => Err(format!("coinbase-* credential is not a Coinbase credential: {creds:?}").into()),
     }
 }
 
 fn build_okx(creds: &BrokerCredentials) -> Result<OkxAdapter, Box<dyn std::error::Error>> {
-    match creds {
-        BrokerCredentials::Okx { api_key, api_secret, passphrase } => {
-            Ok(OkxAdapter::new(api_key.clone(), api_secret.clone(), passphrase.clone(), &okx_env()))
-        }
-        other => Err(format!("okx-* credential is not an OKX credential: {other:?}").into()),
+    match creds.parse::<crate::adapters::okx::OkxCredentials>() {
+        Ok(c) if creds.kind == "Okx" => Ok(OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, &okx_env())),
+        _ => Err(format!("okx-* credential is not an OKX credential: {creds:?}").into()),
     }
 }
 
@@ -559,7 +549,7 @@ mod tests {
     }
 
     fn alpaca_cred() -> BrokerCredentials {
-        BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() }
+        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "k".into(), secret: "s".into() })
     }
 
     /// `has_creds` must key off the connection code, not just "is anything

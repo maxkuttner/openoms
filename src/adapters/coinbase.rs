@@ -29,6 +29,19 @@ const BASE: &str = "/api/v3/brokerage";
 /// Coinbase rejects a token older than two minutes.
 const JWT_TTL_SECS: i64 = 120;
 
+/// A Coinbase CDP API key: its name (`organizations/…/apiKeys/…`) and the EC
+/// private key PEM that signs each request's JWT.
+/// Stored as `{"kind":"Coinbase", …}` (see [`crate::credentials::BrokerCredentials`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct CoinbaseCredentials {
+    pub api_key: String,
+    pub private_key: String,
+}
+
+impl CoinbaseCredentials {
+    pub const KIND: &'static str = "Coinbase";
+}
+
 #[derive(Clone)]
 pub struct CoinbaseAdapter {
     client: Client,

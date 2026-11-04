@@ -212,23 +212,23 @@ async fn reload_http_lifecycle_against_postgres() {
     insert_broker(&pool, "binance-paper", "BINANCE").await;
     insert_broker(&pool, "bybit-paper", "BYBIT").await;
     insert_broker(&pool, "okx-paper", "OKX").await;
-    credentials::save_broker(&pool, &key(), "alpaca-paper", &BrokerCredentials::Alpaca {
+    credentials::save_broker(&pool, &key(), "alpaca-paper", &BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials {
         key: "SYNTHETIC-API-KEY".into(), secret: "SYNTHETIC-SECRET".into(),
-    }).await.unwrap();
-    credentials::save_broker(&pool, &key(), "ibkr-paper", &BrokerCredentials::IbkrFix {
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "ibkr-paper", &BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
         target_comp_id: "IBKR".into(), password: "SYNTHETIC-FIX-PASSWORD".into(), ssl: true,
-    }).await.unwrap();
-    credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::BinanceFix {
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
         target_comp_id: "SPOT".into(), api_key: "SYNTHETIC-BINANCE".into(), private_key: "SYNTHETIC-PEM".into(),
-    }).await.unwrap();
-    credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::Bybit {
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::from_typed("Bybit", &crate::adapters::bybit::BybitCredentials {
         api_key: "SYNTHETIC-BYBIT".into(), api_secret: "SYNTHETIC-BYBIT-SECRET".into(),
-    }).await.unwrap();
-    credentials::save_broker(&pool, &key(), "okx-paper", &BrokerCredentials::Okx {
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "okx-paper", &BrokerCredentials::from_typed("Okx", &crate::adapters::okx::OkxCredentials {
         api_key: "SYNTHETIC-OKX".into(), api_secret: "SYNTHETIC-OKX-SECRET".into(), passphrase: "SYNTHETIC-OKX-PASS".into(),
-    }).await.unwrap();
+    })).await.unwrap();
     credentials::save_feed(&pool, &key(), "databento-opra", &FeedCredentials::Databento {
         api_key: "SYNTHETIC-DATABENTO".into(),
     }).await.unwrap();

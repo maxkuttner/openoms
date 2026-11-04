@@ -15,12 +15,12 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::event_bus::EventBus;
-use crate::adapters::alpaca::AlpacaAdapter;
+use crate::adapters::alpaca::{AlpacaAdapter, AlpacaCredentials};
 use crate::alpaca_stream;
-use crate::adapters::binance::BinanceAdapter;
-use crate::adapters::bybit::BybitAdapter;
-use crate::adapters::coinbase::CoinbaseAdapter;
-use crate::adapters::okx::OkxAdapter;
+use crate::adapters::binance::{BinanceAdapter, BinanceCredentials};
+use crate::adapters::bybit::{BybitAdapter, BybitCredentials};
+use crate::adapters::coinbase::{CoinbaseAdapter, CoinbaseCredentials};
+use crate::adapters::okx::{OkxAdapter, OkxCredentials};
 use crate::bybit_stream;
 use crate::coinbase_stream;
 use crate::okx_stream;
@@ -71,8 +71,8 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
     match &conn.credentials {
         CredentialState::Unconfigured => ConnectionOutcome::Unconfigured,
         CredentialState::Error(e) => ConnectionOutcome::Failed(e.clone()),
-        CredentialState::Configured(c) => match c {
-            BrokerCredentials::Alpaca { .. } => ConnectionOutcome::Registered,
+        CredentialState::Configured(c) => match c.kind.as_str() {
+            "Alpaca" => ConnectionOutcome::Registered,
             // `BinanceFix` covers both transports — the REST path is selected at
             // registration time by `Transport::from_env`, not by which variant the
             // credential is. Reporting `RestartRequired` here even when the actual
@@ -81,19 +81,21 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             // Narrowing that is a follow-up, not this task.
             // REST order entry plus a private WebSocket that `restart_bybit_stream`
             // can stop and start at will: nothing forces a restart, on reload or boot.
-            BrokerCredentials::Bybit { .. } => ConnectionOutcome::Registered,
+            "Bybit" => ConnectionOutcome::Registered,
             // Same as Bybit: REST orders plus a private WebSocket that
             // `restart_coinbase_stream` can stop and start at will.
-            BrokerCredentials::Coinbase { .. } => ConnectionOutcome::Registered,
+            "Coinbase" => ConnectionOutcome::Registered,
             // Same as Bybit, under `restart_okx_stream`.
-            BrokerCredentials::Okx { .. } => ConnectionOutcome::Registered,
-            BrokerCredentials::IbkrFix { .. } | BrokerCredentials::BinanceFix { .. } => {
+            "Okx" => ConnectionOutcome::Registered,
+            "IbkrFix" | "BinanceFix" => {
                 if is_boot {
                     ConnectionOutcome::Registered
                 } else {
                     ConnectionOutcome::RestartRequired
                 }
             }
+            // no connector claims it; registration reports why
+            _ => ConnectionOutcome::Registered,
         },
     }
 }
@@ -166,6 +168,13 @@ pub struct RegistrationOutput {
     /// OKX adapters built fresh this pass, one per environment, whose private
     /// stream the caller (re)starts — on reload as well as at boot.
     pub okx_adapters: Vec<(&'static str, Arc<OkxAdapter>)>,
+}
+
+/// A stored credential whose fields don't fit its own kind — a hand-edited or
+/// half-written row. Reported like any other credential that can't be used.
+fn unreadable(code: &str, e: serde_json::Error) -> ConnectionOutcome {
+    error!(code = %code, "credential fields do not match their kind: {e}");
+    ConnectionOutcome::Failed(format!("credential fields do not match their kind: {e}"))
 }
 
 /// Turn every broker connection into an entry in a fresh `BrokerRegistry`.
@@ -261,13 +270,14 @@ pub async fn build_registry(
                 // credential's variant, not `conn.kind`, so this cannot mis-route an
                 // adapter — but the mismatch itself is a real misconfiguration worth
                 // surfacing rather than registering silently.
-                let expected_kind = match creds {
-                    BrokerCredentials::Alpaca { .. } => "ALPACA",
-                    BrokerCredentials::IbkrFix { .. } => "IBKR",
-                    BrokerCredentials::BinanceFix { .. } => "BINANCE",
-                    BrokerCredentials::Bybit { .. } => "BYBIT",
-                    BrokerCredentials::Coinbase { .. } => "COINBASE",
-                    BrokerCredentials::Okx { .. } => "OKX",
+                let expected_kind = match creds.kind.as_str() {
+                    "Alpaca" => "ALPACA",
+                    "IbkrFix" => "IBKR",
+                    "BinanceFix" => "BINANCE",
+                    "Bybit" => "BYBIT",
+                    "Coinbase" => "COINBASE",
+                    "Okx" => "OKX",
+                    _ => "",
                 };
                 if conn.kind != expected_kind {
                     warn!(
@@ -275,15 +285,19 @@ pub async fn build_registry(
                         "broker_connection's broker_code does not match its stored credential's kind"
                     );
                 }
-                match creds {
+                match creds.kind.as_str() {
                     // Coinbase has no paper venue: its adapter always talks to live
                     // api.coinbase.com, so a non-LIVE label would hide real-money orders.
-                    BrokerCredentials::Coinbase { .. } if env_name != "LIVE" => {
+                    "Coinbase" if env_name != "LIVE" => {
                         error!(code = %conn.code, environment = env_name, "Coinbase connection is not LIVE, adapter not registered");
                         outcome = ConnectionOutcome::Failed("Coinbase is LIVE only; this connection's environment is not LIVE".into());
                     }
-                    BrokerCredentials::Coinbase { api_key, private_key } => {
-                        match CoinbaseAdapter::new(api_key.clone(), private_key) {
+                    "Coinbase" => {
+                        match creds
+                            .parse::<CoinbaseCredentials>()
+                            .map_err(|e| e.to_string())
+                            .and_then(|c| CoinbaseAdapter::new(c.api_key, &c.private_key).map_err(|e| e.to_string()))
+                        {
                             Ok(adapter) => {
                                 let adapter = Arc::new(adapter);
                                 registry.register("COINBASE", env_name, adapter.clone());
@@ -296,24 +310,33 @@ pub async fn build_registry(
                             }
                         }
                     }
-                    BrokerCredentials::Okx { api_key, api_secret, passphrase } => {
-                        let adapter = Arc::new(OkxAdapter::new(api_key.clone(), api_secret.clone(), passphrase.clone(), env_name));
-                        registry.register("OKX", env_name, adapter.clone());
-                        okx_adapters.push((env_name, adapter));
-                        info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered OKX/{env_name} adapter (REST/WS)");
-                    }
-                    BrokerCredentials::Bybit { api_key, api_secret } => {
-                        let adapter = Arc::new(BybitAdapter::new(api_key.clone(), api_secret.clone(), env_name));
-                        registry.register("BYBIT", env_name, adapter.clone());
-                        bybit_adapters.push((env_name, adapter));
-                        info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BYBIT/{env_name} adapter (REST/WS)");
-                    }
-                    BrokerCredentials::Alpaca { key, secret } => {
-                        registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(key.clone(), secret.clone(), env_name)));
-                        alpaca_creds.insert(env_name, (key.clone(), secret.clone()));
-                        info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered ALPACA/{env_name} adapter");
-                    }
-                    BrokerCredentials::IbkrFix { .. } => {
+                    "Okx" => match creds.parse::<OkxCredentials>() {
+                        Ok(c) => {
+                            let adapter = Arc::new(OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, env_name));
+                            registry.register("OKX", env_name, adapter.clone());
+                            okx_adapters.push((env_name, adapter));
+                            info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered OKX/{env_name} adapter (REST/WS)");
+                        }
+                        Err(e) => outcome = unreadable(&conn.code, e),
+                    },
+                    "Bybit" => match creds.parse::<BybitCredentials>() {
+                        Ok(c) => {
+                            let adapter = Arc::new(BybitAdapter::new(c.api_key, c.api_secret, env_name));
+                            registry.register("BYBIT", env_name, adapter.clone());
+                            bybit_adapters.push((env_name, adapter));
+                            info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered BYBIT/{env_name} adapter (REST/WS)");
+                        }
+                        Err(e) => outcome = unreadable(&conn.code, e),
+                    },
+                    "Alpaca" => match creds.parse::<AlpacaCredentials>() {
+                        Ok(c) => {
+                            registry.register_alpaca(env_name, Arc::new(AlpacaAdapter::new(c.key.clone(), c.secret.clone(), env_name)));
+                            alpaca_creds.insert(env_name, (c.key, c.secret));
+                            info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered ALPACA/{env_name} adapter");
+                        }
+                        Err(e) => outcome = unreadable(&conn.code, e),
+                    },
+                    "IbkrFix" => {
                         // IBKR is FIX-only — the FIX session both routes orders and
                         // delivers execution reports.
                         if matches!(outcome, ConnectionOutcome::RestartRequired) {
@@ -345,7 +368,7 @@ pub async fn build_registry(
                             }
                         }
                     }
-                    BrokerCredentials::BinanceFix { api_key, private_key, .. } => {
+                    "BinanceFix" => {
                         if matches!(outcome, ConnectionOutcome::RestartRequired) {
                             // Conservative on purpose (see `classify`): carry forward
                             // whatever is currently registered, FIX or REST, rather
@@ -380,7 +403,11 @@ pub async fn build_registry(
                                         }
                                     }
                                 }
-                                Transport::Rest => match BinanceAdapter::new(api_key.clone(), private_key, env_name) {
+                                Transport::Rest => match creds
+                                    .parse::<BinanceCredentials>()
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|c| BinanceAdapter::new(c.api_key, &c.private_key, env_name).map_err(|e| e.to_string()))
+                                {
                                     Ok(adapter) => {
                                         let adapter = Arc::new(adapter);
                                         registry.register("BINANCE", env_name, adapter.clone());
@@ -394,6 +421,10 @@ pub async fn build_registry(
                                 },
                             }
                         }
+                    }
+                    other => {
+                        error!(code = %conn.code, credential_kind = other, "no connector for this credential kind, adapter not registered");
+                        outcome = ConnectionOutcome::Failed(format!("no connector for credential kind {other}"));
                     }
                 }
             }
@@ -681,23 +712,23 @@ mod tests {
     }
 
     fn alpaca() -> BrokerCredentials {
-        BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() }
+        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "k".into(), secret: "s".into() })
     }
 
     fn ibkr() -> BrokerCredentials {
-        BrokerCredentials::IbkrFix {
+        BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
             host: "h".into(), port: 4001,
             sender_comp_id: "OMS".into(), target_comp_id: "IBKR".into(),
             password: "p".into(), ssl: true,
-        }
+        })
     }
 
     fn binance() -> BrokerCredentials {
-        BrokerCredentials::BinanceFix {
+        BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
             host: "h".into(), port: 9000,
             sender_comp_id: "OMS".into(), target_comp_id: "SPOT".into(),
             api_key: "k".into(), private_key: "pk".into(),
-        }
+        })
     }
 
     /// A `RegistrationDeps` that never touches the network: `PgPool::connect_lazy`
@@ -925,7 +956,7 @@ mod tests {
         let c = conn(
             "bybit-paper",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() }),
+            CredentialState::Configured(BrokerCredentials::from_typed("Bybit", &crate::adapters::bybit::BybitCredentials { api_key: "k".into(), api_secret: "s".into() })),
         );
         assert!(matches!(classify(&c, false), ConnectionOutcome::Registered));
         assert!(matches!(classify(&c, true), ConnectionOutcome::Registered));
@@ -939,7 +970,7 @@ mod tests {
         let mut c = conn(
             "coinbase-live",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::Coinbase { api_key: "organizations/o/apiKeys/k".into(), private_key: pem }),
+            CredentialState::Configured(BrokerCredentials::from_typed("Coinbase", &crate::adapters::coinbase::CoinbaseCredentials { api_key: "organizations/o/apiKeys/k".into(), private_key: pem })),
         );
         c.environment = Some("LIVE".into());
         c
@@ -985,7 +1016,7 @@ mod tests {
         conn(
             "okx-paper",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::Okx { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() }),
+            CredentialState::Configured(BrokerCredentials::from_typed("Okx", &crate::adapters::okx::OkxCredentials { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() })),
         )
     }
 
@@ -1023,7 +1054,7 @@ mod tests {
         let c = conn(
             "bybit-paper",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() }),
+            CredentialState::Configured(BrokerCredentials::from_typed("Bybit", &crate::adapters::bybit::BybitCredentials { api_key: "k".into(), api_secret: "s".into() })),
         );
         let deps = RegistrationDeps {
             stream_health: StreamHealthRegistry::new(),

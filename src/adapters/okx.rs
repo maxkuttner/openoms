@@ -34,6 +34,19 @@ const REST_URL: &str = "https://openapi.okx.com";
 /// OKX's page size cap for orders-pending.
 const PAGE_LIMIT: usize = 100;
 
+/// An OKX v5 API key: key, secret and the passphrase chosen when creating it.
+/// Stored as `{"kind":"Okx", …}` (see [`crate::credentials::BrokerCredentials`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct OkxCredentials {
+    pub api_key: String,
+    pub api_secret: String,
+    pub passphrase: String,
+}
+
+impl OkxCredentials {
+    pub const KIND: &'static str = "Okx";
+}
+
 #[derive(Clone)]
 pub struct OkxAdapter {
     client: Client,

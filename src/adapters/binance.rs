@@ -45,6 +45,25 @@ fn pct_encode(s: &str) -> String {
         .collect()
 }
 
+/// A Binance Ed25519 API key, plus the FIX session it uses when the transport is FIX
+/// (REST ignores the session fields).
+/// Stored as `{"kind":"BinanceFix", …}` (see [`crate::credentials::BrokerCredentials`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct BinanceCredentials {
+    pub host: String,
+    pub port: u16,
+    pub sender_comp_id: String,
+    pub target_comp_id: String,
+    pub api_key: String,
+    /// PEM contents, not a path. A filesystem path is precisely what stops a
+    /// credential being configurable from anywhere but the server's shell.
+    pub private_key: String,
+}
+
+impl BinanceCredentials {
+    pub const KIND: &'static str = "BinanceFix";
+}
+
 #[derive(Clone)]
 pub struct BinanceAdapter {
     client: Client,

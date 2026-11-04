@@ -14,6 +14,27 @@ use crate::fix::dialect::{
     FixDialect, ParsedExecReport,
 };
 
+/// An IBKR FIX session.
+/// Stored as `{"kind":"IbkrFix", …}` (see [`crate::credentials::BrokerCredentials`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct IbkrFixCredentials {
+    pub host: String,
+    pub port: u16,
+    pub sender_comp_id: String,
+    pub target_comp_id: String,
+    pub password: String,
+    #[serde(default = "default_true")]
+    pub ssl: bool,
+}
+
+impl IbkrFixCredentials {
+    pub const KIND: &'static str = "IbkrFix";
+}
+
+fn default_true() -> bool {
+    true
+}
+
 pub struct IbkrDialect {
     /// FIX account password, sent in the Logon.
     password: String,

@@ -11,10 +11,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 use serde::Deserialize;
 
-use crate::adapters::alpaca::AlpacaAdapter;
-use crate::adapters::bybit::BybitAdapter;
-use crate::adapters::coinbase::CoinbaseAdapter;
-use crate::adapters::okx::OkxAdapter;
+use crate::adapters::alpaca::{AlpacaAdapter, AlpacaCredentials};
+use crate::adapters::binance::BinanceCredentials;
+use crate::adapters::bybit::{BybitAdapter, BybitCredentials};
+use crate::adapters::coinbase::{CoinbaseAdapter, CoinbaseCredentials};
+use crate::adapters::okx::{OkxAdapter, OkxCredentials};
+use crate::fix::ibkr::IbkrFixCredentials;
 use crate::credentials::{BrokerCredentials, FeedCredentials};
 
 /// A submitted credential form: field name to raw string value, exactly as
@@ -119,7 +121,7 @@ fn parse_ssl(sub: &CredentialSubmission, existing: Option<bool>) -> Result<bool,
             name: "ssl",
             why: "not a valid boolean (expected \"true\" or \"false\")".into(),
         }),
-        // ssl defaults to true — the same default `BrokerCredentials::IbkrFix`
+        // ssl defaults to true — the same default `IbkrFixCredentials`
         // applies on deserialize — when nothing is submitted or stored yet.
         None => Ok(existing.unwrap_or(true)),
     }
@@ -134,81 +136,67 @@ pub fn parse_broker(
     existing: Option<&BrokerCredentials>,
     sub: &CredentialSubmission,
 ) -> Result<BrokerCredentials, CredentialError> {
+    // the stored credential's own typed view, when it is of the submitted kind
+    fn stored<T: serde::de::DeserializeOwned>(existing: Option<&BrokerCredentials>, kind: &str) -> Option<T> {
+        existing.filter(|c| c.kind == kind).and_then(|c| c.parse().ok())
+    }
     match kind {
         "ALPACA" => {
-            let (existing_key, existing_secret) = match existing {
-                Some(BrokerCredentials::Alpaca { key, secret }) => (Some(key.as_str()), Some(secret.as_str())),
-                _ => (None, None),
+            let e = stored::<AlpacaCredentials>(existing, AlpacaCredentials::KIND);
+            let c = AlpacaCredentials {
+                key: field(sub, "key", e.as_ref().map(|e| e.key.as_str()))?.to_string(),
+                secret: field(sub, "secret", e.as_ref().map(|e| e.secret.as_str()))?.to_string(),
             };
-            Ok(BrokerCredentials::Alpaca {
-                key: field(sub, "key", existing_key)?.to_string(),
-                secret: field(sub, "secret", existing_secret)?.to_string(),
-            })
+            Ok(BrokerCredentials::from_typed(AlpacaCredentials::KIND, &c))
         }
         "IBKR" => {
-            let existing = match existing {
-                Some(BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl }) => {
-                    Some((host.as_str(), *port, sender_comp_id.as_str(), target_comp_id.as_str(), password.as_str(), *ssl))
-                }
-                _ => None,
+            let e = stored::<IbkrFixCredentials>(existing, IbkrFixCredentials::KIND);
+            let c = IbkrFixCredentials {
+                host: field(sub, "host", e.as_ref().map(|e| e.host.as_str()))?.to_string(),
+                port: parse_port(sub, e.as_ref().map(|e| e.port))?,
+                sender_comp_id: field(sub, "sender_comp_id", e.as_ref().map(|e| e.sender_comp_id.as_str()))?.to_string(),
+                target_comp_id: field(sub, "target_comp_id", e.as_ref().map(|e| e.target_comp_id.as_str()))?.to_string(),
+                password: field(sub, "password", e.as_ref().map(|e| e.password.as_str()))?.to_string(),
+                ssl: parse_ssl(sub, e.as_ref().map(|e| e.ssl))?,
             };
-            Ok(BrokerCredentials::IbkrFix {
-                host: field(sub, "host", existing.map(|e| e.0))?.to_string(),
-                port: parse_port(sub, existing.map(|e| e.1))?,
-                sender_comp_id: field(sub, "sender_comp_id", existing.map(|e| e.2))?.to_string(),
-                target_comp_id: field(sub, "target_comp_id", existing.map(|e| e.3))?.to_string(),
-                password: field(sub, "password", existing.map(|e| e.4))?.to_string(),
-                ssl: parse_ssl(sub, existing.map(|e| e.5))?,
-            })
+            Ok(BrokerCredentials::from_typed(IbkrFixCredentials::KIND, &c))
         }
         "BINANCE" => {
-            let existing = match existing {
-                Some(BrokerCredentials::BinanceFix { host, port, sender_comp_id, target_comp_id, api_key, private_key }) => {
-                    Some((host.as_str(), *port, sender_comp_id.as_str(), target_comp_id.as_str(), api_key.as_str(), private_key.as_str()))
-                }
-                _ => None,
+            let e = stored::<BinanceCredentials>(existing, BinanceCredentials::KIND);
+            let c = BinanceCredentials {
+                host: field(sub, "host", e.as_ref().map(|e| e.host.as_str()))?.to_string(),
+                port: parse_port(sub, e.as_ref().map(|e| e.port))?,
+                sender_comp_id: field(sub, "sender_comp_id", e.as_ref().map(|e| e.sender_comp_id.as_str()))?.to_string(),
+                target_comp_id: field(sub, "target_comp_id", e.as_ref().map(|e| e.target_comp_id.as_str()))?.to_string(),
+                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
+                private_key: field(sub, "private_key", e.as_ref().map(|e| e.private_key.as_str()))?.to_string(),
             };
-            Ok(BrokerCredentials::BinanceFix {
-                host: field(sub, "host", existing.map(|e| e.0))?.to_string(),
-                port: parse_port(sub, existing.map(|e| e.1))?,
-                sender_comp_id: field(sub, "sender_comp_id", existing.map(|e| e.2))?.to_string(),
-                target_comp_id: field(sub, "target_comp_id", existing.map(|e| e.3))?.to_string(),
-                api_key: field(sub, "api_key", existing.map(|e| e.4))?.to_string(),
-                private_key: field(sub, "private_key", existing.map(|e| e.5))?.to_string(),
-            })
+            Ok(BrokerCredentials::from_typed(BinanceCredentials::KIND, &c))
         }
         "BYBIT" => {
-            let (existing_key, existing_secret) = match existing {
-                Some(BrokerCredentials::Bybit { api_key, api_secret }) => (Some(api_key.as_str()), Some(api_secret.as_str())),
-                _ => (None, None),
+            let e = stored::<BybitCredentials>(existing, BybitCredentials::KIND);
+            let c = BybitCredentials {
+                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
+                api_secret: field(sub, "api_secret", e.as_ref().map(|e| e.api_secret.as_str()))?.to_string(),
             };
-            Ok(BrokerCredentials::Bybit {
-                api_key: field(sub, "api_key", existing_key)?.to_string(),
-                api_secret: field(sub, "api_secret", existing_secret)?.to_string(),
-            })
+            Ok(BrokerCredentials::from_typed(BybitCredentials::KIND, &c))
         }
         "COINBASE" => {
-            let (existing_key, existing_pem) = match existing {
-                Some(BrokerCredentials::Coinbase { api_key, private_key }) => (Some(api_key.as_str()), Some(private_key.as_str())),
-                _ => (None, None),
+            let e = stored::<CoinbaseCredentials>(existing, CoinbaseCredentials::KIND);
+            let c = CoinbaseCredentials {
+                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
+                private_key: field(sub, "private_key", e.as_ref().map(|e| e.private_key.as_str()))?.to_string(),
             };
-            Ok(BrokerCredentials::Coinbase {
-                api_key: field(sub, "api_key", existing_key)?.to_string(),
-                private_key: field(sub, "private_key", existing_pem)?.to_string(),
-            })
+            Ok(BrokerCredentials::from_typed(CoinbaseCredentials::KIND, &c))
         }
         "OKX" => {
-            let existing = match existing {
-                Some(BrokerCredentials::Okx { api_key, api_secret, passphrase }) => {
-                    Some((api_key.as_str(), api_secret.as_str(), passphrase.as_str()))
-                }
-                _ => None,
+            let e = stored::<OkxCredentials>(existing, OkxCredentials::KIND);
+            let c = OkxCredentials {
+                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
+                api_secret: field(sub, "api_secret", e.as_ref().map(|e| e.api_secret.as_str()))?.to_string(),
+                passphrase: field(sub, "passphrase", e.as_ref().map(|e| e.passphrase.as_str()))?.to_string(),
             };
-            Ok(BrokerCredentials::Okx {
-                api_key: field(sub, "api_key", existing.map(|e| e.0))?.to_string(),
-                api_secret: field(sub, "api_secret", existing.map(|e| e.1))?.to_string(),
-                passphrase: field(sub, "passphrase", existing.map(|e| e.2))?.to_string(),
-            })
+            Ok(BrokerCredentials::from_typed(OkxCredentials::KIND, &c))
         }
         other => Err(CredentialError::UnknownKind(other.to_string())),
     }
@@ -298,23 +286,23 @@ fn timed_out(provider: &str) -> TestOutcome {
 /// rather than test anything). So this deliberately does not attempt one and
 /// says so via `NotTestable`, rather than reporting a pass it did not earn.
 pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOutcome {
-    match creds {
-        BrokerCredentials::Alpaca { key, secret } => {
-            let adapter = AlpacaAdapter::new(key.clone(), secret.clone(), environment);
+    let unreadable = |e: serde_json::Error| TestOutcome::Failed(format!("credential fields do not match their kind: {e}"));
+    match creds.kind.as_str() {
+        AlpacaCredentials::KIND => {
+            let c = match creds.parse::<AlpacaCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
+            let adapter = AlpacaAdapter::new(c.key, c.secret, environment);
             match tokio::time::timeout(TEST_TIMEOUT, adapter.get_account()).await {
                 Ok(Ok(_)) => TestOutcome::Passed,
                 Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
                 Err(_) => timed_out("Alpaca"),
             }
         }
-        BrokerCredentials::IbkrFix { .. } => {
+        IbkrFixCredentials::KIND | BinanceCredentials::KIND => {
             TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save")
         }
-        BrokerCredentials::BinanceFix { .. } => {
-            TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save")
-        }
-        BrokerCredentials::Coinbase { api_key, private_key } => {
-            let adapter = match CoinbaseAdapter::new(api_key.clone(), private_key) {
+        CoinbaseCredentials::KIND => {
+            let c = match creds.parse::<CoinbaseCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
+            let adapter = match CoinbaseAdapter::new(c.api_key, &c.private_key) {
                 Ok(a) => a,
                 Err(e) => return TestOutcome::Failed(e),
             };
@@ -324,22 +312,25 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
                 Err(_) => timed_out("Coinbase"),
             }
         }
-        BrokerCredentials::Bybit { api_key, api_secret } => {
-            let adapter = BybitAdapter::new(api_key.clone(), api_secret.clone(), environment);
+        BybitCredentials::KIND => {
+            let c = match creds.parse::<BybitCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
+            let adapter = BybitAdapter::new(c.api_key, c.api_secret, environment);
             match tokio::time::timeout(TEST_TIMEOUT, adapter.api_key_info()).await {
                 Ok(Ok(_)) => TestOutcome::Passed,
                 Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
                 Err(_) => timed_out("Bybit"),
             }
         }
-        BrokerCredentials::Okx { api_key, api_secret, passphrase } => {
-            let adapter = OkxAdapter::new(api_key.clone(), api_secret.clone(), passphrase.clone(), environment);
+        OkxCredentials::KIND => {
+            let c = match creds.parse::<OkxCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
+            let adapter = OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, environment);
             match tokio::time::timeout(TEST_TIMEOUT, adapter.key_permissions()).await {
                 Ok(Ok(perm)) => judge_okx_permissions(&perm),
                 Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
                 Err(_) => timed_out("OKX"),
             }
         }
+        other => TestOutcome::Failed(format!("no connector for credential kind {other}")),
     }
 }
 
@@ -498,17 +489,19 @@ mod tests {
     }
 
     fn existing_alpaca() -> BrokerCredentials {
-        BrokerCredentials::Alpaca { key: "OLDKEY".into(), secret: "OLDSECRET".into() }
+        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "OLDKEY".into(), secret: "OLDSECRET".into() })
     }
 
     #[test]
     fn a_full_submission_replaces_everything() {
-        match parse_broker("ALPACA", None, &sub(&[("key", "NEWKEY"), ("secret", "NEWSECRET")])).expect("parse") {
-            BrokerCredentials::Alpaca { key, secret } => {
+        {
+            let c = parse_broker("ALPACA", None, &sub(&[("key", "NEWKEY"), ("secret", "NEWSECRET")])).expect("parse");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let crate::adapters::alpaca::AlpacaCredentials { key, secret } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
+            {
                 assert_eq!(key, "NEWKEY");
                 assert_eq!(secret, "NEWSECRET");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -517,12 +510,14 @@ mod tests {
     /// non-secret field without re-typing the secret they cannot see.
     #[test]
     fn an_omitted_secret_keeps_the_stored_one() {
-        match parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY")])).expect("parse") {
-            BrokerCredentials::Alpaca { key, secret } => {
+        {
+            let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY")])).expect("parse");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let crate::adapters::alpaca::AlpacaCredentials { key, secret } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
+            {
                 assert_eq!(key, "NEWKEY");
                 assert_eq!(secret, "OLDSECRET", "the stored secret must survive an omission");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -530,21 +525,23 @@ mod tests {
     /// secret to empty" would silently break a working connection.
     #[test]
     fn an_empty_secret_is_treated_as_omitted() {
-        match parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse") {
-            BrokerCredentials::Alpaca { secret, .. } => assert_eq!(secret, "OLDSECRET"),
-            other => panic!("wrong variant: {other:?}"),
+        {
+            let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let crate::adapters::alpaca::AlpacaCredentials { secret, .. } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
+            { assert_eq!(secret, "OLDSECRET"); }
         }
     }
 
     fn existing_ibkr() -> BrokerCredentials {
-        BrokerCredentials::IbkrFix {
+        BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
             host: "old.fix.example".into(),
             port: 4101,
             sender_comp_id: "OLDSENDER".into(),
             target_comp_id: "OLDTARGET".into(),
             password: "OLDPASSWORD".into(),
             ssl: true,
-        }
+        })
     }
 
     /// The merge rule above is proven only for Alpaca's two fields; IBKR and
@@ -566,7 +563,8 @@ mod tests {
         )
         .expect("parse")
         {
-            BrokerCredentials::IbkrFix { host, .. } => {
+            c if c.kind == "IbkrFix" => {
+                let crate::fix::ibkr::IbkrFixCredentials { host, .. } = c.parse::<crate::fix::ibkr::IbkrFixCredentials>().unwrap();
                 assert_eq!(host, "old.fix.example", "an omitted host must carry over from the stored credential");
             }
             other => panic!("wrong variant: {other:?}"),
@@ -590,7 +588,8 @@ mod tests {
         )
         .expect("parse")
         {
-            BrokerCredentials::IbkrFix { host, .. } => {
+            c if c.kind == "IbkrFix" => {
+                let crate::fix::ibkr::IbkrFixCredentials { host, .. } = c.parse::<crate::fix::ibkr::IbkrFixCredentials>().unwrap();
                 assert_eq!(host, "old.fix.example", "an empty host must be treated as omitted, not as a value");
             }
             other => panic!("wrong variant: {other:?}"),
