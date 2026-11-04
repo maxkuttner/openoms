@@ -305,6 +305,31 @@ mod tests {
         assert!((fill(&reports[0]).0 - 0.3).abs() < 1e-9);
     }
 
+    /// The phase 4 boundary: connectors report, the engine books. A connector
+    /// that reaches for the database, the bus or Kafka again fails here.
+    #[test]
+    fn connectors_do_not_touch_the_database() {
+        let connectors = [
+            ("alpaca_stream.rs", include_str!("alpaca_stream.rs")),
+            ("binance_stream.rs", include_str!("binance_stream.rs")),
+            ("bybit_stream.rs", include_str!("bybit_stream.rs")),
+            ("coinbase_stream.rs", include_str!("coinbase_stream.rs")),
+            ("okx_stream.rs", include_str!("okx_stream.rs")),
+            ("fix/adapter.rs", include_str!("fix/adapter.rs")),
+            ("fix/app.rs", include_str!("fix/app.rs")),
+            ("fix/binance.rs", include_str!("fix/binance.rs")),
+            ("fix/dialect.rs", include_str!("fix/dialect.rs")),
+            ("fix/ibkr.rs", include_str!("fix/ibkr.rs")),
+            ("fix/mod.rs", include_str!("fix/mod.rs")),
+        ];
+        let forbidden = ["PgPool", "sqlx::", "KafkaClient", "process_execution_report", "apply_broker_", "EventBus"];
+        for (file, source) in connectors {
+            for word in forbidden {
+                assert!(!source.contains(word), "{file} mentions {word}: connectors send events to the order engine");
+            }
+        }
+    }
+
     #[test]
     fn report_maps_to_kind() {
         let id = Uuid::nil();
