@@ -24,7 +24,7 @@ use crate::recon_orders::{BrokerOpenOrder, BrokerOrderState};
 use std::sync::Arc;
 
 /// How long `submit_order` waits for the broker's ack before giving up. The order
-/// isn't lost — a late ack/fill still flows through `process_execution_report`;
+/// isn't lost — a late ack/fill still reaches the order engine;
 /// this only bounds the synchronous submit call.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -153,7 +153,7 @@ impl BrokerAdapter for FixBrokerAdapter {
 
     async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError> {
         // Sync send; the resulting ExecutionReport (Canceled) arrives asynchronously
-        // and is applied by process_execution_report, mirroring the WS cancel path.
+        // and is booked by the order engine, mirroring the WS cancel path.
         self.send_cancel(external_order_id, symbol)
     }
 

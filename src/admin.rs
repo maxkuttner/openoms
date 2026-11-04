@@ -1343,9 +1343,7 @@ async fn apply_reload(
     info!("admin reload connections");
 
     let deps = reload::RegistrationDeps {
-        pool: state.pool().clone(),
         stream_health: state.stream_health().clone(),
-        event_bus: state.event_bus().clone(),
         engine: state.engine().clone(),
     };
 

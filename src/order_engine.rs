@@ -306,6 +306,18 @@ mod tests {
     }
 
     #[test]
+    fn report_maps_to_kind() {
+        let id = Uuid::nil();
+        let fill = ExecutionReport::Fill { execution_id: "x".into(), fill_qty: 1.5, fill_price: 9.0, venue: "V".into() };
+        let canceled = ExecutionReport::Canceled { reason: Some("user".into()), venue: Some("V".into()) };
+        let reject = ExecutionReport::Reject { reason: "no funds".into(), venue: None };
+        let kind = |r| ExecEvent::from_report(id, "V", "t", r).kind;
+        assert_eq!(kind(fill), ExecKind::Fill { execution_id: "x".into(), qty: 1.5, price: 9.0 });
+        assert_eq!(kind(canceled), ExecKind::Canceled { reason: Some("user".into()) });
+        assert_eq!(kind(reject), ExecKind::Rejected { reason: "no funds".into() });
+    }
+
+    #[test]
     fn needs_booked_state_only_for_cumulative_and_terminal() {
         let st = BrokerOrderState { outcome: BrokerOrderOutcome::Filled, executed_qty: 1.0, avg_px: 1.0 };
         assert!(needs_booked_state(&ExecKind::Cumulative { cum_qty: 1.0, avg_px: 1.0 }));

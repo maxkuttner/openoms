@@ -1076,9 +1076,7 @@ async fn serve() {
     // `broker_connections` was loaded once, above, alongside the master-key
     // resolution.
     let registration_deps = RegistrationDeps {
-        pool: pool.clone(),
         stream_health: stream_health.clone(),
-        event_bus: event_bus.clone(),
         engine: engine.clone(),
     };
     let RegistrationOutput {

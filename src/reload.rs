@@ -120,11 +120,10 @@ pub fn restarts_execution_stream(outcome: &ConnectionOutcome) -> bool {
 /// What the FIX starters and freshly-built adapters need beyond the credential
 /// itself. Built once in `serve()` and handed to every call of `build_registry`
 /// — boot today, a runtime reload endpoint in a later task — so both draw on the
-/// exact same pool, stream-health registry and event bus rather than each constructing (or re-deriving) their own.
+/// exact same stream-health registry and order engine rather than each
+/// constructing (or re-deriving) their own.
 pub struct RegistrationDeps {
-    pub pool: PgPool,
     pub stream_health: StreamHealthRegistry,
-    pub event_bus: EventBus,
     pub engine: crate::order_engine::EngineHandle,
 }
 
@@ -337,8 +336,7 @@ pub async fn build_registry(
                                 env_name,
                                 creds,
                                 &deps.stream_health,
-                                deps.pool.clone(),
-                                Some(deps.event_bus.clone()),
+                                deps.engine.clone(),
                             ) {
                                 Some(adapter) => registry.register("IBKR", env_name, adapter),
                                 None => {
@@ -373,8 +371,7 @@ pub async fn build_registry(
                                         env_name,
                                         creds,
                                         &deps.stream_health,
-                                        deps.pool.clone(),
-                                        Some(deps.event_bus.clone()),
+                                        deps.engine.clone(),
                                     ) {
                                         Some(adapter) => registry.register("BINANCE", env_name, adapter),
                                         None => {
@@ -709,10 +706,7 @@ mod tests {
     /// it only reads `current`.
     fn stub_deps() -> RegistrationDeps {
         RegistrationDeps {
-            pool: PgPool::connect_lazy("postgres://localhost/oms_test_never_connects")
-                .expect("connect_lazy never actually connects"),
             stream_health: StreamHealthRegistry::new(),
-            event_bus: EventBus::new(),
             engine: crate::order_engine::EngineHandle::new().0,
         }
     }
@@ -961,9 +955,7 @@ mod tests {
         let mut c = coinbase_conn();
         c.environment = Some("PAPER".into());
         let deps = RegistrationDeps {
-            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            event_bus: EventBus::new(),
             engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
@@ -981,9 +973,7 @@ mod tests {
     #[tokio::test]
     async fn a_configured_coinbase_connection_is_registered_and_handed_back() {
         let deps = RegistrationDeps {
-            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            event_bus: EventBus::new(),
             engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
@@ -1013,9 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn a_configured_okx_connection_is_registered_and_handed_back_for_its_stream() {
         let deps = RegistrationDeps {
-            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            event_bus: EventBus::new(),
             engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
@@ -1038,9 +1026,7 @@ mod tests {
             CredentialState::Configured(BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() }),
         );
         let deps = RegistrationDeps {
-            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            event_bus: EventBus::new(),
             engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;

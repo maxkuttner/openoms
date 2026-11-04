@@ -3,8 +3,8 @@
 //! One [`start_session`] call per broker/environment wires a full FIX order-entry
 //! session into the OMS: outbound orders through [`adapter::FixBrokerAdapter`]
 //! (registered in the [`BrokerRegistry`](crate::adapters::BrokerRegistry)), and
-//! inbound execution reports through [`app::FixApplication`] into the existing
-//! [`process_execution_report`](crate::execution::process_execution_report) path.
+//! inbound execution reports through [`app::FixApplication`] to the
+//! [order engine](crate::order_engine), which books them.
 //! QuickFIX owns the session mechanics — logon, heartbeat, sequence numbers,
 //! resend/gap-fill, TLS, and reconnect — so there is no supervisor loop here.
 
@@ -21,7 +21,6 @@ use quickfix::{
     Application, ConnectionHandler, Dictionary, FixSocketServerKind, Initiator, LogCallback,
     LogFactory, MemoryMessageStoreFactory, SessionId, SessionSettings,
 };
-use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tracing::{debug, error, info};
@@ -113,15 +112,13 @@ mod tracing_fix_log_tests {
     }
 }
 
-use crate::event_bus::EventBus;
 use crate::adapters::BrokerError;
-use crate::execution::process_execution_report;
 use crate::fix::adapter::FixBrokerAdapter;
 use crate::fix::app::FixApplication;
 use crate::fix::binance::BinanceDialect;
 use crate::fix::dialect::FixDialect;
 use crate::fix::ibkr::IbkrDialect;
-use crate::recon_orders::run_order_reconcile;
+use crate::order_engine::{EngineHandle, ExecEvent};
 use crate::stream_health::{StreamHandle, StreamHealthRegistry};
 
 /// Connection parameters for one FIX session. Credentials live on the dialect;
@@ -178,8 +175,7 @@ pub fn start_session(
     cfg: FixConfig,
     actor: &'static str,
     health: StreamHandle,
-    pool: PgPool,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
     // Optional REST adapter that owns the reconciliation reads (open orders / order
     // status) for venues with no FIX equivalent (Binance Spot FIX). When present, the
     // recon driver reconciles through a SplitAdapter — orders over FIX, reads over
@@ -203,23 +199,12 @@ pub fn start_session(
     // session thread — used as the broker_code for reconciliation queries.
     let broker_code = dialect.venue();
 
-    // Drain inbound execution reports into the shared apply path.
+    // Forward inbound execution reports to the order engine, which books them.
     {
-        let pool = pool.clone();
-        let bus = bus.clone();
+        let engine = engine.clone();
         tokio::spawn(async move {
             while let Some((order_id, report)) = report_rx.recv().await {
-                if let Err(e) = process_execution_report(
-                    &pool,
-                    order_id,
-                    report,
-                    actor,
-                    bus.as_ref(),
-                )
-                .await
-                {
-                    error!(order_id = %order_id, error = %e, "FIX: failed to apply execution report");
-                }
+                engine.exec(ExecEvent::from_report(order_id, broker_code, actor, report)).await;
             }
         });
     }
@@ -246,8 +231,7 @@ pub fn start_session(
     // snapshot-on-reconnect — necessary because `ResetOnLogon=Y` disables QuickFIX's
     // own resend of anything missed during an outage.
     {
-        let pool = pool.clone();
-        let bus = bus.clone();
+        let engine = engine.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.tick().await; // consume the immediate first tick
@@ -260,14 +244,7 @@ pub fn start_session(
                     }
                     _ = interval.tick() => {}
                 }
-                run_order_reconcile(
-                    &pool,
-                    &*recon_adapter,
-                    broker_code,
-                    actor,
-                    bus.as_ref(),
-                )
-                .await;
+                engine.reconcile(broker_code, actor, recon_adapter.clone()).await;
             }
         });
     }
@@ -332,8 +309,7 @@ pub fn start_ibkr(
     env_name: &str,
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
-    pool: PgPool,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 ) -> Option<Arc<FixBrokerAdapter>> {
     let crate::credentials::BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } =
         creds
@@ -353,7 +329,7 @@ pub fn start_ibkr(
     let health = stream_health.fix_handle("IBKR", env_name);
     let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password.clone()));
     // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
-    match start_session(dialect, cfg, "ibkr", health, pool, bus, None) {
+    match start_session(dialect, cfg, "ibkr", health, engine, None) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "IBKR FIX session not started"); None }
     }
@@ -369,8 +345,7 @@ pub fn start_binance(
     env_name: &str,
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
-    pool: PgPool,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 ) -> Option<Arc<FixBrokerAdapter>> {
     let crate::credentials::BrokerCredentials::BinanceFix {
         host, port, sender_comp_id, target_comp_id, api_key, private_key,
@@ -418,7 +393,7 @@ pub fn start_binance(
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("BINANCE", env_name);
-    match start_session(dialect, cfg, "binance", health, pool, bus, read_delegate) {
+    match start_session(dialect, cfg, "binance", health, engine, read_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
     }
@@ -429,12 +404,10 @@ mod tests {
     use super::*;
     use crate::credentials::BrokerCredentials;
 
-    /// `PgPool::connect_lazy` builds a pool without ever connecting — safe here
-    /// because every test below hits a guard that returns `None` before the
-    /// pool, network, or QuickFIX are touched at all.
-    fn lazy_pool() -> PgPool {
-        PgPool::connect_lazy("postgres://localhost/oms_test_never_connects")
-            .expect("connect_lazy never actually connects")
+    /// An engine nothing drains — safe here because every test below hits a
+    /// guard that returns `None` before the network or QuickFIX are touched.
+    fn idle_engine() -> EngineHandle {
+        EngineHandle::new().0
     }
 
     fn alpaca_cred() -> BrokerCredentials {
@@ -455,13 +428,11 @@ mod tests {
     /// A caller bug (the wrong credential variant reaching `start_ibkr`) must be
     /// logged and refused, not panic or attempt a connection built from garbage
     /// data — see the doc comment on `start_ibkr`. `#[tokio::test]`, not
-    /// `#[test]`: `PgPool::connect_lazy` spawns a background maintenance task at
-    /// construction even though it never actually connects, so it needs a Tokio
-    /// context to exist in.
+    /// `#[test]`: kept on a Tokio runtime like the session it guards.
     #[tokio::test]
     async fn start_ibkr_refuses_a_non_ibkr_credential() {
         let health = StreamHealthRegistry::new();
-        let result = start_ibkr("PAPER", &alpaca_cred(), &health, lazy_pool(), None);
+        let result = start_ibkr("PAPER", &alpaca_cred(), &health, idle_engine());
         assert!(result.is_none());
     }
 
@@ -469,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn start_binance_refuses_a_non_binance_credential() {
         let health = StreamHealthRegistry::new();
-        let result = start_binance("PAPER", &ibkr_cred(), &health, lazy_pool(), None);
+        let result = start_binance("PAPER", &ibkr_cred(), &health, idle_engine());
         assert!(result.is_none());
     }
 
@@ -488,7 +459,7 @@ mod tests {
             api_key: "k".into(),
             private_key: "pem".into(),
         };
-        let result = start_binance("PAPER", &creds, &health, lazy_pool(), None);
+        let result = start_binance("PAPER", &creds, &health, idle_engine());
         assert!(result.is_none());
     }
 }
