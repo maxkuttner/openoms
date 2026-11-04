@@ -296,6 +296,34 @@ mod tests {
         (order_id, portfolio_id, instrument_id.to_string())
     }
 
+    /// Remove everything `seeded_order` and the fill under test wrote, so runs
+    /// don't pile up held positions in the shared dev DB. The order's events
+    /// stay: `order_event` is append-only and refuses deletes.
+    async fn remove_seeded(pool: &PgPool, order_id: Uuid) {
+        let mut tx = pool.begin().await.expect("begin cleanup");
+        let row = sqlx::query(
+            "DELETE FROM order_state WHERE order_id = $1 \
+             RETURNING principal_id, portfolio_id, account_id, broker_connection_code, instrument_id",
+        )
+        .bind(order_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("delete order_state");
+        let portfolio_id: Uuid = row.get("portfolio_id");
+        let instrument_id: String = row.get("instrument_id");
+        for (sql, bind) in [
+            ("DELETE FROM position WHERE portfolio_id = CAST($1 AS uuid)", portfolio_id.to_string()),
+            ("DELETE FROM account WHERE id = CAST($1 AS uuid)", row.get::<Uuid, _>("account_id").to_string()),
+            ("DELETE FROM broker_connection WHERE code = $1", row.get("broker_connection_code")),
+            ("DELETE FROM portfolio WHERE id = CAST($1 AS uuid)", portfolio_id.to_string()),
+            ("DELETE FROM principal WHERE id = CAST($1 AS uuid)", row.get::<Uuid, _>("principal_id").to_string()),
+            ("DELETE FROM instrument WHERE id = CAST($1 AS bigint)", instrument_id),
+        ] {
+            sqlx::query(sql).bind(bind).execute(&mut *tx).await.expect(sql);
+        }
+        tx.commit().await.expect("commit cleanup");
+    }
+
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn fill_publishes_appended_then_position_changed() {
@@ -304,14 +332,15 @@ mod tests {
         let bus = EventBus::new();
         let mut rx = bus.subscribe_order();
 
-        process_execution_report(&pool, &None, order_id, fill(), "bus-test", Some(&bus))
-            .await
-            .expect("apply fill");
-
+        let applied = process_execution_report(&pool, &None, order_id, fill(), "bus-test", Some(&bus)).await;
         let mut got = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             got.push(ev);
         }
+        // before any assert, so a failing run cleans up too
+        remove_seeded(&pool, order_id).await;
+
+        applied.expect("apply fill");
         let (last, appended) = got.split_last().expect("events published");
         assert!(!appended.is_empty());
         assert!(appended
@@ -329,9 +358,10 @@ mod tests {
         let bus = EventBus::new();
         let mut rx = bus.subscribe_order();
 
-        let err = apply_once(&pool, &None, order_id, fill(), "bus-test", Some(&bus))
-            .await
-            .expect_err("version conflict");
+        let applied = apply_once(&pool, &None, order_id, fill(), "bus-test", Some(&bus)).await;
+        remove_seeded(&pool, order_id).await;
+
+        let err = applied.expect_err("version conflict");
 
         assert!(err.downcast_ref::<ConcurrencyRetry>().is_some());
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
