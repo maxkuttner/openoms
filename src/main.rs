@@ -59,6 +59,7 @@ mod event_bus;
 mod kafka_outbox;
 mod live_updates;
 mod order_engine;
+mod connectors;
 mod alpaca_stream;
 mod binance_stream;
 mod bybit_stream;

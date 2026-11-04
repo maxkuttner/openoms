@@ -2,18 +2,19 @@
 //! set one up: a plain name, what it trades, what PAPER means there, where to
 //! get the keys, and the credential fields.
 //!
-//! The one place a venue is described: the cockpit's dropdown and credentials
-//! form are built from `GET /admin/venues`, and the tests below hold this list
-//! to `known_broker_codes` and to each venue's `BrokerCredentials` fields.
+//! Each venue is described by its connector (`crate::connectors`); this module
+//! holds the shapes and assembles the list the cockpit's dropdown and
+//! credentials form are built from (`GET /admin/venues`). The tests below hold
+//! that list to `known_broker_codes` and to each venue's credential fields.
 //! What each field means and where to get it is on the venue's docs page
 //! (`docs_url`), not here: the form looks the same for every venue.
 
 use serde::Serialize;
 
-const DOCS: &str = "https://maxkuttner.github.io/openoms/integrations";
+pub(crate) const DOCS: &str = "https://maxkuttner.github.io/openoms/integrations";
 
 /// The section a venue's FIX session settings go in, after the credentials.
-const FIX_SESSION: &str = "FIX session";
+pub(crate) const FIX_SESSION: &str = "FIX session";
 
 #[derive(Serialize)]
 pub struct Venue {
@@ -63,31 +64,31 @@ pub struct CredentialField {
     pub live: Option<&'static str>,
 }
 
-fn field(name: &'static str, label: &'static str) -> CredentialField {
+pub(crate) fn field(name: &'static str, label: &'static str) -> CredentialField {
     CredentialField { name, label, secret: false, input: Input::Text, section: None, paper: None, live: None }
 }
 
 impl CredentialField {
-    fn secret(mut self) -> Self {
+    pub(crate) fn secret(mut self) -> Self {
         self.secret = true;
         self
     }
-    fn input(mut self, input: Input) -> Self {
+    pub(crate) fn input(mut self, input: Input) -> Self {
         self.input = input;
         self
     }
-    fn fix(mut self) -> Self {
+    pub(crate) fn fix(mut self) -> Self {
         self.section = Some(FIX_SESSION);
         self
     }
-    fn prefill(mut self, paper: &'static str, live: &'static str) -> Self {
+    pub(crate) fn prefill(mut self, paper: &'static str, live: &'static str) -> Self {
         self.paper = Some(paper);
         self.live = Some(live);
         self
     }
 }
 
-fn environments(paper: &'static str, paper_keys: Option<&'static str>, live_keys: Option<&'static str>) -> Vec<Environment> {
+pub(crate) fn environments(paper: &'static str, paper_keys: Option<&'static str>, live_keys: Option<&'static str>) -> Vec<Environment> {
     vec![
         Environment { code: "PAPER", label: paper, keys_url: paper_keys },
         Environment { code: "LIVE", label: "live account", keys_url: live_keys },
@@ -105,105 +106,7 @@ pub fn environment_allowed(broker_code: &str, environment: &str) -> bool {
 }
 
 pub fn venues() -> Vec<Venue> {
-    vec![
-        Venue {
-            code: "ALPACA",
-            name: "Alpaca",
-            description: "US stocks, ETFs and options",
-            docs_url: format!("{DOCS}/alpaca/"),
-            universe: Some("About 14,400 stocks and ETFs"),
-            environments: environments(
-                "paper trading account",
-                Some("https://app.alpaca.markets/paper/dashboard/overview"),
-                Some("https://app.alpaca.markets/brokerage/dashboard/overview"),
-            ),
-            fields: vec![field("key", "API key ID"), field("secret", "Secret key").secret()],
-        },
-        Venue {
-            code: "BINANCE",
-            name: "Binance",
-            description: "Crypto spot pairs",
-            docs_url: format!("{DOCS}/binance/"),
-            universe: Some("About 2,000 spot pairs"),
-            environments: environments(
-                "spot testnet",
-                Some("https://testnet.binance.vision/"),
-                Some("https://www.binance.com/en/my/settings/api-management"),
-            ),
-            fields: vec![
-                field("api_key", "API key").secret(),
-                field("private_key", "Private key (PEM)").secret().input(Input::Textarea),
-                field("host", "Host").fix().prefill("fix-oe.testnet.binance.vision", "fix-oe.binance.com"),
-                field("port", "Port").fix().prefill("9000", "9000"),
-                field("sender_comp_id", "SenderCompID").fix().prefill("OMS", "OMS"),
-                field("target_comp_id", "TargetCompID").fix().prefill("SPOT", "SPOT"),
-            ],
-        },
-        Venue {
-            code: "BYBIT",
-            name: "Bybit",
-            description: "Crypto spot pairs",
-            docs_url: format!("{DOCS}/bybit/"),
-            universe: Some("About 800 spot pairs"),
-            environments: environments(
-                "spot testnet",
-                Some("https://testnet.bybit.com/app/user/api-management"),
-                Some("https://www.bybit.com/app/user/api-management"),
-            ),
-            fields: vec![field("api_key", "API key").secret(), field("api_secret", "API secret").secret()],
-        },
-        Venue {
-            code: "COINBASE",
-            name: "Coinbase",
-            description: "Crypto spot pairs",
-            docs_url: format!("{DOCS}/coinbase/"),
-            universe: Some("About 900 spot pairs"),
-            // LIVE only: Coinbase's sandbox returns canned responses, not paper trading.
-            environments: vec![Environment {
-                code: "LIVE",
-                label: "live account",
-                keys_url: Some("https://portal.cdp.coinbase.com/projects/api-keys"),
-            }],
-            fields: vec![
-                field("api_key", "API key").secret(),
-                field("private_key", "Private key (PEM)").secret().input(Input::Textarea),
-            ],
-        },
-        Venue {
-            code: "OKX",
-            name: "OKX",
-            description: "Crypto spot pairs",
-            docs_url: format!("{DOCS}/okx/"),
-            universe: Some("About 700 spot pairs"),
-            // Demo Trading keys are made in the same account, under Demo Trading.
-            environments: environments(
-                "demo trading",
-                Some("https://www.okx.com/account/my-api"),
-                Some("https://www.okx.com/account/my-api"),
-            ),
-            fields: vec![
-                field("api_key", "API key").secret(),
-                field("api_secret", "API secret").secret(),
-                field("passphrase", "Passphrase").secret(),
-            ],
-        },
-        Venue {
-            code: "IBKR",
-            name: "Interactive Brokers",
-            description: "Multi-asset over FIX; experimental, no instrument loading",
-            docs_url: format!("{DOCS}/interactive-brokers/"),
-            universe: None,
-            environments: environments("paper account", None, None),
-            fields: vec![
-                field("password", "Password").secret(),
-                field("host", "Host").fix(),
-                field("port", "Port").fix(),
-                field("sender_comp_id", "SenderCompID").fix(),
-                field("target_comp_id", "TargetCompID").fix().prefill("IBKR", "IBKR"),
-                field("ssl", "TLS").fix().input(Input::Checkbox).prefill("true", "true"),
-            ],
-        },
-    ]
+    crate::connectors::all().iter().map(|c| (c.manifest().venue)()).collect()
 }
 
 #[cfg(test)]

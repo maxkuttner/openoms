@@ -105,25 +105,10 @@ pub enum Shown {
     Tail,
 }
 
-/// Each kind's fields in display order, and how each may be shown.
-// TEMPORARY: moves into each connector's manifest (phase 5a, Task 2).
+/// Each kind's fields in display order and how each may be shown — from the
+/// connector that owns the kind; a kind no connector owns shows nothing.
 fn redaction(kind: &str) -> &'static [(&'static str, Shown)] {
-    use Shown::*;
-    match kind {
-        "Alpaca" => &[("key", Tail), ("secret", Hidden)],
-        "IbkrFix" => &[
-            ("host", Clear), ("port", Clear), ("sender_comp_id", Clear), ("target_comp_id", Clear),
-            ("ssl", Clear), ("password", Hidden),
-        ],
-        "BinanceFix" => &[
-            ("host", Clear), ("port", Clear), ("sender_comp_id", Clear), ("target_comp_id", Clear),
-            ("api_key", Hidden), ("private_key", Hidden),
-        ],
-        "Bybit" => &[("api_key", Hidden), ("api_secret", Hidden)],
-        "Coinbase" => &[("api_key", Hidden), ("private_key", Hidden)],
-        "Okx" => &[("api_key", Hidden), ("api_secret", Hidden), ("passphrase", Hidden)],
-        _ => &[],
-    }
+    crate::connectors::by_credential_kind(kind).map_or(&[], |c| c.manifest().redaction)
 }
 
 impl Redact for BrokerCredentials {
