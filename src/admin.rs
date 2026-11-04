@@ -1359,10 +1359,11 @@ async fn apply_reload(
         // classifies `RestartRequired` on reload and is carried forward, so it
         // never appears here outside of boot.
         exec_streams,
-    } = reload::build_registry(&broker_connections, false, &current, &deps).await;
+        daily_stats,
+    } = reload::build_registry(&broker_connections, false, &current, &state.daily_stats_handle().load(), &deps).await;
     drop(current);
 
-    state.swap_registry(registry);
+    state.swap_registries(registry, daily_stats);
 
     // `build_registry` pushes exactly one report entry per input connection,
     // in order (verified by reading every branch), which is what makes the

@@ -46,7 +46,7 @@ impl Connector for Ibkr {
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
         let adapter = start_ibkr(env, creds, &deps.stream_health, deps.engine.clone())
             .ok_or_else(|| "IBKR FIX session could not start".to_string())?;
-        Ok(Connected { adapter, exec_stream: None })
+        Ok(Connected { adapter, exec_stream: None, daily_stats: None })
     }
 
     fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {

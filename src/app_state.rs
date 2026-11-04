@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use gateway::adapter::BrokerRegistry;
+use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::event_bus::EventBus;
 use gateway::contract::EngineHandle;
 use crate::marks::MarkStore;
@@ -83,6 +84,9 @@ pub struct AppState {
     /// already routing holds its own `Arc` and finishes against the adapter it
     /// started with. A `Mutex` here would put a lock on every order.
     registry: Arc<ArcSwap<BrokerRegistry>>,
+    /// Previous-close sources, swapped together with `registry` so a reload
+    /// never publishes one without the other.
+    daily_stats_sources: Arc<ArcSwap<DailyStatsRegistry>>,
     /// Serialize the entire reload, including store reads and stream joins.
     /// Order readers still use ArcSwap and never acquire this lock.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
@@ -126,6 +130,7 @@ impl AppState {
             admin_auth_enabled,
             session_config,
             registry: Arc::new(ArcSwap::from_pointee(registry)),
+            daily_stats_sources: Arc::new(ArcSwap::from_pointee(DailyStatsRegistry::new())),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             symbology: Arc::new(symbology),
             stream_health,
@@ -148,12 +153,14 @@ impl AppState {
         self.registry.load()
     }
 
-    /// Publish a new registry. Readers see it on their next `registry()` call;
-    /// anything already holding an adapter is unaffected. Called by the
-    /// `/admin/connections/reload` handler in `admin.rs`, and by boot itself
-    /// (see `serve()`) so the very first publish exercises the same path.
-    pub fn swap_registry(&self, next: BrokerRegistry) {
-        self.registry.store(Arc::new(next));
+    /// Publish a new registry and its previous-close sources. Readers see them
+    /// on their next load; anything already holding an adapter is unaffected.
+    /// Called by the `/admin/connections/reload` handler in `admin.rs`, and by
+    /// boot itself (see `serve()`) so the very first publish exercises the same
+    /// path.
+    pub fn swap_registries(&self, registry: BrokerRegistry, daily_stats: DailyStatsRegistry) {
+        self.registry.store(Arc::new(registry));
+        self.daily_stats_sources.store(Arc::new(daily_stats));
     }
 
     pub async fn lock_reload(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -173,11 +180,11 @@ impl AppState {
 
     pub fn daily_stats(&self) -> &crate::daily_stats::DailyStatsStore { &self.daily_stats }
 
-    /// The registry's own swappable handle, for a long-running task
+    /// The previous-close sources' swappable handle, for a long-running task
     /// (`daily_stats_poller::run`) that needs to `.load()` fresh on every
     /// iteration rather than holding one `Guard` for its whole lifetime.
-    pub fn registry_handle(&self) -> Arc<ArcSwap<BrokerRegistry>> {
-        self.registry.clone()
+    pub fn daily_stats_handle(&self) -> Arc<ArcSwap<DailyStatsRegistry>> {
+        self.daily_stats_sources.clone()
     }
 
     pub fn streams(&self) -> &StreamRegistry {
@@ -261,7 +268,7 @@ mod tests {
         let before = state.registry();
         let had_alpaca = before.get("ALPACA", "PAPER").is_some();
 
-        state.swap_registry(BrokerRegistry::new()); // empty: everything removed
+        state.swap_registries(BrokerRegistry::new(), DailyStatsRegistry::new()); // empty: everything removed
 
         // The guard taken before the swap still sees the old registry.
         assert_eq!(before.get("ALPACA", "PAPER").is_some(), had_alpaca);
@@ -274,11 +281,25 @@ mod tests {
     #[tokio::test]
     async fn the_last_swap_wins() {
         let state = sample_state();
-        state.swap_registry(BrokerRegistry::new());
+        state.swap_registries(BrokerRegistry::new(), DailyStatsRegistry::new());
         let mut second = BrokerRegistry::new();
         second.register("ALPACA", "LIVE", sample_alpaca_adapter());
-        state.swap_registry(second);
+        state.swap_registries(second, DailyStatsRegistry::new());
         assert!(state.registry().get("ALPACA", "LIVE").is_some());
+    }
+
+    /// A reload publishes both registries together: a connection removed from
+    /// the order side stops being asked for previous closes in the same step.
+    #[tokio::test]
+    async fn swapping_registries_replaces_daily_stats_too() {
+        let state = sample_state();
+        let mut stats = DailyStatsRegistry::new();
+        stats.register("ALPACA", "PAPER", sample_alpaca_adapter());
+        state.swap_registries(BrokerRegistry::new(), stats);
+        assert!(state.daily_stats_handle().load().get("ALPACA", "PAPER").is_some());
+
+        state.swap_registries(BrokerRegistry::new(), DailyStatsRegistry::new());
+        assert!(state.daily_stats_handle().load().get("ALPACA", "PAPER").is_none());
     }
 
     /// Aborting a feed must actually stop it, and re-inserting under the same

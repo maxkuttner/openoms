@@ -19,6 +19,7 @@ use reqwest::Client;
 use tracing::info;
 
 use crate::adapter::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
+use crate::md::daily_stats::DailyStats;
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Quantities and prices as plain decimals without float noise — Bybit's rule.
@@ -348,7 +349,10 @@ impl BrokerAdapter for CoinbaseAdapter {
         let body = self.get(&format!("/orders/historical/{external_order_id}"), "", true).await?;
         Ok(parse_order_state(&body["order"]))
     }
+}
 
+#[async_trait::async_trait]
+impl DailyStats for CoinbaseAdapter {
     /// Public GET /market/products?product_type=SPOT — one call covers every product.
     async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
         if symbols.is_empty() {

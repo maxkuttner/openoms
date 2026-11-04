@@ -17,6 +17,7 @@ mod oidc;
 mod auth_api;
 
 use gateway::adapter::BrokerRegistry;
+use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::app_state::AppState;
 use crate::credentials::{CredentialState, FeedCredentials};
 use gateway::connectors::RegistrationDeps;
@@ -1078,7 +1079,8 @@ async fn serve() {
         // `build_registry`, so there is nothing left to do with it here.
         report: _report,
         exec_streams,
-    } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &registration_deps).await;
+        daily_stats,
+    } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &registration_deps).await;
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
     // (OPENFIGI_API_KEY) raises the limits and batch size.
@@ -1094,7 +1096,7 @@ async fn serve() {
     );
 
     // AppState. Constructed with an empty registry and immediately swapped to the
-    // one `build_registry` just produced — the same `swap_registry` call a
+    // one `build_registry` just produced — the same `swap_registries` call a
     // runtime reload will use — so boot itself exercises that path rather than
     // being the one caller that bypasses it. `event_bus` and
     // `quote_tx` are handed in (not just kept as `serve()` locals) so the
@@ -1134,7 +1136,7 @@ async fn serve() {
         quote_tx.clone(),
         session_config,
     );
-    state.swap_registry(registry);
+    state.swap_registries(registry, daily_stats);
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -1192,7 +1194,7 @@ async fn serve() {
     // arrives. See `daily_stats_poller` for cadence and selection.
     tokio::spawn(daily_stats_poller::run(
         state.pool().clone(),
-        state.registry_handle(),
+        state.daily_stats_handle(),
         state.daily_stats().clone(),
     ));
 

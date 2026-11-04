@@ -27,6 +27,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::adapter::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
+use crate::md::daily_stats::DailyStats;
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 const REST_URL: &str = "https://openapi.okx.com";
@@ -374,7 +375,10 @@ impl BrokerAdapter for OkxAdapter {
             None => Err(BrokerError::BrokerRejected(format!("OKX has no order {external_order_id}"))),
         }
     }
+}
 
+#[async_trait::async_trait]
+impl DailyStats for OkxAdapter {
     /// GET /api/v5/market/tickers?instType=SPOT — public; one call covers every pair.
     async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
         if symbols.is_empty() {

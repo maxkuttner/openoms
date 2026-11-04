@@ -43,6 +43,7 @@ impl Connector for Coinbase {
         let adapter = Arc::new(adapter);
         let stream_adapter = adapter.clone();
         Ok(Connected {
+            daily_stats: Some(adapter.clone()),
             adapter,
             exec_stream: Some(Arc::new(move |health, engine| {
                 Box::pin(crate::connectors::coinbase::stream::run(env, stream_adapter.clone(), health, engine))

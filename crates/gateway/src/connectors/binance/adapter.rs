@@ -21,6 +21,7 @@ use crate::adapter::{
     BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest,
     BrokerOrderResponse, InstrumentProvider,
 };
+use crate::md::daily_stats::DailyStats;
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Read a Binance symbol filter's numeric field (e.g. LOT_SIZE.stepSize).
@@ -322,7 +323,10 @@ impl BrokerAdapter for BinanceAdapter {
         };
         Ok(BrokerOrderState { outcome, executed_qty, avg_px })
     }
+}
 
+#[async_trait::async_trait]
+impl DailyStats for BinanceAdapter {
     async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
         if symbols.is_empty() {
             return Ok(Vec::new());

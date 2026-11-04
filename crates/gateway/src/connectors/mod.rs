@@ -12,6 +12,7 @@ use futures_util::future::BoxFuture;
 
 use crate::adapter::{BrokerAdapter, InstrumentProvider};
 use crate::credentials::{BrokerCredentials, Shown};
+use crate::md::daily_stats::DailyStats;
 use crate::verify::TestOutcome;
 use crate::contract::EngineHandle;
 use crate::stream_health::StreamHealthRegistry;
@@ -100,6 +101,9 @@ pub struct Connected {
     /// The execution stream to (re)start for it; `None` when the session that
     /// routes orders also delivers fills (FIX).
     pub exec_stream: Option<ExecStream>,
+    /// Its previous-close source for the market-data side; `None` when the
+    /// connection has no snapshot endpoint (FIX).
+    pub daily_stats: Option<Arc<dyn DailyStats>>,
 }
 
 pub trait Connector: Send + Sync {

@@ -41,6 +41,7 @@ impl Connector for Okx {
         let adapter = Arc::new(crate::connectors::okx::adapter::OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, env));
         let stream_adapter = adapter.clone();
         Ok(Connected {
+            daily_stats: Some(adapter.clone()),
             adapter,
             exec_stream: Some(Arc::new(move |health, engine| {
                 Box::pin(crate::connectors::okx::stream::run(env, stream_adapter.clone(), health, engine))

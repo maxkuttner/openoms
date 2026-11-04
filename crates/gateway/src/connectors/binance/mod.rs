@@ -56,7 +56,7 @@ impl Connector for Binance {
             Transport::Fix => {
                 let adapter = start_binance(env, creds, &deps.stream_health, deps.engine.clone())
                     .ok_or_else(|| "Binance FIX session could not start".to_string())?;
-                Ok(Connected { adapter, exec_stream: None })
+                Ok(Connected { adapter, exec_stream: None, daily_stats: None })
             }
             Transport::Rest => {
                 let c: crate::connectors::binance::adapter::BinanceCredentials = typed(creds, MANIFEST.credential_kind)?;
@@ -65,6 +65,7 @@ impl Connector for Binance {
                 let adapter = Arc::new(adapter);
                 let stream_adapter = adapter.clone();
                 Ok(Connected {
+                    daily_stats: Some(adapter.clone()),
                     adapter,
                     exec_stream: Some(Arc::new(move |health, engine| {
                         Box::pin(crate::connectors::binance::stream::run(env, stream_adapter.clone(), health, engine))

@@ -9,6 +9,7 @@ use crate::adapter::{
     BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest,
     BrokerOrderResponse, InstrumentProvider,
 };
+use crate::md::daily_stats::DailyStats;
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Alpaca's market-data API is a separate host from the trading API
@@ -428,7 +429,10 @@ impl BrokerAdapter for AlpacaAdapter {
             Err(BrokerError::BrokerRejected(err_body))
         }
     }
+}
 
+#[async_trait::async_trait]
+impl DailyStats for AlpacaAdapter {
     async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
         if symbols.is_empty() {
             return Ok(Vec::new());

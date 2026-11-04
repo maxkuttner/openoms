@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 use crate::event_bus::EventBus;
 use gateway::adapter::{BrokerAdapter, BrokerRegistry};
 use gateway::connectors::{self, ExecStream, RegistrationDeps};
+use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::app_state::{AppState, StreamRegistry};
 use gateway::credentials::BrokerCredentials;
 use crate::credentials::{Connection, CredentialState};
@@ -88,6 +89,10 @@ pub struct RegistrationOutput {
     /// forward (restart required, or an unreadable credential) is not in it and
     /// keeps the stream it already has.
     pub exec_streams: Vec<ExecStreamStart>,
+    /// The previous-close sources, published beside `registry` (see
+    /// `AppState::swap_registries`). Fresh connections bring their own; one
+    /// carried forward keeps the source it had in `current_daily_stats`.
+    pub daily_stats: DailyStatsRegistry,
 }
 
 /// One connection's execution stream, ready to (re)start.
@@ -119,9 +124,11 @@ pub async fn build_registry(
     connections: &[Connection<BrokerCredentials>],
     is_boot: bool,
     current: &BrokerRegistry,
+    current_daily_stats: &DailyStatsRegistry,
     deps: &RegistrationDeps,
 ) -> RegistrationOutput {
     let mut registry = BrokerRegistry::new();
+    let mut daily_stats = DailyStatsRegistry::new();
     let mut exec_streams = Vec::new();
     let mut report = ReloadReport { connections: Vec::new() };
 
@@ -170,6 +177,9 @@ pub async fn build_registry(
                 if let Some(adapter) = current.get(&conn.kind, env_name) {
                     registry.register(&conn.kind, env_name, adapter);
                 }
+                if let Some(source) = current_daily_stats.get(&conn.kind, env_name) {
+                    daily_stats.register(&conn.kind, env_name, source);
+                }
             }
             CredentialState::Configured(creds) => {
                 // Registration follows the stored credential's kind, not
@@ -215,6 +225,9 @@ pub async fn build_registry(
                             match connector.connect(env_name, creds, deps) {
                                 Ok(connected) => {
                                     registry.register(m.code, env_name, connected.adapter.clone());
+                                    if let Some(source) = connected.daily_stats {
+                                        daily_stats.register(m.code, env_name, source);
+                                    }
                                     if let Some(start) = connected.exec_stream {
                                         exec_streams.push(ExecStreamStart { code: m.code, env: env_name, adapter: connected.adapter, start });
                                     }
@@ -233,7 +246,7 @@ pub async fn build_registry(
         report.connections.push((conn.code.clone(), outcome));
     }
 
-    RegistrationOutput { registry, report, exec_streams }
+    RegistrationOutput { registry, report, exec_streams, daily_stats }
 }
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
@@ -386,7 +399,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_credential_kind_is_reported_failed() {
         let c = conn("nasdaq-paper", "ACTIVE", CredentialState::Configured(BrokerCredentials::new("Nasdaq", Default::default())));
-        let out = build_registry(&[c], true, &BrokerRegistry::new(), &stub_deps()).await;
+        let out = build_registry(&[c], true, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &stub_deps()).await;
         assert!(matches!(&out.report.connections[0].1, ConnectionOutcome::Failed(r) if r.contains("Nasdaq")));
         assert!(out.exec_streams.is_empty());
     }
@@ -404,10 +417,53 @@ mod tests {
             &gateway::connectors::bybit::adapter::BybitCredentials { api_key: "k".into(), api_secret: "s".into() },
         ));
         let connections = [conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca())), bybit, coinbase, okx_conn()];
-        let out = build_registry(&connections, true, &BrokerRegistry::new(), &stub_deps()).await;
+        let out = build_registry(&connections, true, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &stub_deps()).await;
         let mut codes: Vec<&str> = out.exec_streams.iter().map(|s| s.code).collect();
         codes.sort_unstable();
         assert_eq!(codes, ["ALPACA", "BYBIT", "COINBASE", "OKX"]);
+    }
+
+    /// Every REST connector's previous-close source comes back beside its
+    /// adapter, for the market-data side; FIX connectors have none.
+    #[tokio::test]
+    async fn every_rest_connector_hands_back_daily_stats() {
+        let mut coinbase = coinbase_conn();
+        coinbase.environment = Some("LIVE".into());
+        let mut bybit = okx_conn();
+        bybit.kind = "BYBIT".into();
+        bybit.credentials = CredentialState::Configured(BrokerCredentials::from_typed(
+            "Bybit",
+            &gateway::connectors::bybit::adapter::BybitCredentials { api_key: "k".into(), api_secret: "s".into() },
+        ));
+        let connections = [conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca())), bybit, coinbase, okx_conn()];
+        let out = build_registry(&connections, true, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &stub_deps()).await;
+        let mut codes: Vec<&str> = out.daily_stats.iter().map(|((code, _), _)| code.as_str()).collect();
+        codes.sort_unstable();
+        assert_eq!(codes, ["ALPACA", "BYBIT", "COINBASE", "OKX"]);
+    }
+
+    /// An unreadable credential keeps its connection's previous-close source,
+    /// as it keeps its adapter: one bad row must not blank Day P&L.
+    #[tokio::test]
+    async fn an_error_alpaca_credential_keeps_its_daily_stats() {
+        let mut current = BrokerRegistry::new();
+        current.register("ALPACA", "PAPER", stub_adapter());
+        let mut current_stats = DailyStatsRegistry::new();
+        current_stats.register("ALPACA", "PAPER", Arc::new(NoStats));
+
+        let c = conn("alpaca-paper", "ACTIVE", CredentialState::Error("bad key".into()));
+        let output = build_registry(&[c], false, &current, &current_stats, &stub_deps()).await;
+
+        assert!(output.daily_stats.get("ALPACA", "PAPER").is_some());
+    }
+
+    struct NoStats;
+
+    #[async_trait::async_trait]
+    impl gateway::md::daily_stats::DailyStats for NoStats {
+        async fn daily_stats(&self, _: &[String]) -> Result<Vec<(String, f64)>, gateway::adapter::BrokerError> {
+            Ok(Vec::new())
+        }
     }
 
     fn ibkr_conn(code: &str, status: &str, credentials: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
@@ -489,7 +545,7 @@ mod tests {
         current.register("IBKR", "PAPER", stub_adapter());
 
         let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Configured(ibkr()));
-        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+        let output = build_registry(&[c], false, &current, &DailyStatsRegistry::new(), &stub_deps()).await;
 
         assert!(output.registry.get("IBKR", "PAPER").is_some(), "the running adapter must be carried forward, not dropped");
         assert_eq!(
@@ -509,11 +565,11 @@ mod tests {
         current.register("IBKR", "PAPER", stub_adapter());
 
         let disabled = ibkr_conn("ibkr-paper", "DISABLED", CredentialState::Configured(ibkr()));
-        let output = build_registry(&[disabled], false, &current, &stub_deps()).await;
+        let output = build_registry(&[disabled], false, &current, &DailyStatsRegistry::new(), &stub_deps()).await;
         assert!(output.registry.get("IBKR", "PAPER").is_none());
 
         let unconfigured = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Unconfigured);
-        let output = build_registry(&[unconfigured], false, &current, &stub_deps()).await;
+        let output = build_registry(&[unconfigured], false, &current, &DailyStatsRegistry::new(), &stub_deps()).await;
         assert!(output.registry.get("IBKR", "PAPER").is_none());
     }
 
@@ -527,7 +583,7 @@ mod tests {
     async fn restart_required_with_nothing_to_carry_forward_is_reported_failed() {
         let current = BrokerRegistry::new(); // empty: nothing running for any venue
         let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Configured(ibkr()));
-        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+        let output = build_registry(&[c], false, &current, &DailyStatsRegistry::new(), &stub_deps()).await;
 
         assert!(output.registry.get("IBKR", "PAPER").is_none());
         match &output.report.connections[0] {
@@ -555,7 +611,7 @@ mod tests {
         current.register("IBKR", "PAPER", stub_adapter());
 
         let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Error("bad key".into()));
-        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+        let output = build_registry(&[c], false, &current, &DailyStatsRegistry::new(), &stub_deps()).await;
 
         assert!(
             output.registry.get("IBKR", "PAPER").is_some(),
@@ -578,7 +634,7 @@ mod tests {
         current.register("ALPACA", "PAPER", stub_adapter());
 
         let c = conn("alpaca-paper", "ACTIVE", CredentialState::Error("bad key".into()));
-        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+        let output = build_registry(&[c], false, &current, &DailyStatsRegistry::new(), &stub_deps()).await;
 
         assert!(
             output.registry.get("ALPACA", "PAPER").is_some(),
@@ -594,7 +650,7 @@ mod tests {
     async fn an_error_credential_with_nothing_to_carry_forward_registers_nothing() {
         let current = BrokerRegistry::new();
         let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Error("bad key".into()));
-        let output = build_registry(&[c], false, &current, &stub_deps()).await;
+        let output = build_registry(&[c], false, &current, &DailyStatsRegistry::new(), &stub_deps()).await;
 
         assert!(output.registry.get("IBKR", "PAPER").is_none());
         assert!(matches!(&output.report.connections[0], (_, ConnectionOutcome::Failed(_))));
@@ -605,11 +661,11 @@ mod tests {
     #[tokio::test]
     async fn reloading_alpaca_also_restarts_its_execution_stream() {
         let c = conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca()));
-        let out = build_registry(&[c], false, &BrokerRegistry::new(), &stub_deps()).await;
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &stub_deps()).await;
         assert_eq!(out.exec_streams.iter().map(|s| s.code).collect::<Vec<_>>(), ["ALPACA"]);
 
         let disabled = conn("alpaca-paper", "DISABLED", CredentialState::Configured(alpaca()));
-        let out = build_registry(&[disabled], false, &BrokerRegistry::new(), &stub_deps()).await;
+        let out = build_registry(&[disabled], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &stub_deps()).await;
         assert!(out.exec_streams.is_empty());
     }
 
@@ -655,7 +711,7 @@ mod tests {
             stream_health: StreamHealthRegistry::new(),
             engine: gateway::contract::EngineHandle::new().0,
         };
-        let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "PAPER").is_none());
         assert!(!out.exec_streams.iter().any(|s| s.code == "COINBASE"));
         assert!(matches!(&out.report.connections[0].1, ConnectionOutcome::Failed(m) if m.contains("LIVE")));
@@ -673,7 +729,7 @@ mod tests {
             stream_health: StreamHealthRegistry::new(),
             engine: gateway::contract::EngineHandle::new().0,
         };
-        let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
+        let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "LIVE").is_some());
         assert_eq!(out.exec_streams.iter().filter(|s| s.code == "COINBASE").map(|s| s.env).collect::<Vec<_>>(), ["LIVE"]);
     }
@@ -703,7 +759,7 @@ mod tests {
             stream_health: StreamHealthRegistry::new(),
             engine: gateway::contract::EngineHandle::new().0,
         };
-        let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
+        let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &deps).await;
         assert!(out.registry.get("OKX", "PAPER").is_some());
         assert_eq!(out.exec_streams.iter().filter(|s| s.code == "OKX").map(|s| s.env).collect::<Vec<_>>(), ["PAPER"]);
     }
@@ -726,7 +782,7 @@ mod tests {
             stream_health: StreamHealthRegistry::new(),
             engine: gateway::contract::EngineHandle::new().0,
         };
-        let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &deps).await;
         assert!(out.registry.get("BYBIT", "PAPER").is_some());
         assert_eq!(out.exec_streams.iter().filter(|s| s.code == "BYBIT").map(|s| s.env).collect::<Vec<_>>(), ["PAPER"]);
     }

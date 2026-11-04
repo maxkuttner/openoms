@@ -22,6 +22,7 @@ use sha2::Sha256;
 use tracing::info;
 
 use crate::adapter::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
+use crate::md::daily_stats::DailyStats;
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Bybit's default; how long after `X-BAPI-TIMESTAMP` the request stays valid.
@@ -340,7 +341,10 @@ impl BrokerAdapter for BybitAdapter {
         }
         Err(BrokerError::BrokerRejected(format!("Bybit has no order {external_order_id}")))
     }
+}
 
+#[async_trait::async_trait]
+impl DailyStats for BybitAdapter {
     /// GET /v5/market/tickers?category=spot — public; one call covers every pair.
     async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
         if symbols.is_empty() {

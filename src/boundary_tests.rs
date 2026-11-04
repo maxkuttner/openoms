@@ -107,3 +107,10 @@ fn central_files_name_no_connector() {
         }
     }
 }
+
+/// The order side carries no prices: previous closes come from `gateway::md`.
+#[test]
+fn order_adapter_carries_no_prices() {
+    let adapter = include_str!("../crates/gateway/src/adapter.rs");
+    assert!(!adapter.contains("daily_stats"), "BrokerAdapter still serves prices");
+}

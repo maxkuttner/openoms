@@ -11,6 +11,7 @@ use sqlx::{postgres::PgConnectOptions, PgPool};
 use tokio::sync::{mpsc, Notify};
 
 use gateway::adapter::BrokerRegistry;
+use gateway::md::daily_stats::DailyStatsRegistry;
 use gateway::connectors::alpaca::adapter::AlpacaAdapter;
 use crate::app_state::{AppState, StreamRegistry};
 use gateway::credentials::BrokerCredentials;
@@ -155,7 +156,7 @@ async fn reload_http_auth_and_store_failure_preserve_state() {
     let before = adapter();
     let mut registry = BrokerRegistry::new();
     registry.register("ALPACA", "PAPER", before.clone());
-    state.swap_registry(registry);
+    state.swap_registries(registry, DailyStatsRegistry::new());
     let fake = FakeStreams::default();
     fake.spawn("alpaca-paper:exec", state.streams());
     let (url, server) = serve(state.clone(), fake.clone()).await;
@@ -228,7 +229,7 @@ async fn reload_http_lifecycle_against_postgres() {
     let mut registry = BrokerRegistry::new();
     registry.register("IBKR", "PAPER", adapter());
     registry.register("BINANCE", "PAPER", adapter());
-    state.swap_registry(registry);
+    state.swap_registries(registry, DailyStatsRegistry::new());
     let held_fix = state.registry().get("IBKR", "PAPER").unwrap();
     fake.spawn("binance-paper:exec", state.streams());
     for _ in 0..3 {

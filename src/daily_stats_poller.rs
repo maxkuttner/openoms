@@ -1,5 +1,5 @@
-//! Periodically refreshes `DailyStatsStore` from every registered broker
-//! adapter's own snapshot/24hr-stats endpoint (`BrokerAdapter::daily_stats`),
+//! Periodically refreshes `DailyStatsStore` from every registered connection's
+//! previous-close source (`gateway::md::daily_stats::DailyStats`),
 //! for whatever instruments are "interesting" right now: watched, or held.
 //! Independent of any HTTP request — a request for `/marks` never blocks on
 //! a broker call.
@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use gateway::adapter::BrokerRegistry;
+use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::daily_stats::DailyStatsStore;
 
 const POLL_INTERVAL_SECS: u64 = 300;
@@ -152,7 +152,7 @@ async fn symbols_for(pool: &PgPool, ids: &[i64]) -> Result<Vec<(i64, String, Str
     .await
 }
 
-async fn poll_once(pool: &PgPool, registry: &BrokerRegistry, stats: &DailyStatsStore) {
+async fn poll_once(pool: &PgPool, sources: &DailyStatsRegistry, stats: &DailyStatsStore) {
     let watchlisted = watchlisted_instrument_ids(pool).await.unwrap_or_else(|e| {
         warn!(error = %e, "daily stats: failed to load watchlist instruments");
         Vec::new()
@@ -178,11 +178,11 @@ async fn poll_once(pool: &PgPool, registry: &BrokerRegistry, stats: &DailyStatsS
     // BINANCE/LIVE, if both registered, would both answer for the same
     // symbols and whichever responds second would silently overwrite the
     // other's price.
-    let registered: Vec<(String, String)> = registry.iter().map(|(key, _)| key.clone()).collect();
+    let registered: Vec<(String, String)> = sources.iter().map(|(key, _)| key.clone()).collect();
     let selected_environments = select_one_environment_per_broker(&registered);
 
     for (broker_code, environment) in selected_environments {
-        let Some(adapter) = registry.get(&broker_code, &environment) else {
+        let Some(source) = sources.get(&broker_code, &environment) else {
             continue;
         };
 
@@ -204,7 +204,7 @@ async fn poll_once(pool: &PgPool, registry: &BrokerRegistry, stats: &DailyStatsS
         let symbol_to_id = build_symbol_to_id(&served);
         let symbols: Vec<String> = served.into_iter().map(|(_, sym)| sym).collect();
 
-        match adapter.daily_stats(&symbols).await {
+        match source.daily_stats(&symbols).await {
             Ok(results) => {
                 let mut updated = 0;
                 for (symbol, prev_close) in results {
@@ -218,20 +218,20 @@ async fn poll_once(pool: &PgPool, registry: &BrokerRegistry, stats: &DailyStatsS
                 }
             }
             Err(gateway::adapter::BrokerError::NotConfigured(_)) => {
-                // This adapter doesn't support it. Not an error — most won't.
+                // This source can't answer. Not an error.
             }
             Err(e) => {
-                warn!(broker_code = %broker_code, environment = %environment, error = %e, "daily stats: adapter call failed, others continue");
+                warn!(broker_code = %broker_code, environment = %environment, error = %e, "daily stats: source call failed, others continue");
             }
         }
     }
 }
 
-pub async fn run(pool: PgPool, registry: Arc<ArcSwap<BrokerRegistry>>, stats: DailyStatsStore) {
+pub async fn run(pool: PgPool, sources: Arc<ArcSwap<DailyStatsRegistry>>, stats: DailyStatsStore) {
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     loop {
         interval.tick().await;
-        poll_once(&pool, &registry.load(), &stats).await;
+        poll_once(&pool, &sources.load(), &stats).await;
     }
 }
 
