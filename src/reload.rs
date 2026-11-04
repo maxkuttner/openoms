@@ -206,7 +206,12 @@ pub async fn build_registry(
                             // Carry the running session forward rather than starting a
                             // second one against the same venue (see fn doc comment).
                             match current.get(m.code, env_name) {
-                                Some(adapter) => registry.register(m.code, env_name, adapter),
+                                Some(adapter) => {
+                                    registry.register(m.code, env_name, adapter);
+                                    if let Some(source) = current_daily_stats.get(m.code, env_name) {
+                                        daily_stats.register(m.code, env_name, source);
+                                    }
+                                }
                                 // Nothing was actually running to carry forward — a
                                 // materially different state from "restart to pick up
                                 // your change": the operator needs to know there is no
@@ -435,6 +440,24 @@ mod tests {
         let output = build_registry(&[c], false, &current, &current_stats, &stub_deps()).await;
 
         assert!(output.daily_stats.get("ALPACA", "PAPER").is_some());
+    }
+
+    /// Binance is session-bound on either transport, so a reload carries a
+    /// running REST connection forward; its previous-close source must come
+    /// with it, or Day P&L baselines stop refreshing until a restart.
+    #[tokio::test]
+    async fn a_carried_forward_binance_connection_keeps_its_daily_stats() {
+        let mut current = BrokerRegistry::new();
+        current.register("BINANCE", "PAPER", stub_adapter());
+        let mut current_stats = DailyStatsRegistry::new();
+        current_stats.register("BINANCE", "PAPER", Arc::new(NoStats));
+
+        let mut c = conn("binance-paper", "ACTIVE", CredentialState::Configured(binance()));
+        c.kind = "BINANCE".into();
+        let output = build_registry(&[c], false, &current, &current_stats, &stub_deps()).await;
+
+        assert_eq!(output.report.connections[0].1, ConnectionOutcome::RestartRequired);
+        assert!(output.daily_stats.get("BINANCE", "PAPER").is_some());
     }
 
     struct NoStats;
