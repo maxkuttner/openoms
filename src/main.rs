@@ -1059,7 +1059,7 @@ async fn serve() {
     // events instead of writing to the database (see `order_engine.rs`). Started
     // before any connector, though its channel would buffer either way.
     let (engine, engine_rx) = order_engine::EngineHandle::new();
-    tokio::spawn(order_engine::run(engine_rx, pool.clone(), event_bus.clone()));
+    tokio::spawn(order_engine::run(engine_rx, engine.clone(), pool.clone(), event_bus.clone()));
 
     // Quote channel every market-data feed publishes onto. Created here, ahead
     // of `AppState`, for the same reason: a runtime reload needs to hand a

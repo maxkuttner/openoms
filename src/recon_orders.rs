@@ -29,9 +29,8 @@ use sqlx::{PgPool, Row};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::event_bus::EventBus;
 use crate::adapters::{BrokerAdapter, BrokerError};
-use crate::order_engine::{apply_planned, ExecEvent, ExecKind, ExecSource};
+use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
 
 const EPS: f64 = 1e-9;
 
@@ -184,19 +183,32 @@ pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<Om
     out
 }
 
-/// The imperative shell: snapshot the broker's open orders, diff against the OMS
-/// working set, and act on each difference. Used by both the Binance WS driver and
-/// the FIX recon driver. `broker_code` is the uppercase registry/venue code
-/// (`"BINANCE"`); `actor` labels appended events (`"binance"` / `"ibkr"`).
+/// The imperative shell: read the OMS working set, then reconcile it against the
+/// broker. `broker_code` is the uppercase registry/venue code (`"BINANCE"`);
+/// `actor` labels the events booked from it (`"binance"` / `"ibkr"`).
 pub async fn run_order_reconcile(
     pool: &PgPool,
     adapter: &dyn BrokerAdapter,
-    broker_code: &str,
+    broker_code: &'static str,
     actor: &'static str,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) {
     let oms = load_oms_working_orders(pool, broker_code).await;
+    reconcile_with(&oms, adapter, broker_code, actor, engine).await;
+}
 
+/// Snapshot the broker's open orders, diff against `oms`, and act on each
+/// difference. Recon never books: an order that closed at the broker goes to the
+/// order engine as a terminal state, and the engine books it against what is
+/// booked *then* — in arrival order with live fills — not against `oms`, which a
+/// live fill may have overtaken while recon waited on the broker.
+pub async fn reconcile_with(
+    oms: &[OmsWorkingOrder],
+    adapter: &dyn BrokerAdapter,
+    broker_code: &'static str,
+    actor: &'static str,
+    engine: &EngineHandle,
+) {
     let broker_open = match adapter.open_orders().await {
         Ok(o) => o,
         Err(BrokerError::NotConfigured(_)) => return, // adapter doesn't support snapshots
@@ -210,10 +222,9 @@ pub async fn run_order_reconcile(
         return;
     }
 
-    let booked_avg: HashMap<Uuid, Option<f64>> = oms.iter().map(|o| (o.order_id, o.avg_px)).collect();
-    for action in plan_order_recon(&oms, &broker_open) {
+    for action in plan_order_recon(oms, &broker_open) {
         match action {
-            ReconAction::ResolveTerminal { order_id, symbol, ext_id, oms_cum } => {
+            ReconAction::ResolveTerminal { order_id, symbol, ext_id, .. } => {
                 let st = match adapter.order_status(&order_id.to_string(), &ext_id, &symbol).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -221,8 +232,14 @@ pub async fn run_order_reconcile(
                         continue;
                     }
                 };
-                let oms_avg = booked_avg.get(&order_id).copied().flatten();
-                apply_terminal(pool, order_id, oms_cum, oms_avg, &st, broker_code, actor, bus)
+                engine
+                    .exec(ExecEvent {
+                        order_id,
+                        venue: broker_code.to_string(),
+                        actor,
+                        source: ExecSource::Snapshot,
+                        kind: ExecKind::Terminal(st),
+                    })
                     .await;
             }
             ReconAction::PartialDrift { order_id, oms_cum, broker_executed } => {
@@ -286,32 +303,52 @@ pub(crate) async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64
     }
 }
 
-/// Apply the terminal outcome of an order that dropped out of the open-order set:
-/// the missed fill first, then the close (see [`crate::order_engine::reports_for`]).
-/// The terminal-state guard in `process_execution_report` makes every step
-/// replay-safe.
-#[allow(clippy::too_many_arguments)]
-async fn apply_terminal(
-    pool: &PgPool,
-    order_id: Uuid,
-    oms_cum: f64,
-    oms_avg: Option<f64>,
-    st: &BrokerOrderState,
-    venue: &str,
-    actor: &'static str,
-    bus: Option<&EventBus>,
-) {
-    let ev = exec_event(order_id, venue, actor, ExecSource::Snapshot, ExecKind::Terminal(st.clone()));
-    apply_planned(pool, bus, &ev, oms_cum, oms_avg).await;
-}
-
-fn exec_event(order_id: Uuid, venue: &str, actor: &'static str, source: ExecSource, kind: ExecKind) -> ExecEvent {
-    ExecEvent { order_id, venue: venue.to_string(), actor, source, kind }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A broker whose snapshot no longer lists the order, and which reports it
+    /// canceled with some quantity executed.
+    struct ClosedAtBroker;
+
+    #[async_trait::async_trait]
+    impl BrokerAdapter for ClosedAtBroker {
+        async fn submit_order(
+            &self,
+            _: &crate::adapters::BrokerOrderRequest,
+        ) -> Result<crate::adapters::BrokerOrderResponse, BrokerError> {
+            unreachable!()
+        }
+        async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
+            unreachable!()
+        }
+        async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+            Ok(Vec::new())
+        }
+        async fn order_status(&self, _: &str, _: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
+            Ok(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 0.4, avg_px: 10.0 })
+        }
+    }
+
+    /// Recon only asks the broker; the order engine books, against what is
+    /// booked when it gets there — never against the snapshot recon read at its
+    /// start, which a live fill may have overtaken.
+    #[tokio::test]
+    async fn recon_hands_terminal_states_to_the_engine_instead_of_booking() {
+        let order_id = Uuid::new_v4();
+        let oms = [OmsWorkingOrder { order_id, symbol: "X".into(), ext_id: "e1".into(), cum_qty: 0.0, avg_px: None }];
+        let (engine, mut rx) = crate::order_engine::EngineHandle::new();
+
+        reconcile_with(&oms, &ClosedAtBroker, "FAKE", "fake", &engine).await;
+
+        let Ok(crate::order_engine::GatewayMsg::Exec(ev)) = rx.try_recv() else { panic!("an exec event") };
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.source, ExecSource::Snapshot);
+        assert_eq!(
+            ev.kind,
+            ExecKind::Terminal(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 0.4, avg_px: 10.0 })
+        );
+    }
 
     // The missing quantity is priced from the OMS's own booked state, not from
     // whatever a connection happened to see: 0.5 booked @100, Coinbase now says

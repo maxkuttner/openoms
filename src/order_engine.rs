@@ -7,7 +7,7 @@
 //! no database pool and no bus — so the booking rules live in one place, and a
 //! new connector cannot get them subtly wrong.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use sqlx::PgPool;
@@ -163,24 +163,46 @@ impl EngineHandle {
 }
 
 /// The only place that books. Applies execution events one at a time, in the
-/// order connectors sent them; runs each reconcile on its own task (it waits on
-/// the broker's REST API, which must not hold up fills), at most one per broker.
-pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, pool: PgPool, bus: EventBus) {
+/// order connectors sent them. A reconcile runs on its own task — it waits on the
+/// broker's REST API, which must not hold up fills — and sends what it finds
+/// back through `engine` as events, so it books in line with live fills too.
+pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, engine: EngineHandle, pool: PgPool, bus: EventBus) {
     info!("order engine: started");
-    let reconciling: Arc<Mutex<HashSet<&'static str>>> = Arc::default();
+    let reconciling: Arc<Mutex<HashMap<ReconKey, bool>>> = Arc::default();
     while let Some(msg) = rx.recv().await {
         match msg {
-            GatewayMsg::Exec(ev) => apply_exec(&pool, &bus, &ev).await,
+            GatewayMsg::Exec(ev) => {
+                guarded(ev.order_id, apply_exec(&pool, &bus, &ev)).await;
+            }
             GatewayMsg::Reconcile { broker_code, actor, adapter } => {
-                if !reconciling.lock().unwrap().insert(broker_code) {
-                    debug!(broker = broker_code, "order engine: reconcile already running, skipped");
-                    continue;
+                // per connection, not per broker: PAPER and LIVE (or Binance WS and
+                // FIX) share a broker code but are separate sessions
+                let key = (broker_code, Arc::as_ptr(&adapter) as *const () as usize);
+                {
+                    let mut running = reconciling.lock().unwrap();
+                    if let Some(rerun) = running.get_mut(&key) {
+                        // may be a reconnect's snapshot: run once more when this one ends
+                        *rerun = true;
+                        debug!(broker = broker_code, "order engine: reconcile running, will run again after");
+                        continue;
+                    }
+                    running.insert(key, false);
                 }
-                let done = Reconciling { set: reconciling.clone(), broker_code };
-                let (pool, bus) = (pool.clone(), bus.clone());
+                let done = Reconciling { running: reconciling.clone(), key };
+                let (pool, engine) = (pool.clone(), engine.clone());
                 tokio::spawn(async move {
-                    let _done = done;
-                    run_order_reconcile(&pool, &*adapter, broker_code, actor, Some(&bus)).await;
+                    let done = done;
+                    loop {
+                        run_order_reconcile(&pool, &*adapter, broker_code, actor, &engine).await;
+                        let mut running = done.running.lock().unwrap();
+                        match running.get_mut(&done.key) {
+                            Some(rerun) if *rerun => *rerun = false,
+                            _ => {
+                                running.remove(&done.key);
+                                break;
+                            }
+                        }
+                    }
                 });
             }
         }
@@ -188,16 +210,35 @@ pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, pool: PgPool, bus: EventBus
     info!("order engine: every connector is gone, stopping");
 }
 
-/// Frees a broker's reconcile slot however the task ends, panics included.
+/// Run one event's booking, containing a panic to that event. The engine is the
+/// only consumer of every connector's events; if a bug in one booking ended its
+/// task, every later fill from every venue would be dropped. Returns whether the
+/// booking completed.
+async fn guarded(order_id: Uuid, booking: impl std::future::Future<Output = ()>) -> bool {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(booking).catch_unwind().await {
+        Ok(()) => true,
+        Err(_) => {
+            error!(order_id = %order_id, "order engine: booking panicked; event skipped, engine continues");
+            false
+        }
+    }
+}
+
+/// One connection's reconcile slot: its broker code and adapter instance.
+type ReconKey = (&'static str, usize);
+
+/// Frees a connection's reconcile slot however the task ends, panics included.
+/// The value in `running` is "run again when this one finishes".
 struct Reconciling {
-    set: Arc<Mutex<HashSet<&'static str>>>,
-    broker_code: &'static str,
+    running: Arc<Mutex<HashMap<ReconKey, bool>>>,
+    key: ReconKey,
 }
 
 impl Drop for Reconciling {
     fn drop(&mut self) {
-        if let Ok(mut set) = self.set.lock() {
-            set.remove(self.broker_code);
+        if let Ok(mut running) = self.running.lock() {
+            running.remove(&self.key);
         }
     }
 }
@@ -213,23 +254,11 @@ pub async fn apply_exec(pool: &PgPool, bus: &EventBus, ev: &ExecEvent) {
     } else {
         (0.0, None)
     };
-    apply_planned(pool, Some(bus), ev, booked_cum, booked_avg).await;
-}
-
-/// Apply [`reports_for`] in order against a booked state the caller already has
-/// (recon reads it for its whole working set at once).
-pub(crate) async fn apply_planned(
-    pool: &PgPool,
-    bus: Option<&EventBus>,
-    ev: &ExecEvent,
-    booked_cum: f64,
-    booked_avg: Option<f64>,
-) {
     if matches!(&ev.kind, ExecKind::Terminal(st) if st.outcome == BrokerOrderOutcome::Working) {
         info!(order_id = %ev.order_id, "order engine: order still working at broker, no terminal action");
     }
     for report in reports_for(ev, booked_cum, booked_avg) {
-        if let Err(e) = process_execution_report(pool, ev.order_id, report, ev.actor, bus).await {
+        if let Err(e) = process_execution_report(pool, ev.order_id, report, ev.actor, Some(bus)).await {
             error!(order_id = %ev.order_id, source = ?ev.source, error = %e, "order engine: apply failed");
         }
     }
@@ -386,25 +415,63 @@ mod tests {
             .unwrap()
     }
 
+    /// One event whose booking panics must cost that event, not the engine:
+    /// with the engine gone, every later fill from every connector is lost.
     #[tokio::test]
-    async fn second_reconcile_for_a_busy_broker_is_dropped() {
-        let broker = Arc::new(SlowBroker { calls: Default::default(), release: tokio::sync::Notify::new() });
+    async fn a_panicking_booking_does_not_stop_the_engine() {
+        let survived = guarded(Uuid::nil(), async { panic!("booking bug") }).await;
+        assert!(!survived);
+        assert!(guarded(Uuid::nil(), async {}).await);
+    }
+
+    fn slow_broker() -> Arc<SlowBroker> {
+        Arc::new(SlowBroker { calls: Default::default(), release: tokio::sync::Notify::new() })
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    /// A reconnect that lands while a heartbeat recon is still waiting on the
+    /// broker must not be lost — its snapshot may be the one that heals the
+    /// outage — but neither may requests pile up: they fold into one rerun.
+    #[tokio::test]
+    async fn reconcile_requests_while_busy_coalesce_into_one_rerun() {
+        let broker = slow_broker();
         let (engine, rx) = EngineHandle::new();
-        tokio::spawn(run(rx, refusing_pool(), crate::event_bus::EventBus::new()));
+        tokio::spawn(run(rx, engine.clone(), refusing_pool(), crate::event_bus::EventBus::new()));
         let calls = || broker.calls.load(std::sync::atomic::Ordering::SeqCst);
-        let settle = || tokio::time::sleep(std::time::Duration::from_millis(300));
 
-        engine.reconcile("FAKE", "fake", broker.clone()).await;
-        engine.reconcile("FAKE", "fake", broker.clone()).await;
+        for _ in 0..3 {
+            engine.reconcile("FAKE", "fake", broker.clone()).await;
+        }
         settle().await;
-        assert_eq!(calls(), 1, "a second recon for a broker still reconciling is dropped");
+        assert_eq!(calls(), 1, "one at a time");
 
         broker.release.notify_waiters();
         settle().await;
-        engine.reconcile("FAKE", "fake", broker.clone()).await;
-        settle().await;
-        assert_eq!(calls(), 2, "once it finished, the next one runs");
+        assert_eq!(calls(), 2, "the requests made meanwhile run once more, together");
+
         broker.release.notify_waiters();
+        settle().await;
+        assert_eq!(calls(), 2, "and nothing after that");
+    }
+
+    /// PAPER and LIVE (or Binance's WS and FIX sessions) share a broker code but
+    /// are separate connections; one's recon must not hold back the other's.
+    #[tokio::test]
+    async fn another_connection_of_the_same_broker_is_not_blocked() {
+        let (paper, live) = (slow_broker(), slow_broker());
+        let (engine, rx) = EngineHandle::new();
+        tokio::spawn(run(rx, engine.clone(), refusing_pool(), crate::event_bus::EventBus::new()));
+
+        engine.reconcile("FAKE", "fake", paper.clone()).await;
+        engine.reconcile("FAKE", "fake", live.clone()).await;
+        settle().await;
+
+        assert_eq!(live.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        paper.release.notify_waiters();
+        live.release.notify_waiters();
     }
 
     #[tokio::test]
@@ -424,7 +491,7 @@ mod tests {
                 kind: ExecKind::Fill { execution_id: "e1".into(), qty: 1.0, price: 100.0 },
             })
             .await;
-        tokio::spawn(run(rx, pool.clone(), crate::event_bus::EventBus::new()));
+        tokio::spawn(run(rx, engine.clone(), pool.clone(), crate::event_bus::EventBus::new()));
 
         let mut status = String::new();
         for _ in 0..20 {
