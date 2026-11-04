@@ -1443,6 +1443,7 @@ async fn serve() {
         )
         .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
         .route("/marks", get(handlers::get_marks))
+        .route("/updates", get(live_updates::ws_updates))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
         .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
         .route(

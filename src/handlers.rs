@@ -3158,7 +3158,7 @@ pub(crate) mod tests {
     /// exactly (src/handlers.rs, the test just above this one) — empty registry,
     /// a throwaway quote channel. Nothing in these tests routes an
     /// order or reads the registry, so an empty one is correct, not a stub.
-    fn test_app_state(pool: sqlx::PgPool) -> AppState {
+    pub(crate) fn test_app_state(pool: sqlx::PgPool) -> AppState {
         use crate::adapters::BrokerRegistry;
         use crate::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
