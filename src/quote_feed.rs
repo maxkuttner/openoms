@@ -17,7 +17,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
 use tracing::info;
 
-use crate::connectors::QuoteSource;
+use gateway::connectors::QuoteSource;
 use crate::event_bus::OrderLaneEvent;
 use gateway::stream_health::StreamHandle;
 use gateway::stream_supervisor::{Session, StreamResult};

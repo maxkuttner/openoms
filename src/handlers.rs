@@ -15,7 +15,7 @@ use axum::{
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
-use crate::adapters::{BrokerOrderRequest, BrokerError};
+use gateway::adapter::{BrokerOrderRequest, BrokerError};
 use crate::app_state::AppState;
 use crate::domain::orders::commands;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
@@ -2311,7 +2311,7 @@ pub(crate) mod tests {
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn a_submitted_order_records_the_principal_that_sent_it() {
         use crate::app_state::AppState;
-        use crate::adapters::BrokerRegistry;
+        use gateway::adapter::BrokerRegistry;
         use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
@@ -3162,7 +3162,7 @@ pub(crate) mod tests {
     /// a throwaway quote channel. Nothing in these tests routes an
     /// order or reads the registry, so an empty one is correct, not a stub.
     pub(crate) fn test_app_state(pool: sqlx::PgPool) -> AppState {
-        use crate::adapters::BrokerRegistry;
+        use gateway::adapter::BrokerRegistry;
         use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 

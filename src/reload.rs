@@ -14,10 +14,11 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::event_bus::EventBus;
-use crate::adapters::{BrokerAdapter, BrokerRegistry};
-use crate::connectors::{self, ExecStream};
+use gateway::adapter::{BrokerAdapter, BrokerRegistry};
+use gateway::connectors::{self, ExecStream, RegistrationDeps};
 use crate::app_state::{AppState, StreamRegistry};
-use crate::credentials::{BrokerCredentials, Connection, CredentialState};
+use gateway::credentials::BrokerCredentials;
+use crate::credentials::{Connection, CredentialState};
 use crate::opra_stream::DatabentoOpraFeed;
 use crate::quote_feed::QuoteFeedSession;
 use gateway::stream_health::{StreamHealthRegistry, StreamKind};
@@ -69,16 +70,6 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             _ => ConnectionOutcome::Registered,
         },
     }
-}
-
-/// What the FIX starters and freshly-built adapters need beyond the credential
-/// itself. Built once in `serve()` and handed to every call of `build_registry`
-/// — boot today, a runtime reload endpoint in a later task — so both draw on the
-/// exact same stream-health registry and order engine rather than each
-/// constructing (or re-deriving) their own.
-pub struct RegistrationDeps {
-    pub stream_health: StreamHealthRegistry,
-    pub engine: gateway::contract::EngineHandle,
 }
 
 /// Everything `build_registry` produces: the registry, the per-connection report,
@@ -287,7 +278,7 @@ pub async fn restart_databento_feed(
     streams.insert("databento-opra", handle);
 }
 
-pub(crate) use crate::connectors::exec_stream_code;
+pub(crate) use gateway::connectors::exec_stream_code;
 
 /// The network boundary of reload. Store reads, classification, serialization,
 /// swaps and stops remain real in integration tests; only new external sessions
@@ -334,8 +325,9 @@ pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::alpaca::AlpacaAdapter;
-    use crate::credentials::{BrokerCredentials, Connection, CredentialState};
+    use gateway::connectors::alpaca::adapter::AlpacaAdapter;
+    use gateway::credentials::BrokerCredentials;
+    use crate::credentials::{Connection, CredentialState};
 
     fn conn(code: &str, status: &str, state: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
         Connection {
@@ -349,11 +341,11 @@ mod tests {
     }
 
     fn alpaca() -> BrokerCredentials {
-        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "k".into(), secret: "s".into() })
+        BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "k".into(), secret: "s".into() })
     }
 
     fn ibkr() -> BrokerCredentials {
-        BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
+        BrokerCredentials::from_typed("IbkrFix", &gateway::connectors::ibkr::fix::IbkrFixCredentials {
             host: "h".into(), port: 4001,
             sender_comp_id: "OMS".into(), target_comp_id: "IBKR".into(),
             password: "p".into(), ssl: true,
@@ -361,7 +353,7 @@ mod tests {
     }
 
     fn binance() -> BrokerCredentials {
-        BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
+        BrokerCredentials::from_typed("BinanceFix", &gateway::connectors::binance::adapter::BinanceCredentials {
             host: "h".into(), port: 9000,
             sender_comp_id: "OMS".into(), target_comp_id: "SPOT".into(),
             api_key: "k".into(), private_key: "pk".into(),
@@ -409,7 +401,7 @@ mod tests {
         bybit.kind = "BYBIT".into();
         bybit.credentials = CredentialState::Configured(BrokerCredentials::from_typed(
             "Bybit",
-            &crate::adapters::bybit::BybitCredentials { api_key: "k".into(), api_secret: "s".into() },
+            &gateway::connectors::bybit::adapter::BybitCredentials { api_key: "k".into(), api_secret: "s".into() },
         ));
         let connections = [conn("alpaca-paper", "ACTIVE", CredentialState::Configured(alpaca())), bybit, coinbase, okx_conn()];
         let out = build_registry(&connections, true, &BrokerRegistry::new(), &stub_deps()).await;
@@ -630,7 +622,7 @@ mod tests {
         let c = conn(
             "bybit-paper",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::from_typed("Bybit", &crate::adapters::bybit::BybitCredentials { api_key: "k".into(), api_secret: "s".into() })),
+            CredentialState::Configured(BrokerCredentials::from_typed("Bybit", &gateway::connectors::bybit::adapter::BybitCredentials { api_key: "k".into(), api_secret: "s".into() })),
         );
         assert!(matches!(classify(&c, false), ConnectionOutcome::Registered));
         assert!(matches!(classify(&c, true), ConnectionOutcome::Registered));
@@ -644,7 +636,7 @@ mod tests {
         let mut c = conn(
             "coinbase-live",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::from_typed("Coinbase", &crate::adapters::coinbase::CoinbaseCredentials { api_key: "organizations/o/apiKeys/k".into(), private_key: pem })),
+            CredentialState::Configured(BrokerCredentials::from_typed("Coinbase", &gateway::connectors::coinbase::adapter::CoinbaseCredentials { api_key: "organizations/o/apiKeys/k".into(), private_key: pem })),
         );
         c.environment = Some("LIVE".into());
         c
@@ -690,7 +682,7 @@ mod tests {
         conn(
             "okx-paper",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::from_typed("Okx", &crate::adapters::okx::OkxCredentials { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() })),
+            CredentialState::Configured(BrokerCredentials::from_typed("Okx", &gateway::connectors::okx::adapter::OkxCredentials { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() })),
         )
     }
 
@@ -728,7 +720,7 @@ mod tests {
         let c = conn(
             "bybit-paper",
             "ACTIVE",
-            CredentialState::Configured(BrokerCredentials::from_typed("Bybit", &crate::adapters::bybit::BybitCredentials { api_key: "k".into(), api_secret: "s".into() })),
+            CredentialState::Configured(BrokerCredentials::from_typed("Bybit", &gateway::connectors::bybit::adapter::BybitCredentials { api_key: "k".into(), api_secret: "s".into() })),
         );
         let deps = RegistrationDeps {
             stream_health: StreamHealthRegistry::new(),

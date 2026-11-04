@@ -10,10 +10,13 @@ use axum::{extract::State, middleware, routing::post, Router};
 use sqlx::{postgres::PgConnectOptions, PgPool};
 use tokio::sync::{mpsc, Notify};
 
-use crate::adapters::{alpaca::AlpacaAdapter, BrokerRegistry};
+use gateway::adapter::BrokerRegistry;
+use gateway::connectors::alpaca::adapter::AlpacaAdapter;
 use crate::app_state::{AppState, StreamRegistry};
-use crate::credentials::{self, BrokerCredentials, FeedCredentials};
-use crate::reload::{self, RegistrationDeps, ReloadStreams};
+use gateway::credentials::BrokerCredentials;
+use crate::credentials::{self, FeedCredentials};
+use gateway::connectors::RegistrationDeps;
+use crate::reload::{self, ReloadStreams};
 use crate::secrets::{parse_master_key, MasterKey};
 use gateway::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
 
@@ -41,7 +44,7 @@ fn state(pool: PgPool) -> AppState {
 #[derive(Clone, Default)]
 struct FakeStreams {
     active: Arc<Mutex<HashMap<String, usize>>>,
-    adapters: Arc<Mutex<HashMap<String, Arc<dyn crate::adapters::BrokerAdapter>>>>,
+    adapters: Arc<Mutex<HashMap<String, Arc<dyn gateway::adapter::BrokerAdapter>>>>,
     gate: Arc<Mutex<Option<StartGate>>>,
 }
 
@@ -114,7 +117,7 @@ impl ReloadStreams for FakeStreams {
 
 /// The same adapter instance (compares the data pointer; a `dyn` vtable pointer
 /// may differ between codegen units).
-fn same_adapter(a: &Arc<dyn crate::adapters::BrokerAdapter>, b: &Arc<dyn crate::adapters::BrokerAdapter>) -> bool {
+fn same_adapter(a: &Arc<dyn gateway::adapter::BrokerAdapter>, b: &Arc<dyn gateway::adapter::BrokerAdapter>) -> bool {
     std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
 }
 
@@ -160,7 +163,7 @@ async fn reload_http_auth_and_store_failure_preserve_state() {
     assert_eq!(client().post(&url).send().await.unwrap().status(), 403);
     assert_eq!(client().post(&url).bearer_auth("wrong").send().await.unwrap().status(), 403);
     assert_eq!(post_reload(&url).await.0, 500);
-    assert!(same_adapter(&(before.clone() as Arc<dyn crate::adapters::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn gateway::adapter::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
 
     state.streams().abort_and_remove("alpaca-paper:exec").await;
@@ -201,21 +204,21 @@ async fn reload_http_lifecycle_against_postgres() {
     insert_broker(&pool, "binance-paper", "BINANCE").await;
     insert_broker(&pool, "bybit-paper", "BYBIT").await;
     insert_broker(&pool, "okx-paper", "OKX").await;
-    credentials::save_broker(&pool, &key(), "alpaca-paper", &BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials {
+    credentials::save_broker(&pool, &key(), "alpaca-paper", &BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials {
         key: "SYNTHETIC-API-KEY".into(), secret: "SYNTHETIC-SECRET".into(),
     })).await.unwrap();
-    credentials::save_broker(&pool, &key(), "ibkr-paper", &BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
+    credentials::save_broker(&pool, &key(), "ibkr-paper", &BrokerCredentials::from_typed("IbkrFix", &gateway::connectors::ibkr::fix::IbkrFixCredentials {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
         target_comp_id: "IBKR".into(), password: "SYNTHETIC-FIX-PASSWORD".into(), ssl: true,
     })).await.unwrap();
-    credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
+    credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::from_typed("BinanceFix", &gateway::connectors::binance::adapter::BinanceCredentials {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
         target_comp_id: "SPOT".into(), api_key: "SYNTHETIC-BINANCE".into(), private_key: "SYNTHETIC-PEM".into(),
     })).await.unwrap();
-    credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::from_typed("Bybit", &crate::adapters::bybit::BybitCredentials {
+    credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::from_typed("Bybit", &gateway::connectors::bybit::adapter::BybitCredentials {
         api_key: "SYNTHETIC-BYBIT".into(), api_secret: "SYNTHETIC-BYBIT-SECRET".into(),
     })).await.unwrap();
-    credentials::save_broker(&pool, &key(), "okx-paper", &BrokerCredentials::from_typed("Okx", &crate::adapters::okx::OkxCredentials {
+    credentials::save_broker(&pool, &key(), "okx-paper", &BrokerCredentials::from_typed("Okx", &gateway::connectors::okx::adapter::OkxCredentials {
         api_key: "SYNTHETIC-OKX".into(), api_secret: "SYNTHETIC-OKX-SECRET".into(), passphrase: "SYNTHETIC-OKX-PASS".into(),
     })).await.unwrap();
     credentials::save_feed(&pool, &key(), "databento-opra", &FeedCredentials::Databento {
@@ -276,14 +279,14 @@ async fn reload_http_lifecycle_against_postgres() {
     assert_eq!(status, 200);
     assert!(outcome(&body, "alpaca-paper")["Failed"].is_string());
     assert!(outcome(&body, "databento-opra")["Failed"].is_string());
-    assert!(same_adapter(&(before.clone() as Arc<dyn crate::adapters::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn gateway::adapter::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("databento-opra"), 1);
 
     // No readable rows: refuse before swapping or stopping anything.
     sqlx::query("UPDATE oms.broker_connection SET credentials = '\\x00'::bytea")
         .execute(&pool).await.unwrap();
     assert_eq!(post_reload(&url).await.0, 500);
-    assert!(same_adapter(&(before.clone() as Arc<dyn crate::adapters::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn gateway::adapter::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
     assert_eq!(fake.count("binance-paper:exec"), 1);
     assert_eq!(fake.count("databento-opra"), 1);

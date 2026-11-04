@@ -13,3 +13,18 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 dataprovider = { path = "../dataprovider" }
+serde_json = "1"
+futures-util = "0.3"
+# Venue HTTP APIs and their WebSocket streams.
+reqwest = { version = "0.13.1", features = ["json"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+# Request signing: Binance (Ed25519), Coinbase (ES256 JWT), Bybit / OKX (HMAC-SHA256).
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+rand = "0.8"
+# The C++ QuickFIX engine for the FIX sessions (IBKR 4.2, Binance 4.4), with
+# TLS; we implement its ApplicationCallback. Needs cmake + a C++ compiler to build.
+quickfix = { version = "0.2", features = ["build-with-ssl"] }

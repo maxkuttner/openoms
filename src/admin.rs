@@ -13,8 +13,10 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::jobs::api::JobStarted;
-use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials, RedactedField};
-use crate::credentials_api::{self, CredentialSubmission, TestOutcome};
+use gateway::credentials::BrokerCredentials;
+use crate::credentials::{Connection, CredentialState, FeedCredentials, RedactedField};
+use gateway::verify::TestOutcome;
+use crate::credentials_api::{self, CredentialSubmission};
 use crate::reload;
 use gateway::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
@@ -643,7 +645,7 @@ pub async fn create_broker_connection(
 
 /// The venues a broker connection can point at, with their credential fields:
 /// the cockpit builds its create form and credentials drawer from this.
-pub async fn list_venues() -> Json<Vec<crate::venues::Venue>> {
+pub async fn list_venues() -> Json<Vec<gateway::venue::Venue>> {
     Json(crate::venues::venues())
 }
 
@@ -1342,7 +1344,7 @@ async fn apply_reload(
 
     info!("admin reload connections");
 
-    let deps = reload::RegistrationDeps {
+    let deps = gateway::connectors::RegistrationDeps {
         stream_health: state.stream_health().clone(),
         engine: state.engine().clone(),
     };
@@ -1392,7 +1394,7 @@ async fn apply_reload(
     // not on the outcome alone: an unreadable credential whose adapter was
     // carried forward must keep its fills flowing while orders still route
     // through it.
-    for connector in crate::connectors::all().iter().filter(|c| c.manifest().exec_stream) {
+    for connector in gateway::connectors::all().iter().filter(|c| c.manifest().exec_stream) {
         let code = connector.manifest().code;
         for env_name in ["PAPER", "LIVE"] {
             if state.registry().get(code, env_name).is_none() {
@@ -2895,7 +2897,7 @@ mod tests {
     }
 
     fn good_alpaca() -> CredentialState<BrokerCredentials> {
-        CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "k".into(), secret: "s".into() }))
+        CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "k".into(), secret: "s".into() }))
     }
 
     /// The gate must never fire on a normal running system or a fresh
@@ -3032,7 +3034,7 @@ mod tests {
     fn the_save_response_carries_no_submitted_secret() {
         let conn = broker(
             "alpaca-paper",
-            CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials {
+            CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials {
                 key: "AKLIVE".into(),
                 secret: "SUPERSECRETVALUE".into(),
             })),
@@ -3309,7 +3311,7 @@ mod tests {
     }
 
     fn test_app_state(pool: sqlx::PgPool) -> AppState {
-        use crate::adapters::BrokerRegistry;
+        use gateway::adapter::BrokerRegistry;
         use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 

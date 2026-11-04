@@ -1,4 +1,3 @@
-mod adapters;
 mod event_store;
 mod order_events;
 mod domain;
@@ -17,10 +16,11 @@ mod sessions;
 mod oidc;
 mod auth_api;
 
-use crate::adapters::BrokerRegistry;
+use gateway::adapter::BrokerRegistry;
 use crate::app_state::AppState;
 use crate::credentials::{CredentialState, FeedCredentials};
-use crate::reload::{RegistrationDeps, RegistrationOutput};
+use gateway::connectors::RegistrationDeps;
+use crate::reload::RegistrationOutput;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit, BlotterRow};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
@@ -59,12 +59,6 @@ mod event_bus;
 mod kafka_outbox;
 mod live_updates;
 mod order_engine;
-mod connectors;
-mod alpaca_stream;
-mod binance_stream;
-mod bybit_stream;
-mod coinbase_stream;
-mod okx_stream;
 
 mod venues;
 mod marks;
@@ -74,10 +68,6 @@ mod opra_stream;
 mod quote_feed;
 mod mark_router;
 mod daily_stats_poller;
-mod binance_feed;
-mod bybit_feed;
-mod coinbase_feed;
-mod okx_feed;
 mod feeds;
 mod preflight;
 mod config;
@@ -86,7 +76,6 @@ mod credentials;
 mod credentials_api;
 mod expiry;
 mod jobs;
-mod fix;
 mod reload;
 mod cockpit;
 #[cfg(test)]
@@ -1289,7 +1278,7 @@ async fn serve() {
     // order-lane subscription to learn when positions change. Not registered in
     // `StreamRegistry`: no credential can change under it, so a reload has
     // nothing to restart; it runs for the life of the process.
-    for connector in connectors::all() {
+    for connector in gateway::connectors::all() {
         if let Some(feed) = connector.public_feed() {
             let health = state.stream_health().handle(connector.manifest().code, "SPOT", gateway::stream_health::StreamKind::Feed);
             let session = quote_feed::QuoteFeedSession::new(

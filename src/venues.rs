@@ -2,98 +2,14 @@
 //! set one up: a plain name, what it trades, what PAPER means there, where to
 //! get the keys, and the credential fields.
 //!
-//! Each venue is described by its connector (`crate::connectors`); this module
-//! holds the shapes and assembles the list the cockpit's dropdown and
+//! Each venue is described by its connector (`gateway::connectors`, shapes in
+//! `gateway::venue`); this module assembles the list the cockpit's dropdown and
 //! credentials form are built from (`GET /admin/venues`). The tests below hold
 //! that list to `known_broker_codes` and to each venue's credential fields.
 //! What each field means and where to get it is on the venue's docs page
 //! (`docs_url`), not here: the form looks the same for every venue.
 
-use serde::Serialize;
-
-pub(crate) const DOCS: &str = "https://maxkuttner.github.io/openoms/integrations";
-
-/// The section a venue's FIX session settings go in, after the credentials.
-pub(crate) const FIX_SESSION: &str = "FIX session";
-
-#[derive(Serialize)]
-pub struct Venue {
-    /// The `broker_connection.broker_code`.
-    pub code: &'static str,
-    pub name: &'static str,
-    /// What it trades, in a few words.
-    pub description: &'static str,
-    pub docs_url: String,
-    /// What loading its instrument universe brings in, for the cockpit's
-    /// "load now?" prompt; `None` when it has no catalog to load.
-    pub universe: Option<&'static str>,
-    pub environments: Vec<Environment>,
-    /// Credentials first, then any grouped connection settings.
-    pub fields: Vec<CredentialField>,
-}
-
-#[derive(Serialize)]
-pub struct Environment {
-    pub code: &'static str,
-    /// What this environment is at the venue, e.g. "spot testnet".
-    pub label: &'static str,
-    /// Where to get the keys for it, when there is one page for that.
-    pub keys_url: Option<&'static str>,
-}
-
-#[derive(Serialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum Input {
-    Text,
-    Checkbox,
-    Textarea,
-}
-
-#[derive(Serialize)]
-pub struct CredentialField {
-    pub name: &'static str,
-    pub label: &'static str,
-    pub secret: bool,
-    pub input: Input,
-    /// Connection settings are grouped under a section name; the key and
-    /// secret are not.
-    pub section: Option<&'static str>,
-    /// Pre-filled for a PAPER / LIVE connection: values that are the same for
-    /// everyone, such as a testnet host. Never a secret.
-    pub paper: Option<&'static str>,
-    pub live: Option<&'static str>,
-}
-
-pub(crate) fn field(name: &'static str, label: &'static str) -> CredentialField {
-    CredentialField { name, label, secret: false, input: Input::Text, section: None, paper: None, live: None }
-}
-
-impl CredentialField {
-    pub(crate) fn secret(mut self) -> Self {
-        self.secret = true;
-        self
-    }
-    pub(crate) fn input(mut self, input: Input) -> Self {
-        self.input = input;
-        self
-    }
-    pub(crate) fn fix(mut self) -> Self {
-        self.section = Some(FIX_SESSION);
-        self
-    }
-    pub(crate) fn prefill(mut self, paper: &'static str, live: &'static str) -> Self {
-        self.paper = Some(paper);
-        self.live = Some(live);
-        self
-    }
-}
-
-pub(crate) fn environments(paper: &'static str, paper_keys: Option<&'static str>, live_keys: Option<&'static str>) -> Vec<Environment> {
-    vec![
-        Environment { code: "PAPER", label: paper, keys_url: paper_keys },
-        Environment { code: "LIVE", label: "live account", keys_url: live_keys },
-    ]
-}
+use gateway::venue::Venue;
 
 /// Whether a broker connection for `broker_code` may run in `environment` —
 /// only the environments its venue offers (Coinbase: LIVE only, so a "PAPER"
@@ -106,12 +22,13 @@ pub fn environment_allowed(broker_code: &str, environment: &str) -> bool {
 }
 
 pub fn venues() -> Vec<Venue> {
-    crate::connectors::all().iter().map(|c| (c.manifest().venue)()).collect()
+    gateway::connectors::all().iter().map(|c| (c.manifest().venue)()).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gateway::venue::Input;
     use crate::credentials::redacted_fields;
     use crate::credentials_api::{parse_broker, CredentialSubmission};
     use std::collections::{BTreeSet, HashMap};

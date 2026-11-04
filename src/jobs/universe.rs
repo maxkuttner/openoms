@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::{create, CreateError, JobHandle, JobKind};
 #[cfg(test)]
 use super::{get, JobStatus};
-use crate::adapters::InstrumentProvider;
+use gateway::adapter::InstrumentProvider;
 use crate::setup::brokers::{self, Broker, LoadOptions, LoadProgress};
 
 /// Cockpit and boot loads: base instruments only, no OpenFIGI enrichment (that
@@ -184,7 +184,7 @@ impl LoadProgress for ChannelProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::{BrokerError, BrokerInstrument, InstrumentProvider};
+    use gateway::adapter::{BrokerError, BrokerInstrument, InstrumentProvider};
     use crate::setup::brokers::{Broker, LoadOptions};
     use dataprovider::InstrumentDef;
 

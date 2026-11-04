@@ -16,9 +16,10 @@ use dataprovider::{Enricher, InstrumentDef, OpenFigiEnricher};
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::{info, warn};
 
-use crate::adapters::{BrokerInstrument, InstrumentProvider};
-use crate::connectors::Connector;
-use crate::credentials::{BrokerCredentials, Connection, CredentialState};
+use gateway::adapter::{BrokerInstrument, InstrumentProvider};
+use gateway::connectors::Connector;
+use gateway::credentials::BrokerCredentials;
+use crate::credentials::{Connection, CredentialState};
 use crate::setup::catalog;
 
 const BATCH: usize = 4000;
@@ -62,7 +63,7 @@ impl ValueEnum for Broker {
 impl Broker {
     /// Every broker the app can sync — the set boot-time auto-sync iterates.
     pub fn all() -> Vec<Broker> {
-        crate::connectors::all().iter().filter(|c| c.manifest().universe).map(|c| Broker(*c)).collect()
+        gateway::connectors::all().iter().filter(|c| c.manifest().universe).map(|c| Broker(*c)).collect()
     }
 
     /// What `sync-broker` syncs when no `--broker` is given: the first universe
@@ -124,7 +125,7 @@ pub fn brokers_with_creds(connections: &[Connection<BrokerCredentials>]) -> Vec<
 /// per connector. The single source callers validate a
 /// `broker_connection.broker_code` write against (`admin::validate_broker_code`).
 pub fn known_broker_codes() -> Vec<&'static str> {
-    crate::connectors::all().iter().map(|c| c.manifest().code).collect()
+    gateway::connectors::all().iter().map(|c| c.manifest().code).collect()
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -499,7 +500,7 @@ mod tests {
     }
 
     fn alpaca_cred() -> BrokerCredentials {
-        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "k".into(), secret: "s".into() })
+        BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "k".into(), secret: "s".into() })
     }
 
     /// `has_creds` must key off the connection code, not just "is anything
@@ -573,7 +574,7 @@ mod tests {
         async fn list_instruments(
             &self,
             _option_underlyings: &[String],
-        ) -> Result<Vec<BrokerInstrument>, crate::adapters::BrokerError> {
+        ) -> Result<Vec<BrokerInstrument>, gateway::adapter::BrokerError> {
             Ok(self.0.iter().map(|(sym, venue)| fake(sym, venue)).collect())
         }
     }

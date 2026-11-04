@@ -19,7 +19,7 @@ pub fn all() -> Vec<&'static dyn FeedSymbology> {
     // Symbology only — this never runs a session, so the key is a placeholder.
     static OPRA: crate::opra_stream::DatabentoOpraFeed = crate::opra_stream::DatabentoOpraFeed::new(String::new());
     std::iter::once(&OPRA as &'static dyn FeedSymbology)
-        .chain(crate::connectors::all().iter().filter_map(|c| c.public_feed()).map(|f| f.symbology))
+        .chain(gateway::connectors::all().iter().filter_map(|c| c.public_feed()).map(|f| f.symbology))
         .collect()
 }
 
@@ -34,7 +34,7 @@ mod tests {
     #[test]
     fn public_feeds_are_the_four_crypto_venues() {
         let mut codes: Vec<&str> =
-            crate::connectors::all().iter().filter(|c| c.public_feed().is_some()).map(|c| c.manifest().code).collect();
+            gateway::connectors::all().iter().filter(|c| c.public_feed().is_some()).map(|c| c.manifest().code).collect();
         codes.sort_unstable();
         assert_eq!(codes, ["BINANCE", "BYBIT", "COINBASE", "OKX"]);
         for code in ["DATABENTO", "BINANCE", "BYBIT", "COINBASE", "OKX"] {

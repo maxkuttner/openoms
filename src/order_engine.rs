@@ -183,7 +183,7 @@ pub async fn apply_exec(pool: &PgPool, bus: &EventBus, ev: &ExecEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::BrokerAdapter;
+    use gateway::adapter::BrokerAdapter;
     use gateway::contract::{BrokerOrderOutcome, BrokerOrderState, ExecSource};
 
     fn ev(kind: ExecKind) -> ExecEvent {
@@ -251,31 +251,6 @@ mod tests {
         assert!((fill(&reports[0]).0 - 0.3).abs() < 1e-9);
     }
 
-    /// The phase 4 boundary: connectors report, the engine books. A connector
-    /// that reaches for the database, the bus or Kafka again fails here.
-    #[test]
-    fn connectors_do_not_touch_the_database() {
-        let connectors = [
-            ("alpaca_stream.rs", include_str!("alpaca_stream.rs")),
-            ("binance_stream.rs", include_str!("binance_stream.rs")),
-            ("bybit_stream.rs", include_str!("bybit_stream.rs")),
-            ("coinbase_stream.rs", include_str!("coinbase_stream.rs")),
-            ("okx_stream.rs", include_str!("okx_stream.rs")),
-            ("fix/adapter.rs", include_str!("fix/adapter.rs")),
-            ("fix/app.rs", include_str!("fix/app.rs")),
-            ("fix/binance.rs", include_str!("fix/binance.rs")),
-            ("fix/dialect.rs", include_str!("fix/dialect.rs")),
-            ("fix/ibkr.rs", include_str!("fix/ibkr.rs")),
-            ("fix/mod.rs", include_str!("fix/mod.rs")),
-        ];
-        let forbidden = ["PgPool", "sqlx::", "KafkaClient", "process_execution_report", "apply_broker_", "EventBus"];
-        for (file, source) in connectors {
-            for word in forbidden {
-                assert!(!source.contains(word), "{file} mentions {word}: connectors send events to the order engine");
-            }
-        }
-    }
-
     #[test]
     fn needs_booked_state_only_for_cumulative_and_terminal() {
         let st = BrokerOrderState { outcome: BrokerOrderOutcome::Filled, executed_qty: 1.0, avg_px: 1.0 };
@@ -297,14 +272,14 @@ mod tests {
     impl BrokerAdapter for SlowBroker {
         async fn submit_order(
             &self,
-            _: &crate::adapters::BrokerOrderRequest,
-        ) -> Result<crate::adapters::BrokerOrderResponse, crate::adapters::BrokerError> {
+            _: &gateway::adapter::BrokerOrderRequest,
+        ) -> Result<gateway::adapter::BrokerOrderResponse, gateway::adapter::BrokerError> {
             unreachable!("recon never submits")
         }
-        async fn cancel_order(&self, _: &str, _: &str) -> Result<(), crate::adapters::BrokerError> {
+        async fn cancel_order(&self, _: &str, _: &str) -> Result<(), gateway::adapter::BrokerError> {
             unreachable!("recon never cancels")
         }
-        async fn open_orders(&self) -> Result<Vec<gateway::contract::BrokerOpenOrder>, crate::adapters::BrokerError> {
+        async fn open_orders(&self) -> Result<Vec<gateway::contract::BrokerOpenOrder>, gateway::adapter::BrokerError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.release.notified().await;
             Ok(Vec::new())

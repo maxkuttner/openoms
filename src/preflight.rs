@@ -342,12 +342,12 @@ mod tests {
     #[test]
     fn open_venue_filter_covers_another_venues_listing() {
         let held = row("BTCUSDT", "SPOT", "CRYPTO", "BINANCE");
-        assert!(covers(&crate::bybit_feed::BybitFeed, &held));
-        assert!(covers(&crate::binance_feed::BinanceFeed, &held));
+        assert!(covers(&gateway::connectors::bybit::feed::BybitFeed, &held));
+        assert!(covers(&gateway::connectors::binance::feed::BinanceFeed, &held));
 
         let elsewhere = row("BTCUSDT", "SPOT", "CRYPTO", "XNAS");
-        assert!(covers(&crate::bybit_feed::BybitFeed, &elsewhere));
-        assert!(!covers(&crate::binance_feed::BinanceFeed, &elsewhere));
+        assert!(covers(&gateway::connectors::bybit::feed::BybitFeed, &elsewhere));
+        assert!(!covers(&gateway::connectors::binance::feed::BinanceFeed, &elsewhere));
     }
 
     /// A symbol inside `candidates` that the symbology still declines is not

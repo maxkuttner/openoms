@@ -1,0 +1,225 @@
+//! Binance Spot user-data stream over the WebSocket API — real-time
+//! `executionReport` push, mirroring the Alpaca stream (no polling).
+//!
+//! Binance retired the REST `listenKey` stream; the current mechanism is:
+//! connect the WS API, `session.logon` with an Ed25519 signature, then
+//! `userDataStream.subscribe`. Events arrive wrapped as
+//! `{"subscriptionId":N,"event":{"e":"executionReport",...}}`. A `TRADE`
+//! execution fires per fill (including partials), so fills reflect immediately
+//! and incrementally, as execution events to the order engine.
+
+use std::sync::Arc;
+
+use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use tokio::time::Duration;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use crate::connectors::binance::adapter::BinanceAdapter;
+use crate::contract::VenueReport;
+use crate::contract::{EngineHandle, ExecEvent};
+use crate::stream_health::StreamHandle;
+use crate::stream_supervisor::{supervise, Session, StreamResult};
+
+const VENUE: &str = "BINANCE";
+
+/// How often to ping the socket and sweep for missed terminal reports. A stalled
+/// user-data subscription (fills stop arriving without a Close frame) is otherwise
+/// invisible; the ping surfaces a dead socket and the sweep recovers the fill.
+const HEARTBEAT_SECS: u64 = 30;
+
+struct BinanceSession {
+    adapter: Arc<BinanceAdapter>,
+    health: StreamHandle,
+    engine: EngineHandle,
+}
+
+#[async_trait::async_trait]
+impl Session for BinanceSession {
+    async fn run_once(&mut self) -> StreamResult {
+        connect_and_run(&self.adapter, &self.health, &self.engine)
+        .await
+    }
+}
+
+/// Credentials are not taken here: the adapter already holds them (it signs with
+/// an Ed25519 key loaded at construction), which is why the old `_api_key` /
+/// `_api_secret` parameters were unused.
+pub async fn run(
+    environment: &'static str,
+    adapter: Arc<BinanceAdapter>,
+    health: StreamHandle,
+    engine: EngineHandle,
+) {
+    info!(env = environment, "starting Binance user-data stream");
+    // The catch-up sweep runs on every (re)connect from the subscribe-success path in
+    // connect_and_run, so it covers the initial catch-up too — no separate call here.
+
+    let session = BinanceSession {
+        adapter,
+        health: health.clone(),
+        engine,
+    };
+    let name: &'static str = if environment == "LIVE" { "BINANCE/LIVE" } else { "BINANCE/PAPER" };
+    supervise(name, health, session).await
+}
+
+async fn connect_and_run(
+    adapter: &Arc<BinanceAdapter>,
+    health: &StreamHandle,
+    engine: &EngineHandle,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (mut ws, _) = connect_async(adapter.ws_url()).await?;
+    info!("Binance WS-API connected");
+
+    // session.logon — Ed25519 signature over the alphabetically-sorted params.
+    let ts = Utc::now().timestamp_millis();
+    let payload = format!("apiKey={}&timestamp={}", adapter.api_key(), ts);
+    let logon = serde_json::json!({
+        "id": "logon",
+        "method": "session.logon",
+        "params": { "apiKey": adapter.api_key(), "timestamp": ts, "signature": adapter.sign(&payload) }
+    });
+    ws.send(Message::Text(logon.to_string())).await?;
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    heartbeat.tick().await; // consume the immediate first tick
+
+    loop {
+        let text = tokio::select! {
+            // Periodic liveness probe + catch-up sweep for missed terminal reports.
+            _ = heartbeat.tick() => {
+                ws.send(Message::Ping(Vec::new())).await?;
+                engine.reconcile(VENUE, "binance", adapter.clone()).await;
+                continue;
+            }
+            msg = ws.next() => {
+                let Some(msg) = msg else { break };
+                health.record_event();
+                match msg? {
+                    Message::Text(t) => t,
+                    Message::Binary(b) => match String::from_utf8(b) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    },
+                    Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
+                    Message::Close(_) => break,
+                    _ => continue,
+                }
+            }
+        };
+
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => { warn!(error = %e, raw = %text, "Binance WS: parse failed"); continue; }
+        };
+
+        // Pushed user-data event: {"subscriptionId":N,"event":{...}}
+        if v.get("event").is_some() {
+            if v["event"]["e"].as_str() == Some("executionReport") {
+                if let Err(e) = handle_execution_report(&v["event"], engine).await {
+                    error!(error = %e, "Binance WS: error processing executionReport");
+                }
+            }
+            continue;
+        }
+
+        // Otherwise it's a request response, keyed by our id.
+        match v["id"].as_str() {
+            Some("logon") => {
+                if v["status"].as_i64() == Some(200) {
+                    info!("Binance WS-API session authenticated");
+                    let sub = serde_json::json!({ "id": "sub", "method": "userDataStream.subscribe" });
+                    ws.send(Message::Text(sub.to_string())).await?;
+                } else {
+                    return Err(format!("session.logon failed: {}", v).into());
+                }
+            }
+            Some("sub") => {
+                if v["status"].as_i64() == Some(200) {
+                    info!("Binance WS-API subscribed to user-data stream");
+                    health.set_live();
+                    // Snapshot-on-(re)connect: diff the broker's open orders against
+                    // the OMS working set now that the live stream is up, so anything
+                    // that resolved during the outage is healed immediately.
+                    engine.reconcile(VENUE, "binance", adapter.clone()).await;
+                } else {
+                    return Err(format!("userDataStream.subscribe failed: {}", v).into());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+async fn handle_execution_report(
+    event: &serde_json::Value,
+    engine: &EngineHandle,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let exec_type = event["x"].as_str().unwrap_or("");
+    // On a cancel, Binance puts the cancel-request's id in `c` and the original
+    // order's client id in `C`; for fills the order id is in `c`. Prefer `C`.
+    let client_order_id = match event["C"].as_str() {
+        Some(c) if !c.is_empty() => c,
+        _ => event["c"].as_str().unwrap_or(""),
+    };
+
+    let report = match exec_type {
+        "TRADE" => {
+            // Per-fill event (incl. partials): l/L are the last executed qty/price.
+            let fill_qty: f64 = event["l"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let fill_price: f64 = event["L"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let execution_id = event["t"]
+                .as_i64()
+                .map(|t| t.to_string())
+                .or_else(|| event["i"].as_i64().map(|i| i.to_string()))
+                .unwrap_or_else(|| client_order_id.to_string());
+            VenueReport::Fill { execution_id, fill_qty, fill_price, venue: VENUE.to_string() }
+        }
+        "CANCELED" => VenueReport::Canceled { reason: None, venue: Some(VENUE.to_string()) },
+        "REJECTED" | "EXPIRED" => VenueReport::Reject {
+            reason: event["X"].as_str().unwrap_or(exec_type).to_string(),
+            venue: Some(VENUE.to_string()),
+        },
+        // NEW / REPLACED / … — no OMS state change.
+        _ => return Ok(()),
+    };
+
+    let order_id = match Uuid::parse_str(client_order_id) {
+        Ok(id) => id,
+        Err(_) => {
+            warn!(client_order_id, "Binance WS: client id is not a UUID, skipping");
+            return Ok(());
+        }
+    };
+
+    engine.exec(ExecEvent::from_report(order_id, VENUE, "binance", report)).await;
+    Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contract::{EngineHandle, ExecKind, GatewayMsg};
+
+    #[tokio::test]
+    async fn binance_trade_frame_becomes_fill_event() {
+        let order_id = Uuid::new_v4();
+        let event = serde_json::json!({
+            "e": "executionReport", "x": "TRADE", "c": order_id.to_string(),
+            "l": "0.5", "L": "64000.1", "t": 77,
+        });
+        let (engine, mut rx) = EngineHandle::new();
+
+        handle_execution_report(&event, &engine).await.unwrap();
+
+        let Some(GatewayMsg::Exec(ev)) = rx.try_recv().ok() else { panic!("an exec event") };
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.venue, "BINANCE");
+        assert_eq!(ev.kind, ExecKind::Fill { execution_id: "77".into(), qty: 0.5, price: 64000.1 });
+    }
+}

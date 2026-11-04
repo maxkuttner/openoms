@@ -6,7 +6,7 @@ use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::adapters::BrokerRegistry;
+use gateway::adapter::BrokerRegistry;
 use crate::event_bus::EventBus;
 use gateway::contract::EngineHandle;
 use crate::marks::MarkStore;
@@ -205,7 +205,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::alpaca::AlpacaAdapter;
+    use gateway::connectors::alpaca::adapter::AlpacaAdapter;
 
     /// `PgPool::connect_lazy` builds a pool without ever connecting, so `AppState`
     /// can be constructed in a unit test without a real database.

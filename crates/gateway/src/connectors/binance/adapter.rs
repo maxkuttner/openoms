@@ -1,0 +1,432 @@
+//! Binance Spot broker adapter (testnet by default).
+//!
+//! Auth: an API key sent as the `X-MBX-APIKEY` header, plus an HMAC-SHA256
+//! `signature` over the exact query string (signed with the secret) on SIGNED
+//! endpoints. Every SIGNED request carries a `timestamp` (ms). Order/cancel/
+//! account are all SIGNED.
+//!
+//! Symbol mapping: the OMS instrument's broker xref stores the Binance pair
+//! (e.g. `BTCUSDT`) as `external_symbol` — used verbatim as the order `symbol` —
+//! and the base asset (e.g. `BTC`) as `external_native_id`, which is what account
+//! balances report and reconciliation matches on.
+
+use base64::Engine;
+use dataprovider::{Identifiers, InstrumentDef};
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::{Signer, SigningKey};
+use reqwest::{Client, Method};
+use tracing::info;
+
+use crate::adapter::{
+    BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest,
+    BrokerOrderResponse, InstrumentProvider,
+};
+use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+
+/// Read a Binance symbol filter's numeric field (e.g. LOT_SIZE.stepSize).
+fn filter_val(filters: &[serde_json::Value], filter_type: &str, field: &str) -> Option<f64> {
+    filters
+        .iter()
+        .find(|f| f["filterType"].as_str() == Some(filter_type))
+        .and_then(|f| f[field].as_str())
+        .and_then(|s| s.parse().ok())
+}
+
+/// Percent-encode the non-unreserved characters of a base64 string (`+`, `/`, `=`)
+/// so an Ed25519 signature is safe inside a URL query string.
+fn pct_encode(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '+' => "%2B".to_string(),
+            '/' => "%2F".to_string(),
+            '=' => "%3D".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// A Binance Ed25519 API key, plus the FIX session it uses when the transport is FIX
+/// (REST ignores the session fields).
+/// Stored as `{"kind":"BinanceFix", …}` (see [`crate::credentials::BrokerCredentials`]).
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct BinanceCredentials {
+    pub host: String,
+    pub port: u16,
+    pub sender_comp_id: String,
+    pub target_comp_id: String,
+    pub api_key: String,
+    /// PEM contents, not a path. A filesystem path is precisely what stops a
+    /// credential being configurable from anywhere but the server's shell.
+    pub private_key: String,
+}
+
+impl BinanceCredentials {
+    pub const KIND: &'static str = "BinanceFix";
+}
+
+#[derive(Clone)]
+pub struct BinanceAdapter {
+    client: Client,
+    api_key: String,
+    signing_key: SigningKey,
+    base_url: &'static str,
+    ws_url: &'static str,
+}
+
+impl BinanceAdapter {
+    /// `private_key_pem` is the Ed25519 private key (PKCS#8 PEM) whose public key
+    /// is registered on Binance for `api_key`.
+    pub fn new(api_key: String, private_key_pem: &str, environment: &str) -> Result<Self, String> {
+        let (base_url, ws_url) = if environment == "LIVE" {
+            ("https://api.binance.com", "wss://ws-api.binance.com:443/ws-api/v3")
+        } else {
+            ("https://testnet.binance.vision", "wss://ws-api.testnet.binance.vision/ws-api/v3")
+        };
+        let signing_key = SigningKey::from_pkcs8_pem(private_key_pem)
+            .map_err(|e| format!("invalid Ed25519 private key PEM: {e}"))?;
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        Ok(Self { client, api_key, signing_key, base_url, ws_url })
+    }
+
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    pub fn ws_url(&self) -> &'static str {
+        self.ws_url
+    }
+
+    /// Ed25519-sign a payload, base64-encoded — used for REST `signature` and the
+    /// WS-API `session.logon` signature.
+    pub fn sign(&self, payload: &str) -> String {
+        let sig = self.signing_key.sign(payload.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+    }
+
+    /// Send a SIGNED request: append `timestamp`, sign the query, append the
+    /// signature, attach the API-key header. Params values here (symbols, numeric
+    /// quantities, UUID client ids) contain no characters needing URL-encoding.
+    async fn signed(
+        &self,
+        method: Method,
+        endpoint: &str,
+        params: &[(&str, String)],
+    ) -> Result<reqwest::Response, BrokerError> {
+        let ts = chrono::Utc::now().timestamp_millis();
+        let mut query: String = params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        if !query.is_empty() {
+            query.push('&');
+        }
+        query.push_str(&format!("timestamp={ts}"));
+        // The base64 Ed25519 signature can contain +, /, = — percent-encode it so
+        // it survives the query string intact.
+        let signature = pct_encode(&self.sign(&query));
+        let url = format!("{}{}?{}&signature={}", self.base_url, endpoint, query, signature);
+
+        self.client
+            .request(method, &url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))
+    }
+
+    /// GET /api/v3/exchangeInfo — the full spot catalog as canonical instrument
+    /// records + routing handles. Public (unsigned). Binance is the source of the
+    /// master crypto instrument: the pair is the Symbol@Venue symbol, venue =
+    /// BINANCE, currency = the quote asset, and the base asset is the routing native
+    /// id (what account balances / recon match on). Only `TRADING` spot pairs.
+    pub async fn list_spot_instruments(&self) -> Result<Vec<BrokerInstrument>, BrokerError> {
+        let url = format!("{}/api/v3/exchangeInfo", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value =
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        let symbols = body["symbols"].as_array().cloned().unwrap_or_default();
+        Ok(symbols
+            .iter()
+            .filter_map(|s| {
+                let pair = s["symbol"].as_str()?.to_string();
+                let base = s["baseAsset"].as_str()?.to_string();
+                let quote = s["quoteAsset"].as_str()?.to_string();
+                let is_spot = s["isSpotTradingAllowed"].as_bool().unwrap_or(true);
+                if !is_spot {
+                    return None;
+                }
+                let filters: Vec<serde_json::Value> =
+                    s["filters"].as_array().cloned().unwrap_or_default();
+                let definition = InstrumentDef {
+                    symbol: pair.clone(),
+                    venue: "BINANCE".to_string(),
+                    currency: quote,
+                    asset_class: "CRYPTO".to_string(),
+                    instrument_class: "SPOT".to_string(),
+                    name: None,
+                    price_precision: s["quoteAssetPrecision"].as_i64().unwrap_or(8) as i32,
+                    price_increment: filter_val(&filters, "PRICE_FILTER", "tickSize").unwrap_or(0.0),
+                    size_increment: filter_val(&filters, "LOT_SIZE", "stepSize").unwrap_or(0.0),
+                    lot_size: None,
+                    contract_size: 1.0,
+                    native_id: Some(base), // base asset — what recon matches balances on
+                    provider_exchange: Some("BINANCE".to_string()),
+                    derivative: None,
+                    identifiers: Identifiers::default(),
+                };
+                Some(BrokerInstrument {
+                    broker_symbol: pair,
+                    broker_exchange: Some("BINANCE".to_string()),
+                    is_tradeable: s["status"].as_str() == Some("TRADING"),
+                    min_quantity: filter_val(&filters, "LOT_SIZE", "minQty"),
+                    max_quantity: filter_val(&filters, "LOT_SIZE", "maxQty"),
+                    min_notional: filter_val(&filters, "NOTIONAL", "minNotional")
+                        .or_else(|| filter_val(&filters, "MIN_NOTIONAL", "minNotional")),
+                    max_notional: None,
+                    definition,
+                })
+            })
+            .collect())
+    }
+
+    /// GET /api/v3/order — fetch one order's state (for startup reconciliation of
+    /// routed orders). Needs the symbol alongside the order id.
+    pub async fn get_order(
+        &self,
+        symbol: &str,
+        external_order_id: &str,
+    ) -> Result<serde_json::Value, BrokerError> {
+        let params = [
+            ("symbol", symbol.to_string()),
+            ("orderId", external_order_id.to_string()),
+        ];
+        let resp = self.signed(Method::GET, "/api/v3/order", &params).await?;
+        if resp.status().is_success() {
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))
+        } else {
+            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BrokerAdapter for BinanceAdapter {
+    async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        let side = req.side.to_uppercase(); // "buy"/"sell" -> BUY/SELL
+        let mut params: Vec<(&str, String)> = vec![
+            ("symbol", req.symbol.clone()), // the Binance pair, e.g. BTCUSDT
+            ("side", side),
+            ("newClientOrderId", req.order_id.clone()), // our UUID, echoed on fills
+            ("quantity", req.quantity.to_string()),
+        ];
+
+        match req.order_type.as_str() {
+            "market" => params.push(("type", "MARKET".to_string())),
+            "limit" => {
+                let price = req
+                    .limit_price
+                    .ok_or_else(|| BrokerError::BrokerRejected("limit order missing limit_price".into()))?;
+                // Day is meaningless on a 24/7 venue — treat as GTC.
+                let tif = match req.time_in_force.to_uppercase().as_str() {
+                    "IOC" => "IOC",
+                    "FOK" => "FOK",
+                    _ => "GTC",
+                };
+                params.push(("type", "LIMIT".to_string()));
+                params.push(("timeInForce", tif.to_string()));
+                params.push(("price", price.to_string()));
+            }
+            other => return Err(BrokerError::NotConfigured(format!("unsupported order type: {other}"))),
+        }
+
+        info!(symbol = %req.symbol, side = %req.side, "submitting order to Binance");
+
+        let resp = self.signed(Method::POST, "/api/v3/order", &params).await?;
+        if resp.status().is_success() {
+            let body: serde_json::Value =
+                resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+            // Binance returns orderId as a JSON number.
+            let external_order_id = body["orderId"]
+                .as_i64()
+                .map(|id| id.to_string())
+                .or_else(|| body["orderId"].as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            Ok(BrokerOrderResponse { external_order_id })
+        } else {
+            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+        }
+    }
+
+    async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError> {
+        // Binance requires the symbol to cancel a specific order.
+        let params = [
+            ("symbol", symbol.to_string()),
+            ("orderId", external_order_id.to_string()),
+        ];
+        let resp = self.signed(Method::DELETE, "/api/v3/order", &params).await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+        }
+    }
+
+    /// GET /api/v3/openOrders — every currently-open order across all symbols in one
+    /// signed call (the snapshot side of order reconciliation).
+    async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+        let resp = self.signed(Method::GET, "/api/v3/openOrders", &[]).await?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value =
+            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        let orders = body.as_array().cloned().unwrap_or_default();
+        Ok(orders
+            .iter()
+            .filter_map(|o| {
+                let client_order_id = o["clientOrderId"].as_str()?.to_string();
+                let symbol = o["symbol"].as_str()?.to_string();
+                let (executed_qty, _) = exec_stats(o);
+                Some(BrokerOpenOrder { client_order_id, symbol, executed_qty })
+            })
+            .collect())
+    }
+
+    /// One order's current state via GET /api/v3/order, normalized to a
+    /// [`BrokerOrderState`] for the reconcile shell.
+    async fn order_status(
+        &self,
+        _client_order_id: &str,
+        external_order_id: &str,
+        symbol: &str,
+    ) -> Result<BrokerOrderState, BrokerError> {
+        let order = self.get_order(symbol, external_order_id).await?;
+        let (executed_qty, avg_px) = exec_stats(&order);
+        let outcome = match order["status"].as_str().unwrap_or("") {
+            "FILLED" => BrokerOrderOutcome::Filled,
+            "CANCELED" => BrokerOrderOutcome::Canceled,
+            "REJECTED" | "EXPIRED" => BrokerOrderOutcome::Rejected,
+            _ => BrokerOrderOutcome::Working, // NEW / PARTIALLY_FILLED — still live
+        };
+        Ok(BrokerOrderState { outcome, executed_qty, avg_px })
+    }
+
+    async fn daily_stats(&self, symbols: &[String]) -> Result<Vec<(String, f64)>, BrokerError> {
+        if symbols.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Public endpoint — no signing needed, same as exchangeInfo.
+        let symbols_json = serde_json::to_string(symbols).unwrap_or_default();
+        // Inline URL-encoding fallback: replace JSON special chars for URL safety.
+        let encoded_json = symbols_json
+            .replace('"', "%22")
+            .replace(',', "%2C")
+            .replace('[', "%5B")
+            .replace(']', "%5D");
+        let url = format!(
+            "{}/api/v3/ticker/24hr?symbols={}",
+            self.base_url,
+            encoded_json
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(format!(
+                "24hr ticker request failed: {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_binance_24hr_stats(&body))
+    }
+}
+
+/// Parse `(executed_qty, avg_px)` from a Binance order JSON. `avg_px` is the executed
+/// volume-weighted price (`cummulativeQuoteQty / executedQty`), 0 when nothing filled.
+fn exec_stats(order: &serde_json::Value) -> (f64, f64) {
+    let executed_qty: f64 =
+        order["executedQty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let quote: f64 =
+        order["cummulativeQuoteQty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let avg_px = if executed_qty > 0.0 { quote / executed_qty } else { 0.0 };
+    (executed_qty, avg_px)
+}
+
+/// `GET /api/v3/ticker/24hr?symbols=[...]` returns an array; `prevClosePrice`
+/// is a string (Binance quotes all prices as strings to avoid float
+/// round-tripping ambiguity). An entry whose price doesn't parse is skipped,
+/// never reported as a zero previous close.
+fn parse_binance_24hr_stats(body: &serde_json::Value) -> Vec<(String, f64)> {
+    let Some(entries) = body.as_array() else { return Vec::new() };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let symbol = entry.get("symbol")?.as_str()?.to_string();
+            let price: f64 = entry.get("prevClosePrice")?.as_str()?.parse().ok()?;
+            Some((symbol, price))
+        })
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl InstrumentProvider for BinanceAdapter {
+    /// Binance has no separate option catalog on the spot venue; `option_underlyings`
+    /// is ignored — it always returns the spot pairs.
+    async fn list_instruments(
+        &self,
+        _option_underlyings: &[String],
+    ) -> Result<Vec<BrokerInstrument>, BrokerError> {
+        self.list_spot_instruments().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_binance_24hr_stats;
+
+    #[test]
+    fn parses_prev_close_price_from_24hr_ticker_array() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"[
+                {"symbol": "BTCUSDT", "prevClosePrice": "64000.50"},
+                {"symbol": "ETHUSDT", "prevClosePrice": "3200.10"}
+            ]"#,
+        )
+        .unwrap();
+        let mut stats = parse_binance_24hr_stats(&body);
+        stats.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            stats,
+            vec![("BTCUSDT".to_string(), 64000.50), ("ETHUSDT".to_string(), 3200.10)]
+        );
+    }
+
+    #[test]
+    fn an_entry_with_unparseable_price_is_skipped_not_zeroed() {
+        let body: serde_json::Value = serde_json::from_str(
+            r#"[{"symbol": "BTCUSDT", "prevClosePrice": "64000.50"}, {"symbol": "BROKEN", "prevClosePrice": "not-a-number"}]"#,
+        )
+        .unwrap();
+        let stats = parse_binance_24hr_stats(&body);
+        assert_eq!(stats, vec![("BTCUSDT".to_string(), 64000.50)]);
+    }
+}

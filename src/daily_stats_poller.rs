@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use crate::adapters::BrokerRegistry;
+use gateway::adapter::BrokerRegistry;
 use crate::daily_stats::DailyStatsStore;
 
 const POLL_INTERVAL_SECS: u64 = 300;
@@ -30,7 +30,7 @@ const POLL_INTERVAL_SECS: u64 = 300;
 /// wired for daily stats (IBKR), or one no connector knows, serves nothing
 /// here rather than guessing.
 fn broker_serves_venue(broker_code: &str, venue: &str) -> bool {
-    use crate::connectors::{self, QuoteScope};
+    use gateway::connectors::{self, QuoteScope};
     let own_venue = |code: &str| {
         connectors::by_code(code).is_some_and(|c| c.manifest().quotes == QuoteScope::OwnVenue)
     };
@@ -217,7 +217,7 @@ async fn poll_once(pool: &PgPool, registry: &BrokerRegistry, stats: &DailyStatsS
                     info!(broker_code = %broker_code, environment = %environment, updated, "daily stats: refreshed");
                 }
             }
-            Err(crate::adapters::BrokerError::NotConfigured(_)) => {
+            Err(gateway::adapter::BrokerError::NotConfigured(_)) => {
                 // This adapter doesn't support it. Not an error — most won't.
             }
             Err(e) => {

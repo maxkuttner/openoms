@@ -29,7 +29,7 @@ use sqlx::{PgPool, Row};
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::adapters::{BrokerAdapter, BrokerError};
+use gateway::adapter::{BrokerAdapter, BrokerError};
 use gateway::contract::{BrokerOpenOrder, EngineHandle, ExecEvent, ExecKind, ExecSource};
 
 const EPS: f64 = 1e-9;
@@ -297,8 +297,8 @@ mod tests {
     impl BrokerAdapter for ClosedAtBroker {
         async fn submit_order(
             &self,
-            _: &crate::adapters::BrokerOrderRequest,
-        ) -> Result<crate::adapters::BrokerOrderResponse, BrokerError> {
+            _: &gateway::adapter::BrokerOrderRequest,
+        ) -> Result<gateway::adapter::BrokerOrderResponse, BrokerError> {
             unreachable!()
         }
         async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {

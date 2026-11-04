@@ -10,7 +10,8 @@
 
 use sqlx::PgPool;
 
-use crate::credentials::{save_broker, save_feed, BrokerCredentials, FeedCredentials};
+use gateway::credentials::BrokerCredentials;
+use crate::credentials::{save_broker, save_feed, FeedCredentials};
 use crate::secrets::{self, MasterKey};
 
 fn var(name: &str) -> Option<String> {
@@ -26,7 +27,7 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
         let secret_var = format!("ALPACA_{env_name}_API_SECRET");
         let code = format!("alpaca-{}", env_name.to_lowercase());
         match (var(&key_var), var(&secret_var)) {
-            (Some(key), Some(secret)) => out.push((code, BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key, secret }))),
+            (Some(key), Some(secret)) => out.push((code, BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret }))),
             (Some(_), None) => eprintln!("  skipped {code}: {key_var} is set but {secret_var} is not"),
             (None, Some(_)) => eprintln!("  skipped {code}: {secret_var} is set but {key_var} is not"),
             (None, None) => {}
@@ -36,7 +37,7 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
         if let Some(host) = var(&format!("{p}_FIX_HOST")) {
             out.push((
                 format!("ibkr-{}", env_name.to_lowercase()),
-                BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
+                BrokerCredentials::from_typed("IbkrFix", &gateway::connectors::ibkr::fix::IbkrFixCredentials {
                     host,
                     port: var(&format!("{p}_FIX_PORT")).and_then(|s| s.parse().ok()).unwrap_or(4001),
                     sender_comp_id: var(&format!("{p}_SENDER_COMP_ID")).unwrap_or_else(|| "OMS".into()),
@@ -80,7 +81,7 @@ pub fn scan_env() -> Vec<(String, BrokerCredentials)> {
                         }
                         out.push((
                             code,
-                            BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
+                            BrokerCredentials::from_typed("BinanceFix", &gateway::connectors::binance::adapter::BinanceCredentials {
                                 host: host.unwrap_or_default(),
                                 port: var(&format!("{p}_FIX_PORT")).and_then(|s| s.parse().ok()).unwrap_or(9000),
                                 sender_comp_id: var(&format!("{p}_SENDER_COMP_ID")).unwrap_or_else(|| "OMS".into()),
@@ -410,7 +411,7 @@ mod tests {
         {
             let c = cred;
             assert_eq!(c.kind, "BinanceFix", "wrong kind: {c:?}");
-            let crate::adapters::binance::BinanceCredentials { host, port, sender_comp_id, target_comp_id, api_key, private_key } = c.parse::<crate::adapters::binance::BinanceCredentials>().unwrap();
+            let gateway::connectors::binance::adapter::BinanceCredentials { host, port, sender_comp_id, target_comp_id, api_key, private_key } = c.parse::<gateway::connectors::binance::adapter::BinanceCredentials>().unwrap();
             {
                 assert_eq!(host, "", "no FIX host configured — must default empty, not be refused");
                 assert_eq!(port, 9000);

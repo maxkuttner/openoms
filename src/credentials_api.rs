@@ -8,10 +8,11 @@
 //! of this module that reaches the network.
 
 use std::collections::HashMap;
-use std::time::Duration;
 use serde::Deserialize;
 
-use crate::credentials::{BrokerCredentials, FeedCredentials};
+use gateway::credentials::BrokerCredentials;
+use gateway::verify::{timed_out, TestOutcome, TEST_TIMEOUT};
+use crate::credentials::FeedCredentials;
 
 /// A submitted credential form: field name to raw string value, exactly as
 /// an HTML form or a JSON object would hand it over. Untyped on purpose —
@@ -135,7 +136,7 @@ pub fn parse_broker(
     existing: Option<&BrokerCredentials>,
     sub: &CredentialSubmission,
 ) -> Result<BrokerCredentials, CredentialError> {
-    use crate::connectors::{self, FieldType};
+    use gateway::connectors::{self, FieldType};
     use serde_json::Value;
 
     let connector = connectors::by_code(kind).ok_or_else(|| CredentialError::UnknownKind(kind.to_string()))?;
@@ -184,49 +185,6 @@ pub fn parse_feed(
     }
 }
 
-/// Outcome of attempting to verify a credential before it is saved.
-///
-/// A plain `Result<(), String>` can only say "it worked" or "it didn't" — it
-/// cannot also say "we didn't try", so a FIX credential would have to fake one
-/// of the other two. Faking `Ok(())` is the dishonest "passed" the brief warns
-/// against; faking `Err(_)` would show a real credential as broken before it
-/// is even saved. A third variant is the only way to keep both meanings
-/// distinct for the caller (task 3's `tested` field).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TestOutcome {
-    /// The credential authenticated against the broker.
-    Passed,
-    /// The credential was tested and the broker rejected it (or the attempt
-    /// failed for a network reason). `String` is a message for operators and
-    /// logs — built from the failure, never from the submitted credential.
-    Failed(String),
-    /// Nothing was attempted. Reserved for credentials with no cheap,
-    /// side-effect-free way to test.
-    NotTestable(&'static str),
-}
-
-/// How long a credential test may spend talking to a provider before it is
-/// reported as a failure.
-///
-/// Neither provider client sets a timeout of its own (Alpaca's is a bare
-/// `reqwest::Client::new()`, which has none by default), so without this a
-/// provider that completes the TCP handshake and then goes silent would hold
-/// the admin request open indefinitely — and with it the cockpit's "Test"
-/// button, which has no way to cancel. Ten seconds is far longer than either
-/// check needs against a healthy provider.
-pub(crate) const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The failure reported when a provider stops responding mid-test. Says which
-/// provider and how long was waited, because "test failed" alone would be
-/// indistinguishable from a rejected credential — the operator needs to know
-/// their key was never actually judged.
-pub(crate) fn timed_out(provider: &str) -> TestOutcome {
-    TestOutcome::Failed(format!(
-        "{provider} did not respond within {}s — credential not verified",
-        TEST_TIMEOUT.as_secs()
-    ))
-}
-
 /// Tests a credential the cheap way, where one exists.
 ///
 /// Alpaca gets a real check: `GET /v2/account` is a lightweight, read-only,
@@ -245,7 +203,7 @@ pub(crate) fn timed_out(provider: &str) -> TestOutcome {
 /// rather than test anything). So this deliberately does not attempt one and
 /// says so via `NotTestable`, rather than reporting a pass it did not earn.
 pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOutcome {
-    match crate::connectors::by_credential_kind(&creds.kind) {
+    match gateway::connectors::by_credential_kind(&creds.kind) {
         Some(connector) => connector.verify(environment, creds).await,
         None => TestOutcome::Failed(format!("no connector for credential kind {}", creds.kind)),
     }
@@ -352,7 +310,8 @@ mod tests {
     }
     use super::*;
 
-    use crate::credentials::{BrokerCredentials, FeedCredentials};
+    use gateway::credentials::BrokerCredentials;
+    use crate::credentials::FeedCredentials;
 
     fn sub(pairs: &[(&str, &str)]) -> CredentialSubmission {
         CredentialSubmission {
@@ -364,15 +323,15 @@ mod tests {
     /// every field blank: the stored credential must come back unchanged.
     #[test]
     fn blank_secret_keeps_the_stored_value_for_every_connector() {
-        for c in crate::connectors::all() {
+        for c in gateway::connectors::all() {
             let m = c.manifest();
             let full: Vec<(String, String)> = (m.venue)()
                 .fields
                 .iter()
                 .map(|f| {
                     let v = match m.field_types.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t) {
-                        Some(crate::connectors::FieldType::Port) => "1234".to_string(),
-                        Some(crate::connectors::FieldType::Bool { .. }) => "false".to_string(),
+                        Some(gateway::connectors::FieldType::Port) => "1234".to_string(),
+                        Some(gateway::connectors::FieldType::Bool { .. }) => "false".to_string(),
                         None => format!("v-{}", f.name),
                     };
                     (f.name.to_string(), v)
@@ -407,7 +366,7 @@ mod tests {
     }
 
     fn existing_alpaca() -> BrokerCredentials {
-        BrokerCredentials::from_typed("Alpaca", &crate::adapters::alpaca::AlpacaCredentials { key: "OLDKEY".into(), secret: "OLDSECRET".into() })
+        BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "OLDKEY".into(), secret: "OLDSECRET".into() })
     }
 
     #[test]
@@ -415,7 +374,7 @@ mod tests {
         {
             let c = parse_broker("ALPACA", None, &sub(&[("key", "NEWKEY"), ("secret", "NEWSECRET")])).expect("parse");
             assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
-            let crate::adapters::alpaca::AlpacaCredentials { key, secret } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
+            let gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
             {
                 assert_eq!(key, "NEWKEY");
                 assert_eq!(secret, "NEWSECRET");
@@ -431,7 +390,7 @@ mod tests {
         {
             let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY")])).expect("parse");
             assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
-            let crate::adapters::alpaca::AlpacaCredentials { key, secret } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
+            let gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
             {
                 assert_eq!(key, "NEWKEY");
                 assert_eq!(secret, "OLDSECRET", "the stored secret must survive an omission");
@@ -446,13 +405,13 @@ mod tests {
         {
             let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse");
             assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
-            let crate::adapters::alpaca::AlpacaCredentials { secret, .. } = c.parse::<crate::adapters::alpaca::AlpacaCredentials>().unwrap();
+            let gateway::connectors::alpaca::adapter::AlpacaCredentials { secret, .. } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
             { assert_eq!(secret, "OLDSECRET"); }
         }
     }
 
     fn existing_ibkr() -> BrokerCredentials {
-        BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
+        BrokerCredentials::from_typed("IbkrFix", &gateway::connectors::ibkr::fix::IbkrFixCredentials {
             host: "old.fix.example".into(),
             port: 4101,
             sender_comp_id: "OLDSENDER".into(),
@@ -482,7 +441,7 @@ mod tests {
         .expect("parse")
         {
             c if c.kind == "IbkrFix" => {
-                let crate::fix::ibkr::IbkrFixCredentials { host, .. } = c.parse::<crate::fix::ibkr::IbkrFixCredentials>().unwrap();
+                let gateway::connectors::ibkr::fix::IbkrFixCredentials { host, .. } = c.parse::<gateway::connectors::ibkr::fix::IbkrFixCredentials>().unwrap();
                 assert_eq!(host, "old.fix.example", "an omitted host must carry over from the stored credential");
             }
             other => panic!("wrong variant: {other:?}"),
@@ -507,7 +466,7 @@ mod tests {
         .expect("parse")
         {
             c if c.kind == "IbkrFix" => {
-                let crate::fix::ibkr::IbkrFixCredentials { host, .. } = c.parse::<crate::fix::ibkr::IbkrFixCredentials>().unwrap();
+                let gateway::connectors::ibkr::fix::IbkrFixCredentials { host, .. } = c.parse::<gateway::connectors::ibkr::fix::IbkrFixCredentials>().unwrap();
                 assert_eq!(host, "old.fix.example", "an empty host must be treated as omitted, not as a value");
             }
             other => panic!("wrong variant: {other:?}"),
