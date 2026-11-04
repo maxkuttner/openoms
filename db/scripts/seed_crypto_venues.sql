@@ -13,7 +13,8 @@ SET search_path TO public;
 INSERT INTO venue (code, name, mic, status) VALUES
     ('BINANCE', 'Binance', NULL, 'ACTIVE'),
     ('BYBIT',   'Bybit',   NULL, 'ACTIVE'),
-    ('COINBASE', 'Coinbase', NULL, 'ACTIVE')
+    ('COINBASE', 'Coinbase', NULL, 'ACTIVE'),
+    ('OKX',      'OKX',      NULL, 'ACTIVE')
 ON CONFLICT (code) DO NOTHING;
 
 RESET ROLE;

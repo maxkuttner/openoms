@@ -152,6 +152,7 @@ async fn check_loadable(pool: &PgPool, master: Option<&MasterKey>, code: &str, k
         "BINANCE" => Broker::Binance,
         "BYBIT" => Broker::Bybit,
         "COINBASE" => Broker::Coinbase,
+        "OKX" => Broker::Okx,
         other => return Err(LoadRefusal::Unprocessable(format!("{other} has no instrument universe to load"))),
     };
     // A load always runs with the broker's active connection (ALPACA_ENV /

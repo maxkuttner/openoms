@@ -49,6 +49,12 @@ pub enum BrokerCredentials {
         api_key: String,
         private_key: String,
     },
+    /// An OKX v5 API key: key, secret and the passphrase chosen when creating it.
+    Okx {
+        api_key: String,
+        api_secret: String,
+        passphrase: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -125,6 +131,7 @@ impl Redact for BrokerCredentials {
             ],
             BrokerCredentials::Bybit { .. } => vec![hidden("api_key"), hidden("api_secret")],
             BrokerCredentials::Coinbase { .. } => vec![hidden("api_key"), hidden("private_key")],
+            BrokerCredentials::Okx { .. } => vec![hidden("api_key"), hidden("api_secret"), hidden("passphrase")],
         };
         Redacted { fields }
     }
@@ -442,6 +449,16 @@ mod tests {
         assert!(matches!(back, BrokerCredentials::Coinbase { ref api_key, ref private_key } if api_key == "organizations/o/apiKeys/k" && private_key == "pem"));
         let fields = redacted_fields(&c);
         assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
+    }
+
+    #[test]
+    fn an_okx_credential_round_trips_and_redacts_all_three_fields() {
+        let c = BrokerCredentials::Okx { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() };
+        let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(matches!(back, BrokerCredentials::Okx { ref api_key, ref api_secret, ref passphrase } if api_key == "k" && api_secret == "s" && passphrase == "p"));
+        let fields = redacted_fields(&c);
+        assert_eq!(fields.len(), 3);
         assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
     }
 

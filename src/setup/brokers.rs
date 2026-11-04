@@ -20,6 +20,7 @@ use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::bybit::BybitAdapter;
 use crate::adapters::coinbase::CoinbaseAdapter;
+use crate::adapters::okx::OkxAdapter;
 use crate::adapters::{BrokerInstrument, InstrumentProvider};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::setup::catalog;
@@ -32,11 +33,12 @@ pub enum Broker {
     Binance,
     Bybit,
     Coinbase,
+    Okx,
 }
 
 impl Broker {
     /// Every broker the app can sync — the set boot-time auto-sync iterates.
-    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance, Broker::Bybit, Broker::Coinbase];
+    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance, Broker::Bybit, Broker::Coinbase, Broker::Okx];
 
     pub fn code(self) -> &'static str {
         match self {
@@ -44,6 +46,7 @@ impl Broker {
             Broker::Binance => "BINANCE",
             Broker::Bybit => "BYBIT",
             Broker::Coinbase => "COINBASE",
+            Broker::Okx => "OKX",
         }
     }
 
@@ -57,6 +60,7 @@ impl Broker {
             Broker::Bybit => bybit_env(),
             // Coinbase has no paper trading (its sandbox returns canned responses).
             Broker::Coinbase => "LIVE".to_string(),
+            Broker::Okx => okx_env(),
         }
     }
 
@@ -118,6 +122,10 @@ fn binance_env() -> String {
 
 fn bybit_env() -> String {
     env::var("BYBIT_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
+}
+
+fn okx_env() -> String {
+    env::var("OKX_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -249,6 +257,7 @@ pub async fn provider_for(
         Broker::Binance => Box::new(build_binance(&creds)?),
         Broker::Bybit => Box::new(build_bybit(&creds)?),
         Broker::Coinbase => Box::new(build_coinbase(&creds)?),
+        Broker::Okx => Box::new(build_okx(&creds)?),
     })
 }
 
@@ -420,6 +429,15 @@ fn build_coinbase(creds: &BrokerCredentials) -> Result<CoinbaseAdapter, Box<dyn 
             CoinbaseAdapter::new(api_key.clone(), private_key).map_err(Into::into)
         }
         other => Err(format!("coinbase-* credential is not a Coinbase credential: {other:?}").into()),
+    }
+}
+
+fn build_okx(creds: &BrokerCredentials) -> Result<OkxAdapter, Box<dyn std::error::Error>> {
+    match creds {
+        BrokerCredentials::Okx { api_key, api_secret, passphrase } => {
+            Ok(OkxAdapter::new(api_key.clone(), api_secret.clone(), passphrase.clone(), &okx_env()))
+        }
+        other => Err(format!("okx-* credential is not an OKX credential: {other:?}").into()),
     }
 }
 

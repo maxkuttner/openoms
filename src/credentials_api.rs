@@ -14,6 +14,7 @@ use serde::Deserialize;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::adapters::bybit::BybitAdapter;
 use crate::adapters::coinbase::CoinbaseAdapter;
+use crate::adapters::okx::OkxAdapter;
 use crate::credentials::{BrokerCredentials, FeedCredentials};
 
 /// A submitted credential form: field name to raw string value, exactly as
@@ -196,6 +197,19 @@ pub fn parse_broker(
                 private_key: field(sub, "private_key", existing_pem)?.to_string(),
             })
         }
+        "OKX" => {
+            let existing = match existing {
+                Some(BrokerCredentials::Okx { api_key, api_secret, passphrase }) => {
+                    Some((api_key.as_str(), api_secret.as_str(), passphrase.as_str()))
+                }
+                _ => None,
+            };
+            Ok(BrokerCredentials::Okx {
+                api_key: field(sub, "api_key", existing.map(|e| e.0))?.to_string(),
+                api_secret: field(sub, "api_secret", existing.map(|e| e.1))?.to_string(),
+                passphrase: field(sub, "passphrase", existing.map(|e| e.2))?.to_string(),
+            })
+        }
         other => Err(CredentialError::UnknownKind(other.to_string())),
     }
 }
@@ -318,6 +332,27 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
                 Err(_) => timed_out("Bybit"),
             }
         }
+        BrokerCredentials::Okx { api_key, api_secret, passphrase } => {
+            let adapter = OkxAdapter::new(api_key.clone(), api_secret.clone(), passphrase.clone(), environment);
+            match tokio::time::timeout(TEST_TIMEOUT, adapter.key_permissions()).await {
+                Ok(Ok(perm)) => judge_okx_permissions(&perm),
+                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
+                Err(_) => timed_out("OKX"),
+            }
+        }
+    }
+}
+
+/// An OKX key is fit for the OMS when it can trade and cannot withdraw — the
+/// same rule as Coinbase. `perm` is a comma list such as "read_only,trade".
+pub(crate) fn judge_okx_permissions(perm: &str) -> TestOutcome {
+    let has = |p: &str| perm.split(',').any(|x| x.trim() == p);
+    if has("withdraw") {
+        TestOutcome::Failed("the key can withdraw funds; create one with Read and Trade permissions only".into())
+    } else if !has("trade") {
+        TestOutcome::Failed("the key cannot trade; give it the Trade permission".into())
+    } else {
+        TestOutcome::Passed
     }
 }
 
@@ -433,6 +468,13 @@ mod tests {
         assert!(!printed.contains("sup3r-s3cret"), "leaked a value: {printed}");
     }
     use super::*;
+
+    #[test]
+    fn an_okx_key_must_trade_and_must_not_withdraw() {
+        assert_eq!(judge_okx_permissions("read_only,trade"), TestOutcome::Passed);
+        assert!(matches!(judge_okx_permissions("read_only,withdraw,trade"), TestOutcome::Failed(m) if m.contains("withdraw")));
+        assert!(matches!(judge_okx_permissions("read_only"), TestOutcome::Failed(m) if m.contains("trade")));
+    }
 
     #[test]
     fn a_key_that_can_transfer_fails_the_test() {

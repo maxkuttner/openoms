@@ -170,6 +170,24 @@ pub fn venues() -> Vec<Venue> {
             ],
         },
         Venue {
+            code: "OKX",
+            name: "OKX",
+            description: "Crypto spot pairs",
+            docs_url: format!("{DOCS}/okx/"),
+            universe: Some("About 700 spot pairs"),
+            // Demo Trading keys are made in the same account, under Demo Trading.
+            environments: environments(
+                "demo trading",
+                Some("https://www.okx.com/account/my-api"),
+                Some("https://www.okx.com/account/my-api"),
+            ),
+            fields: vec![
+                field("api_key", "API key").secret(),
+                field("api_secret", "API secret").secret(),
+                field("passphrase", "Passphrase").secret(),
+            ],
+        },
+        Venue {
             code: "IBKR",
             name: "Interactive Brokers",
             description: "Multi-asset over FIX; experimental, no instrument loading",
@@ -262,6 +280,19 @@ mod tests {
         assert_eq!(fields, [("api_key", "API key", true, None), ("api_secret", "API secret", true, None)]);
         assert_eq!(bybit.environments[0].label, "spot testnet");
         assert_eq!(bybit.environments[0].keys_url, Some("https://testnet.bybit.com/app/user/api-management"));
+    }
+
+    #[test]
+    fn okx_is_key_secret_and_passphrase_on_demo_trading() {
+        let okx = venues().into_iter().find(|v| v.code == "OKX").expect("OKX listed");
+        let fields: Vec<_> = okx.fields.iter().map(|f| (f.name, f.label, f.secret, f.section)).collect();
+        assert_eq!(
+            fields,
+            [("api_key", "API key", true, None), ("api_secret", "API secret", true, None), ("passphrase", "Passphrase", true, None)]
+        );
+        assert_eq!(okx.environments[0].code, "PAPER");
+        assert_eq!(okx.environments[0].label, "demo trading");
+        assert!(environment_allowed("OKX", "PAPER") && environment_allowed("OKX", "LIVE"));
     }
 
     // A Coinbase connection labelled PAPER would still trade real money.

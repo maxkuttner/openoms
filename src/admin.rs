@@ -1363,6 +1363,7 @@ async fn apply_reload(
         binance_rest_adapters: _binance_rest_adapters,
         bybit_adapters,
         coinbase_adapters,
+        okx_adapters,
     } = reload::build_registry(&broker_connections, false, &current, &deps).await;
     drop(current);
 
@@ -1445,6 +1446,10 @@ async fn apply_reload(
     for (env_name, adapter) in coinbase_adapters {
         streams.coinbase(env_name, adapter, &deps, state.streams()).await;
     }
+    // And OKX.
+    for (env_name, adapter) in okx_adapters {
+        streams.okx(env_name, adapter, &deps, state.streams()).await;
+    }
 
     // Reconcile known execution tasks against the resulting registry, not just
     // input rows: a deleted row has no iteration in the loop above. Binance REST
@@ -1461,6 +1466,9 @@ async fn apply_reload(
         }
         if state.registry().get("COINBASE", env_name).is_none() {
             stop_execution_stream(&state, "COINBASE", env_name, &reload::coinbase_exec_stream_code(env_name)).await;
+        }
+        if state.registry().get("OKX", env_name).is_none() {
+            stop_execution_stream(&state, "OKX", env_name, &reload::okx_exec_stream_code(env_name)).await;
         }
     }
 

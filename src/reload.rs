@@ -19,8 +19,10 @@ use crate::alpaca_stream;
 use crate::adapters::binance::BinanceAdapter;
 use crate::adapters::bybit::BybitAdapter;
 use crate::adapters::coinbase::CoinbaseAdapter;
+use crate::adapters::okx::OkxAdapter;
 use crate::bybit_stream;
 use crate::coinbase_stream;
+use crate::okx_stream;
 use crate::adapters::{BrokerRegistry, Transport};
 use crate::app_state::{AppState, DoorbellRegistry, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
@@ -83,6 +85,8 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
             // Same as Bybit: REST orders plus a private WebSocket that
             // `restart_coinbase_stream` can stop and start at will.
             BrokerCredentials::Coinbase { .. } => ConnectionOutcome::Registered,
+            // Same as Bybit, under `restart_okx_stream`.
+            BrokerCredentials::Okx { .. } => ConnectionOutcome::Registered,
             BrokerCredentials::IbkrFix { .. } | BrokerCredentials::BinanceFix { .. } => {
                 if is_boot {
                     ConnectionOutcome::Registered
@@ -161,6 +165,9 @@ pub struct RegistrationOutput {
     /// Coinbase adapters built fresh this pass (LIVE only), whose user stream
     /// the caller (re)starts — on reload as well as at boot.
     pub coinbase_adapters: Vec<(&'static str, Arc<CoinbaseAdapter>)>,
+    /// OKX adapters built fresh this pass, one per environment, whose private
+    /// stream the caller (re)starts — on reload as well as at boot.
+    pub okx_adapters: Vec<(&'static str, Arc<OkxAdapter>)>,
 }
 
 /// Turn every broker connection into an entry in a fresh `BrokerRegistry`.
@@ -190,6 +197,7 @@ pub async fn build_registry(
     let mut binance_rest_adapters: Vec<(&'static str, Arc<BinanceAdapter>)> = Vec::new();
     let mut bybit_adapters: Vec<(&'static str, Arc<BybitAdapter>)> = Vec::new();
     let mut coinbase_adapters: Vec<(&'static str, Arc<CoinbaseAdapter>)> = Vec::new();
+    let mut okx_adapters: Vec<(&'static str, Arc<OkxAdapter>)> = Vec::new();
     let mut report = ReloadReport { connections: Vec::new() };
 
     for conn in connections {
@@ -261,6 +269,7 @@ pub async fn build_registry(
                     BrokerCredentials::BinanceFix { .. } => "BINANCE",
                     BrokerCredentials::Bybit { .. } => "BYBIT",
                     BrokerCredentials::Coinbase { .. } => "COINBASE",
+                    BrokerCredentials::Okx { .. } => "OKX",
                 };
                 if conn.kind != expected_kind {
                     warn!(
@@ -288,6 +297,12 @@ pub async fn build_registry(
                                 outcome = ConnectionOutcome::Failed(format!("Coinbase adapter not registered: {e}"));
                             }
                         }
+                    }
+                    BrokerCredentials::Okx { api_key, api_secret, passphrase } => {
+                        let adapter = Arc::new(OkxAdapter::new(api_key.clone(), api_secret.clone(), passphrase.clone(), env_name));
+                        registry.register("OKX", env_name, adapter.clone());
+                        okx_adapters.push((env_name, adapter));
+                        info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered OKX/{env_name} adapter (REST/WS)");
                     }
                     BrokerCredentials::Bybit { api_key, api_secret } => {
                         let adapter = Arc::new(BybitAdapter::new(api_key.clone(), api_secret.clone(), env_name));
@@ -392,7 +407,7 @@ pub async fn build_registry(
         report.connections.push((conn.code.clone(), outcome));
     }
 
-    RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters, bybit_adapters, coinbase_adapters }
+    RegistrationOutput { registry, report, alpaca_creds, binance_rest_adapters, bybit_adapters, coinbase_adapters, okx_adapters }
 }
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
@@ -470,6 +485,10 @@ pub(crate) fn coinbase_exec_stream_code(env_name: &str) -> String {
     format!("coinbase-{}:exec", env_name.to_lowercase())
 }
 
+pub(crate) fn okx_exec_stream_code(env_name: &str) -> String {
+    format!("okx-{}:exec", env_name.to_lowercase())
+}
+
 /// The network boundary of reload. Store reads, classification, serialization,
 /// swaps and stops remain real in integration tests; only new external sessions
 /// are substituted with controlled tasks.
@@ -496,6 +515,14 @@ pub(crate) trait ReloadStreams: Send + Sync + 'static {
         &self,
         environment: &'static str,
         adapter: Arc<CoinbaseAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    );
+
+    async fn okx(
+        &self,
+        environment: &'static str,
+        adapter: Arc<OkxAdapter>,
         deps: &RegistrationDeps,
         streams: &StreamRegistry,
     );
@@ -536,6 +563,16 @@ impl ReloadStreams for LiveReloadStreams {
         streams: &StreamRegistry,
     ) {
         restart_coinbase_stream(environment, adapter, deps, streams).await;
+    }
+
+    async fn okx(
+        &self,
+        environment: &'static str,
+        adapter: Arc<OkxAdapter>,
+        deps: &RegistrationDeps,
+        streams: &StreamRegistry,
+    ) {
+        restart_okx_stream(environment, adapter, deps, streams).await;
     }
 
     async fn databento(&self, api_key: String, state: &AppState) {
@@ -630,6 +667,29 @@ pub async fn restart_coinbase_stream(
     let health = deps.stream_health.handle("COINBASE", env_name, StreamKind::Execution);
     health.set_connecting();
     let handle = tokio::spawn(coinbase_stream::run(
+        env_name,
+        deps.pool.clone(),
+        deps.kafka.clone(),
+        adapter,
+        health,
+        deps.position_changed_tx.clone(),
+    ));
+    streams.insert(code, handle);
+}
+
+/// (Re)start one OKX environment's private stream against a freshly built
+/// `adapter` — the same shape as `restart_bybit_stream`.
+pub async fn restart_okx_stream(
+    env_name: &'static str,
+    adapter: Arc<OkxAdapter>,
+    deps: &RegistrationDeps,
+    streams: &StreamRegistry,
+) {
+    let code = okx_exec_stream_code(env_name);
+    streams.abort_and_remove(&code).await;
+    let health = deps.stream_health.handle("OKX", env_name, StreamKind::Execution);
+    health.set_connecting();
+    let handle = tokio::spawn(okx_stream::run(
         env_name,
         deps.pool.clone(),
         deps.kafka.clone(),
@@ -962,6 +1022,38 @@ mod tests {
         let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "LIVE").is_some());
         assert_eq!(out.coinbase_adapters.iter().map(|(env, _)| *env).collect::<Vec<_>>(), ["LIVE"]);
+    }
+
+    fn okx_conn() -> Connection<BrokerCredentials> {
+        conn(
+            "okx-paper",
+            "ACTIVE",
+            CredentialState::Configured(BrokerCredentials::Okx { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() }),
+        )
+    }
+
+    #[test]
+    fn an_okx_credential_applies_on_reload_without_a_restart() {
+        assert!(matches!(classify(&okx_conn(), false), ConnectionOutcome::Registered));
+    }
+
+    #[test]
+    fn okx_exec_stream_code_is_per_environment() {
+        assert_eq!(okx_exec_stream_code("PAPER"), "okx-paper:exec");
+        assert_eq!(okx_exec_stream_code("LIVE"), "okx-live:exec");
+    }
+
+    #[tokio::test]
+    async fn a_configured_okx_connection_is_registered_and_handed_back_for_its_stream() {
+        let deps = RegistrationDeps {
+            pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
+            stream_health: StreamHealthRegistry::new(),
+            kafka: None,
+            position_changed_tx: None,
+        };
+        let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
+        assert!(out.registry.get("OKX", "PAPER").is_some());
+        assert_eq!(out.okx_adapters.iter().map(|(env, _)| *env).collect::<Vec<_>>(), ["PAPER"]);
     }
 
     #[test]

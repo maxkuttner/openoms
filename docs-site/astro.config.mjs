@@ -52,6 +52,7 @@ export default defineConfig({
             "integrations/interactive-brokers",
             "integrations/bybit",
             "integrations/coinbase",
+            "integrations/okx",
             "integrations/databento",
           ],
         },
