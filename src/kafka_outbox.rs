@@ -83,6 +83,65 @@ pub async fn pending_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar("SELECT count(*) FROM kafka_outbox").fetch_one(pool).await
 }
 
+#[derive(Clone)]
+pub struct OutboxTopics {
+    pub orders: String,
+    pub fills: String,
+    pub positions: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxRecord {
+    pub topic: String,
+    pub key: String,
+    pub payload: String,
+}
+
+/// The Kafka records one event becomes: always one on the orders topic (the stored
+/// payload, verbatim — the same message the direct publish used to send); a fill
+/// adds one on fills and, when the position row exists, one on positions. Fills
+/// key by order so they share its partition; positions key by what they describe,
+/// so a compacted topic keeps the latest state per position.
+pub fn records_for(row: &OutboxRow, topics: &OutboxTopics) -> Vec<OutboxRecord> {
+    let order_key = row.order_id.to_string();
+    let mut records = vec![OutboxRecord {
+        topic: topics.orders.clone(),
+        key: order_key.clone(),
+        payload: row.payload.to_string(),
+    }];
+    if !matches!(row.event_type.as_str(), "order_partially_filled" | "order_filled") {
+        return records;
+    }
+
+    records.push(OutboxRecord {
+        topic: topics.fills.clone(),
+        key: order_key,
+        payload: serde_json::json!({
+            "event": row.payload,
+            "portfolio_id": row.portfolio_id,
+            "instrument_id": row.instrument_id,
+            "side": row.side,
+        })
+        .to_string(),
+    });
+    if let (Some(p), Some(portfolio_id), Some(instrument_id)) = (&row.position, row.portfolio_id, &row.instrument_id) {
+        records.push(OutboxRecord {
+            topic: topics.positions.clone(),
+            key: format!("{portfolio_id}:{instrument_id}"),
+            payload: serde_json::json!({
+                "portfolio_id": portfolio_id,
+                "instrument_id": instrument_id,
+                "net_qty": p.net_qty,
+                "avg_cost": p.avg_cost,
+                "realized_pnl": p.realized_pnl,
+                "global_position": row.global_position,
+            })
+            .to_string(),
+        });
+    }
+    records
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +159,57 @@ mod tests {
             causation_id: None,
             schema_version: 0,
         }
+    }
+
+    fn topics() -> OutboxTopics {
+        OutboxTopics { orders: "orders".into(), fills: "fills".into(), positions: "positions".into() }
+    }
+
+    fn row(event_type: &str, position: Option<PositionSnapshot>) -> OutboxRow {
+        OutboxRow {
+            global_position: 42,
+            order_id: Uuid::new_v4(),
+            event_id: Uuid::new_v4(),
+            event_type: event_type.to_string(),
+            payload: serde_json::json!({ "event_type": event_type, "payload": { "fill_qty": 1.0 } }),
+            portfolio_id: Some(Uuid::new_v4()),
+            instrument_id: Some("123".to_string()),
+            side: Some("buy".to_string()),
+            position,
+        }
+    }
+
+    fn json(r: &OutboxRecord) -> serde_json::Value {
+        serde_json::from_str(&r.payload).expect("payload is json")
+    }
+
+    #[test]
+    fn routed_event_goes_to_orders_only() {
+        let row = row("order_routed", None);
+        let records = records_for(&row, &topics());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].topic, "orders");
+        assert_eq!(records[0].key, row.order_id.to_string());
+        assert_eq!(json(&records[0]), row.payload);
+    }
+
+    #[test]
+    fn fill_fans_out_to_orders_fills_positions() {
+        let row = row("order_filled", Some(PositionSnapshot { net_qty: 2.5, avg_cost: 100.0, realized_pnl: 0.0 }));
+        let records = records_for(&row, &topics());
+        let names: Vec<&str> = records.iter().map(|r| r.topic.as_str()).collect();
+        assert_eq!(names, ["orders", "fills", "positions"]);
+        assert_eq!(json(&records[1])["portfolio_id"], row.portfolio_id.unwrap().to_string());
+        assert_eq!(json(&records[1])["event"], row.payload);
+        assert_eq!(records[2].key, format!("{}:123", row.portfolio_id.unwrap()));
+        assert_eq!(json(&records[2])["net_qty"], 2.5);
+        assert_eq!(json(&records[2])["global_position"], 42);
+    }
+
+    #[test]
+    fn fill_without_position_row_skips_positions() {
+        let records = records_for(&row("order_partially_filled", None), &topics());
+        assert_eq!(records.len(), 2);
     }
 
     async fn rows_for(pool: &PgPool, order_id: Uuid) -> Vec<OutboxRow> {
