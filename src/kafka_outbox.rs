@@ -18,6 +18,9 @@ const RETRY_SECS: u64 = 5;
 /// Backstop when the order lane is quiet: an event queued by a path that did not
 /// publish on the bus is still picked up.
 const IDLE_RECHECK_SECS: u64 = 30;
+/// While failures continue, repeat the warning every this many failed attempts
+/// (about every 1–6 minutes, depending on how fast the broker refuses).
+const REMIND_EVERY: u32 = 10;
 
 pub struct PositionSnapshot {
     pub net_qty: f64,
@@ -187,6 +190,9 @@ pub struct OutageLog {
 #[derive(Debug, PartialEq)]
 pub enum Transition {
     WentDown,
+    /// Still failing: an outage — or one record that can never be sent, which
+    /// holds back every later event — must not go quiet after one line.
+    StillDown { failed_attempts: u32 },
     Recovered { failed_attempts: u32 },
 }
 
@@ -198,9 +204,13 @@ impl OutageLog {
                 self.failed_attempts = 0;
                 Some(Transition::Recovered { failed_attempts })
             }
+            (false, 0) => {
+                self.failed_attempts = 1;
+                Some(Transition::WentDown)
+            }
             (false, n) => {
                 self.failed_attempts = n + 1;
-                (n == 0).then_some(Transition::WentDown)
+                (n % REMIND_EVERY == 0).then_some(Transition::StillDown { failed_attempts: n + 1 })
             }
         }
     }
@@ -209,7 +219,8 @@ impl OutageLog {
 #[derive(Debug)]
 pub enum DrainError {
     Db(sqlx::Error),
-    Sink { published: usize, error: String },
+    /// `stuck_at` is the global position of the event that could not be sent.
+    Sink { published: usize, stuck_at: i64, error: String },
 }
 
 /// Publish until the outbox is empty or the sink fails. Returns events published.
@@ -231,7 +242,8 @@ pub async fn drain(
         ack(pool, &acked).await.map_err(DrainError::Db)?;
         published += acked.len();
         if let Some(error) = failure {
-            return Err(DrainError::Sink { published, error });
+            let stuck_at = batch[acked.len()].0;
+            return Err(DrainError::Sink { published, stuck_at, error });
         }
     }
 }
@@ -258,9 +270,19 @@ pub async fn run(
                 }
                 true
             }
-            Err(DrainError::Sink { published, error }) => {
-                if outage.on_attempt(false) == Some(Transition::WentDown) {
-                    warn!(%error, published, "kafka outbox: Kafka down, events stay queued until it is back");
+            Err(DrainError::Sink { published, stuck_at, error }) => {
+                match outage.on_attempt(false) {
+                    Some(Transition::WentDown) => {
+                        warn!(%error, published, stuck_at, "kafka outbox: Kafka down, events stay queued until it is back")
+                    }
+                    Some(Transition::StillDown { failed_attempts }) => {
+                        let pending = pending_count(&pool).await.unwrap_or(-1);
+                        warn!(
+                            %error, failed_attempts, pending, stuck_at,
+                            "kafka outbox: still failing; event {stuck_at} and everything after it are held back"
+                        )
+                    }
+                    _ => {}
                 }
                 false
             }
@@ -414,6 +436,17 @@ mod tests {
         let (acked, err) = deliver(&[(1, vec![rec("orders"), rec("fills")])], &sink).await;
         assert!(acked.is_empty());
         assert!(err.is_some());
+    }
+
+    /// A record that can never be sent (missing topic, too large) blocks every
+    /// later event; a single "down" line would hide that for good.
+    #[test]
+    fn long_outage_is_re_reported_periodically() {
+        let mut log = OutageLog::default();
+        let seen: Vec<Option<Transition>> = (0..=REMIND_EVERY).map(|_| log.on_attempt(false)).collect();
+        assert_eq!(seen[0], Some(Transition::WentDown));
+        assert!(seen[1..REMIND_EVERY as usize].iter().all(Option::is_none));
+        assert_eq!(seen[REMIND_EVERY as usize], Some(Transition::StillDown { failed_attempts: REMIND_EVERY + 1 }));
     }
 
     #[test]
