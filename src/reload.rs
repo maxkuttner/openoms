@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::event_bus::EventBus;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::alpaca_stream;
 use crate::adapters::binance::BinanceAdapter;
@@ -120,13 +121,13 @@ pub fn restarts_execution_stream(outcome: &ConnectionOutcome) -> bool {
 /// What the FIX starters and freshly-built adapters need beyond the credential
 /// itself. Built once in `serve()` and handed to every call of `build_registry`
 /// — boot today, a runtime reload endpoint in a later task — so both draw on the
-/// exact same pool, stream-health registry, Kafka client and fill-doorbell
-/// sender rather than each constructing (or re-deriving) their own.
+/// exact same pool, stream-health registry, Kafka client and event
+/// bus rather than each constructing (or re-deriving) their own.
 pub struct RegistrationDeps {
     pub pool: PgPool,
     pub stream_health: StreamHealthRegistry,
     pub kafka: Option<KafkaClient>,
-    pub position_changed_tx: Option<mpsc::Sender<()>>,
+    pub event_bus: EventBus,
 }
 
 /// Everything `build_registry` produces. `registry` and `report` are the pair
@@ -340,7 +341,7 @@ pub async fn build_registry(
                                 &deps.stream_health,
                                 deps.pool.clone(),
                                 deps.kafka.clone(),
-                                deps.position_changed_tx.clone(),
+                                Some(deps.event_bus.clone()),
                             ) {
                                 Some(adapter) => registry.register("IBKR", env_name, adapter),
                                 None => {
@@ -377,7 +378,7 @@ pub async fn build_registry(
                                         &deps.stream_health,
                                         deps.pool.clone(),
                                         deps.kafka.clone(),
-                                        deps.position_changed_tx.clone(),
+                                        Some(deps.event_bus.clone()),
                                     ) {
                                         Some(adapter) => registry.register("BINANCE", env_name, adapter),
                                         None => {
@@ -599,7 +600,7 @@ impl ReloadStreams for LiveReloadStreams {
 /// case where nothing is running yet, same as `restart_databento_feed`.
 ///
 /// Takes `deps` rather than its individual fields (pool, stream_health, kafka,
-/// position_changed_tx) both to stay under clippy's argument-count lint and
+/// event_bus) both to stay under clippy's argument-count lint and
 /// because it is the same bundle `build_registry` already draws on — boot and
 /// a later reload share one source for these rather than each re-deriving or
 /// threading them through separately.
@@ -623,7 +624,7 @@ pub async fn restart_alpaca_stream(
         deps.kafka.clone(),
         adapter,
         health,
-        deps.position_changed_tx.clone(),
+        Some(deps.event_bus.clone()),
     ));
     streams.insert(code, handle);
 }
@@ -649,7 +650,7 @@ pub async fn restart_bybit_stream(
         deps.kafka.clone(),
         adapter,
         health,
-        deps.position_changed_tx.clone(),
+        Some(deps.event_bus.clone()),
     ));
     streams.insert(code, handle);
 }
@@ -672,7 +673,7 @@ pub async fn restart_coinbase_stream(
         deps.kafka.clone(),
         adapter,
         health,
-        deps.position_changed_tx.clone(),
+        Some(deps.event_bus.clone()),
     ));
     streams.insert(code, handle);
 }
@@ -695,7 +696,7 @@ pub async fn restart_okx_stream(
         deps.kafka.clone(),
         adapter,
         health,
-        deps.position_changed_tx.clone(),
+        Some(deps.event_bus.clone()),
     ));
     streams.insert(code, handle);
 }
@@ -746,7 +747,7 @@ mod tests {
                 .expect("connect_lazy never actually connects"),
             stream_health: StreamHealthRegistry::new(),
             kafka: None,
-            position_changed_tx: None,
+            event_bus: EventBus::new(),
         }
     }
 
@@ -997,7 +998,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             kafka: None,
-            position_changed_tx: None,
+            event_bus: EventBus::new(),
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "PAPER").is_none());
@@ -1017,7 +1018,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             kafka: None,
-            position_changed_tx: None,
+            event_bus: EventBus::new(),
         };
         let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "LIVE").is_some());
@@ -1049,7 +1050,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             kafka: None,
-            position_changed_tx: None,
+            event_bus: EventBus::new(),
         };
         let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("OKX", "PAPER").is_some());
@@ -1074,7 +1075,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             kafka: None,
-            position_changed_tx: None,
+            event_bus: EventBus::new(),
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("BYBIT", "PAPER").is_some());

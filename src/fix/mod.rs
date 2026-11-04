@@ -113,6 +113,7 @@ mod tracing_fix_log_tests {
     }
 }
 
+use crate::event_bus::EventBus;
 use crate::adapters::BrokerError;
 use crate::execution::process_execution_report;
 use crate::fix::adapter::FixBrokerAdapter;
@@ -180,7 +181,7 @@ pub fn start_session(
     health: StreamHandle,
     pool: PgPool,
     kafka: Option<KafkaClient>,
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    bus: Option<EventBus>,
     // Optional REST adapter that owns the reconciliation reads (open orders / order
     // status) for venues with no FIX equivalent (Binance Spot FIX). When present, the
     // recon driver reconciles through a SplitAdapter — orders over FIX, reads over
@@ -208,7 +209,7 @@ pub fn start_session(
     {
         let pool = pool.clone();
         let kafka = kafka.clone();
-        let position_changed_tx = position_changed_tx.clone();
+        let bus = bus.clone();
         tokio::spawn(async move {
             while let Some((order_id, report)) = report_rx.recv().await {
                 if let Err(e) = process_execution_report(
@@ -217,7 +218,7 @@ pub fn start_session(
                     order_id,
                     report,
                     actor,
-                    position_changed_tx.as_ref(),
+                    bus.as_ref(),
                 )
                 .await
                 {
@@ -251,7 +252,7 @@ pub fn start_session(
     {
         let pool = pool.clone();
         let kafka = kafka.clone();
-        let position_changed_tx = position_changed_tx.clone();
+        let bus = bus.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.tick().await; // consume the immediate first tick
@@ -270,7 +271,7 @@ pub fn start_session(
                     &*recon_adapter,
                     broker_code,
                     actor,
-                    position_changed_tx.as_ref(),
+                    bus.as_ref(),
                 )
                 .await;
             }
@@ -339,7 +340,7 @@ pub fn start_ibkr(
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
     kafka: Option<KafkaClient>,
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    bus: Option<EventBus>,
 ) -> Option<Arc<FixBrokerAdapter>> {
     let crate::credentials::BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } =
         creds
@@ -359,7 +360,7 @@ pub fn start_ibkr(
     let health = stream_health.fix_handle("IBKR", env_name);
     let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password.clone()));
     // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
-    match start_session(dialect, cfg, "ibkr", health, pool, kafka, position_changed_tx, None) {
+    match start_session(dialect, cfg, "ibkr", health, pool, kafka, bus, None) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "IBKR FIX session not started"); None }
     }
@@ -377,7 +378,7 @@ pub fn start_binance(
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
     kafka: Option<KafkaClient>,
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    bus: Option<EventBus>,
 ) -> Option<Arc<FixBrokerAdapter>> {
     let crate::credentials::BrokerCredentials::BinanceFix {
         host, port, sender_comp_id, target_comp_id, api_key, private_key,
@@ -425,7 +426,7 @@ pub fn start_binance(
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("BINANCE", env_name);
-    match start_session(dialect, cfg, "binance", health, pool, kafka, position_changed_tx, read_delegate) {
+    match start_session(dialect, cfg, "binance", health, pool, kafka, bus, read_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
     }

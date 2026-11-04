@@ -1039,25 +1039,17 @@ async fn serve() {
         }
     }
 
-    // Stream health + the fill→marks doorbell are created here (before the broker
+    // Stream health + the event bus are created here (before the broker
     // registry) because FIX sessions register their adapter *and* start their
     // session in one step, so they need both up front. The same StreamHealthRegistry
     // is handed to AppState so REST/WS streams spawned later share it.
     let stream_health = stream_health::StreamHealthRegistry::new();
 
-    // Doorbell from the fill path to the marks feeds: a fill moved a position, so
-    // re-read the held set. bounded(1) — a queued signal already means "reload",
-    // so extras are redundant and try_send never blocks the fill path. A fan-out
-    // task (spawned below, once every feed has registered) relays to each feed's
-    // own doorbell, so execution.rs need not know how many feeds exist.
-    //
-    // The registry that fan-out reads from (keyed by feed code, so a restarted
-    // feed's fresh sender replaces its old one rather than accumulating a dead
-    // entry — see `DoorbellRegistry`'s doc comment) lives on `AppState` itself,
-    // not as a local here: the `/admin/connections/reload` handler needs to
-    // reach the exact same map this fan-out task drains, and a `serve()`-local
-    // would be unreachable from a request handler.
-    let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // The in-process event bus (see `event_bus.rs`). The fill path publishes
+    // committed events and position changes on its order lane; market-data feeds
+    // subscribe to it to re-read the held set. One bus for the whole process,
+    // held by `AppState` so a reload hands restarted streams the same one.
+    let event_bus = event_bus::EventBus::new();
 
     // Quote channel every market-data feed publishes onto. Created here, ahead
     // of `AppState`, for the same reason: a runtime reload needs to hand a
@@ -1077,7 +1069,7 @@ async fn serve() {
         pool: pool.clone(),
         stream_health: stream_health.clone(),
         kafka: kafka_client.clone(),
-        position_changed_tx: Some(position_changed_tx.clone()),
+        event_bus: event_bus.clone(),
     };
     let RegistrationOutput {
         registry,
@@ -1108,7 +1100,7 @@ async fn serve() {
     // AppState. Constructed with an empty registry and immediately swapped to the
     // one `build_registry` just produced — the same `swap_registry` call a
     // runtime reload will use — so boot itself exercises that path rather than
-    // being the one caller that bypasses it. `position_changed_tx` and
+    // being the one caller that bypasses it. `event_bus` and
     // `quote_tx` are handed in (not just kept as `serve()` locals) so the
     // `/admin/connections/reload` handler can rebuild an equivalent
     // `RegistrationDeps` and restart feeds against the same channels boot used.
@@ -1142,7 +1134,7 @@ async fn serve() {
         kafka_client,
         symbology,
         stream_health,
-        Some(position_changed_tx.clone()),
+        event_bus,
         quote_tx.clone(),
         session_config,
     );
@@ -1162,7 +1154,7 @@ async fn serve() {
         Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
-    // (stream_health, position_changed_tx/rx and quote_tx/rx were created
+    // (stream_health, event_bus and quote_tx/rx were created
     // before the broker registry so FIX sessions could use them, and before
     // `AppState` so it could be constructed holding them.)
 
@@ -1189,7 +1181,7 @@ async fn serve() {
     // the adapter already holds them).
     for (env_name, adapter) in binance_rest_adapters {
         let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
-        let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
+        let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(state.event_bus().clone())));
         state.streams().insert(reload::binance_exec_stream_code(env_name), handle);
     }
 
@@ -1374,9 +1366,15 @@ async fn serve() {
     // reload can still register a replacement doorbell through the same
     // `DoorbellRegistry` after this task has started — see its doc comment.
     let fanout_doorbells = state.doorbells().clone();
+    let mut order_rx = state.event_bus().subscribe_order();
     tokio::spawn(async move {
-        while position_changed_rx.recv().await.is_some() {
-            fanout_doorbells.ring_all();
+        loop {
+            match order_rx.recv().await {
+                Ok(event_bus::OrderLaneEvent::PositionChanged { .. })
+                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => fanout_doorbells.ring_all(),
+                Ok(event_bus::OrderLaneEvent::Appended { .. }) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 

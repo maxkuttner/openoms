@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::adapters::BrokerRegistry;
+use crate::event_bus::EventBus;
 use crate::kafka::KafkaClient;
 use crate::marks::MarkStore;
 use crate::stream_health::StreamHealthRegistry;
@@ -144,11 +145,10 @@ pub struct AppState {
     /// reads from; see `DoorbellRegistry`'s own doc comment for why keyed
     /// replacement, not accumulation, matters.
     doorbells: DoorbellRegistry,
-    /// Sender half of the fill→marks doorbell, so a reload can hand a restarted
-    /// FIX/Alpaca adapter the *same* channel boot wired up rather than a copy
-    /// nothing reads. `None` only in a test fixture that never signs up for the
-    /// doorbell at all.
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    /// The in-process event bus. Stored so a reload can hand a restarted
+    /// adapter or feed the *same* bus boot wired up rather than a copy nothing
+    /// reads.
+    event_bus: EventBus,
     /// Where every market-data feed publishes quotes. Stored so a reload can
     /// hand a restarted feed the same channel the boot-time `mark_router` task
     /// already reads from, instead of constructing a second, disconnected one.
@@ -165,7 +165,7 @@ impl AppState {
         kafka: Option<KafkaClient>,
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
-        position_changed_tx: Option<mpsc::Sender<()>>,
+        event_bus: EventBus,
         quote_tx: mpsc::Sender<dataprovider::Quote>,
         session_config: crate::sessions::SessionConfig,
     ) -> Self {
@@ -183,7 +183,7 @@ impl AppState {
             daily_stats: crate::daily_stats::DailyStatsStore::new(),
             streams: StreamRegistry::new(),
             doorbells: DoorbellRegistry::new(),
-            position_changed_tx,
+            event_bus,
             quote_tx,
         }
     }
@@ -241,12 +241,10 @@ impl AppState {
         &self.doorbells
     }
 
-    /// A fresh handle on the fill→marks doorbell sender, for handing to a
-    /// freshly built `RegistrationDeps` (see `reload.rs`). Cloning a
-    /// `mpsc::Sender` is cheap — it is a handle onto the shared channel state,
-    /// not the channel itself.
-    pub fn position_changed_tx(&self) -> Option<mpsc::Sender<()>> {
-        self.position_changed_tx.clone()
+    /// The process's one event bus. Cloning it is cheap — it hands out handles
+    /// onto the same two lanes.
+    pub fn event_bus(&self) -> &EventBus {
+        &self.event_bus
     }
 
     /// A fresh handle on the shared quote channel every market-data feed
@@ -282,7 +280,7 @@ mod tests {
             None,
             symbology,
             StreamHealthRegistry::new(),
-            None,
+            EventBus::new(),
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),

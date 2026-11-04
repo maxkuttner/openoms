@@ -26,10 +26,10 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlx::{PgPool, Row};
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::event_bus::EventBus;
 use crate::adapters::{BrokerAdapter, BrokerError};
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
@@ -196,7 +196,7 @@ pub async fn run_order_reconcile(
     adapter: &dyn BrokerAdapter,
     broker_code: &str,
     actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) {
     let oms = load_oms_working_orders(pool, broker_code).await;
 
@@ -225,7 +225,7 @@ pub async fn run_order_reconcile(
                     }
                 };
                 let oms_avg = booked_avg.get(&order_id).copied().flatten();
-                apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, &st, broker_code, actor, position_changed_tx)
+                apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, &st, broker_code, actor, bus)
                     .await;
             }
             ReconAction::PartialDrift { order_id, oms_cum, broker_executed } => {
@@ -300,10 +300,10 @@ pub(crate) async fn apply_broker_terminal(
     st: &BrokerOrderState,
     venue: &str,
     actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) {
     let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
-    apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, st, venue, actor, position_changed_tx).await;
+    apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, st, venue, actor, bus).await;
 }
 
 /// Book a still-working order's progress from a venue that reports cumulative
@@ -320,7 +320,7 @@ pub(crate) async fn apply_broker_progress(
     broker_avg: f64,
     venue: &str,
     actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) {
     let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
     let Some(fill_qty) = missing_qty(oms_cum, broker_cum) else { return };
@@ -330,7 +330,7 @@ pub(crate) async fn apply_broker_progress(
         fill_price: increment_price(oms_cum, oms_avg, broker_cum, broker_avg),
         venue: venue.to_string(),
     };
-    if let Err(e) = process_execution_report(pool, kafka, order_id, report, actor, position_changed_tx).await {
+    if let Err(e) = process_execution_report(pool, kafka, order_id, report, actor, bus).await {
         error!(order_id = %order_id, error = %e, "broker progress: apply failed");
     }
 }
@@ -350,11 +350,11 @@ async fn apply_terminal(
     st: &BrokerOrderState,
     venue: &str,
     actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) {
     let apply = |report: ExecutionReport| async move {
         if let Err(e) =
-            process_execution_report(pool, kafka, order_id, report, actor, position_changed_tx).await
+            process_execution_report(pool, kafka, order_id, report, actor, bus).await
         {
             error!(order_id = %order_id, error = %e, "order recon: apply failed");
         }

@@ -12,6 +12,8 @@
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::event_store::{AppendResult, NewOrderEvent};
+
 pub const ORDER_LANE_CAPACITY: usize = 1024;
 pub const PRICE_LANE_CAPACITY: usize = 4096;
 
@@ -64,6 +66,18 @@ impl EventBus {
 
     pub fn subscribe_price(&self) -> broadcast::Receiver<MarkUpdate> {
         self.price.subscribe()
+    }
+}
+
+/// Publish one `Appended` per committed event. Call only after the append's
+/// transaction has committed.
+pub fn publish_appended(bus: &EventBus, order_id: Uuid, events: &[NewOrderEvent], result: &AppendResult) {
+    for (event, &global_position) in events.iter().zip(&result.global_positions) {
+        bus.publish_order(OrderLaneEvent::Appended {
+            order_id,
+            global_position,
+            event_type: event.event_type.clone(),
+        });
     }
 }
 
@@ -149,5 +163,33 @@ mod tests {
             source_code: "BINANCE",
         };
         assert_eq!(MarkUpdate::from(&q), MarkUpdate { instrument_id: 42, bid: 100.5, ask: 101.0 });
+    }
+
+    #[test]
+    fn publish_appended_pairs_types_with_positions() {
+        let ev = |t: &str| NewOrderEvent {
+            event_id: Uuid::new_v4().to_string(),
+            event_type: t.to_string(),
+            actor: "test".to_string(),
+            payload: serde_json::json!({}),
+            correlation_id: None,
+            causation_id: None,
+            schema_version: 0,
+        };
+        let order_id = Uuid::new_v4();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe_order();
+        let result = AppendResult { last_version: 2, appended: 2, global_positions: vec![10, 11] };
+
+        publish_appended(&bus, order_id, &[ev("order_partially_filled"), ev("order_filled")], &result);
+
+        let expect = |global_position, t: &str| OrderLaneEvent::Appended {
+            order_id,
+            global_position,
+            event_type: t.to_string(),
+        };
+        assert_eq!(rx.try_recv().unwrap(), expect(10, "order_partially_filled"));
+        assert_eq!(rx.try_recv().unwrap(), expect(11, "order_filled"));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }

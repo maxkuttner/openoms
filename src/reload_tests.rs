@@ -29,7 +29,7 @@ fn state(pool: PgPool) -> AppState {
     let (quote_tx, _) = mpsc::channel(1);
     AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(), None,
         symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
-        StreamHealthRegistry::new(), None, quote_tx,
+        StreamHealthRegistry::new(), crate::event_bus::EventBus::new(), quote_tx,
         crate::sessions::SessionConfig {
             cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
             ttl: crate::sessions::SessionTtl::default(),

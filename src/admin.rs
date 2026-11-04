@@ -1346,7 +1346,7 @@ async fn apply_reload(
         pool: state.pool().clone(),
         stream_health: state.stream_health().clone(),
         kafka: state.kafka().cloned(),
-        position_changed_tx: state.position_changed_tx(),
+        event_bus: state.event_bus().clone(),
     };
 
     // Release this snapshot after registration, before joining old streams.
@@ -3441,7 +3441,7 @@ mod tests {
             None,
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
-            None,
+            crate::event_bus::EventBus::new(),
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),

@@ -26,6 +26,7 @@ use crate::auth::AuthContext;
 use crate::positions::{value as value_position, Position};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
+use crate::event_bus::publish_appended;
 use crate::kafka::publish_events;
 use crate::risk_engine::{PgRiskDataProvider, RiskCheckError, RiskEngine};
 
@@ -680,7 +681,7 @@ pub async fn orders_submit(
     // log events:
     // - to recover state (later potentially)
     // - populate audit trail
-    event_store
+    let appended = event_store
         .append_events_in_tx(&mut tx, order_id, 0, &new_events)
         .await
         .map_err(|err| {
@@ -697,6 +698,7 @@ pub async fn orders_submit(
         message: format!("failed to commit transaction: {:?}", err),
     })?;
 
+    publish_appended(state.event_bus(), order_id, &new_events, &appended);
     publish_events(state.kafka(), &order_id.to_string(), &events).await;
 
     // --- TX2: route order to broker ---
@@ -898,11 +900,11 @@ pub async fn orders_submit(
             route_new_events.push(domain_event_to_new_event(event)?);
         }
 
-        match event_store
+        let appended = match event_store
             .append_events_in_tx(&mut tx2, order_id, expected_version, &route_new_events)
             .await
         {
-            Ok(_) => {}
+            Ok(r) => r,
             Err(crate::event_store::EventStoreError::Concurrency(c)) => {
                 drop(tx2);
                 if attempt == MAX_ROUTE_ATTEMPTS {
@@ -926,7 +928,7 @@ pub async fn orders_submit(
                     message: format!("failed to persist OrderRouted event: {:?}", err),
                 });
             }
-        }
+        };
 
         tx2.commit().await.map_err(|err| {
             error!(order_id = %order_id, error = ?err, "TX2 commit failed — broker holds order but OMS status is Submitted");
@@ -935,6 +937,7 @@ pub async fn orders_submit(
                 message: format!("failed to commit routing transaction: {:?}", err),
             }
         })?;
+        publish_appended(state.event_bus(), order_id, &route_new_events, &appended);
 
         route_events = attempt_events;
         break;
@@ -1194,7 +1197,7 @@ pub async fn orders_cancel(
         new_events.push(domain_event_to_new_event(event)?);
     }
 
-    event_store
+    let appended = event_store
         .append_events_in_tx(&mut tx, order_id, expected_version, &new_events)
         .await
         .map_err(|err| {
@@ -1210,6 +1213,7 @@ pub async fn orders_cancel(
         message: format!("failed to commit transaction: {:?}", err),
     })?;
 
+    publish_appended(app_state.event_bus(), order_id, &new_events, &appended);
     publish_events(app_state.kafka(), &order_id.to_string(), &events).await;
 
     // return response
@@ -2198,7 +2202,7 @@ pub async fn get_marks(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2424,7 +2428,7 @@ mod tests {
             None,                  // no Kafka; `publish_events` is a no-op without it
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
-            None,
+            crate::event_bus::EventBus::new(),
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
@@ -2983,7 +2987,7 @@ mod tests {
     /// without this the test resolves a different database than the server runs
     /// against. The `oms` role carries `search_path = oms, public`
     /// (db/access/roles.sql); these are the admin credentials, so set it here.
-    async fn test_pool() -> sqlx::PgPool {
+    pub(crate) async fn test_pool() -> sqlx::PgPool {
         use crate::setup::database::config;
         dotenvy::dotenv().ok();
         let cfg = config::resolve(config::PostgresOverrides::default());
@@ -3002,7 +3006,7 @@ mod tests {
     /// `principal.code` is `UNIQUE` and these tests leave their rows behind, so
     /// the code is suffixed with the row's own id — which is also what pushes it
     /// past 30 characters.
-    async fn seed_principal(pool: &sqlx::PgPool, code: &str) -> (Uuid, String) {
+    pub(crate) async fn seed_principal(pool: &sqlx::PgPool, code: &str) -> (Uuid, String) {
         let id = Uuid::new_v4();
         let code = format!("{code}-{id}");
         sqlx::query(
@@ -3017,7 +3021,7 @@ mod tests {
         (id, code)
     }
 
-    async fn seed_instrument(pool: &sqlx::PgPool, symbol_suffix: &str) -> i64 {
+    pub(crate) async fn seed_instrument(pool: &sqlx::PgPool, symbol_suffix: &str) -> i64 {
         let venue: String = sqlx::query_scalar("SELECT code FROM venue ORDER BY code LIMIT 1")
             .fetch_one(pool)
             .await
@@ -3045,7 +3049,7 @@ mod tests {
     /// references — nothing here is seeded elsewhere in this file, since
     /// load_blotter has had no tests of its own until now. Returns the new
     /// order's id.
-    async fn seed_order_state(
+    pub(crate) async fn seed_order_state(
         pool: &sqlx::PgPool,
         principal_id: Uuid,
         instrument_id: i64,
@@ -3177,7 +3181,7 @@ mod tests {
             None,
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
-            None,
+            crate::event_bus::EventBus::new(),
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),

@@ -6,8 +6,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
+use crate::event_bus::EventBus;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
@@ -27,7 +27,7 @@ struct AlpacaSession {
     kafka: Option<KafkaClient>,
     adapter: Arc<AlpacaAdapter>,
     health: StreamHandle,
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    bus: Option<EventBus>,
 }
 
 #[async_trait::async_trait]
@@ -41,7 +41,7 @@ impl Session for AlpacaSession {
             &self.kafka,
             &self.adapter,
             &self.health,
-            self.position_changed_tx.as_ref(),
+            self.bus.as_ref(),
         )
         .await
     }
@@ -55,10 +55,10 @@ pub async fn run(
     kafka: Option<KafkaClient>,
     adapter: Arc<AlpacaAdapter>,
     health: StreamHandle,
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    bus: Option<EventBus>,
 ) {
     info!(env = environment, "starting Alpaca trade-update stream");
-    run_order_reconcile(&pool, &kafka, &*adapter, "ALPACA", "alpaca", position_changed_tx.as_ref()).await;
+    run_order_reconcile(&pool, &kafka, &*adapter, "ALPACA", "alpaca", bus.as_ref()).await;
 
     let ws_url = if environment == "LIVE" {
         "wss://api.alpaca.markets/stream"
@@ -75,7 +75,7 @@ pub async fn run(
         kafka,
         adapter,
         health: health.clone(),
-        position_changed_tx,
+        bus,
     };
     supervise(name, health, session).await
 }
@@ -88,7 +88,7 @@ async fn connect_and_run(
     kafka: &Option<KafkaClient>,
     adapter: &AlpacaAdapter,
     health: &StreamHandle,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(ws_url).await?;
     info!("Alpaca stream connected url={ws_url}");
@@ -114,7 +114,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                run_order_reconcile(pool, kafka, adapter, "ALPACA", "alpaca", position_changed_tx).await;
+                run_order_reconcile(pool, kafka, adapter, "ALPACA", "alpaca", bus).await;
                 continue;
             }
             msg = ws.next() => {
@@ -159,7 +159,7 @@ async fn connect_and_run(
                 health.set_live();
             }
             "trade_updates" => {
-                if let Err(e) = handle_trade_update(data, pool, kafka, position_changed_tx).await {
+                if let Err(e) = handle_trade_update(data, pool, kafka, bus).await {
                     error!(error = %e, "Alpaca stream: error processing trade update");
                 }
             }
@@ -176,7 +176,7 @@ async fn handle_trade_update(
     data: &serde_json::Value,
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let event = data["event"].as_str().unwrap_or("unknown");
     let order = &data["order"];
@@ -234,7 +234,7 @@ async fn handle_trade_update(
         }
     };
 
-    match process_execution_report(pool, kafka, order_id, report, "alpaca", position_changed_tx).await {
+    match process_execution_report(pool, kafka, order_id, report, "alpaca", bus).await {
         Ok(()) => {}
         Err(e) => {
             error!(order_id = %order_id, error = %e, "Alpaca stream: failed to process execution report");

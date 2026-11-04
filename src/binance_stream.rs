@@ -13,12 +13,12 @@ use std::sync::Arc;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use sqlx::PgPool;
-use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::event_bus::EventBus;
 use crate::adapters::binance::BinanceAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
@@ -39,7 +39,7 @@ struct BinanceSession {
     kafka: Option<KafkaClient>,
     adapter: Arc<BinanceAdapter>,
     health: StreamHandle,
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    bus: Option<EventBus>,
 }
 
 #[async_trait::async_trait]
@@ -50,7 +50,7 @@ impl Session for BinanceSession {
             &self.pool,
             &self.kafka,
             &self.health,
-            self.position_changed_tx.as_ref(),
+            self.bus.as_ref(),
         )
         .await
     }
@@ -65,7 +65,7 @@ pub async fn run(
     kafka: Option<KafkaClient>,
     adapter: Arc<BinanceAdapter>,
     health: StreamHandle,
-    position_changed_tx: Option<mpsc::Sender<()>>,
+    bus: Option<EventBus>,
 ) {
     info!(env = environment, "starting Binance user-data stream");
     // The catch-up sweep runs on every (re)connect from the subscribe-success path in
@@ -76,7 +76,7 @@ pub async fn run(
         kafka,
         adapter,
         health: health.clone(),
-        position_changed_tx,
+        bus,
     };
     let name: &'static str = if environment == "LIVE" { "BINANCE/LIVE" } else { "BINANCE/PAPER" };
     supervise(name, health, session).await
@@ -87,7 +87,7 @@ async fn connect_and_run(
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
     health: &StreamHandle,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.ws_url()).await?;
     info!("Binance WS-API connected");
@@ -110,7 +110,7 @@ async fn connect_and_run(
             // Periodic liveness probe + catch-up sweep for missed terminal reports.
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                run_order_reconcile(pool, kafka, adapter, VENUE, "binance", position_changed_tx).await;
+                run_order_reconcile(pool, kafka, adapter, VENUE, "binance", bus).await;
                 continue;
             }
             msg = ws.next() => {
@@ -137,7 +137,7 @@ async fn connect_and_run(
         // Pushed user-data event: {"subscriptionId":N,"event":{...}}
         if v.get("event").is_some() {
             if v["event"]["e"].as_str() == Some("executionReport") {
-                if let Err(e) = handle_execution_report(&v["event"], pool, kafka, position_changed_tx).await {
+                if let Err(e) = handle_execution_report(&v["event"], pool, kafka, bus).await {
                     error!(error = %e, "Binance WS: error processing executionReport");
                 }
             }
@@ -162,7 +162,7 @@ async fn connect_and_run(
                     // Snapshot-on-(re)connect: diff the broker's open orders against
                     // the OMS working set now that the live stream is up, so anything
                     // that resolved during the outage is healed immediately.
-                    run_order_reconcile(pool, kafka, adapter, VENUE, "binance", position_changed_tx).await;
+                    run_order_reconcile(pool, kafka, adapter, VENUE, "binance", bus).await;
                 } else {
                     return Err(format!("userDataStream.subscribe failed: {}", v).into());
                 }
@@ -177,7 +177,7 @@ async fn handle_execution_report(
     event: &serde_json::Value,
     pool: &PgPool,
     kafka: &Option<KafkaClient>,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let exec_type = event["x"].as_str().unwrap_or("");
     // On a cancel, Binance puts the cancel-request's id in `c` and the original
@@ -216,7 +216,7 @@ async fn handle_execution_report(
         }
     };
 
-    if let Err(e) = process_execution_report(pool, kafka, order_id, report, "binance", position_changed_tx).await {
+    if let Err(e) = process_execution_report(pool, kafka, order_id, report, "binance", bus).await {
         error!(order_id = %order_id, error = %e, "Binance WS: failed to apply execution report");
     }
     Ok(())
