@@ -56,7 +56,7 @@ impl Connector for Okx {
                         order_rx,
                         health.clone(),
                     );
-                    crate::stream_supervisor::supervise("OKX/SPOT", health, session).await;
+                    gateway::stream_supervisor::supervise("OKX/SPOT", health, session).await;
                 })
             },
         })

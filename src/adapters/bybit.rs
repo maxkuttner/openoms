@@ -22,7 +22,7 @@ use sha2::Sha256;
 use tracing::info;
 
 use super::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
-use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Bybit's default; how long after `X-BAPI-TIMESTAMP` the request stays valid.
 const RECV_WINDOW: &str = "5000";

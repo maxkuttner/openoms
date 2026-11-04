@@ -30,7 +30,7 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::adapters::{BrokerAdapter, BrokerError};
-use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
+use gateway::contract::{BrokerOpenOrder, EngineHandle, ExecEvent, ExecKind, ExecSource};
 
 const EPS: f64 = 1e-9;
 
@@ -47,34 +47,6 @@ pub struct OmsWorkingOrder {
     /// Average price of what the OMS has booked so far (`None` before any fill),
     /// against which a missed quantity is priced.
     pub avg_px: Option<f64>,
-}
-
-/// One order the broker currently reports as open, normalized across transports.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrokerOpenOrder {
-    /// Our order UUID (the client order id we sent).
-    pub client_order_id: String,
-    pub symbol: String,
-    pub executed_qty: f64,
-}
-
-/// How the broker says a no-longer-open order finished (from `order_status`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BrokerOrderOutcome {
-    Filled,
-    Canceled,
-    Rejected,
-    /// Still open at the broker (shouldn't happen on the ResolveTerminal path).
-    Working,
-}
-
-/// One order's current state at the broker, resolved on demand for an OMS order that
-/// dropped out of the open-order snapshot.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrokerOrderState {
-    pub outcome: BrokerOrderOutcome,
-    pub executed_qty: f64,
-    pub avg_px: f64,
 }
 
 /// What the diff decided to do about one order.
@@ -306,6 +278,16 @@ pub(crate) async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gateway::contract::{BrokerOrderOutcome, BrokerOrderState};
+
+    // Cumulative venues (Coinbase, OKX) book "venue cumulative − OMS cum_qty", so
+    // a repeated or replayed update (same cumulative) books nothing.
+    #[test]
+    fn missing_qty_books_only_what_is_new() {
+        assert_eq!(missing_qty(0.0, 0.0005), Some(0.0005));
+        assert_eq!(missing_qty(0.0005, 0.0005), None);
+        assert_eq!(missing_qty(0.001, 0.0005), None, "an older update after a newer one");
+    }
 
     /// A broker whose snapshot no longer lists the order, and which reports it
     /// canceled with some quantity executed.
@@ -337,11 +319,11 @@ mod tests {
     async fn recon_hands_terminal_states_to_the_engine_instead_of_booking() {
         let order_id = Uuid::new_v4();
         let oms = [OmsWorkingOrder { order_id, symbol: "X".into(), ext_id: "e1".into(), cum_qty: 0.0, avg_px: None }];
-        let (engine, mut rx) = crate::order_engine::EngineHandle::new();
+        let (engine, mut rx) = gateway::contract::EngineHandle::new();
 
         reconcile_with(&oms, &ClosedAtBroker, "FAKE", "fake", &engine).await;
 
-        let Ok(crate::order_engine::GatewayMsg::Exec(ev)) = rx.try_recv() else { panic!("an exec event") };
+        let Ok(gateway::contract::GatewayMsg::Exec(ev)) = rx.try_recv() else { panic!("an exec event") };
         assert_eq!(ev.order_id, order_id);
         assert_eq!(ev.source, ExecSource::Snapshot);
         assert_eq!(

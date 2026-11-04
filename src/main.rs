@@ -65,12 +65,12 @@ mod binance_stream;
 mod bybit_stream;
 mod coinbase_stream;
 mod okx_stream;
-mod stream_health;
+
 mod venues;
 mod marks;
 mod daily_stats;
 mod opra_stream;
-mod stream_supervisor;
+
 mod quote_feed;
 mod mark_router;
 mod daily_stats_poller;
@@ -91,6 +91,8 @@ mod reload;
 mod cockpit;
 #[cfg(test)]
 mod reload_tests;
+#[cfg(test)]
+mod boundary_tests;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -1048,7 +1050,7 @@ async fn serve() {
     // registry) because FIX sessions register their adapter *and* start their
     // session in one step, so they need both up front. The same StreamHealthRegistry
     // is handed to AppState so REST/WS streams spawned later share it.
-    let stream_health = stream_health::StreamHealthRegistry::new();
+    let stream_health = gateway::stream_health::StreamHealthRegistry::new();
 
     // The in-process event bus (see `event_bus.rs`). The fill path publishes
     // committed events and position changes on its order lane; market-data feeds
@@ -1059,7 +1061,7 @@ async fn serve() {
     // The order engine: the only place that books. Connectors send it execution
     // events instead of writing to the database (see `order_engine.rs`). Started
     // before any connector, though its channel would buffer either way.
-    let (engine, engine_rx) = order_engine::EngineHandle::new();
+    let (engine, engine_rx) = gateway::contract::EngineHandle::new();
     tokio::spawn(order_engine::run(engine_rx, engine.clone(), pool.clone(), event_bus.clone()));
 
     // Quote channel every market-data feed publishes onto. Created here, ahead
@@ -1289,7 +1291,7 @@ async fn serve() {
     // nothing to restart; it runs for the life of the process.
     for connector in connectors::all() {
         if let Some(feed) = connector.public_feed() {
-            let health = state.stream_health().handle(connector.manifest().code, "SPOT", stream_health::StreamKind::Feed);
+            let health = state.stream_health().handle(connector.manifest().code, "SPOT", gateway::stream_health::StreamKind::Feed);
             tokio::spawn((feed.run)(state.pool().clone(), quote_tx.clone(), state.event_bus().subscribe_order(), health));
         }
     }

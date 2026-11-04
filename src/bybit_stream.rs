@@ -14,7 +14,7 @@
 //! update for an order with fills (`cumExecQty > 0`) can overtake those fills.
 //! Closing the order on it would make the terminal guard drop the late Trades;
 //! instead it is resolved like a missed terminal in reconcile
-//! ([`crate::order_engine::ExecKind::Terminal`]): book whatever Bybit filled
+//! ([`gateway::contract::ExecKind::Terminal`]): book whatever Bybit filled
 //! that the OMS hasn't yet, then close.
 
 use std::sync::Arc;
@@ -26,11 +26,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::adapters::bybit::BybitAdapter;
-use crate::domain::orders::commands::ExecutionReport;
-use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
-use crate::recon_orders::BrokerOrderState;
-use crate::stream_health::StreamHandle;
-use crate::stream_supervisor::{supervise, Session, StreamResult};
+use gateway::contract::VenueReport;
+use gateway::contract::{EngineHandle, ExecEvent, ExecKind, ExecSource};
+use gateway::contract::BrokerOrderState;
+use gateway::stream_health::StreamHandle;
+use gateway::stream_supervisor::{supervise, Session, StreamResult};
 
 const VENUE: &str = "BYBIT";
 
@@ -81,7 +81,7 @@ fn topic_is(msg: &serde_json::Value, name: &str) -> bool {
 /// What one pushed entry means for its OMS order.
 #[derive(Debug)]
 pub(crate) enum Update {
-    Report(ExecutionReport),
+    Report(VenueReport),
     /// A terminal order update for an order with fills: apply through reconcile
     /// so fills it may have overtaken are booked before the close.
     Terminal(BrokerOrderState),
@@ -101,7 +101,7 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
                 if d["execType"].as_str() != Some("Trade") {
                     return None;
                 }
-                Update::Report(ExecutionReport::Fill {
+                Update::Report(VenueReport::Fill {
                     execution_id: d["execId"].as_str()?.to_string(),
                     fill_qty: num("execQty")?,
                     fill_price: num("execPrice")?,
@@ -115,11 +115,11 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
                 }
                 let reason = d["rejectReason"].as_str().filter(|r| !r.is_empty() && *r != "EC_NoError");
                 Update::Report(match status {
-                    "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => ExecutionReport::Canceled {
+                    "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => VenueReport::Canceled {
                         reason: reason.map(String::from),
                         venue: Some(VENUE.to_string()),
                     },
-                    "Rejected" => ExecutionReport::Reject {
+                    "Rejected" => VenueReport::Reject {
                         reason: reason.unwrap_or("Rejected").to_string(),
                         venue: Some(VENUE.to_string()),
                     },
@@ -228,7 +228,7 @@ async fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recon_orders::BrokerOrderOutcome;
+    use gateway::contract::BrokerOrderOutcome;
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
 
@@ -252,14 +252,14 @@ mod tests {
         let ev = exec_event(order_id, update);
         assert_eq!(ev.order_id, order_id);
         assert_eq!(ev.actor, "bybit");
-        let crate::order_engine::ExecKind::Terminal(st) = ev.kind else { panic!("a terminal event") };
+        let gateway::contract::ExecKind::Terminal(st) = ev.kind else { panic!("a terminal event") };
         assert_eq!(st.outcome, BrokerOrderOutcome::Canceled);
     }
 
     #[test]
     fn bybit_execution_becomes_fill_event() {
         let (order_id, update) = reports(&sample("ws_execution")).remove(0);
-        assert!(matches!(exec_event(order_id, update).kind, crate::order_engine::ExecKind::Fill { .. }));
+        assert!(matches!(exec_event(order_id, update).kind, gateway::contract::ExecKind::Fill { .. }));
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0.to_string(), ORDER_ID);
         match &r[0].1 {
-            Update::Report(ExecutionReport::Fill { execution_id, fill_qty, fill_price, venue }) => {
+            Update::Report(VenueReport::Fill { execution_id, fill_qty, fill_price, venue }) => {
                 assert_eq!(execution_id, "2100000000007764263");
                 assert_eq!(*fill_qty, 0.001);
                 assert_eq!(*fill_price, 65000.0);
@@ -295,7 +295,7 @@ mod tests {
         // Nothing filled: a plain cancel.
         for (_, update) in [&cancels[0], &cancels[2]] {
             assert!(
-                matches!(update, Update::Report(ExecutionReport::Canceled { reason: None, venue: Some(v) }) if v == "BYBIT"),
+                matches!(update, Update::Report(VenueReport::Canceled { reason: None, venue: Some(v) }) if v == "BYBIT"),
                 "{update:?}"
             );
         }
@@ -304,7 +304,7 @@ mod tests {
         let rejects = reports(&sample("ws_order_rejected"));
         assert_eq!(rejects.len(), 1);
         assert!(
-            matches!(&rejects[0].1, Update::Report(ExecutionReport::Reject { reason, .. }) if reason == "EC_InsufficientBalance"),
+            matches!(&rejects[0].1, Update::Report(VenueReport::Reject { reason, .. }) if reason == "EC_InsufficientBalance"),
             "{:?}",
             rejects[0].1
         );

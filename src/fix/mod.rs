@@ -118,8 +118,8 @@ use crate::fix::app::FixApplication;
 use crate::fix::binance::BinanceDialect;
 use crate::fix::dialect::FixDialect;
 use crate::fix::ibkr::IbkrDialect;
-use crate::order_engine::{EngineHandle, ExecEvent};
-use crate::stream_health::{StreamHandle, StreamHealthRegistry};
+use gateway::contract::{EngineHandle, ExecEvent};
+use gateway::stream_health::{StreamHandle, StreamHealthRegistry};
 
 /// Connection parameters for one FIX session. Credentials live on the dialect;
 /// this is only the endpoint + identity.

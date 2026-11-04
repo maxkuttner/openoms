@@ -16,7 +16,7 @@ use crate::jobs::api::JobStarted;
 use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials, RedactedField};
 use crate::credentials_api::{self, CredentialSubmission, TestOutcome};
 use crate::reload;
-use crate::stream_health::StreamHealth;
+use gateway::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
 use crate::symbology_resolver::{self, ResolveError, ResolveOutcome};
 use symbology::InstrumentQuery;
@@ -1457,14 +1457,14 @@ fn reload_store_error(error: sqlx::Error) -> AdminError {
 
 async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str, code: &str) {
     if state.streams().abort_and_remove(code).await {
-        state.stream_health().handle(broker, environment, crate::stream_health::StreamKind::Execution)
+        state.stream_health().handle(broker, environment, gateway::stream_health::StreamKind::Execution)
             .set_down("connection disabled, unconfigured, or removed");
     }
 }
 
 async fn stop_databento_feed(state: &AppState) {
     if state.streams().abort_and_remove("databento-opra").await {
-        state.stream_health().handle("DATABENTO", "OPRA", crate::stream_health::StreamKind::Feed)
+        state.stream_health().handle("DATABENTO", "OPRA", gateway::stream_health::StreamKind::Feed)
             .set_down("connection disabled, unconfigured, or removed");
     }
 }
@@ -3310,7 +3310,7 @@ mod tests {
 
     fn test_app_state(pool: sqlx::PgPool) -> AppState {
         use crate::adapters::BrokerRegistry;
-        use crate::stream_health::StreamHealthRegistry;
+        use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
         let (quote_tx, _quote_rx) = tokio::sync::mpsc::channel(1);
@@ -3322,7 +3322,7 @@ mod tests {
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
-            crate::order_engine::EngineHandle::new().0,
+            gateway::contract::EngineHandle::new().0,
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),

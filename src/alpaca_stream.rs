@@ -7,10 +7,10 @@ use uuid::Uuid;
 use std::sync::Arc;
 
 use crate::adapters::alpaca::AlpacaAdapter;
-use crate::domain::orders::commands::ExecutionReport;
-use crate::order_engine::{EngineHandle, ExecEvent};
-use crate::stream_health::StreamHandle;
-use crate::stream_supervisor::{supervise, Session, StreamResult};
+use gateway::contract::VenueReport;
+use gateway::contract::{EngineHandle, ExecEvent};
+use gateway::stream_health::StreamHandle;
+use gateway::stream_supervisor::{supervise, Session, StreamResult};
 
 /// Ping + missed-fill sweep cadence; see the Binance stream for the rationale.
 const HEARTBEAT_SECS: u64 = 30;
@@ -183,7 +183,7 @@ async fn handle_trade_update(
                 .unwrap_or(client_order_id)
                 .to_string();
 
-            ExecutionReport::Fill {
+            VenueReport::Fill {
                 execution_id,
                 fill_qty,
                 fill_price,
@@ -192,12 +192,12 @@ async fn handle_trade_update(
         }
         "rejected" => {
             let reason = order["status"].as_str().unwrap_or("rejected").to_string();
-            ExecutionReport::Reject {
+            VenueReport::Reject {
                 reason,
                 venue: Some("ALPACA".to_string()),
             }
         }
-        "canceled" => ExecutionReport::Canceled {
+        "canceled" => VenueReport::Canceled {
             reason: None,
             venue: Some("ALPACA".to_string()),
         },
@@ -226,7 +226,7 @@ async fn handle_trade_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order_engine::{EngineHandle, ExecKind, ExecSource, GatewayMsg};
+    use gateway::contract::{EngineHandle, ExecKind, ExecSource, GatewayMsg};
 
     #[tokio::test]
     async fn alpaca_fill_frame_becomes_fill_event() {

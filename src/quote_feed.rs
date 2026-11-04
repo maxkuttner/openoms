@@ -4,7 +4,7 @@
 //! subscribe to, hand it to the feed, watch the bus's order lane, and push newly
 //! held instruments in mid-session. The feed itself only speaks its wire protocol.
 //!
-//! Pairing this with [`crate::stream_supervisor`] means a new vendor is one
+//! Pairing this with [`gateway::stream_supervisor`] means a new vendor is one
 //! `impl LiveQuoteFeed` — no reconnect loop, no health wiring, no DB access, no
 //! subscription bookkeeping.
 
@@ -17,8 +17,8 @@ use tokio::time::{sleep, Duration};
 use tracing::info;
 
 use crate::event_bus::OrderLaneEvent;
-use crate::stream_health::StreamHandle;
-use crate::stream_supervisor::{Session, StreamResult};
+use gateway::stream_health::StreamHandle;
+use gateway::stream_supervisor::{Session, StreamResult};
 
 /// How long to idle before re-checking when nothing is held. A reconnect re-runs
 /// the query, so this is just the poll interval for "did we buy anything yet".

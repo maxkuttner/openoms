@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use sqlx::Connection;
 
-use crate::stream_health::{StreamHealth, StreamKind, StreamState};
+use gateway::stream_health::{StreamHealth, StreamKind, StreamState};
 
 /// Long enough for a slow local service, short enough that a dead one does not
 /// make `oms status` look hung.
@@ -250,7 +250,7 @@ pub async fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stream_health::{StreamHealth, StreamKind, StreamState, StreamTransport};
+    use gateway::stream_health::{StreamHealth, StreamKind, StreamState, StreamTransport};
 
     fn check(name: &str, state: State, target: &str, detail: &str) -> Check {
         Check { name: name.into(), state, target: target.into(), detail: detail.into() }

@@ -1,0 +1,15 @@
+[package]
+name = "gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Venue connectivity for the OMS: adapters, execution streams, feeds and FIX sessions."
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+dataprovider = { path = "../dataprovider" }

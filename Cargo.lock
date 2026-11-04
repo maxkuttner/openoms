@@ -1324,6 +1324,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dataprovider",
+ "serde",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3084,6 +3097,7 @@ dependencies = [
  "ed25519-dalek",
  "flate2",
  "futures-util",
+ "gateway",
  "hmac",
  "include_dir",
  "mime_guess",

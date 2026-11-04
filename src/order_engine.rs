@@ -15,72 +15,12 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use crate::adapters::BrokerAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::event_bus::EventBus;
+use gateway::contract::{EngineHandle, ExecEvent, ExecKind, GatewayMsg};
 use crate::execution::process_execution_report;
-use crate::recon_orders::{
-    increment_price, missing_qty, oms_fill_state, run_order_reconcile, BrokerOrderOutcome, BrokerOrderState,
-};
-
-/// Connectors wait (rather than drop) once this many messages are queued: a
-/// stalled engine slows the streams down, it never loses a fill.
-pub const ENGINE_CHANNEL_CAPACITY: usize = 4096;
-
-/// Where an event came from: the live session, or a snapshot the engine's
-/// reconcile fetched. (Drop copy joins when the first connector has one.)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ExecSource {
-    Session,
-    Snapshot,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ExecKind {
-    /// One fill with the venue's execution id (Alpaca, Binance, Bybit, FIX).
-    Fill { execution_id: String, qty: f64, price: f64 },
-    /// Cumulative order state; books whatever exceeds what the OMS has (Coinbase, OKX).
-    Cumulative { cum_qty: f64, avg_px: f64 },
-    /// The order is closed at the venue, with its final cumulative state.
-    Terminal(BrokerOrderState),
-    Canceled { reason: Option<String> },
-    Rejected { reason: String },
-}
-
-/// What a venue did to one order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExecEvent {
-    pub order_id: Uuid,
-    pub venue: String,
-    /// Labels the events this books (`"binance"`, `"ibkr"`, …).
-    pub actor: &'static str,
-    pub source: ExecSource,
-    pub kind: ExecKind,
-}
-
-impl ExecEvent {
-    /// A live-session event from a transport that already speaks the state
-    /// machine's `ExecutionReport` (Alpaca, Binance, FIX).
-    pub fn from_report(order_id: Uuid, venue: &str, actor: &'static str, report: ExecutionReport) -> Self {
-        let kind = match report {
-            ExecutionReport::Fill { execution_id, fill_qty, fill_price, .. } => {
-                ExecKind::Fill { execution_id, qty: fill_qty, price: fill_price }
-            }
-            ExecutionReport::Canceled { reason, .. } => ExecKind::Canceled { reason },
-            ExecutionReport::Reject { reason, .. } => ExecKind::Rejected { reason },
-        };
-        Self { order_id, venue: venue.to_string(), actor, source: ExecSource::Session, kind }
-    }
-}
-
-/// Everything a connector sends the engine.
-pub enum GatewayMsg {
-    Exec(ExecEvent),
-    /// Reconcile this broker's open orders now (a reconnect, or the heartbeat).
-    /// Carries the adapter because the diff asks the broker about each order it
-    /// resolves, not just for one snapshot.
-    Reconcile { broker_code: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter> },
-}
+use gateway::contract::BrokerOrderOutcome;
+use crate::recon_orders::{increment_price, missing_qty, oms_fill_state, run_order_reconcile};
 
 /// Whether [`reports_for`] needs the OMS's booked fill state for this event.
 pub fn needs_booked_state(kind: &ExecKind) -> bool {
@@ -135,30 +75,6 @@ pub fn reports_for(ev: &ExecEvent, booked_cum: f64, booked_avg: Option<f64>) -> 
         }
         ExecKind::Canceled { reason } => vec![ExecutionReport::Canceled { reason: reason.clone(), venue: Some(venue) }],
         ExecKind::Rejected { reason } => vec![ExecutionReport::Reject { reason: reason.clone(), venue: Some(venue) }],
-    }
-}
-
-/// How a connector reaches the engine.
-#[derive(Clone)]
-pub struct EngineHandle(mpsc::Sender<GatewayMsg>);
-
-impl EngineHandle {
-    pub fn new() -> (Self, mpsc::Receiver<GatewayMsg>) {
-        let (tx, rx) = mpsc::channel(ENGINE_CHANNEL_CAPACITY);
-        (Self(tx), rx)
-    }
-
-    pub async fn exec(&self, ev: ExecEvent) {
-        let order_id = ev.order_id;
-        if self.0.send(GatewayMsg::Exec(ev)).await.is_err() {
-            error!(order_id = %order_id, "order engine is gone; execution event not booked");
-        }
-    }
-
-    pub async fn reconcile(&self, broker_code: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter>) {
-        if self.0.send(GatewayMsg::Reconcile { broker_code, actor, adapter }).await.is_err() {
-            error!(broker = broker_code, "order engine is gone; reconcile skipped");
-        }
     }
 }
 
@@ -267,7 +183,8 @@ pub async fn apply_exec(pool: &PgPool, bus: &EventBus, ev: &ExecEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recon_orders::{BrokerOrderOutcome, BrokerOrderState};
+    use crate::adapters::BrokerAdapter;
+    use gateway::contract::{BrokerOrderOutcome, BrokerOrderState, ExecSource};
 
     fn ev(kind: ExecKind) -> ExecEvent {
         ExecEvent { order_id: Uuid::nil(), venue: "TEST".into(), actor: "test", source: ExecSource::Session, kind }
@@ -360,18 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn report_maps_to_kind() {
-        let id = Uuid::nil();
-        let fill = ExecutionReport::Fill { execution_id: "x".into(), fill_qty: 1.5, fill_price: 9.0, venue: "V".into() };
-        let canceled = ExecutionReport::Canceled { reason: Some("user".into()), venue: Some("V".into()) };
-        let reject = ExecutionReport::Reject { reason: "no funds".into(), venue: None };
-        let kind = |r| ExecEvent::from_report(id, "V", "t", r).kind;
-        assert_eq!(kind(fill), ExecKind::Fill { execution_id: "x".into(), qty: 1.5, price: 9.0 });
-        assert_eq!(kind(canceled), ExecKind::Canceled { reason: Some("user".into()) });
-        assert_eq!(kind(reject), ExecKind::Rejected { reason: "no funds".into() });
-    }
-
-    #[test]
     fn needs_booked_state_only_for_cumulative_and_terminal() {
         let st = BrokerOrderState { outcome: BrokerOrderOutcome::Filled, executed_qty: 1.0, avg_px: 1.0 };
         assert!(needs_booked_state(&ExecKind::Cumulative { cum_qty: 1.0, avg_px: 1.0 }));
@@ -399,7 +304,7 @@ mod tests {
         async fn cancel_order(&self, _: &str, _: &str) -> Result<(), crate::adapters::BrokerError> {
             unreachable!("recon never cancels")
         }
-        async fn open_orders(&self) -> Result<Vec<crate::recon_orders::BrokerOpenOrder>, crate::adapters::BrokerError> {
+        async fn open_orders(&self) -> Result<Vec<gateway::contract::BrokerOpenOrder>, crate::adapters::BrokerError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.release.notified().await;
             Ok(Vec::new())

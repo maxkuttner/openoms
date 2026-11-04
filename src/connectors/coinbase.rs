@@ -58,7 +58,7 @@ impl Connector for Coinbase {
                         order_rx,
                         health.clone(),
                     );
-                    crate::stream_supervisor::supervise("COINBASE/SPOT", health, session).await;
+                    gateway::stream_supervisor::supervise("COINBASE/SPOT", health, session).await;
                 })
             },
         })

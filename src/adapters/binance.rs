@@ -21,7 +21,7 @@ use super::{
     BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest,
     BrokerOrderResponse, InstrumentProvider,
 };
-use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Read a Binance symbol filter's numeric field (e.g. LOT_SIZE.stepSize).
 fn filter_val(filters: &[serde_json::Value], filter_type: &str, field: &str) -> Option<f64> {

@@ -56,7 +56,7 @@ impl Connector for Bybit {
                         order_rx,
                         health.clone(),
                     );
-                    crate::stream_supervisor::supervise("BYBIT/SPOT", health, session).await;
+                    gateway::stream_supervisor::supervise("BYBIT/SPOT", health, session).await;
                 })
             },
         })

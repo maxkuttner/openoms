@@ -18,10 +18,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::adapters::binance::BinanceAdapter;
-use crate::domain::orders::commands::ExecutionReport;
-use crate::order_engine::{EngineHandle, ExecEvent};
-use crate::stream_health::StreamHandle;
-use crate::stream_supervisor::{supervise, Session, StreamResult};
+use gateway::contract::VenueReport;
+use gateway::contract::{EngineHandle, ExecEvent};
+use gateway::stream_health::StreamHandle;
+use gateway::stream_supervisor::{supervise, Session, StreamResult};
 
 const VENUE: &str = "BINANCE";
 
@@ -177,10 +177,10 @@ async fn handle_execution_report(
                 .map(|t| t.to_string())
                 .or_else(|| event["i"].as_i64().map(|i| i.to_string()))
                 .unwrap_or_else(|| client_order_id.to_string());
-            ExecutionReport::Fill { execution_id, fill_qty, fill_price, venue: VENUE.to_string() }
+            VenueReport::Fill { execution_id, fill_qty, fill_price, venue: VENUE.to_string() }
         }
-        "CANCELED" => ExecutionReport::Canceled { reason: None, venue: Some(VENUE.to_string()) },
-        "REJECTED" | "EXPIRED" => ExecutionReport::Reject {
+        "CANCELED" => VenueReport::Canceled { reason: None, venue: Some(VENUE.to_string()) },
+        "REJECTED" | "EXPIRED" => VenueReport::Reject {
             reason: event["X"].as_str().unwrap_or(exec_type).to_string(),
             venue: Some(VENUE.to_string()),
         },
@@ -204,7 +204,7 @@ async fn handle_execution_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order_engine::{EngineHandle, ExecKind, GatewayMsg};
+    use gateway::contract::{EngineHandle, ExecKind, GatewayMsg};
 
     #[tokio::test]
     async fn binance_trade_frame_becomes_fill_event() {

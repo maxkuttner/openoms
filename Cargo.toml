@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/symbology", "crates/dataprovider"]
+members = [".", "crates/symbology", "crates/dataprovider", "crates/gateway"]
 resolver = "2"
 
 [package]
@@ -85,6 +85,7 @@ symbology = { path = "crates/symbology" }
 
 # In-repo data-provider abstraction (universe discovery + seeding + enrichment)
 dataprovider = { path = "crates/dataprovider" }
+gateway = { path = "crates/gateway" }
 
 # CLI (oms setup universe …)
 clap = { version = "4", features = ["derive"] }

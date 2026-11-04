@@ -73,7 +73,7 @@ impl Connector for Binance {
                         order_rx,
                         health.clone(),
                     );
-                    crate::stream_supervisor::supervise("BINANCE/SPOT", health, session).await;
+                    gateway::stream_supervisor::supervise("BINANCE/SPOT", health, session).await;
                 })
             },
         })

@@ -8,9 +8,9 @@ use tokio::task::JoinHandle;
 
 use crate::adapters::BrokerRegistry;
 use crate::event_bus::EventBus;
-use crate::order_engine::EngineHandle;
+use gateway::contract::EngineHandle;
 use crate::marks::MarkStore;
-use crate::stream_health::StreamHealthRegistry;
+use gateway::stream_health::StreamHealthRegistry;
 
 /// The OpenFIGI-backed instrument identification engine, with an in-memory cache.
 pub type SymbologyEngine = Identifier<OpenFigiClient, InMemoryCache>;

@@ -16,9 +16,9 @@ use crate::adapters::{BrokerAdapter, InstrumentProvider};
 use crate::credentials::{BrokerCredentials, Shown};
 use crate::credentials_api::TestOutcome;
 use crate::event_bus::OrderLaneEvent;
-use crate::order_engine::EngineHandle;
+use gateway::contract::EngineHandle;
 use crate::reload::RegistrationDeps;
-use crate::stream_health::StreamHandle;
+use gateway::stream_health::StreamHandle;
 use crate::venues::Venue;
 
 mod alpaca;

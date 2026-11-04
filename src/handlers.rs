@@ -2312,7 +2312,7 @@ pub(crate) mod tests {
     async fn a_submitted_order_records_the_principal_that_sent_it() {
         use crate::app_state::AppState;
         use crate::adapters::BrokerRegistry;
-        use crate::stream_health::StreamHealthRegistry;
+        use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
         let pool = test_pool().await;
@@ -2422,7 +2422,7 @@ pub(crate) mod tests {
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
-            crate::order_engine::EngineHandle::new().0,
+            gateway::contract::EngineHandle::new().0,
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
@@ -3163,7 +3163,7 @@ pub(crate) mod tests {
     /// order or reads the registry, so an empty one is correct, not a stub.
     pub(crate) fn test_app_state(pool: sqlx::PgPool) -> AppState {
         use crate::adapters::BrokerRegistry;
-        use crate::stream_health::StreamHealthRegistry;
+        use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
         let (quote_tx, _quote_rx) = tokio::sync::mpsc::channel(1);
@@ -3175,7 +3175,7 @@ pub(crate) mod tests {
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
-            crate::order_engine::EngineHandle::new().0,
+            gateway::contract::EngineHandle::new().0,
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),

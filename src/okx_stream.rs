@@ -10,9 +10,9 @@
 //! after a partial fill may carry them again), and the execution path does not
 //! dedupe by execution id — so a push is never booked as one trade. Instead the
 //! OMS books whatever OKX has filled that it hasn't
-//! ([`crate::order_engine::ExecKind::Cumulative`]), and `filled` / `canceled` /
+//! ([`gateway::contract::ExecKind::Cumulative`]), and `filled` / `canceled` /
 //! `mmp_canceled` close the order through reconcile
-//! ([`crate::order_engine::ExecKind::Terminal`]). Both are idempotent.
+//! ([`gateway::contract::ExecKind::Terminal`]). Both are idempotent.
 
 use std::sync::Arc;
 
@@ -23,10 +23,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::adapters::okx::{oms_order_id, parse_order_state, OkxAdapter};
-use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
-use crate::recon_orders::BrokerOrderState;
-use crate::stream_health::StreamHandle;
-use crate::stream_supervisor::{supervise, Session, StreamResult};
+use gateway::contract::{EngineHandle, ExecEvent, ExecKind, ExecSource};
+use gateway::contract::BrokerOrderState;
+use gateway::stream_health::StreamHandle;
+use gateway::stream_supervisor::{supervise, Session, StreamResult};
 
 const VENUE: &str = "OKX";
 
@@ -192,7 +192,7 @@ async fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recon_orders::BrokerOrderOutcome;
+    use gateway::contract::BrokerOrderOutcome;
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
 
@@ -205,7 +205,7 @@ mod tests {
         let ev = exec_event(order_id, update);
         assert_eq!(ev.order_id, order_id);
         assert_eq!(ev.actor, "okx");
-        assert!(matches!(ev.kind, crate::order_engine::ExecKind::Terminal(_)), "{:?}", ev.kind);
+        assert!(matches!(ev.kind, gateway::contract::ExecKind::Terminal(_)), "{:?}", ev.kind);
     }
 
     fn sample(name: &str) -> serde_json::Value {

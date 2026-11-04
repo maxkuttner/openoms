@@ -27,7 +27,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
-use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 const REST_URL: &str = "https://openapi.okx.com";
 

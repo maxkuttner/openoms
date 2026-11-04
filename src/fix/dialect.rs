@@ -1,14 +1,14 @@
 //! The per-broker seam. QuickFIX owns the session; a `FixDialect` owns the
 //! parts that differ between venues: the FIX version, the Logon auth fields, how
 //! an order maps onto `NewOrderSingle`/`OrderCancelRequest`, and how an inbound
-//! `ExecutionReport` (35=8) maps back to our internal [`ExecutionReport`].
+//! `VenueReport` (35=8) maps back to our internal [`VenueReport`].
 
 use quickfix::{FieldMap, Message};
 use uuid::Uuid;
 
 use crate::adapters::{BrokerError, BrokerOrderRequest};
-use crate::domain::orders::commands::ExecutionReport;
-use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+use gateway::contract::VenueReport;
+use gateway::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// FIX field tags used across dialects. Named so the message-building code reads
 /// like the spec rather than a wall of integers. A few are kept for completeness
@@ -50,7 +50,7 @@ pub mod tag {
     pub const LAST_RPT_REQUESTED: i32 = 912;
 }
 
-/// A parsed inbound `ExecutionReport` (35=8), addressed to one of our orders.
+/// A parsed inbound `VenueReport` (35=8), addressed to one of our orders.
 pub struct ParsedExecReport {
     /// Our order UUID, taken from `ClOrdID`(11) (or `OrigClOrdID`(41) on cancels).
     pub order_id: Uuid,
@@ -62,7 +62,7 @@ pub struct ParsedExecReport {
     pub is_ack: bool,
     /// The normalized report to apply, if this message changes OMS state. `None`
     /// for a pure ack (New) that only resolves the submit oneshot.
-    pub report: Option<ExecutionReport>,
+    pub report: Option<VenueReport>,
     /// A reject reason, when `ExecType`/`OrdStatus` say the order was rejected —
     /// used to fail a pending `submit_order`.
     pub reject_reason: Option<String>,
@@ -74,7 +74,7 @@ pub trait FixDialect: Send + Sync {
     /// FIX version string for the session, e.g. `"FIX.4.2"` / `"FIX.4.4"`.
     fn begin_string(&self) -> &'static str;
 
-    /// The venue this dialect trades, as it appears in `ExecutionReport.venue`
+    /// The venue this dialect trades, as it appears in `VenueReport.venue`
     /// and the broker registry key (`"IBKR"` / `"BINANCE"`).
     fn venue(&self) -> &'static str;
 
@@ -89,14 +89,14 @@ pub trait FixDialect: Send + Sync {
     /// Build an `OrderCancelRequest` (35=F) for a resting order.
     fn build_cancel(&self, external_order_id: &str, symbol: &str) -> Result<Message, BrokerError>;
 
-    /// Map an inbound `ExecutionReport` (35=8) to our internal report. Returns
+    /// Map an inbound `VenueReport` (35=8) to our internal report. Returns
     /// `None` when the message isn't an execution report or its `ClOrdID` isn't a
     /// UUID we issued. Most dialects delegate to [`parse_standard_exec_report`].
     fn parse_execution_report(&self, msg: &Message) -> Option<ParsedExecReport>;
 
     /// Build an `Order Mass Status Request` (35=AF) for the snapshot side of order
     /// reconciliation — `MassStatusReqType`(585)=7 (all orders). The broker replies
-    /// with one `ExecutionReport` (`ExecType=I`) per order, echoing
+    /// with one `VenueReport` (`ExecType=I`) per order, echoing
     /// `MassStatusReqID`(584), the last carrying `LastRptRequested`(912)=Y. Standard
     /// FIX 4.3+; on a venue that doesn't answer it (e.g. an older gateway) the
     /// caller's wait simply times out and reconciliation is skipped.
@@ -134,7 +134,7 @@ pub trait FixDialect: Send + Sync {
     }
 }
 
-/// A solicited order-status `ExecutionReport` (`ExecType=I`), the reply to a 35=AF /
+/// A solicited order-status `VenueReport` (`ExecType=I`), the reply to a 35=AF /
 /// 35=H. Carries the order's cumulative state rather than a single fill.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusReport {
@@ -187,7 +187,7 @@ impl StatusReport {
     }
 }
 
-/// Parse a solicited order-status `ExecutionReport` (35=8 with `ExecType`(150)=`I`).
+/// Parse a solicited order-status `VenueReport` (35=8 with `ExecType`(150)=`I`).
 /// Returns `None` for anything else — including live fills/acks, which stay on the
 /// existing execution path.
 pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
@@ -216,7 +216,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::adapters::BrokerOrderRequest;
-    use crate::domain::orders::commands::ExecutionReport;
+    use gateway::contract::VenueReport;
     use crate::fix::binance::BinanceDialect;
     use crate::fix::ibkr::IbkrDialect;
 
@@ -234,7 +234,7 @@ mod tests {
         }
     }
 
-    /// Build an inbound ExecutionReport (35=8) message for parser tests.
+    /// Build an inbound VenueReport (35=8) message for parser tests.
     fn exec_report(fields: &[(i32, &str)]) -> Message {
         let mut m = Message::new();
         m.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "8")).unwrap();
@@ -310,7 +310,7 @@ mod tests {
             ]);
             let p = parse_standard_exec_report(&msg, "BINANCE").unwrap();
             match p.report {
-                Some(ExecutionReport::Fill { fill_qty, fill_price, execution_id, venue }) => {
+                Some(VenueReport::Fill { fill_qty, fill_price, execution_id, venue }) => {
                     assert_eq!(fill_qty, 0.5);
                     assert_eq!(fill_price, 100.25);
                     assert_eq!(execution_id, "E-1");
@@ -331,7 +331,7 @@ mod tests {
         ]);
         let p = parse_standard_exec_report(&msg, "IBKR").unwrap();
         assert_eq!(p.reject_reason.as_deref(), Some("insufficient balance"));
-        assert!(matches!(p.report, Some(ExecutionReport::Reject { .. })));
+        assert!(matches!(p.report, Some(VenueReport::Reject { .. })));
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
         ]);
         let p = parse_standard_exec_report(&msg, "BINANCE").unwrap();
         assert_eq!(p.order_id, orig, "must key on the original order, not the cancel id");
-        assert!(matches!(p.report, Some(ExecutionReport::Canceled { .. })));
+        assert!(matches!(p.report, Some(VenueReport::Canceled { .. })));
     }
 
     #[test]
@@ -436,7 +436,7 @@ pub fn transact_time() -> String {
     chrono::Utc::now().format("%Y%m%d-%H:%M:%S%.3f").to_string()
 }
 
-/// Parse a standard FIX `ExecutionReport` (35=8). The field tags used here —
+/// Parse a standard FIX `VenueReport` (35=8). The field tags used here —
 /// `ExecType`(150), `OrdStatus`(39), `LastQty`(32)/`LastPx`(31), `OrderID`(37),
 /// `ExecID`(17) — are common to FIX 4.2 and 4.4, so both dialects share this. The
 /// only version wrinkle is `ExecType`: 4.2 fills report `1`/`2`, 4.4 reports `F`.
@@ -478,7 +478,7 @@ pub fn parse_standard_exec_report(msg: &Message, venue: &str) -> Option<ParsedEx
                 .get_field(tag::EXEC_ID)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| cl.clone());
-            out.report = Some(ExecutionReport::Fill {
+            out.report = Some(VenueReport::Fill {
                 execution_id,
                 fill_qty,
                 fill_price,
@@ -487,7 +487,7 @@ pub fn parse_standard_exec_report(msg: &Message, venue: &str) -> Option<ParsedEx
         }
         // Canceled.
         "4" => {
-            out.report = Some(ExecutionReport::Canceled {
+            out.report = Some(VenueReport::Canceled {
                 reason: msg.get_field(tag::TEXT),
                 venue: Some(venue.to_string()),
             });
@@ -499,7 +499,7 @@ pub fn parse_standard_exec_report(msg: &Message, venue: &str) -> Option<ParsedEx
                 .or_else(|| msg.get_field(tag::ORD_REJ_REASON))
                 .unwrap_or_else(|| "rejected".to_string());
             out.reject_reason = Some(reason.clone());
-            out.report = Some(ExecutionReport::Reject {
+            out.report = Some(VenueReport::Reject {
                 reason,
                 venue: Some(venue.to_string()),
             });

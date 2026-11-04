@@ -15,7 +15,7 @@ use crate::app_state::{AppState, StreamRegistry};
 use crate::credentials::{self, BrokerCredentials, FeedCredentials};
 use crate::reload::{self, RegistrationDeps, ReloadStreams};
 use crate::secrets::{parse_master_key, MasterKey};
-use crate::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
+use gateway::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
 
 fn key() -> MasterKey {
     parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap()
@@ -30,7 +30,7 @@ fn state(pool: PgPool) -> AppState {
     AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(),
         symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
         StreamHealthRegistry::new(), crate::event_bus::EventBus::new(),
-        crate::order_engine::EngineHandle::new().0, quote_tx,
+        gateway::contract::EngineHandle::new().0, quote_tx,
         crate::sessions::SessionConfig {
             cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
             ttl: crate::sessions::SessionTtl::default(),

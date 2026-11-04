@@ -19,7 +19,7 @@ use reqwest::Client;
 use tracing::info;
 
 use super::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
-use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Quantities and prices as plain decimals without float noise — Bybit's rule.
 pub(crate) use super::bybit::decimal;

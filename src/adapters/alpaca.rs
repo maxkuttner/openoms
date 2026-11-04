@@ -9,7 +9,7 @@ use super::{
     BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest,
     BrokerOrderResponse, InstrumentProvider,
 };
-use crate::recon_orders::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Alpaca's market-data API is a separate host from the trading API
 /// (`api.alpaca.markets`/`paper-api.alpaca.markets`) and is not

@@ -20,8 +20,8 @@ use crate::app_state::{AppState, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::opra_stream::DatabentoOpraFeed;
 use crate::quote_feed::QuoteFeedSession;
-use crate::stream_health::{StreamHealthRegistry, StreamKind};
-use crate::stream_supervisor;
+use gateway::stream_health::{StreamHealthRegistry, StreamKind};
+use gateway::stream_supervisor;
 
 /// What happened to one connection during a registration pass.
 ///
@@ -78,7 +78,7 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
 /// constructing (or re-deriving) their own.
 pub struct RegistrationDeps {
     pub stream_health: StreamHealthRegistry,
-    pub engine: crate::order_engine::EngineHandle,
+    pub engine: gateway::contract::EngineHandle,
 }
 
 /// Everything `build_registry` produces: the registry, the per-connection report,
@@ -375,7 +375,7 @@ mod tests {
     fn stub_deps() -> RegistrationDeps {
         RegistrationDeps {
             stream_health: StreamHealthRegistry::new(),
-            engine: crate::order_engine::EngineHandle::new().0,
+            engine: gateway::contract::EngineHandle::new().0,
         }
     }
 
@@ -661,7 +661,7 @@ mod tests {
         c.environment = Some("PAPER".into());
         let deps = RegistrationDeps {
             stream_health: StreamHealthRegistry::new(),
-            engine: crate::order_engine::EngineHandle::new().0,
+            engine: gateway::contract::EngineHandle::new().0,
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "PAPER").is_none());
@@ -679,7 +679,7 @@ mod tests {
     async fn a_configured_coinbase_connection_is_registered_and_handed_back() {
         let deps = RegistrationDeps {
             stream_health: StreamHealthRegistry::new(),
-            engine: crate::order_engine::EngineHandle::new().0,
+            engine: gateway::contract::EngineHandle::new().0,
         };
         let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "LIVE").is_some());
@@ -709,7 +709,7 @@ mod tests {
     async fn a_configured_okx_connection_is_registered_and_handed_back_for_its_stream() {
         let deps = RegistrationDeps {
             stream_health: StreamHealthRegistry::new(),
-            engine: crate::order_engine::EngineHandle::new().0,
+            engine: gateway::contract::EngineHandle::new().0,
         };
         let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("OKX", "PAPER").is_some());
@@ -732,7 +732,7 @@ mod tests {
         );
         let deps = RegistrationDeps {
             stream_health: StreamHealthRegistry::new(),
-            engine: crate::order_engine::EngineHandle::new().0,
+            engine: gateway::contract::EngineHandle::new().0,
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("BYBIT", "PAPER").is_some());

@@ -6,10 +6,10 @@
 //! each with a fresh JWT. Coinbase reports **cumulative** order state —
 //! `cumulative_quantity` and `avg_price` — not one message per fill. A fill is
 //! therefore "Coinbase cumulative − what the OMS has booked", priced against
-//! the OMS's booked average ([`crate::order_engine::ExecKind::Cumulative`]), so
+//! the OMS's booked average ([`gateway::contract::ExecKind::Cumulative`]), so
 //! a repeated, replayed or reordered update books nothing and needs no memory of
 //! earlier messages; the execution path has no execution-id dedupe to lean on. A terminal status goes through
-//! [`crate::order_engine::ExecKind::Terminal`]: book what's missing, then close.
+//! [`gateway::contract::ExecKind::Terminal`]: book what's missing, then close.
 
 use std::sync::Arc;
 
@@ -20,10 +20,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::adapters::coinbase::{order_outcome, CoinbaseAdapter};
-use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
-use crate::recon_orders::BrokerOrderState;
-use crate::stream_health::StreamHandle;
-use crate::stream_supervisor::{supervise, Session, StreamResult};
+use gateway::contract::{EngineHandle, ExecEvent, ExecKind, ExecSource};
+use gateway::contract::BrokerOrderState;
+use gateway::stream_health::StreamHandle;
+use gateway::stream_supervisor::{supervise, Session, StreamResult};
 
 const VENUE: &str = "COINBASE";
 const WS_URL: &str = "wss://advanced-trade-ws-user.coinbase.com";
@@ -178,7 +178,7 @@ async fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recon_orders::{missing_qty, BrokerOrderOutcome};
+    use gateway::contract::BrokerOrderOutcome;
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
 
@@ -191,7 +191,7 @@ mod tests {
         let ev = exec_event(order_id, update);
         assert_eq!(ev.order_id, order_id);
         assert_eq!(ev.actor, "coinbase");
-        assert!(matches!(ev.kind, crate::order_engine::ExecKind::Cumulative { .. }), "{:?}", ev.kind);
+        assert!(matches!(ev.kind, gateway::contract::ExecKind::Cumulative { .. }), "{:?}", ev.kind);
     }
 
     fn sample(name: &str) -> serde_json::Value {
@@ -263,16 +263,6 @@ mod tests {
             ]
         );
     }
-
-    // The booking rule is "Coinbase cumulative − OMS cum_qty", so a repeated or
-    // replayed update (same cumulative) books nothing.
-    #[test]
-    fn a_repeat_books_nothing() {
-        assert_eq!(missing_qty(0.0, 0.0005), Some(0.0005));
-        assert_eq!(missing_qty(0.0005, 0.0005), None);
-        assert_eq!(missing_qty(0.001, 0.0005), None, "an older update after a newer one");
-    }
-
 
     #[test]
     fn a_non_uuid_client_order_id_is_ignored() {

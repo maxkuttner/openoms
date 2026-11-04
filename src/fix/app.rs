@@ -15,10 +15,10 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::domain::orders::commands::ExecutionReport;
+use gateway::contract::VenueReport;
 use crate::fix::dialect::{parse_order_status_report, tag, FixDialect, StatusReport};
-use crate::recon_orders::{BrokerOpenOrder, BrokerOrderState};
-use crate::stream_health::StreamHandle;
+use gateway::contract::{BrokerOpenOrder, BrokerOrderState};
+use gateway::stream_health::StreamHandle;
 
 /// Result handed back to a waiting `submit_order`: the broker `OrderID` on accept,
 /// or a reject reason.
@@ -44,7 +44,7 @@ pub type PendingStatus = Arc<Mutex<HashMap<String, oneshot::Sender<BrokerOrderSt
 
 /// A normalized inbound report addressed to one of our orders, carried from the
 /// callback thread to the async drain task.
-pub type InboundReport = (Uuid, ExecutionReport);
+pub type InboundReport = (Uuid, VenueReport);
 
 /// Bridges one broker's QuickFIX session to the OMS. One instance per session.
 pub struct FixApplication {
