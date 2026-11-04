@@ -66,7 +66,7 @@ mod marks;
 mod daily_stats;
 mod opra_stream;
 
-mod quote_feed;
+mod market_data;
 mod mark_router;
 mod daily_stats_poller;
 mod feeds;
@@ -1054,12 +1054,11 @@ async fn serve() {
     let (engine, engine_rx) = gateway::contract::EngineHandle::new();
     tokio::spawn(order_engine::run(engine_rx, engine.clone(), pool.clone(), event_bus.clone()));
 
-    // Quote channel every market-data feed publishes onto. Created here, ahead
-    // of `AppState`, for the same reason: a runtime reload needs to hand a
-    // restarted feed this exact sender, not a disconnected second channel, so
-    // it has to be a value `AppState` can hold and hand back out, not a
-    // `serve()`-local threaded only through the boot-time spawns below.
-    let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
+    // The market data gateway, and the one receiver of every quote it emits.
+    // Created here, ahead of `AppState`, for the same reason: a runtime reload
+    // restarts a credentialed feed on this exact gateway, so its quotes reach
+    // the one mark router boot started.
+    let (market_data, quote_rx) = gateway::md::MarketDataGateway::new(stream_health.clone());
 
     // Adapters come from the store, not the environment. `build_registry` is the
     // one code path that turns a credential into an adapter, so a credential
@@ -1098,10 +1097,10 @@ async fn serve() {
     // AppState. Constructed with an empty registry and immediately swapped to the
     // one `build_registry` just produced — the same `swap_registries` call a
     // runtime reload will use — so boot itself exercises that path rather than
-    // being the one caller that bypasses it. `event_bus` and
-    // `quote_tx` are handed in (not just kept as `serve()` locals) so the
+    // being the one caller that bypasses it. `event_bus` and the market data
+    // gateway are handed in (not just kept as `serve()` locals) so the
     // `/admin/connections/reload` handler can rebuild an equivalent
-    // `RegistrationDeps` and restart feeds against the same channels boot used.
+    // `RegistrationDeps` and restart feeds on the same gateway boot used.
     // Session cookie policy is derived once here from the OIDC public base URL
     // — the browser's own view of this server, so a TLS terminator in front of
     // a loopback bind still gets `Secure` and the `__Host-` prefix — falling
@@ -1133,7 +1132,7 @@ async fn serve() {
         stream_health,
         event_bus,
         engine,
-        quote_tx.clone(),
+        std::sync::Arc::new(market_data),
         session_config,
     );
     state.swap_registries(registry, daily_stats);
@@ -1152,7 +1151,7 @@ async fn serve() {
         Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
-    // (stream_health, event_bus and quote_tx/rx were created
+    // (stream_health, event_bus and the market data gateway were created
     // before the broker registry so FIX sessions could use them, and before
     // `AppState` so it could be constructed holding them.)
 
@@ -1264,11 +1263,9 @@ async fn serve() {
                 // exercises the exact same call a runtime reload will use.
                 reload::restart_databento_feed(
                     api_key.clone(),
-                    state.pool().clone(),
+                    state.market_data(),
                     state.stream_health(),
                     state.streams(),
-                    state.event_bus(),
-                    quote_tx.clone(),
                 ).await;
                 info!(code = %conn.code, "registered DATABENTO/OPRA feed");
             }
@@ -1276,23 +1273,11 @@ async fn serve() {
     }
 
     // Public market data: every connector whose venue has a public quote feed
-    // runs it — no credentials, so it is always on. Each takes its own
-    // order-lane subscription to learn when positions change. Not registered in
-    // `StreamRegistry`: no credential can change under it, so a reload has
-    // nothing to restart; it runs for the life of the process.
-    for connector in gateway::connectors::all() {
-        if let Some(feed) = connector.public_feed() {
-            let health = state.stream_health().handle(connector.manifest().code, "SPOT", gateway::stream_health::StreamKind::Feed);
-            let session = quote_feed::QuoteFeedSession::new(
-                (feed.source)(),
-                state.pool().clone(),
-                quote_tx.clone(),
-                state.event_bus().subscribe_order(),
-                health.clone(),
-            );
-            tokio::spawn(async move { gateway::stream_supervisor::supervise(feed.label, health, session).await });
-        }
-    }
+    // runs it on the market data gateway — no credentials, so it is always on,
+    // for the life of the process. What they price is what is held: the core
+    // keeps the gateway's subscriptions in step with the position table.
+    state.market_data().start_public_feeds();
+    tokio::spawn(market_data::run(state.pool().clone(), state.market_data().handle(), state.event_bus().subscribe_order()));
 
     // Load each credentialed broker's never-loaded instrument universe as a
     // background job, after everything above so the load never delays the server

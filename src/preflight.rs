@@ -254,25 +254,24 @@ struct HeldRow {
     venue: Option<String>,
 }
 
-/// Whether `feed` would actually subscribe this instrument.
-///
-/// Mirrors `load_subscribable` exactly: every `Some` field of `candidates()` must
-/// match, *and* `to_feed_symbol` must accept the symbol. Checking only some of the
-/// filter would over-report coverage and hide the very positions this exists to
-/// surface.
-fn covers(feed: &dyn dataprovider::FeedSymbology, row: &HeldRow) -> bool {
-    let f = feed.candidates();
-    let matches = |want: Option<&str>, have: &Option<String>| match (want, have) {
-        (None, _) => true,
-        (Some(w), Some(h)) => w == h,
-        // The filter constrains a column the row has no value for: not a match.
-        (Some(_), None) => false,
-    };
+impl HeldRow {
+    /// What the market data gateway is told about this position's instrument;
+    /// `None` when the instrument is gone or has no symbol.
+    fn instrument(&self) -> Option<dataprovider::InstrumentRef> {
+        Some(dataprovider::InstrumentRef {
+            id: self.id?,
+            symbol: self.symbol.clone()?,
+            instrument_class: self.instrument_class.clone(),
+            asset_class: self.asset_class.clone(),
+            venue: self.venue.clone(),
+        })
+    }
+}
 
-    matches(f.instrument_class, &row.instrument_class)
-        && matches(f.asset_class, &row.asset_class)
-        && matches(f.venue, &row.venue)
-        && row.symbol.as_deref().is_some_and(|s| feed.to_feed_symbol(s).is_some())
+/// Whether `feed` would actually subscribe this position's instrument — the
+/// same check the market data gateway makes (`dataprovider::covers`).
+fn covers(feed: &dyn dataprovider::FeedSymbology, row: &HeldRow) -> bool {
+    row.instrument().is_some_and(|i| dataprovider::covers(feed, &i))
 }
 
 /// Render up to [`SAMPLE`] names, noting how many were withheld.

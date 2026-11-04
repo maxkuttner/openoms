@@ -1,6 +1,6 @@
 //! The market-data feeds this build ships, as a lookup by feed code.
 //!
-//! The live path does not need this: `QuoteFeedSession` is generic over its feed,
+//! The live path does not need this: `gateway::md`'s `FeedSession` is generic over its feed,
 //! so it reaches [`dataprovider::FeedSymbology`] through the concrete type. This
 //! registry exists for the callers that only hold a *code* — a `provider_feed_policy`
 //! row, a preflight report — and must find the symbology behind it.

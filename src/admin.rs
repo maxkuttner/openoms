@@ -3316,7 +3316,6 @@ mod tests {
         use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
-        let (quote_tx, _quote_rx) = tokio::sync::mpsc::channel(1);
         AppState::new(
             pool,
             "test-admin-token".to_string(),
@@ -3326,7 +3325,7 @@ mod tests {
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
             gateway::contract::EngineHandle::new().0,
-            quote_tx,
+            std::sync::Arc::new(gateway::md::MarketDataGateway::new(StreamHealthRegistry::new()).0),
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
                 ttl: crate::sessions::SessionTtl::default(),

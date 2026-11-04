@@ -6,8 +6,8 @@
 //! would leave an illiquid contract unmarked for hours.)
 //!
 //! Everything not specific to Databento's wire format lives elsewhere:
-//! [`crate::quote_feed`] decides what to subscribe to and watches for new
-//! positions, [`gateway::stream_supervisor`] reconnects, and
+//! [`crate::market_data`] tells the market data gateway what is held,
+//! `gateway::md` decides what this feed subscribes and adds new positions, [`gateway::stream_supervisor`] reconnects, and
 //! [`crate::mark_router`] decides what becomes a mark.
 
 use std::collections::HashMap;

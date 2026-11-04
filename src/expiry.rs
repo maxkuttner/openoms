@@ -19,7 +19,7 @@
 //!
 //! Retiring an instrument is all this does. The existing `status = 'ACTIVE'` filters
 //! on the order path ([`crate::handlers`]) and the subscription path
-//! ([`crate::quote_feed::load_subscribable`]) then take effect on their own — no
+//! ([`crate::market_data::held_instruments`]) then take effect on their own — no
 //! expiry-awareness anywhere else.
 //!
 //! Deliberately *not* here: what happens to an open order or a held position when its

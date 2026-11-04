@@ -9,11 +9,8 @@
 
 use std::sync::Arc;
 
-use sqlx::PgPool;
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::event_bus::EventBus;
 use gateway::adapter::{BrokerAdapter, BrokerRegistry};
 use gateway::connectors::{self, ExecStream, RegistrationDeps};
 use gateway::md::daily_stats::DailyStatsRegistry;
@@ -21,9 +18,8 @@ use crate::app_state::{AppState, StreamRegistry};
 use gateway::credentials::BrokerCredentials;
 use crate::credentials::{Connection, CredentialState};
 use crate::opra_stream::DatabentoOpraFeed;
-use crate::quote_feed::QuoteFeedSession;
 use gateway::stream_health::{StreamHealthRegistry, StreamKind};
-use gateway::stream_supervisor;
+use gateway::md::MarketDataGateway;
 
 /// What happened to one connection during a registration pass.
 ///
@@ -251,8 +247,8 @@ pub async fn build_registry(
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
 /// publishing the fresh handle into `streams` under the code ("databento-opra")
-/// this feed always runs under. The fresh session subscribes to the same bus's
-/// order lane every other feed listens on.
+/// this feed always runs under. It runs on the market data gateway, so it prices
+/// what every other feed is told is held and feeds the same mark router.
 ///
 /// Only Databento is credential-driven among the market-data feeds — Binance
 /// and Bybit are public and are never restarted here or anywhere else (see
@@ -265,29 +261,14 @@ pub async fn build_registry(
 /// restart are the same call.
 pub async fn restart_databento_feed(
     api_key: String,
-    pool: PgPool,
+    md: &MarketDataGateway,
     stream_health: &StreamHealthRegistry,
     streams: &StreamRegistry,
-    bus: &EventBus,
-    quote_tx: mpsc::Sender<dataprovider::Quote>,
 ) {
     streams.abort_and_remove("databento-opra").await;
     let health = stream_health.handle("DATABENTO", "OPRA", StreamKind::Feed);
     health.set_connecting();
-    let session = QuoteFeedSession::new(
-        Arc::new(DatabentoOpraFeed::new(api_key)),
-        pool,
-        quote_tx,
-        bus.subscribe_order(),
-        health.clone(),
-    );
-    // `supervise` returns `!` (it never returns), so `JoinHandle<!>` — wrap it in
-    // a block so the spawned future's output is `()`, matching what
-    // `StreamRegistry` stores. The wrapping changes nothing about behavior:
-    // `.await` on a `!`-returning future never completes either way.
-    let handle = tokio::spawn(async move {
-        stream_supervisor::supervise("DATABENTO/OPRA", health, session).await;
-    });
+    let handle = md.start_vendor_feed(Arc::new(DatabentoOpraFeed::new(api_key)), "DATABENTO/OPRA", health);
     streams.insert("databento-opra", handle);
 }
 
@@ -312,8 +293,7 @@ impl ReloadStreams for LiveReloadStreams {
     }
 
     async fn databento(&self, api_key: String, state: &AppState) {
-        restart_databento_feed(api_key, state.pool().clone(), state.stream_health(),
-            state.streams(), state.event_bus(), state.quote_tx()).await;
+        restart_databento_feed(api_key, state.market_data(), state.stream_health(), state.streams()).await;
     }
 }
 

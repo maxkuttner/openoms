@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use symbology::{Identifier, InMemoryCache, OpenFigiClient};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use gateway::adapter::BrokerRegistry;
 use gateway::md::daily_stats::DailyStatsRegistry;
+use gateway::md::MarketDataGateway;
 use crate::event_bus::EventBus;
 use gateway::contract::EngineHandle;
 use crate::marks::MarkStore;
@@ -104,10 +104,9 @@ pub struct AppState {
     /// The order engine's inbox, so a reload can hand restarted connectors the
     /// same engine boot started.
     engine: EngineHandle,
-    /// Where every market-data feed publishes quotes. Stored so a reload can
-    /// hand a restarted feed the same channel the boot-time `mark_router` task
-    /// already reads from, instead of constructing a second, disconnected one.
-    quote_tx: mpsc::Sender<dataprovider::Quote>,
+    /// The market data gateway. Stored so a reload can restart a credentialed
+    /// feed on the same gateway whose quotes the boot-time `mark_router` reads.
+    market_data: Arc<MarketDataGateway>,
 }
 
 impl AppState {
@@ -121,7 +120,7 @@ impl AppState {
         stream_health: StreamHealthRegistry,
         event_bus: EventBus,
         engine: EngineHandle,
-        quote_tx: mpsc::Sender<dataprovider::Quote>,
+        market_data: Arc<MarketDataGateway>,
         session_config: crate::sessions::SessionConfig,
     ) -> Self {
         Self {
@@ -139,7 +138,7 @@ impl AppState {
             streams: StreamRegistry::new(),
             event_bus,
             engine,
-            quote_tx,
+            market_data,
         }
     }
 
@@ -201,11 +200,9 @@ impl AppState {
         &self.engine
     }
 
-    /// A fresh handle on the shared quote channel every market-data feed
-    /// publishes onto, for restarting a feed outside of boot (see
-    /// `reload::restart_databento_feed`).
-    pub fn quote_tx(&self) -> mpsc::Sender<dataprovider::Quote> {
-        self.quote_tx.clone()
+    /// The market data gateway, for starting feeds and telling it what is held.
+    pub fn market_data(&self) -> &MarketDataGateway {
+        &self.market_data
     }
 }
 
@@ -222,10 +219,8 @@ mod tests {
         let symbology = Identifier::new(OpenFigiClient::new(None), InMemoryCache::new());
         let mut registry = BrokerRegistry::new();
         registry.register("ALPACA", "PAPER", sample_alpaca_adapter());
-        // Nothing in these tests drains either channel — they only exercise the
-        // registry swap and the stream registry, never a real fill or
-        // a real quote.
-        let (quote_tx, _quote_rx) = mpsc::channel(1);
+        // Nothing in these tests drains the quote channel — they only exercise
+        // the registry swap and the stream registry, never a real quote.
         AppState::new(
             pool,
             "test-admin-token".to_string(),
@@ -235,7 +230,7 @@ mod tests {
             StreamHealthRegistry::new(),
             EventBus::new(),
             EngineHandle::new().0,
-            quote_tx,
+            Arc::new(MarketDataGateway::new(StreamHealthRegistry::new()).0),
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
                 ttl: crate::sessions::SessionTtl::default(),
@@ -321,7 +316,7 @@ mod tests {
 
         // The sender was dropped with the task, so the channel closes — this is
         // the actual proof the task was aborted, not just unregistered.
-        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected),
+        assert_eq!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
             "stop must finish cancellation before returning, not at a later await");
         // And the map entry itself is gone, not just the task inside it left
         // to dangle — reached via the private field directly (this test module

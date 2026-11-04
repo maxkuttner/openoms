@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::{extract::State, middleware, routing::post, Router};
 use sqlx::{postgres::PgConnectOptions, PgPool};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 
 use gateway::adapter::BrokerRegistry;
 use gateway::md::daily_stats::DailyStatsRegistry;
@@ -30,11 +30,10 @@ fn adapter() -> Arc<AlpacaAdapter> {
 }
 
 fn state(pool: PgPool) -> AppState {
-    let (quote_tx, _) = mpsc::channel(1);
     AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(),
         symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
         StreamHealthRegistry::new(), crate::event_bus::EventBus::new(),
-        gateway::contract::EngineHandle::new().0, quote_tx,
+        gateway::contract::EngineHandle::new().0, std::sync::Arc::new(gateway::md::MarketDataGateway::new(StreamHealthRegistry::new()).0),
         crate::sessions::SessionConfig {
             cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
             ttl: crate::sessions::SessionTtl::default(),

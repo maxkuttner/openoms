@@ -29,7 +29,8 @@ pub use error::ProviderError;
 pub use instrument::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
 pub use provider::DataProvider;
 pub use quote::{
-    FeedHealth, FeedSymbology, InstrumentFilter, LiveQuoteFeed, NoFeedHealth, Quote, SymbolAdds,
+    covers, FeedHealth, FeedSymbology, InstrumentFilter, InstrumentRef, LiveQuoteFeed, NoFeedHealth, Quote,
+    SymbolAdds,
 };
 
 pub use enrichers::openfigi::OpenFigiEnricher;
