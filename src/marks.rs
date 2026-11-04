@@ -15,6 +15,8 @@ impl Mark {
     pub fn mid(&self) -> f64 { (self.bid + self.ask) / 2.0 }
 }
 
+// latest accepted mark per instrument; the event bus's price lane mirrors every
+// write (see `mark_router::apply_accepted`)
 #[derive(Clone, Default)]
 pub struct MarkStore {
     // create a atomic smart pointer to a multiple-readers single-writer hashmap

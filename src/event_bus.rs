@@ -64,6 +64,8 @@ impl EventBus {
         self.order.subscribe()
     }
 
+    // no production subscriber yet: the first is the UI websocket (phase 3)
+    #[allow(dead_code)]
     pub fn subscribe_price(&self) -> broadcast::Receiver<MarkUpdate> {
         self.price.subscribe()
     }

@@ -1200,7 +1200,7 @@ async fn serve() {
     // Market data: feeds emit quotes onto one channel (created above, alongside
     // `AppState`); the router is the sole writer to MarkStore. Adding a vendor
     // means spawning another feed here — nothing downstream changes.
-    tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
+    tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone(), state.event_bus().clone()));
 
     // Periodically refresh previous-close data for the interesting set (held
     // positions + watchlist) so Day P&L has a baseline even before a live quote
