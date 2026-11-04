@@ -11,12 +11,6 @@ use std::collections::HashMap;
 use std::time::Duration;
 use serde::Deserialize;
 
-use crate::adapters::alpaca::{AlpacaAdapter, AlpacaCredentials};
-use crate::adapters::binance::BinanceCredentials;
-use crate::adapters::bybit::{BybitAdapter, BybitCredentials};
-use crate::adapters::coinbase::{CoinbaseAdapter, CoinbaseCredentials};
-use crate::adapters::okx::{OkxAdapter, OkxCredentials};
-use crate::fix::ibkr::IbkrFixCredentials;
 use crate::credentials::{BrokerCredentials, FeedCredentials};
 
 /// A submitted credential form: field name to raw string value, exactly as
@@ -105,25 +99,30 @@ fn field<'a>(
     }
 }
 
-fn parse_port(sub: &CredentialSubmission, existing: Option<u16>) -> Result<u16, CredentialError> {
-    match sub.get("port") {
+fn parse_port(sub: &CredentialSubmission, name: &'static str, existing: Option<u16>) -> Result<u16, CredentialError> {
+    match sub.get(name) {
         Some(v) => v.parse::<u16>().map_err(|_| CredentialError::BadField {
-            name: "port",
+            name,
             why: "not a valid port number".into(),
         }),
-        None => existing.ok_or(CredentialError::MissingField("port")),
+        None => existing.ok_or(CredentialError::MissingField(name)),
     }
 }
 
-fn parse_ssl(sub: &CredentialSubmission, existing: Option<bool>) -> Result<bool, CredentialError> {
-    match sub.get("ssl") {
+/// A flag: submitted, else stored, else the connector's default (IBKR's `ssl`
+/// defaults to true — the same default its credential applies on decode).
+fn parse_bool(
+    sub: &CredentialSubmission,
+    name: &'static str,
+    existing: Option<bool>,
+    default: bool,
+) -> Result<bool, CredentialError> {
+    match sub.get(name) {
         Some(v) => v.parse::<bool>().map_err(|_| CredentialError::BadField {
-            name: "ssl",
+            name,
             why: "not a valid boolean (expected \"true\" or \"false\")".into(),
         }),
-        // ssl defaults to true — the same default `IbkrFixCredentials`
-        // applies on deserialize — when nothing is submitted or stored yet.
-        None => Ok(existing.unwrap_or(true)),
+        None => Ok(existing.unwrap_or(default)),
     }
 }
 
@@ -136,70 +135,30 @@ pub fn parse_broker(
     existing: Option<&BrokerCredentials>,
     sub: &CredentialSubmission,
 ) -> Result<BrokerCredentials, CredentialError> {
-    // the stored credential's own typed view, when it is of the submitted kind
-    fn stored<T: serde::de::DeserializeOwned>(existing: Option<&BrokerCredentials>, kind: &str) -> Option<T> {
-        existing.filter(|c| c.kind == kind).and_then(|c| c.parse().ok())
+    use crate::connectors::{self, FieldType};
+    use serde_json::Value;
+
+    let connector = connectors::by_code(kind).ok_or_else(|| CredentialError::UnknownKind(kind.to_string()))?;
+    let m = connector.manifest();
+    // a stored credential of another kind has nothing to carry over
+    let stored = existing.filter(|e| e.kind == m.credential_kind);
+    let stored_value = |name: &str| stored.and_then(|e| e.fields.get(name));
+
+    let mut fields = serde_json::Map::new();
+    for f in (m.venue)().fields {
+        let value = match m.field_types.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t) {
+            None => Value::String(field(sub, f.name, stored_value(f.name).and_then(Value::as_str))?.to_string()),
+            Some(FieldType::Port) => {
+                let existing = stored_value(f.name).and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+                Value::from(parse_port(sub, f.name, existing)?)
+            }
+            Some(FieldType::Bool { default }) => {
+                Value::Bool(parse_bool(sub, f.name, stored_value(f.name).and_then(Value::as_bool), default)?)
+            }
+        };
+        fields.insert(f.name.to_string(), value);
     }
-    match kind {
-        "ALPACA" => {
-            let e = stored::<AlpacaCredentials>(existing, AlpacaCredentials::KIND);
-            let c = AlpacaCredentials {
-                key: field(sub, "key", e.as_ref().map(|e| e.key.as_str()))?.to_string(),
-                secret: field(sub, "secret", e.as_ref().map(|e| e.secret.as_str()))?.to_string(),
-            };
-            Ok(BrokerCredentials::from_typed(AlpacaCredentials::KIND, &c))
-        }
-        "IBKR" => {
-            let e = stored::<IbkrFixCredentials>(existing, IbkrFixCredentials::KIND);
-            let c = IbkrFixCredentials {
-                host: field(sub, "host", e.as_ref().map(|e| e.host.as_str()))?.to_string(),
-                port: parse_port(sub, e.as_ref().map(|e| e.port))?,
-                sender_comp_id: field(sub, "sender_comp_id", e.as_ref().map(|e| e.sender_comp_id.as_str()))?.to_string(),
-                target_comp_id: field(sub, "target_comp_id", e.as_ref().map(|e| e.target_comp_id.as_str()))?.to_string(),
-                password: field(sub, "password", e.as_ref().map(|e| e.password.as_str()))?.to_string(),
-                ssl: parse_ssl(sub, e.as_ref().map(|e| e.ssl))?,
-            };
-            Ok(BrokerCredentials::from_typed(IbkrFixCredentials::KIND, &c))
-        }
-        "BINANCE" => {
-            let e = stored::<BinanceCredentials>(existing, BinanceCredentials::KIND);
-            let c = BinanceCredentials {
-                host: field(sub, "host", e.as_ref().map(|e| e.host.as_str()))?.to_string(),
-                port: parse_port(sub, e.as_ref().map(|e| e.port))?,
-                sender_comp_id: field(sub, "sender_comp_id", e.as_ref().map(|e| e.sender_comp_id.as_str()))?.to_string(),
-                target_comp_id: field(sub, "target_comp_id", e.as_ref().map(|e| e.target_comp_id.as_str()))?.to_string(),
-                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
-                private_key: field(sub, "private_key", e.as_ref().map(|e| e.private_key.as_str()))?.to_string(),
-            };
-            Ok(BrokerCredentials::from_typed(BinanceCredentials::KIND, &c))
-        }
-        "BYBIT" => {
-            let e = stored::<BybitCredentials>(existing, BybitCredentials::KIND);
-            let c = BybitCredentials {
-                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
-                api_secret: field(sub, "api_secret", e.as_ref().map(|e| e.api_secret.as_str()))?.to_string(),
-            };
-            Ok(BrokerCredentials::from_typed(BybitCredentials::KIND, &c))
-        }
-        "COINBASE" => {
-            let e = stored::<CoinbaseCredentials>(existing, CoinbaseCredentials::KIND);
-            let c = CoinbaseCredentials {
-                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
-                private_key: field(sub, "private_key", e.as_ref().map(|e| e.private_key.as_str()))?.to_string(),
-            };
-            Ok(BrokerCredentials::from_typed(CoinbaseCredentials::KIND, &c))
-        }
-        "OKX" => {
-            let e = stored::<OkxCredentials>(existing, OkxCredentials::KIND);
-            let c = OkxCredentials {
-                api_key: field(sub, "api_key", e.as_ref().map(|e| e.api_key.as_str()))?.to_string(),
-                api_secret: field(sub, "api_secret", e.as_ref().map(|e| e.api_secret.as_str()))?.to_string(),
-                passphrase: field(sub, "passphrase", e.as_ref().map(|e| e.passphrase.as_str()))?.to_string(),
-            };
-            Ok(BrokerCredentials::from_typed(OkxCredentials::KIND, &c))
-        }
-        other => Err(CredentialError::UnknownKind(other.to_string())),
-    }
+    Ok(BrokerCredentials::new(m.credential_kind, fields))
 }
 
 /// Turns a submitted form into a typed feed credential, same merge rule as
@@ -255,13 +214,13 @@ pub enum TestOutcome {
 /// the admin request open indefinitely — and with it the cockpit's "Test"
 /// button, which has no way to cancel. Ten seconds is far longer than either
 /// check needs against a healthy provider.
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The failure reported when a provider stops responding mid-test. Says which
 /// provider and how long was waited, because "test failed" alone would be
 /// indistinguishable from a rejected credential — the operator needs to know
 /// their key was never actually judged.
-fn timed_out(provider: &str) -> TestOutcome {
+pub(crate) fn timed_out(provider: &str) -> TestOutcome {
     TestOutcome::Failed(format!(
         "{provider} did not respond within {}s — credential not verified",
         TEST_TIMEOUT.as_secs()
@@ -286,76 +245,9 @@ fn timed_out(provider: &str) -> TestOutcome {
 /// rather than test anything). So this deliberately does not attempt one and
 /// says so via `NotTestable`, rather than reporting a pass it did not earn.
 pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOutcome {
-    let unreadable = |e: serde_json::Error| TestOutcome::Failed(format!("credential fields do not match their kind: {e}"));
-    match creds.kind.as_str() {
-        AlpacaCredentials::KIND => {
-            let c = match creds.parse::<AlpacaCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
-            let adapter = AlpacaAdapter::new(c.key, c.secret, environment);
-            match tokio::time::timeout(TEST_TIMEOUT, adapter.get_account()).await {
-                Ok(Ok(_)) => TestOutcome::Passed,
-                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
-                Err(_) => timed_out("Alpaca"),
-            }
-        }
-        IbkrFixCredentials::KIND | BinanceCredentials::KIND => {
-            TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save")
-        }
-        CoinbaseCredentials::KIND => {
-            let c = match creds.parse::<CoinbaseCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
-            let adapter = match CoinbaseAdapter::new(c.api_key, &c.private_key) {
-                Ok(a) => a,
-                Err(e) => return TestOutcome::Failed(e),
-            };
-            match tokio::time::timeout(TEST_TIMEOUT, adapter.key_permissions()).await {
-                Ok(Ok(permissions)) => judge_coinbase_permissions(&permissions),
-                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
-                Err(_) => timed_out("Coinbase"),
-            }
-        }
-        BybitCredentials::KIND => {
-            let c = match creds.parse::<BybitCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
-            let adapter = BybitAdapter::new(c.api_key, c.api_secret, environment);
-            match tokio::time::timeout(TEST_TIMEOUT, adapter.api_key_info()).await {
-                Ok(Ok(_)) => TestOutcome::Passed,
-                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
-                Err(_) => timed_out("Bybit"),
-            }
-        }
-        OkxCredentials::KIND => {
-            let c = match creds.parse::<OkxCredentials>() { Ok(c) => c, Err(e) => return unreadable(e) };
-            let adapter = OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, environment);
-            match tokio::time::timeout(TEST_TIMEOUT, adapter.key_permissions()).await {
-                Ok(Ok(perm)) => judge_okx_permissions(&perm),
-                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
-                Err(_) => timed_out("OKX"),
-            }
-        }
-        other => TestOutcome::Failed(format!("no connector for credential kind {other}")),
-    }
-}
-
-/// An OKX key is fit for the OMS when it can trade and cannot withdraw — the
-/// same rule as Coinbase. `perm` is a comma list such as "read_only,trade".
-pub(crate) fn judge_okx_permissions(perm: &str) -> TestOutcome {
-    let has = |p: &str| perm.split(',').any(|x| x.trim() == p);
-    if has("withdraw") {
-        TestOutcome::Failed("the key can withdraw funds; create one with Read and Trade permissions only".into())
-    } else if !has("trade") {
-        TestOutcome::Failed("the key cannot trade; give it the Trade permission".into())
-    } else {
-        TestOutcome::Passed
-    }
-}
-
-/// A Coinbase key is fit for the OMS when it can trade and cannot move money
-/// out: an OMS never needs to withdraw, so a transfer-capable key is refused.
-pub(crate) fn judge_coinbase_permissions(permissions: &serde_json::Value) -> TestOutcome {
-    if permissions["can_transfer"].as_bool() != Some(false) {
-        TestOutcome::Failed("the key can transfer funds; create one with View and Trade permissions only".into())
-    } else if permissions["can_trade"].as_bool() != Some(true) {
-        TestOutcome::Failed("the key cannot trade; give it the Trade permission".into())
-    } else {
-        TestOutcome::Passed
+    match crate::connectors::by_credential_kind(&creds.kind) {
+        Some(connector) => connector.verify(environment, creds).await,
+        None => TestOutcome::Failed(format!("no connector for credential kind {}", creds.kind)),
     }
 }
 
@@ -460,32 +352,58 @@ mod tests {
     }
     use super::*;
 
-    #[test]
-    fn an_okx_key_must_trade_and_must_not_withdraw() {
-        assert_eq!(judge_okx_permissions("read_only,trade"), TestOutcome::Passed);
-        assert!(matches!(judge_okx_permissions("read_only,withdraw,trade"), TestOutcome::Failed(m) if m.contains("withdraw")));
-        assert!(matches!(judge_okx_permissions("read_only"), TestOutcome::Failed(m) if m.contains("trade")));
-    }
-
-    #[test]
-    fn a_key_that_can_transfer_fails_the_test() {
-        let judge = |v: serde_json::Value| judge_coinbase_permissions(&v);
-        assert_eq!(judge(serde_json::json!({"can_view": true, "can_trade": true, "can_transfer": false})), TestOutcome::Passed);
-        assert!(matches!(
-            judge(serde_json::json!({"can_view": true, "can_trade": true, "can_transfer": true})),
-            TestOutcome::Failed(m) if m.contains("transfer")
-        ));
-        assert!(matches!(
-            judge(serde_json::json!({"can_view": true, "can_trade": false, "can_transfer": false})),
-            TestOutcome::Failed(m) if m.contains("trade")
-        ));
-    }
     use crate::credentials::{BrokerCredentials, FeedCredentials};
 
     fn sub(pairs: &[(&str, &str)]) -> CredentialSubmission {
         CredentialSubmission {
             fields: pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }
+    }
+
+    /// Every connector's form, filled in completely, then submitted again with
+    /// every field blank: the stored credential must come back unchanged.
+    #[test]
+    fn blank_secret_keeps_the_stored_value_for_every_connector() {
+        for c in crate::connectors::all() {
+            let m = c.manifest();
+            let full: Vec<(String, String)> = (m.venue)()
+                .fields
+                .iter()
+                .map(|f| {
+                    let v = match m.field_types.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t) {
+                        Some(crate::connectors::FieldType::Port) => "1234".to_string(),
+                        Some(crate::connectors::FieldType::Bool { .. }) => "false".to_string(),
+                        None => format!("v-{}", f.name),
+                    };
+                    (f.name.to_string(), v)
+                })
+                .collect();
+            let full_sub = CredentialSubmission { fields: full.iter().cloned().collect() };
+            let stored = parse_broker(m.code, None, &full_sub).expect(m.code);
+            let blank = CredentialSubmission { fields: full.iter().map(|(k, _)| (k.clone(), String::new())).collect() };
+            let kept = parse_broker(m.code, Some(&stored), &blank).expect(m.code);
+            assert_eq!(serde_json::to_value(&kept).unwrap(), serde_json::to_value(&stored).unwrap(), "{}", m.code);
+        }
+    }
+
+    #[test]
+    fn port_and_bool_fields_keep_their_validation() {
+        let base = [("host", "h"), ("sender_comp_id", "S"), ("target_comp_id", "T"), ("password", "p")];
+        let with = |extra: (&'static str, &'static str)| {
+            let mut pairs = base.to_vec();
+            pairs.push(extra);
+            parse_broker("IBKR", None, &sub(&pairs))
+        };
+        assert!(matches!(
+            with(("port", "x")),
+            Err(CredentialError::BadField { name: "port", why }) if why == "not a valid port number"
+        ));
+        let mut pairs = base.to_vec();
+        pairs.extend([("port", "4001"), ("ssl", "maybe")]);
+        assert!(matches!(
+            parse_broker("IBKR", None, &sub(&pairs)),
+            Err(CredentialError::BadField { name: "ssl", why }) if why == "not a valid boolean (expected \"true\" or \"false\")"
+        ));
     }
 
     fn existing_alpaca() -> BrokerCredentials {

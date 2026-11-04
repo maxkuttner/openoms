@@ -1,3 +1,6 @@
+use futures_util::future::BoxFuture;
+
+use crate::credentials_api::TestOutcome;
 use crate::credentials::BrokerCredentials;
 use crate::reload::RegistrationDeps;
 
@@ -5,7 +8,7 @@ use super::Connected;
 use crate::credentials::Shown::{Clear, Hidden};
 use crate::venues::{environments, field, Input, Venue, DOCS};
 
-use super::{Connector, FieldType, Manifest, QuoteScope};
+use super::{FIX_NOT_TESTABLE, Connector, FieldType, Manifest, QuoteScope};
 
 pub struct Ibkr;
 
@@ -32,6 +35,10 @@ impl Connector for Ibkr {
         let adapter = crate::fix::start_ibkr(env, creds, &deps.stream_health, deps.engine.clone())
             .ok_or_else(|| "IBKR FIX session could not start".to_string())?;
         Ok(Connected { adapter, exec_stream: None })
+    }
+
+    fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
+        Box::pin(async { FIX_NOT_TESTABLE })
     }
 }
 

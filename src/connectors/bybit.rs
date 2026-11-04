@@ -1,9 +1,12 @@
+use futures_util::future::BoxFuture;
+
+use crate::credentials_api::TestOutcome;
 use std::sync::Arc;
 
 use crate::credentials::BrokerCredentials;
 use crate::reload::RegistrationDeps;
 
-use super::{typed, Connected};
+use super::{checked, typed, Connected, PublicFeed};
 use crate::credentials::Shown::Hidden;
 use crate::venues::{environments, field, Venue, DOCS};
 
@@ -39,6 +42,40 @@ impl Connector for Bybit {
                 Box::pin(crate::bybit_stream::run(env, stream_adapter.clone(), health, engine))
             })),
         })
+    }
+
+    fn public_feed(&self) -> Option<PublicFeed> {
+        Some(PublicFeed {
+            symbology: &crate::bybit_feed::BybitFeed,
+            run: |pool, quotes, order_rx, health| {
+                Box::pin(async move {
+                    let session = crate::quote_feed::QuoteFeedSession::new(
+                        crate::bybit_feed::BybitFeed,
+                        pool,
+                        quotes,
+                        order_rx,
+                        health.clone(),
+                    );
+                    crate::stream_supervisor::supervise("BYBIT/SPOT", health, session).await;
+                })
+            },
+        })
+    }
+
+    fn verify<'a>(&'a self, env: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
+        Box::pin(async move {
+            let c: crate::adapters::bybit::BybitCredentials = match typed(creds) {
+                Ok(c) => c,
+                Err(e) => return TestOutcome::Failed(e),
+            };
+            let adapter = crate::adapters::bybit::BybitAdapter::new(c.api_key, c.api_secret, env);
+            checked("Bybit", adapter.api_key_info(), |_| TestOutcome::Passed).await
+        })
+    }
+
+    fn universe_provider(&self, env: &str, creds: &BrokerCredentials) -> Result<Box<dyn crate::adapters::InstrumentProvider>, String> {
+        let c: crate::adapters::bybit::BybitCredentials = typed(creds)?;
+        Ok(Box::new(crate::adapters::bybit::BybitAdapter::new(c.api_key, c.api_secret, env)))
     }
 }
 

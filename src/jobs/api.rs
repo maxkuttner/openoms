@@ -147,13 +147,8 @@ async fn check_loadable(pool: &PgPool, master: Option<&MasterKey>, code: &str, k
             return Err(LoadRefusal::Unprocessable(format!("{code}: credentials unusable: {e}")))
         }
     }
-    let broker = match conn.kind.as_str() {
-        "ALPACA" => Broker::Alpaca,
-        "BINANCE" => Broker::Binance,
-        "BYBIT" => Broker::Bybit,
-        "COINBASE" => Broker::Coinbase,
-        "OKX" => Broker::Okx,
-        other => return Err(LoadRefusal::Unprocessable(format!("{other} has no instrument universe to load"))),
+    let Some(broker) = Broker::by_code(&conn.kind) else {
+        return Err(LoadRefusal::Unprocessable(format!("{} has no instrument universe to load", conn.kind)));
     };
     // A load always runs with the broker's active connection (ALPACA_ENV /
     // BINANCE_ENV decide which); loading another connection's universe would

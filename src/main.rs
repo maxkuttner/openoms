@@ -1282,65 +1282,16 @@ async fn serve() {
         }
     }
 
-    // Binance public market data — no credentials, so it is always on. Each feed
-    // takes its own order-lane subscription to learn when positions change. Not
-    // registered in `StreamRegistry`: there is no credential that could change under it, so
-    // there is nothing for a reload to restart here — leave it running for the
-    // life of the process, same as before this feature existed.
-    {
-        let health = state.stream_health().handle("BINANCE", "SPOT", stream_health::StreamKind::Feed);
-        let session = quote_feed::QuoteFeedSession::new(
-            binance_feed::BinanceFeed,
-            state.pool().clone(),
-            quote_tx.clone(),
-            state.event_bus().subscribe_order(),
-            health.clone(),
-        );
-        tokio::spawn(stream_supervisor::supervise("BINANCE/SPOT", health, session));
-    }
-
-    // Bybit public market data — a second source for the same crypto pairs, so a
-    // Binance outage does not leave positions unmarked. Ranked below Binance in
-    // provider_feed_policy; the router decides which one owns the mark. Also not
-    // credential-driven, so — like Binance above — not registered in
-    // `StreamRegistry`.
-    {
-        let health = state.stream_health().handle("BYBIT", "SPOT", stream_health::StreamKind::Feed);
-        let session = quote_feed::QuoteFeedSession::new(
-            bybit_feed::BybitFeed,
-            state.pool().clone(),
-            quote_tx.clone(),
-            state.event_bus().subscribe_order(),
-            health.clone(),
-        );
-        tokio::spawn(stream_supervisor::supervise("BYBIT/SPOT", health, session));
-    }
-
-    // Coinbase's public ticker marks Coinbase's own products, which no other feed
-    // prices. Not credential-driven either, so not in `StreamRegistry`.
-    {
-        let health = state.stream_health().handle("COINBASE", "SPOT", stream_health::StreamKind::Feed);
-        let session = quote_feed::QuoteFeedSession::new(
-            coinbase_feed::CoinbaseFeed,
-            state.pool().clone(),
-            quote_tx.clone(),
-            state.event_bus().subscribe_order(),
-            health.clone(),
-        );
-        tokio::spawn(stream_supervisor::supervise("COINBASE/SPOT", health, session));
-    }
-
-    // OKX's public tickers mark OKX's own pairs, which no other feed prices.
-    {
-        let health = state.stream_health().handle("OKX", "SPOT", stream_health::StreamKind::Feed);
-        let session = quote_feed::QuoteFeedSession::new(
-            okx_feed::OkxFeed,
-            state.pool().clone(),
-            quote_tx.clone(),
-            state.event_bus().subscribe_order(),
-            health.clone(),
-        );
-        tokio::spawn(stream_supervisor::supervise("OKX/SPOT", health, session));
+    // Public market data: every connector whose venue has a public quote feed
+    // runs it — no credentials, so it is always on. Each takes its own
+    // order-lane subscription to learn when positions change. Not registered in
+    // `StreamRegistry`: no credential can change under it, so a reload has
+    // nothing to restart; it runs for the life of the process.
+    for connector in connectors::all() {
+        if let Some(feed) = connector.public_feed() {
+            let health = state.stream_health().handle(connector.manifest().code, "SPOT", stream_health::StreamKind::Feed);
+            tokio::spawn((feed.run)(state.pool().clone(), quote_tx.clone(), state.event_bus().subscribe_order(), health));
+        }
     }
 
     // Load each credentialed broker's never-loaded instrument universe as a

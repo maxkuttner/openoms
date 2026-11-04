@@ -1,9 +1,12 @@
+use futures_util::future::BoxFuture;
+
+use crate::credentials_api::TestOutcome;
 use std::sync::Arc;
 
 use crate::credentials::BrokerCredentials;
 use crate::reload::RegistrationDeps;
 
-use super::{typed, Connected};
+use super::{FIX_NOT_TESTABLE, PublicFeed, typed, Connected};
 use crate::credentials::Shown::{Clear, Hidden};
 use crate::venues::{environments, field, Input, Venue, DOCS};
 
@@ -56,6 +59,34 @@ impl Connector for Binance {
                 })
             }
         }
+    }
+
+    fn public_feed(&self) -> Option<PublicFeed> {
+        Some(PublicFeed {
+            symbology: &crate::binance_feed::BinanceFeed,
+            run: |pool, quotes, order_rx, health| {
+                Box::pin(async move {
+                    let session = crate::quote_feed::QuoteFeedSession::new(
+                        crate::binance_feed::BinanceFeed,
+                        pool,
+                        quotes,
+                        order_rx,
+                        health.clone(),
+                    );
+                    crate::stream_supervisor::supervise("BINANCE/SPOT", health, session).await;
+                })
+            },
+        })
+    }
+
+    /// Not tested on either transport (as before connectors).
+    fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
+        Box::pin(async { FIX_NOT_TESTABLE })
+    }
+
+    fn universe_provider(&self, env: &str, creds: &BrokerCredentials) -> Result<Box<dyn crate::adapters::InstrumentProvider>, String> {
+        let c: crate::adapters::binance::BinanceCredentials = typed(creds)?;
+        Ok(Box::new(crate::adapters::binance::BinanceAdapter::new(c.api_key, &c.private_key, env)?))
     }
 }
 

@@ -24,7 +24,7 @@ use crate::setup::brokers::Broker;
 /// does (see [`ensure_feed_connections`]). Runs as the `oms` role (which owns
 /// the schema), idempotent on `code`.
 pub async fn ensure_broker_connections(pool: &PgPool) {
-    for broker in Broker::ALL.iter().copied() {
+    for broker in Broker::all().into_iter() {
         let code = broker.connection_code();
         let res = sqlx::query(
             "INSERT INTO oms.broker_connection (code, broker_code, environment, status) \

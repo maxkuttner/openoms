@@ -1,9 +1,12 @@
+use futures_util::future::BoxFuture;
+
+use crate::credentials_api::TestOutcome;
 use std::sync::Arc;
 
 use crate::credentials::BrokerCredentials;
 use crate::reload::RegistrationDeps;
 
-use super::{typed, Connected};
+use super::{checked, typed, Connected, PublicFeed};
 use crate::credentials::Shown::Hidden;
 use crate::venues::{field, Environment, Input, Venue, DOCS};
 
@@ -42,6 +45,43 @@ impl Connector for Coinbase {
             })),
         })
     }
+
+    fn public_feed(&self) -> Option<PublicFeed> {
+        Some(PublicFeed {
+            symbology: &crate::coinbase_feed::CoinbaseFeed,
+            run: |pool, quotes, order_rx, health| {
+                Box::pin(async move {
+                    let session = crate::quote_feed::QuoteFeedSession::new(
+                        crate::coinbase_feed::CoinbaseFeed,
+                        pool,
+                        quotes,
+                        order_rx,
+                        health.clone(),
+                    );
+                    crate::stream_supervisor::supervise("COINBASE/SPOT", health, session).await;
+                })
+            },
+        })
+    }
+
+    fn verify<'a>(&'a self, _: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
+        Box::pin(async move {
+            let c: crate::adapters::coinbase::CoinbaseCredentials = match typed(creds) {
+                Ok(c) => c,
+                Err(e) => return TestOutcome::Failed(e),
+            };
+            let adapter = match crate::adapters::coinbase::CoinbaseAdapter::new(c.api_key, &c.private_key) {
+                Ok(a) => a,
+                Err(e) => return TestOutcome::Failed(e),
+            };
+            checked("Coinbase", adapter.key_permissions(), |p| judge_coinbase_permissions(&p)).await
+        })
+    }
+
+    fn universe_provider(&self, _env: &str, creds: &BrokerCredentials) -> Result<Box<dyn crate::adapters::InstrumentProvider>, String> {
+        let c: crate::adapters::coinbase::CoinbaseCredentials = typed(creds)?;
+        Ok(Box::new(crate::adapters::coinbase::CoinbaseAdapter::new(c.api_key, &c.private_key)?))
+    }
 }
 
 fn venue() -> Venue {
@@ -61,5 +101,36 @@ fn venue() -> Venue {
             field("api_key", "API key").secret(),
             field("private_key", "Private key (PEM)").secret().input(Input::Textarea),
         ],
+    }
+}
+
+/// A Coinbase key is fit for the OMS when it can trade and cannot move money
+/// out: an OMS never needs to withdraw, so a transfer-capable key is refused.
+fn judge_coinbase_permissions(permissions: &serde_json::Value) -> TestOutcome {
+    if permissions["can_transfer"].as_bool() != Some(false) {
+        TestOutcome::Failed("the key can transfer funds; create one with View and Trade permissions only".into())
+    } else if permissions["can_trade"].as_bool() != Some(true) {
+        TestOutcome::Failed("the key cannot trade; give it the Trade permission".into())
+    } else {
+        TestOutcome::Passed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_that_can_transfer_fails_the_test() {
+        let judge = |v: serde_json::Value| judge_coinbase_permissions(&v);
+        assert_eq!(judge(serde_json::json!({"can_view": true, "can_trade": true, "can_transfer": false})), TestOutcome::Passed);
+        assert!(matches!(
+            judge(serde_json::json!({"can_view": true, "can_trade": true, "can_transfer": true})),
+            TestOutcome::Failed(m) if m.contains("transfer")
+        ));
+        assert!(matches!(
+            judge(serde_json::json!({"can_view": true, "can_trade": false, "can_transfer": false})),
+            TestOutcome::Failed(m) if m.contains("trade")
+        ));
     }
 }

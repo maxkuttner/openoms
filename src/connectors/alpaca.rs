@@ -1,9 +1,12 @@
+use futures_util::future::BoxFuture;
+
+use crate::credentials_api::TestOutcome;
 use std::sync::Arc;
 
 use crate::credentials::BrokerCredentials;
 use crate::reload::RegistrationDeps;
 
-use super::{typed, Connected};
+use super::{checked, typed, Connected};
 use crate::credentials::Shown::{Hidden, Tail};
 use crate::venues::{environments, field, Venue, DOCS};
 
@@ -39,6 +42,25 @@ impl Connector for Alpaca {
                 Box::pin(crate::alpaca_stream::run(env, c.key.clone(), c.secret.clone(), stream_adapter.clone(), health, engine))
             })),
         })
+    }
+
+    /// `GET /v2/account`: lightweight, read-only, sub-second. `env` must be the
+    /// connection's own — the adapter picks the live endpoint only for exactly
+    /// "LIVE", so a live key tested as PAPER would be refused though valid.
+    fn verify<'a>(&'a self, env: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
+        Box::pin(async move {
+            let c: crate::adapters::alpaca::AlpacaCredentials = match typed(creds) {
+                Ok(c) => c,
+                Err(e) => return TestOutcome::Failed(e),
+            };
+            let adapter = crate::adapters::alpaca::AlpacaAdapter::new(c.key, c.secret, env);
+            checked("Alpaca", adapter.get_account(), |_| TestOutcome::Passed).await
+        })
+    }
+
+    fn universe_provider(&self, env: &str, creds: &BrokerCredentials) -> Result<Box<dyn crate::adapters::InstrumentProvider>, String> {
+        let c: crate::adapters::alpaca::AlpacaCredentials = typed(creds)?;
+        Ok(Box::new(crate::adapters::alpaca::AlpacaAdapter::new(c.key, c.secret, env)))
     }
 }
 

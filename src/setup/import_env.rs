@@ -346,8 +346,8 @@ mod tests {
         clear();
         // ALPACA_ENV / BINANCE_ENV are cleared, so both default to "PAPER" —
         // matching the "PAPER" iteration of scan_env()'s loop.
-        let alpaca_code = Broker::Alpaca.connection_code();
-        let binance_code = Broker::Binance.connection_code();
+        let alpaca_code = Broker::by_code("ALPACA").unwrap().connection_code();
+        let binance_code = Broker::by_code("BINANCE").unwrap().connection_code();
         clear();
         assert_eq!(alpaca_code, "alpaca-paper");
         assert_eq!(binance_code, "binance-paper");

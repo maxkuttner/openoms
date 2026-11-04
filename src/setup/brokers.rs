@@ -16,52 +16,70 @@ use dataprovider::{Enricher, InstrumentDef, OpenFigiEnricher};
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::{info, warn};
 
-use crate::adapters::alpaca::AlpacaAdapter;
-use crate::adapters::binance::BinanceAdapter;
-use crate::adapters::bybit::BybitAdapter;
-use crate::adapters::coinbase::CoinbaseAdapter;
-use crate::adapters::okx::OkxAdapter;
 use crate::adapters::{BrokerInstrument, InstrumentProvider};
+use crate::connectors::Connector;
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::setup::catalog;
 
 const BATCH: usize = 4000;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Broker {
-    Alpaca,
-    Binance,
-    Bybit,
-    Coinbase,
-    Okx,
+/// A broker whose instrument universe can be loaded: a connector that has one.
+#[derive(Copy, Clone)]
+pub struct Broker(&'static dyn Connector);
+
+impl PartialEq for Broker {
+    fn eq(&self, other: &Self) -> bool {
+        self.code() == other.code()
+    }
+}
+impl Eq for Broker {}
+
+impl std::fmt::Debug for Broker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.code())
+    }
+}
+
+/// `--broker <name>`: any universe broker's code, case-insensitive
+/// (`alpaca`, `binance`, …).
+impl ValueEnum for Broker {
+    fn value_variants<'a>() -> &'a [Self] {
+        static ALL: std::sync::OnceLock<Vec<Broker>> = std::sync::OnceLock::new();
+        ALL.get_or_init(Broker::all)
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.code()))
+    }
 }
 
 impl Broker {
     /// Every broker the app can sync — the set boot-time auto-sync iterates.
-    pub const ALL: &'static [Broker] = &[Broker::Alpaca, Broker::Binance, Broker::Bybit, Broker::Coinbase, Broker::Okx];
+    pub fn all() -> Vec<Broker> {
+        crate::connectors::all().iter().filter(|c| c.manifest().universe).map(|c| Broker(*c)).collect()
+    }
+
+    pub fn by_code(code: &str) -> Option<Broker> {
+        Broker::all().into_iter().find(|b| b.code() == code)
+    }
+
+    pub fn connector(self) -> &'static dyn Connector {
+        self.0
+    }
 
     pub fn code(self) -> &'static str {
-        match self {
-            Broker::Alpaca => "ALPACA",
-            Broker::Binance => "BINANCE",
-            Broker::Bybit => "BYBIT",
-            Broker::Coinbase => "COINBASE",
-            Broker::Okx => "OKX",
-        }
+        self.0.manifest().code
     }
 
     /// The configured environment for this broker (`PAPER` | `LIVE`), from
-    /// `{BROKER}_ENV`, defaulting to `PAPER`. Together with [`code`](Self::code) this
-    /// is the `(broker_code, environment)` pair a `broker_connection` routes on.
+    /// `{BROKER}_ENV`, defaulting to `PAPER` — or `LIVE` for a venue with no
+    /// paper trading. Together with [`code`](Self::code) this is the
+    /// `(broker_code, environment)` pair a `broker_connection` routes on.
     pub fn environment(self) -> String {
-        match self {
-            Broker::Alpaca => alpaca_env(),
-            Broker::Binance => binance_env(),
-            Broker::Bybit => bybit_env(),
-            // Coinbase has no paper trading (its sandbox returns canned responses).
-            Broker::Coinbase => "LIVE".to_string(),
-            Broker::Okx => okx_env(),
+        if self.0.manifest().live_only {
+            return "LIVE".to_string();
         }
+        env::var(format!("{}_ENV", self.code())).unwrap_or_else(|_| "PAPER".into()).to_uppercase()
     }
 
     /// The conventional `broker_connection.code` for this broker+env, e.g.
@@ -72,14 +90,9 @@ impl Broker {
 
     /// Whether this broker has a usable credential in the store — its
     /// conventional `broker_connection.code` (e.g. "alpaca-paper") appears in
-    /// `connections` with a `Configured` credential.
-    ///
-    /// This is now the single source of truth for "can we sync this broker":
-    /// `run` (below) sources `build_alpaca`/`build_binance`'s credential from the
-    /// same store, so cred *detection* (`bootstrap::pending_boot_loads`) and
-    /// cred *use* (`provider_for`) can never disagree — mirroring the
-    /// guarantee this method's doc comment made before the credential store
-    /// existed, when both sides read the environment instead.
+    /// `connections` with a `Configured` credential. The single source of truth
+    /// for "can we sync this broker": cred detection (`bootstrap::pending_boot_loads`)
+    /// and cred use (`provider_for`) read the same store, so they cannot disagree.
     pub fn has_creds(self, connections: &[Connection<BrokerCredentials>]) -> bool {
         connections
             .iter()
@@ -87,51 +100,25 @@ impl Broker {
     }
 }
 
-/// Every broker in `Broker::ALL` whose store credential is `Configured`.
+/// Every universe broker whose store credential is `Configured`.
 /// Computed once by `serve()` and reused for both preflight and the boot loads
 /// (`bootstrap::pending_boot_loads`), so the two cannot disagree about which
 /// brokers are eligible.
 pub fn brokers_with_creds(connections: &[Connection<BrokerCredentials>]) -> Vec<Broker> {
-    Broker::ALL.iter().copied().filter(|b| b.has_creds(connections)).collect()
+    Broker::all().into_iter().filter(|b| b.has_creds(connections)).collect()
 }
 
-/// FIX-only venues `reload.rs` registers under a literal, hardcoded key — they
-/// have no `sync-broker` support and so no `Broker` variant, but the registry
-/// key is exactly as real as `Broker::code()`'s. Kept here, next to `Broker`,
-/// so both halves of "what can `broker_connection.broker_code` legally be"
-/// live in one file.
-const FIX_ONLY_BROKER_CODES: &[&str] = &["IBKR"];
-
-/// Every `broker_code` the adapter registry can actually be reached under:
-/// `Broker::ALL`'s codes plus the FIX-only venues above. This is the single
-/// source callers validate a `broker_connection.broker_code` write against —
-/// see `admin::validate_broker_code` — so that list and `reload.rs`'s
-/// registration literals cannot drift apart into the silent-503 hazard a
-/// second, independently maintained list would reintroduce.
+/// Every `broker_code` the adapter registry can actually be reached under: one
+/// per connector. The single source callers validate a
+/// `broker_connection.broker_code` write against (`admin::validate_broker_code`).
 pub fn known_broker_codes() -> Vec<&'static str> {
-    Broker::ALL.iter().map(|b| b.code()).chain(FIX_ONLY_BROKER_CODES.iter().copied()).collect()
-}
-
-fn alpaca_env() -> String {
-    env::var("ALPACA_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
-}
-
-fn binance_env() -> String {
-    env::var("BINANCE_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
-}
-
-fn bybit_env() -> String {
-    env::var("BYBIT_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
-}
-
-fn okx_env() -> String {
-    env::var("OKX_ENV").unwrap_or_else(|_| "PAPER".into()).to_uppercase()
+    crate::connectors::all().iter().map(|c| c.manifest().code).collect()
 }
 
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
     /// Which broker's catalog to sync (also the instrument source).
-    #[arg(long, value_enum, default_value_t = Broker::Alpaca)]
+    #[arg(long, value_enum, ignore_case = true, default_value = "alpaca")]
     pub broker: Broker,
     /// Comma-separated option underlyings to seed the option chain for (Alpaca only).
     /// Empty seeds equities/spot only — the full option tape is not seeded wholesale.
@@ -252,13 +239,10 @@ pub async fn provider_for(
         }
     };
 
-    Ok(match broker {
-        Broker::Alpaca => Box::new(build_alpaca(&creds)?),
-        Broker::Binance => Box::new(build_binance(&creds)?),
-        Broker::Bybit => Box::new(build_bybit(&creds)?),
-        Broker::Coinbase => Box::new(build_coinbase(&creds)?),
-        Broker::Okx => Box::new(build_okx(&creds)?),
-    })
+    broker
+        .connector()
+        .universe_provider(&broker.environment(), &creds)
+        .map_err(|e| format!("{code}: {e}").into())
 }
 
 /// How a universe load is run. `allow_skips` is honoured by the caller (the CLI
@@ -383,52 +367,6 @@ pub async fn load_universe(
         skipped: summary.skipped_fk() as usize,
         skipped_reasons,
     })
-}
-
-/// Build an `AlpacaAdapter` from a store credential. `ALPACA_ENV` still selects
-/// *which* environment to sync (PAPER vs LIVE) — that is a mode selector, not a
-/// secret — but the key/secret themselves come from `creds`, not the environment.
-fn build_alpaca(creds: &BrokerCredentials) -> Result<AlpacaAdapter, Box<dyn std::error::Error>> {
-    match creds.parse::<crate::adapters::alpaca::AlpacaCredentials>() {
-        Ok(c) if creds.kind == "Alpaca" => Ok(AlpacaAdapter::new(c.key, c.secret, &alpaca_env())),
-        // `run` looked this credential up by `Broker::Alpaca.connection_code()`,
-        // so any other variant here is a programming error (a code/kind
-        // mismatch in the store), not something an operator can hit.
-        _ => Err(format!("alpaca-* credential is not an Alpaca credential: {creds:?}").into()),
-    }
-}
-
-/// Build a `BinanceAdapter` from a store credential. The catalog endpoint
-/// (exchangeInfo) is public, but the adapter constructor needs a valid key pair
-/// regardless — `private_key` is PEM contents already (no file read needed).
-fn build_binance(creds: &BrokerCredentials) -> Result<BinanceAdapter, Box<dyn std::error::Error>> {
-    match creds.parse::<crate::adapters::binance::BinanceCredentials>() {
-        Ok(c) if creds.kind == "BinanceFix" => BinanceAdapter::new(c.api_key, &c.private_key, &binance_env()).map_err(Into::into),
-        _ => Err(format!("binance-* credential is not a Binance credential: {creds:?}").into()),
-    }
-}
-
-/// The catalog is public, but the adapter is built from the stored credential
-/// like the others so a sync always runs as the configured connection.
-fn build_bybit(creds: &BrokerCredentials) -> Result<BybitAdapter, Box<dyn std::error::Error>> {
-    match creds.parse::<crate::adapters::bybit::BybitCredentials>() {
-        Ok(c) if creds.kind == "Bybit" => Ok(BybitAdapter::new(c.api_key, c.api_secret, &bybit_env())),
-        _ => Err(format!("bybit-* credential is not a Bybit credential: {creds:?}").into()),
-    }
-}
-
-fn build_coinbase(creds: &BrokerCredentials) -> Result<CoinbaseAdapter, Box<dyn std::error::Error>> {
-    match creds.parse::<crate::adapters::coinbase::CoinbaseCredentials>() {
-        Ok(c) if creds.kind == "Coinbase" => CoinbaseAdapter::new(c.api_key, &c.private_key).map_err(Into::into),
-        _ => Err(format!("coinbase-* credential is not a Coinbase credential: {creds:?}").into()),
-    }
-}
-
-fn build_okx(creds: &BrokerCredentials) -> Result<OkxAdapter, Box<dyn std::error::Error>> {
-    match creds.parse::<crate::adapters::okx::OkxCredentials>() {
-        Ok(c) if creds.kind == "Okx" => Ok(OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, &okx_env())),
-        _ => Err(format!("okx-* credential is not an OKX credential: {creds:?}").into()),
-    }
 }
 
 /// A broker mapping row ready to upsert into `broker_instrument`.
@@ -559,10 +497,10 @@ mod tests {
     fn has_creds_is_true_only_for_a_configured_row_with_the_matching_code() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        let alpaca_code = Broker::Alpaca.connection_code();
+        let alpaca_code = Broker::by_code("ALPACA").unwrap().connection_code();
         let connections = vec![connection(&alpaca_code, CredentialState::Configured(alpaca_cred()))];
-        let alpaca_has = Broker::Alpaca.has_creds(&connections);
-        let binance_has = Broker::Binance.has_creds(&connections);
+        let alpaca_has = Broker::by_code("ALPACA").unwrap().has_creds(&connections);
+        let binance_has = Broker::by_code("BINANCE").unwrap().has_creds(&connections);
         clear();
 
         assert!(alpaca_has);
@@ -576,11 +514,11 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
         let connections = vec![
-            connection(&Broker::Alpaca.connection_code(), CredentialState::Unconfigured),
-            connection(&Broker::Binance.connection_code(), CredentialState::Error("bad key".into())),
+            connection(&Broker::by_code("ALPACA").unwrap().connection_code(), CredentialState::Unconfigured),
+            connection(&Broker::by_code("BINANCE").unwrap().connection_code(), CredentialState::Error("bad key".into())),
         ];
-        let alpaca_has = Broker::Alpaca.has_creds(&connections);
-        let binance_has = Broker::Binance.has_creds(&connections);
+        let alpaca_has = Broker::by_code("ALPACA").unwrap().has_creds(&connections);
+        let binance_has = Broker::by_code("BINANCE").unwrap().has_creds(&connections);
         clear();
 
         assert!(!alpaca_has);
@@ -593,7 +531,7 @@ mod tests {
     fn has_creds_is_false_when_no_row_exists_for_the_code() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
-        let alpaca_has = Broker::Alpaca.has_creds(&[]);
+        let alpaca_has = Broker::by_code("ALPACA").unwrap().has_creds(&[]);
         clear();
 
         assert!(!alpaca_has);
@@ -604,13 +542,13 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear();
         let connections = vec![
-            connection(&Broker::Alpaca.connection_code(), CredentialState::Configured(alpaca_cred())),
-            connection(&Broker::Binance.connection_code(), CredentialState::Unconfigured),
+            connection(&Broker::by_code("ALPACA").unwrap().connection_code(), CredentialState::Configured(alpaca_cred())),
+            connection(&Broker::by_code("BINANCE").unwrap().connection_code(), CredentialState::Unconfigured),
         ];
         let result = brokers_with_creds(&connections);
         clear();
 
-        assert_eq!(result, vec![Broker::Alpaca]);
+        assert_eq!(result, vec![Broker::by_code("ALPACA").unwrap()]);
     }
 
     // --- load_universe -------------------------------------------------------
@@ -712,7 +650,7 @@ mod tests {
         let provider = FakeProvider((0..3).map(|i| (format!("{prefix}{i}"), "XNAS".to_string())).collect());
         let rec = Recorder::default();
 
-        let report = load_universe(&pool, Broker::Alpaca, &provider, &opts(), &rec).await.unwrap();
+        let report = load_universe(&pool, Broker::by_code("ALPACA").unwrap(), &provider, &opts(), &rec).await.unwrap();
         remove(&pool, &prefix).await;
 
         assert_eq!((report.fetched, report.mapped), (3, 3));
@@ -730,7 +668,7 @@ mod tests {
         ]);
         let rec = Recorder::default();
 
-        let report = load_universe(&pool, Broker::Alpaca, &provider, &opts(), &rec).await.unwrap();
+        let report = load_universe(&pool, Broker::by_code("ALPACA").unwrap(), &provider, &opts(), &rec).await.unwrap();
         remove(&pool, &prefix).await;
 
         assert_eq!(report.skipped, 1);

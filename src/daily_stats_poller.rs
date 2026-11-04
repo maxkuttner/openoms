@@ -17,34 +17,27 @@ use crate::daily_stats::DailyStatsStore;
 
 const POLL_INTERVAL_SECS: u64 = 300;
 
-/// Crypto venue codes seeded outside the ISO 10383 MIC registry (see
-/// `db/scripts/seed_crypto_venues.sql`) — everything else in `instrument.venue`
-/// is an equity MIC.
-const CRYPTO_VENUES: &[&str] = &["BINANCE", "BYBIT", "COINBASE", "OKX"];
-
-/// Which venues a broker_code's adapter can actually be asked about.
+/// Which venues a broker_code's adapter can actually be asked about — from
+/// its connector's `QuoteScope`.
 ///
 /// Binance's `GET /api/v3/ticker/24hr?symbols=[...]` rejects the WHOLE request
 /// with `{"code":-1121,"msg":"Invalid symbol."}` if even one symbol in the
 /// batch isn't a Binance symbol (live-verified) — so a Binance adapter must
 /// only ever be called with Binance symbols, never the full cross-venue set.
-///
-/// Pure and explicit rather than routed through a registry lookup: there is no
-/// existing "which venue does this broker serve" concept to reuse (
-/// `dataprovider::FeedSymbology::candidates` is the market-data-feed
-/// counterpart of this question, not the broker-adapter one — `BrokerAdapter`
-/// carries no such method), and the mapping itself is small and stable enough
-/// that a table lookup would be more indirection, not less.
+/// A broker quoting everything else (Alpaca) is asked about every venue no
+/// connector claims as its own (the crypto venues are seeded outside the ISO
+/// 10383 MIC registry, see `db/scripts/seed_crypto_venues.sql`). A broker not
+/// wired for daily stats (IBKR), or one no connector knows, serves nothing
+/// here rather than guessing.
 fn broker_serves_venue(broker_code: &str, venue: &str) -> bool {
-    match broker_code {
-        "BINANCE" => venue == "BINANCE",
-        "BYBIT" => venue == "BYBIT",
-        "COINBASE" => venue == "COINBASE",
-        "OKX" => venue == "OKX",
-        "ALPACA" => !CRYPTO_VENUES.contains(&venue),
-        // Any other/future broker_code (e.g. IBKR): not wired for daily
-        // stats yet, so it serves nothing here rather than guessing.
-        _ => false,
+    use crate::connectors::{self, QuoteScope};
+    let own_venue = |code: &str| {
+        connectors::by_code(code).is_some_and(|c| c.manifest().quotes == QuoteScope::OwnVenue)
+    };
+    match connectors::by_code(broker_code).map(|c| c.manifest().quotes) {
+        Some(QuoteScope::OwnVenue) => venue == broker_code,
+        Some(QuoteScope::NonCrypto) => !own_venue(venue),
+        Some(QuoteScope::None) | None => false,
     }
 }
 
@@ -245,6 +238,31 @@ pub async fn run(pool: PgPool, registry: Arc<ArcSwap<BrokerRegistry>>, stats: Da
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule as it was written per broker before connectors described
+    /// themselves; the manifest-driven rule must decide every pair the same.
+    fn old_rule(broker_code: &str, venue: &str) -> bool {
+        const CRYPTO: &[&str] = &["BINANCE", "BYBIT", "COINBASE", "OKX"];
+        match broker_code {
+            "BINANCE" => venue == "BINANCE",
+            "BYBIT" => venue == "BYBIT",
+            "COINBASE" => venue == "COINBASE",
+            "OKX" => venue == "OKX",
+            "ALPACA" => !CRYPTO.contains(&venue),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn quote_scope_matches_the_old_venue_rule() {
+        let codes = ["BINANCE", "BYBIT", "COINBASE", "OKX", "ALPACA", "IBKR", "NASDAQ"];
+        let venues = ["BINANCE", "BYBIT", "COINBASE", "OKX", "XNAS", "XNYS", "ARCX", "NASDAQ"];
+        for code in codes {
+            for venue in venues {
+                assert_eq!(broker_serves_venue(code, venue), old_rule(code, venue), "{code} / {venue}");
+            }
+        }
+    }
 
     #[test]
     fn okx_serves_only_okx_symbols() {

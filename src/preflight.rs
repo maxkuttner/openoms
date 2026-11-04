@@ -200,7 +200,7 @@ async fn report_held(pool: &PgPool) {
     // drift from what actually gets subscribed.
     let unpriceable: Vec<&str> = live
         .iter()
-        .filter(|r| !crate::feeds::ALL.iter().any(|feed| covers(*feed, r)))
+        .filter(|r| !crate::feeds::all().iter().any(|feed| covers(*feed, r)))
         .filter_map(|r| r.symbol.as_deref())
         .collect();
     if !unpriceable.is_empty() {
@@ -236,8 +236,8 @@ async fn report_held(pool: &PgPool) {
     }
 
     // One line per feed, so the healthy case is a glance rather than an absence.
-    for feed in crate::feeds::ALL {
-        let n = live.iter().filter(|r| covers(*feed, r)).count();
+    for feed in crate::feeds::all() {
+        let n = live.iter().filter(|r| covers(feed, r)).count();
         info!("preflight: {} covers {} of {} held instrument(s)", feed.code(), n, live.len());
     }
 }
@@ -328,7 +328,7 @@ mod tests {
     fn equity_is_not_covered_by_the_opra_feed() {
         let held = row("SPY", "SPOT", "EQUITY", "ARCX");
         assert!(!covers(&crate::opra_stream::DatabentoOpraFeed::new(String::new()), &held));
-        assert!(!crate::feeds::ALL.iter().any(|f| covers(*f, &held)));
+        assert!(!crate::feeds::all().iter().any(|f| covers(*f, &held)));
     }
 
     #[test]

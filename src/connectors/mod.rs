@@ -7,10 +7,15 @@
 
 use std::sync::Arc;
 
+use dataprovider::{FeedSymbology, Quote};
 use futures_util::future::BoxFuture;
+use sqlx::PgPool;
+use tokio::sync::{broadcast, mpsc};
 
-use crate::adapters::BrokerAdapter;
+use crate::adapters::{BrokerAdapter, InstrumentProvider};
 use crate::credentials::{BrokerCredentials, Shown};
+use crate::credentials_api::TestOutcome;
+use crate::event_bus::OrderLaneEvent;
 use crate::order_engine::EngineHandle;
 use crate::reload::RegistrationDeps;
 use crate::stream_health::StreamHandle;
@@ -68,6 +73,14 @@ pub struct Manifest {
 /// Starts one execution stream; called again on every restart.
 pub type ExecStream = Arc<dyn Fn(StreamHandle, EngineHandle) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// A venue's public quote feed: needs no credential, runs for the life of the
+/// process, and prices the instruments it covers that are held.
+pub struct PublicFeed {
+    pub symbology: &'static dyn FeedSymbology,
+    /// Run the feed's supervised session; never returns.
+    pub run: fn(PgPool, mpsc::Sender<Quote>, broadcast::Receiver<OrderLaneEvent>, StreamHandle) -> BoxFuture<'static, ()>,
+}
+
 /// What connecting one configured connection produced.
 pub struct Connected {
     pub adapter: Arc<dyn BrokerAdapter>,
@@ -82,7 +95,41 @@ pub trait Connector: Send + Sync {
     /// Build the adapter (and start a FIX session) for one connection. `Err` is
     /// the reason the connection is reported failed.
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String>;
+
+    /// Check a credential against the venue before it is saved, where that is
+    /// cheap and side-effect free.
+    fn verify<'a>(&'a self, env: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome>;
+
+    /// The data provider that loads this broker's instrument universe, built
+    /// from its stored credential. Only connectors whose manifest has `universe`.
+    fn universe_provider(&self, _env: &str, _creds: &BrokerCredentials) -> Result<Box<dyn InstrumentProvider>, String> {
+        Err("no instrument universe to load".into())
+    }
+
+    /// Its public quote feed, if the venue has one.
+    fn public_feed(&self) -> Option<PublicFeed> {
+        None
+    }
 }
+
+/// Run a verification call under the credential-test timeout, mapping its
+/// outcome; `provider` names it in the timeout message.
+async fn checked<T, E: std::fmt::Display>(
+    provider: &str,
+    call: impl std::future::Future<Output = Result<T, E>>,
+    judge: impl FnOnce(T) -> TestOutcome,
+) -> TestOutcome {
+    match tokio::time::timeout(crate::credentials_api::TEST_TIMEOUT, call).await {
+        Ok(Ok(v)) => judge(v),
+        Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
+        Err(_) => crate::credentials_api::timed_out(provider),
+    }
+}
+
+/// A FIX credential is checked by logging on, which only the one running
+/// session per connection may do; so nothing is attempted before save.
+const FIX_NOT_TESTABLE: TestOutcome =
+    TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save");
 
 /// Read a connector's typed credential, worded the way a failed connection reports it.
 fn typed<T: serde::de::DeserializeOwned>(creds: &BrokerCredentials) -> Result<T, String> {

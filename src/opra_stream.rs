@@ -40,7 +40,7 @@ pub struct DatabentoOpraFeed {
 }
 
 impl DatabentoOpraFeed {
-    // `const fn` so `feeds::ALL` (symbology-only, never runs a session) can build
+    // `const fn` so `feeds::all` (symbology-only, never runs a session) can build
     // one with a placeholder key as a promoted `'static` value.
     pub const fn new(api_key: String) -> Self {
         Self { api_key }
