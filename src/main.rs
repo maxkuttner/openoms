@@ -1055,6 +1055,12 @@ async fn serve() {
     // held by `AppState` so a reload hands restarted streams the same one.
     let event_bus = event_bus::EventBus::new();
 
+    // The order engine: the only place that books. Connectors send it execution
+    // events instead of writing to the database (see `order_engine.rs`). Started
+    // before any connector, though its channel would buffer either way.
+    let (engine, engine_rx) = order_engine::EngineHandle::new();
+    tokio::spawn(order_engine::run(engine_rx, pool.clone(), event_bus.clone()));
+
     // Quote channel every market-data feed publishes onto. Created here, ahead
     // of `AppState`, for the same reason: a runtime reload needs to hand a
     // restarted feed this exact sender, not a disconnected second channel, so
@@ -1073,6 +1079,7 @@ async fn serve() {
         pool: pool.clone(),
         stream_health: stream_health.clone(),
         event_bus: event_bus.clone(),
+        engine: engine.clone(),
     };
     let RegistrationOutput {
         registry,
@@ -1137,6 +1144,7 @@ async fn serve() {
         symbology,
         stream_health,
         event_bus,
+        engine,
         quote_tx.clone(),
         session_config,
     );

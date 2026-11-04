@@ -125,6 +125,7 @@ pub struct RegistrationDeps {
     pub pool: PgPool,
     pub stream_health: StreamHealthRegistry,
     pub event_bus: EventBus,
+    pub engine: crate::order_engine::EngineHandle,
 }
 
 /// Everything `build_registry` produces. `registry` and `report` are the pair
@@ -731,6 +732,7 @@ mod tests {
                 .expect("connect_lazy never actually connects"),
             stream_health: StreamHealthRegistry::new(),
             event_bus: EventBus::new(),
+            engine: crate::order_engine::EngineHandle::new().0,
         }
     }
 
@@ -981,6 +983,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             event_bus: EventBus::new(),
+            engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "PAPER").is_none());
@@ -1000,6 +1003,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             event_bus: EventBus::new(),
+            engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("COINBASE", "LIVE").is_some());
@@ -1031,6 +1035,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             event_bus: EventBus::new(),
+            engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("OKX", "PAPER").is_some());
@@ -1055,6 +1060,7 @@ mod tests {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
             event_bus: EventBus::new(),
+            engine: crate::order_engine::EngineHandle::new().0,
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
         assert!(out.registry.get("BYBIT", "PAPER").is_some());

@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 
 use crate::adapters::BrokerRegistry;
 use crate::event_bus::EventBus;
+use crate::order_engine::EngineHandle;
 use crate::marks::MarkStore;
 use crate::stream_health::StreamHealthRegistry;
 
@@ -96,6 +97,9 @@ pub struct AppState {
     /// adapter or feed the *same* bus boot wired up rather than a copy nothing
     /// reads.
     event_bus: EventBus,
+    /// The order engine's inbox, so a reload can hand restarted connectors the
+    /// same engine boot started.
+    engine: EngineHandle,
     /// Where every market-data feed publishes quotes. Stored so a reload can
     /// hand a restarted feed the same channel the boot-time `mark_router` task
     /// already reads from, instead of constructing a second, disconnected one.
@@ -112,6 +116,7 @@ impl AppState {
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
         event_bus: EventBus,
+        engine: EngineHandle,
         quote_tx: mpsc::Sender<dataprovider::Quote>,
         session_config: crate::sessions::SessionConfig,
     ) -> Self {
@@ -128,6 +133,7 @@ impl AppState {
             daily_stats: crate::daily_stats::DailyStatsStore::new(),
             streams: StreamRegistry::new(),
             event_bus,
+            engine,
             quote_tx,
         }
     }
@@ -184,6 +190,10 @@ impl AppState {
         &self.event_bus
     }
 
+    pub fn engine(&self) -> &EngineHandle {
+        &self.engine
+    }
+
     /// A fresh handle on the shared quote channel every market-data feed
     /// publishes onto, for restarting a feed outside of boot (see
     /// `reload::restart_databento_feed`).
@@ -217,6 +227,7 @@ mod tests {
             symbology,
             StreamHealthRegistry::new(),
             EventBus::new(),
+            EngineHandle::new().0,
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),

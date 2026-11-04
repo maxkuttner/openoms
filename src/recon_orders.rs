@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::event_bus::EventBus;
 use crate::adapters::{BrokerAdapter, BrokerError};
 use crate::domain::orders::commands::ExecutionReport;
-use crate::execution::process_execution_report;
+use crate::order_engine::{apply_planned, ExecEvent, ExecKind, ExecSource};
 
 const EPS: f64 = 1e-9;
 
@@ -193,7 +193,7 @@ pub async fn run_order_reconcile(
     pool: &PgPool,
     adapter: &dyn BrokerAdapter,
     broker_code: &str,
-    actor: &str,
+    actor: &'static str,
     bus: Option<&EventBus>,
 ) {
     let oms = load_oms_working_orders(pool, broker_code).await;
@@ -267,7 +267,7 @@ pub(crate) fn increment_price(oms_cum: f64, oms_avg: Option<f64>, broker_cum: f6
 
 /// The OMS's own booked state for one order — cumulative quantity and average
 /// price; `None` (logged) when the order is unknown or unreadable.
-async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64, Option<f64>)> {
+pub(crate) async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64, Option<f64>)> {
     match sqlx::query_as::<_, (f64, Option<f64>)>(
         "SELECT cum_qty::float8, avg_px::float8 FROM order_state WHERE order_id = $1",
     )
@@ -296,46 +296,35 @@ pub(crate) async fn apply_broker_terminal(
     order_id: Uuid,
     st: &BrokerOrderState,
     venue: &str,
-    actor: &str,
+    actor: &'static str,
     bus: Option<&EventBus>,
 ) {
     let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
-    apply_terminal(pool, order_id, oms_cum, oms_avg, st, venue, actor, bus).await;
+    let ev = exec_event(order_id, venue, actor, ExecSource::Session, ExecKind::Terminal(st.clone()));
+    apply_planned(pool, bus, &ev, oms_cum, oms_avg).await;
 }
 
 /// Book a still-working order's progress from a venue that reports cumulative
-/// state rather than individual fills (Coinbase): whatever `broker_cum` holds
-/// beyond what the OMS has booked becomes one fill, priced against the OMS's
-/// booked average ([`increment_price`]). A repeated update books nothing, which
-/// is what makes this safe without execution-id dedupe.
-#[allow(clippy::too_many_arguments)]
+/// state rather than individual fills (Coinbase, OKX).
 pub(crate) async fn apply_broker_progress(
     pool: &PgPool,
     order_id: Uuid,
     broker_cum: f64,
     broker_avg: f64,
     venue: &str,
-    actor: &str,
+    actor: &'static str,
     bus: Option<&EventBus>,
 ) {
     let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
-    let Some(fill_qty) = missing_qty(oms_cum, broker_cum) else { return };
-    let report = ExecutionReport::Fill {
-        execution_id: format!("{venue}-{order_id}-{broker_cum}"),
-        fill_qty,
-        fill_price: increment_price(oms_cum, oms_avg, broker_cum, broker_avg),
-        venue: venue.to_string(),
-    };
-    if let Err(e) = process_execution_report(pool, order_id, report, actor, bus).await {
-        error!(order_id = %order_id, error = %e, "broker progress: apply failed");
-    }
+    let kind = ExecKind::Cumulative { cum_qty: broker_cum, avg_px: broker_avg };
+    let ev = exec_event(order_id, venue, actor, ExecSource::Session, kind);
+    apply_planned(pool, bus, &ev, oms_cum, oms_avg).await;
 }
 
-/// Apply the terminal outcome of an order that dropped out of the open-order set.
-/// Emits the missed fill (full executed − OMS cum, priced against the OMS's
-/// booked average) first, then the close, so a partial-then-canceled order books
-/// its trade before releasing the remainder. The terminal-state guard in
-/// [`process_execution_report`] makes every step replay-safe.
+/// Apply the terminal outcome of an order that dropped out of the open-order set:
+/// the missed fill first, then the close (see [`crate::order_engine::reports_for`]).
+/// The terminal-state guard in `process_execution_report` makes every step
+/// replay-safe.
 #[allow(clippy::too_many_arguments)]
 async fn apply_terminal(
     pool: &PgPool,
@@ -344,45 +333,15 @@ async fn apply_terminal(
     oms_avg: Option<f64>,
     st: &BrokerOrderState,
     venue: &str,
-    actor: &str,
+    actor: &'static str,
     bus: Option<&EventBus>,
 ) {
-    let apply = |report: ExecutionReport| async move {
-        if let Err(e) =
-            process_execution_report(pool, order_id, report, actor, bus).await
-        {
-            error!(order_id = %order_id, error = %e, "order recon: apply failed");
-        }
-    };
+    let ev = exec_event(order_id, venue, actor, ExecSource::Snapshot, ExecKind::Terminal(st.clone()));
+    apply_planned(pool, bus, &ev, oms_cum, oms_avg).await;
+}
 
-    if let Some(missed) = missing_qty(oms_cum, st.executed_qty) {
-        apply(ExecutionReport::Fill {
-            execution_id: format!("recon-{order_id}"),
-            fill_qty: missed,
-            fill_price: increment_price(oms_cum, oms_avg, st.executed_qty, st.avg_px),
-            venue: venue.to_string(),
-        })
-        .await;
-    }
-
-    match st.outcome {
-        BrokerOrderOutcome::Filled => {
-            // The fill above closes it (leaves → 0). Nothing else to do.
-        }
-        BrokerOrderOutcome::Canceled => {
-            apply(ExecutionReport::Canceled { reason: None, venue: Some(venue.to_string()) }).await;
-        }
-        BrokerOrderOutcome::Rejected => {
-            apply(ExecutionReport::Reject {
-                reason: "rejected".to_string(),
-                venue: Some(venue.to_string()),
-            })
-            .await;
-        }
-        BrokerOrderOutcome::Working => {
-            info!(order_id = %order_id, "order recon: order still working at broker, no terminal action");
-        }
-    }
+fn exec_event(order_id: Uuid, venue: &str, actor: &'static str, source: ExecSource, kind: ExecKind) -> ExecEvent {
+    ExecEvent { order_id, venue: venue.to_string(), actor, source, kind }
 }
 
 #[cfg(test)]

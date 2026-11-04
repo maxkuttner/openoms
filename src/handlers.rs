@@ -2422,6 +2422,7 @@ pub(crate) mod tests {
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
+            crate::order_engine::EngineHandle::new().0,
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
@@ -3174,6 +3175,7 @@ pub(crate) mod tests {
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
+            crate::order_engine::EngineHandle::new().0,
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),

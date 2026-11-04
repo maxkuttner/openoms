@@ -1346,6 +1346,7 @@ async fn apply_reload(
         pool: state.pool().clone(),
         stream_health: state.stream_health().clone(),
         event_bus: state.event_bus().clone(),
+        engine: state.engine().clone(),
     };
 
     // Release this snapshot after registration, before joining old streams.
@@ -3439,6 +3440,7 @@ mod tests {
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
+            crate::order_engine::EngineHandle::new().0,
             quote_tx,
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
