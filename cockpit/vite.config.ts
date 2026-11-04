@@ -16,6 +16,10 @@ function rewriteOriginHeader(proxy: import("http-proxy").default) {
   proxy.on("proxyReq", (proxyReq) => {
     proxyReq.setHeader("origin", target);
   });
+  // the live-updates WebSocket upgrade is checked against the same origin
+  proxy.on("proxyReqWs", (proxyReq) => {
+    proxyReq.setHeader("origin", target);
+  });
 }
 
 export default defineConfig(({ command }) => ({
@@ -33,6 +37,7 @@ export default defineConfig(({ command }) => ({
       "/api": {
         target,
         changeOrigin: true,
+        ws: true,
         rewrite: (p) => p.replace(/^\/api/, ""),
         configure: rewriteOriginHeader,
       },
