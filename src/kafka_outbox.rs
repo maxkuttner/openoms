@@ -142,6 +142,58 @@ pub fn records_for(row: &OutboxRow, topics: &OutboxTopics) -> Vec<OutboxRecord> 
     records
 }
 
+#[async_trait::async_trait]
+pub trait OutboxSink: Send + Sync {
+    /// Publish one record; Ok only once the broker has acked it.
+    async fn send(&self, record: &OutboxRecord) -> Result<(), String>;
+}
+
+/// Send events in order and stop at the first failure, so nothing later in the
+/// batch overtakes it. Returns the global positions whose records were ALL acked,
+/// plus the failure, if any. An event that failed part-way is not acked: it is
+/// re-sent whole next time, and its already-sent records arrive twice.
+pub async fn deliver(batch: &[(i64, Vec<OutboxRecord>)], sink: &dyn OutboxSink) -> (Vec<i64>, Option<String>) {
+    let mut acked = Vec::with_capacity(batch.len());
+    for (global_position, records) in batch {
+        for record in records {
+            if let Err(e) = sink.send(record).await {
+                return (acked, Some(e));
+            }
+        }
+        acked.push(*global_position);
+    }
+    (acked, None)
+}
+
+/// Turns a stream of attempt outcomes into one log line per outage edge, so a
+/// broker that stays down for an hour logs twice, not once per retry.
+#[derive(Default)]
+pub struct OutageLog {
+    failed_attempts: u32,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Transition {
+    WentDown,
+    Recovered { failed_attempts: u32 },
+}
+
+impl OutageLog {
+    pub fn on_attempt(&mut self, ok: bool) -> Option<Transition> {
+        match (ok, self.failed_attempts) {
+            (true, 0) => None,
+            (true, failed_attempts) => {
+                self.failed_attempts = 0;
+                Some(Transition::Recovered { failed_attempts })
+            }
+            (false, n) => {
+                self.failed_attempts = n + 1;
+                (n == 0).then_some(Transition::WentDown)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +262,79 @@ mod tests {
     fn fill_without_position_row_skips_positions() {
         let records = records_for(&row("order_partially_filled", None), &topics());
         assert_eq!(records.len(), 2);
+    }
+
+    /// Records every send it accepts; from send number `fail_from` (0-based, counting
+    /// attempts) on, refuses — until `fail_from` is cleared, which brings it back up.
+    #[derive(Default)]
+    struct FakeSink {
+        sent: std::sync::Mutex<Vec<OutboxRecord>>,
+        attempts: std::sync::atomic::AtomicUsize,
+        fail_from: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl FakeSink {
+        fn failing_from(n: usize) -> Self {
+            Self { fail_from: std::sync::Mutex::new(Some(n)), ..Default::default() }
+        }
+        fn sent(&self) -> Vec<OutboxRecord> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OutboxSink for FakeSink {
+        async fn send(&self, record: &OutboxRecord) -> Result<(), String> {
+            let n = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if matches!(*self.fail_from.lock().unwrap(), Some(f) if n >= f) {
+                return Err("broker down".into());
+            }
+            self.sent.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    fn rec(tag: &str) -> OutboxRecord {
+        OutboxRecord { topic: "orders".into(), key: tag.into(), payload: tag.into() }
+    }
+
+    #[tokio::test]
+    async fn all_acked_when_sink_is_up() {
+        let sink = FakeSink::default();
+        let batch = vec![(1, vec![rec("a")]), (2, vec![rec("b")]), (3, vec![rec("c")])];
+        let (acked, err) = deliver(&batch, &sink).await;
+        assert_eq!(acked, vec![1, 2, 3]);
+        assert!(err.is_none());
+        assert_eq!(sink.sent(), vec![rec("a"), rec("b"), rec("c")]);
+    }
+
+    #[tokio::test]
+    async fn stops_at_first_failed_event() {
+        let sink = FakeSink::failing_from(1);
+        let batch = vec![(1, vec![rec("a")]), (2, vec![rec("b")]), (3, vec![rec("c")])];
+        let (acked, err) = deliver(&batch, &sink).await;
+        assert_eq!(acked, vec![1]);
+        assert!(err.is_some());
+        assert_eq!(sink.attempts.load(std::sync::atomic::Ordering::SeqCst), 2, "event 3 must not be tried");
+    }
+
+    #[tokio::test]
+    async fn partially_sent_event_is_not_acked() {
+        let sink = FakeSink::failing_from(1);
+        let (acked, err) = deliver(&[(1, vec![rec("orders"), rec("fills")])], &sink).await;
+        assert!(acked.is_empty());
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn outage_log_reports_each_transition_once() {
+        let mut log = OutageLog::default();
+        let seen: Vec<Option<Transition>> =
+            [true, false, false, false, true, true].into_iter().map(|ok| log.on_attempt(ok)).collect();
+        assert_eq!(
+            seen,
+            vec![None, Some(Transition::WentDown), None, None, Some(Transition::Recovered { failed_attempts: 3 }), None]
+        );
     }
 
     async fn rows_for(pool: &PgPool, order_id: Uuid) -> Vec<OutboxRow> {
