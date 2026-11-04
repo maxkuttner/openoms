@@ -111,3 +111,5 @@ tempfile = "3"
 # ID-token verification can be tested against real signatures without an IdP.
 # Already an indirect dependency of openidconnect; pinned here to use it directly.
 rsa = "0.9"
+# Test-only: paused clock, so src/live_updates.rs can test its heartbeat without waiting.
+tokio = { version = "1", features = ["test-util"] }

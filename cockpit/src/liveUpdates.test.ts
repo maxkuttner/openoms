@@ -1,7 +1,7 @@
 // Run with `npm test` (node --test; Node strips the types itself).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reconnectDelayMs, staleFor, updatesUrl } from "./trade/api/liveUpdatesCore.ts";
+import { reconnectDelayMs, staleFor, updatesUrl, WATCHDOG_MS, type UiNotice } from "./trade/api/liveUpdatesCore.ts";
 
 const blotter = ["/orders", { portfolioId: "p", limit: 200 }];
 const followed = ["/orders", "o-1", "state"];
@@ -43,4 +43,18 @@ test("reconnect delay doubles to cap", () => {
 test("updates url follows page protocol", () => {
   assert.equal(updatesUrl({ protocol: "https:", host: "h" }, ""), "wss://h/updates");
   assert.equal(updatesUrl({ protocol: "http:", host: "h" }, "/api"), "ws://h/api/updates");
+});
+
+test("heartbeat stales nothing", () => {
+  const stale = staleFor({ type: "heartbeat" });
+  for (const key of [blotter, positions, marks(["1"])]) assert.equal(stale(key), false);
+});
+
+test("an unknown notice from a newer server stales nothing", () => {
+  const stale = staleFor({ type: "something_new" } as unknown as UiNotice);
+  assert.equal(stale(blotter), false);
+});
+
+test("watchdog outlasts two missed heartbeats", () => {
+  assert.ok(WATCHDOG_MS > 2 * 15_000);
 });

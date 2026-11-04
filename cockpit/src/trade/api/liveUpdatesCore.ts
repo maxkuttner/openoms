@@ -9,7 +9,13 @@ export type UiNotice =
   | { type: "orders" }
   | { type: "positions" }
   | { type: "resync" }
+  | { type: "heartbeat" }
   | { type: "marks"; instrument_ids: number[] };
+
+// The server sends a heartbeat every 15s (src/live_updates.rs HEARTBEAT_SECS).
+// Silence longer than this means the connection is dead without having said
+// so — close it and reconnect rather than keep showing "Live updates".
+export const WATCHDOG_MS = 40_000;
 
 // Query keys as the trade screens build them today:
 //   ["/orders", …]                    blotter list and the followed order
@@ -26,6 +32,8 @@ export function staleFor(n: UiNotice): (queryKey: readonly unknown[]) => boolean
       return isPositions;
     case "resync":
       return () => true;
+    case "heartbeat":
+      return () => false;
     case "marks": {
       const moved = new Set(n.instrument_ids.map(String));
       // Positions too: the server prices unrealized P&L from these marks.
@@ -33,6 +41,9 @@ export function staleFor(n: UiNotice): (queryKey: readonly unknown[]) => boolean
         isPositions(key) ||
         (key[0] === "/marks" && Array.isArray(key[1]) && key[1].some((id) => moved.has(String(id))));
     }
+    // a notice type from a newer server: nothing this client knows to refresh
+    default:
+      return () => false;
   }
 }
 

@@ -24,6 +24,9 @@ use crate::event_bus::{MarkUpdate, OrderLaneEvent};
 const FLUSH_MS: u64 = 250;
 /// Marks tick constantly; at most one marks notice a second per socket.
 const MARKS_FLUSH_MS: u64 = 1000;
+/// An idle socket still gets a frame this often, so a half-open connection is
+/// noticed: the client's watchdog reconnects when frames stop.
+const HEARTBEAT_SECS: u64 = 15;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -33,6 +36,8 @@ pub enum UiNotice {
     Marks { instrument_ids: Vec<i64> },
     /// The socket fell behind the order lane: refetch everything.
     Resync,
+    /// Nothing changed; proves the connection is alive.
+    Heartbeat,
 }
 
 /// What has changed since the last flush.
@@ -107,6 +112,8 @@ pub async fn pump(
     let mut conflator = Conflator::default();
     let mut fast = interval(Duration::from_millis(FLUSH_MS));
     let mut slow = interval(Duration::from_millis(MARKS_FLUSH_MS));
+    let heartbeat_every = Duration::from_secs(HEARTBEAT_SECS);
+    let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + heartbeat_every, heartbeat_every);
     fast.set_missed_tick_behavior(MissedTickBehavior::Delay);
     slow.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let (mut order_open, mut price_open) = (true, true);
@@ -131,6 +138,7 @@ pub async fn pump(
             }
             _ = fast.tick() => conflator.take_fast(),
             _ = slow.tick() => conflator.take_marks().into_iter().collect(),
+            _ = heartbeat.tick() => vec![UiNotice::Heartbeat],
             _ = out.closed() => return,
         };
         for n in notices {
@@ -276,6 +284,20 @@ mod tests {
             .await
             .expect("pump returns once nobody reads")
             .unwrap();
+    }
+
+    /// A half-open connection (laptop sleep, NAT change) is only noticed if
+    /// something is sent; an idle socket still gets a frame every HEARTBEAT_SECS.
+    #[tokio::test(start_paused = true)]
+    async fn pump_sends_heartbeat_when_idle() {
+        let bus = crate::event_bus::EventBus::new();
+        let (out, mut rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(pump(bus.subscribe_order(), bus.subscribe_price(), out));
+
+        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_SECS - 1)).await;
+        assert!(rx.try_recv().is_err(), "no heartbeat before the interval");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert_eq!(rx.try_recv(), Ok(UiNotice::Heartbeat));
     }
 
     #[test]
