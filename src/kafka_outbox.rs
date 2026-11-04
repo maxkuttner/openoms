@@ -2,8 +2,22 @@
 //! trigger on `order_event`, see migration 0033) until Kafka has acked it. The
 //! bridge reads it oldest-first, so an outage only delays events, never drops them.
 
+use std::sync::Arc;
+
 use sqlx::{PgPool, Row};
+use tokio::sync::broadcast;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+use crate::event_bus::OrderLaneEvent;
+
+const BATCH_SIZE: i64 = 500;
+/// Wait after a failed drain before trying again.
+const RETRY_SECS: u64 = 5;
+/// Backstop when the order lane is quiet: an event queued by a path that did not
+/// publish on the bus is still picked up.
+const IDLE_RECHECK_SECS: u64 = 30;
 
 pub struct PositionSnapshot {
     pub net_qty: f64,
@@ -194,6 +208,85 @@ impl OutageLog {
     }
 }
 
+#[derive(Debug)]
+pub enum DrainError {
+    Db(sqlx::Error),
+    Sink { published: usize, error: String },
+}
+
+/// Publish until the outbox is empty or the sink fails. Returns events published.
+pub async fn drain(
+    pool: &PgPool,
+    sink: &dyn OutboxSink,
+    topics: &OutboxTopics,
+    batch_size: i64,
+) -> Result<usize, DrainError> {
+    let mut published = 0;
+    loop {
+        let rows = fetch_batch(pool, batch_size).await.map_err(DrainError::Db)?;
+        if rows.is_empty() {
+            return Ok(published);
+        }
+        let batch: Vec<(i64, Vec<OutboxRecord>)> =
+            rows.iter().map(|r| (r.global_position, records_for(r, topics))).collect();
+        let (acked, failure) = deliver(&batch, sink).await;
+        ack(pool, &acked).await.map_err(DrainError::Db)?;
+        published += acked.len();
+        if let Some(error) = failure {
+            return Err(DrainError::Sink { published, error });
+        }
+    }
+}
+
+/// The Kafka bridge: drain the outbox whenever the order lane says something was
+/// committed (or the idle timer fires), and retry on a timer while Kafka is down.
+/// Runs for the life of the process; nothing on the order path waits on it.
+pub async fn run(
+    pool: PgPool,
+    sink: Arc<dyn OutboxSink>,
+    mut order_rx: broadcast::Receiver<OrderLaneEvent>,
+    topics: OutboxTopics,
+) -> ! {
+    let mut outage = OutageLog::default();
+    let mut lane_open = true;
+    info!("kafka outbox: bridge started");
+    loop {
+        let caught_up = match drain(&pool, sink.as_ref(), &topics, BATCH_SIZE).await {
+            Ok(published) => {
+                if let Some(Transition::Recovered { failed_attempts }) = outage.on_attempt(true) {
+                    info!(failed_attempts, published, "kafka outbox: Kafka recovered, caught up");
+                } else if published > 0 {
+                    debug!(published, "kafka outbox: published");
+                }
+                true
+            }
+            Err(DrainError::Sink { published, error }) => {
+                if outage.on_attempt(false) == Some(Transition::WentDown) {
+                    warn!(%error, published, "kafka outbox: Kafka down, events stay queued until it is back");
+                }
+                false
+            }
+            Err(DrainError::Db(e)) => {
+                error!(error = %e, "kafka outbox: reading the outbox failed");
+                false
+            }
+        };
+
+        if !caught_up {
+            sleep(Duration::from_secs(RETRY_SECS)).await;
+            continue;
+        }
+        tokio::select! {
+            r = order_rx.recv(), if lane_open => {
+                if matches!(r, Err(broadcast::error::RecvError::Closed)) {
+                    lane_open = false;
+                }
+            }
+            _ = sleep(Duration::from_secs(IDLE_RECHECK_SECS)) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +428,40 @@ mod tests {
             seen,
             vec![None, Some(Transition::WentDown), None, None, Some(Transition::Recovered { failed_attempts: 3 }), None]
         );
+    }
+
+    /// The spec's phase 2 success test: Kafka down, then up — no event missing,
+    /// none out of order. Batch size 2 so catch-up has to loop. Drains the shared
+    /// dev outbox, so other pending rows may interleave: only this order's
+    /// records are checked.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn kafka_down_then_up_publishes_everything_in_order() {
+        let pool = test_pool().await;
+        let (order_id, _, _) = seeded_order(&pool, 0).await;
+        let events: Vec<NewOrderEvent> = (0..5)
+            .map(|i| NewOrderEvent { payload: serde_json::json!({ "seq": i }), ..event("order_routed") })
+            .collect();
+        OrderEventStore::new(pool.clone()).append_events(order_id, 0, &events).await.expect("append");
+        let sink = FakeSink::failing_from(2);
+
+        let down = drain(&pool, &sink, &topics(), 2).await;
+        *sink.fail_from.lock().unwrap() = None;
+        let up = drain(&pool, &sink, &topics(), 2).await;
+        let left = rows_for(&pool, order_id).await;
+        remove_seeded(&pool, order_id).await;
+
+        assert!(matches!(down, Err(DrainError::Sink { .. })));
+        assert!(up.is_ok());
+        let key = order_id.to_string();
+        let ids: Vec<String> = sink
+            .sent()
+            .iter()
+            .filter(|r| r.key == key)
+            .map(|r| serde_json::from_str::<serde_json::Value>(&r.payload).unwrap()["seq"].to_string())
+            .collect();
+        assert_eq!(ids, ["0", "1", "2", "3", "4"], "every event once, in append order");
+        assert!(left.is_empty(), "outbox drained");
     }
 
     async fn rows_for(pool: &PgPool, order_id: Uuid) -> Vec<OutboxRow> {

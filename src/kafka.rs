@@ -4,13 +4,18 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::error::KafkaError;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
 use tracing::info;
+
+use crate::kafka_outbox::{OutboxRecord, OutboxSink, OutboxTopics};
 
 #[derive(Clone)]
 pub struct KafkaConfig {
     pub brokers: String,
     pub client_id: String,
     pub orders_topic: String,
+    pub fills_topic: String,
+    pub positions_topic: String,
     pub projector_group_id: String,
 }
 
@@ -28,6 +33,12 @@ impl KafkaConfig {
         };
         info!("KAFKA_TOPIC: {}", orders_topic);
 
+        let fills_topic = env::var("KAFKA_FILLS_TOPIC").unwrap_or_else(|_| "oms.fills".to_string());
+        info!("KAFKA_FILLS_TOPIC: {}", fills_topic);
+
+        let positions_topic = env::var("KAFKA_POSITIONS_TOPIC").unwrap_or_else(|_| "oms.positions".to_string());
+        info!("KAFKA_POSITIONS_TOPIC: {}", positions_topic);
+
         let client_id = env::var("KAFKA_CLIENT_ID").
             unwrap_or_else(|_| "rust-oms".to_string());
         info!("KAFKA_CLIENT_ID: {}", client_id);
@@ -40,8 +51,18 @@ impl KafkaConfig {
             brokers,
             client_id,
             orders_topic,
+            fills_topic,
+            positions_topic,
             projector_group_id,
         })
+    }
+
+    pub fn topics(&self) -> OutboxTopics {
+        OutboxTopics {
+            orders: self.orders_topic.clone(),
+            fills: self.fills_topic.clone(),
+            positions: self.positions_topic.clone(),
+        }
     }
 
     fn base_client_config(&self, client_id: &str) -> ClientConfig {
@@ -86,6 +107,9 @@ impl KafkaClient {
             .set("client.id", &config.client_id)
             .set("retries", "5")
             .set("acks", "all")
+            // bounds how long the outbox bridge waits on one record while the
+            // broker is down before it backs off and retries
+            .set("message.timeout.ms", "30000")
             .set("broker.address.family", "v4")
             .create()?;
 
@@ -93,6 +117,22 @@ impl KafkaClient {
             producer,
             topic: config.orders_topic.clone(),
         })
+    }
+}
+
+/// The outbox bridge's way out: one record, awaited until the broker acks it.
+pub struct KafkaSink(pub KafkaClient);
+
+#[async_trait::async_trait]
+impl OutboxSink for KafkaSink {
+    async fn send(&self, record: &OutboxRecord) -> Result<(), String> {
+        let r = FutureRecord::to(&record.topic).key(&record.key).payload(&record.payload);
+        self.0
+            .producer
+            .send(r, Timeout::Never)
+            .await
+            .map(|_| ())
+            .map_err(|(e, _)| e.to_string())
     }
 }
 
@@ -189,6 +229,8 @@ mod tests {
             brokers: "127.0.0.1:1".to_string(),
             client_id: "publish-test".to_string(),
             orders_topic: "orders".to_string(),
+            fills_topic: "fills".to_string(),
+            positions_topic: "positions".to_string(),
             projector_group_id: "unused".to_string(),
         };
         let client = KafkaClient::new(&config).expect("producer builds without a broker");

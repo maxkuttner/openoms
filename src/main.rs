@@ -971,14 +971,16 @@ async fn serve() {
         return;
     }
 
-    // Init kafka client from .env (optional — publishing is disabled if not configured)
-    let kafka_client: Option<kafka::KafkaClient> = match kafka::KafkaConfig::from_env() {
+    // Init kafka client from .env (optional — publishing is disabled if not configured).
+    // The config is kept alongside the client for the outbox bridge's topic names.
+    let kafka_setup: Option<(kafka::KafkaConfig, kafka::KafkaClient)> = match kafka::KafkaConfig::from_env() {
         Ok(cfg) => match cfg.create_producer_client() {
-            Ok(client) => { info!("Kafka producer ready (topic: {})", cfg.orders_topic); Some(client) }
+            Ok(client) => { info!("Kafka producer ready (topic: {})", cfg.orders_topic); Some((cfg, client)) }
             Err(err) => { warn!("Kafka producer failed, publishing disabled: {}", err); None }
         },
         Err(err) => { info!("Kafka not configured ({}), publishing disabled", err); None }
     };
+    let kafka_client = kafka_setup.as_ref().map(|(_, client)| client.clone());
 
 
     // `file_cfg` was already loaded above (for the master key); `config::load()`
@@ -1202,6 +1204,24 @@ async fn serve() {
     // `AppState`); the router is the sole writer to MarkStore. Adding a vendor
     // means spawning another feed here — nothing downstream changes.
     tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone(), state.event_bus().clone()));
+
+    // Kafka bridge: publishes committed order events from the outbox, catching up
+    // after an outage. Without Kafka, events still queue; say how many wait.
+    match kafka_setup {
+        Some((cfg, client)) => {
+            tokio::spawn(kafka_outbox::run(
+                state.pool().clone(),
+                std::sync::Arc::new(kafka::KafkaSink(client)),
+                state.event_bus().subscribe_order(),
+                cfg.topics(),
+            ));
+        }
+        None => match kafka_outbox::pending_count(state.pool()).await {
+            Ok(n) if n > 0 => info!("kafka outbox: {n} events waiting; Kafka not configured"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "kafka outbox: could not count pending events"),
+        },
+    }
 
     // Periodically refresh previous-close data for the interesting set (held
     // positions + watchlist) so Day P&L has a baseline even before a live quote
