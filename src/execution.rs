@@ -323,6 +323,8 @@ pub(crate) mod tests {
             ("DELETE FROM portfolio WHERE id = CAST($1 AS uuid)", portfolio_id.to_string()),
             ("DELETE FROM principal WHERE id = CAST($1 AS uuid)", row.get::<Uuid, _>("principal_id").to_string()),
             ("DELETE FROM instrument WHERE id = CAST($1 AS bigint)", instrument_id),
+            // last: deleting the position above queued one more change
+            ("DELETE FROM kafka_position_outbox WHERE portfolio_id = CAST($1 AS uuid)", portfolio_id.to_string()),
         ] {
             sqlx::query(sql).bind(bind).execute(&mut *tx).await.expect(sql);
         }

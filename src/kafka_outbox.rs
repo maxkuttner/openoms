@@ -1,6 +1,8 @@
 //! Kafka outbox: every committed order event waits in `kafka_outbox` (filled by a
-//! trigger on `order_event`, see migration 0033) until Kafka has acked it. The
-//! bridge reads it oldest-first, so an outage only delays events, never drops them.
+//! trigger on `order_event`, migration 0033) and every position write waits in
+//! `kafka_position_outbox` (a trigger on `position`, migration 0034) until Kafka has
+//! acked it. The bridge reads both oldest-first, so an outage only delays
+//! events, never drops them.
 
 use std::sync::Arc;
 
@@ -38,8 +40,14 @@ pub struct OutboxRow {
     pub portfolio_id: Option<Uuid>,
     pub instrument_id: Option<String>,
     pub side: Option<String>,
-    /// the position row for (portfolio, instrument) as it is now
-    pub position: Option<PositionSnapshot>,
+}
+
+/// One queued position write, with the row as it is now (`None` once deleted).
+pub struct PositionChange {
+    pub id: i64,
+    pub portfolio_id: Uuid,
+    pub instrument_id: String,
+    pub snapshot: Option<PositionSnapshot>,
 }
 
 pub async fn fetch_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sqlx::Error> {
@@ -47,15 +55,43 @@ pub async fn fetch_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sq
         r#"
         SELECT
             o.global_position, e.order_id, e.event_type, e.payload_json,
-            s.portfolio_id, s.instrument_id, s.side,
-            p.net_qty::double precision      AS net_qty,
-            p.avg_cost::double precision     AS avg_cost,
-            p.realized_pnl::double precision AS realized_pnl
+            s.portfolio_id, s.instrument_id, s.side
         FROM kafka_outbox o
         JOIN order_event e USING (global_position)
         LEFT JOIN order_state s ON s.order_id = e.order_id
-        LEFT JOIN position p ON p.portfolio_id = s.portfolio_id AND p.instrument_id = s.instrument_id
         ORDER BY o.global_position
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| OutboxRow {
+            global_position: r.get("global_position"),
+            order_id: r.get("order_id"),
+            event_type: r.get("event_type"),
+            payload: r.get("payload_json"),
+            portfolio_id: r.get("portfolio_id"),
+            instrument_id: r.get("instrument_id"),
+            side: r.get("side"),
+        })
+        .collect())
+}
+
+pub async fn fetch_position_batch(pool: &PgPool, limit: i64) -> Result<Vec<PositionChange>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            q.id, q.portfolio_id, q.instrument_id,
+            p.net_qty::double precision      AS net_qty,
+            p.avg_cost::double precision     AS avg_cost,
+            p.realized_pnl::double precision AS realized_pnl
+        FROM kafka_position_outbox q
+        LEFT JOIN position p ON p.portfolio_id = q.portfolio_id AND p.instrument_id = q.instrument_id
+        ORDER BY q.id
         LIMIT $1
         "#,
     )
@@ -67,15 +103,11 @@ pub async fn fetch_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sq
         .into_iter()
         .map(|r| {
             let net_qty: Option<f64> = r.get("net_qty");
-            OutboxRow {
-                global_position: r.get("global_position"),
-                order_id: r.get("order_id"),
-                event_type: r.get("event_type"),
-                payload: r.get("payload_json"),
+            PositionChange {
+                id: r.get("id"),
                 portfolio_id: r.get("portfolio_id"),
                 instrument_id: r.get("instrument_id"),
-                side: r.get("side"),
-                position: net_qty.map(|net_qty| PositionSnapshot {
+                snapshot: net_qty.map(|net_qty| PositionSnapshot {
                     net_qty,
                     avg_cost: r.get("avg_cost"),
                     realized_pnl: r.get("realized_pnl"),
@@ -83,6 +115,14 @@ pub async fn fetch_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sq
             }
         })
         .collect())
+}
+
+pub async fn ack_positions(pool: &PgPool, ids: &[i64]) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM kafka_position_outbox WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
 }
 
 /// Remove acked events from the outbox. Returns how many rows went.
@@ -95,7 +135,9 @@ pub async fn ack(pool: &PgPool, positions: &[i64]) -> Result<u64, sqlx::Error> {
 }
 
 pub async fn pending_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT count(*) FROM kafka_outbox").fetch_one(pool).await
+    sqlx::query_scalar("SELECT (SELECT count(*) FROM kafka_outbox) + (SELECT count(*) FROM kafka_position_outbox)")
+        .fetch_one(pool)
+        .await
 }
 
 #[derive(Clone)]
@@ -113,10 +155,10 @@ pub struct OutboxRecord {
 }
 
 /// The Kafka records one event becomes: always one on the orders topic (the stored
-/// payload, verbatim — the same message the direct publish used to send); a fill
-/// adds one on fills and, when the position row exists, one on positions. Fills
-/// key by order so they share its partition; positions key by what they describe,
-/// so a compacted topic keeps the latest state per position.
+/// payload, verbatim — the same message the direct publish used to send), plus one
+/// on fills for a fill, keyed by order so it shares the order's partition.
+/// Positions come from [`position_record`] instead: not every position change is
+/// a fill.
 pub fn records_for(row: &OutboxRow, topics: &OutboxTopics) -> Vec<OutboxRecord> {
     let order_key = row.order_id.to_string();
     let mut records = vec![OutboxRecord {
@@ -124,37 +166,40 @@ pub fn records_for(row: &OutboxRow, topics: &OutboxTopics) -> Vec<OutboxRecord> 
         key: order_key.clone(),
         payload: row.payload.to_string(),
     }];
-    if !matches!(row.event_type.as_str(), "order_partially_filled" | "order_filled") {
-        return records;
-    }
-
-    records.push(OutboxRecord {
-        topic: topics.fills.clone(),
-        key: order_key,
-        payload: serde_json::json!({
-            "event": row.payload,
-            "portfolio_id": row.portfolio_id,
-            "instrument_id": row.instrument_id,
-            "side": row.side,
-        })
-        .to_string(),
-    });
-    if let (Some(p), Some(portfolio_id), Some(instrument_id)) = (&row.position, row.portfolio_id, &row.instrument_id) {
+    if matches!(row.event_type.as_str(), "order_partially_filled" | "order_filled") {
         records.push(OutboxRecord {
-            topic: topics.positions.clone(),
-            key: format!("{portfolio_id}:{instrument_id}"),
+            topic: topics.fills.clone(),
+            key: order_key,
             payload: serde_json::json!({
-                "portfolio_id": portfolio_id,
-                "instrument_id": instrument_id,
-                "net_qty": p.net_qty,
-                "avg_cost": p.avg_cost,
-                "realized_pnl": p.realized_pnl,
-                "global_position": row.global_position,
+                "event": row.payload,
+                "portfolio_id": row.portfolio_id,
+                "instrument_id": row.instrument_id,
+                "side": row.side,
             })
             .to_string(),
         });
     }
     records
+}
+
+/// A position's current state, keyed by what it describes so a compacted topic
+/// keeps the latest per position. `None` for a row that no longer exists: only
+/// tests and the boot-time rebuild delete position rows, and the rebuild
+/// re-inserts in the same transaction.
+pub fn position_record(change: &PositionChange, topics: &OutboxTopics) -> Option<OutboxRecord> {
+    let p = change.snapshot.as_ref()?;
+    Some(OutboxRecord {
+        topic: topics.positions.clone(),
+        key: format!("{}:{}", change.portfolio_id, change.instrument_id),
+        payload: serde_json::json!({
+            "portfolio_id": change.portfolio_id,
+            "instrument_id": change.instrument_id,
+            "net_qty": p.net_qty,
+            "avg_cost": p.avg_cost,
+            "realized_pnl": p.realized_pnl,
+        })
+        .to_string(),
+    })
 }
 
 #[async_trait::async_trait]
@@ -219,7 +264,8 @@ impl OutageLog {
 #[derive(Debug)]
 pub enum DrainError {
     Db(sqlx::Error),
-    /// `stuck_at` is the global position of the event that could not be sent.
+    /// `stuck_at` is the global position of the event that could not be sent, or
+    /// the `kafka_position_outbox` id of the position change.
     Sink { published: usize, stuck_at: i64, error: String },
 }
 
@@ -232,14 +278,28 @@ pub async fn drain(
 ) -> Result<usize, DrainError> {
     let mut published = 0;
     loop {
+        // Order events first, then position changes; each queue is acked by its own key.
         let rows = fetch_batch(pool, batch_size).await.map_err(DrainError::Db)?;
-        if rows.is_empty() {
+        let from_orders = !rows.is_empty();
+        let batch: Vec<(i64, Vec<OutboxRecord>)> = if from_orders {
+            rows.iter().map(|r| (r.global_position, records_for(r, topics))).collect()
+        } else {
+            fetch_position_batch(pool, batch_size)
+                .await
+                .map_err(DrainError::Db)?
+                .iter()
+                .map(|c| (c.id, position_record(c, topics).into_iter().collect()))
+                .collect()
+        };
+        if batch.is_empty() {
             return Ok(published);
         }
-        let batch: Vec<(i64, Vec<OutboxRecord>)> =
-            rows.iter().map(|r| (r.global_position, records_for(r, topics))).collect();
         let (acked, failure) = deliver(&batch, sink).await;
-        ack(pool, &acked).await.map_err(DrainError::Db)?;
+        if from_orders {
+            ack(pool, &acked).await.map_err(DrainError::Db)?;
+        } else {
+            ack_positions(pool, &acked).await.map_err(DrainError::Db)?;
+        }
         published += acked.len();
         if let Some(error) = failure {
             let stuck_at = batch[acked.len()].0;
@@ -330,7 +390,7 @@ mod tests {
         OutboxTopics { orders: "orders".into(), fills: "fills".into(), positions: "positions".into() }
     }
 
-    fn row(event_type: &str, position: Option<PositionSnapshot>) -> OutboxRow {
+    fn row(event_type: &str) -> OutboxRow {
         OutboxRow {
             global_position: 42,
             order_id: Uuid::new_v4(),
@@ -339,7 +399,6 @@ mod tests {
             portfolio_id: Some(Uuid::new_v4()),
             instrument_id: Some("123".to_string()),
             side: Some("buy".to_string()),
-            position,
         }
     }
 
@@ -349,7 +408,7 @@ mod tests {
 
     #[test]
     fn routed_event_goes_to_orders_only() {
-        let row = row("order_routed", None);
+        let row = row("order_routed");
         let records = records_for(&row, &topics());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].topic, "orders");
@@ -358,22 +417,35 @@ mod tests {
     }
 
     #[test]
-    fn fill_fans_out_to_orders_fills_positions() {
-        let row = row("order_filled", Some(PositionSnapshot { net_qty: 2.5, avg_cost: 100.0, realized_pnl: 0.0 }));
+    fn fill_fans_out_to_orders_and_fills() {
+        let row = row("order_filled");
         let records = records_for(&row, &topics());
         let names: Vec<&str> = records.iter().map(|r| r.topic.as_str()).collect();
-        assert_eq!(names, ["orders", "fills", "positions"]);
+        assert_eq!(names, ["orders", "fills"]);
         assert_eq!(json(&records[1])["portfolio_id"], row.portfolio_id.unwrap().to_string());
         assert_eq!(json(&records[1])["event"], row.payload);
-        assert_eq!(records[2].key, format!("{}:123", row.portfolio_id.unwrap()));
-        assert_eq!(json(&records[2])["net_qty"], 2.5);
-        assert_eq!(json(&records[2])["global_position"], 42);
     }
 
     #[test]
-    fn fill_without_position_row_skips_positions() {
-        let records = records_for(&row("order_partially_filled", None), &topics());
-        assert_eq!(records.len(), 2);
+    fn position_change_publishes_the_current_row() {
+        let portfolio_id = Uuid::new_v4();
+        let change = PositionChange {
+            id: 7,
+            portfolio_id,
+            instrument_id: "123".into(),
+            snapshot: Some(PositionSnapshot { net_qty: 2.5, avg_cost: 100.0, realized_pnl: 1.0 }),
+        };
+        let r = position_record(&change, &topics()).expect("a record");
+        assert_eq!(r.topic, "positions");
+        assert_eq!(r.key, format!("{portfolio_id}:123"));
+        assert_eq!(json(&r)["net_qty"], 2.5);
+        assert_eq!(json(&r)["instrument_id"], "123");
+    }
+
+    #[test]
+    fn deleted_position_row_publishes_nothing() {
+        let change = PositionChange { id: 7, portfolio_id: Uuid::new_v4(), instrument_id: "1".into(), snapshot: None };
+        assert!(position_record(&change, &topics()).is_none());
     }
 
     /// Records every send it accepts; from send number `fail_from` (0-based, counting
@@ -467,6 +539,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn kafka_down_then_up_publishes_everything_in_order() {
+        let _outbox = OUTBOX.lock().await;
         let pool = test_pool().await;
         let (order_id, _, _) = seeded_order(&pool, 0).await;
         let events: Vec<NewOrderEvent> = (0..5)
@@ -494,6 +567,47 @@ mod tests {
         assert!(left.is_empty(), "outbox drained");
     }
 
+    /// An allocation transfer moves a position with no order event at all; both
+    /// sides must still reach the positions topic. Drains the shared dev outbox.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn transfer_queues_both_positions() {
+        let _outbox = OUTBOX.lock().await;
+        let pool = test_pool().await;
+        let (order_id, from, instrument_id) = seeded_order(&pool, 0).await;
+        let to = Uuid::new_v4();
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, $2, 'ACTIVE')")
+            .bind(to)
+            .bind(format!("ZZPORT{}", &to.simple().to_string()[..8]))
+            .execute(&pool)
+            .await
+            .expect("seed portfolio");
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::positions::persist_transfer(&mut conn, from, to, &instrument_id, crate::domain::orders::state::OrderSide::Buy, 1.0, 100.0)
+            .await
+            .expect("transfer");
+        drop(conn);
+
+        let sink = FakeSink::default();
+        drain(&pool, &sink, &topics(), 500).await.expect("drain");
+        sqlx::query("DELETE FROM position WHERE portfolio_id = $1").bind(to).execute(&pool).await.expect("rm position");
+        sqlx::query("DELETE FROM kafka_position_outbox WHERE portfolio_id = $1").bind(to).execute(&pool).await.expect("rm queued");
+        sqlx::query("DELETE FROM portfolio WHERE id = $1").bind(to).execute(&pool).await.expect("rm portfolio");
+        remove_seeded(&pool, order_id).await;
+
+        let sent = sink.sent();
+        let to_side = sent
+            .iter()
+            .find(|r| r.topic == "positions" && r.key == format!("{to}:{instrument_id}"))
+            .expect("destination published");
+        assert_eq!(json(to_side)["net_qty"], 1.0);
+        assert!(sent.iter().any(|r| r.key == format!("{from}:{instrument_id}")), "source published");
+    }
+
+    /// The outbox is one shared table and some tests drain all of it; run the
+    /// outbox DB tests one at a time so a drain can't swallow another test's rows.
+    static OUTBOX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn rows_for(pool: &PgPool, order_id: Uuid) -> Vec<OutboxRow> {
         fetch_batch(pool, 10_000)
             .await
@@ -506,6 +620,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn appended_event_is_queued_with_its_order_context() {
+        let _outbox = OUTBOX.lock().await;
         let pool = test_pool().await;
         let (order_id, portfolio_id, _) = seeded_order(&pool, 0).await;
         let ev = event("order_routed");
@@ -529,6 +644,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn rolled_back_append_queues_nothing() {
+        let _outbox = OUTBOX.lock().await;
         let pool = test_pool().await;
         let order_id = Uuid::new_v4();
         let mut tx = pool.begin().await.expect("begin");
@@ -544,6 +660,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
     async fn ack_removes_only_named_rows() {
+        let _outbox = OUTBOX.lock().await;
         let pool = test_pool().await;
         let order_id = Uuid::new_v4();
         let r = OrderEventStore::new(pool.clone())
