@@ -980,7 +980,6 @@ async fn serve() {
         },
         Err(err) => { info!("Kafka not configured ({}), publishing disabled", err); None }
     };
-    let kafka_client = kafka_setup.as_ref().map(|(_, client)| client.clone());
 
 
     // `file_cfg` was already loaded above (for the master key); `config::load()`
@@ -1071,7 +1070,6 @@ async fn serve() {
     let registration_deps = RegistrationDeps {
         pool: pool.clone(),
         stream_health: stream_health.clone(),
-        kafka: kafka_client.clone(),
         event_bus: event_bus.clone(),
     };
     let RegistrationOutput {
@@ -1134,7 +1132,6 @@ async fn serve() {
         admin_token,
         admin_auth_enabled,
         BrokerRegistry::new(),
-        kafka_client,
         symbology,
         stream_health,
         event_bus,
@@ -1184,7 +1181,7 @@ async fn serve() {
     // the adapter already holds them).
     for (env_name, adapter) in binance_rest_adapters {
         let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
-        let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(state.event_bus().clone())));
+        let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), adapter, health, Some(state.event_bus().clone())));
         state.streams().insert(reload::binance_exec_stream_code(env_name), handle);
     }
 

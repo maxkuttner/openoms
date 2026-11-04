@@ -1345,7 +1345,6 @@ async fn apply_reload(
     let deps = reload::RegistrationDeps {
         pool: state.pool().clone(),
         stream_health: state.stream_health().clone(),
-        kafka: state.kafka().cloned(),
         event_bus: state.event_bus().clone(),
     };
 
@@ -3437,7 +3436,6 @@ mod tests {
             "test-admin-token".to_string(),
             false,
             BrokerRegistry::new(),
-            None,
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),

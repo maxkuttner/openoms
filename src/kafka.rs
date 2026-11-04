@@ -33,10 +33,10 @@ impl KafkaConfig {
         };
         info!("KAFKA_TOPIC: {}", orders_topic);
 
-        let fills_topic = env::var("KAFKA_FILLS_TOPIC").unwrap_or_else(|_| "oms.fills".to_string());
+        let fills_topic = or_default(env::var("KAFKA_FILLS_TOPIC"), "oms.fills");
         info!("KAFKA_FILLS_TOPIC: {}", fills_topic);
 
-        let positions_topic = env::var("KAFKA_POSITIONS_TOPIC").unwrap_or_else(|_| "oms.positions".to_string());
+        let positions_topic = or_default(env::var("KAFKA_POSITIONS_TOPIC"), "oms.positions");
         info!("KAFKA_POSITIONS_TOPIC: {}", positions_topic);
 
         let client_id = env::var("KAFKA_CLIENT_ID").
@@ -93,11 +93,18 @@ impl KafkaConfig {
     }
 }
 
+// an unset or blank variable means the default
+fn or_default(value: Result<String, env::VarError>, default: &str) -> String {
+    match value {
+        Ok(v) if !v.is_empty() => v,
+        _ => default.to_string(),
+    }
+}
+
 // Kafka client to hold broker connections and produce/publish events
 #[derive(Clone)]
 pub struct KafkaClient {
     pub producer: FutureProducer,
-    pub topic: String,
 }
 
 impl KafkaClient {
@@ -113,10 +120,7 @@ impl KafkaClient {
             .set("broker.address.family", "v4")
             .create()?;
 
-        Ok(Self {
-            producer,
-            topic: config.orders_topic.clone(),
-        })
+        Ok(Self { producer })
     }
 }
 
@@ -136,121 +140,16 @@ impl OutboxSink for KafkaSink {
     }
 }
 
-pub async fn publish_events(
-    client: Option<&KafkaClient>,
-    order_id: &str,
-    events: &[crate::domain::orders::events::OrderDomainEvent],
-) {
-    let client = match client {
-        Some(c) => c,
-        None => return,
-    };
-
-    for event in events {
-        let payload = match serde_json::to_string(event) {
-            Ok(p) => p,
-            Err(err) => {
-                tracing::error!(
-                    order_id = %order_id,
-                    event_type = %event.event_type.as_str(),
-                    error = ?err,
-                    "failed to serialize domain event for Kafka"
-                );
-                continue;
-            }
-        };
-
-        let record = FutureRecord::to(&client.topic)
-            .key(order_id)
-            .payload(payload.as_str());
-
-        // Enqueue without awaiting delivery. `send(..).await` waits until the
-        // broker acks or librdkafka's `message.timeout.ms` (300s) expires, and
-        // every caller — order submit, cancel, fills off the broker streams —
-        // sits on that await, so a down Kafka stalled each order ~5 minutes
-        // before it reached the broker. Publishing is non-fatal; the delivery
-        // outcome is only logged, from a detached task. Enqueueing here, in
-        // call order, keeps the per-order event order on the partition.
-        let event_type = event.event_type.as_str();
-        match client.producer.send_result(record) {
-            Ok(delivery) => {
-                let order_id = order_id.to_string();
-                tokio::spawn(async move {
-                    match delivery.await {
-                        Ok(Ok((partition, offset))) => tracing::info!(
-                            order_id = %order_id,
-                            event_type = %event_type,
-                            partition,
-                            offset,
-                            "published event to Kafka"
-                        ),
-                        Ok(Err((err, _msg))) => tracing::error!(
-                            order_id = %order_id,
-                            event_type = %event_type,
-                            error = ?err,
-                            "failed to publish event to Kafka (non-fatal)"
-                        ),
-                        Err(_canceled) => tracing::error!(
-                            order_id = %order_id,
-                            event_type = %event_type,
-                            "Kafka producer dropped before delivery (non-fatal)"
-                        ),
-                    }
-                });
-            }
-            Err((err, _record)) => {
-                tracing::error!(
-                    order_id = %order_id,
-                    event_type = %event_type,
-                    error = ?err,
-                    "failed to enqueue event for Kafka (non-fatal)"
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
-    use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload, OrderEventType};
-    use crate::domain::orders::state::OrderStatus;
 
-    /// Regression: with the broker unreachable, `publish_events` used to await
-    /// delivery until librdkafka's `message.timeout.ms` (300s default) — and
-    /// every caller (order submit, cancel, fills off the broker streams) sits
-    /// on that await, so a down Kafka stalled each order ~5 minutes before it
-    /// reached the broker. Publishing is non-fatal by design; it must not wait.
-    #[tokio::test]
-    async fn publish_does_not_wait_for_an_unreachable_broker() {
-        let config = KafkaConfig {
-            brokers: "127.0.0.1:1".to_string(),
-            client_id: "publish-test".to_string(),
-            orders_topic: "orders".to_string(),
-            fills_topic: "fills".to_string(),
-            positions_topic: "positions".to_string(),
-            projector_group_id: "unused".to_string(),
-        };
-        let client = KafkaClient::new(&config).expect("producer builds without a broker");
-        let event = OrderDomainEvent {
-            event_id: "e-1".to_string(),
-            event_type: OrderEventType::OrderCanceled,
-            order_id: "o-1".to_string(),
-            timestamp: chrono::Utc::now(),
-            actor: "test".to_string(),
-            payload: OrderEventPayload::OrderCanceled { reason: None },
-            version: 1,
-            status_after: OrderStatus::Canceled,
-        };
-
-        let started = std::time::Instant::now();
-        publish_events(Some(&client), "o-1", &[event.clone(), event]).await;
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "publish_events blocked for {:?}",
-            started.elapsed()
-        );
+    /// `.env.example` ships the topic variables blank; blank must mean "default",
+    /// not a topic named "".
+    #[test]
+    fn blank_topic_falls_back_to_default() {
+        assert_eq!(or_default(Ok(String::new()), "oms.fills"), "oms.fills");
+        assert_eq!(or_default(Err(env::VarError::NotPresent), "oms.fills"), "oms.fills");
+        assert_eq!(or_default(Ok("custom".into()), "oms.fills"), "custom");
     }
 }

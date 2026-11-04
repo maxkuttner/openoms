@@ -33,7 +33,6 @@ use crate::event_bus::EventBus;
 use crate::adapters::{BrokerAdapter, BrokerError};
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
-use crate::kafka::KafkaClient;
 
 const EPS: f64 = 1e-9;
 
@@ -192,7 +191,6 @@ pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<Om
 /// (`"BINANCE"`); `actor` labels appended events (`"binance"` / `"ibkr"`).
 pub async fn run_order_reconcile(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     adapter: &dyn BrokerAdapter,
     broker_code: &str,
     actor: &str,
@@ -225,7 +223,7 @@ pub async fn run_order_reconcile(
                     }
                 };
                 let oms_avg = booked_avg.get(&order_id).copied().flatten();
-                apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, &st, broker_code, actor, bus)
+                apply_terminal(pool, order_id, oms_cum, oms_avg, &st, broker_code, actor, bus)
                     .await;
             }
             ReconAction::PartialDrift { order_id, oms_cum, broker_executed } => {
@@ -295,7 +293,6 @@ async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64, Option<f6
 /// where the close can arrive before the OMS has booked every fill.
 pub(crate) async fn apply_broker_terminal(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     order_id: Uuid,
     st: &BrokerOrderState,
     venue: &str,
@@ -303,7 +300,7 @@ pub(crate) async fn apply_broker_terminal(
     bus: Option<&EventBus>,
 ) {
     let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
-    apply_terminal(pool, kafka, order_id, oms_cum, oms_avg, st, venue, actor, bus).await;
+    apply_terminal(pool, order_id, oms_cum, oms_avg, st, venue, actor, bus).await;
 }
 
 /// Book a still-working order's progress from a venue that reports cumulative
@@ -314,7 +311,6 @@ pub(crate) async fn apply_broker_terminal(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_broker_progress(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     order_id: Uuid,
     broker_cum: f64,
     broker_avg: f64,
@@ -330,7 +326,7 @@ pub(crate) async fn apply_broker_progress(
         fill_price: increment_price(oms_cum, oms_avg, broker_cum, broker_avg),
         venue: venue.to_string(),
     };
-    if let Err(e) = process_execution_report(pool, kafka, order_id, report, actor, bus).await {
+    if let Err(e) = process_execution_report(pool, order_id, report, actor, bus).await {
         error!(order_id = %order_id, error = %e, "broker progress: apply failed");
     }
 }
@@ -343,7 +339,6 @@ pub(crate) async fn apply_broker_progress(
 #[allow(clippy::too_many_arguments)]
 async fn apply_terminal(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     order_id: Uuid,
     oms_cum: f64,
     oms_avg: Option<f64>,
@@ -354,7 +349,7 @@ async fn apply_terminal(
 ) {
     let apply = |report: ExecutionReport| async move {
         if let Err(e) =
-            process_execution_report(pool, kafka, order_id, report, actor, bus).await
+            process_execution_report(pool, order_id, report, actor, bus).await
         {
             error!(order_id = %order_id, error = %e, "order recon: apply failed");
         }

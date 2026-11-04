@@ -28,7 +28,6 @@ use crate::adapters::{BrokerRegistry, Transport};
 use crate::app_state::{AppState, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::fix;
-use crate::kafka::KafkaClient;
 use crate::opra_stream::DatabentoOpraFeed;
 use crate::quote_feed::QuoteFeedSession;
 use crate::stream_health::{StreamHealthRegistry, StreamKind};
@@ -121,12 +120,10 @@ pub fn restarts_execution_stream(outcome: &ConnectionOutcome) -> bool {
 /// What the FIX starters and freshly-built adapters need beyond the credential
 /// itself. Built once in `serve()` and handed to every call of `build_registry`
 /// — boot today, a runtime reload endpoint in a later task — so both draw on the
-/// exact same pool, stream-health registry, Kafka client and event
-/// bus rather than each constructing (or re-deriving) their own.
+/// exact same pool, stream-health registry and event bus rather than each constructing (or re-deriving) their own.
 pub struct RegistrationDeps {
     pub pool: PgPool,
     pub stream_health: StreamHealthRegistry,
-    pub kafka: Option<KafkaClient>,
     pub event_bus: EventBus,
 }
 
@@ -340,7 +337,6 @@ pub async fn build_registry(
                                 creds,
                                 &deps.stream_health,
                                 deps.pool.clone(),
-                                deps.kafka.clone(),
                                 Some(deps.event_bus.clone()),
                             ) {
                                 Some(adapter) => registry.register("IBKR", env_name, adapter),
@@ -377,7 +373,6 @@ pub async fn build_registry(
                                         creds,
                                         &deps.stream_health,
                                         deps.pool.clone(),
-                                        deps.kafka.clone(),
                                         Some(deps.event_bus.clone()),
                                     ) {
                                         Some(adapter) => registry.register("BINANCE", env_name, adapter),
@@ -592,7 +587,7 @@ impl ReloadStreams for LiveReloadStreams {
 /// first (rather than only inserting) is what makes a reload also cover the
 /// case where nothing is running yet, same as `restart_databento_feed`.
 ///
-/// Takes `deps` rather than its individual fields (pool, stream_health, kafka,
+/// Takes `deps` rather than its individual fields (pool, stream_health,
 /// event_bus) both to stay under clippy's argument-count lint and
 /// because it is the same bundle `build_registry` already draws on — boot and
 /// a later reload share one source for these rather than each re-deriving or
@@ -614,7 +609,6 @@ pub async fn restart_alpaca_stream(
         key,
         secret,
         deps.pool.clone(),
-        deps.kafka.clone(),
         adapter,
         health,
         Some(deps.event_bus.clone()),
@@ -640,7 +634,6 @@ pub async fn restart_bybit_stream(
     let handle = tokio::spawn(bybit_stream::run(
         env_name,
         deps.pool.clone(),
-        deps.kafka.clone(),
         adapter,
         health,
         Some(deps.event_bus.clone()),
@@ -663,7 +656,6 @@ pub async fn restart_coinbase_stream(
     let handle = tokio::spawn(coinbase_stream::run(
         env_name,
         deps.pool.clone(),
-        deps.kafka.clone(),
         adapter,
         health,
         Some(deps.event_bus.clone()),
@@ -686,7 +678,6 @@ pub async fn restart_okx_stream(
     let handle = tokio::spawn(okx_stream::run(
         env_name,
         deps.pool.clone(),
-        deps.kafka.clone(),
         adapter,
         health,
         Some(deps.event_bus.clone()),
@@ -739,7 +730,6 @@ mod tests {
             pool: PgPool::connect_lazy("postgres://localhost/oms_test_never_connects")
                 .expect("connect_lazy never actually connects"),
             stream_health: StreamHealthRegistry::new(),
-            kafka: None,
             event_bus: EventBus::new(),
         }
     }
@@ -990,7 +980,6 @@ mod tests {
         let deps = RegistrationDeps {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            kafka: None,
             event_bus: EventBus::new(),
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;
@@ -1010,7 +999,6 @@ mod tests {
         let deps = RegistrationDeps {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            kafka: None,
             event_bus: EventBus::new(),
         };
         let out = build_registry(&[coinbase_conn()], false, &BrokerRegistry::new(), &deps).await;
@@ -1042,7 +1030,6 @@ mod tests {
         let deps = RegistrationDeps {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            kafka: None,
             event_bus: EventBus::new(),
         };
         let out = build_registry(&[okx_conn()], false, &BrokerRegistry::new(), &deps).await;
@@ -1067,7 +1054,6 @@ mod tests {
         let deps = RegistrationDeps {
             pool: sqlx::PgPool::connect_lazy("postgres://unused@localhost/unused").unwrap(),
             stream_health: StreamHealthRegistry::new(),
-            kafka: None,
             event_bus: EventBus::new(),
         };
         let out = build_registry(&[c], false, &BrokerRegistry::new(), &deps).await;

@@ -25,7 +25,6 @@ use uuid::Uuid;
 
 use crate::event_bus::EventBus;
 use crate::adapters::okx::{oms_order_id, parse_order_state, OkxAdapter};
-use crate::kafka::KafkaClient;
 use crate::recon_orders::{apply_broker_progress, apply_broker_terminal, run_order_reconcile, BrokerOrderState};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
@@ -38,7 +37,6 @@ const HEARTBEAT_SECS: u64 = 20;
 
 struct OkxSession {
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     adapter: Arc<OkxAdapter>,
     health: StreamHandle,
     bus: Option<EventBus>,
@@ -47,20 +45,19 @@ struct OkxSession {
 #[async_trait::async_trait]
 impl Session for OkxSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.pool, &self.kafka, &self.health, self.bus.as_ref()).await
+        connect_and_run(&self.adapter, &self.pool, &self.health, self.bus.as_ref()).await
     }
 }
 
 pub async fn run(
     environment: &'static str,
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     adapter: Arc<OkxAdapter>,
     health: StreamHandle,
     bus: Option<EventBus>,
 ) {
     info!(env = environment, "starting OKX private stream");
-    let session = OkxSession { pool, kafka, adapter, health: health.clone(), bus };
+    let session = OkxSession { pool, adapter, health: health.clone(), bus };
     let name: &'static str = if environment == "LIVE" { "OKX/LIVE" } else { "OKX/PAPER" };
     supervise(name, health, session).await
 }
@@ -117,7 +114,6 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
 async fn connect_and_run(
     adapter: &OkxAdapter,
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     health: &StreamHandle,
     bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -132,7 +128,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Text("ping".into())).await?;
-                run_order_reconcile(pool, kafka, adapter, VENUE, "okx", bus).await;
+                run_order_reconcile(pool, adapter, VENUE, "okx", bus).await;
                 continue;
             }
             msg = ws.next() => {
@@ -163,10 +159,10 @@ async fn connect_and_run(
             for (order_id, update) in updates(&v) {
                 match update {
                     Update::Terminal(st) => {
-                        apply_broker_terminal(pool, kafka, order_id, &st, VENUE, "okx", bus).await;
+                        apply_broker_terminal(pool, order_id, &st, VENUE, "okx", bus).await;
                     }
                     Update::Progress { cum, avg } => {
-                        apply_broker_progress(pool, kafka, order_id, cum, avg, VENUE, "okx", bus).await;
+                        apply_broker_progress(pool, order_id, cum, avg, VENUE, "okx", bus).await;
                     }
                 }
             }
@@ -183,7 +179,7 @@ async fn connect_and_run(
                 info!("OKX private WS subscribed to orders");
                 health.set_live();
                 // Snapshot-on-(re)connect: heal anything that resolved during the outage.
-                run_order_reconcile(pool, kafka, adapter, VENUE, "okx", bus).await;
+                run_order_reconcile(pool, adapter, VENUE, "okx", bus).await;
             }
             Some("login") | Some("error") => {
                 return Err(format!("OKX WS {}: {} (code {})", v["event"], v["msg"], v["code"]).into());

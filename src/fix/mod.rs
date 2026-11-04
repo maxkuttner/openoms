@@ -121,7 +121,6 @@ use crate::fix::app::FixApplication;
 use crate::fix::binance::BinanceDialect;
 use crate::fix::dialect::FixDialect;
 use crate::fix::ibkr::IbkrDialect;
-use crate::kafka::KafkaClient;
 use crate::recon_orders::run_order_reconcile;
 use crate::stream_health::{StreamHandle, StreamHealthRegistry};
 
@@ -180,7 +179,6 @@ pub fn start_session(
     actor: &'static str,
     health: StreamHandle,
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     bus: Option<EventBus>,
     // Optional REST adapter that owns the reconciliation reads (open orders / order
     // status) for venues with no FIX equivalent (Binance Spot FIX). When present, the
@@ -208,13 +206,11 @@ pub fn start_session(
     // Drain inbound execution reports into the shared apply path.
     {
         let pool = pool.clone();
-        let kafka = kafka.clone();
         let bus = bus.clone();
         tokio::spawn(async move {
             while let Some((order_id, report)) = report_rx.recv().await {
                 if let Err(e) = process_execution_report(
                     &pool,
-                    &kafka,
                     order_id,
                     report,
                     actor,
@@ -251,7 +247,6 @@ pub fn start_session(
     // own resend of anything missed during an outage.
     {
         let pool = pool.clone();
-        let kafka = kafka.clone();
         let bus = bus.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -267,7 +262,6 @@ pub fn start_session(
                 }
                 run_order_reconcile(
                     &pool,
-                    &kafka,
                     &*recon_adapter,
                     broker_code,
                     actor,
@@ -339,7 +333,6 @@ pub fn start_ibkr(
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     bus: Option<EventBus>,
 ) -> Option<Arc<FixBrokerAdapter>> {
     let crate::credentials::BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } =
@@ -360,7 +353,7 @@ pub fn start_ibkr(
     let health = stream_health.fix_handle("IBKR", env_name);
     let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password.clone()));
     // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
-    match start_session(dialect, cfg, "ibkr", health, pool, kafka, bus, None) {
+    match start_session(dialect, cfg, "ibkr", health, pool, bus, None) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "IBKR FIX session not started"); None }
     }
@@ -377,7 +370,6 @@ pub fn start_binance(
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     bus: Option<EventBus>,
 ) -> Option<Arc<FixBrokerAdapter>> {
     let crate::credentials::BrokerCredentials::BinanceFix {
@@ -426,7 +418,7 @@ pub fn start_binance(
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("BINANCE", env_name);
-    match start_session(dialect, cfg, "binance", health, pool, kafka, bus, read_delegate) {
+    match start_session(dialect, cfg, "binance", health, pool, bus, read_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
     }
@@ -469,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn start_ibkr_refuses_a_non_ibkr_credential() {
         let health = StreamHealthRegistry::new();
-        let result = start_ibkr("PAPER", &alpaca_cred(), &health, lazy_pool(), None, None);
+        let result = start_ibkr("PAPER", &alpaca_cred(), &health, lazy_pool(), None);
         assert!(result.is_none());
     }
 
@@ -477,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn start_binance_refuses_a_non_binance_credential() {
         let health = StreamHealthRegistry::new();
-        let result = start_binance("PAPER", &ibkr_cred(), &health, lazy_pool(), None, None);
+        let result = start_binance("PAPER", &ibkr_cred(), &health, lazy_pool(), None);
         assert!(result.is_none());
     }
 
@@ -496,7 +488,7 @@ mod tests {
             api_key: "k".into(),
             private_key: "pem".into(),
         };
-        let result = start_binance("PAPER", &creds, &health, lazy_pool(), None, None);
+        let result = start_binance("PAPER", &creds, &health, lazy_pool(), None);
         assert!(result.is_none());
     }
 }

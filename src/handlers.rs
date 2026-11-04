@@ -27,7 +27,6 @@ use crate::positions::{value as value_position, Position};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::{OrderEventStore, NewOrderEvent};
 use crate::event_bus::publish_appended;
-use crate::kafka::publish_events;
 use crate::risk_engine::{PgRiskDataProvider, RiskCheckError, RiskEngine};
 
 /// Who to record as having caused an event.
@@ -699,7 +698,6 @@ pub async fn orders_submit(
     })?;
 
     publish_appended(state.event_bus(), order_id, &new_events, &appended);
-    publish_events(state.kafka(), &order_id.to_string(), &events).await;
 
     // --- TX2: route order to broker ---
     // broker_code, environment, external_account_ref, and broker_symbol were resolved in the
@@ -764,7 +762,6 @@ pub async fn orders_submit(
     // apply_once, instead of trusting the in-memory `state_after_submit` from
     // before the broker round-trip.
     const MAX_ROUTE_ATTEMPTS: u32 = 5;
-    let mut route_events: Vec<OrderDomainEvent> = Vec::new();
     for attempt in 1..=MAX_ROUTE_ATTEMPTS {
         let row = sqlx::query(
             r#"
@@ -829,7 +826,6 @@ pub async fn orders_submit(
                 status = ?current_state.status,
                 "order reached a terminal state before routing could persist (raced a concurrent fill/cancel) — treating as routed"
             );
-            route_events = Vec::new();
             break;
         }
 
@@ -938,12 +934,9 @@ pub async fn orders_submit(
             }
         })?;
         publish_appended(state.event_bus(), order_id, &route_new_events, &appended);
-
-        route_events = attempt_events;
         break;
     }
 
-    publish_events(state.kafka(), &order_id.to_string(), &route_events).await;
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -1214,7 +1207,6 @@ pub async fn orders_cancel(
     })?;
 
     publish_appended(app_state.event_bus(), order_id, &new_events, &appended);
-    publish_events(app_state.kafka(), &order_id.to_string(), &events).await;
 
     // return response
     Ok(Response::builder()
@@ -2425,7 +2417,6 @@ pub(crate) mod tests {
             "test-admin-token".to_string(),
             false,
             BrokerRegistry::new(), // empty: nothing can route
-            None,                  // no Kafka; `publish_events` is a no-op without it
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
@@ -3165,7 +3156,7 @@ pub(crate) mod tests {
 
     /// Mirrors the existing actor-attribution test's `AppState::new(...)` call
     /// exactly (src/handlers.rs, the test just above this one) — empty registry,
-    /// no Kafka, a throwaway quote channel. Nothing in these tests routes an
+    /// a throwaway quote channel. Nothing in these tests routes an
     /// order or reads the registry, so an empty one is correct, not a stub.
     fn test_app_state(pool: sqlx::PgPool) -> AppState {
         use crate::adapters::BrokerRegistry;
@@ -3178,7 +3169,6 @@ pub(crate) mod tests {
             "test-admin-token".to_string(),
             false,
             BrokerRegistry::new(),
-            None,
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),

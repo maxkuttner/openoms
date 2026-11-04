@@ -30,7 +30,6 @@ use crate::event_bus::EventBus;
 use crate::adapters::bybit::BybitAdapter;
 use crate::domain::orders::commands::ExecutionReport;
 use crate::execution::process_execution_report;
-use crate::kafka::KafkaClient;
 use crate::recon_orders::{apply_broker_terminal, run_order_reconcile, BrokerOrderState};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
@@ -46,7 +45,6 @@ const AUTH_EXPIRY_MS: i64 = 10_000;
 
 struct BybitSession {
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     adapter: Arc<BybitAdapter>,
     health: StreamHandle,
     bus: Option<EventBus>,
@@ -55,20 +53,19 @@ struct BybitSession {
 #[async_trait::async_trait]
 impl Session for BybitSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.pool, &self.kafka, &self.health, self.bus.as_ref()).await
+        connect_and_run(&self.adapter, &self.pool, &self.health, self.bus.as_ref()).await
     }
 }
 
 pub async fn run(
     environment: &'static str,
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     adapter: Arc<BybitAdapter>,
     health: StreamHandle,
     bus: Option<EventBus>,
 ) {
     info!(env = environment, "starting Bybit private stream");
-    let session = BybitSession { pool, kafka, adapter, health: health.clone(), bus };
+    let session = BybitSession { pool, adapter, health: health.clone(), bus };
     let name: &'static str = if environment == "LIVE" { "BYBIT/LIVE" } else { "BYBIT/PAPER" };
     supervise(name, health, session).await
 }
@@ -144,7 +141,6 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
 async fn connect_and_run(
     adapter: &BybitAdapter,
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     health: &StreamHandle,
     bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -160,7 +156,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Text(serde_json::json!({"op": "ping"}).to_string())).await?;
-                run_order_reconcile(pool, kafka, adapter, VENUE, "bybit", bus).await;
+                run_order_reconcile(pool, adapter, VENUE, "bybit", bus).await;
                 continue;
             }
             msg = ws.next() => {
@@ -188,12 +184,12 @@ async fn connect_and_run(
             for (order_id, update) in reports(&v) {
                 match update {
                     Update::Report(report) => {
-                        if let Err(e) = process_execution_report(pool, kafka, order_id, report, "bybit", bus).await {
+                        if let Err(e) = process_execution_report(pool, order_id, report, "bybit", bus).await {
                             error!(order_id = %order_id, error = %e, "Bybit WS: failed to apply execution report");
                         }
                     }
                     Update::Terminal(st) => {
-                        apply_broker_terminal(pool, kafka, order_id, &st, VENUE, "bybit", bus).await;
+                        apply_broker_terminal(pool, order_id, &st, VENUE, "bybit", bus).await;
                     }
                 }
             }
@@ -216,7 +212,7 @@ async fn connect_and_run(
                     info!("Bybit private WS subscribed to order.spot and execution.spot");
                     health.set_live();
                     // Snapshot-on-(re)connect: heal anything that resolved during the outage.
-                    run_order_reconcile(pool, kafka, adapter, VENUE, "bybit", bus).await;
+                    run_order_reconcile(pool, adapter, VENUE, "bybit", bus).await;
                 } else {
                     return Err(format!("Bybit subscribe failed: {}", v["ret_msg"]).into());
                 }

@@ -22,7 +22,6 @@ use uuid::Uuid;
 
 use crate::event_bus::EventBus;
 use crate::adapters::coinbase::{order_outcome, CoinbaseAdapter};
-use crate::kafka::KafkaClient;
 use crate::recon_orders::{apply_broker_progress, apply_broker_terminal, run_order_reconcile, BrokerOrderState};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
@@ -36,7 +35,6 @@ const RECONCILE_SECS: u64 = 20;
 
 struct CoinbaseSession {
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     adapter: Arc<CoinbaseAdapter>,
     health: StreamHandle,
     bus: Option<EventBus>,
@@ -45,20 +43,19 @@ struct CoinbaseSession {
 #[async_trait::async_trait]
 impl Session for CoinbaseSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.pool, &self.kafka, &self.health, self.bus.as_ref()).await
+        connect_and_run(&self.adapter, &self.pool, &self.health, self.bus.as_ref()).await
     }
 }
 
 pub async fn run(
     environment: &'static str,
     pool: PgPool,
-    kafka: Option<KafkaClient>,
     adapter: Arc<CoinbaseAdapter>,
     health: StreamHandle,
     bus: Option<EventBus>,
 ) {
     info!(env = environment, "starting Coinbase user stream");
-    let session = CoinbaseSession { pool, kafka, adapter, health: health.clone(), bus };
+    let session = CoinbaseSession { pool, adapter, health: health.clone(), bus };
     supervise("COINBASE/LIVE", health, session).await
 }
 
@@ -112,7 +109,6 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
 async fn connect_and_run(
     adapter: &CoinbaseAdapter,
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     health: &StreamHandle,
     bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -130,7 +126,7 @@ async fn connect_and_run(
     loop {
         let text = tokio::select! {
             _ = sweep.tick() => {
-                run_order_reconcile(pool, kafka, adapter, VENUE, "coinbase", bus).await;
+                run_order_reconcile(pool, adapter, VENUE, "coinbase", bus).await;
                 continue;
             }
             msg = ws.next() => {
@@ -164,15 +160,15 @@ async fn connect_and_run(
             info!("Coinbase user stream live");
             health.set_live();
             live = true;
-            run_order_reconcile(pool, kafka, adapter, VENUE, "coinbase", bus).await;
+            run_order_reconcile(pool, adapter, VENUE, "coinbase", bus).await;
         }
         for (order_id, update) in updates(&v) {
             match update {
                 Update::Progress { cum, avg } => {
-                    apply_broker_progress(pool, kafka, order_id, cum, avg, VENUE, "coinbase", bus).await;
+                    apply_broker_progress(pool, order_id, cum, avg, VENUE, "coinbase", bus).await;
                 }
                 Update::Terminal(st) => {
-                    apply_broker_terminal(pool, kafka, order_id, &st, VENUE, "coinbase", bus).await;
+                    apply_broker_terminal(pool, order_id, &st, VENUE, "coinbase", bus).await;
                 }
             }
         }

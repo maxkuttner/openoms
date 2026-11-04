@@ -8,7 +8,6 @@ use tokio::task::JoinHandle;
 
 use crate::adapters::BrokerRegistry;
 use crate::event_bus::EventBus;
-use crate::kafka::KafkaClient;
 use crate::marks::MarkStore;
 use crate::stream_health::StreamHealthRegistry;
 
@@ -86,7 +85,6 @@ pub struct AppState {
     /// Serialize the entire reload, including store reads and stream joins.
     /// Order readers still use ArcSwap and never acquire this lock.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
-    kafka: Option<KafkaClient>,
     symbology: Arc<SymbologyEngine>,
     stream_health: StreamHealthRegistry,
     marks: MarkStore,
@@ -111,7 +109,6 @@ impl AppState {
         admin_token: String,
         admin_auth_enabled: bool,
         registry: BrokerRegistry,
-        kafka: Option<KafkaClient>,
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
         event_bus: EventBus,
@@ -125,7 +122,6 @@ impl AppState {
             session_config,
             registry: Arc::new(ArcSwap::from_pointee(registry)),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
-            kafka,
             symbology: Arc::new(symbology),
             stream_health,
             marks: MarkStore::new(),
@@ -158,9 +154,6 @@ impl AppState {
         self.reload_lock.lock().await
     }
 
-    pub fn kafka(&self) -> Option<&KafkaClient> {
-        self.kafka.as_ref()
-    }
 
     pub fn symbology(&self) -> &Arc<SymbologyEngine> {
         &self.symbology
@@ -221,7 +214,6 @@ mod tests {
             "test-admin-token".to_string(),
             false,
             registry,
-            None,
             symbology,
             StreamHealthRegistry::new(),
             EventBus::new(),

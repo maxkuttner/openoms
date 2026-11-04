@@ -5,7 +5,8 @@
 //! [`process_execution_report`]. It rehydrates the order aggregate, applies the
 //! report through the state machine, and — in a single transaction — updates
 //! `order_state`, maintains the position projection, and appends the resulting
-//! events. On commit it publishes to the bus's order lane and to Kafka.
+//! events (the outbox trigger queues them for Kafka). On commit it publishes to
+//! the bus's order lane.
 
 use chrono::Utc;
 use sqlx::{PgPool, Row};
@@ -19,7 +20,6 @@ use crate::domain::orders::state::OrderAggregateState;
 use crate::event_bus::{publish_appended, EventBus, OrderLaneEvent};
 use crate::event_store::{NewOrderEvent, OrderEventStore};
 use crate::handlers::{parse_order_side, parse_order_status, parse_order_type, parse_time_in_force};
-use crate::kafka::{publish_events, KafkaClient};
 use crate::positions;
 
 /// Signals an optimistic-concurrency version conflict — the caller retries.
@@ -40,7 +40,6 @@ impl std::error::Error for ConcurrencyRetry {}
 /// OrderRouted version bump; re-read and re-apply rather than drop the fill.
 pub async fn process_execution_report(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     order_id: Uuid,
     report: ExecutionReport,
     actor: &str,
@@ -48,7 +47,7 @@ pub async fn process_execution_report(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const MAX_ATTEMPTS: u32 = 5;
     for attempt in 1..=MAX_ATTEMPTS {
-        match apply_once(pool, kafka, order_id, report.clone(), actor, bus).await {
+        match apply_once(pool, order_id, report.clone(), actor, bus).await {
             Ok(()) => return Ok(()),
             Err(e) if e.downcast_ref::<ConcurrencyRetry>().is_some() => {
                 if attempt == MAX_ATTEMPTS {
@@ -65,7 +64,6 @@ pub async fn process_execution_report(
 
 async fn apply_once(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     order_id: Uuid,
     report: ExecutionReport,
     actor: &str,
@@ -256,7 +254,6 @@ async fn apply_once(
         }
     }
 
-    publish_events(kafka.as_ref(), &order_id.to_string(), &events).await;
 
     Ok(())
 }
@@ -340,7 +337,7 @@ pub(crate) mod tests {
         let bus = EventBus::new();
         let mut rx = bus.subscribe_order();
 
-        let applied = process_execution_report(&pool, &None, order_id, fill(), "bus-test", Some(&bus)).await;
+        let applied = process_execution_report(&pool, order_id, fill(), "bus-test", Some(&bus)).await;
         let mut got = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             got.push(ev);
@@ -366,7 +363,7 @@ pub(crate) mod tests {
         let bus = EventBus::new();
         let mut rx = bus.subscribe_order();
 
-        let applied = apply_once(&pool, &None, order_id, fill(), "bus-test", Some(&bus)).await;
+        let applied = apply_once(&pool, order_id, fill(), "bus-test", Some(&bus)).await;
         remove_seeded(&pool, order_id).await;
 
         let err = applied.expect_err("version conflict");

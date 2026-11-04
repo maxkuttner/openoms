@@ -29,7 +29,6 @@ pub struct PositionSnapshot {
 pub struct OutboxRow {
     pub global_position: i64,
     pub order_id: Uuid,
-    pub event_id: Uuid,
     pub event_type: String,
     /// `order_event.payload_json`, verbatim
     pub payload: serde_json::Value,
@@ -44,7 +43,7 @@ pub async fn fetch_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sq
     let rows = sqlx::query(
         r#"
         SELECT
-            o.global_position, e.order_id, e.event_id, e.event_type, e.payload_json,
+            o.global_position, e.order_id, e.event_type, e.payload_json,
             s.portfolio_id, s.instrument_id, s.side,
             p.net_qty::double precision      AS net_qty,
             p.avg_cost::double precision     AS avg_cost,
@@ -68,7 +67,6 @@ pub async fn fetch_batch(pool: &PgPool, limit: i64) -> Result<Vec<OutboxRow>, sq
             OutboxRow {
                 global_position: r.get("global_position"),
                 order_id: r.get("order_id"),
-                event_id: r.get("event_id"),
                 event_type: r.get("event_type"),
                 payload: r.get("payload_json"),
                 portfolio_id: r.get("portfolio_id"),
@@ -314,7 +312,6 @@ mod tests {
         OutboxRow {
             global_position: 42,
             order_id: Uuid::new_v4(),
-            event_id: Uuid::new_v4(),
             event_type: event_type.to_string(),
             payload: serde_json::json!({ "event_type": event_type, "payload": { "fill_qty": 1.0 } }),
             portfolio_id: Some(Uuid::new_v4()),

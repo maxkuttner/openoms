@@ -27,7 +27,7 @@ fn adapter() -> Arc<AlpacaAdapter> {
 
 fn state(pool: PgPool) -> AppState {
     let (quote_tx, _) = mpsc::channel(1);
-    AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(), None,
+    AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(),
         symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
         StreamHealthRegistry::new(), crate::event_bus::EventBus::new(), quote_tx,
         crate::sessions::SessionConfig {
