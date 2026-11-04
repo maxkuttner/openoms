@@ -168,6 +168,56 @@ mod tests {
         assert_eq!(serde_json::to_value(crate::venues::venues()).unwrap(), golden);
     }
 
+    /// The phase 5a boundary: the central files work from `all()` and never
+    /// name a connector, so adding one touches its module, its line in `all()`,
+    /// its migration and its docs page — nothing here. Comments and test
+    /// modules may name connectors (test fixtures need concrete ones); module
+    /// declarations are wiring that moving connectors into their own crate
+    /// (phase 5b) removes.
+    #[test]
+    fn central_files_name_no_connector() {
+        let central = [
+            ("reload.rs", include_str!("../reload.rs")),
+            ("admin.rs", include_str!("../admin.rs")),
+            ("main.rs", include_str!("../main.rs")),
+            ("venues.rs", include_str!("../venues.rs")),
+            ("credentials.rs", include_str!("../credentials.rs")),
+            ("credentials_api.rs", include_str!("../credentials_api.rs")),
+            ("setup/brokers.rs", include_str!("../setup/brokers.rs")),
+            ("jobs/api.rs", include_str!("../jobs/api.rs")),
+            ("daily_stats_poller.rs", include_str!("../daily_stats_poller.rs")),
+            ("feeds.rs", include_str!("../feeds.rs")),
+            ("adapters/mod.rs", include_str!("../adapters/mod.rs")),
+        ];
+        let names: Vec<String> = all()
+            .iter()
+            .flat_map(|c| {
+                let m = c.manifest();
+                [m.code.to_string(), m.credential_kind.to_string(), m.code.to_lowercase()]
+            })
+            .collect();
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mentions = |line: &str, name: &str| {
+            line.match_indices(name).any(|(i, _)| {
+                let before = i.checked_sub(1).map(|j| line.as_bytes()[j]);
+                let after = line.as_bytes().get(i + name.len()).copied();
+                !before.is_some_and(is_word) && !after.is_some_and(is_word)
+            })
+        };
+        for (file, source) in central {
+            let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            for (n, line) in code.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("mod ") || t.starts_with("pub mod ") {
+                    continue;
+                }
+                for name in &names {
+                    assert!(!mentions(line, name), "{file}:{}: names connector {name}: {t}", n + 1);
+                }
+            }
+        }
+    }
+
     #[test]
     fn codes_and_kinds_are_unique() {
         let mut codes: Vec<_> = all().iter().map(|c| c.manifest().code).collect();

@@ -34,6 +34,12 @@ impl PartialEq for Broker {
 }
 impl Eq for Broker {}
 
+impl std::fmt::Display for Broker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.code().to_lowercase())
+    }
+}
+
 impl std::fmt::Debug for Broker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.code())
@@ -57,6 +63,12 @@ impl Broker {
     /// Every broker the app can sync — the set boot-time auto-sync iterates.
     pub fn all() -> Vec<Broker> {
         crate::connectors::all().iter().filter(|c| c.manifest().universe).map(|c| Broker(*c)).collect()
+    }
+
+    /// What `sync-broker` syncs when no `--broker` is given: the first universe
+    /// connector in `connectors::all()`.
+    pub fn default_sync() -> Broker {
+        Broker::all()[0]
     }
 
     pub fn by_code(code: &str) -> Option<Broker> {
@@ -118,7 +130,7 @@ pub fn known_broker_codes() -> Vec<&'static str> {
 #[derive(ClapArgs, Debug, Clone)]
 pub struct Args {
     /// Which broker's catalog to sync (also the instrument source).
-    #[arg(long, value_enum, ignore_case = true, default_value = "alpaca")]
+    #[arg(long, value_enum, ignore_case = true, default_value_t = Broker::default_sync())]
     pub broker: Broker,
     /// Comma-separated option underlyings to seed the option chain for (Alpaca only).
     /// Empty seeds equities/spot only — the full option tape is not seeded wholesale.
