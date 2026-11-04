@@ -1,0 +1,5 @@
+{"code":"0","msg":"","data":[
+{"instType":"SPOT","instId":"BTC-USDT","baseCcy":"BTC","quoteCcy":"USDT","tickSz":"0.1","lotSz":"0.00000001","minSz":"0.00001","maxLmtSz":"9999999999","maxMktSz":"1000000","maxLmtAmt":"20000000","maxMktAmt":"1000000","state":"live"},
+{"instType":"SPOT","instId":"ETH-EUR","baseCcy":"ETH","quoteCcy":"EUR","tickSz":"0.01","lotSz":"0.000001","minSz":"0.001","maxLmtSz":"9999999999","maxMktSz":"","state":"live"},
+{"instType":"SPOT","instId":"HALT-USDT","baseCcy":"HALT","quoteCcy":"USDT","tickSz":"0.0001","lotSz":"1","minSz":"1","maxLmtSz":"","maxMktSz":"","state":"suspend"}
+]}

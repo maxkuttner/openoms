@@ -1,0 +1,5 @@
+{"arg":{"channel":"orders","instType":"SPOT","uid":"77"},"data":[
+{"instType":"SPOT","instId":"BTC-USDT","ordId":"1","clOrdId":"3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b","state":"live","sz":"0.001","fillSz":"0","fillPx":"","tradeId":"","accFillSz":"0","avgPx":"","side":"buy","ordType":"limit"},
+{"instType":"SPOT","instId":"BTC-USDT","ordId":"1","clOrdId":"3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b","state":"canceled","sz":"0.001","fillSz":"0","fillPx":"","tradeId":"","accFillSz":"0","avgPx":"","side":"buy","ordType":"limit","cancelSource":"1"},
+{"instType":"SPOT","instId":"BTC-USDT","ordId":"2","clOrdId":"9a8b7c6d000040008000000000000002","state":"mmp_canceled","sz":"0.001","fillSz":"0","fillPx":"","tradeId":"","accFillSz":"0.0005","avgPx":"65000","side":"buy","ordType":"limit"}
+]}

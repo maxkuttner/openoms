@@ -1,0 +1,5 @@
+{"arg":{"channel":"orders","instType":"SPOT","uid":"77"},"data":[
+{"instType":"SPOT","instId":"BTC-USDT","ordId":"312269865356374016","clOrdId":"3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b","state":"partially_filled","sz":"0.001","fillSz":"0.0004","fillPx":"65000","tradeId":"123456789","accFillSz":"0.0004","avgPx":"65000","side":"buy","ordType":"limit"},
+{"instType":"SPOT","instId":"BTC-USDT","ordId":"312269865356374016","clOrdId":"3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b","state":"filled","sz":"0.001","fillSz":"0.0006","fillPx":"65010","tradeId":"123456790","accFillSz":"0.001","avgPx":"65006","side":"buy","ordType":"limit"},
+{"instType":"SPOT","instId":"BTC-USDT","ordId":"312269865356374099","clOrdId":"manual1","state":"filled","sz":"1","fillSz":"1","fillPx":"65000","tradeId":"123456791","accFillSz":"1","avgPx":"65000","side":"buy","ordType":"market"}
+]}

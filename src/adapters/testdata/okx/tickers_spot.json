@@ -1,0 +1,5 @@
+{"code":"0","msg":"","data":[
+{"instType":"SPOT","instId":"BTC-USDT","last":"65500","open24h":"64000","sodUtc0":"64200","sodUtc8":"64100","bidPx":"65499.9","askPx":"65500"},
+{"instType":"SPOT","instId":"BAD-USDT","last":"1","open24h":"","sodUtc0":"","sodUtc8":""},
+{"instType":"SPOT","instId":"ETH-USDT","last":"3000","open24h":"2900","sodUtc0":"2950","sodUtc8":"2940"}
+]}
