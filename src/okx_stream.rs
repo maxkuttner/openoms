@@ -4,16 +4,15 @@
 //! Connect `wss://ws.okx.com/ws/v5/private` (Demo Trading: `wspap.okx.com`), log
 //! in with `{"op":"login","args":[{apiKey, passphrase, timestamp, sign}]}` where
 //! `sign` is the base64 HMAC of `{unix seconds}GET/users/self/verify`, then
-//! subscribe to the `orders` channel for SPOT. That one channel carries both
-//! fills and state changes, in order per order: an entry with a `tradeId` is one
-//! fill (`fillSz` at `fillPx`, keyed by the trade id), and `canceled` /
-//! `mmp_canceled` close the order. Applied through the shared
-//! [`crate::execution::process_execution_report`].
-//!
-//! A cancel for an order with fills goes through reconcile
-//! ([`crate::recon_orders::apply_broker_terminal`]) rather than closing it
-//! directly: whatever OKX filled that the OMS hasn't booked (a fill missed while
-//! disconnected) is booked first, then the order closes.
+//! subscribe to the `orders` channel for SPOT. Every push carries the order's
+//! cumulative state (`accFillSz`, `avgPx`, `state`). The push's `tradeId` /
+//! `fillSz` describe the last trade and can be repeated on later pushes (a cancel
+//! after a partial fill may carry them again), and the execution path does not
+//! dedupe by execution id — so a push is never booked as one trade. Instead the
+//! OMS books whatever OKX has filled that it hasn't
+//! ([`crate::recon_orders::apply_broker_progress`]), and `filled` / `canceled` /
+//! `mmp_canceled` close the order through reconcile
+//! ([`crate::recon_orders::apply_broker_terminal`]). Both are idempotent.
 
 use std::sync::Arc;
 
@@ -22,14 +21,12 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::adapters::okx::{oms_order_id, parse_order_state, OkxAdapter};
-use crate::domain::orders::commands::ExecutionReport;
-use crate::execution::process_execution_report;
 use crate::kafka::KafkaClient;
-use crate::recon_orders::{apply_broker_terminal, run_order_reconcile, BrokerOrderState};
+use crate::recon_orders::{apply_broker_progress, apply_broker_terminal, run_order_reconcile, BrokerOrderState};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -88,7 +85,8 @@ fn subscribe_message() -> serde_json::Value {
 /// What one pushed entry means for its OMS order.
 #[derive(Debug)]
 pub(crate) enum Update {
-    Report(ExecutionReport),
+    /// OKX's cumulative filled size and average price for a working order.
+    Progress { cum: f64, avg: f64 },
     /// A cancel for an order with fills: apply through reconcile so any fill the
     /// OMS missed is booked before the close.
     Terminal(BrokerOrderState),
@@ -104,30 +102,14 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
     data.iter()
         .filter_map(|d| {
             let id = oms_order_id(d["clOrdId"].as_str()?)?;
-            let num = |k: &str| d[k].as_str().and_then(|s| s.parse::<f64>().ok());
-            let trade_id = d["tradeId"].as_str().filter(|t| !t.is_empty());
-            if let (Some(trade_id), Some(qty)) = (trade_id, num("fillSz").filter(|q| *q > 0.0)) {
-                return Some((
-                    id,
-                    Update::Report(ExecutionReport::Fill {
-                        execution_id: trade_id.to_string(),
-                        fill_qty: qty,
-                        fill_price: num("fillPx")?,
-                        venue: VENUE.to_string(),
-                    }),
-                ));
-            }
-            match d["state"].as_str()? {
-                "canceled" | "mmp_canceled" if num("accFillSz").unwrap_or(0.0) > 0.0 => {
-                    Some((id, Update::Terminal(parse_order_state(d))))
-                }
-                "canceled" | "mmp_canceled" => Some((
-                    id,
-                    Update::Report(ExecutionReport::Canceled { reason: None, venue: Some(VENUE.to_string()) }),
-                )),
-                // live / partially_filled / filled without a trade: nothing new.
-                _ => None,
-            }
+            let st = parse_order_state(d);
+            let update = match d["state"].as_str()? {
+                "filled" | "canceled" | "mmp_canceled" => Update::Terminal(st),
+                _ if st.executed_qty > 0.0 => Update::Progress { cum: st.executed_qty, avg: st.avg_px },
+                // live, nothing filled yet: nothing new.
+                _ => return None,
+            };
+            Some((id, update))
         })
         .collect()
 }
@@ -180,13 +162,11 @@ async fn connect_and_run(
         if v.get("data").is_some() {
             for (order_id, update) in updates(&v) {
                 match update {
-                    Update::Report(report) => {
-                        if let Err(e) = process_execution_report(pool, kafka, order_id, report, "okx", position_changed_tx).await {
-                            error!(order_id = %order_id, error = %e, "OKX WS: failed to apply execution report");
-                        }
-                    }
                     Update::Terminal(st) => {
                         apply_broker_terminal(pool, kafka, order_id, &st, VENUE, "okx", position_changed_tx).await;
+                    }
+                    Update::Progress { cum, avg } => {
+                        apply_broker_progress(pool, kafka, order_id, cum, avg, VENUE, "okx", position_changed_tx).await;
                     }
                 }
             }
@@ -249,39 +229,44 @@ mod tests {
         assert_eq!(m["args"][0]["instType"], "SPOT");
     }
 
+    // OKX repeats the last fill's tradeId/fillSz on later pushes for the same
+    // order, so a push is read as OKX's cumulative state, never as one trade:
+    // booking what the OMS is missing is idempotent across repeats.
     #[test]
-    fn each_trade_is_one_fill_keyed_by_trade_id() {
+    fn a_partial_fill_push_is_cumulative_progress() {
         let u = updates(&sample("ws_orders_fill"));
         assert_eq!(u.len(), 2, "the manual order is not ours");
-        let fills: Vec<_> = u
-            .iter()
-            .map(|(id, up)| match up {
-                Update::Report(ExecutionReport::Fill { execution_id, fill_qty, fill_price, venue }) => {
-                    assert_eq!(id.to_string(), ORDER_ID);
-                    assert_eq!(venue, "OKX");
-                    (execution_id.clone(), *fill_qty, *fill_price)
-                }
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        // The `filled` push carries the last fill; it is booked as a fill, not a close.
-        assert_eq!(fills, [("123456789".to_string(), 0.0004, 65000.0), ("123456790".to_string(), 0.0006, 65010.0)]);
+        assert_eq!(u[0].0.to_string(), ORDER_ID);
+        assert!(matches!(u[0].1, Update::Progress { cum, avg } if cum == 0.0004 && avg == 65000.0), "{:?}", u[0].1);
     }
 
     #[test]
-    fn live_is_nothing_and_a_cancel_without_fills_is_a_plain_cancel() {
+    fn a_filled_push_closes_through_reconcile_with_okx_totals() {
+        let u = updates(&sample("ws_orders_fill"));
+        match &u[1].1 {
+            Update::Terminal(st) => {
+                assert_eq!(st.outcome, BrokerOrderOutcome::Filled);
+                assert_eq!(st.executed_qty, 0.001);
+                assert_eq!(st.avg_px, 65006.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_is_nothing_and_a_cancel_without_fills_closes_with_nothing_filled() {
         let u = updates(&sample("ws_orders_lifecycle"));
         assert_eq!(u.len(), 2, "live produces nothing");
         assert_eq!(u[0].0.to_string(), ORDER_ID);
         assert!(
-            matches!(&u[0].1, Update::Report(ExecutionReport::Canceled { reason: None, venue: Some(v) }) if v == "OKX"),
+            matches!(&u[0].1, Update::Terminal(st) if st.outcome == BrokerOrderOutcome::Canceled && st.executed_qty == 0.0),
             "{:?}",
             u[0].1
         );
     }
 
     #[test]
-    fn a_cancel_after_fills_goes_through_reconcile_with_okx_state() {
+    fn a_cancel_repeating_its_last_fill_closes_with_okx_totals() {
         let u = updates(&sample("ws_orders_lifecycle"));
         let (id, update) = &u[1];
         assert_eq!(id.to_string(), "9a8b7c6d-0000-4000-8000-000000000002");

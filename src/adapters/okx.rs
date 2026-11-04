@@ -149,6 +149,13 @@ pub(crate) fn envelope(body: serde_json::Value) -> Result<serde_json::Value, Bro
     }
 }
 
+/// OKX's code for an order it no longer knows (51603). Only a cancelled order
+/// with nothing filled ages out (after about 2 hours), so that is what it was.
+pub(crate) fn missing_order_state(e: &BrokerError) -> Option<BrokerOrderState> {
+    matches!(e, BrokerError::BrokerRejected(m) if m.ends_with("(code 51603)") || m.ends_with("(sCode 51603)"))
+        .then_some(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 0.0, avg_px: 0.0 })
+}
+
 /// The OMS order id as an OKX `clOrdId`: the UUID without dashes (32 hex chars).
 pub(crate) fn client_order_id(order_id: &str) -> String {
     order_id.replace('-', "")
@@ -345,7 +352,10 @@ impl BrokerAdapter for OkxAdapter {
         external_order_id: &str,
         symbol: &str,
     ) -> Result<BrokerOrderState, BrokerError> {
-        let data = self.get(&format!("/api/v5/trade/order?instId={symbol}&ordId={external_order_id}"), true).await?;
+        let data = match self.get(&format!("/api/v5/trade/order?instId={symbol}&ordId={external_order_id}"), true).await {
+            Ok(data) => data,
+            Err(e) => return missing_order_state(&e).ok_or(e),
+        };
         match data.as_array().and_then(|l| l.first()) {
             Some(order) => Ok(parse_order_state(order)),
             None => Err(BrokerError::BrokerRejected(format!("OKX has no order {external_order_id}"))),
@@ -542,6 +552,17 @@ mod tests {
     fn previous_price_is_open24h_and_a_blank_one_is_skipped() {
         let prev = parse_prev_prices(&sample("tickers_spot"), &["BTC-USDT".to_string(), "BAD-USDT".to_string()]);
         assert_eq!(prev, vec![("BTC-USDT".to_string(), 64000.0)]);
+    }
+
+    // OKX keeps a cancelled order with no fills queryable for about 2 hours; after
+    // that /trade/order answers 51603. Reconcile must still close it.
+    #[test]
+    fn an_order_okx_no_longer_knows_was_cancelled_with_nothing_filled() {
+        let gone = envelope(serde_json::json!({"code":"51603","msg":"Order does not exist","data":[]})).unwrap_err();
+        let st = missing_order_state(&gone).expect("51603 means cancelled unfilled");
+        assert_eq!((st.outcome, st.executed_qty, st.avg_px), (BrokerOrderOutcome::Canceled, 0.0, 0.0));
+        let other = envelope(serde_json::json!({"code":"50011","msg":"Too many requests","data":[]})).unwrap_err();
+        assert!(missing_order_state(&other).is_none());
     }
 
     #[test]
