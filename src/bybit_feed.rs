@@ -65,8 +65,8 @@ impl FeedSymbology for BybitFeed {
     }
 
     /// Identity: the master symbol is the pair, matching the `s` field verbatim.
-    /// A dashed symbol is a Coinbase product (`BTC-USD`), not a Bybit pair; an
-    /// unknown topic could fail the whole subscribe request.
+    /// A dashed symbol is a Coinbase or OKX pair (`BTC-USD`, `BTC-USDT`), not a
+    /// Bybit pair; an unknown topic could fail the whole subscribe request.
     fn to_feed_symbol(&self, symbol: &str) -> Option<String> {
         (!symbol.contains('-')).then(|| symbol.to_string())
     }

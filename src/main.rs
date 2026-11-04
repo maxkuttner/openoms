@@ -59,6 +59,7 @@ mod alpaca_stream;
 mod binance_stream;
 mod bybit_stream;
 mod coinbase_stream;
+mod okx_stream;
 mod stream_health;
 mod venues;
 mod marks;
@@ -71,6 +72,7 @@ mod daily_stats_poller;
 mod binance_feed;
 mod bybit_feed;
 mod coinbase_feed;
+mod okx_feed;
 mod feeds;
 mod preflight;
 mod config;
@@ -1086,6 +1088,7 @@ async fn serve() {
         binance_rest_adapters,
         bybit_adapters,
         coinbase_adapters,
+        okx_adapters,
     } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &registration_deps).await;
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
@@ -1196,6 +1199,9 @@ async fn serve() {
     }
     for (env_name, adapter) in coinbase_adapters {
         reload::restart_coinbase_stream(env_name, adapter, &registration_deps, state.streams()).await;
+    }
+    for (env_name, adapter) in okx_adapters {
+        reload::restart_okx_stream(env_name, adapter, &registration_deps, state.streams()).await;
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside
@@ -1344,6 +1350,21 @@ async fn serve() {
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("COINBASE/SPOT", health, session));
+    }
+
+    // OKX's public tickers mark OKX's own pairs, which no other feed prices.
+    {
+        let (okx_pos_tx, okx_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
+        state.doorbells().set("OKX/SPOT", okx_pos_tx);
+        let health = state.stream_health().handle("OKX", "SPOT", stream_health::StreamKind::Feed);
+        let session = quote_feed::QuoteFeedSession::new(
+            okx_feed::OkxFeed,
+            state.pool().clone(),
+            quote_tx.clone(),
+            okx_pos_rx,
+            health.clone(),
+        );
+        tokio::spawn(stream_supervisor::supervise("OKX/SPOT", health, session));
     }
 
     // Relay the fill path's single doorbell to every feed. `ring_all`'s

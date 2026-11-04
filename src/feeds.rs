@@ -19,6 +19,7 @@ pub static ALL: &[&dyn FeedSymbology] = &[
     &crate::binance_feed::BinanceFeed,
     &crate::bybit_feed::BybitFeed,
     &crate::coinbase_feed::CoinbaseFeed,
+    &crate::okx_feed::OkxFeed,
 ];
 
 /// The symbology for a feed code, or `None` if this build has no such feed —
