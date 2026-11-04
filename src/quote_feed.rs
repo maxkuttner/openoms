@@ -104,10 +104,19 @@ fn needs_recheck(r: &Result<OrderLaneEvent, broadcast::error::RecvError>) -> Rec
 /// Resolve on the next order-lane event that warrants a re-read. The lane only
 /// closes when the bus is gone; never end the session over it — a feed with no
 /// order lane still streams fine — so park instead.
+///
+/// Drains whatever is already queued before resolving: one re-read covers a
+/// whole burst of fills, so a sweep of partials costs one query, not one each.
 async fn next_recheck(order_rx: &mut broadcast::Receiver<OrderLaneEvent>) {
     loop {
         match needs_recheck(&order_rx.recv().await) {
-            Recheck::Yes => return,
+            Recheck::Yes => {
+                while !matches!(
+                    order_rx.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed)
+                ) {}
+                return;
+            }
             Recheck::No => {}
             Recheck::Closed => std::future::pending::<()>().await,
         }
@@ -217,6 +226,20 @@ mod tests {
     #[test]
     fn lagged_order_lane_means_recheck() {
         assert_eq!(needs_recheck(&Err(RecvError::Lagged(3))), Recheck::Yes);
+    }
+
+    /// A sweep of partial fills must cost one held-set re-read, not one per fill.
+    #[tokio::test]
+    async fn next_recheck_coalesces_a_burst() {
+        let bus = crate::event_bus::EventBus::new();
+        let mut rx = bus.subscribe_order();
+        for _ in 0..3 {
+            bus.publish_order(OrderLaneEvent::PositionChanged { portfolio_id: Uuid::nil(), instrument_id: "1".into() });
+        }
+
+        next_recheck(&mut rx).await;
+
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
     }
 
     #[test]

@@ -3,7 +3,11 @@
 //!
 //! Two lanes, because they behave differently:
 //! - order lane: committed order events and position changes. Published only after
-//!   the transaction commits, in append order.
+//!   the transaction commits, in append order *per publishing task*. There is no
+//!   global order: two tasks committing concurrently can publish in either order,
+//!   and `global_position` is assigned at insert, not commit, so it can differ
+//!   from commit order too. A consumer resuming by `global_position` must
+//!   tolerate gaps.
 //! - price lane: accepted marks. Latest wins; a lagging subscriber skips ahead and a
 //!   producer never waits on it.
 //!
@@ -19,7 +23,7 @@ pub const PRICE_LANE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderLaneEvent {
-    /// One committed order event (published after commit, in append order).
+    /// One committed order event (published after commit; see module doc on ordering).
     Appended { order_id: Uuid, global_position: i64, event_type: String },
     /// A committed fill changed a position.
     PositionChanged { portfolio_id: Uuid, instrument_id: String },
