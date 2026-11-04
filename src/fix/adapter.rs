@@ -152,7 +152,7 @@ impl BrokerAdapter for FixBrokerAdapter {
     }
 
     async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError> {
-        // Sync send; the resulting VenueReport (Canceled) arrives asynchronously
+        // Sync send; the resulting ExecutionReport (Canceled) arrives asynchronously
         // and is booked by the order engine, mirroring the WS cancel path.
         self.send_cancel(external_order_id, symbol)
     }

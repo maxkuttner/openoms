@@ -114,3 +114,28 @@ impl FixDialect for BinanceDialect {
         parse_standard_exec_report(msg, self.venue())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quickfix::FieldMap;
+    use uuid::Uuid;
+
+    use crate::fix::dialect::tests::order;
+
+    // A throwaway Ed25519 PKCS#8 PEM (generated for tests only, not a real
+    // credential) so the Binance dialect constructs its signing key.
+    const TEST_ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAGvAMHEDQzczRRSN2T3AYeEUyaWSwA6GXlSZ2hjM8TC\n-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn binance_market_order_omits_price_and_tif() {
+        let id = Uuid::new_v4();
+        let d = BinanceDialect::new("key".into(), TEST_ED25519_PEM).unwrap();
+        let msg = d.build_new_order_single(&order(&id, "market", None)).unwrap();
+
+        assert_eq!(msg.with_header(|h| h.get_field(tag::MSG_TYPE)).as_deref(), Some("D"));
+        assert_eq!(msg.get_field(tag::ORD_TYPE).as_deref(), Some("1")); // market
+        assert_eq!(msg.get_field(tag::PRICE), None);
+        assert_eq!(msg.get_field(tag::TIME_IN_FORCE), None);
+    }
+}

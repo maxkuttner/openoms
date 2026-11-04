@@ -49,18 +49,8 @@ impl Connector for Coinbase {
     fn public_feed(&self) -> Option<PublicFeed> {
         Some(PublicFeed {
             symbology: &crate::coinbase_feed::CoinbaseFeed,
-            run: |pool, quotes, order_rx, health| {
-                Box::pin(async move {
-                    let session = crate::quote_feed::QuoteFeedSession::new(
-                        crate::coinbase_feed::CoinbaseFeed,
-                        pool,
-                        quotes,
-                        order_rx,
-                        health.clone(),
-                    );
-                    gateway::stream_supervisor::supervise("COINBASE/SPOT", health, session).await;
-                })
-            },
+            label: "COINBASE/SPOT",
+            source: || Arc::new(crate::coinbase_feed::CoinbaseFeed),
         })
     }
 

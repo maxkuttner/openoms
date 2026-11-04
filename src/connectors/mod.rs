@@ -7,15 +7,12 @@
 
 use std::sync::Arc;
 
-use dataprovider::{FeedSymbology, Quote};
+use dataprovider::{FeedSymbology, LiveQuoteFeed};
 use futures_util::future::BoxFuture;
-use sqlx::PgPool;
-use tokio::sync::{broadcast, mpsc};
 
 use crate::adapters::{BrokerAdapter, InstrumentProvider};
 use crate::credentials::{BrokerCredentials, Shown};
 use crate::credentials_api::TestOutcome;
-use crate::event_bus::OrderLaneEvent;
 use gateway::contract::EngineHandle;
 use crate::reload::RegistrationDeps;
 use gateway::stream_health::StreamHandle;
@@ -73,12 +70,18 @@ pub struct Manifest {
 /// Starts one execution stream; called again on every restart.
 pub type ExecStream = Arc<dyn Fn(StreamHandle, EngineHandle) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// A live quote source the OMS drives: it knows what it can price and how to stream it.
+pub trait QuoteSource: LiveQuoteFeed + FeedSymbology {}
+impl<T: LiveQuoteFeed + FeedSymbology> QuoteSource for T {}
+
 /// A venue's public quote feed: needs no credential, runs for the life of the
-/// process, and prices the instruments it covers that are held.
+/// process, and prices the instruments it covers that are held. The OMS drives
+/// it, since what is held lives in the database.
 pub struct PublicFeed {
     pub symbology: &'static dyn FeedSymbology,
-    /// Run the feed's supervised session; never returns.
-    pub run: fn(PgPool, mpsc::Sender<Quote>, broadcast::Receiver<OrderLaneEvent>, StreamHandle) -> BoxFuture<'static, ()>,
+    /// Its supervisor's name in the stream registry, e.g. "OKX/SPOT".
+    pub label: &'static str,
+    pub source: fn() -> Arc<dyn QuoteSource>,
 }
 
 /// What connecting one configured connection produced.
@@ -180,6 +183,12 @@ mod tests {
     /// declarations are wiring that moving connectors into their own crate
     /// (phase 5b) removes.
     #[test]
+    fn every_public_feed_keeps_its_label() {
+        let labels: Vec<&str> = all().iter().filter_map(|c| c.public_feed()).map(|f| f.label).collect();
+        assert_eq!(labels, ["BINANCE/SPOT", "BYBIT/SPOT", "COINBASE/SPOT", "OKX/SPOT"]);
+    }
+
+    #[test]
     fn central_files_name_no_connector() {
         let central = [
             ("reload.rs", include_str!("../reload.rs")),
@@ -193,6 +202,10 @@ mod tests {
             ("daily_stats_poller.rs", include_str!("../daily_stats_poller.rs")),
             ("feeds.rs", include_str!("../feeds.rs")),
             ("adapters/mod.rs", include_str!("../adapters/mod.rs")),
+            ("fix/mod.rs", include_str!("../fix/mod.rs")),
+            ("fix/app.rs", include_str!("../fix/app.rs")),
+            ("fix/adapter.rs", include_str!("../fix/adapter.rs")),
+            ("fix/dialect.rs", include_str!("../fix/dialect.rs")),
         ];
         // case-insensitive, and `_` separates words: `alpaca_stream`,
         // `"BINANCE_ENV"` and `IbkrFix` all name a connector
@@ -216,9 +229,23 @@ mod tests {
             })
         };
         for (file, source) in central {
-            let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
-            for (n, line) in code.lines().enumerate() {
+            // test modules may name connectors, wherever in the file they sit
+            let mut in_test = false;
+            let mut depth = 0i32;
+            let mut after_cfg_test = false;
+            for (n, line) in source.lines().enumerate() {
                 let t = line.trim_start();
+                if in_test {
+                    depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+                    in_test = depth > 0;
+                    continue;
+                }
+                let item = t.trim_start_matches("pub(crate) ").trim_start_matches("pub ");
+                if after_cfg_test && item.starts_with("mod ") && t.ends_with('{') {
+                    (in_test, depth) = (true, 1);
+                    continue;
+                }
+                after_cfg_test = t == "#[cfg(test)]";
                 if t.starts_with("//") || t.starts_with("mod ") || t.starts_with("pub mod ") {
                     continue;
                 }

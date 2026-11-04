@@ -1,4 +1,4 @@
-//! Generic driver for any [`LiveQuoteFeed`].
+//! Generic driver for any [`dataprovider::LiveQuoteFeed`].
 //!
 //! Owns everything that is the same regardless of vendor: work out what to
 //! subscribe to, hand it to the feed, watch the bus's order lane, and push newly
@@ -9,13 +9,15 @@
 //! subscription bookkeeping.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use dataprovider::{FeedSymbology, LiveQuoteFeed, Quote, SymbolAdds};
+use dataprovider::{FeedSymbology, Quote, SymbolAdds};
 use sqlx::PgPool;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
 use tracing::info;
 
+use crate::connectors::QuoteSource;
 use crate::event_bus::OrderLaneEvent;
 use gateway::stream_health::StreamHandle;
 use gateway::stream_supervisor::{Session, StreamResult};
@@ -24,17 +26,17 @@ use gateway::stream_supervisor::{Session, StreamResult};
 /// the query, so this is just the poll interval for "did we buy anything yet".
 const IDLE_RECHECK_SECS: u64 = 60;
 
-pub struct QuoteFeedSession<F: LiveQuoteFeed + FeedSymbology> {
-    feed: F,
+pub struct QuoteFeedSession {
+    feed: Arc<dyn QuoteSource>,
     pool: PgPool,
     out: mpsc::Sender<Quote>,
     order_rx: broadcast::Receiver<OrderLaneEvent>,
     health: StreamHandle,
 }
 
-impl<F: LiveQuoteFeed + FeedSymbology> QuoteFeedSession<F> {
+impl QuoteFeedSession {
     pub fn new(
-        feed: F,
+        feed: Arc<dyn QuoteSource>,
         pool: PgPool,
         out: mpsc::Sender<Quote>,
         order_rx: broadcast::Receiver<OrderLaneEvent>,
@@ -52,7 +54,7 @@ impl<F: LiveQuoteFeed + FeedSymbology> QuoteFeedSession<F> {
     /// with a timer as the backstop for positions this process didn't see.
     async fn wait_for_subscribable(&mut self) -> Result<HashMap<String, i64>, sqlx::Error> {
         loop {
-            let held = load_subscribable(&self.pool, &self.feed).await?;
+            let held = load_subscribable(&self.pool, self.feed.as_ref()).await?;
             if !held.is_empty() {
                 return Ok(held);
             }
@@ -65,7 +67,7 @@ impl<F: LiveQuoteFeed + FeedSymbology> QuoteFeedSession<F> {
 }
 
 #[async_trait::async_trait]
-impl<F: LiveQuoteFeed + FeedSymbology> Session for QuoteFeedSession<F> {
+impl Session for QuoteFeedSession {
     async fn run_once(&mut self) -> StreamResult {
         let known = self.wait_for_subscribable().await?;
         info!(source = self.feed.code(), count = known.len(), "quote feed: subscribing held set");
@@ -76,7 +78,7 @@ impl<F: LiveQuoteFeed + FeedSymbology> Session for QuoteFeedSession<F> {
         // them lets a fill be picked up without waiting for a reconnect.
         tokio::select! {
             r = self.feed.run_session(known.clone(), &self.out, &mut add_rx, &self.health) => r.map_err(Into::into),
-            r = watch_held(&self.pool, &self.feed, &mut self.order_rx, &add_tx, known) => r,
+            r = watch_held(&self.pool, self.feed.as_ref(), &mut self.order_rx, &add_tx, known) => r,
         }
     }
 }

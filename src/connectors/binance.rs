@@ -5,6 +5,14 @@ use std::sync::Arc;
 
 use crate::credentials::BrokerCredentials;
 use crate::reload::RegistrationDeps;
+use crate::fix::binance::BinanceDialect;
+use tracing::{error, info};
+
+use crate::fix::adapter::FixBrokerAdapter;
+use crate::fix::dialect::FixDialect;
+use crate::fix::{start_session, FixConfig};
+use gateway::contract::EngineHandle;
+use gateway::stream_health::StreamHealthRegistry;
 
 use super::{FIX_NOT_TESTABLE, PublicFeed, typed, Connected};
 use crate::credentials::Shown::{Clear, Hidden};
@@ -41,7 +49,7 @@ impl Connector for Binance {
         use crate::adapters::Transport;
         match Transport::from_env(&format!("BINANCE_{env}"), Transport::Rest) {
             Transport::Fix => {
-                let adapter = crate::fix::start_binance(env, creds, &deps.stream_health, deps.engine.clone())
+                let adapter = start_binance(env, creds, &deps.stream_health, deps.engine.clone())
                     .ok_or_else(|| "Binance FIX session could not start".to_string())?;
                 Ok(Connected { adapter, exec_stream: None })
             }
@@ -64,18 +72,8 @@ impl Connector for Binance {
     fn public_feed(&self) -> Option<PublicFeed> {
         Some(PublicFeed {
             symbology: &crate::binance_feed::BinanceFeed,
-            run: |pool, quotes, order_rx, health| {
-                Box::pin(async move {
-                    let session = crate::quote_feed::QuoteFeedSession::new(
-                        crate::binance_feed::BinanceFeed,
-                        pool,
-                        quotes,
-                        order_rx,
-                        health.clone(),
-                    );
-                    gateway::stream_supervisor::supervise("BINANCE/SPOT", health, session).await;
-                })
-            },
+            label: "BINANCE/SPOT",
+            source: || Arc::new(crate::binance_feed::BinanceFeed),
         })
     }
 
@@ -110,5 +108,124 @@ fn venue() -> Venue {
             field("sender_comp_id", "SenderCompID").fix().prefill("OMS", "OMS"),
             field("target_comp_id", "TargetCompID").fix().prefill("SPOT", "SPOT"),
         ],
+    }
+}
+
+/// Wire a Binance Spot FIX order-entry session for `env_name` from an
+/// already-decrypted credential. `creds` must be a `BinanceFix` credential
+/// — see `start_ibkr`'s doc comment for why a mismatch is logged, not panicked.
+/// `private_key` is PEM contents (not a path) — the store holds the key material
+/// itself, so there is nothing to read from disk here.
+fn start_binance(
+    env_name: &str,
+    creds: &crate::credentials::BrokerCredentials,
+    stream_health: &StreamHealthRegistry,
+    engine: EngineHandle,
+) -> Option<Arc<FixBrokerAdapter>> {
+    let parsed = match creds.kind.as_str() {
+        crate::adapters::binance::BinanceCredentials::KIND => {
+            creds.parse::<crate::adapters::binance::BinanceCredentials>().ok()
+        }
+        _ => None,
+    };
+    let Some(parsed) = parsed else {
+        error!(env = env_name, "start_binance called with non-Binance credentials (programming error)");
+        return None;
+    };
+    let crate::adapters::binance::BinanceCredentials {
+        host, port, sender_comp_id, target_comp_id, api_key, private_key,
+    } = &parsed;
+    // A REST-only Binance credential stores an empty host (see `import_env::scan_env`
+    // and `save_broker` from the cockpit-to-be — REST never reads a FIX host, so
+    // nothing requires one to be set). Asking for FIX transport on such a
+    // credential must fail clearly here, before ever touching the network, rather
+    // than attempting a QuickFIX connection to `SocketConnectHost = ""`.
+    if host.is_empty() {
+        error!(
+            env = env_name,
+            "start_binance: credential has no FIX host configured — set it (e.g. via \
+             BINANCE_{{ENV}}_FIX_HOST before `oms config import-env`, or the cockpit \
+             once it can edit credentials) before selecting FIX transport"
+        );
+        return None;
+    }
+    let dialect = match BinanceDialect::new(api_key.clone(), private_key) {
+        Ok(d) => Arc::new(d) as Arc<dyn FixDialect>,
+        Err(e) => { error!(env = env_name, error = %e, "Binance FIX dialect init failed"); return None; }
+    };
+    // Binance Spot FIX has no open-orders / order-status message, so route the
+    // order-reconciliation reads through the same credential's REST API. Orders still
+    // go over FIX; only the recon snapshot/status reads use REST.
+    let read_delegate: Option<Arc<dyn crate::adapters::BrokerAdapter>> =
+        match crate::adapters::binance::BinanceAdapter::new(api_key.clone(), private_key, env_name) {
+            Ok(a) => Some(Arc::new(a)),
+            Err(e) => {
+                error!(env = env_name, error = %e, "Binance FIX: REST recon delegate init failed; recon disabled");
+                None
+            }
+        };
+    let cfg = FixConfig {
+        host: host.clone(),
+        port: *port,
+        sender_comp_id: sender_comp_id.clone(),
+        target_comp_id: target_comp_id.clone(),
+        ssl: true, // Binance FIX requires TLS.
+        heartbeat_secs: 30,
+    };
+    // Seed the health entry only now that we know the session is configured.
+    let health = stream_health.fix_handle("BINANCE", env_name);
+    match start_session(dialect, cfg, "binance", health, engine, read_delegate) {
+        Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
+        Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An engine nothing drains — safe here because every test below hits a
+    /// guard that returns `None` before the network or QuickFIX are touched.
+    fn idle_engine() -> EngineHandle {
+        EngineHandle::new().0
+    }
+
+    fn ibkr_cred() -> BrokerCredentials {
+        BrokerCredentials::from_typed("IbkrFix", &crate::fix::ibkr::IbkrFixCredentials {
+            host: "h".into(),
+            port: 4001,
+            sender_comp_id: "S".into(),
+            target_comp_id: "T".into(),
+            password: "p".into(),
+            ssl: true,
+        })
+    }
+
+
+    /// Same guard, the other direction.
+    #[tokio::test]
+    async fn start_binance_refuses_a_non_binance_credential() {
+        let health = StreamHealthRegistry::new();
+        let result = start_binance("PAPER", &ibkr_cred(), &health, idle_engine());
+        assert!(result.is_none());
+    }
+
+    /// The empty-host guard added this round: a REST-only Binance credential
+    /// (empty `host`, per `import_env::scan_env` — REST never reads a FIX host)
+    /// must refuse FIX transport rather than attempt a QuickFIX connection to
+    /// `SocketConnectHost = ""`.
+    #[tokio::test]
+    async fn start_binance_refuses_an_empty_fix_host() {
+        let health = StreamHealthRegistry::new();
+        let creds = BrokerCredentials::from_typed("BinanceFix", &crate::adapters::binance::BinanceCredentials {
+            host: "".into(),
+            port: 9000,
+            sender_comp_id: "OMS".into(),
+            target_comp_id: "SPOT".into(),
+            api_key: "k".into(),
+            private_key: "pem".into(),
+        });
+        let result = start_binance("PAPER", &creds, &health, idle_engine());
+        assert!(result.is_none());
     }
 }

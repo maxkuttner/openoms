@@ -47,18 +47,8 @@ impl Connector for Okx {
     fn public_feed(&self) -> Option<PublicFeed> {
         Some(PublicFeed {
             symbology: &crate::okx_feed::OkxFeed,
-            run: |pool, quotes, order_rx, health| {
-                Box::pin(async move {
-                    let session = crate::quote_feed::QuoteFeedSession::new(
-                        crate::okx_feed::OkxFeed,
-                        pool,
-                        quotes,
-                        order_rx,
-                        health.clone(),
-                    );
-                    gateway::stream_supervisor::supervise("OKX/SPOT", health, session).await;
-                })
-            },
+            label: "OKX/SPOT",
+            source: || Arc::new(crate::okx_feed::OkxFeed),
         })
     }
 

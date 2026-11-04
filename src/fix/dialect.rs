@@ -1,7 +1,7 @@
 //! The per-broker seam. QuickFIX owns the session; a `FixDialect` owns the
 //! parts that differ between venues: the FIX version, the Logon auth fields, how
 //! an order maps onto `NewOrderSingle`/`OrderCancelRequest`, and how an inbound
-//! `VenueReport` (35=8) maps back to our internal [`VenueReport`].
+//! `ExecutionReport` (35=8) maps back to our internal [`VenueReport`].
 
 use quickfix::{FieldMap, Message};
 use uuid::Uuid;
@@ -50,7 +50,7 @@ pub mod tag {
     pub const LAST_RPT_REQUESTED: i32 = 912;
 }
 
-/// A parsed inbound `VenueReport` (35=8), addressed to one of our orders.
+/// A parsed inbound `ExecutionReport` (35=8), addressed to one of our orders.
 pub struct ParsedExecReport {
     /// Our order UUID, taken from `ClOrdID`(11) (or `OrigClOrdID`(41) on cancels).
     pub order_id: Uuid,
@@ -89,14 +89,14 @@ pub trait FixDialect: Send + Sync {
     /// Build an `OrderCancelRequest` (35=F) for a resting order.
     fn build_cancel(&self, external_order_id: &str, symbol: &str) -> Result<Message, BrokerError>;
 
-    /// Map an inbound `VenueReport` (35=8) to our internal report. Returns
+    /// Map an inbound `ExecutionReport` (35=8) to our internal report. Returns
     /// `None` when the message isn't an execution report or its `ClOrdID` isn't a
     /// UUID we issued. Most dialects delegate to [`parse_standard_exec_report`].
     fn parse_execution_report(&self, msg: &Message) -> Option<ParsedExecReport>;
 
     /// Build an `Order Mass Status Request` (35=AF) for the snapshot side of order
     /// reconciliation — `MassStatusReqType`(585)=7 (all orders). The broker replies
-    /// with one `VenueReport` (`ExecType=I`) per order, echoing
+    /// with one `ExecutionReport` (`ExecType=I`) per order, echoing
     /// `MassStatusReqID`(584), the last carrying `LastRptRequested`(912)=Y. Standard
     /// FIX 4.3+; on a venue that doesn't answer it (e.g. an older gateway) the
     /// caller's wait simply times out and reconciliation is skipped.
@@ -134,7 +134,7 @@ pub trait FixDialect: Send + Sync {
     }
 }
 
-/// A solicited order-status `VenueReport` (`ExecType=I`), the reply to a 35=AF /
+/// A solicited order-status `ExecutionReport` (`ExecType=I`), the reply to a 35=AF /
 /// 35=H. Carries the order's cumulative state rather than a single fill.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusReport {
@@ -187,7 +187,7 @@ impl StatusReport {
     }
 }
 
-/// Parse a solicited order-status `VenueReport` (35=8 with `ExecType`(150)=`I`).
+/// Parse a solicited order-status `ExecutionReport` (35=8 with `ExecType`(150)=`I`).
 /// Returns `None` for anything else — including live fills/acks, which stay on the
 /// existing execution path.
 pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
@@ -210,17 +210,15 @@ pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use quickfix::FieldMap;
     use uuid::Uuid;
 
     use crate::adapters::BrokerOrderRequest;
     use gateway::contract::VenueReport;
-    use crate::fix::binance::BinanceDialect;
-    use crate::fix::ibkr::IbkrDialect;
 
-    fn order(order_id: &Uuid, order_type: &str, limit: Option<f64>) -> BrokerOrderRequest {
+    pub(crate) fn order(order_id: &Uuid, order_type: &str, limit: Option<f64>) -> BrokerOrderRequest {
         BrokerOrderRequest {
             order_id: order_id.to_string(),
             symbol: "BTCUSDT".to_string(),
@@ -234,7 +232,7 @@ mod tests {
         }
     }
 
-    /// Build an inbound VenueReport (35=8) message for parser tests.
+    /// Build an inbound ExecutionReport (35=8) message for parser tests.
     fn exec_report(fields: &[(i32, &str)]) -> Message {
         let mut m = Message::new();
         m.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "8")).unwrap();
@@ -242,44 +240,6 @@ mod tests {
             m.set_field(*t, *v).unwrap();
         }
         m
-    }
-
-    // A throwaway Ed25519 PKCS#8 PEM (generated for tests only, not a real
-    // credential) so the Binance dialect constructs its signing key.
-    const TEST_ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAGvAMHEDQzczRRSN2T3AYeEUyaWSwA6GXlSZ2hjM8TC\n-----END PRIVATE KEY-----\n";
-
-    #[test]
-    fn ibkr_builds_new_order_single_with_conid() {
-        let id = Uuid::new_v4();
-        let d = IbkrDialect::new("pw".into());
-        let msg = d.build_new_order_single(&order(&id, "limit", Some(101.5))).unwrap();
-
-        assert_eq!(msg.with_header(|h| h.get_field(tag::MSG_TYPE)).as_deref(), Some("D"));
-        assert_eq!(msg.get_field(tag::SECURITY_ID).as_deref(), Some("42"));
-        assert_eq!(msg.get_field(tag::SECURITY_ID_SOURCE).as_deref(), Some("K"));
-        assert_eq!(msg.get_field(tag::SYMBOL).as_deref(), Some("BTCUSDT"));
-        assert_eq!(msg.get_field(tag::SIDE).as_deref(), Some("1")); // buy
-        assert_eq!(msg.get_field(tag::ORD_TYPE).as_deref(), Some("2")); // limit
-        assert_eq!(msg.get_field(tag::PRICE).as_deref(), Some("101.5"));
-    }
-
-    #[test]
-    fn binance_market_order_omits_price_and_tif() {
-        let id = Uuid::new_v4();
-        let d = BinanceDialect::new("key".into(), TEST_ED25519_PEM).unwrap();
-        let msg = d.build_new_order_single(&order(&id, "market", None)).unwrap();
-
-        assert_eq!(msg.with_header(|h| h.get_field(tag::MSG_TYPE)).as_deref(), Some("D"));
-        assert_eq!(msg.get_field(tag::ORD_TYPE).as_deref(), Some("1")); // market
-        assert_eq!(msg.get_field(tag::PRICE), None);
-        assert_eq!(msg.get_field(tag::TIME_IN_FORCE), None);
-    }
-
-    #[test]
-    fn limit_without_price_is_rejected() {
-        let id = Uuid::new_v4();
-        let d = IbkrDialect::new("pw".into());
-        assert!(d.build_new_order_single(&order(&id, "limit", None)).is_err());
     }
 
     #[test]
@@ -436,7 +396,7 @@ pub fn transact_time() -> String {
     chrono::Utc::now().format("%Y%m%d-%H:%M:%S%.3f").to_string()
 }
 
-/// Parse a standard FIX `VenueReport` (35=8). The field tags used here —
+/// Parse a standard FIX `ExecutionReport` (35=8). The field tags used here —
 /// `ExecType`(150), `OrdStatus`(39), `LastQty`(32)/`LastPx`(31), `OrderID`(37),
 /// `ExecID`(17) — are common to FIX 4.2 and 4.4, so both dialects share this. The
 /// only version wrinkle is `ExecType`: 4.2 fills report `1`/`2`, 4.4 reports `F`.

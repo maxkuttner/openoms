@@ -271,7 +271,7 @@ pub async fn restart_databento_feed(
     let health = stream_health.handle("DATABENTO", "OPRA", StreamKind::Feed);
     health.set_connecting();
     let session = QuoteFeedSession::new(
-        DatabentoOpraFeed::new(api_key),
+        Arc::new(DatabentoOpraFeed::new(api_key)),
         pool,
         quote_tx,
         bus.subscribe_order(),

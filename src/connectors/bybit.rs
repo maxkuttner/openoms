@@ -47,18 +47,8 @@ impl Connector for Bybit {
     fn public_feed(&self) -> Option<PublicFeed> {
         Some(PublicFeed {
             symbology: &crate::bybit_feed::BybitFeed,
-            run: |pool, quotes, order_rx, health| {
-                Box::pin(async move {
-                    let session = crate::quote_feed::QuoteFeedSession::new(
-                        crate::bybit_feed::BybitFeed,
-                        pool,
-                        quotes,
-                        order_rx,
-                        health.clone(),
-                    );
-                    gateway::stream_supervisor::supervise("BYBIT/SPOT", health, session).await;
-                })
-            },
+            label: "BYBIT/SPOT",
+            source: || Arc::new(crate::bybit_feed::BybitFeed),
         })
     }
 

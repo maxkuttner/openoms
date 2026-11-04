@@ -1292,7 +1292,14 @@ async fn serve() {
     for connector in connectors::all() {
         if let Some(feed) = connector.public_feed() {
             let health = state.stream_health().handle(connector.manifest().code, "SPOT", gateway::stream_health::StreamKind::Feed);
-            tokio::spawn((feed.run)(state.pool().clone(), quote_tx.clone(), state.event_bus().subscribe_order(), health));
+            let session = quote_feed::QuoteFeedSession::new(
+                (feed.source)(),
+                state.pool().clone(),
+                quote_tx.clone(),
+                state.event_bus().subscribe_order(),
+                health.clone(),
+            );
+            tokio::spawn(async move { gateway::stream_supervisor::supervise(feed.label, health, session).await });
         }
     }
 

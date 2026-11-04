@@ -112,3 +112,34 @@ impl FixDialect for IbkrDialect {
         parse_standard_exec_report(msg, self.venue())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quickfix::FieldMap;
+    use uuid::Uuid;
+
+    use crate::fix::dialect::tests::order;
+
+    #[test]
+    fn ibkr_builds_new_order_single_with_conid() {
+        let id = Uuid::new_v4();
+        let d = IbkrDialect::new("pw".into());
+        let msg = d.build_new_order_single(&order(&id, "limit", Some(101.5))).unwrap();
+
+        assert_eq!(msg.with_header(|h| h.get_field(tag::MSG_TYPE)).as_deref(), Some("D"));
+        assert_eq!(msg.get_field(tag::SECURITY_ID).as_deref(), Some("42"));
+        assert_eq!(msg.get_field(tag::SECURITY_ID_SOURCE).as_deref(), Some("K"));
+        assert_eq!(msg.get_field(tag::SYMBOL).as_deref(), Some("BTCUSDT"));
+        assert_eq!(msg.get_field(tag::SIDE).as_deref(), Some("1")); // buy
+        assert_eq!(msg.get_field(tag::ORD_TYPE).as_deref(), Some("2")); // limit
+        assert_eq!(msg.get_field(tag::PRICE).as_deref(), Some("101.5"));
+    }
+
+    #[test]
+    fn limit_without_price_is_rejected() {
+        let id = Uuid::new_v4();
+        let d = IbkrDialect::new("pw".into());
+        assert!(d.build_new_order_single(&order(&id, "limit", None)).is_err());
+    }
+}
