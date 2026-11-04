@@ -609,10 +609,9 @@ pub async fn restart_alpaca_stream(
         env_name,
         key,
         secret,
-        deps.pool.clone(),
         adapter,
         health,
-        Some(deps.event_bus.clone()),
+        deps.engine.clone(),
     ));
     streams.insert(code, handle);
 }
@@ -632,13 +631,7 @@ pub async fn restart_bybit_stream(
     streams.abort_and_remove(&code).await;
     let health = deps.stream_health.handle("BYBIT", env_name, StreamKind::Execution);
     health.set_connecting();
-    let handle = tokio::spawn(bybit_stream::run(
-        env_name,
-        deps.pool.clone(),
-        adapter,
-        health,
-        Some(deps.event_bus.clone()),
-    ));
+    let handle = tokio::spawn(bybit_stream::run(env_name, adapter, health, deps.engine.clone()));
     streams.insert(code, handle);
 }
 
@@ -654,13 +647,7 @@ pub async fn restart_coinbase_stream(
     streams.abort_and_remove(&code).await;
     let health = deps.stream_health.handle("COINBASE", env_name, StreamKind::Execution);
     health.set_connecting();
-    let handle = tokio::spawn(coinbase_stream::run(
-        env_name,
-        deps.pool.clone(),
-        adapter,
-        health,
-        Some(deps.event_bus.clone()),
-    ));
+    let handle = tokio::spawn(coinbase_stream::run(env_name, adapter, health, deps.engine.clone()));
     streams.insert(code, handle);
 }
 
@@ -676,13 +663,7 @@ pub async fn restart_okx_stream(
     streams.abort_and_remove(&code).await;
     let health = deps.stream_health.handle("OKX", env_name, StreamKind::Execution);
     health.set_connecting();
-    let handle = tokio::spawn(okx_stream::run(
-        env_name,
-        deps.pool.clone(),
-        adapter,
-        health,
-        Some(deps.event_bus.clone()),
-    ));
+    let handle = tokio::spawn(okx_stream::run(env_name, adapter, health, deps.engine.clone()));
     streams.insert(code, handle);
 }
 

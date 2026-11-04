@@ -7,30 +7,28 @@
 //! `execution.spot` `Trade` entries (one per fill, partials included), keyed by
 //! Bybit's `execId`; `order.spot` supplies cancels and rejects. Taking fills from
 //! both topics would double-count them: the execution path does not dedupe by
-//! execution id. Everything is applied through the shared
-//! [`crate::execution::process_execution_report`].
+//! execution id. Everything goes to the order engine as execution events
+//! ([`crate::order_engine`]), which books it.
 //!
 //! The two topics are not ordered against each other, so a terminal `order.spot`
 //! update for an order with fills (`cumExecQty > 0`) can overtake those fills.
 //! Closing the order on it would make the terminal guard drop the late Trades;
 //! instead it is resolved like a missed terminal in reconcile
-//! ([`crate::recon_orders::apply_broker_terminal`]): book whatever Bybit filled
+//! ([`crate::order_engine::ExecKind::Terminal`]): book whatever Bybit filled
 //! that the OMS hasn't yet, then close.
 
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use sqlx::PgPool;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::event_bus::EventBus;
 use crate::adapters::bybit::BybitAdapter;
 use crate::domain::orders::commands::ExecutionReport;
-use crate::execution::process_execution_report;
-use crate::recon_orders::{apply_broker_terminal, run_order_reconcile, BrokerOrderState};
+use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
+use crate::recon_orders::BrokerOrderState;
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -44,28 +42,26 @@ const HEARTBEAT_SECS: u64 = 20;
 const AUTH_EXPIRY_MS: i64 = 10_000;
 
 struct BybitSession {
-    pool: PgPool,
     adapter: Arc<BybitAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 }
 
 #[async_trait::async_trait]
 impl Session for BybitSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.pool, &self.health, self.bus.as_ref()).await
+        connect_and_run(&self.adapter, &self.health, &self.engine).await
     }
 }
 
 pub async fn run(
     environment: &'static str,
-    pool: PgPool,
     adapter: Arc<BybitAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 ) {
     info!(env = environment, "starting Bybit private stream");
-    let session = BybitSession { pool, adapter, health: health.clone(), bus };
+    let session = BybitSession { adapter, health: health.clone(), engine };
     let name: &'static str = if environment == "LIVE" { "BYBIT/LIVE" } else { "BYBIT/PAPER" };
     supervise(name, health, session).await
 }
@@ -138,11 +134,26 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
         .collect()
 }
 
+/// What one parsed update tells the order engine. Fills and order updates
+/// arrive on separate, unordered topics, so a close is sent as a terminal state
+/// the engine books against what it already has.
+fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
+    match update {
+        Update::Report(report) => ExecEvent::from_report(order_id, VENUE, "bybit", report),
+        Update::Terminal(st) => ExecEvent {
+            order_id,
+            venue: VENUE.to_string(),
+            actor: "bybit",
+            source: ExecSource::Session,
+            kind: ExecKind::Terminal(st),
+        },
+    }
+}
+
 async fn connect_and_run(
-    adapter: &BybitAdapter,
-    pool: &PgPool,
+    adapter: &Arc<BybitAdapter>,
     health: &StreamHandle,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.private_ws_url()).await?;
     info!("Bybit private WS connected");
@@ -156,7 +167,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Text(serde_json::json!({"op": "ping"}).to_string())).await?;
-                run_order_reconcile(pool, adapter, VENUE, "bybit", bus).await;
+                engine.reconcile(VENUE, "bybit", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -182,16 +193,7 @@ async fn connect_and_run(
 
         if v.get("topic").is_some() {
             for (order_id, update) in reports(&v) {
-                match update {
-                    Update::Report(report) => {
-                        if let Err(e) = process_execution_report(pool, order_id, report, "bybit", bus).await {
-                            error!(order_id = %order_id, error = %e, "Bybit WS: failed to apply execution report");
-                        }
-                    }
-                    Update::Terminal(st) => {
-                        apply_broker_terminal(pool, order_id, &st, VENUE, "bybit", bus).await;
-                    }
-                }
+                engine.exec(exec_event(order_id, update)).await;
             }
             continue;
         }
@@ -212,7 +214,7 @@ async fn connect_and_run(
                     info!("Bybit private WS subscribed to order.spot and execution.spot");
                     health.set_live();
                     // Snapshot-on-(re)connect: heal anything that resolved during the outage.
-                    run_order_reconcile(pool, adapter, VENUE, "bybit", bus).await;
+                    engine.reconcile(VENUE, "bybit", adapter.clone()).await;
                 } else {
                     return Err(format!("Bybit subscribe failed: {}", v["ret_msg"]).into());
                 }
@@ -239,6 +241,25 @@ mod tests {
             other => panic!("no sample {other}"),
         };
         serde_json::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn bybit_closed_order_becomes_terminal_event() {
+        let (order_id, update) = reports(&sample("ws_order_cancelled"))
+            .into_iter()
+            .find(|(_, u)| matches!(u, Update::Terminal(_)))
+            .expect("the sample carries a terminal update");
+        let ev = exec_event(order_id, update);
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.actor, "bybit");
+        let crate::order_engine::ExecKind::Terminal(st) = ev.kind else { panic!("a terminal event") };
+        assert_eq!(st.outcome, BrokerOrderOutcome::Canceled);
+    }
+
+    #[test]
+    fn bybit_execution_becomes_fill_event() {
+        let (order_id, update) = reports(&sample("ws_execution")).remove(0);
+        assert!(matches!(exec_event(order_id, update).kind, crate::order_engine::ExecKind::Fill { .. }));
     }
 
     #[test]

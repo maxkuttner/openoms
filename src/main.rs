@@ -1191,7 +1191,7 @@ async fn serve() {
     // the adapter already holds them).
     for (env_name, adapter) in binance_rest_adapters {
         let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
-        let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), adapter, health, Some(state.event_bus().clone())));
+        let handle = tokio::spawn(binance_stream::run(env_name, adapter, health, state.engine().clone()));
         state.streams().insert(reload::binance_exec_stream_code(env_name), handle);
     }
 

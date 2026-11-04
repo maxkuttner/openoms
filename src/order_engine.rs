@@ -58,6 +58,21 @@ pub struct ExecEvent {
     pub kind: ExecKind,
 }
 
+impl ExecEvent {
+    /// A live-session event from a transport that already speaks the state
+    /// machine's `ExecutionReport` (Alpaca, Binance, FIX).
+    pub fn from_report(order_id: Uuid, venue: &str, actor: &'static str, report: ExecutionReport) -> Self {
+        let kind = match report {
+            ExecutionReport::Fill { execution_id, fill_qty, fill_price, .. } => {
+                ExecKind::Fill { execution_id, qty: fill_qty, price: fill_price }
+            }
+            ExecutionReport::Canceled { reason, .. } => ExecKind::Canceled { reason },
+            ExecutionReport::Reject { reason, .. } => ExecKind::Rejected { reason },
+        };
+        Self { order_id, venue: venue.to_string(), actor, source: ExecSource::Session, kind }
+    }
+}
+
 /// Everything a connector sends the engine.
 pub enum GatewayMsg {
     Exec(ExecEvent),

@@ -6,23 +6,20 @@
 //! `userDataStream.subscribe`. Events arrive wrapped as
 //! `{"subscriptionId":N,"event":{"e":"executionReport",...}}`. A `TRADE`
 //! execution fires per fill (including partials), so fills reflect immediately
-//! and incrementally through the shared [`crate::execution::process_execution_report`].
+//! and incrementally, as execution events to the order engine.
 
 use std::sync::Arc;
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use sqlx::PgPool;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::event_bus::EventBus;
 use crate::adapters::binance::BinanceAdapter;
 use crate::domain::orders::commands::ExecutionReport;
-use crate::execution::process_execution_report;
-use crate::recon_orders::run_order_reconcile;
+use crate::order_engine::{EngineHandle, ExecEvent};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -34,21 +31,15 @@ const VENUE: &str = "BINANCE";
 const HEARTBEAT_SECS: u64 = 30;
 
 struct BinanceSession {
-    pool: PgPool,
     adapter: Arc<BinanceAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 }
 
 #[async_trait::async_trait]
 impl Session for BinanceSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(
-            &self.adapter,
-            &self.pool,
-            &self.health,
-            self.bus.as_ref(),
-        )
+        connect_and_run(&self.adapter, &self.health, &self.engine)
         .await
     }
 }
@@ -58,30 +49,27 @@ impl Session for BinanceSession {
 /// `_api_secret` parameters were unused.
 pub async fn run(
     environment: &'static str,
-    pool: PgPool,
     adapter: Arc<BinanceAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 ) {
     info!(env = environment, "starting Binance user-data stream");
     // The catch-up sweep runs on every (re)connect from the subscribe-success path in
     // connect_and_run, so it covers the initial catch-up too — no separate call here.
 
     let session = BinanceSession {
-        pool,
         adapter,
         health: health.clone(),
-        bus,
+        engine,
     };
     let name: &'static str = if environment == "LIVE" { "BINANCE/LIVE" } else { "BINANCE/PAPER" };
     supervise(name, health, session).await
 }
 
 async fn connect_and_run(
-    adapter: &BinanceAdapter,
-    pool: &PgPool,
+    adapter: &Arc<BinanceAdapter>,
     health: &StreamHandle,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.ws_url()).await?;
     info!("Binance WS-API connected");
@@ -104,7 +92,7 @@ async fn connect_and_run(
             // Periodic liveness probe + catch-up sweep for missed terminal reports.
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                run_order_reconcile(pool, adapter, VENUE, "binance", bus).await;
+                engine.reconcile(VENUE, "binance", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -131,7 +119,7 @@ async fn connect_and_run(
         // Pushed user-data event: {"subscriptionId":N,"event":{...}}
         if v.get("event").is_some() {
             if v["event"]["e"].as_str() == Some("executionReport") {
-                if let Err(e) = handle_execution_report(&v["event"], pool, bus).await {
+                if let Err(e) = handle_execution_report(&v["event"], engine).await {
                     error!(error = %e, "Binance WS: error processing executionReport");
                 }
             }
@@ -156,7 +144,7 @@ async fn connect_and_run(
                     // Snapshot-on-(re)connect: diff the broker's open orders against
                     // the OMS working set now that the live stream is up, so anything
                     // that resolved during the outage is healed immediately.
-                    run_order_reconcile(pool, adapter, VENUE, "binance", bus).await;
+                    engine.reconcile(VENUE, "binance", adapter.clone()).await;
                 } else {
                     return Err(format!("userDataStream.subscribe failed: {}", v).into());
                 }
@@ -169,8 +157,7 @@ async fn connect_and_run(
 
 async fn handle_execution_report(
     event: &serde_json::Value,
-    pool: &PgPool,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let exec_type = event["x"].as_str().unwrap_or("");
     // On a cancel, Binance puts the cancel-request's id in `c` and the original
@@ -209,9 +196,30 @@ async fn handle_execution_report(
         }
     };
 
-    if let Err(e) = process_execution_report(pool, order_id, report, "binance", bus).await {
-        error!(order_id = %order_id, error = %e, "Binance WS: failed to apply execution report");
-    }
+    engine.exec(ExecEvent::from_report(order_id, VENUE, "binance", report)).await;
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::order_engine::{EngineHandle, ExecKind, GatewayMsg};
+
+    #[tokio::test]
+    async fn binance_trade_frame_becomes_fill_event() {
+        let order_id = Uuid::new_v4();
+        let event = serde_json::json!({
+            "e": "executionReport", "x": "TRADE", "c": order_id.to_string(),
+            "l": "0.5", "L": "64000.1", "t": 77,
+        });
+        let (engine, mut rx) = EngineHandle::new();
+
+        handle_execution_report(&event, &engine).await.unwrap();
+
+        let Some(GatewayMsg::Exec(ev)) = rx.try_recv().ok() else { panic!("an exec event") };
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.venue, "BINANCE");
+        assert_eq!(ev.kind, ExecKind::Fill { execution_id: "77".into(), qty: 0.5, price: 64000.1 });
+    }
+}

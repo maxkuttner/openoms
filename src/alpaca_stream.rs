@@ -1,5 +1,4 @@
 use futures_util::{SinkExt, StreamExt};
-use sqlx::PgPool;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
@@ -7,11 +6,9 @@ use uuid::Uuid;
 
 use std::sync::Arc;
 
-use crate::event_bus::EventBus;
 use crate::adapters::alpaca::AlpacaAdapter;
 use crate::domain::orders::commands::ExecutionReport;
-use crate::execution::process_execution_report;
-use crate::recon_orders::run_order_reconcile;
+use crate::order_engine::{EngineHandle, ExecEvent};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -22,10 +19,9 @@ struct AlpacaSession {
     ws_url: &'static str,
     api_key: String,
     api_secret: String,
-    pool: PgPool,
     adapter: Arc<AlpacaAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 }
 
 #[async_trait::async_trait]
@@ -35,10 +31,9 @@ impl Session for AlpacaSession {
             self.ws_url,
             &self.api_key,
             &self.api_secret,
-            &self.pool,
             &self.adapter,
             &self.health,
-            self.bus.as_ref(),
+            &self.engine,
         )
         .await
     }
@@ -48,13 +43,12 @@ pub async fn run(
     environment: &'static str,
     api_key: String,
     api_secret: String,
-    pool: PgPool,
     adapter: Arc<AlpacaAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 ) {
     info!(env = environment, "starting Alpaca trade-update stream");
-    run_order_reconcile(&pool, &*adapter, "ALPACA", "alpaca", bus.as_ref()).await;
+    engine.reconcile("ALPACA", "alpaca", adapter.clone()).await;
 
     let ws_url = if environment == "LIVE" {
         "wss://api.alpaca.markets/stream"
@@ -67,10 +61,9 @@ pub async fn run(
         ws_url,
         api_key,
         api_secret,
-        pool,
         adapter,
         health: health.clone(),
-        bus,
+        engine,
     };
     supervise(name, health, session).await
 }
@@ -79,10 +72,9 @@ async fn connect_and_run(
     ws_url: &str,
     api_key: &str,
     api_secret: &str,
-    pool: &PgPool,
-    adapter: &AlpacaAdapter,
+    adapter: &Arc<AlpacaAdapter>,
     health: &StreamHandle,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(ws_url).await?;
     info!("Alpaca stream connected url={ws_url}");
@@ -108,7 +100,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                run_order_reconcile(pool, adapter, "ALPACA", "alpaca", bus).await;
+                engine.reconcile("ALPACA", "alpaca", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -153,7 +145,7 @@ async fn connect_and_run(
                 health.set_live();
             }
             "trade_updates" => {
-                if let Err(e) = handle_trade_update(data, pool, bus).await {
+                if let Err(e) = handle_trade_update(data, engine).await {
                     error!(error = %e, "Alpaca stream: error processing trade update");
                 }
             }
@@ -168,8 +160,7 @@ async fn connect_and_run(
 
 async fn handle_trade_update(
     data: &serde_json::Value,
-    pool: &PgPool,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let event = data["event"].as_str().unwrap_or("unknown");
     let order = &data["order"];
@@ -227,13 +218,34 @@ async fn handle_trade_update(
         }
     };
 
-    match process_execution_report(pool, order_id, report, "alpaca", bus).await {
-        Ok(()) => {}
-        Err(e) => {
-            error!(order_id = %order_id, error = %e, "Alpaca stream: failed to process execution report");
-        }
-    }
-
+    engine.exec(ExecEvent::from_report(order_id, "ALPACA", "alpaca", report)).await;
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::order_engine::{EngineHandle, ExecKind, ExecSource, GatewayMsg};
+
+    #[tokio::test]
+    async fn alpaca_fill_frame_becomes_fill_event() {
+        let order_id = Uuid::new_v4();
+        let data = serde_json::json!({
+            "event": "partial_fill",
+            "qty": "2",
+            "price": "101.5",
+            "execution_id": "ex-1",
+            "order": { "client_order_id": order_id.to_string(), "status": "partially_filled" },
+        });
+        let (engine, mut rx) = EngineHandle::new();
+
+        handle_trade_update(&data, &engine).await.unwrap();
+
+        let Some(GatewayMsg::Exec(ev)) = rx.try_recv().ok() else { panic!("an exec event") };
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.actor, "alpaca");
+        assert_eq!(ev.source, ExecSource::Session);
+        assert_eq!(ev.kind, ExecKind::Fill { execution_id: "ex-1".into(), qty: 2.0, price: 101.5 });
+    }
+}

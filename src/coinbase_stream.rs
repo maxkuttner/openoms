@@ -6,23 +6,22 @@
 //! each with a fresh JWT. Coinbase reports **cumulative** order state —
 //! `cumulative_quantity` and `avg_price` — not one message per fill. A fill is
 //! therefore "Coinbase cumulative − what the OMS has booked", priced against
-//! the OMS's booked average ([`crate::recon_orders::apply_broker_progress`]), so
+//! the OMS's booked average ([`crate::order_engine::ExecKind::Cumulative`]), so
 //! a repeated, replayed or reordered update books nothing and needs no memory of
 //! earlier messages; the execution path has no execution-id dedupe to lean on. A terminal status goes through
-//! [`crate::recon_orders::apply_broker_terminal`]: book what's missing, then close.
+//! [`crate::order_engine::ExecKind::Terminal`]: book what's missing, then close.
 
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use sqlx::PgPool;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::event_bus::EventBus;
 use crate::adapters::coinbase::{order_outcome, CoinbaseAdapter};
-use crate::recon_orders::{apply_broker_progress, apply_broker_terminal, run_order_reconcile, BrokerOrderState};
+use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
+use crate::recon_orders::BrokerOrderState;
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -34,28 +33,26 @@ const WS_URL: &str = "wss://advanced-trade-ws-user.coinbase.com";
 const RECONCILE_SECS: u64 = 20;
 
 struct CoinbaseSession {
-    pool: PgPool,
     adapter: Arc<CoinbaseAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 }
 
 #[async_trait::async_trait]
 impl Session for CoinbaseSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.pool, &self.health, self.bus.as_ref()).await
+        connect_and_run(&self.adapter, &self.health, &self.engine).await
     }
 }
 
 pub async fn run(
     environment: &'static str,
-    pool: PgPool,
     adapter: Arc<CoinbaseAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 ) {
     info!(env = environment, "starting Coinbase user stream");
-    let session = CoinbaseSession { pool, adapter, health: health.clone(), bus };
+    let session = CoinbaseSession { adapter, health: health.clone(), engine };
     supervise("COINBASE/LIVE", health, session).await
 }
 
@@ -106,11 +103,20 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
         .collect()
 }
 
+/// What one parsed update tells the order engine: cumulative progress books
+/// only what the OMS is missing, so a repeated update books nothing.
+fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
+    let kind = match update {
+        Update::Progress { cum, avg } => ExecKind::Cumulative { cum_qty: cum, avg_px: avg },
+        Update::Terminal(st) => ExecKind::Terminal(st),
+    };
+    ExecEvent { order_id, venue: VENUE.to_string(), actor: "coinbase", source: ExecSource::Session, kind }
+}
+
 async fn connect_and_run(
-    adapter: &CoinbaseAdapter,
-    pool: &PgPool,
+    adapter: &Arc<CoinbaseAdapter>,
     health: &StreamHandle,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(WS_URL).await?;
     info!("Coinbase user WS connected");
@@ -126,7 +132,7 @@ async fn connect_and_run(
     loop {
         let text = tokio::select! {
             _ = sweep.tick() => {
-                run_order_reconcile(pool, adapter, VENUE, "coinbase", bus).await;
+                engine.reconcile(VENUE, "coinbase", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -160,17 +166,10 @@ async fn connect_and_run(
             info!("Coinbase user stream live");
             health.set_live();
             live = true;
-            run_order_reconcile(pool, adapter, VENUE, "coinbase", bus).await;
+            engine.reconcile(VENUE, "coinbase", adapter.clone()).await;
         }
         for (order_id, update) in updates(&v) {
-            match update {
-                Update::Progress { cum, avg } => {
-                    apply_broker_progress(pool, order_id, cum, avg, VENUE, "coinbase", bus).await;
-                }
-                Update::Terminal(st) => {
-                    apply_broker_terminal(pool, order_id, &st, VENUE, "coinbase", bus).await;
-                }
-            }
+            engine.exec(exec_event(order_id, update)).await;
         }
     }
     Ok(())
@@ -182,6 +181,18 @@ mod tests {
     use crate::recon_orders::{missing_qty, BrokerOrderOutcome};
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
+
+    #[test]
+    fn coinbase_progress_becomes_cumulative_event() {
+        let (order_id, update) = updates(&sample("partial"))
+            .into_iter()
+            .find(|(_, u)| matches!(u, Update::Progress { .. }))
+            .expect("the sample carries one");
+        let ev = exec_event(order_id, update);
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.actor, "coinbase");
+        assert!(matches!(ev.kind, crate::order_engine::ExecKind::Cumulative { .. }), "{:?}", ev.kind);
+    }
 
     fn sample(name: &str) -> serde_json::Value {
         let text = match name {

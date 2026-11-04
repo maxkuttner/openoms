@@ -10,22 +10,21 @@
 //! after a partial fill may carry them again), and the execution path does not
 //! dedupe by execution id — so a push is never booked as one trade. Instead the
 //! OMS books whatever OKX has filled that it hasn't
-//! ([`crate::recon_orders::apply_broker_progress`]), and `filled` / `canceled` /
+//! ([`crate::order_engine::ExecKind::Cumulative`]), and `filled` / `canceled` /
 //! `mmp_canceled` close the order through reconcile
-//! ([`crate::recon_orders::apply_broker_terminal`]). Both are idempotent.
+//! ([`crate::order_engine::ExecKind::Terminal`]). Both are idempotent.
 
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use sqlx::PgPool;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::event_bus::EventBus;
 use crate::adapters::okx::{oms_order_id, parse_order_state, OkxAdapter};
-use crate::recon_orders::{apply_broker_progress, apply_broker_terminal, run_order_reconcile, BrokerOrderState};
+use crate::order_engine::{EngineHandle, ExecEvent, ExecKind, ExecSource};
+use crate::recon_orders::BrokerOrderState;
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 
@@ -36,28 +35,26 @@ const VENUE: &str = "OKX";
 const HEARTBEAT_SECS: u64 = 20;
 
 struct OkxSession {
-    pool: PgPool,
     adapter: Arc<OkxAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 }
 
 #[async_trait::async_trait]
 impl Session for OkxSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.pool, &self.health, self.bus.as_ref()).await
+        connect_and_run(&self.adapter, &self.health, &self.engine).await
     }
 }
 
 pub async fn run(
     environment: &'static str,
-    pool: PgPool,
     adapter: Arc<OkxAdapter>,
     health: StreamHandle,
-    bus: Option<EventBus>,
+    engine: EngineHandle,
 ) {
     info!(env = environment, "starting OKX private stream");
-    let session = OkxSession { pool, adapter, health: health.clone(), bus };
+    let session = OkxSession { adapter, health: health.clone(), engine };
     let name: &'static str = if environment == "LIVE" { "OKX/LIVE" } else { "OKX/PAPER" };
     supervise(name, health, session).await
 }
@@ -111,11 +108,20 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
         .collect()
 }
 
+/// What one parsed update tells the order engine: cumulative progress books
+/// only what the OMS is missing, so a repeated update books nothing.
+fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
+    let kind = match update {
+        Update::Progress { cum, avg } => ExecKind::Cumulative { cum_qty: cum, avg_px: avg },
+        Update::Terminal(st) => ExecKind::Terminal(st),
+    };
+    ExecEvent { order_id, venue: VENUE.to_string(), actor: "okx", source: ExecSource::Session, kind }
+}
+
 async fn connect_and_run(
-    adapter: &OkxAdapter,
-    pool: &PgPool,
+    adapter: &Arc<OkxAdapter>,
     health: &StreamHandle,
-    bus: Option<&EventBus>,
+    engine: &EngineHandle,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.private_ws_url()).await?;
     info!("OKX private WS connected");
@@ -128,7 +134,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Text("ping".into())).await?;
-                run_order_reconcile(pool, adapter, VENUE, "okx", bus).await;
+                engine.reconcile(VENUE, "okx", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -157,14 +163,7 @@ async fn connect_and_run(
 
         if v.get("data").is_some() {
             for (order_id, update) in updates(&v) {
-                match update {
-                    Update::Terminal(st) => {
-                        apply_broker_terminal(pool, order_id, &st, VENUE, "okx", bus).await;
-                    }
-                    Update::Progress { cum, avg } => {
-                        apply_broker_progress(pool, order_id, cum, avg, VENUE, "okx", bus).await;
-                    }
-                }
+                engine.exec(exec_event(order_id, update)).await;
             }
             continue;
         }
@@ -179,7 +178,7 @@ async fn connect_and_run(
                 info!("OKX private WS subscribed to orders");
                 health.set_live();
                 // Snapshot-on-(re)connect: heal anything that resolved during the outage.
-                run_order_reconcile(pool, adapter, VENUE, "okx", bus).await;
+                engine.reconcile(VENUE, "okx", adapter.clone()).await;
             }
             Some("login") | Some("error") => {
                 return Err(format!("OKX WS {}: {} (code {})", v["event"], v["msg"], v["code"]).into());
@@ -196,6 +195,18 @@ mod tests {
     use crate::recon_orders::BrokerOrderOutcome;
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
+
+    #[test]
+    fn okx_filled_order_becomes_terminal_event() {
+        let (order_id, update) = updates(&sample("ws_orders_fill"))
+            .into_iter()
+            .find(|(_, u)| matches!(u, Update::Terminal(_)))
+            .expect("the sample carries one");
+        let ev = exec_event(order_id, update);
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.actor, "okx");
+        assert!(matches!(ev.kind, crate::order_engine::ExecKind::Terminal(_)), "{:?}", ev.kind);
+    }
 
     fn sample(name: &str) -> serde_json::Value {
         let text = match name {

@@ -26,12 +26,11 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlx::{PgPool, Row};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::event_bus::EventBus;
 use crate::adapters::{BrokerAdapter, BrokerError};
-use crate::domain::orders::commands::ExecutionReport;
 use crate::order_engine::{apply_planned, ExecEvent, ExecKind, ExecSource};
 
 const EPS: f64 = 1e-9;
@@ -285,40 +284,6 @@ pub(crate) async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64
             None
         }
     }
-}
-
-/// Apply a terminal state the broker pushed for one order, against the OMS's own
-/// cumulative fill — for venues whose order and fill updates arrive on separate,
-/// unordered channels (Bybit), or only as cumulative order state (Coinbase),
-/// where the close can arrive before the OMS has booked every fill.
-pub(crate) async fn apply_broker_terminal(
-    pool: &PgPool,
-    order_id: Uuid,
-    st: &BrokerOrderState,
-    venue: &str,
-    actor: &'static str,
-    bus: Option<&EventBus>,
-) {
-    let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
-    let ev = exec_event(order_id, venue, actor, ExecSource::Session, ExecKind::Terminal(st.clone()));
-    apply_planned(pool, bus, &ev, oms_cum, oms_avg).await;
-}
-
-/// Book a still-working order's progress from a venue that reports cumulative
-/// state rather than individual fills (Coinbase, OKX).
-pub(crate) async fn apply_broker_progress(
-    pool: &PgPool,
-    order_id: Uuid,
-    broker_cum: f64,
-    broker_avg: f64,
-    venue: &str,
-    actor: &'static str,
-    bus: Option<&EventBus>,
-) {
-    let Some((oms_cum, oms_avg)) = oms_fill_state(pool, order_id).await else { return };
-    let kind = ExecKind::Cumulative { cum_qty: broker_cum, avg_px: broker_avg };
-    let ev = exec_event(order_id, venue, actor, ExecSource::Session, kind);
-    apply_planned(pool, bus, &ev, oms_cum, oms_avg).await;
 }
 
 /// Apply the terminal outcome of an order that dropped out of the open-order set:
