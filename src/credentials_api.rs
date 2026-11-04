@@ -210,7 +210,7 @@ pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOu
 }
 
 /// The Databento dataset `test_feed` authenticates against. Mirrors
-/// `opra_stream::OPRA_DATASET` (private to that module, so not reusable
+/// `gateway::md::opra::OPRA_DATASET` (private to that module, so not reusable
 /// directly): `databento-opra` is, today, the only Databento feed connection
 /// this build ever registers (see `admin::classify_feed`'s and `serve()`'s
 /// matching "only databento-opra" guards) and it is hardcoded to OPRA options

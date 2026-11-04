@@ -6,6 +6,7 @@
 //! [`Quote`] on the one channel [`MarketDataGateway::new`] hands back.
 
 pub mod daily_stats;
+pub mod opra;
 pub mod session;
 
 use std::collections::BTreeMap;

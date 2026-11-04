@@ -64,7 +64,6 @@ mod order_engine;
 mod venues;
 mod marks;
 mod daily_stats;
-mod opra_stream;
 
 mod market_data;
 mod mark_router;

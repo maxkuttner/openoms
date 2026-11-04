@@ -114,3 +114,30 @@ fn order_adapter_carries_no_prices() {
     let adapter = include_str!("../crates/gateway/src/adapter.rs");
     assert!(!adapter.contains("daily_stats"), "BrokerAdapter still serves prices");
 }
+
+/// The pricing service has one source: no OMS file and no order-side gateway
+/// file holds a quote sender; only `gateway::md` does. A connector's `feed.rs`
+/// is its price side, which runs under `gateway::md` and is handed the sender.
+#[test]
+fn only_the_market_data_gateway_sends_quotes() {
+    fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("crates/gateway/src/adapter.rs")];
+    rust_files(&root.join("src"), &mut files);
+    rust_files(&root.join("crates/gateway/src/connectors"), &mut files);
+    for f in files.iter().filter(|f| !f.ends_with("boundary_tests.rs") && !f.ends_with("feed.rs")) {
+        let text = std::fs::read_to_string(f).unwrap();
+        for word in ["Sender<Quote>", "Sender<dataprovider::Quote>", "quote_tx"] {
+            assert!(!text.contains(word), "{} holds a quote sender ({word})", f.display());
+        }
+    }
+}

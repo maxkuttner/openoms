@@ -17,7 +17,7 @@ use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::app_state::{AppState, StreamRegistry};
 use gateway::credentials::BrokerCredentials;
 use crate::credentials::{Connection, CredentialState};
-use crate::opra_stream::DatabentoOpraFeed;
+use gateway::md::opra::{self, DatabentoOpraFeed};
 use gateway::stream_health::{StreamHealthRegistry, StreamKind};
 use gateway::md::MarketDataGateway;
 
@@ -265,11 +265,11 @@ pub async fn restart_databento_feed(
     stream_health: &StreamHealthRegistry,
     streams: &StreamRegistry,
 ) {
-    streams.abort_and_remove("databento-opra").await;
+    streams.abort_and_remove(opra::STREAM_CODE).await;
     let health = stream_health.handle("DATABENTO", "OPRA", StreamKind::Feed);
     health.set_connecting();
-    let handle = md.start_vendor_feed(Arc::new(DatabentoOpraFeed::new(api_key)), "DATABENTO/OPRA", health);
-    streams.insert("databento-opra", handle);
+    let handle = md.start_vendor_feed(Arc::new(DatabentoOpraFeed::new(api_key)), opra::LABEL, health);
+    streams.insert(opra::STREAM_CODE, handle);
 }
 
 pub(crate) use gateway::connectors::exec_stream_code;

@@ -5,10 +5,13 @@
 //! dataset; `tcbbo` decodes to the same record but only ticks on trades, which
 //! would leave an illiquid contract unmarked for hours.)
 //!
-//! Everything not specific to Databento's wire format lives elsewhere:
-//! [`crate::market_data`] tells the market data gateway what is held,
-//! `gateway::md` decides what this feed subscribes and adds new positions, [`gateway::stream_supervisor`] reconnects, and
-//! [`crate::mark_router`] decides what becomes a mark.
+//! Everything not specific to Databento's wire format lives elsewhere: the core
+//! tells the market data gateway what is held, [`crate::md::session`] decides
+//! what this feed subscribes and adds new positions, [`crate::stream_supervisor`]
+//! reconnects, and the core's mark router decides what becomes a mark.
+//!
+//! A price-only vendor, not a connector: it has its own credential and no order
+//! side, so it lives here rather than under `connectors/`.
 
 use std::collections::HashMap;
 
@@ -23,6 +26,12 @@ use dataprovider::{
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
+
+/// Its supervisor's name in the stream registry and logs.
+pub const LABEL: &str = "DATABENTO/OPRA";
+
+/// The `StreamRegistry` key a reload aborts and replaces the running session under.
+pub const STREAM_CODE: &str = "databento-opra";
 
 const OPRA_DATASET: &str = "OPRA.PILLAR";
 const SOURCE_CODE: &str = "DATABENTO";
@@ -198,6 +207,14 @@ fn px(v: i64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reload finds the running OPRA session by these, and the health badge
+    /// and logs name it by them.
+    #[test]
+    fn opra_keeps_its_names() {
+        assert_eq!(LABEL, "DATABENTO/OPRA");
+        assert_eq!(STREAM_CODE, "databento-opra");
+    }
 
     /// The api_key is irrelevant to symbol/candidate logic — a fixed placeholder
     /// keeps every test below focused on what it actually checks.

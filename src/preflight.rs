@@ -326,14 +326,14 @@ mod tests {
     #[test]
     fn equity_is_not_covered_by_the_opra_feed() {
         let held = row("SPY", "SPOT", "EQUITY", "ARCX");
-        assert!(!covers(&crate::opra_stream::DatabentoOpraFeed::new(String::new()), &held));
+        assert!(!covers(&gateway::md::opra::DatabentoOpraFeed::new(String::new()), &held));
         assert!(!crate::feeds::all().iter().any(|f| covers(*f, &held)));
     }
 
     #[test]
     fn opra_feed_covers_a_held_option() {
         let held = row("SPY260724P00739000", "OPTION", "EQUITY", "OPRA");
-        assert!(covers(&crate::opra_stream::DatabentoOpraFeed::new(String::new()), &held));
+        assert!(covers(&gateway::md::opra::DatabentoOpraFeed::new(String::new()), &held));
     }
 
     /// Bybit leaves `venue` open, so it prices the pair wherever it is listed —
@@ -354,6 +354,6 @@ mod tests {
     #[test]
     fn declined_symbol_is_not_covered_despite_matching_the_filter() {
         let malformed = row("SPY", "OPTION", "EQUITY", "OPRA");
-        assert!(!covers(&crate::opra_stream::DatabentoOpraFeed::new(String::new()), &malformed));
+        assert!(!covers(&gateway::md::opra::DatabentoOpraFeed::new(String::new()), &malformed));
     }
 }

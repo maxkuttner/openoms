@@ -17,7 +17,7 @@ use dataprovider::FeedSymbology;
 /// own credential, not yet a connector) and each connector's public feed.
 pub fn all() -> Vec<&'static dyn FeedSymbology> {
     // Symbology only — this never runs a session, so the key is a placeholder.
-    static OPRA: crate::opra_stream::DatabentoOpraFeed = crate::opra_stream::DatabentoOpraFeed::new(String::new());
+    static OPRA: gateway::md::opra::DatabentoOpraFeed = gateway::md::opra::DatabentoOpraFeed::new(String::new());
     std::iter::once(&OPRA as &'static dyn FeedSymbology)
         .chain(gateway::connectors::all().iter().filter_map(|c| c.public_feed()).map(|f| f.symbology))
         .collect()

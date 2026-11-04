@@ -6,6 +6,7 @@ description = "Venue connectivity for the OMS: adapters, execution streams, feed
 license = "MIT"
 
 [dependencies]
+databento = { version = "0.54.0", default-features = false, features = ["live", "chrono"]}
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
