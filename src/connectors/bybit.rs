@@ -33,7 +33,7 @@ impl Connector for Bybit {
     }
 
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
-        let c: crate::adapters::bybit::BybitCredentials = typed(creds)?;
+        let c: crate::adapters::bybit::BybitCredentials = typed(creds, MANIFEST.credential_kind)?;
         let adapter = Arc::new(crate::adapters::bybit::BybitAdapter::new(c.api_key, c.api_secret, env));
         let stream_adapter = adapter.clone();
         Ok(Connected {
@@ -64,7 +64,7 @@ impl Connector for Bybit {
 
     fn verify<'a>(&'a self, env: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
         Box::pin(async move {
-            let c: crate::adapters::bybit::BybitCredentials = match typed(creds) {
+            let c: crate::adapters::bybit::BybitCredentials = match typed(creds, MANIFEST.credential_kind) {
                 Ok(c) => c,
                 Err(e) => return TestOutcome::Failed(e),
             };
@@ -74,7 +74,7 @@ impl Connector for Bybit {
     }
 
     fn universe_provider(&self, env: &str, creds: &BrokerCredentials) -> Result<Box<dyn crate::adapters::InstrumentProvider>, String> {
-        let c: crate::adapters::bybit::BybitCredentials = typed(creds)?;
+        let c: crate::adapters::bybit::BybitCredentials = typed(creds, MANIFEST.credential_kind)?;
         Ok(Box::new(crate::adapters::bybit::BybitAdapter::new(c.api_key, c.api_secret, env)))
     }
 }

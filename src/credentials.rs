@@ -38,6 +38,18 @@ impl BrokerCredentials {
         }
     }
 
+    /// What a field the blob does not carry means: a flag's default (IBKR's
+    /// `ssl` predates some stored blobs and defaults to true), else nothing.
+    fn default_text(&self, name: &str) -> String {
+        crate::connectors::by_credential_kind(&self.kind)
+            .and_then(|c| c.manifest().field_types.iter().find(|(n, _)| *n == name).map(|(_, t)| *t))
+            .and_then(|t| match t {
+                crate::connectors::FieldType::Bool { default } => Some(default.to_string()),
+                crate::connectors::FieldType::Port => None,
+            })
+            .unwrap_or_default()
+    }
+
     /// One field's value as text, as a form or a log shows it.
     pub fn text(&self, name: &str) -> Option<String> {
         self.fields.get(name).map(|v| match v {
@@ -116,7 +128,7 @@ impl Redact for BrokerCredentials {
         let fields = redaction(&self.kind)
             .iter()
             .map(|&(name, how)| match how {
-                Shown::Clear => shown(name, self.text(name).unwrap_or_default()),
+                Shown::Clear => shown(name, self.text(name).unwrap_or_else(|| self.default_text(name))),
                 Shown::Hidden => hidden(name),
                 // The last four characters identify which key is installed without
                 // being enough to use it — the same trick every payment UI uses.
@@ -679,6 +691,16 @@ mod tests {
             let back = serde_json::to_value(&creds).unwrap();
             assert_eq!(back, serde_json::from_str::<serde_json::Value>(blob).unwrap(), "{blob}");
         }
+    }
+
+    /// The cockpit pre-ticks the TLS box from the redacted value: a blob from
+    /// before `ssl` existed runs with TLS on, so it must show "true", not "".
+    #[test]
+    fn redaction_shows_the_default_for_a_flag_the_blob_predates() {
+        let json = r#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p"}"#;
+        let creds: BrokerCredentials = serde_json::from_str(json).unwrap();
+        let ssl = creds.redact().fields.into_iter().find(|f| f.name == "ssl").expect("ssl shown");
+        assert_eq!(ssl.value.as_deref(), Some("true"));
     }
 
     #[test]

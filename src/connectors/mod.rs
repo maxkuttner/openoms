@@ -131,8 +131,13 @@ async fn checked<T, E: std::fmt::Display>(
 const FIX_NOT_TESTABLE: TestOutcome =
     TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save");
 
-/// Read a connector's typed credential, worded the way a failed connection reports it.
-fn typed<T: serde::de::DeserializeOwned>(creds: &BrokerCredentials) -> Result<T, String> {
+/// Read a connector's typed credential, worded the way a failed connection
+/// reports it. A credential of another kind is refused even when its fields
+/// would fit — it is another venue's key.
+fn typed<T: serde::de::DeserializeOwned>(creds: &BrokerCredentials, kind: &str) -> Result<T, String> {
+    if creds.kind != kind {
+        return Err(format!("a {} credential is not a {kind} credential", creds.kind));
+    }
     creds.parse().map_err(|e| format!("credential fields do not match their kind: {e}"))
 }
 
@@ -189,19 +194,25 @@ mod tests {
             ("feeds.rs", include_str!("../feeds.rs")),
             ("adapters/mod.rs", include_str!("../adapters/mod.rs")),
         ];
+        // case-insensitive, and `_` separates words: `alpaca_stream`,
+        // `"BINANCE_ENV"` and `IbkrFix` all name a connector
         let names: Vec<String> = all()
             .iter()
             .flat_map(|c| {
                 let m = c.manifest();
-                [m.code.to_string(), m.credential_kind.to_string(), m.code.to_lowercase()]
+                [m.code.to_lowercase(), m.credential_kind.to_lowercase()]
             })
             .collect();
-        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        // a word ends at a non-alphanumeric byte or where the next word starts
+        // with a capital (`AlpacaAdapter`)
         let mentions = |line: &str, name: &str| {
-            line.match_indices(name).any(|(i, _)| {
-                let before = i.checked_sub(1).map(|j| line.as_bytes()[j]);
-                let after = line.as_bytes().get(i + name.len()).copied();
-                !before.is_some_and(is_word) && !after.is_some_and(is_word)
+            let orig = line.as_bytes();
+            let lower = line.to_ascii_lowercase();
+            lower.match_indices(name).any(|(i, _)| {
+                let j = i + name.len();
+                let starts = i == 0 || !orig[i - 1].is_ascii_alphanumeric() || orig[i].is_ascii_uppercase();
+                let ends = j == orig.len() || !orig[j].is_ascii_alphanumeric() || orig[j].is_ascii_uppercase();
+                starts && ends
             })
         };
         for (file, source) in central {
@@ -216,6 +227,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A credential stored under another broker's row (hand-imported into the
+    /// wrong row) must not be used as this broker's key, even when its fields
+    /// happen to fit: an OKX key has everything a Bybit key has.
+    #[test]
+    fn a_credential_of_another_kind_is_refused() {
+        let okx = BrokerCredentials::from_typed(
+            "Okx",
+            &crate::adapters::okx::OkxCredentials { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() },
+        );
+        let bybit = by_code("BYBIT").unwrap();
+        assert!(bybit.universe_provider("PAPER", &okx).is_err());
     }
 
     #[test]

@@ -46,7 +46,7 @@ impl Connector for Binance {
                 Ok(Connected { adapter, exec_stream: None })
             }
             Transport::Rest => {
-                let c: crate::adapters::binance::BinanceCredentials = typed(creds)?;
+                let c: crate::adapters::binance::BinanceCredentials = typed(creds, MANIFEST.credential_kind)?;
                 let adapter = crate::adapters::binance::BinanceAdapter::new(c.api_key, &c.private_key, env)
                     .map_err(|e| format!("Binance adapter not registered: {e}"))?;
                 let adapter = Arc::new(adapter);
@@ -85,7 +85,7 @@ impl Connector for Binance {
     }
 
     fn universe_provider(&self, env: &str, creds: &BrokerCredentials) -> Result<Box<dyn crate::adapters::InstrumentProvider>, String> {
-        let c: crate::adapters::binance::BinanceCredentials = typed(creds)?;
+        let c: crate::adapters::binance::BinanceCredentials = typed(creds, MANIFEST.credential_kind)?;
         Ok(Box::new(crate::adapters::binance::BinanceAdapter::new(c.api_key, &c.private_key, env)?))
     }
 }

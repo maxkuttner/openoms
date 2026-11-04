@@ -33,7 +33,7 @@ impl Connector for Coinbase {
     }
 
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
-        let c: crate::adapters::coinbase::CoinbaseCredentials = typed(creds)?;
+        let c: crate::adapters::coinbase::CoinbaseCredentials = typed(creds, MANIFEST.credential_kind)?;
         let adapter = crate::adapters::coinbase::CoinbaseAdapter::new(c.api_key, &c.private_key)
             .map_err(|e| format!("Coinbase adapter not registered: {e}"))?;
         let adapter = Arc::new(adapter);
@@ -66,7 +66,7 @@ impl Connector for Coinbase {
 
     fn verify<'a>(&'a self, _: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
         Box::pin(async move {
-            let c: crate::adapters::coinbase::CoinbaseCredentials = match typed(creds) {
+            let c: crate::adapters::coinbase::CoinbaseCredentials = match typed(creds, MANIFEST.credential_kind) {
                 Ok(c) => c,
                 Err(e) => return TestOutcome::Failed(e),
             };
@@ -79,7 +79,7 @@ impl Connector for Coinbase {
     }
 
     fn universe_provider(&self, _env: &str, creds: &BrokerCredentials) -> Result<Box<dyn crate::adapters::InstrumentProvider>, String> {
-        let c: crate::adapters::coinbase::CoinbaseCredentials = typed(creds)?;
+        let c: crate::adapters::coinbase::CoinbaseCredentials = typed(creds, MANIFEST.credential_kind)?;
         Ok(Box::new(crate::adapters::coinbase::CoinbaseAdapter::new(c.api_key, &c.private_key)?))
     }
 }
