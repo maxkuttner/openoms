@@ -87,6 +87,20 @@ pub fn publish_appended(bus: &EventBus, order_id: Uuid, events: &[NewOrderEvent]
     }
 }
 
+/// An allocation transfer moved a position between portfolios without any order
+/// event: announce every portfolio it touched, once each. Call after commit.
+pub fn publish_transfer(bus: &EventBus, from_portfolio: Uuid, to_portfolios: &[Uuid], instrument_id: &str) {
+    let mut seen = vec![from_portfolio];
+    for &p in to_portfolios {
+        if !seen.contains(&p) {
+            seen.push(p);
+        }
+    }
+    for portfolio_id in seen {
+        bus.publish_order(OrderLaneEvent::PositionChanged { portfolio_id, instrument_id: instrument_id.to_string() });
+    }
+}
+
 impl Default for EventBus {
     fn default() -> Self {
         Self::new()
@@ -169,6 +183,23 @@ mod tests {
             source_code: "BINANCE",
         };
         assert_eq!(MarkUpdate::from(&q), MarkUpdate { instrument_id: 42, bid: 100.5, ask: 101.0 });
+    }
+
+    #[test]
+    fn transfer_publishes_position_changed_for_each_portfolio() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe_order();
+
+        publish_transfer(&bus, a, &[b, c, b], "42");
+
+        for portfolio_id in [a, b, c] {
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                OrderLaneEvent::PositionChanged { portfolio_id, instrument_id: "42".into() }
+            );
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]

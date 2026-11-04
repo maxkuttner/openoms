@@ -1724,6 +1724,8 @@ pub async fn create_allocations(
         });
     }
     tx.commit().await.map_err(|e| err500(format!("commit: {e:?}")))?;
+    let to_portfolios: Vec<Uuid> = created.iter().map(|a| a.to_portfolio_id).collect();
+    crate::event_bus::publish_transfer(state.event_bus(), from_portfolio, &to_portfolios, &instrument_id);
     Ok(Json(created))
 }
 
