@@ -66,51 +66,6 @@ impl StreamRegistry {
     }
 }
 
-/// Fan-out targets for the "a fill changed positions, go re-check what's held"
-/// doorbell, keyed by feed code.
-///
-/// Keyed, rather than a plain `Vec`, so that restarting a feed *replaces* its
-/// entry instead of appending a second one: the old sender's receiver is owned
-/// by the task `StreamRegistry::abort_and_remove` just aborted, so an
-/// unreplaced old entry would sit forever pointing at a dead channel, and
-/// every future ring would keep `try_send`ing into it for no reason.
-///
-/// `std::sync::Mutex`, not an `ArcSwap`: the critical section here is the
-/// `try_send` loop in `ring_all`, which never awaits, and it only ever runs on
-/// the fill path, which is not high-frequency — the same reasoning as
-/// `StreamRegistry`'s mutex, and the opposite of the broker registry's
-/// `ArcSwap`, which sits on the much hotter, latency-sensitive order path.
-#[derive(Clone, Default)]
-pub struct DoorbellRegistry {
-    senders: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
-}
-
-impl DoorbellRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register `tx` as the doorbell target for `code`, replacing whatever was
-    /// registered there before (see the struct doc comment for why replacing,
-    /// not accumulating, matters).
-    pub fn set(&self, code: impl Into<String>, tx: mpsc::Sender<()>) {
-        self.senders.lock().unwrap().insert(code.into(), tx);
-    }
-
-    pub fn remove(&self, code: &str) {
-        self.senders.lock().unwrap().remove(code);
-    }
-
-    /// Wake every registered feed. Non-blocking: a full per-feed channel
-    /// already means "reload pending" for that feed, so a failed `try_send`
-    /// is fine to ignore.
-    pub fn ring_all(&self) {
-        for tx in self.senders.lock().unwrap().values() {
-            let _ = tx.try_send(());
-        }
-    }
-}
-
 /// Shared application state injected into every Axum handler via State<AppState>.
 #[derive(Clone)]
 pub struct AppState {
@@ -139,12 +94,6 @@ pub struct AppState {
     /// Handles for Databento and Alpaca/Binance REST execution tasks. Public
     /// Binance/Bybit market-data feeds are never registered here.
     streams: StreamRegistry,
-    /// Fan-out targets for the fill→marks doorbell. Owned here — not just a
-    /// `serve()` local — so the reload handler can register a restarted feed's
-    /// replacement sender into the exact map the boot-time fan-out task already
-    /// reads from; see `DoorbellRegistry`'s own doc comment for why keyed
-    /// replacement, not accumulation, matters.
-    doorbells: DoorbellRegistry,
     /// The in-process event bus. Stored so a reload can hand a restarted
     /// adapter or feed the *same* bus boot wired up rather than a copy nothing
     /// reads.
@@ -182,7 +131,6 @@ impl AppState {
             marks: MarkStore::new(),
             daily_stats: crate::daily_stats::DailyStatsStore::new(),
             streams: StreamRegistry::new(),
-            doorbells: DoorbellRegistry::new(),
             event_bus,
             quote_tx,
         }
@@ -237,10 +185,6 @@ impl AppState {
         &self.streams
     }
 
-    pub fn doorbells(&self) -> &DoorbellRegistry {
-        &self.doorbells
-    }
-
     /// The process's one event bus. Cloning it is cheap — it hands out handles
     /// onto the same two lanes.
     pub fn event_bus(&self) -> &EventBus {
@@ -269,7 +213,7 @@ mod tests {
         let mut registry = BrokerRegistry::new();
         registry.register_alpaca("PAPER", sample_alpaca_adapter());
         // Nothing in these tests drains either channel — they only exercise the
-        // registry swap and the stream/doorbell registries, never a real fill or
+        // registry swap and the stream registry, never a real fill or
         // a real quote.
         let (quote_tx, _quote_rx) = mpsc::channel(1);
         AppState::new(
@@ -361,24 +305,5 @@ mod tests {
         // expose) now that the diagnostics-only accessor is gone.
         assert!(reg.handles.lock().unwrap().is_empty(), "abort_and_remove must also remove the map entry");
         assert!(!reg.abort_and_remove("databento-opra").await);
-    }
-
-    /// Replacing a feed's doorbell must overwrite its entry, not add a second
-    /// one — otherwise a restarted feed's old, now-dead sender keeps
-    /// accumulating on every reload, and `ring_all` keeps trying (harmlessly,
-    /// but pointlessly) to wake a receiver nothing is listening on anymore.
-    #[tokio::test]
-    async fn replacing_a_doorbell_reaches_only_the_new_channel() {
-        let reg = DoorbellRegistry::new();
-        let (tx1, mut rx1) = tokio::sync::mpsc::channel::<()>(1);
-        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<()>(1);
-
-        reg.set("databento-opra", tx1);
-        reg.set("databento-opra", tx2);
-
-        reg.ring_all();
-
-        assert!(rx2.try_recv().is_ok(), "the new channel should have been rung");
-        assert!(rx1.try_recv().is_err(), "the old channel should not have been rung");
     }
 }

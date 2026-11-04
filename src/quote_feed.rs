@@ -1,7 +1,7 @@
 //! Generic driver for any [`LiveQuoteFeed`].
 //!
 //! Owns everything that is the same regardless of vendor: work out what to
-//! subscribe to, hand it to the feed, watch the position doorbell, and push newly
+//! subscribe to, hand it to the feed, watch the bus's order lane, and push newly
 //! held instruments in mid-session. The feed itself only speaks its wire protocol.
 //!
 //! Pairing this with [`crate::stream_supervisor`] means a new vendor is one
@@ -12,10 +12,11 @@ use std::collections::HashMap;
 
 use dataprovider::{FeedSymbology, LiveQuoteFeed, Quote, SymbolAdds};
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, Duration};
 use tracing::info;
 
+use crate::event_bus::OrderLaneEvent;
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{Session, StreamResult};
 
@@ -27,7 +28,7 @@ pub struct QuoteFeedSession<F: LiveQuoteFeed + FeedSymbology> {
     feed: F,
     pool: PgPool,
     out: mpsc::Sender<Quote>,
-    position_changed_rx: mpsc::Receiver<()>,
+    order_rx: broadcast::Receiver<OrderLaneEvent>,
     health: StreamHandle,
 }
 
@@ -36,10 +37,10 @@ impl<F: LiveQuoteFeed + FeedSymbology> QuoteFeedSession<F> {
         feed: F,
         pool: PgPool,
         out: mpsc::Sender<Quote>,
-        position_changed_rx: mpsc::Receiver<()>,
+        order_rx: broadcast::Receiver<OrderLaneEvent>,
         health: StreamHandle,
     ) -> Self {
-        Self { feed, pool, out, position_changed_rx, health }
+        Self { feed, pool, out, order_rx, health }
     }
 
     /// Block until there is something to subscribe to.
@@ -47,7 +48,7 @@ impl<F: LiveQuoteFeed + FeedSymbology> QuoteFeedSession<F> {
     /// Deliberately does *not* return to the supervisor when nothing is held: an
     /// idle feed is not a closed stream, and reporting it as one would flap the
     /// health badge and log a reconnect warning every minute for a feed behaving
-    /// exactly as designed. Waits on the doorbell so a fill is picked up at once,
+    /// exactly as designed. Waits on the order lane so a fill is picked up at once,
     /// with a timer as the backstop for positions this process didn't see.
     async fn wait_for_subscribable(&mut self) -> Result<HashMap<String, i64>, sqlx::Error> {
         loop {
@@ -56,7 +57,7 @@ impl<F: LiveQuoteFeed + FeedSymbology> QuoteFeedSession<F> {
                 return Ok(held);
             }
             tokio::select! {
-                _ = self.position_changed_rx.recv() => {}
+                _ = next_recheck(&mut self.order_rx) => {}
                 _ = sleep(Duration::from_secs(IDLE_RECHECK_SECS)) => {}
             }
         }
@@ -75,49 +76,76 @@ impl<F: LiveQuoteFeed + FeedSymbology> Session for QuoteFeedSession<F> {
         // them lets a fill be picked up without waiting for a reconnect.
         tokio::select! {
             r = self.feed.run_session(known.clone(), &self.out, &mut add_rx, &self.health) => r.map_err(Into::into),
-            r = watch_held(&self.pool, &self.feed, &mut self.position_changed_rx, &add_tx, known) => r,
+            r = watch_held(&self.pool, &self.feed, &mut self.order_rx, &add_tx, known) => r,
         }
     }
 }
 
-/// On each doorbell ring, re-read the held set and push anything new to the feed.
+/// What an order-lane receive means for a feed's held set.
+#[derive(Debug, PartialEq)]
+enum Recheck {
+    Yes,
+    No,
+    Closed,
+}
+
+/// A position change means the held set may have grown. So does a lag: the
+/// skipped events may have included one, and re-reading is cheap. Other order
+/// events leave positions alone.
+fn needs_recheck(r: &Result<OrderLaneEvent, broadcast::error::RecvError>) -> Recheck {
+    match r {
+        Ok(OrderLaneEvent::PositionChanged { .. }) => Recheck::Yes,
+        Ok(OrderLaneEvent::Appended { .. }) => Recheck::No,
+        Err(broadcast::error::RecvError::Lagged(_)) => Recheck::Yes,
+        Err(broadcast::error::RecvError::Closed) => Recheck::Closed,
+    }
+}
+
+/// Resolve on the next order-lane event that warrants a re-read. The lane only
+/// closes when the bus is gone; never end the session over it — a feed with no
+/// order lane still streams fine — so park instead.
+async fn next_recheck(order_rx: &mut broadcast::Receiver<OrderLaneEvent>) {
+    loop {
+        match needs_recheck(&order_rx.recv().await) {
+            Recheck::Yes => return,
+            Recheck::No => {}
+            Recheck::Closed => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// On each position change, re-read the held set and push anything new to the feed.
 ///
-/// Re-reads rather than trusting a payload: the DB is the truth, and a signal that
-/// carries no data cannot carry stale data.
+/// Re-reads rather than trusting a payload: the DB is the truth, and a re-read
+/// cannot act on a stale event.
 async fn watch_held(
     pool: &PgPool,
     feed: &dyn FeedSymbology,
-    doorbell: &mut mpsc::Receiver<()>,
+    order_rx: &mut broadcast::Receiver<OrderLaneEvent>,
     add_tx: &mpsc::Sender<SymbolAdds>,
     mut known: HashMap<String, i64>,
 ) -> StreamResult {
     loop {
-        match doorbell.recv().await {
-            Some(()) => {
-                let latest = load_subscribable(pool, feed).await?;
-                let adds: SymbolAdds = latest
-                    .into_iter()
-                    .filter(|(sym, _)| !known.contains_key(sym))
-                    .collect();
-                if adds.is_empty() {
-                    continue;
-                }
-                info!(
-                    source = feed.code(),
-                    count = adds.len(),
-                    "quote feed: subscribing newly-held instruments"
-                );
-                known.extend(adds.iter().map(|(s, i)| (s.clone(), *i)));
-                if add_tx.send(adds).await.is_err() {
-                    // The feed dropped its receiver: the session is ending anyway.
-                    // Park rather than return, so the feed's own result is what the
-                    // supervisor sees.
-                    std::future::pending::<()>().await;
-                }
-            }
-            // Doorbell closed (only if every fill stream is gone). Never end the
-            // session over it — a feed with no doorbell still streams fine.
-            None => std::future::pending::<()>().await,
+        next_recheck(order_rx).await;
+        let latest = load_subscribable(pool, feed).await?;
+        let adds: SymbolAdds = latest
+            .into_iter()
+            .filter(|(sym, _)| !known.contains_key(sym))
+            .collect();
+        if adds.is_empty() {
+            continue;
+        }
+        info!(
+            source = feed.code(),
+            count = adds.len(),
+            "quote feed: subscribing newly-held instruments"
+        );
+        known.extend(adds.iter().map(|(s, i)| (s.clone(), *i)));
+        if add_tx.send(adds).await.is_err() {
+            // The feed dropped its receiver: the session is ending anyway.
+            // Park rather than return, so the feed's own result is what the
+            // supervisor sees.
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -162,4 +190,37 @@ pub(crate) async fn load_subscribable(
         .into_iter()
         .filter_map(|(id, symbol)| feed.to_feed_symbol(&symbol).map(|s| (s, id)))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast::error::RecvError;
+    use uuid::Uuid;
+
+    #[test]
+    fn position_changed_means_recheck() {
+        let ev = OrderLaneEvent::PositionChanged { portfolio_id: Uuid::nil(), instrument_id: "1".into() };
+        assert_eq!(needs_recheck(&Ok(ev)), Recheck::Yes);
+    }
+
+    #[test]
+    fn appended_alone_is_not_a_recheck() {
+        let ev = OrderLaneEvent::Appended {
+            order_id: Uuid::nil(),
+            global_position: 1,
+            event_type: "order_routed".into(),
+        };
+        assert_eq!(needs_recheck(&Ok(ev)), Recheck::No);
+    }
+
+    #[test]
+    fn lagged_order_lane_means_recheck() {
+        assert_eq!(needs_recheck(&Err(RecvError::Lagged(3))), Recheck::Yes);
+    }
+
+    #[test]
+    fn closed_order_lane_parks() {
+        assert_eq!(needs_recheck(&Err(RecvError::Closed)), Recheck::Closed);
+    }
 }

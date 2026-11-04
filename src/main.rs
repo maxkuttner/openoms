@@ -1272,17 +1272,15 @@ async fn serve() {
                     continue;
                 }
                 // Credential-driven, so its task is registered in `StreamRegistry`
-                // and its doorbell in `DoorbellRegistry` (unlike the public
-                // Binance/Bybit feeds below): a later credential change can abort
-                // and replace it without a process restart. `restart_databento_feed`
-                // owns its own doorbell channel pair — see its doc comment — so
-                // boot exercises the exact same call a runtime reload will use.
+                // (unlike the public Binance/Bybit feeds below): a later credential
+                // change can abort and replace it without a process restart. Boot
+                // exercises the exact same call a runtime reload will use.
                 reload::restart_databento_feed(
                     api_key.clone(),
                     state.pool().clone(),
                     state.stream_health(),
                     state.streams(),
-                    state.doorbells(),
+                    state.event_bus(),
                     quote_tx.clone(),
                 ).await;
                 info!(code = %conn.code, "registered DATABENTO/OPRA feed");
@@ -1291,20 +1289,17 @@ async fn serve() {
     }
 
     // Binance public market data — no credentials, so it is always on. Each feed
-    // needs its own doorbell receiver (an mpsc has exactly one consumer), so the
-    // sender is cloned per feed rather than shared. Not registered in
-    // `StreamRegistry`: there is no credential that could change under it, so
+    // takes its own order-lane subscription to learn when positions change. Not
+    // registered in `StreamRegistry`: there is no credential that could change under it, so
     // there is nothing for a reload to restart here — leave it running for the
     // life of the process, same as before this feature existed.
     {
-        let (binance_pos_tx, binance_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        state.doorbells().set("BINANCE/SPOT", binance_pos_tx);
         let health = state.stream_health().handle("BINANCE", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             binance_feed::BinanceFeed,
             state.pool().clone(),
             quote_tx.clone(),
-            binance_pos_rx,
+            state.event_bus().subscribe_order(),
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("BINANCE/SPOT", health, session));
@@ -1316,14 +1311,12 @@ async fn serve() {
     // credential-driven, so — like Binance above — not registered in
     // `StreamRegistry`.
     {
-        let (bybit_pos_tx, bybit_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        state.doorbells().set("BYBIT/SPOT", bybit_pos_tx);
         let health = state.stream_health().handle("BYBIT", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             bybit_feed::BybitFeed,
             state.pool().clone(),
             quote_tx.clone(),
-            bybit_pos_rx,
+            state.event_bus().subscribe_order(),
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("BYBIT/SPOT", health, session));
@@ -1332,14 +1325,12 @@ async fn serve() {
     // Coinbase's public ticker marks Coinbase's own products, which no other feed
     // prices. Not credential-driven either, so not in `StreamRegistry`.
     {
-        let (coinbase_pos_tx, coinbase_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        state.doorbells().set("COINBASE/SPOT", coinbase_pos_tx);
         let health = state.stream_health().handle("COINBASE", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             coinbase_feed::CoinbaseFeed,
             state.pool().clone(),
             quote_tx.clone(),
-            coinbase_pos_rx,
+            state.event_bus().subscribe_order(),
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("COINBASE/SPOT", health, session));
@@ -1347,36 +1338,16 @@ async fn serve() {
 
     // OKX's public tickers mark OKX's own pairs, which no other feed prices.
     {
-        let (okx_pos_tx, okx_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        state.doorbells().set("OKX/SPOT", okx_pos_tx);
         let health = state.stream_health().handle("OKX", "SPOT", stream_health::StreamKind::Feed);
         let session = quote_feed::QuoteFeedSession::new(
             okx_feed::OkxFeed,
             state.pool().clone(),
             quote_tx.clone(),
-            okx_pos_rx,
+            state.event_bus().subscribe_order(),
             health.clone(),
         );
         tokio::spawn(stream_supervisor::supervise("OKX/SPOT", health, session));
     }
-
-    // Relay the fill path's single doorbell to every feed. `ring_all`'s
-    // `try_send`: a full per-feed channel already means "reload pending", and
-    // this must never block. Cloned rather than moved so a later credential
-    // reload can still register a replacement doorbell through the same
-    // `DoorbellRegistry` after this task has started — see its doc comment.
-    let fanout_doorbells = state.doorbells().clone();
-    let mut order_rx = state.event_bus().subscribe_order();
-    tokio::spawn(async move {
-        loop {
-            match order_rx.recv().await {
-                Ok(event_bus::OrderLaneEvent::PositionChanged { .. })
-                | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => fanout_doorbells.ring_all(),
-                Ok(event_bus::OrderLaneEvent::Appended { .. }) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
 
     // Load each credentialed broker's never-loaded instrument universe as a
     // background job, after everything above so the load never delays the server

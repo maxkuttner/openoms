@@ -1538,7 +1538,6 @@ async fn stop_databento_feed(state: &AppState) {
         state.stream_health().handle("DATABENTO", "OPRA", crate::stream_health::StreamKind::Feed)
             .set_down("connection disabled, unconfigured, or removed");
     }
-    state.doorbells().remove("databento-opra");
 }
 
 /// Whether `reload_connections` must refuse rather than swap: the same

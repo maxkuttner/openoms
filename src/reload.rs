@@ -25,7 +25,7 @@ use crate::bybit_stream;
 use crate::coinbase_stream;
 use crate::okx_stream;
 use crate::adapters::{BrokerRegistry, Transport};
-use crate::app_state::{AppState, DoorbellRegistry, StreamRegistry};
+use crate::app_state::{AppState, StreamRegistry};
 use crate::credentials::{BrokerCredentials, Connection, CredentialState};
 use crate::fix;
 use crate::kafka::KafkaClient;
@@ -412,9 +412,9 @@ pub async fn build_registry(
 }
 
 /// (Re)start the Databento OPRA feed session under (possibly new) credentials,
-/// publishing the fresh handle into `streams` and the fresh doorbell sender
-/// into `doorbells`, both under the same code ("databento-opra") this feed
-/// always runs under.
+/// publishing the fresh handle into `streams` under the code ("databento-opra")
+/// this feed always runs under. The fresh session subscribes to the same bus's
+/// order lane every other feed listens on.
 ///
 /// Only Databento is credential-driven among the market-data feeds — Binance
 /// and Bybit are public and are never restarted here or anywhere else (see
@@ -423,31 +423,24 @@ pub async fn build_registry(
 /// connections: there is exactly one credentialed feed to restart.
 ///
 /// Calling this when nothing is registered yet (boot) is safe: `abort_and_remove`
-/// on an empty registry is a no-op and `doorbells.set` on an unpopulated code
-/// is a plain insert, so boot and a later credential-driven restart are the
-/// same call. The doorbell channel pair is created *inside* this function
-/// (rather than threaded in by the caller) precisely so that guarantee holds:
-/// a caller that built its own pair and pushed the sender into a fan-out list
-/// by hand could forget to replace the old entry, which is the bug this
-/// function exists to make impossible — see `DoorbellRegistry`'s doc comment.
+/// on an empty registry is a no-op, so boot and a later credential-driven
+/// restart are the same call.
 pub async fn restart_databento_feed(
     api_key: String,
     pool: PgPool,
     stream_health: &StreamHealthRegistry,
     streams: &StreamRegistry,
-    doorbells: &DoorbellRegistry,
+    bus: &EventBus,
     quote_tx: mpsc::Sender<dataprovider::Quote>,
 ) {
     streams.abort_and_remove("databento-opra").await;
-    let (position_changed_tx, position_changed_rx) = mpsc::channel::<()>(1);
-    doorbells.set("databento-opra", position_changed_tx);
     let health = stream_health.handle("DATABENTO", "OPRA", StreamKind::Feed);
     health.set_connecting();
     let session = QuoteFeedSession::new(
         DatabentoOpraFeed::new(api_key),
         pool,
         quote_tx,
-        position_changed_rx,
+        bus.subscribe_order(),
         health.clone(),
     );
     // `supervise` returns `!` (it never returns), so `JoinHandle<!>` — wrap it in
@@ -578,7 +571,7 @@ impl ReloadStreams for LiveReloadStreams {
 
     async fn databento(&self, api_key: String, state: &AppState) {
         restart_databento_feed(api_key, state.pool().clone(), state.stream_health(),
-            state.streams(), state.doorbells(), state.quote_tx()).await;
+            state.streams(), state.event_bus(), state.quote_tx()).await;
     }
 }
 

@@ -125,10 +125,6 @@ impl ReloadStreams for FakeStreams {
     async fn databento(&self, _: String, state: &AppState) {
         state.streams().abort_and_remove("databento-opra").await;
         self.spawn("databento-opra", state.streams());
-        let (tx, mut rx) = mpsc::channel(1);
-        state.doorbells().set("databento-opra", tx);
-        state.doorbells().ring_all();
-        assert!(rx.try_recv().is_ok(), "replacement feed must receive doorbells");
     }
 }
 
