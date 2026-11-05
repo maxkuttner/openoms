@@ -6,6 +6,7 @@
 //! the order path read without a query; every admin write reloads it.
 
 pub mod admin;
+pub mod guard;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -151,13 +152,17 @@ impl RegistrySnapshot {
         self.0.load().iter().find(|s| s.sender_comp_id == sender && s.target_comp_id == target).cloned()
     }
 
+    pub fn by_portfolio_id(&self, portfolio_id: Uuid) -> Option<Strategy> {
+        self.0.load().iter().find(|s| s.portfolio_id == portfolio_id).cloned()
+    }
+
     pub fn by_code(&self, code: &str) -> Option<Strategy> {
         self.0.load().iter().find(|s| s.code == code).cloned()
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]

@@ -16,6 +16,9 @@ use tracing::{info, warn};
 
 use crate::event_bus::OrderLaneEvent;
 
+/// This loop's owner name on the market data gateway.
+const HELD: &str = "held";
+
 /// The backstop re-read interval, for positions this process didn't see change.
 const IDLE_RECHECK_SECS: u64 = 60;
 
@@ -57,14 +60,14 @@ pub async fn run(pool: PgPool, md: MdHandle, mut order_rx: broadcast::Receiver<O
                 if !subscribe.is_empty() {
                     info!(count = subscribe.len(), "market data: subscribing held instruments");
                     sent.extend(subscribe.iter().map(|i| i.id));
-                    md.subscribe(subscribe);
+                    md.subscribe(HELD, subscribe);
                 }
                 if !unsubscribe.is_empty() {
                     info!(count = unsubscribe.len(), "market data: unsubscribing instruments no longer held");
                     for id in &unsubscribe {
                         sent.remove(id);
                     }
-                    md.unsubscribe(&unsubscribe);
+                    md.unsubscribe(HELD, &unsubscribe);
                 }
             }
             Err(e) => warn!(error = %e, "market data: could not read held instruments, keeping the last set"),

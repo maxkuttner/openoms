@@ -1,7 +1,7 @@
 //! The market data gateway: everything that brings prices in. The order side
 //! of the gateway ([`crate::adapter`]) carries none.
 //!
-//! The core says what is held ([`MdHandle::subscribe`] / [`MdHandle::unsubscribe`]);
+//! The core says what it wants priced ([`MdHandle::subscribe`] / [`MdHandle::unsubscribe`]);
 //! the gateway decides which feed covers what, runs the sessions and emits every
 //! [`Quote`] on the one channel [`MarketDataGateway::new`] hands back.
 
@@ -9,8 +9,8 @@ pub mod daily_stats;
 pub mod opra;
 pub mod session;
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 
 use dataprovider::{InstrumentRef, Quote};
 use tokio::sync::{mpsc, watch};
@@ -26,35 +26,75 @@ type Held = BTreeMap<i64, InstrumentRef>;
 /// How many quotes may wait for the mark router before feeds block.
 const QUOTE_CHANNEL_CAPACITY: usize = 1024;
 
-/// The core's handle on the market data gateway: what is held.
+/// The core's handle on the market data gateway: what it wants priced.
+///
+/// Each subscription belongs to an owner (the held set, a strategy). An
+/// instrument stays subscribed while any owner wants it, so one owner letting
+/// go never drops another's.
 #[derive(Clone)]
-pub struct MdHandle(Arc<watch::Sender<Held>>);
+pub struct MdHandle(Arc<Interests>);
+
+struct Interests {
+    /// The union the feed sessions watch.
+    held: watch::Sender<Held>,
+    /// instrument id → (what to subscribe, who wants it).
+    owners: Mutex<BTreeMap<i64, (InstrumentRef, BTreeSet<String>)>>,
+}
 
 impl MdHandle {
-    /// Hold these instruments (insert, or replace by id).
-    pub fn subscribe(&self, instruments: Vec<InstrumentRef>) {
-        self.0.send_if_modified(|held| {
-            let mut changed = false;
+    fn new() -> Self {
+        let (held, _) = watch::channel(Held::new());
+        Self(Arc::new(Interests { held, owners: Mutex::new(BTreeMap::new()) }))
+    }
+
+    /// `owner` wants these instruments priced (insert, or replace by id).
+    pub fn subscribe(&self, owner: &str, instruments: Vec<InstrumentRef>) {
+        self.update(|owners| {
             for i in instruments {
-                if held.get(&i.id) != Some(&i) {
-                    held.insert(i.id, i);
-                    changed = true;
-                }
+                let entry = owners.entry(i.id).or_insert_with(|| (i.clone(), BTreeSet::new()));
+                entry.0 = i;
+                entry.1.insert(owner.to_string());
             }
-            changed
         });
     }
 
-    /// Stop holding these. A running session keeps them until its next reconnect:
-    /// feeds cannot unsubscribe mid-session.
-    pub fn unsubscribe(&self, instrument_ids: &[i64]) {
-        self.0.send_if_modified(|held| {
-            let before = held.len();
+    /// `owner` no longer wants these. A running session keeps an instrument
+    /// nobody wants until its next reconnect: feeds cannot unsubscribe mid-session.
+    pub fn unsubscribe(&self, owner: &str, instrument_ids: &[i64]) {
+        self.update(|owners| {
             for id in instrument_ids {
-                held.remove(id);
+                if let Some((_, who)) = owners.get_mut(id) {
+                    who.remove(owner);
+                }
             }
-            held.len() != before
         });
+    }
+
+    /// Drop everything `owner` wanted.
+    pub fn unsubscribe_owner(&self, owner: &str) {
+        self.update(|owners| {
+            for (_, who) in owners.values_mut() {
+                who.remove(owner);
+            }
+        });
+    }
+
+    fn update(&self, change: impl FnOnce(&mut BTreeMap<i64, (InstrumentRef, BTreeSet<String>)>)) {
+        let mut owners = self.0.owners.lock().unwrap();
+        change(&mut owners);
+        owners.retain(|_, (_, who)| !who.is_empty());
+        let union: Held = owners.iter().map(|(id, (i, _))| (*id, i.clone())).collect();
+        self.0.held.send_if_modified(|held| {
+            if *held == union {
+                return false;
+            }
+            *held = union;
+            true
+        });
+    }
+
+    fn watch(&self) -> watch::Receiver<Held> {
+        self.0.held.subscribe()
     }
 }
 
@@ -68,8 +108,7 @@ impl MarketDataGateway {
     /// The gateway and the one receiver of every quote it emits (the mark router's input).
     pub fn new(health: StreamHealthRegistry) -> (Self, mpsc::Receiver<Quote>) {
         let (quote_tx, quote_rx) = mpsc::channel(QUOTE_CHANNEL_CAPACITY);
-        let (held, _) = watch::channel(Held::new());
-        (Self { quote_tx, held: MdHandle(Arc::new(held)), health }, quote_rx)
+        (Self { quote_tx, held: MdHandle::new(), health }, quote_rx)
     }
 
     pub fn handle(&self) -> MdHandle {
@@ -99,6 +138,6 @@ impl MarketDataGateway {
     }
 
     pub(crate) fn session(&self, source: Arc<dyn QuoteSource>, health: StreamHandle) -> FeedSession {
-        FeedSession::new(source, self.held.0.subscribe(), self.quote_tx.clone(), health)
+        FeedSession::new(source, self.held.watch(), self.quote_tx.clone(), health)
     }
 }

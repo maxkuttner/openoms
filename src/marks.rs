@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Mark {
     pub bid: f64,
     pub ask: f64,

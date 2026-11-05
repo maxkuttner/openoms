@@ -197,38 +197,56 @@ mod tests {
     #[tokio::test]
     async fn a_feed_waits_until_something_it_covers_is_held() {
         let (md, mut session, mut rx, _end) = setup();
-        md.handle().subscribe(vec![held(1, "AAA", "Y")]);
+        md.handle().subscribe("held", vec![held(1, "AAA", "Y")]);
         tokio::spawn(async move { session.run_once().await });
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "no session while nothing it covers is held");
 
-        md.handle().subscribe(vec![held(2, "ABC", "X")]);
+        md.handle().subscribe("held", vec![held(2, "ABC", "X")]);
         assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2)])));
     }
 
     #[tokio::test]
     async fn an_instrument_held_mid_session_is_added() {
         let (md, mut session, mut rx, _end) = setup();
-        md.handle().subscribe(vec![held(2, "ABC", "X")]);
+        md.handle().subscribe("held", vec![held(2, "ABC", "X")]);
         tokio::spawn(async move { session.run_once().await });
         assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2)])));
 
-        md.handle().subscribe(vec![held(3, "DEF", "X")]);
+        md.handle().subscribe("held", vec![held(3, "DEF", "X")]);
         assert_eq!(next(&mut rx).await, Seen::Adds(symbols(&[("def", 3)])));
+    }
+
+    /// Another owner's interest keeps an instrument subscribed when the held
+    /// set drops it: a strategy trading a pair nobody holds keeps its prices.
+    #[tokio::test]
+    async fn a_strategy_interest_survives_the_held_set_dropping_it() {
+        let (md, mut session, mut rx, end) = setup();
+        md.handle().subscribe("held", vec![held(2, "ABC", "X")]);
+        md.handle().subscribe("strategy:s", vec![held(2, "ABC", "X")]);
+        tokio::spawn(async move {
+            let _ = session.run_once().await;
+            let _ = session.run_once().await;
+        });
+        assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2)])));
+
+        md.handle().unsubscribe("held", &[2]);
+        end.notify_one();
+        assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2)])));
     }
 
     #[tokio::test]
     async fn an_unsubscribed_instrument_is_not_resubscribed_on_reconnect() {
         let (md, mut session, mut rx, end) = setup();
-        md.handle().subscribe(vec![held(2, "ABC", "X"), held(3, "DEF", "X")]);
+        md.handle().subscribe("held", vec![held(2, "ABC", "X"), held(3, "DEF", "X")]);
         tokio::spawn(async move {
             let _ = session.run_once().await;
             let _ = session.run_once().await;
         });
         assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2), ("def", 3)])));
 
-        md.handle().unsubscribe(&[3]);
+        md.handle().unsubscribe("held", &[3]);
         end.notify_one();
         assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2)])));
     }

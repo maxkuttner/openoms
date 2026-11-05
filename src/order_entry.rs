@@ -22,7 +22,9 @@ use crate::handlers::{
     parse_order_type, parse_time_in_force, require_order_grant, resolve_instrument_ref, ApiError, OrderPermission,
     SubmitOrderRequest,
 };
+use crate::domain::orders::risk::RiskRejection;
 use crate::risk_engine::{PgRiskDataProvider, RiskCheckError, RiskEngine};
+use crate::strategies::{self, guard, Strategy};
 
 /// Where an order came from. Recorded on the order (`order_state.origin`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +32,53 @@ pub enum Origin {
     Api,
     Fix { cl_ord_id: String },
     Flatten,
+}
+
+impl Origin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Origin::Api => "API",
+            Origin::Fix { .. } => "FIX",
+            Origin::Flatten => "FLATTEN",
+        }
+    }
+}
+
+/// A pre-trade rejection as the API reports it; the reason names the check.
+fn risk_api_error(order_id: Uuid, rejection: RiskRejection) -> ApiError {
+    warn!(order_id = %order_id, code = %rejection.code, message = %rejection.message, "order rejected by pre-trade risk");
+    // TODO: also persist an OrderDenied audit event for rejected orders.
+    ApiError {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        message: format!("risk check failed [{}]: {}", rejection.code, rejection.message),
+    }
+}
+
+/// For a strategy order naming its instrument by broker symbol plus broker
+/// code: (the strategy's account for that broker, the instrument id).
+/// `None` when the order names its instrument another way.
+async fn strategy_route(pool: &sqlx::PgPool, strategy: &Strategy, req: &SubmitOrderRequest) -> Result<Option<(Uuid, i64)>, ApiError> {
+    let (None, Some(symbol), Some(venue)) = (&req.instrument_id, &req.symbol, &req.venue) else {
+        return Ok(None);
+    };
+    let unprocessable = |message: String| ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message };
+    let account = *strategy
+        .connections
+        .get(venue)
+        .ok_or_else(|| unprocessable(format!("strategy has no connection for {venue}")))?;
+    let instrument_id: i64 = query_scalar(
+        "SELECT instrument_id FROM broker_instrument WHERE broker_symbol = $1 AND broker_code = $2 AND is_tradeable = true",
+    )
+    .bind(symbol)
+    .bind(venue)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to resolve broker symbol: {:?}", err),
+    })?
+    .ok_or_else(|| unprocessable(format!("{symbol} is not tradeable on {venue}")))?;
+    Ok(Some((account, instrument_id)))
 }
 
 /// What a cancel did: asked the broker (it confirms on the execution stream),
@@ -42,8 +91,6 @@ pub enum CancelOutcome {
 
 /// Validate, risk-check, store and route one order; returns its OMS order id.
 pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderRequest, origin: Origin) -> Result<Uuid, ApiError> {
-    let _ = &origin;
-
     info!(?req, principal_id = %auth.principal_id, "submit order received");
     let pool = state.pool().clone();
     let event_store = OrderEventStore::new(pool.clone());
@@ -55,16 +102,29 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         status: StatusCode::BAD_REQUEST,
         message: "portfolio_id must be a UUID".to_string(),
     })?;
+    // A strategy's portfolio is traded only by the strategy. Its orders may name
+    // the instrument by broker symbol plus broker code (`venue`), which also
+    // picks the strategy's account for that broker.
+    let strategy = state.strategies().by_portfolio_id(portfolio_id);
+    if let Some(s) = &strategy {
+        guard::may_trade(s, auth.principal_id).map_err(|r| risk_api_error(order_id, r))?;
+    }
+    let strategy_route = match &strategy {
+        Some(s) => strategy_route(&pool, s, &req).await?,
+        None => None,
+    };
+
     // Resolve the account: explicit override if given, else the portfolio's default route.
     // Captured before `req` is moved into `cmd` below; drives the ownership
     // check further down (an explicit account_id must belong to portfolio_id).
-    let account_id_was_explicit = req.account_id.is_some();
-    let account_id: Uuid = match req.account_id.as_deref() {
-        Some(a) => Uuid::parse_str(a).map_err(|_| ApiError {
+    let account_id_was_explicit = req.account_id.is_some() || strategy_route.is_some();
+    let account_id: Uuid = match (strategy_route, req.account_id.as_deref()) {
+        (Some((account, _)), _) => account,
+        (None, Some(a)) => Uuid::parse_str(a).map_err(|_| ApiError {
             status: StatusCode::BAD_REQUEST,
             message: "account_id must be a UUID".to_string(),
         })?,
-        None => query_scalar::<_, Option<Uuid>>(
+        (None, None) => query_scalar::<_, Option<Uuid>>(
             "SELECT default_account_id FROM portfolio WHERE id = $1",
         )
         .bind(portfolio_id)
@@ -83,7 +143,14 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // instrument.id is a BIGINT surrogate key (the mdm master instrument), not a UUID.
     // The request may have named the instrument by symbol instead; either way the
     // command below carries only the id.
-    let instrument_id_bigint = resolve_instrument_ref(&pool, &req).await?;
+    let instrument_id_bigint = match strategy_route {
+        Some((_, instrument_id)) => instrument_id,
+        None => resolve_instrument_ref(&pool, &req).await?,
+    };
+    let fix_cl_ord_id = match &origin {
+        Origin::Fix { cl_ord_id } => Some(cl_ord_id.clone()),
+        _ => None,
+    };
 
     // Boundary → domain: fold the resolved account into the pure SubmitOrder command.
     let cmd = req.into_command(account_id.to_string(), instrument_id_bigint);
@@ -150,7 +217,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // `contract_size` (the notional multiplier — 100 for options, 1 otherwise) and
     // `instrument_class` (to apply option-specific order rules).
     let instrument_row = sqlx::query(
-        "SELECT instrument_class, status, \
+        "SELECT instrument_class, status, symbol, asset_class, venue, currency, \
                 contract_size::double precision AS contract_size \
          FROM instrument WHERE id = $1"
     )
@@ -223,6 +290,23 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         }
     }
 
+    // A strategy order's reference price, looked up before the transaction so
+    // waiting for a first quote never holds the strategy's row lock.
+    let quote_currency: String = instrument_row.get("currency");
+    let mark = match &strategy {
+        Some(s) => {
+            let inst = dataprovider::InstrumentRef {
+                id: instrument_id_bigint,
+                symbol: instrument_row.get("symbol"),
+                instrument_class: Some(instrument_class.clone()),
+                asset_class: instrument_row.get("asset_class"),
+                venue: instrument_row.get("venue"),
+            };
+            guard::reference(state, s, &inst).await.map_err(|r| risk_api_error(order_id, r))?
+        }
+        None => None,
+    };
+
     // start of the transaction
     let mut tx = pool.begin().await.map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -279,28 +363,24 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // Pre-trade risk check. Runs inside TX1 so the FOR UPDATE lock on the
     // risk_limits row serializes concurrent submits for the same
     // portfolio/instrument scope until this transaction commits.
-    RiskEngine::new(PgRiskDataProvider::new(&mut *tx))
-        .check_submit(portfolio_id, &cmd, contract_size)
-        .await
-        .map_err(|err| match err {
-            RiskCheckError::Rejected(rejection) => {
-                warn!(
-                    order_id = %order_id,
-                    code = %rejection.code,
-                    message = %rejection.message,
-                    "order rejected by pre-trade risk"
-                );
-                // TODO: also persist an OrderDenied audit event for rejected orders.
-                ApiError {
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    message: format!("risk check failed [{}]: {}", rejection.code, rejection.message),
-                }
-            }
-            RiskCheckError::Data(err) => ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("failed to evaluate pre-trade risk: {:?}", err),
-            },
-        })?;
+    let risk = if strategy.is_some() {
+        // The strategy row as it is now, locked: its state and limits may have
+        // changed since the snapshot (Kill), and the lock serializes its submits.
+        match strategies::by_portfolio(&mut tx, portfolio_id).await {
+            Ok(Some(locked)) => guard::check(&mut tx, &locked, &cmd, &quote_currency, mark, contract_size).await,
+            Ok(None) => Ok(()),
+            Err(e) => Err(RiskCheckError::Data(e)),
+        }
+    } else {
+        RiskEngine::new(PgRiskDataProvider::new(&mut *tx)).check_submit(portfolio_id, &cmd, contract_size).await
+    };
+    risk.map_err(|err| match err {
+        RiskCheckError::Rejected(rejection) => risk_api_error(order_id, rejection),
+        RiskCheckError::Data(err) => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to evaluate pre-trade risk: {:?}", err),
+        },
+    })?;
 
     // create empty aggregate
     let aggregate = OrderAggregate::empty();
@@ -352,9 +432,11 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
             status,
             resume_to_status,
             version,
-            broker_connection_code
+            broker_connection_code,
+            origin,
+            fix_cl_ord_id
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
         )
         "#
     )
@@ -376,6 +458,8 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     .bind(state_after_submit.resume_to_status.map(|status| status.as_str()))
     .bind(state_after_submit.version)
     .bind(&broker_connection_code)
+    .bind(origin.as_str())
+    .bind(&fix_cl_ord_id)
     .execute(&mut *tx)
     .await
     .map_err(|err| ApiError {
@@ -896,4 +980,60 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
 
     // return response
     Ok(CancelOutcome::Canceled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategies::test_support;
+
+    fn request(portfolio_id: Uuid, symbol: &str, venue: &str) -> SubmitOrderRequest {
+        serde_json::from_value(serde_json::json!({
+            "order_id": Uuid::new_v4().to_string(),
+            "client_order_id": "leg",
+            "portfolio_id": portfolio_id.to_string(),
+            "symbol": symbol,
+            "venue": venue,
+            "side": "buy",
+            "order_type": "limit",
+            "time_in_force": "gtc",
+            "limit_price": 1.0,
+            "quantity": 1.0,
+        }))
+        .unwrap()
+    }
+
+    /// Against the shared dev DB (read-only): the two legs of an arbitrage name
+    /// different brokers and resolve to each broker's own account, and a broker
+    /// the strategy has no connection for is refused with its reason.
+    #[tokio::test]
+    #[ignore]
+    async fn two_legs_resolve_to_their_own_accounts() {
+        let pool = test_support::dev_pool().await;
+        let mut s = crate::strategies::tests::sample("s", "S", "OMS");
+        let (binance, bybit) = (Uuid::new_v4(), Uuid::new_v4());
+        s.connections.insert("BINANCE".into(), binance);
+        s.connections.insert("BYBIT".into(), bybit);
+        let leg1 = strategy_route(&pool, &s, &request(s.portfolio_id, "BTCUSDT", "BINANCE")).await.unwrap().unwrap();
+        let leg2 = strategy_route(&pool, &s, &request(s.portfolio_id, "BTCUSDT", "BYBIT")).await.unwrap().unwrap();
+        assert_eq!((leg1.0, leg2.0), (binance, bybit));
+        let e = strategy_route(&pool, &s, &request(s.portfolio_id, "BTCUSDT", "OKX")).await.unwrap_err();
+        assert_eq!(e.message, "strategy has no connection for OKX");
+    }
+
+    /// Against the shared dev DB: a REST order on a strategy's portfolio from
+    /// anyone but the strategy is refused before anything is stored.
+    #[tokio::test]
+    #[ignore]
+    async fn a_rest_order_on_a_strategy_portfolio_from_another_principal_is_refused() {
+        let pool = test_support::dev_pool().await;
+        let code = test_support::seed_strategy(&pool).await;
+        let state = test_support::state(pool.clone());
+        state.strategies().reload(&pool).await.unwrap();
+        let s = state.strategies().by_code(&code).unwrap();
+        let other = AuthContext { principal_id: Uuid::new_v4(), principal_code: "someone".into() };
+        let e = submit(&state, &other, request(s.portfolio_id, "BTCUSDT", "BINANCE"), Origin::Api).await.unwrap_err();
+        assert!(e.message.contains("strategy_portfolio"), "{}", e.message);
+        test_support::drop_strategy(&pool, &code).await;
+    }
 }
