@@ -2253,7 +2253,37 @@
       }
     },
     "/admin/strategies/{code}": {
-      "put": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "delete_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
         "tags": [
           "admin"
         ],
@@ -2289,36 +2319,6 @@
                 }
               }
             }
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      },
-      "delete": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "delete_strategy",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Deleted"
           },
           "404": {
             "description": "Not found"
@@ -4242,10 +4242,8 @@
         ],
         "properties": {
           "allowed_addresses": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
+            "type": "string",
+            "description": "Comma-separated IP addresses; empty means any.",
             "nullable": true
           },
           "code": {
@@ -5409,14 +5407,13 @@
           "has_fix_password",
           "allowed_addresses",
           "state",
-          "rest_enabled"
+          "rest_enabled",
+          "session_live"
         ],
         "properties": {
           "allowed_addresses": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
+            "type": "string",
+            "description": "Comma-separated IP addresses; empty means any."
           },
           "code": {
             "type": "string"
@@ -5473,6 +5470,10 @@
           },
           "sender_comp_id": {
             "type": "string"
+          },
+          "session_live": {
+            "type": "boolean",
+            "description": "Whether its FIX session is logged on right now."
           },
           "state": {
             "type": "string"
@@ -5908,10 +5909,8 @@
         "type": "object",
         "properties": {
           "allowed_addresses": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
+            "type": "string",
+            "description": "Comma-separated IP addresses; empty means any.",
             "nullable": true
           },
           "max_order_notional": {

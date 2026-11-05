@@ -44,6 +44,7 @@ export default defineConfig({
           items: ["configuration/reference", "configuration/file-locations", "configuration/login"],
         },
         { label: "Concepts", items: ["concepts/architecture"] },
+        { label: "Strategies", items: ["strategies/fix", "strategies/rest"] },
         {
           label: "Integrations",
           items: [

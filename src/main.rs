@@ -1501,7 +1501,7 @@ async fn serve() {
         )
         .route(
             "/admin/strategies/:code",
-            axum::routing::put(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
+            axum::routing::patch(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
         )
         .route("/admin/strategies/:code/connections", axum::routing::put(strategies::admin::put_connections))
         .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
