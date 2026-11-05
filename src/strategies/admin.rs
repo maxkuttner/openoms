@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,9 @@ use uuid::Uuid;
 
 use crate::admin::{map_db_error, AdminError};
 use crate::app_state::AppState;
+use crate::auth::AuthContext;
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct StrategyRow {
     pub code: String,
     pub name: String,
@@ -42,7 +43,7 @@ const ROW_SELECT: &str = "code, name, portfolio_id, owner_principal_id, principa
     max_position_notional::double precision AS max_position_notional, \
     price_band_pct::double precision AS price_band_pct, last_logon_error";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateStrategy {
     pub code: String,
     pub name: String,
@@ -59,7 +60,7 @@ pub struct CreateStrategy {
     pub price_band_pct: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateStrategy {
     pub name: Option<String>,
     pub sender_comp_id: Option<String>,
@@ -72,13 +73,13 @@ pub struct UpdateStrategy {
     pub price_band_pct: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct ConnectionEntry {
     pub broker_code: String,
     pub account_id: Uuid,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct NewPassword {
     /// Shown once; only its hash is stored.
     pub password: String,
@@ -102,6 +103,11 @@ fn validate_comp_ids(sender: &str, target: &str) -> Result<(), AdminError> {
     Ok(())
 }
 
+#[utoipa::path(
+    get, path = "/admin/strategies", tag = "admin",
+    responses((status = 200, description = "Every strategy", body = [StrategyRow])),
+    security(("bearer_token" = []))
+)]
 pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<StrategyRow>>, AdminError> {
     let rows = sqlx::query_as::<_, StrategyRow>(&format!("SELECT {ROW_SELECT} FROM strategy ORDER BY code"))
         .fetch_all(state.pool())
@@ -110,6 +116,16 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
     Ok(Json(rows))
 }
 
+#[utoipa::path(
+    post, path = "/admin/strategies", tag = "admin",
+    request_body = CreateStrategy,
+    responses(
+        (status = 200, description = "Created", body = StrategyRow),
+        (status = 400, description = "Missing CompIDs"),
+        (status = 409, description = "Code, portfolio, principal or CompIDs already used"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn create_strategy(
     State(state): State<AppState>,
     Json(p): Json<CreateStrategy>,
@@ -142,6 +158,13 @@ pub async fn create_strategy(
     Ok(Json(row))
 }
 
+#[utoipa::path(
+    put, path = "/admin/strategies/{code}", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    request_body = UpdateStrategy,
+    responses((status = 200, description = "Updated", body = StrategyRow), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
 pub async fn update_strategy(
     State(state): State<AppState>,
     Path(code): Path<String>,
@@ -181,6 +204,12 @@ pub async fn update_strategy(
     Ok(Json(row))
 }
 
+#[utoipa::path(
+    delete, path = "/admin/strategies/{code}", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    responses((status = 204, description = "Deleted"), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
 pub async fn delete_strategy(State(state): State<AppState>, Path(code): Path<String>) -> Result<StatusCode, AdminError> {
     info!(%code, "admin delete strategy");
     let done = sqlx::query("DELETE FROM strategy WHERE code = $1")
@@ -198,6 +227,17 @@ pub async fn delete_strategy(State(state): State<AppState>, Path(code): Path<Str
 /// Replace the strategy's connections. Each account must belong to the
 /// strategy's portfolio and sit on a connection of the named broker; a broker
 /// code may appear once.
+#[utoipa::path(
+    put, path = "/admin/strategies/{code}/connections", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    request_body = [ConnectionEntry],
+    responses(
+        (status = 204, description = "Replaced"),
+        (status = 400, description = "A broker twice, or an account of another portfolio or broker"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
 pub async fn put_connections(
     State(state): State<AppState>,
     Path(code): Path<String>,
@@ -259,6 +299,12 @@ fn check_connection(portfolio_id: Uuid, e: &ConnectionEntry, found: (Option<Uuid
 }
 
 /// Set a new FIX password and return it once.
+#[utoipa::path(
+    post, path = "/admin/strategies/{code}/password", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    responses((status = 200, description = "The new password, shown once", body = NewPassword), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
 pub async fn reset_password(State(state): State<AppState>, Path(code): Path<String>) -> Result<Json<NewPassword>, AdminError> {
     info!(%code, "admin reset strategy FIX password");
     let password = super::new_fix_password();
@@ -277,6 +323,64 @@ pub async fn reset_password(State(state): State<AppState>, Path(code): Path<Stri
     }
     reload(&state).await;
     Ok(Json(NewPassword { password }))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct AcceptorRestarted {
+    /// Strategy sessions that were logged on and were logged out by the restart.
+    pub logged_out: usize,
+}
+
+/// Restart the FIX acceptor with a session per strategy as registered now.
+#[utoipa::path(
+    post, path = "/admin/fix-acceptor/restart", tag = "admin",
+    responses(
+        (status = 200, description = "Restarted", body = AcceptorRestarted),
+        (status = 500, description = "The acceptor did not start again"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn restart_acceptor(State(state): State<AppState>) -> Result<Json<AcceptorRestarted>, AdminError> {
+    info!("admin restart FIX acceptor");
+    let s = state.clone();
+    let logged_out = tokio::task::spawn_blocking(move || s.fix_sessions().restart(&s))
+        .await
+        .map_err(|_| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, "restart task failed"))?
+        .map_err(|e| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("FIX acceptor did not start: {e}")))?;
+    Ok(Json(AcceptorRestarted { logged_out }))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct TradeableInstrument {
+    /// The broker code an order names as its `venue` (FIX tag 100).
+    pub venue: String,
+    /// That broker's symbol (FIX tag 55).
+    pub symbol: String,
+    pub instrument_id: i64,
+}
+
+/// What the calling strategy may trade.
+#[utoipa::path(
+    get, path = "/strategies/securities", tag = "orders",
+    responses(
+        (status = 200, description = "Tradeable instruments", body = [TradeableInstrument]),
+        (status = 404, description = "The caller is not a strategy"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn strategy_securities(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<TradeableInstrument>>, AdminError> {
+    let strategy = state
+        .strategies()
+        .all()
+        .iter()
+        .find(|s| s.principal_id == auth.principal_id)
+        .cloned()
+        .ok_or_else(|| AdminError::not_found("strategy"))?;
+    let rows = super::session::tradeable(state.pool(), &strategy).await.map_err(map_db_error)?;
+    Ok(Json(rows.into_iter().map(|(venue, symbol, instrument_id)| TradeableInstrument { venue, symbol, instrument_id }).collect()))
 }
 
 #[cfg(test)]

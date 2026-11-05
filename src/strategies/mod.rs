@@ -7,6 +7,7 @@
 
 pub mod admin;
 pub mod guard;
+pub mod session;
 #[cfg(test)]
 pub(crate) mod test_support;
 

@@ -52,7 +52,7 @@ fn redact_fix_secrets(msg: &str) -> String {
 /// `RUST_LOG=fix::wire=debug` is set, which shows it); session events at info.
 /// Secret tags are redacted in both directions regardless of level — see
 /// `redact_fix_secrets`.
-struct TracingFixLog;
+pub(crate) struct TracingFixLog;
 
 impl LogCallback for TracingFixLog {
     fn on_incoming(&self, _session: Option<&SessionId>, msg: &str) {

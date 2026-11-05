@@ -158,6 +158,14 @@ mod boundary_tests;
         admin::expiry_sweep,
         admin::setup_status,
         admin::revoke_principal_sessions,
+        strategies::admin::list_strategies,
+        strategies::admin::create_strategy,
+        strategies::admin::update_strategy,
+        strategies::admin::delete_strategy,
+        strategies::admin::put_connections,
+        strategies::admin::reset_password,
+        strategies::admin::restart_acceptor,
+        strategies::admin::strategy_securities,
         auth_api::login,
         auth_api::callback,
         auth_api::logout,
@@ -192,6 +200,9 @@ mod boundary_tests;
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         admin::RevokedSessions,
         auth_api::MeResponse,
+        strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
+        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::AcceptorRestarted,
+        strategies::admin::TradeableInstrument,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -1140,6 +1151,9 @@ async fn serve() {
     if let Err(e) = state.strategies().reload(state.pool()).await {
         error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");
     }
+    if let Err(e) = state.fix_sessions().start(&state, file_cfg.and_then(|f| f.fix_acceptor())) {
+        error!(error = %e, "FIX acceptor did not start; strategies cannot log on over FIX");
+    }
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -1351,6 +1365,7 @@ async fn serve() {
         .route("/orders/:id", get(handlers::get_order))
         .route("/orders/:id/events", get(order_events::get_order_events))
         .route("/orders", get(handlers::list_orders))
+        .route("/strategies/securities", get(strategies::admin::strategy_securities))
         .route("/portfolios", get(handlers::list_portfolios))
         .route(
             "/watchlist",
@@ -1486,6 +1501,7 @@ async fn serve() {
         )
         .route("/admin/strategies/:code/connections", axum::routing::put(strategies::admin::put_connections))
         .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
+        .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))

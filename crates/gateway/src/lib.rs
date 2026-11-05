@@ -8,6 +8,7 @@ pub mod connectors;
 pub mod contract;
 pub mod credentials;
 pub mod fix;
+pub mod fix_acceptor;
 pub mod md;
 pub mod stream_health;
 pub mod stream_supervisor;

@@ -109,6 +109,8 @@ pub struct AppState {
     market_data: Arc<MarketDataGateway>,
     /// The strategy registry as last loaded; admin writes reload it.
     strategies: crate::strategies::RegistrySnapshot,
+    /// Strategies' FIX sessions (the acceptor, when configured).
+    fix_sessions: crate::strategies::session::FixSessions,
 }
 
 impl AppState {
@@ -142,6 +144,7 @@ impl AppState {
             engine,
             market_data,
             strategies: crate::strategies::RegistrySnapshot::default(),
+            fix_sessions: crate::strategies::session::FixSessions::default(),
         }
     }
 
@@ -210,6 +213,10 @@ impl AppState {
 
     pub fn strategies(&self) -> &crate::strategies::RegistrySnapshot {
         &self.strategies
+    }
+
+    pub fn fix_sessions(&self) -> &crate::strategies::session::FixSessions {
+        &self.fix_sessions
     }
 }
 
