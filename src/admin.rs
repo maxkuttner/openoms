@@ -2841,7 +2841,11 @@ pub struct AdminError {
 }
 
 impl AdminError {
-    fn not_found(resource: &str) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self { status, message: message.into() }
+    }
+
+    pub(crate) fn not_found(resource: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: format!("{resource} not found"),
@@ -2855,7 +2859,7 @@ impl IntoResponse for AdminError {
     }
 }
 
-fn map_db_error(err: sqlx::Error) -> AdminError {
+pub(crate) fn map_db_error(err: sqlx::Error) -> AdminError {
     if let sqlx::Error::Database(db_err) = &err {
         if db_err.code().as_deref() == Some("23505") {
             return AdminError {

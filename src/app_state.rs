@@ -107,6 +107,8 @@ pub struct AppState {
     /// The market data gateway. Stored so a reload can restart a credentialed
     /// feed on the same gateway whose quotes the boot-time `mark_router` reads.
     market_data: Arc<MarketDataGateway>,
+    /// The strategy registry as last loaded; admin writes reload it.
+    strategies: crate::strategies::RegistrySnapshot,
 }
 
 impl AppState {
@@ -139,6 +141,7 @@ impl AppState {
             event_bus,
             engine,
             market_data,
+            strategies: crate::strategies::RegistrySnapshot::default(),
         }
     }
 
@@ -203,6 +206,10 @@ impl AppState {
     /// The market data gateway, for starting feeds and telling it what is held.
     pub fn market_data(&self) -> &MarketDataGateway {
         &self.market_data
+    }
+
+    pub fn strategies(&self) -> &crate::strategies::RegistrySnapshot {
+        &self.strategies
     }
 }
 

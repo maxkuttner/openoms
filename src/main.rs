@@ -66,6 +66,7 @@ mod marks;
 mod daily_stats;
 
 mod market_data;
+mod strategies;
 mod mark_router;
 mod daily_stats_poller;
 mod feeds;
@@ -1135,6 +1136,9 @@ async fn serve() {
         session_config,
     );
     state.swap_registries(registry, daily_stats);
+    if let Err(e) = state.strategies().reload(state.pool()).await {
+        error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");
+    }
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -1471,6 +1475,16 @@ async fn serve() {
                 .patch(admin::update_risk_limit)
                 .delete(admin::delete_risk_limit),
         )
+        .route(
+            "/admin/strategies",
+            post(strategies::admin::create_strategy).get(strategies::admin::list_strategies),
+        )
+        .route(
+            "/admin/strategies/:code",
+            axum::routing::put(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
+        )
+        .route("/admin/strategies/:code/connections", axum::routing::put(strategies::admin::put_connections))
+        .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
