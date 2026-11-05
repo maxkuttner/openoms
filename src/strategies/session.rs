@@ -143,7 +143,11 @@ impl FixSessions {
             .all()
             .iter()
             .map(|s| (session_key(s), s.allowed_addresses.clone()))
-            .collect();
+            .collect::<Vec<_>>();
+        if sessions.is_empty() {
+            info!("FIX acceptor: no strategy registered; restart it once one is");
+            return Ok(());
+        }
         let cfg = AcceptorConfig {
             port: settings.port,
             certificate: settings.certificate.into(),
@@ -660,6 +664,16 @@ mod tests {
         let payload = serde_json::json!({ "event_id": "e", "payload": { "fill_qty": 2.0, "fill_price": 101.5, "cum_qty": 2.0 } });
         assert_eq!(fill_of(&payload), Some((2.0, 101.5)));
         assert_eq!(fill_of(&serde_json::json!({ "reason": "x" })), None);
+    }
+
+    /// With no strategy registered there is no session to define: the acceptor
+    /// waits for a restart instead of failing.
+    #[tokio::test]
+    async fn an_acceptor_with_no_strategies_waits_for_a_restart() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/never_connects").unwrap();
+        let state = crate::strategies::test_support::state(pool);
+        let settings = FixAcceptorSettings { port: 1, certificate: "c.pem".into(), private_key: "k.pem".into() };
+        assert!(state.fix_sessions().start(&state, Some(settings)).is_ok());
     }
 
     #[tokio::test]
