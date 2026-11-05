@@ -14,7 +14,7 @@ use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::{CancelOrder, OrderCommand, RouteOrder};
-use crate::domain::orders::state::{OrderAggregateState, TimeInForce};
+use crate::domain::orders::state::{OrderAggregateState, OrderStatus, TimeInForce};
 use crate::event_bus::publish_appended;
 use crate::event_store::OrderEventStore;
 use crate::handlers::{
@@ -363,16 +363,29 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // Pre-trade risk check. Runs inside TX1 so the FOR UPDATE lock on the
     // risk_limits row serializes concurrent submits for the same
     // portfolio/instrument scope until this transaction commits.
-    let risk = if strategy.is_some() {
-        // The strategy row as it is now, locked: its state and limits may have
-        // changed since the snapshot (Kill), and the lock serializes its submits.
-        match strategies::by_portfolio(&mut tx, portfolio_id).await {
-            Ok(Some(locked)) => guard::check(&mut tx, &locked, &cmd, &quote_currency, mark, contract_size).await,
-            Ok(None) => Ok(()),
-            Err(e) => Err(RiskCheckError::Data(e)),
+    // The strategy row as it is now, locked, whatever the snapshot said: its
+    // state may have changed since (Kill), the lock serializes its submits and
+    // its session-end cancels, and a portfolio the snapshot missed is still
+    // the strategy's.
+    let risk = match strategies::by_portfolio(&mut tx, portfolio_id).await {
+        Ok(Some(locked)) => {
+            let gates = (|| {
+                if strategy.is_none() {
+                    return Err(RiskRejection {
+                        code: "strategy_registry".into(),
+                        message: "the strategy registry is not loaded; retry".into(),
+                    });
+                }
+                guard::may_trade(&locked, auth.principal_id)?;
+                guard::session_gate(&origin, state.fix_sessions().is_live(&locked.code))
+            })();
+            match gates {
+                Ok(()) => guard::check(&mut tx, &locked, &cmd, &quote_currency, mark, contract_size).await,
+                Err(rejection) => Err(RiskCheckError::Rejected(rejection)),
+            }
         }
-    } else {
-        RiskEngine::new(PgRiskDataProvider::new(&mut *tx)).check_submit(portfolio_id, &cmd, contract_size).await
+        Ok(None) => RiskEngine::new(PgRiskDataProvider::new(&mut *tx)).check_submit(portfolio_id, &cmd, contract_size).await,
+        Err(e) => Err(RiskCheckError::Data(e)),
     };
     risk.map_err(|err| match err {
         RiskCheckError::Rejected(rejection) => risk_api_error(order_id, rejection),
@@ -612,6 +625,15 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         };
 
         if current_state.status.is_terminal() {
+            // Cancelled locally while the broker call was in flight (a Kill, or a
+            // strategy's session ending): the venue has the order the OMS no
+            // longer tracks, so cancel it there too.
+            if current_state.status == OrderStatus::Canceled {
+                warn!(order_id = %order_id, "order was cancelled while routing; cancelling it at the broker");
+                if let Err(err) = adapter.cancel_order(&broker_resp.external_order_id, &broker_symbol).await {
+                    error!(order_id = %order_id, error = %err, "could not cancel at the broker an order cancelled while routing");
+                }
+            }
             // The broker already reported a fill (or the order was canceled
             // concurrently) before we got here — same race MAX_ROUTE_ATTEMPTS
             // guards against, just resolved in execution.rs's favor entirely.

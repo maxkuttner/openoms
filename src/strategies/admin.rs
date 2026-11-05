@@ -81,7 +81,7 @@ pub struct UpdateStrategy {
     pub price_band_pct: Option<f64>,
 }
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Deserialize, Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct ConnectionEntry {
     pub broker_code: String,
     pub account_id: Uuid,
@@ -253,6 +253,24 @@ pub async fn delete_strategy(State(state): State<AppState>, Path(code): Path<Str
     }
     reload(&state).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The strategy's connections: one account per broker code.
+#[utoipa::path(
+    get, path = "/admin/strategies/{code}/connections", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    responses((status = 200, description = "Its connections", body = [ConnectionEntry])),
+    security(("bearer_token" = []))
+)]
+pub async fn get_connections(State(state): State<AppState>, Path(code): Path<String>) -> Result<Json<Vec<ConnectionEntry>>, AdminError> {
+    let rows = sqlx::query_as::<_, ConnectionEntry>(
+        "SELECT broker_code, account_id FROM strategy_connection WHERE strategy_code = $1 ORDER BY broker_code",
+    )
+    .bind(&code)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(rows))
 }
 
 /// Replace the strategy's connections. Each account must belong to the

@@ -2332,6 +2332,44 @@
       }
     },
     "/admin/strategies/{code}/connections": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "The strategy's connections: one account per broker code.",
+        "operationId": "get_connections",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Its connections",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectionEntry"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
       "put": {
         "tags": [
           "admin"

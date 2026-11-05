@@ -44,6 +44,9 @@ pub fn logon_decision(strategy: Option<&Strategy>, password: Option<&str>, live:
     if s.state == TradingState::Halted {
         return Err("strategy is halted".into());
     }
+    if !s.rest_enabled {
+        return Err("strategy is stopped".into());
+    }
     if live {
         return Err("a session is already logged on".into());
     }
@@ -78,6 +81,35 @@ impl LogonCheck for StrategyLogon {
     }
 }
 
+/// New orders a strategy is still placing, by ClOrdID, so a cancel or status
+/// request that names one waits for it: FIX requests on one order keep their
+/// order, while different orders (an arbitrage's legs) still run side by side.
+#[derive(Clone, Default)]
+pub struct InFlight(Arc<Mutex<std::collections::HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>);
+
+impl InFlight {
+    /// Mark `cl_ord_id` as being placed until the guard drops.
+    pub fn begin(&self, code: &str, cl_ord_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = lock.clone().try_lock_owned().expect("a fresh lock is free");
+        self.0.lock().unwrap().insert((code.to_string(), cl_ord_id.to_string()), lock);
+        guard
+    }
+
+    /// Wait until `cl_ord_id` is no longer being placed.
+    pub async fn wait(&self, code: &str, cl_ord_id: &str) {
+        let lock = self.0.lock().unwrap().get(&(code.to_string(), cl_ord_id.to_string())).cloned();
+        if let Some(lock) = lock {
+            let _ = lock.lock().await;
+        }
+    }
+
+    /// Forget a placed order.
+    pub fn end(&self, code: &str, cl_ord_id: &str) {
+        self.0.lock().unwrap().remove(&(code.to_string(), cl_ord_id.to_string()));
+    }
+}
+
 /// The running acceptor, if one is configured, and which strategies are
 /// logged on. Cheap to clone; every clone sees the same acceptor.
 #[derive(Clone, Default)]
@@ -87,6 +119,10 @@ pub struct FixSessions {
     settings: Arc<Mutex<Option<FixAcceptorSettings>>>,
     reporting: Arc<std::sync::atomic::AtomicBool>,
     delivery: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Each live session and the strategy it logged on as: later events on it
+    /// resolve here even if the registry changed or dropped the strategy since.
+    sessions: Arc<Mutex<std::collections::HashMap<SessionKey, Strategy>>>,
+    inflight: InFlight,
 }
 
 impl FixSessions {
@@ -139,17 +175,29 @@ impl FixSessions {
         Ok(logged_out)
     }
 
-    pub fn send(&self, key: &SessionKey, report: ClientReport) {
-        if let Some(acceptor) = self.acceptor.lock().unwrap().as_ref() {
-            if let Err(e) = acceptor.send(key, report) {
+    /// Whether the report went to the session.
+    pub fn send(&self, key: &SessionKey, report: ClientReport) -> bool {
+        let guard = self.acceptor.lock().unwrap();
+        let Some(acceptor) = guard.as_ref() else { return false };
+        match acceptor.send(key, report) {
+            Ok(()) => true,
+            Err(e) => {
                 warn!(session = ?key, error = %e, "FIX: report not sent");
+                false
             }
         }
     }
 
+    /// Log the session out; it stays out until [`FixSessions::enable`].
     pub fn logout(&self, key: &SessionKey, reason: &str) {
         if let Some(acceptor) = self.acceptor.lock().unwrap().as_ref() {
             acceptor.logout(key, reason);
+        }
+    }
+
+    pub fn enable(&self, key: &SessionKey) {
+        if let Some(acceptor) = self.acceptor.lock().unwrap().as_ref() {
+            acceptor.enable(key);
         }
     }
 
@@ -157,42 +205,78 @@ impl FixSessions {
         self.delivery.lock().unwrap().entry(code.to_string()).or_default().clone()
     }
 
-    fn logged_on(&self, code: &str) {
-        self.live.lock().unwrap().insert(code.to_string());
+    fn logged_on(&self, key: &SessionKey, strategy: &Strategy) {
+        self.live.lock().unwrap().insert(strategy.code.clone());
+        self.sessions.lock().unwrap().insert(key.clone(), strategy.clone());
     }
 
-    /// Whether `code` had a live session (a refused Logon never had one).
-    fn logged_out(&self, code: &str) -> bool {
-        self.live.lock().unwrap().remove(code)
+    /// The strategy a live session belonged to; `None` when it had none (a
+    /// refused Logon never had one).
+    fn logged_out(&self, key: &SessionKey) -> Option<Strategy> {
+        let strategy = self.sessions.lock().unwrap().remove(key)?;
+        self.live.lock().unwrap().remove(&strategy.code);
+        Some(strategy)
+    }
+
+    /// The strategy behind a live session: as the registry has it now, else
+    /// as it logged on.
+    fn strategy_of(&self, key: &SessionKey, strategies: &RegistrySnapshot) -> Option<Strategy> {
+        let known = self.sessions.lock().unwrap().get(key).cloned()?;
+        Some(strategies.by_code(&known.code).unwrap_or(known))
     }
 }
 
 /// Handle what the acceptor reports until it stops.
 async fn run(state: AppState, mut inbound: mpsc::UnboundedReceiver<(SessionKey, Inbound)>) {
     while let Some((key, event)) = inbound.recv().await {
-        let Some(strategy) = state.strategies().by_comp_ids(&key.sender_comp_id, &key.target_comp_id) else {
-            warn!(session = ?key, "FIX: event for a session no strategy owns");
-            continue;
-        };
+        let sessions = state.fix_sessions().clone();
         match event {
             Inbound::LoggedOn => {
-                state.fix_sessions().logged_on(&strategy.code);
+                let Some(strategy) = state.strategies().by_comp_ids(&key.sender_comp_id, &key.target_comp_id) else {
+                    warn!(session = ?key, "FIX: logon on a session no strategy owns; logging it out");
+                    sessions.logout(&key, "no strategy");
+                    continue;
+                };
+                sessions.logged_on(&key, &strategy);
                 let state = state.clone();
                 tokio::spawn(async move { replay(&state, &strategy).await });
             }
             Inbound::LoggedOut => {
                 // A refused logon never had a session: nothing to cancel.
-                if state.fix_sessions().logged_out(&strategy.code) {
+                if let Some(strategy) = sessions.logged_out(&key) {
                     let state = state.clone();
                     tokio::spawn(async move { super::control::on_session_end(&state, &strategy).await });
                 }
             }
             Inbound::Request(request) => {
+                let Some(strategy) = sessions.strategy_of(&key, state.strategies()) else {
+                    warn!(session = ?key, "FIX: request on a session that is not logged on");
+                    continue;
+                };
+                // A new order is marked in flight before its task starts, so a
+                // cancel or status request right behind it waits for it.
+                let placing = match &request {
+                    ClientRequest::NewOrder { cl_ord_id, .. } => Some((cl_ord_id.clone(), sessions.inflight.begin(&strategy.code, cl_ord_id))),
+                    _ => None,
+                };
+                let names = match &request {
+                    ClientRequest::Cancel { orig_cl_ord_id, .. } => Some(orig_cl_ord_id.clone()),
+                    ClientRequest::Status { cl_ord_id } => Some(cl_ord_id.clone()),
+                    _ => None,
+                };
                 // Each request on its own task: one leg never waits on another.
                 let state = state.clone();
                 tokio::spawn(async move {
-                    if let Some(report) = handle(&state, &strategy, request).await {
-                        state.fix_sessions().send(&key, report);
+                    if let Some(named) = names {
+                        sessions.inflight.wait(&strategy.code, &named).await;
+                    }
+                    let report = handle(&state, &strategy, request).await;
+                    if let Some((cl_ord_id, guard)) = placing {
+                        drop(guard);
+                        sessions.inflight.end(&strategy.code, &cl_ord_id);
+                    }
+                    if let Some(report) = report {
+                        let _ = sessions.send(&key, report);
                     }
                 });
             }
@@ -320,9 +404,10 @@ pub fn exec_for(event_type: &str) -> Option<(ExecType, OrdStatus)> {
     }
 }
 
-/// Of `events` (global_position, event_type), the ones to report after `cursor`.
-pub fn reports_to_replay(cursor: i64, events: &[(i64, &str)]) -> Vec<i64> {
-    events.iter().filter(|(pos, t)| *pos > cursor && exec_for(t).is_some()).map(|(pos, _)| *pos).collect()
+/// Whether a strategy is told about this order event (an execution report,
+/// or an Order Cancel Reject for `cancel_rejected`).
+pub fn is_reported(event_type: &str) -> bool {
+    event_type == "cancel_rejected" || exec_for(event_type).is_some()
 }
 
 /// (fill_qty, fill_price) wherever a fill event's payload carries them.
@@ -351,12 +436,24 @@ fn reason_of(payload: &serde_json::Value) -> Option<String> {
 /// other order or event. Quantities are the order's as they stand now; the
 /// type and status are the event's.
 async fn report_for_event(pool: &PgPool, order_id: Uuid, global_position: i64, event_type: &str) -> Result<Option<ClientReport>, sqlx::Error> {
-    let Some((exec_type, status)) = exec_for(event_type) else { return Ok(None) };
     let payload: serde_json::Value = sqlx::query_scalar("SELECT payload_json FROM order_event WHERE global_position = $1")
         .bind(global_position)
         .fetch_optional(pool)
         .await?
         .unwrap_or_default();
+    if event_type == "cancel_rejected" {
+        let cl_ord_id: Option<String> = sqlx::query_scalar("SELECT fix_cl_ord_id FROM order_state WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+        return Ok(cl_ord_id.map(|id| ClientReport::CancelReject {
+            cl_ord_id: id.clone(),
+            orig_cl_ord_id: id,
+            text: reason_of(&payload).unwrap_or_else(|| "cancel rejected by the broker".into()),
+        }));
+    }
+    let Some((exec_type, status)) = exec_for(event_type) else { return Ok(None) };
     let last = if exec_type == ExecType::Trade { fill_of(&payload) } else { None };
     let report = status_report(pool, order_id, exec_type, global_position.to_string(), last).await?;
     Ok(report.map(|r| match r {
@@ -370,55 +467,44 @@ async fn report_for_event(pool: &PgPool, order_id: Uuid, global_position: i64, e
     }))
 }
 
-/// Move the strategy's cursor to `global_position` and send the report, once:
-/// a position the cursor already passed is not sent again.
-async fn deliver(state: &AppState, strategy: &Strategy, global_position: i64, report: ClientReport) -> Result<(), sqlx::Error> {
-    let claimed = sqlx::query("UPDATE strategy SET fix_report_position = $2 WHERE code = $1 AND fix_report_position < $2")
-        .bind(&strategy.code)
-        .bind(global_position)
-        .execute(state.pool())
-        .await?
-        .rows_affected()
-        == 1;
-    if claimed {
-        state.fix_sessions().send(&session_key(strategy), report);
-    }
-    Ok(())
-}
-
-/// Everything on the strategy's FIX orders since its cursor, in order. The
-/// only way reports reach a strategy, live or after a logon, and serialized
-/// per strategy, so each goes out once and in order.
+/// Send every report the strategy is owed, oldest first. The only way
+/// reports reach a strategy, live or after a logon; serialized per strategy so
+/// each goes out once and in order. A row leaves the queue only once its report
+/// went out on a logged-on session; the rest wait for the next logon.
 async fn replay(state: &AppState, strategy: &Strategy) {
     let lock = state.fix_sessions().delivery_lock(&strategy.code);
     let _held = lock.lock().await;
     let result: Result<(), sqlx::Error> = async {
-        let cursor: i64 = sqlx::query_scalar("SELECT fix_report_position FROM strategy WHERE code = $1")
-            .bind(&strategy.code)
-            .fetch_one(state.pool())
-            .await?;
         let rows = sqlx::query_as::<_, (i64, Uuid, String)>(
-            "SELECT e.global_position, e.order_id, e.event_type FROM order_event e \
-             JOIN order_state o ON o.order_id = e.order_id \
-             WHERE o.portfolio_id = $1 AND o.origin = 'FIX' AND e.global_position > $2 \
-             ORDER BY e.global_position",
+            "SELECT q.global_position, e.order_id, e.event_type FROM fix_report_queue q \
+             JOIN order_event e ON e.global_position = q.global_position \
+             WHERE q.strategy_code = $1 ORDER BY q.global_position",
         )
-        .bind(strategy.portfolio_id)
-        .bind(cursor)
+        .bind(&strategy.code)
         .fetch_all(state.pool())
         .await?;
-        let events: Vec<(i64, &str)> = rows.iter().map(|(p, _, t)| (*p, t.as_str())).collect();
-        let due = reports_to_replay(cursor, &events);
-        for (pos, order_id, event_type) in rows.iter().filter(|(p, _, _)| due.contains(p)) {
-            if let Some(report) = report_for_event(state.pool(), *order_id, *pos, event_type).await? {
-                deliver(state, strategy, *pos, report).await?;
+        for (pos, order_id, event_type) in rows {
+            if !state.fix_sessions().is_live(&strategy.code) {
+                break;
             }
+            let sent = match report_for_event(state.pool(), order_id, pos, &event_type).await? {
+                Some(report) => state.fix_sessions().send(&session_key(strategy), report),
+                None => true,
+            };
+            if !sent {
+                break;
+            }
+            sqlx::query("DELETE FROM fix_report_queue WHERE strategy_code = $1 AND global_position = $2")
+                .bind(&strategy.code)
+                .bind(pos)
+                .execute(state.pool())
+                .await?;
         }
         Ok(())
     }
     .await;
     if let Err(e) = result {
-        error!(strategy = %strategy.code, error = %e, "FIX: replay failed");
+        error!(strategy = %strategy.code, error = %e, "FIX: report delivery failed; the rest is sent at the next logon");
     }
 }
 
@@ -432,7 +518,7 @@ async fn report_loop(state: AppState) {
     loop {
         match lane.recv().await {
             Ok(OrderLaneEvent::Appended { order_id, global_position: _, event_type }) => {
-                if exec_for(&event_type).is_none() {
+                if !is_reported(&event_type) {
                     continue;
                 }
                 let portfolio: Option<Uuid> = sqlx::query_scalar("SELECT portfolio_id FROM order_state WHERE order_id = $1 AND origin = 'FIX'")
@@ -540,6 +626,8 @@ mod tests {
         assert_eq!(logon_decision(Some(&s), None, false).unwrap_err(), "wrong password");
         assert!(logon_decision(Some(&s), Some("pw"), false).is_ok());
         assert_eq!(logon_decision(Some(&s), Some("pw"), true).unwrap_err(), "a session is already logged on");
+        s.rest_enabled = false;
+        assert_eq!(logon_decision(Some(&s), Some("pw"), false).unwrap_err(), "strategy is stopped");
         s.state = TradingState::Halted;
         assert_eq!(logon_decision(Some(&s), Some("pw"), false).unwrap_err(), "strategy is halted");
     }
@@ -556,10 +644,15 @@ mod tests {
     }
 
     #[test]
-    fn logon_replays_reports_past_the_cursor_once() {
-        let events = [(9, "order_routed"), (11, "order_canceled"), (12, "order_submitted")];
-        assert_eq!(reports_to_replay(10, &events), vec![11]);
-        assert!(reports_to_replay(12, &events).is_empty());
+    fn a_rejected_cancel_is_reported_to_the_strategy() {
+        assert!(is_reported("cancel_rejected"));
+        assert!(is_reported("order_filled"));
+        assert!(!is_reported("order_submitted"));
+        // Every type the queue trigger enqueues is one the strategy is told about.
+        let migration = include_str!("../../db/migrations/ods/oms/0037_CREATE_FIX_REPORT_QUEUE.sql");
+        for t in ["order_routed", "order_partially_filled", "order_filled", "order_canceled", "order_rejected", "order_expired", "cancel_rejected"] {
+            assert!(migration.contains(&format!("'{t}'")) && is_reported(t), "{t}");
+        }
     }
 
     #[test]
@@ -569,11 +662,40 @@ mod tests {
         assert_eq!(fill_of(&serde_json::json!({ "reason": "x" })), None);
     }
 
+    #[tokio::test]
+    async fn a_cancel_waits_for_the_order_it_names_to_be_placed() {
+        let inflight = InFlight::default();
+        let placing = inflight.begin("s", "c1");
+        let waiter = {
+            let inflight = inflight.clone();
+            tokio::spawn(async move { inflight.wait("s", "c1").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished(), "the cancel ran before the order was placed");
+        drop(placing);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap();
+        // Another ClOrdID never waits.
+        tokio::time::timeout(std::time::Duration::from_millis(50), inflight.wait("s", "c2")).await.unwrap();
+    }
+
+    #[test]
+    fn a_session_ends_as_the_strategy_it_logged_on_as() {
+        let sessions = FixSessions::default();
+        let s = sample("s", "S", "OMS");
+        let key = session_key(&s);
+        sessions.logged_on(&key, &s);
+        assert!(sessions.is_live("s"));
+        // The registry may have changed or dropped it since; the session still knows.
+        assert_eq!(sessions.logged_out(&key).map(|s| s.code), Some("s".to_string()));
+        assert!(!sessions.is_live("s"));
+        assert!(sessions.logged_out(&key).is_none(), "a second logout is not a session end");
+    }
+
     /// Against the shared dev DB: a fill on a FIX order is reported and moves
     /// the strategy's cursor; a second replay sends nothing again.
     #[tokio::test]
     #[ignore]
-    async fn a_fill_on_a_fix_order_reaches_the_session_and_advances_the_cursor() {
+    async fn a_fill_on_a_fix_order_is_queued_until_it_can_be_sent() {
         use crate::strategies::test_support;
         let pool = test_support::dev_pool().await;
         let code = test_support::seed_strategy(&pool).await;
@@ -597,9 +719,13 @@ mod tests {
         .bind(order_id).bind(Uuid::new_v4())
         .fetch_one(&pool).await.unwrap();
 
+        let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM fix_report_queue WHERE strategy_code = $1 AND global_position = $2")
+            .bind(&code).bind(pos).fetch_one(&pool).await.unwrap();
+        assert_eq!(queued, 1, "the trigger queues the fill");
+        // Not logged on: it stays queued for the next logon.
         replay(&state, &strategy).await;
-        let cursor: i64 = sqlx::query_scalar("SELECT fix_report_position FROM strategy WHERE code = $1").bind(&code).fetch_one(&pool).await.unwrap();
-        assert_eq!(cursor, pos);
+        let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM fix_report_queue WHERE strategy_code = $1").bind(&code).fetch_one(&pool).await.unwrap();
+        assert_eq!(queued, 1);
 
         sqlx::query("DELETE FROM order_event WHERE order_id = $1").bind(order_id).execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM order_state WHERE order_id = $1").bind(order_id).execute(&pool).await.unwrap();

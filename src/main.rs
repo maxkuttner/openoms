@@ -163,6 +163,7 @@ mod boundary_tests;
         strategies::admin::update_strategy,
         strategies::admin::delete_strategy,
         strategies::admin::put_connections,
+        strategies::admin::get_connections,
         strategies::admin::reset_password,
         strategies::admin::restart_acceptor,
         strategies::admin::strategy_securities,
@@ -1154,10 +1155,12 @@ async fn serve() {
     if let Err(e) = state.strategies().reload(state.pool()).await {
         error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");
     }
+    // Before the acceptor opens: a strategy that reconnects at once must not
+    // have its new orders taken for leftovers.
+    strategies::control::boot_recovery(&state).await;
     if let Err(e) = state.fix_sessions().start(&state, file_cfg.and_then(|f| f.fix_acceptor())) {
         error!(error = %e, "FIX acceptor did not start; strategies cannot log on over FIX");
     }
-    strategies::control::boot_recovery(&state).await;
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -1503,7 +1506,10 @@ async fn serve() {
             "/admin/strategies/:code",
             axum::routing::patch(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
         )
-        .route("/admin/strategies/:code/connections", axum::routing::put(strategies::admin::put_connections))
+        .route(
+            "/admin/strategies/:code/connections",
+            axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
+        )
         .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
         .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
         .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))

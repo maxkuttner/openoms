@@ -40,14 +40,24 @@ pub fn flatten_order(net_qty: f64, mid: f64, band_pct: f64) -> (OrderSide, f64, 
 /// `keep_flatten`.
 pub async fn cancel_open(state: &AppState, strategy: &Strategy, keep_flatten: bool, reason: &str) -> ControlReport {
     let mut report = ControlReport::default();
-    let open = sqlx::query_scalar::<_, Uuid>(
-        "SELECT order_id FROM order_state WHERE portfolio_id = $1 \
-           AND status IN ('submitted', 'routed', 'partially_filled') \
-           AND NOT ($2 AND origin = 'FLATTEN')",
-    )
-    .bind(strategy.portfolio_id)
-    .bind(keep_flatten)
-    .fetch_all(state.pool())
+    // List under the strategy row's lock, which every submit holds through
+    // its first transaction: an order already past its checks is listed, and
+    // one that is not yet sees the new state or the ended session.
+    let open: Result<Vec<Uuid>, sqlx::Error> = async {
+        let mut tx = state.pool().begin().await?;
+        sqlx::query("SELECT 1 FROM strategy WHERE code = $1 FOR UPDATE").bind(&strategy.code).execute(&mut *tx).await?;
+        let ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT order_id FROM order_state WHERE portfolio_id = $1 \
+               AND status IN ('submitted', 'routed', 'partially_filled', 'suspended') \
+               AND NOT ($2 AND origin = 'FLATTEN')",
+        )
+        .bind(strategy.portfolio_id)
+        .bind(keep_flatten)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
     .await;
     let open = match open {
         Ok(ids) => ids,
@@ -93,7 +103,9 @@ pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiErro
 }
 
 pub async fn enable(state: &AppState, code: &str) -> Result<(), ApiError> {
-    set_state(state, code, "ACTIVE", true).await.map(|_| ())
+    let strategy = set_state(state, code, "ACTIVE", true).await?;
+    state.fix_sessions().enable(&session_key(&strategy));
+    Ok(())
 }
 
 /// Kill, but leave the strategy reducing only, then close every position
@@ -197,6 +209,16 @@ pub async fn boot_recovery(state: &AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Leftover orders are cancelled before strategies can log on again, so a
+    /// fast reconnect's new orders are never taken for leftovers.
+    #[test]
+    fn boot_recovery_runs_before_the_acceptor_opens() {
+        let main = include_str!("../main.rs");
+        let recovery = main.find("strategies::control::boot_recovery(&state)").expect("boot recovery is called");
+        let acceptor = main.find("state.fix_sessions().start(").expect("the acceptor is started");
+        assert!(recovery < acceptor);
+    }
 
     #[test]
     fn flatten_sells_a_long_at_the_lower_band_edge() {

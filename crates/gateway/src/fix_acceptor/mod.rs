@@ -283,7 +283,7 @@ impl AcceptorHandle {
                     Ok(l) => l,
                     Err(e) => return fail(format!("log: {e}")),
                 };
-                let mut acceptor = match Acceptor::try_new(&settings, &app, &store, &log, FixSocketServerKind::SslSingleThreaded) {
+                let mut acceptor = match Acceptor::try_new(&settings, &app, &store, &log, FixSocketServerKind::SslMultiThreaded) {
                     Ok(a) => a,
                     Err(e) => return fail(format!("acceptor: {e}")),
                 };
@@ -328,21 +328,32 @@ impl AcceptorHandle {
         quickfix::send_to_target(msg, &sid).map_err(|e| e.to_string())
     }
 
-    /// Log the session out and disconnect it. It stays enabled: whether it may
-    /// log on again is the [`LogonCheck`]'s decision.
-    pub fn logout(&self, key: &SessionKey, reason: &str) {
-        info!(session = ?key, %reason, "FIX acceptor: logging session out");
+    fn with_session(&self, key: &SessionKey, act: impl FnOnce(&mut Session<'static>) -> Result<(), QuickFixError>) {
         let Ok(sid) = oms_session_id(key) else { return };
         // SAFETY: the session lives as long as the acceptor thread, which
         // outlives this handle's calls (it stops only on `stop`).
         match unsafe { Session::lookup(&sid) } {
             Ok(mut session) => {
-                if let Err(e) = session.reset() {
-                    warn!(error = %e, "FIX acceptor: logout failed");
+                if let Err(e) = act(&mut session) {
+                    warn!(session = ?key, error = %e, "FIX acceptor: session call failed");
                 }
             }
-            Err(e) => warn!(error = %e, "FIX acceptor: no such session"),
+            Err(e) => warn!(session = ?key, error = %e, "FIX acceptor: no such session"),
         }
+    }
+
+    /// Log the session out and keep it out until [`AcceptorHandle::enable`].
+    /// Only flags the session: QuickFIX's own thread sends the Logout and
+    /// disconnects.
+    pub fn logout(&self, key: &SessionKey, reason: &str) {
+        info!(session = ?key, %reason, "FIX acceptor: logging session out");
+        self.with_session(key, |s| s.logout());
+    }
+
+    /// Let a logged-out session log on again.
+    pub fn enable(&self, key: &SessionKey) {
+        info!(session = ?key, "FIX acceptor: session enabled");
+        self.with_session(key, |s| s.logon());
     }
 
     /// Stop listening and log every session out; returns how many were logged on.
@@ -501,6 +512,25 @@ mod tests {
             _ => panic!("the client got no execution report"),
         }
         assert_eq!(acceptor.stop(), 1);
+    }
+
+    /// A logged-out session stays out, however often the client reconnects,
+    /// until it is enabled again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_logged_out_session_stays_out_until_enabled() {
+        let port = free_port();
+        let (acceptor, mut inbound) = start(port, "CLIENT3");
+        let _seen = client(port, "CLIENT3", "pw");
+        assert!(matches!(next(&mut inbound).await, Inbound::LoggedOn));
+
+        acceptor.logout(&key("CLIENT3"), "killed");
+        assert!(matches!(next(&mut inbound).await, Inbound::LoggedOut));
+        let again = tokio::time::timeout(Duration::from_secs(3), inbound.recv()).await;
+        assert!(again.is_err(), "logged on again while disabled");
+
+        acceptor.enable(&key("CLIENT3"));
+        assert!(matches!(next(&mut inbound).await, Inbound::LoggedOn));
+        acceptor.stop();
     }
 
     #[tokio::test(flavor = "multi_thread")]

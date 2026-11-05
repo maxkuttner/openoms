@@ -27,6 +27,11 @@ pub struct MarkStore {
 impl MarkStore {
     pub fn new() -> Self { Self::default() }
 
+    #[cfg(test)]
+    pub fn set_at(&self, instrument_id: i64, bid: f64, ask: f64, ts: DateTime<Utc>) {
+        self.inner.write().unwrap().insert(instrument_id, Mark { bid, ask, ts });
+    }
+
     pub fn set(&self, instrument_id: i64, bid: f64, ask: f64) {
         // acquire a write lock on the inner hashmap and insert a mark
         if let Ok(mut m) = self.inner.write() {

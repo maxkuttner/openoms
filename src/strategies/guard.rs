@@ -33,6 +33,9 @@ pub const USD_LIKE: [&str; 3] = ["USD", "USDT", "USDC"];
 /// How long an order waits for a first quote on an instrument nobody priced yet.
 pub const HOLD_FOR_MARK: Duration = Duration::from_secs(2);
 
+/// A mark older than this is no reference: the order waits for a fresh quote.
+pub const MAX_MARK_AGE: Duration = Duration::from_secs(30);
+
 /// How often a held order looks for its first quote.
 const MARK_POLL: Duration = Duration::from_millis(20);
 
@@ -43,6 +46,15 @@ fn reject(code: &str, message: String) -> RiskRejection {
 /// The market data gateway owner name for a strategy's interest.
 pub fn md_owner(strategy_code: &str) -> String {
     format!("strategy:{strategy_code}")
+}
+
+/// A FIX order is only taken while its session is live: one still in flight
+/// when the session ended would escape the disconnect cancel.
+pub fn session_gate(origin: &crate::order_entry::Origin, live: bool) -> Result<(), RiskRejection> {
+    match origin {
+        crate::order_entry::Origin::Fix { .. } if !live => Err(reject("fix_session_ended", "FIX session ended".into())),
+        _ => Ok(()),
+    }
 }
 
 /// Only the strategy's own principal trades its portfolio.
@@ -58,18 +70,29 @@ pub fn check_state(strategy: &Strategy, side: OrderSide, position_qty: f64) -> R
     check_trading_state(strategy.state, side, position_qty)
 }
 
-/// The limits for one instrument: its `risk_limits` row whole, else the
-/// strategy's defaults — whose notional limits are only read in a USD-like quote.
+/// The limits for one instrument: each field of its `risk_limits` row, else
+/// the strategy's default for that field. A default notional limit is only
+/// read in a USD-like quote; any other quote needs its own.
 pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, quote_currency: &str) -> Result<RiskLimits, RiskRejection> {
-    if let Some(limits) = override_row {
-        return Ok(limits);
-    }
     let d = strategy.limits;
-    let has_notional = d.max_order_notional.is_some() || d.max_position_notional.is_some();
-    if has_notional && !USD_LIKE.contains(&quote_currency) {
+    let o = override_row.unwrap_or(RiskLimits {
+        max_order_quantity: None,
+        max_order_notional: None,
+        max_position_quantity: None,
+        max_position_notional: None,
+    });
+    let falls_back = |own: Option<f64>, default: Option<f64>| own.is_none() && default.is_some();
+    let default_notional = falls_back(o.max_order_notional, d.max_order_notional)
+        || falls_back(o.max_position_notional, d.max_position_notional);
+    if default_notional && !USD_LIKE.contains(&quote_currency) {
         return Err(reject("no_notional_limit", format!("no notional limit for quote currency {quote_currency}")));
     }
-    Ok(d)
+    Ok(RiskLimits {
+        max_order_quantity: o.max_order_quantity.or(d.max_order_quantity),
+        max_order_notional: o.max_order_notional.or(d.max_order_notional),
+        max_position_quantity: o.max_position_quantity.or(d.max_position_quantity),
+        max_position_notional: o.max_position_notional.or(d.max_position_notional),
+    })
 }
 
 /// A limit price more than `band_pct` percent from `mid` is rejected.
@@ -103,7 +126,10 @@ pub async fn reference_mark(marks: &MarkStore, md: &MdHandle, owner: &str, inst:
     md.subscribe(owner, vec![inst.clone()]);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Some(mark) = marks.get(inst.id) {
+        let fresh = marks
+            .get(inst.id)
+            .filter(|m| chrono::Utc::now().signed_duration_since(m.ts).to_std().map_or(true, |age| age <= MAX_MARK_AGE));
+        if let Some(mark) = fresh {
             return MarkLookup::Live(mark);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -205,6 +231,37 @@ mod tests {
         assert_eq!(e.message, "no notional limit for quote currency BTC");
         assert_eq!(effective_limits(&s, Some(limits(Some(5.0))), "BTC").unwrap().max_order_notional, Some(5.0));
         assert_eq!(effective_limits(&s, None, "USDT").unwrap().max_order_notional, Some(10_000.0));
+    }
+
+    #[test]
+    fn an_override_row_replaces_only_the_fields_it_sets() {
+        let mut s = sample("s", "S", "OMS");
+        s.limits = RiskLimits { max_order_quantity: Some(7.0), ..limits(Some(10_000.0)) };
+        let qty_only = RiskLimits { max_order_quantity: Some(1.0), ..limits(None) };
+        // A non-USD quote whose notional would fall back to the default is refused.
+        assert!(effective_limits(&s, Some(qty_only), "BTC").is_err());
+        // A USD-like quote keeps the default notional beside the overridden quantity.
+        let merged = effective_limits(&s, Some(qty_only), "USDT").unwrap();
+        assert_eq!((merged.max_order_quantity, merged.max_order_notional), (Some(1.0), Some(10_000.0)));
+        // A non-USD quote with its own notional keeps the default quantity.
+        let merged = effective_limits(&s, Some(limits(Some(0.5))), "BTC").unwrap();
+        assert_eq!((merged.max_order_quantity, merged.max_order_notional), (Some(7.0), Some(0.5)));
+    }
+
+    #[test]
+    fn a_fix_order_after_its_session_ended_is_refused() {
+        let fix = crate::order_entry::Origin::Fix { cl_ord_id: "c1".into() };
+        assert_eq!(session_gate(&fix, false).unwrap_err().code, "fix_session_ended");
+        assert!(session_gate(&fix, true).is_ok());
+        assert!(session_gate(&crate::order_entry::Origin::Api, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_stale_mark_is_waited_past() {
+        let marks = MarkStore::new();
+        marks.set_at(7, 99.0, 101.0, chrono::Utc::now() - chrono::Duration::minutes(5));
+        let lookup = reference_mark(&marks, &md(), "strategy:s", &held(7), true, Duration::from_millis(50)).await;
+        assert!(matches!(lookup, MarkLookup::TimedOut), "{lookup:?}");
     }
 
     #[test]

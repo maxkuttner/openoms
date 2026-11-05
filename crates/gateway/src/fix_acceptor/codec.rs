@@ -19,7 +19,11 @@ fn required(m: &Message, tag: i32, t: &str) -> Result<String, ClientReport> {
 }
 
 fn number(m: &Message, tag: i32, t: &str) -> Result<f64, ClientReport> {
-    required(m, tag, t)?.parse().map_err(|_| reject(t, format!("tag {tag} is not a number")))
+    required(m, tag, t)?
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| reject(t, format!("tag {tag} is not a number")))
 }
 
 /// A request from a strategy, or the Business Message Reject (35=j) to answer
@@ -189,6 +193,14 @@ mod tests {
                 assert_eq!((side, qty, ord_type, price, tif), (Side::Buy, 0.5, OrdType::Limit, Some(100.25), Tif::Gtc));
             }
             other => panic!("expected a new order, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_finite_quantity_or_price_is_rejected() {
+        for bad in ["38=NaN|44=100", "38=inf|44=100", "38=1|44=NaN", "38=1|44=-inf"] {
+            let m = msg(&format!("8=FIX.4.4|9=1|35=D|11=c1|55=X|100=Y|54=1|{bad}|40=2|59=1|10=000|"));
+            assert!(matches!(decode(&m), Err(ClientReport::BusinessReject { .. })), "{bad} accepted");
         }
     }
 

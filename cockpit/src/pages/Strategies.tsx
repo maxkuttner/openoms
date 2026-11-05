@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Badge, Button, Code, CopyButton, Group, Modal, MultiSelect, Stack, Text } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
 import { api } from "../api/client";
 import { notifyError, notifyOk, useList } from "../api/hooks";
 import { useQueryClient } from "@tanstack/react-query";
-import { connectionEntries, killLabel, reportSummary, type ControlReport } from "../strategies";
+import { connectionEntries, killLabel, reportSummary, savedAccounts, type ControlReport } from "../strategies";
 
 const PATH = "/admin/strategies";
 
@@ -39,7 +39,9 @@ function Confirm({ title, body, onConfirm, onClose }: { title: string; body: str
 function ConnectionsEditor({ strategy, onClose }: { strategy: Strategy; onClose: () => void }) {
   const accounts = (useList<AccountRow>("/admin/accounts").data ?? []).filter((a) => a.portfolio_id === strategy.portfolio_id);
   const connections = useList<ConnectionRow>("/admin/broker-connections").data ?? [];
+  const saved = useList<{ broker_code: string; account_id: string }>(`${PATH}/${strategy.code}/connections`).data;
   const [picked, setPicked] = useState<string[]>([]);
+  useEffect(() => setPicked(savedAccounts(saved)), [saved]);
   const save = () =>
     api
       .put(`${PATH}/${strategy.code}/connections`, connectionEntries(picked, accounts, connections))

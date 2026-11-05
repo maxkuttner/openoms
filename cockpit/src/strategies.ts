@@ -36,3 +36,8 @@ export function connectionEntries(
     return account && connection ? [{ broker_code: connection.broker_code, account_id: id }] : [];
   });
 }
+
+// The accounts a strategy's saved connections point at, to start the editor from.
+export function savedAccounts(entries: { account_id: string }[] | undefined): string[] {
+  return (entries ?? []).map((e) => e.account_id);
+}
