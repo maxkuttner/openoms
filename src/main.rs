@@ -66,6 +66,7 @@ mod marks;
 mod daily_stats;
 
 mod market_data;
+mod order_entry;
 mod strategies;
 mod mark_router;
 mod daily_stats_poller;
