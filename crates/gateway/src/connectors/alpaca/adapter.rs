@@ -368,15 +368,16 @@ impl BrokerAdapter for AlpacaAdapter {
                 .to_string();
             Ok(BrokerOrderResponse { external_order_id })
         } else {
+            let status = response.status().as_u16();
             let err_body = response.text().await.unwrap_or_default();
-            Err(BrokerError::BrokerRejected(err_body))
+            Err(crate::adapter::http_failure(status, err_body))
         }
     }
 
     /// GET /v2/orders?status=open — the snapshot side of order reconciliation, every
     /// open order in one call. `client_order_id` is the UUID we sent.
     async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
-        let url = format!("{}/v2/orders?status=open", self.base_url);
+        let url = format!("{}{OPEN_ORDERS_PATH}", self.base_url);
         let resp = self.get_json(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
         if !resp.status().is_success() {
             return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
@@ -461,6 +462,9 @@ impl DailyStats for AlpacaAdapter {
     }
 }
 
+/// Every open order in one page (Alpaca's default page is 50).
+pub(crate) const OPEN_ORDERS_PATH: &str = "/v2/orders?status=open&limit=500";
+
 /// Where one order is read: by Alpaca's id when known, else by the client order
 /// id we sent (an order whose routing never got recorded).
 pub(crate) fn order_lookup_path(client_order_id: &str, external_order_id: &str) -> String {
@@ -491,6 +495,11 @@ pub(crate) fn parse_open_orders(orders: &serde_json::Value) -> Vec<BrokerOpenOrd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_open_orders_snapshot_asks_for_every_open_order() {
+        assert!(OPEN_ORDERS_PATH.contains("limit=500"));
+    }
 
     #[test]
     fn open_orders_carry_the_venue_order_id() {

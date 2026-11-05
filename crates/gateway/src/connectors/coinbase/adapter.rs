@@ -134,17 +134,24 @@ impl CoinbaseAdapter {
 /// non-2xx status.
 async fn read(resp: Result<reqwest::Response, reqwest::Error>) -> Result<serde_json::Value, BrokerError> {
     let resp = resp.map_err(|e| BrokerError::Network(e.to_string()))?;
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-    let body: Option<serde_json::Value> = serde_json::from_str(&text).ok();
-    if status.is_success() {
-        return body.ok_or_else(|| BrokerError::BrokerRejected(format!("HTTP {status}: not JSON: {text}")));
+    parse_body(status, &text)
+}
+
+/// A response body: JSON on success; an unreadable success or a 5xx/429 says
+/// nothing about the request (`Network`); any other failure carries Coinbase's
+/// message as a rejection.
+pub(crate) fn parse_body(status: u16, text: &str) -> Result<serde_json::Value, BrokerError> {
+    let body: Option<serde_json::Value> = serde_json::from_str(text).ok();
+    if (200..300).contains(&status) {
+        return body.ok_or_else(|| BrokerError::Network(format!("HTTP {status}: not JSON: {text}")));
     }
     let message = body
         .as_ref()
         .and_then(|b| b["message"].as_str().or(b["error"].as_str()).map(String::from))
-        .unwrap_or(text);
-    Err(BrokerError::BrokerRejected(format!("HTTP {status}: {message}")))
+        .unwrap_or_else(|| text.to_string());
+    Err(crate::adapter::http_failure(status, format!("HTTP {status}: {message}")))
 }
 
 /// A decimal string field as f64.
@@ -389,6 +396,13 @@ impl InstrumentProvider for CoinbaseAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unreadable_or_5xx_answer_is_not_a_rejection() {
+        assert!(matches!(parse_body(200, "not json"), Err(BrokerError::Network(_))));
+        assert!(matches!(parse_body(503, r#"{"message":"down"}"#), Err(BrokerError::Network(_))));
+        assert!(matches!(parse_body(400, r#"{"message":"INVALID_SIZE"}"#), Err(BrokerError::BrokerRejected(_))));
+    }
 
     #[test]
     fn open_orders_carry_the_venue_order_id() {

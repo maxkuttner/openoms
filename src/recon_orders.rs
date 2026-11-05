@@ -117,10 +117,10 @@ pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str, environme
     let rows = match sqlx::query(
         "SELECT os.order_id, bi.broker_symbol AS symbol, os.cum_qty::float8 AS cum_qty, \
                 os.avg_px::float8 AS avg_px, \
-                (SELECT payload_json->'payload'->>'external_order_id' \
+                COALESCE((SELECT payload_json->'payload'->>'external_order_id' \
                    FROM order_event \
                   WHERE order_id = os.order_id AND event_type = 'order_routed' \
-                  LIMIT 1) AS ext_id \
+                  LIMIT 1), os.external_order_id) AS ext_id \
          FROM order_state os \
          JOIN broker_connection bc ON bc.code = os.broker_connection_code \
          JOIN broker_instrument bi \
@@ -213,7 +213,7 @@ pub enum StuckAction {
 pub fn plan_stuck(stuck: &[StuckOrder], broker_open: &[BrokerOpenOrder]) -> Vec<StuckAction> {
     stuck
         .iter()
-        .map(|s| match broker_open.iter().find(|b| b.client_order_id == s.order_id.to_string()) {
+        .map(|s| match broker_open.iter().find(|b| b.client_order_id == s.order_id.to_string() && !b.venue_order_id.is_empty()) {
             Some(b) => StuckAction::Route { order_id: s.order_id, venue_order_id: b.venue_order_id.clone() },
             None => StuckAction::AskStatus { order_id: s.order_id, symbol: s.symbol.clone() },
         })
@@ -223,6 +223,8 @@ pub fn plan_stuck(stuck: &[StuckOrder], broker_open: &[BrokerOpenOrder]) -> Vec<
 /// What a stuck order's status answer books; `None` leaves it as it is.
 pub fn stuck_outcome(answer: &Result<BrokerOrderState, BrokerError>) -> Option<ExecKind> {
     match answer {
+        // Working, but not in the snapshot: no id to route with, so leave it.
+        Ok(state) if state.outcome == gateway::contract::BrokerOrderOutcome::Working => None,
         Ok(state) => Some(ExecKind::Terminal(state.clone())),
         Err(BrokerError::NoSuchOrder(_)) => Some(ExecKind::Rejected { reason: "never reached the broker".into() }),
         Err(_) => None,
@@ -477,6 +479,24 @@ mod tests {
         let id = Uuid::new_v4();
         let actions = plan_stuck(&[stuck(id)], &[open(&id.to_string(), 0.5)]);
         assert_eq!(actions, vec![StuckAction::Route { order_id: id, venue_order_id: format!("v-{id}") }]);
+    }
+
+    /// Without the venue's id the order would be routed with none and never
+    /// reconciled again: ask about it instead.
+    #[test]
+    fn a_stuck_order_listed_without_a_venue_id_is_asked_about() {
+        let id = Uuid::new_v4();
+        let mut listed = open(&id.to_string(), 0.0);
+        listed.venue_order_id.clear();
+        assert_eq!(plan_stuck(&[stuck(id)], &[listed]), vec![StuckAction::AskStatus { order_id: id, symbol: "BTCUSDT".into() }]);
+    }
+
+    /// A venue that says the order is still working, though its snapshot did not
+    /// list it, gives no id to route with: leave it rather than book a terminal.
+    #[test]
+    fn a_working_answer_leaves_the_stuck_order() {
+        let st = BrokerOrderState { outcome: gateway::contract::BrokerOrderOutcome::Working, executed_qty: 0.5, avg_px: 2.0 };
+        assert!(stuck_outcome(&Ok(st)).is_none());
     }
 
     #[test]

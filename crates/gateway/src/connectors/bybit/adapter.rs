@@ -126,11 +126,26 @@ impl BybitAdapter {
 /// Turn a sent request into the envelope's `result`, whatever the HTTP status.
 async fn read(resp: Result<reqwest::Response, reqwest::Error>) -> Result<serde_json::Value, BrokerError> {
     let resp = resp.map_err(|e| BrokerError::Network(e.to_string()))?;
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-    match serde_json::from_str::<serde_json::Value>(&text) {
+    parse_body(status, &text)
+}
+
+/// A response body: the envelope when it is JSON; a non-JSON body (a proxy's
+/// 502 page) says nothing about the request, so it is `Network`.
+pub(crate) fn parse_body(status: u16, text: &str) -> Result<serde_json::Value, BrokerError> {
+    match serde_json::from_str::<serde_json::Value>(text) {
         Ok(body) => envelope(body),
-        Err(_) => Err(BrokerError::BrokerRejected(format!("HTTP {status}: {text}"))),
+        Err(_) => Err(BrokerError::Network(format!("HTTP {status}: {text}"))),
+    }
+}
+
+/// An accepted create's order id. Accepted without one, the venue may hold the
+/// order: that is unknown, not a rejection.
+pub(crate) fn created(result: &serde_json::Value) -> Result<BrokerOrderResponse, BrokerError> {
+    match result["orderId"].as_str() {
+        Some(id) if !id.is_empty() => Ok(BrokerOrderResponse { external_order_id: id.to_string() }),
+        _ => Err(BrokerError::Network(format!("Bybit accepted the order but returned no orderId: {result}"))),
     }
 }
 
@@ -138,6 +153,11 @@ async fn read(resp: Result<reqwest::Response, reqwest::Error>) -> Result<serde_j
 pub(crate) fn envelope(body: serde_json::Value) -> Result<serde_json::Value, BrokerError> {
     match body["retCode"].as_i64() {
         Some(0) => Ok(body["result"].clone()),
+        // Server timeout / server error: the request's outcome is unknown.
+        Some(code @ (10000 | 10016)) => Err(BrokerError::Network(format!(
+            "{} (retCode {code})",
+            body["retMsg"].as_str().unwrap_or("no message")
+        ))),
         code => Err(BrokerError::BrokerRejected(format!(
             "{} (retCode {})",
             body["retMsg"].as_str().unwrap_or("no message"),
@@ -307,10 +327,7 @@ impl BrokerAdapter for BybitAdapter {
         let body = order_body(req)?;
         info!(symbol = %req.symbol, side = %req.side, "submitting order to Bybit");
         let result = self.post("/v5/order/create", &body).await?;
-        match result["orderId"].as_str() {
-            Some(id) if !id.is_empty() => Ok(BrokerOrderResponse { external_order_id: id.to_string() }),
-            _ => Err(BrokerError::BrokerRejected(format!("Bybit accepted the order but returned no orderId: {result}"))),
-        }
+        created(&result)
     }
 
     async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError> {
@@ -377,6 +394,15 @@ impl InstrumentProvider for BybitAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_timeout_or_unreadable_answer_is_not_a_rejection() {
+        assert!(matches!(envelope(serde_json::json!({"retCode":10000,"retMsg":"Server Timeout"})), Err(BrokerError::Network(_))));
+        assert!(matches!(envelope(serde_json::json!({"retCode":10016,"retMsg":"Server error"})), Err(BrokerError::Network(_))));
+        assert!(matches!(parse_body(502, "<html>bad gateway</html>"), Err(BrokerError::Network(_))));
+        assert!(matches!(created(&serde_json::json!({})), Err(BrokerError::Network(_))));
+        assert_eq!(created(&serde_json::json!({"orderId": "v-1"})).unwrap().external_order_id, "v-1");
+    }
 
     #[test]
     fn open_orders_carry_the_venue_order_id() {

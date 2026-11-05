@@ -273,6 +273,18 @@ pub async fn persist_routed(
             return Ok(RouteResult::Terminal(current_state.status));
         }
         if current_state.status != OrderStatus::Submitted {
+            // A fill landed first (partially filled, not closed): the venue's
+            // id still has to be on record, or nothing could cancel or
+            // reconcile the order.
+            sqlx::query("UPDATE order_state SET external_order_id = $2 WHERE order_id = $1 AND external_order_id IS NULL")
+                .bind(order_id)
+                .bind(external_order_id)
+                .execute(pool)
+                .await
+                .map_err(|err| ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!("failed to record the venue's order id: {:?}", err),
+                })?;
             return Ok(RouteResult::NotSubmitted);
         }
 

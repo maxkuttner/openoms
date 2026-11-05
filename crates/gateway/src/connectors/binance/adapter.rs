@@ -268,7 +268,8 @@ impl BrokerAdapter for BinanceAdapter {
                 .unwrap_or_default();
             Ok(BrokerOrderResponse { external_order_id })
         } else {
-            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+            let status = resp.status().as_u16();
+            Err(submit_error(status, resp.text().await.unwrap_or_default()))
         }
     }
 
@@ -406,6 +407,16 @@ pub(crate) fn order_lookup_params(symbol: &str, client_order_id: &str, external_
     }
 }
 
+/// A failed order placement. Binance says -1007 / -1006 when it cannot tell
+/// whether the order executed, and a 5xx likewise: not a rejection.
+pub(crate) fn submit_error(status: u16, body: String) -> BrokerError {
+    if body.contains("\"code\":-1007") || body.contains("\"code\":-1006") {
+        BrokerError::Network(body)
+    } else {
+        crate::adapter::http_failure(status, body)
+    }
+}
+
 /// A failed order lookup: Binance's -2013 means it has no such order.
 pub(crate) fn lookup_error(body: String) -> BrokerError {
     if body.contains("\"code\":-2013") {
@@ -435,6 +446,14 @@ pub(crate) fn parse_open_orders(body: &serde_json::Value) -> Vec<BrokerOpenOrder
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_execution_status_is_not_a_rejection() {
+        assert!(matches!(submit_error(400, r#"{"code":-1007,"msg":"Timeout waiting for response"}"#.into()), BrokerError::Network(_)));
+        assert!(matches!(submit_error(400, r#"{"code":-1006,"msg":"Unexpected response"}"#.into()), BrokerError::Network(_)));
+        assert!(matches!(submit_error(503, "".into()), BrokerError::Network(_)));
+        assert!(matches!(submit_error(400, r#"{"code":-2010,"msg":"insufficient balance"}"#.into()), BrokerError::BrokerRejected(_)));
+    }
 
     #[test]
     fn open_orders_carry_the_venue_order_id() {

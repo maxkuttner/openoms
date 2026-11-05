@@ -78,6 +78,16 @@ pub enum BrokerError {
     NoSuchOrder(String),
 }
 
+/// A failed HTTP answer. A 5xx or 429 says nothing about whether the venue took
+/// the request (it may have executed it), so it is `Network`, not a rejection.
+pub fn http_failure(status: u16, body: String) -> BrokerError {
+    if status >= 500 || status == 429 {
+        BrokerError::Network(format!("HTTP {status}: {body}"))
+    } else {
+        BrokerError::BrokerRejected(body)
+    }
+}
+
 impl std::fmt::Display for BrokerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -216,5 +226,17 @@ impl BrokerRegistry {
         self.adapters
             .get(&(broker_code.to_string(), environment.to_string()))
             .cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_5xx_or_429_is_not_a_rejection() {
+        assert!(matches!(http_failure(503, "unavailable".into()), BrokerError::Network(_)));
+        assert!(matches!(http_failure(429, "slow down".into()), BrokerError::Network(_)));
+        assert!(matches!(http_failure(400, "bad qty".into()), BrokerError::BrokerRejected(_)));
     }
 }

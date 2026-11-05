@@ -134,11 +134,17 @@ impl OkxAdapter {
 /// Turn a sent request into the envelope's `data`, whatever the HTTP status.
 async fn read(resp: Result<reqwest::Response, reqwest::Error>) -> Result<serde_json::Value, BrokerError> {
     let resp = resp.map_err(|e| BrokerError::Network(e.to_string()))?;
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-    match serde_json::from_str::<serde_json::Value>(&text) {
+    parse_body(status, &text)
+}
+
+/// A response body: the envelope when it is JSON; a non-JSON body says
+/// nothing about the request, so it is `Network`.
+pub(crate) fn parse_body(status: u16, text: &str) -> Result<serde_json::Value, BrokerError> {
+    match serde_json::from_str::<serde_json::Value>(text) {
         Ok(body) => envelope(body),
-        Err(_) => Err(BrokerError::BrokerRejected(format!("HTTP {status}: {text}"))),
+        Err(_) => Err(BrokerError::Network(format!("HTTP {status}: {text}"))),
     }
 }
 
@@ -154,6 +160,12 @@ pub(crate) fn envelope(body: serde_json::Value) -> Result<serde_json::Value, Bro
             "{} (sCode {})",
             d["sMsg"].as_str().unwrap_or("no message"),
             d["sCode"].as_str().unwrap_or("missing")
+        ))),
+        // Service unavailable / endpoint timeout / system busy: OKX documents
+        // these as not saying whether the request succeeded.
+        (Some(code @ ("50001" | "50004" | "50013")), None) => Err(BrokerError::Network(format!(
+            "{} (code {code})",
+            body["msg"].as_str().filter(|m| !m.is_empty()).unwrap_or("no message")
         ))),
         (code, None) => Err(BrokerError::BrokerRejected(format!(
             "{} (code {})",
@@ -413,6 +425,15 @@ impl InstrumentProvider for OkxAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timeout_or_busy_answer_is_not_a_rejection() {
+        for code in ["50001", "50004", "50013"] {
+            assert!(matches!(envelope(serde_json::json!({"code": code, "msg": "x", "data": []})), Err(BrokerError::Network(_))), "{code}");
+        }
+        assert!(matches!(envelope(serde_json::json!({"code": "51008", "msg": "insufficient", "data": []})), Err(BrokerError::BrokerRejected(_))));
+        assert!(matches!(parse_body(504, "<html>timeout</html>"), Err(BrokerError::Network(_))));
+    }
 
     #[test]
     fn open_orders_carry_the_venue_order_id() {
