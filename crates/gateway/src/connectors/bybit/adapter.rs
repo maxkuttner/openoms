@@ -254,12 +254,23 @@ pub(crate) fn order_outcome(status: &str) -> BrokerOrderOutcome {
     }
 }
 
+/// Order query: by Bybit's id when known, else by our client order id
+/// (`orderLinkId`).
+pub(crate) fn order_lookup_query(client_order_id: &str, external_order_id: &str) -> String {
+    if external_order_id.is_empty() {
+        format!("category=spot&orderLinkId={client_order_id}")
+    } else {
+        format!("category=spot&orderId={external_order_id}")
+    }
+}
+
 pub(crate) fn parse_open_orders(result: &serde_json::Value) -> Vec<BrokerOpenOrder> {
     let list = result["list"].as_array().cloned().unwrap_or_default();
     list.iter()
         .filter_map(|o| {
             Some(BrokerOpenOrder {
                 client_order_id: o["orderLinkId"].as_str()?.to_string(),
+                venue_order_id: o["orderId"].as_str().unwrap_or_default().to_string(),
                 symbol: o["symbol"].as_str()?.to_string(),
                 executed_qty: num(&o["cumExecQty"]).unwrap_or(0.0),
             })
@@ -328,18 +339,18 @@ impl BrokerAdapter for BybitAdapter {
     /// One order by Bybit id: realtime first (open and recently closed), then history.
     async fn order_status(
         &self,
-        _client_order_id: &str,
+        client_order_id: &str,
         external_order_id: &str,
         _symbol: &str,
     ) -> Result<BrokerOrderState, BrokerError> {
-        let query = format!("category=spot&orderId={external_order_id}");
+        let query = order_lookup_query(client_order_id, external_order_id);
         for path in ["/v5/order/realtime", "/v5/order/history"] {
             let result = self.get(path, &query, true).await?;
             if let Some(order) = result["list"].as_array().and_then(|l| l.first()) {
                 return Ok(parse_order_state(order));
             }
         }
-        Err(BrokerError::BrokerRejected(format!("Bybit has no order {external_order_id}")))
+        Err(BrokerError::NoSuchOrder(format!("Bybit has no order {query}")))
     }
 }
 
@@ -366,6 +377,18 @@ impl InstrumentProvider for BybitAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_orders_carry_the_venue_order_id() {
+        let result = serde_json::json!({ "list": [{ "orderId": "v-1", "orderLinkId": "c-1", "symbol": "BTCUSDT", "cumExecQty": "0" }] });
+        assert_eq!(parse_open_orders(&result)[0].venue_order_id, "v-1");
+    }
+
+    #[test]
+    fn order_status_looks_up_by_client_id_without_a_venue_id() {
+        assert_eq!(order_lookup_query("c-1", "v-1"), "category=spot&orderId=v-1");
+        assert_eq!(order_lookup_query("c-1", ""), "category=spot&orderLinkId=c-1");
+    }
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
 

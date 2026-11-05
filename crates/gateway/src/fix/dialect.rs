@@ -142,6 +142,8 @@ pub struct StatusReport {
     pub mass_status_req_id: Option<String>,
     /// `ClOrdID`(11) — our order UUID (may be empty on an empty mass-status reply).
     pub client_order_id: String,
+    /// `OrderID`(37) — the venue's id for the order.
+    pub venue_order_id: String,
     pub symbol: String,
     /// `CumQty`(14) — total executed quantity for the order.
     pub cum_qty: f64,
@@ -170,6 +172,7 @@ impl StatusReport {
         }
         Some(BrokerOpenOrder {
             client_order_id: self.client_order_id.clone(),
+            venue_order_id: self.venue_order_id.clone(),
             symbol: self.symbol.clone(),
             executed_qty: self.cum_qty,
         })
@@ -200,6 +203,7 @@ pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
     Some(StatusReport {
         mass_status_req_id: msg.get_field(tag::MASS_STATUS_REQ_ID).filter(|s| !s.is_empty()),
         client_order_id: msg.get_field(tag::CL_ORD_ID).unwrap_or_default(),
+        venue_order_id: msg.get_field(37).unwrap_or_default(),
         symbol: msg.get_field(tag::SYMBOL).unwrap_or_default(),
         cum_qty: msg.get_field(tag::CUM_QTY).and_then(|s| s.parse().ok()).unwrap_or(0.0),
         avg_px: msg.get_field(tag::AVG_PX).and_then(|s| s.parse().ok()).unwrap_or(0.0),

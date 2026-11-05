@@ -33,6 +33,7 @@ const WS_URL: &str = "wss://advanced-trade-ws-user.coinbase.com";
 const RECONCILE_SECS: u64 = 20;
 
 struct CoinbaseSession {
+    environment: &'static str,
     adapter: Arc<CoinbaseAdapter>,
     health: StreamHandle,
     engine: EngineHandle,
@@ -41,7 +42,7 @@ struct CoinbaseSession {
 #[async_trait::async_trait]
 impl Session for CoinbaseSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.health, &self.engine).await
+        connect_and_run(self.environment, &self.adapter, &self.health, &self.engine).await
     }
 }
 
@@ -52,7 +53,7 @@ pub async fn run(
     engine: EngineHandle,
 ) {
     info!(env = environment, "starting Coinbase user stream");
-    let session = CoinbaseSession { adapter, health: health.clone(), engine };
+    let session = CoinbaseSession { environment, adapter, health: health.clone(), engine };
     supervise("COINBASE/LIVE", health, session).await
 }
 
@@ -114,6 +115,7 @@ fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
 }
 
 async fn connect_and_run(
+    environment: &'static str,
     adapter: &Arc<CoinbaseAdapter>,
     health: &StreamHandle,
     engine: &EngineHandle,
@@ -132,7 +134,7 @@ async fn connect_and_run(
     loop {
         let text = tokio::select! {
             _ = sweep.tick() => {
-                engine.reconcile(VENUE, "coinbase", adapter.clone()).await;
+                engine.reconcile(VENUE, environment, "coinbase", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -166,7 +168,7 @@ async fn connect_and_run(
             info!("Coinbase user stream live");
             health.set_live();
             live = true;
-            engine.reconcile(VENUE, "coinbase", adapter.clone()).await;
+            engine.reconcile(VENUE, environment, "coinbase", adapter.clone()).await;
         }
         for (order_id, update) in updates(&v) {
             engine.exec(exec_event(order_id, update)).await;

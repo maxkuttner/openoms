@@ -74,6 +74,8 @@ pub enum BrokerError {
     Network(String),
     BrokerRejected(String),
     NotConfigured(String),
+    /// The venue has no order by that id.
+    NoSuchOrder(String),
 }
 
 impl std::fmt::Display for BrokerError {
@@ -82,6 +84,7 @@ impl std::fmt::Display for BrokerError {
             BrokerError::Network(msg) => write!(f, "network error: {msg}"),
             BrokerError::BrokerRejected(msg) => write!(f, "broker rejected: {msg}"),
             BrokerError::NotConfigured(msg) => write!(f, "not configured: {msg}"),
+            BrokerError::NoSuchOrder(msg) => write!(f, "no such order: {msg}"),
         }
     }
 }

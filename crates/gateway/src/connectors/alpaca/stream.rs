@@ -16,6 +16,7 @@ use crate::stream_supervisor::{supervise, Session, StreamResult};
 const HEARTBEAT_SECS: u64 = 30;
 
 struct AlpacaSession {
+    environment: &'static str,
     ws_url: &'static str,
     api_key: String,
     api_secret: String,
@@ -28,6 +29,7 @@ struct AlpacaSession {
 impl Session for AlpacaSession {
     async fn run_once(&mut self) -> StreamResult {
         connect_and_run(
+            self.environment,
             self.ws_url,
             &self.api_key,
             &self.api_secret,
@@ -48,7 +50,7 @@ pub async fn run(
     engine: EngineHandle,
 ) {
     info!(env = environment, "starting Alpaca trade-update stream");
-    engine.reconcile("ALPACA", "alpaca", adapter.clone()).await;
+    engine.reconcile("ALPACA", environment, "alpaca", adapter.clone()).await;
 
     let ws_url = if environment == "LIVE" {
         "wss://api.alpaca.markets/stream"
@@ -58,6 +60,7 @@ pub async fn run(
 
     let name: &'static str = if environment == "LIVE" { "ALPACA/LIVE" } else { "ALPACA/PAPER" };
     let session = AlpacaSession {
+        environment,
         ws_url,
         api_key,
         api_secret,
@@ -69,6 +72,7 @@ pub async fn run(
 }
 
 async fn connect_and_run(
+    environment: &'static str,
     ws_url: &str,
     api_key: &str,
     api_secret: &str,
@@ -100,7 +104,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                engine.reconcile("ALPACA", "alpaca", adapter.clone()).await;
+                engine.reconcile("ALPACA", environment, "alpaca", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {

@@ -35,6 +35,8 @@ pub enum ExecKind {
     Terminal(BrokerOrderState),
     Canceled { reason: Option<String> },
     Rejected { reason: String },
+    /// The venue holds the order under this id: routes a `submitted` order.
+    Ack { venue_order_id: String },
 }
 
 /// What a venue did to one order.
@@ -69,7 +71,7 @@ pub enum GatewayMsg {
     /// Reconcile this broker's open orders now (a reconnect, or the heartbeat).
     /// Carries the adapter because the diff asks the broker about each order it
     /// resolves, not just for one snapshot.
-    Reconcile { broker_code: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter> },
+    Reconcile { broker_code: &'static str, environment: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter> },
 }
 
 /// How a connector reaches the engine.
@@ -89,8 +91,9 @@ impl EngineHandle {
         }
     }
 
-    pub async fn reconcile(&self, broker_code: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter>) {
-        if self.0.send(GatewayMsg::Reconcile { broker_code, actor, adapter }).await.is_err() {
+    /// Reconcile one connection (`broker_code` in `environment`) through `adapter`.
+    pub async fn reconcile(&self, broker_code: &'static str, environment: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter>) {
+        if self.0.send(GatewayMsg::Reconcile { broker_code, environment, actor, adapter }).await.is_err() {
             error!(broker = broker_code, "order engine is gone; reconcile skipped");
         }
     }
@@ -101,6 +104,8 @@ impl EngineHandle {
 pub struct BrokerOpenOrder {
     /// Our order UUID (the client order id we sent).
     pub client_order_id: String,
+    /// The venue's own id for the order.
+    pub venue_order_id: String,
     pub symbol: String,
     pub executed_qty: f64,
 }

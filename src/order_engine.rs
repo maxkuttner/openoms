@@ -75,6 +75,8 @@ pub fn reports_for(ev: &ExecEvent, booked_cum: f64, booked_avg: Option<f64>) -> 
         }
         ExecKind::Canceled { reason } => vec![ExecutionReport::Canceled { reason: reason.clone(), venue: Some(venue) }],
         ExecKind::Rejected { reason } => vec![ExecutionReport::Reject { reason: reason.clone(), venue: Some(venue) }],
+        // Routes the order (`apply_exec`); not an execution report.
+        ExecKind::Ack { .. } => Vec::new(),
     }
 }
 
@@ -90,7 +92,7 @@ pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, engine: EngineHandle, pool:
             GatewayMsg::Exec(ev) => {
                 guarded(ev.order_id, apply_exec(&pool, &bus, &ev)).await;
             }
-            GatewayMsg::Reconcile { broker_code, actor, adapter } => {
+            GatewayMsg::Reconcile { broker_code, environment, actor, adapter } => {
                 // per connection, not per broker: PAPER and LIVE (or Binance WS and
                 // FIX) share a broker code but are separate sessions
                 let key = (broker_code, Arc::as_ptr(&adapter) as *const () as usize);
@@ -109,7 +111,7 @@ pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, engine: EngineHandle, pool:
                 tokio::spawn(async move {
                     let done = done;
                     loop {
-                        run_order_reconcile(&pool, &*adapter, broker_code, actor, &engine).await;
+                        run_order_reconcile(&pool, &*adapter, broker_code, environment, actor, &engine).await;
                         let mut running = done.running.lock().unwrap();
                         match running.get_mut(&done.key) {
                             Some(rerun) if *rerun => *rerun = false,
@@ -162,6 +164,13 @@ impl Drop for Reconciling {
 /// Book one event: read what the OMS has booked when the event is cumulative or
 /// terminal, then apply each report the plan yields.
 pub async fn apply_exec(pool: &PgPool, bus: &EventBus, ev: &ExecEvent) {
+    if let ExecKind::Ack { venue_order_id } = &ev.kind {
+        match crate::order_entry::persist_routed(pool, bus, ev.order_id, &ev.venue, venue_order_id, ev.actor).await {
+            Ok(result) => info!(order_id = %ev.order_id, ?result, "order engine: venue acknowledged a stuck order"),
+            Err(e) => error!(order_id = %ev.order_id, error = %e.message, "order engine: could not route a stuck order"),
+        }
+        return;
+    }
     let (booked_cum, booked_avg) = if needs_booked_state(&ev.kind) {
         match oms_fill_state(pool, ev.order_id).await {
             Some(state) => state,
@@ -195,6 +204,13 @@ mod tests {
             ExecutionReport::Fill { fill_qty, fill_price, .. } => (*fill_qty, *fill_price),
             other => panic!("expected a fill, got {other:?}"),
         }
+    }
+
+    /// An Ack routes the order (order entry's route step); it books no
+    /// execution report itself.
+    #[test]
+    fn an_ack_books_no_execution_report() {
+        assert!(reports_for(&ev(ExecKind::Ack { venue_order_id: "v-1".into() }), 0.0, None).is_empty());
     }
 
     #[test]
@@ -323,7 +339,7 @@ mod tests {
         let calls = || broker.calls.load(std::sync::atomic::Ordering::SeqCst);
 
         for _ in 0..3 {
-            engine.reconcile("FAKE", "fake", broker.clone()).await;
+            engine.reconcile("FAKE", "PAPER", "fake", broker.clone()).await;
         }
         settle().await;
         assert_eq!(calls(), 1, "one at a time");
@@ -345,8 +361,8 @@ mod tests {
         let (engine, rx) = EngineHandle::new();
         tokio::spawn(run(rx, engine.clone(), refusing_pool(), crate::event_bus::EventBus::new()));
 
-        engine.reconcile("FAKE", "fake", paper.clone()).await;
-        engine.reconcile("FAKE", "fake", live.clone()).await;
+        engine.reconcile("FAKE", "PAPER", "fake", paper.clone()).await;
+        engine.reconcile("FAKE", "LIVE", "fake", live.clone()).await;
         settle().await;
 
         assert_eq!(live.calls.load(std::sync::atomic::Ordering::SeqCst), 1);

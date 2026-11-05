@@ -42,6 +42,7 @@ const HEARTBEAT_SECS: u64 = 20;
 const AUTH_EXPIRY_MS: i64 = 10_000;
 
 struct BybitSession {
+    environment: &'static str,
     adapter: Arc<BybitAdapter>,
     health: StreamHandle,
     engine: EngineHandle,
@@ -50,7 +51,7 @@ struct BybitSession {
 #[async_trait::async_trait]
 impl Session for BybitSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.health, &self.engine).await
+        connect_and_run(self.environment, &self.adapter, &self.health, &self.engine).await
     }
 }
 
@@ -61,7 +62,7 @@ pub async fn run(
     engine: EngineHandle,
 ) {
     info!(env = environment, "starting Bybit private stream");
-    let session = BybitSession { adapter, health: health.clone(), engine };
+    let session = BybitSession { environment, adapter, health: health.clone(), engine };
     let name: &'static str = if environment == "LIVE" { "BYBIT/LIVE" } else { "BYBIT/PAPER" };
     supervise(name, health, session).await
 }
@@ -151,6 +152,7 @@ fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
 }
 
 async fn connect_and_run(
+    environment: &'static str,
     adapter: &Arc<BybitAdapter>,
     health: &StreamHandle,
     engine: &EngineHandle,
@@ -167,7 +169,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Text(serde_json::json!({"op": "ping"}).to_string())).await?;
-                engine.reconcile(VENUE, "bybit", adapter.clone()).await;
+                engine.reconcile(VENUE, environment, "bybit", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -214,7 +216,7 @@ async fn connect_and_run(
                     info!("Bybit private WS subscribed to order.spot and execution.spot");
                     health.set_live();
                     // Snapshot-on-(re)connect: heal anything that resolved during the outage.
-                    engine.reconcile(VENUE, "bybit", adapter.clone()).await;
+                    engine.reconcile(VENUE, environment, "bybit", adapter.clone()).await;
                 } else {
                     return Err(format!("Bybit subscribe failed: {}", v["ret_msg"]).into());
                 }

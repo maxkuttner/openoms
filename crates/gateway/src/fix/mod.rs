@@ -180,6 +180,7 @@ fn build_settings(cfg: &FixConfig, begin_string: &str) -> Result<(SessionSetting
 /// broker registry. `actor` labels the events this session appends (e.g. "ibkr").
 #[allow(clippy::too_many_arguments)]
 pub fn start_session(
+    environment: &'static str,
     dialect: Arc<dyn FixDialect>,
     cfg: FixConfig,
     actor: &'static str,
@@ -253,7 +254,7 @@ pub fn start_session(
                     }
                     _ = interval.tick() => {}
                 }
-                engine.reconcile(broker_code, actor, recon_adapter.clone()).await;
+                engine.reconcile(broker_code, environment, actor, recon_adapter.clone()).await;
             }
         });
     }

@@ -106,7 +106,12 @@ impl AlpacaAdapter {
     }
 
     pub async fn get_order(&self, external_order_id: &str) -> Result<serde_json::Value, BrokerError> {
-        let url = format!("{}/v2/orders/{}", self.base_url, external_order_id);
+        self.get_order_at(&order_lookup_path("", external_order_id)).await
+    }
+
+    /// One order at `path` (see `order_lookup_path`); a 404 is `NoSuchOrder`.
+    async fn get_order_at(&self, path: &str) -> Result<serde_json::Value, BrokerError> {
+        let url = format!("{}{}", self.base_url, path);
         let resp = self
             .client
             .get(&url)
@@ -117,6 +122,8 @@ impl AlpacaAdapter {
             .map_err(|e| BrokerError::Network(e.to_string()))?;
         if resp.status().is_success() {
             resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))
+        } else if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            Err(BrokerError::NoSuchOrder(resp.text().await.unwrap_or_default()))
         } else {
             Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
         }
@@ -374,28 +381,18 @@ impl BrokerAdapter for AlpacaAdapter {
         if !resp.status().is_success() {
             return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
         }
-        let orders: Vec<serde_json::Value> =
-            resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-        Ok(orders
-            .iter()
-            .filter_map(|o| {
-                Some(BrokerOpenOrder {
-                    client_order_id: o["client_order_id"].as_str()?.to_string(),
-                    symbol: o["symbol"].as_str()?.to_string(),
-                    executed_qty: o["filled_qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
-                })
-            })
-            .collect())
+        let orders: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_open_orders(&orders))
     }
 
     /// One order's current state via GET /v2/orders/{id}, normalized for the shell.
     async fn order_status(
         &self,
-        _client_order_id: &str,
+        client_order_id: &str,
         external_order_id: &str,
         _symbol: &str,
     ) -> Result<BrokerOrderState, BrokerError> {
-        let order = self.get_order(external_order_id).await?;
+        let order = self.get_order_at(&order_lookup_path(client_order_id, external_order_id)).await?;
         let executed_qty: f64 =
             order["filled_qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let avg_px: f64 =
@@ -464,9 +461,48 @@ impl DailyStats for AlpacaAdapter {
     }
 }
 
+/// Where one order is read: by Alpaca's id when known, else by the client order
+/// id we sent (an order whose routing never got recorded).
+pub(crate) fn order_lookup_path(client_order_id: &str, external_order_id: &str) -> String {
+    if external_order_id.is_empty() {
+        format!("/v2/orders:by_client_order_id?client_order_id={client_order_id}")
+    } else {
+        format!("/v2/orders/{external_order_id}")
+    }
+}
+
+/// `GET /v2/orders?status=open` as snapshot rows.
+pub(crate) fn parse_open_orders(orders: &serde_json::Value) -> Vec<BrokerOpenOrder> {
+    orders
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            Some(BrokerOpenOrder {
+                client_order_id: o["client_order_id"].as_str()?.to_string(),
+                venue_order_id: o["id"].as_str().unwrap_or_default().to_string(),
+                symbol: o["symbol"].as_str()?.to_string(),
+                executed_qty: o["filled_qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_orders_carry_the_venue_order_id() {
+        let body = serde_json::json!([{ "id": "v-1", "client_order_id": "c-1", "symbol": "AAPL", "filled_qty": "0" }]);
+        assert_eq!(parse_open_orders(&body)[0].venue_order_id, "v-1");
+    }
+
+    #[test]
+    fn order_status_looks_up_by_client_id_without_a_venue_id() {
+        assert_eq!(order_lookup_path("c-1", "v-1"), "/v2/orders/v-1");
+        assert_eq!(order_lookup_path("c-1", ""), "/v2/orders:by_client_order_id?client_order_id=c-1");
+    }
 
     /// Every exchange label Alpaca actually returns must map. If this fails, the
     /// catalog silently loses that venue's whole listing.

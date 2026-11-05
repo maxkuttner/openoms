@@ -83,7 +83,7 @@ fn venue() -> Venue {
 /// treated as "not started" rather than panicking, so one broken caller cannot
 /// take the process down.
 fn start_ibkr(
-    env_name: &str,
+    env_name: &'static str,
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     engine: EngineHandle,
@@ -109,7 +109,7 @@ fn start_ibkr(
     let health = stream_health.fix_handle("IBKR", env_name);
     let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password.clone()));
     // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
-    match start_session(dialect, cfg, "ibkr", health, engine, None) {
+    match start_session(env_name, dialect, cfg, "ibkr", health, engine, None) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "IBKR FIX session not started"); None }
     }

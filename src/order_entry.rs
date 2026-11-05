@@ -193,6 +193,199 @@ async fn record_rejection(
     Ok(())
 }
 
+/// What persisting a route found.
+#[derive(Debug, PartialEq)]
+pub enum RouteResult {
+    Routed,
+    /// The order closed first (a fast fill, or a cancel while routing).
+    Terminal(OrderStatus),
+    /// Already routed, or otherwise past `submitted`: nothing to do.
+    NotSubmitted,
+}
+
+/// Record that the venue took a `submitted` order under `external_order_id`
+/// (TX2). Re-reads and retries on a concurrent update — a fast fill can land
+/// first. Used by order entry after the broker call, and by the order engine
+/// for an `Ack` recon found for a stuck order.
+pub async fn persist_routed(
+    pool: &sqlx::PgPool,
+    bus: &crate::event_bus::EventBus,
+    order_id: Uuid,
+    venue: &str,
+    external_order_id: &str,
+    actor: &str,
+) -> Result<RouteResult, ApiError> {
+    let event_store = OrderEventStore::new(pool.clone());
+    const MAX_ROUTE_ATTEMPTS: u32 = 5;
+    for attempt in 1..=MAX_ROUTE_ATTEMPTS {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                order_id, client_order_id, portfolio_id, account_id, instrument_id,
+                side, order_type, time_in_force,
+                limit_price::double precision AS limit_price,
+                original_qty::double precision AS original_qty,
+                leaves_qty::double precision AS leaves_qty,
+                cum_qty::double precision AS cum_qty,
+                avg_px::double precision AS avg_px,
+                status, resume_to_status, version
+            FROM order_state
+            WHERE order_id = $1
+            "#,
+        )
+        .bind(order_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to re-read order state before routing: {:?}", err),
+        })?;
+
+        let side = parse_order_side(row.get::<String, _>("side"))?;
+        let order_type = parse_order_type(row.get::<String, _>("order_type"))?;
+        let time_in_force = parse_time_in_force(row.get::<String, _>("time_in_force"))?;
+        let status = parse_order_status(row.get::<String, _>("status"))?;
+        let resume_to_status = row
+            .get::<Option<String>, _>("resume_to_status")
+            .map(parse_order_status)
+            .transpose()?;
+
+        let current_state = OrderAggregateState {
+            order_id: row.get::<Uuid, _>("order_id").to_string(),
+            client_order_id: row.get::<String, _>("client_order_id"),
+            portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
+            account_id: row.get::<Uuid, _>("account_id").to_string(),
+            instrument_id: row.get::<String, _>("instrument_id"),
+            side,
+            order_type,
+            time_in_force,
+            limit_price: row.get::<Option<f64>, _>("limit_price"),
+            original_qty: row.get::<f64, _>("original_qty"),
+            leaves_qty: row.get::<f64, _>("leaves_qty"),
+            cum_qty: row.get::<f64, _>("cum_qty"),
+            avg_px: row.get::<Option<f64>, _>("avg_px"),
+            status,
+            resume_to_status,
+            version: row.get::<i64, _>("version"),
+        };
+
+        if current_state.status.is_terminal() {
+            return Ok(RouteResult::Terminal(current_state.status));
+        }
+        if current_state.status != OrderStatus::Submitted {
+            return Ok(RouteResult::NotSubmitted);
+        }
+
+        let expected_version = current_state.version;
+        let mut applied = OrderAggregate::from_state(current_state);
+
+        let route_metadata = EventMetadata {
+            event_id: Uuid::new_v4().to_string(),
+            timestamp: Utc::now(),
+            actor: actor.to_string(),
+        };
+
+        let attempt_events = applied
+            .decide(
+                OrderCommand::RouteOrder(RouteOrder {
+                    order_id: order_id.to_string(),
+                    venue: venue.to_string(),
+                    external_order_id: external_order_id.to_string(),
+                }),
+                route_metadata,
+            )
+            .map_err(map_rejection_to_api_error)?;
+
+        for event in &attempt_events {
+            applied.apply(event).map_err(|err| ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to apply RouteOrder event: {:?}", err),
+            })?;
+        }
+
+        let routed_state = applied.state.as_ref().ok_or(ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "missing aggregate state after routing".to_string(),
+        })?;
+
+        // If this fails the venue holds the order while the OMS records it
+        // submitted; recon's stuck-order sweep settles it.
+        let mut tx2 = pool.begin().await.map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to start TX2: {:?}", err),
+        })?;
+
+        sqlx::query(
+            r#"
+            UPDATE order_state
+            SET status = $2, version = $3, external_order_id = $4, updated_at = $5
+            WHERE order_id = $1 AND version = $6
+            "#
+        )
+        .bind(order_id)
+        .bind(routed_state.status.as_str())
+        .bind(routed_state.version)
+        .bind(external_order_id)
+        .bind(Utc::now())
+        .bind(expected_version)
+        .execute(&mut *tx2)
+        .await
+        .map_err(|err| {
+            error!(order_id = %order_id, error = ?err, "TX2: failed to update order_state to Routed");
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to update order_state after routing: {:?}", err),
+            }
+        })?;
+
+        let mut route_new_events = Vec::with_capacity(attempt_events.len());
+        for event in &attempt_events {
+            route_new_events.push(domain_event_to_new_event(event)?);
+        }
+
+        let appended = match event_store
+            .append_events_in_tx(&mut tx2, order_id, expected_version, &route_new_events)
+            .await
+        {
+            Ok(r) => r,
+            Err(crate::event_store::EventStoreError::Concurrency(c)) => {
+                drop(tx2);
+                if attempt == MAX_ROUTE_ATTEMPTS {
+                    error!(order_id = %order_id, expected = c.expected, actual = c.actual, "TX2: exhausted retries appending OrderRouted event");
+                    return Err(ApiError {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        message: format!(
+                            "failed to persist OrderRouted event: exhausted retries on a concurrent order update (expected {}, actual {})",
+                            c.expected, c.actual
+                        ),
+                    });
+                }
+                warn!(order_id = %order_id, attempt, expected = c.expected, actual = c.actual, "TX2: order_state changed concurrently (likely a fast fill), retrying route persistence");
+                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
+                continue;
+            }
+            Err(err) => {
+                error!(order_id = %order_id, error = ?err, "TX2: failed to append OrderRouted event");
+                return Err(ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: format!("failed to persist OrderRouted event: {:?}", err),
+                });
+            }
+        };
+
+        tx2.commit().await.map_err(|err| {
+            error!(order_id = %order_id, error = ?err, "TX2 commit failed — broker holds order but OMS status is Submitted");
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to commit routing transaction: {:?}", err),
+            }
+        })?;
+        publish_appended(bus, order_id, &route_new_events, &appended);
+        return Ok(RouteResult::Routed);
+    }
+    Ok(RouteResult::Routed)
+}
+
 /// What a failed broker call means for an order already stored.
 #[derive(Debug, PartialEq)]
 pub enum RouteFailure {
@@ -678,189 +871,21 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // race just 500'd. Re-read + re-decide + retry, mirroring execution.rs's
     // apply_once, instead of trusting the in-memory `state_after_submit` from
     // before the broker round-trip.
-    const MAX_ROUTE_ATTEMPTS: u32 = 5;
-    for attempt in 1..=MAX_ROUTE_ATTEMPTS {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                order_id, client_order_id, portfolio_id, account_id, instrument_id,
-                side, order_type, time_in_force,
-                limit_price::double precision AS limit_price,
-                original_qty::double precision AS original_qty,
-                leaves_qty::double precision AS leaves_qty,
-                cum_qty::double precision AS cum_qty,
-                avg_px::double precision AS avg_px,
-                status, resume_to_status, version
-            FROM order_state
-            WHERE order_id = $1
-            "#,
-        )
-        .bind(order_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|err| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("failed to re-read order state before routing: {:?}", err),
-        })?;
-
-        let side = parse_order_side(row.get::<String, _>("side"))?;
-        let order_type = parse_order_type(row.get::<String, _>("order_type"))?;
-        let time_in_force = parse_time_in_force(row.get::<String, _>("time_in_force"))?;
-        let status = parse_order_status(row.get::<String, _>("status"))?;
-        let resume_to_status = row
-            .get::<Option<String>, _>("resume_to_status")
-            .map(parse_order_status)
-            .transpose()?;
-
-        let current_state = OrderAggregateState {
-            order_id: row.get::<Uuid, _>("order_id").to_string(),
-            client_order_id: row.get::<String, _>("client_order_id"),
-            portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
-            account_id: row.get::<Uuid, _>("account_id").to_string(),
-            instrument_id: row.get::<String, _>("instrument_id"),
-            side,
-            order_type,
-            time_in_force,
-            limit_price: row.get::<Option<f64>, _>("limit_price"),
-            original_qty: row.get::<f64, _>("original_qty"),
-            leaves_qty: row.get::<f64, _>("leaves_qty"),
-            cum_qty: row.get::<f64, _>("cum_qty"),
-            avg_px: row.get::<Option<f64>, _>("avg_px"),
-            status,
-            resume_to_status,
-            version: row.get::<i64, _>("version"),
-        };
-
-        if current_state.status.is_terminal() {
-            // Cancelled locally while the broker call was in flight (a Kill, or a
-            // strategy's session ending): the venue has the order the OMS no
-            // longer tracks, so cancel it there too.
-            if current_state.status == OrderStatus::Canceled {
-                warn!(order_id = %order_id, "order was cancelled while routing; cancelling it at the broker");
-                if let Err(err) = adapter.cancel_order(&broker_resp.external_order_id, &broker_symbol).await {
-                    error!(order_id = %order_id, error = %err, "could not cancel at the broker an order cancelled while routing");
-                }
+    if let RouteResult::Terminal(status) =
+        persist_routed(&pool, state.event_bus(), order_id, &broker_code, &broker_resp.external_order_id, &actor_for(auth)).await?
+    {
+        // Cancelled locally while the broker call was in flight (a Kill, or a
+        // strategy's session ending): the venue has the order the OMS no
+        // longer tracks, so cancel it there too.
+        if status == OrderStatus::Canceled {
+            warn!(order_id = %order_id, "order was cancelled while routing; cancelling it at the broker");
+            if let Err(err) = adapter.cancel_order(&broker_resp.external_order_id, &broker_symbol).await {
+                error!(order_id = %order_id, error = %err, "could not cancel at the broker an order cancelled while routing");
             }
-            // The broker already reported a fill (or the order was canceled
-            // concurrently) before we got here — same race MAX_ROUTE_ATTEMPTS
-            // guards against, just resolved in execution.rs's favor entirely.
-            // RouteOrder is meaningless on a closed order; the broker call
-            // already succeeded and the terminal event is already persisted,
-            // so this is success, not a failure to report to the client.
-            info!(
-                order_id = %order_id,
-                status = ?current_state.status,
-                "order reached a terminal state before routing could persist (raced a concurrent fill/cancel) — treating as routed"
-            );
-            break;
         }
-
-        let expected_version = current_state.version;
-        let mut applied = OrderAggregate::from_state(current_state);
-
-        let route_metadata = EventMetadata {
-            event_id: Uuid::new_v4().to_string(),
-            timestamp: Utc::now(),
-            actor: actor_for(&auth),
-        };
-
-        let attempt_events = applied
-            .decide(
-                OrderCommand::RouteOrder(RouteOrder {
-                    order_id: order_id.to_string(),
-                    venue: broker_code.clone(),
-                    external_order_id: broker_resp.external_order_id.clone(),
-                }),
-                route_metadata,
-            )
-            .map_err(map_rejection_to_api_error)?;
-
-        for event in &attempt_events {
-            applied.apply(event).map_err(|err| ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("failed to apply RouteOrder event: {:?}", err),
-            })?;
-        }
-
-        let routed_state = applied.state.as_ref().ok_or(ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: "missing aggregate state after routing".to_string(),
-        })?;
-
-        // TODO: outbox pattern — if TX2 fails, the broker holds the order but OMS records Submitted.
-        // Detect and reconcile via a stale-Submitted sweep job.
-        let mut tx2 = pool.begin().await.map_err(|err| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("failed to start TX2: {:?}", err),
-        })?;
-
-        sqlx::query(
-            r#"
-            UPDATE order_state
-            SET status = $2, version = $3, external_order_id = $4, updated_at = $5
-            WHERE order_id = $1 AND version = $6
-            "#
-        )
-        .bind(order_id)
-        .bind(routed_state.status.as_str())
-        .bind(routed_state.version)
-        .bind(&broker_resp.external_order_id)
-        .bind(Utc::now())
-        .bind(expected_version)
-        .execute(&mut *tx2)
-        .await
-        .map_err(|err| {
-            error!(order_id = %order_id, error = ?err, "TX2: failed to update order_state to Routed");
-            ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("failed to update order_state after routing: {:?}", err),
-            }
-        })?;
-
-        let mut route_new_events = Vec::with_capacity(attempt_events.len());
-        for event in &attempt_events {
-            route_new_events.push(domain_event_to_new_event(event)?);
-        }
-
-        let appended = match event_store
-            .append_events_in_tx(&mut tx2, order_id, expected_version, &route_new_events)
-            .await
-        {
-            Ok(r) => r,
-            Err(crate::event_store::EventStoreError::Concurrency(c)) => {
-                drop(tx2);
-                if attempt == MAX_ROUTE_ATTEMPTS {
-                    error!(order_id = %order_id, expected = c.expected, actual = c.actual, "TX2: exhausted retries appending OrderRouted event");
-                    return Err(ApiError {
-                        status: StatusCode::INTERNAL_SERVER_ERROR,
-                        message: format!(
-                            "failed to persist OrderRouted event: exhausted retries on a concurrent order update (expected {}, actual {})",
-                            c.expected, c.actual
-                        ),
-                    });
-                }
-                warn!(order_id = %order_id, attempt, expected = c.expected, actual = c.actual, "TX2: order_state changed concurrently (likely a fast fill), retrying route persistence");
-                tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
-                continue;
-            }
-            Err(err) => {
-                error!(order_id = %order_id, error = ?err, "TX2: failed to append OrderRouted event");
-                return Err(ApiError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: format!("failed to persist OrderRouted event: {:?}", err),
-                });
-            }
-        };
-
-        tx2.commit().await.map_err(|err| {
-            error!(order_id = %order_id, error = ?err, "TX2 commit failed — broker holds order but OMS status is Submitted");
-            ApiError {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                message: format!("failed to commit routing transaction: {:?}", err),
-            }
-        })?;
-        publish_appended(state.event_bus(), order_id, &route_new_events, &appended);
-        break;
+        // A fast fill or a cancel closed it first: the broker call succeeded
+        // and the terminal event is persisted, so this is success.
+        info!(order_id = %order_id, status = ?status, "order reached a terminal state before routing could persist — treating as routed");
     }
 
 

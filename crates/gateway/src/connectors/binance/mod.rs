@@ -123,7 +123,7 @@ fn venue() -> Venue {
 /// `private_key` is PEM contents (not a path) — the store holds the key material
 /// itself, so there is nothing to read from disk here.
 fn start_binance(
-    env_name: &str,
+    env_name: &'static str,
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
     engine: EngineHandle,
@@ -180,7 +180,7 @@ fn start_binance(
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("BINANCE", env_name);
-    match start_session(dialect, cfg, "binance", health, engine, read_delegate) {
+    match start_session(env_name, dialect, cfg, "binance", health, engine, read_delegate) {
         Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
     }

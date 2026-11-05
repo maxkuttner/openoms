@@ -170,6 +170,15 @@ pub(crate) fn missing_order_state(e: &BrokerError) -> Option<BrokerOrderState> {
         .then_some(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 0.0, avg_px: 0.0 })
 }
 
+/// One order's path: by OKX's id when known, else by our `clOrdId`.
+pub(crate) fn order_lookup_path(symbol: &str, client_order_id: &str, external_order_id: &str) -> String {
+    if external_order_id.is_empty() {
+        format!("/api/v5/trade/order?instId={symbol}&clOrdId={}", self::client_order_id(client_order_id))
+    } else {
+        format!("/api/v5/trade/order?instId={symbol}&ordId={external_order_id}")
+    }
+}
+
 /// The OMS order id as an OKX `clOrdId`: the UUID without dashes (32 hex chars).
 pub(crate) fn client_order_id(order_id: &str) -> String {
     order_id.replace('-', "")
@@ -293,6 +302,7 @@ pub(crate) fn parse_open_orders(data: &serde_json::Value) -> Vec<BrokerOpenOrder
             let cl = o["clOrdId"].as_str()?;
             Some(BrokerOpenOrder {
                 client_order_id: oms_order_id(cl).map_or_else(|| cl.to_string(), |id| id.to_string()),
+                venue_order_id: o["ordId"].as_str().unwrap_or_default().to_string(),
                 symbol: o["instId"].as_str()?.to_string(),
                 executed_qty: num(&o["accFillSz"]).unwrap_or(0.0),
             })
@@ -362,17 +372,20 @@ impl BrokerAdapter for OkxAdapter {
     /// GET /api/v5/trade/order — one order by OKX id, open or recently closed.
     async fn order_status(
         &self,
-        _client_order_id: &str,
+        client_order_id: &str,
         external_order_id: &str,
         symbol: &str,
     ) -> Result<BrokerOrderState, BrokerError> {
-        let data = match self.get(&format!("/api/v5/trade/order?instId={symbol}&ordId={external_order_id}"), true).await {
+        let by_client_id = external_order_id.is_empty();
+        let data = match self.get(&order_lookup_path(symbol, client_order_id, external_order_id), true).await {
             Ok(data) => data,
+            // Looked up by our id, "no such order" means the venue never had it.
+            Err(e) if by_client_id && missing_order_state(&e).is_some() => return Err(BrokerError::NoSuchOrder(e.to_string())),
             Err(e) => return missing_order_state(&e).ok_or(e),
         };
         match data.as_array().and_then(|l| l.first()) {
             Some(order) => Ok(parse_order_state(order)),
-            None => Err(BrokerError::BrokerRejected(format!("OKX has no order {external_order_id}"))),
+            None => Err(BrokerError::NoSuchOrder(format!("OKX has no order {client_order_id}/{external_order_id}"))),
         }
     }
 }
@@ -400,6 +413,19 @@ impl InstrumentProvider for OkxAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_orders_carry_the_venue_order_id() {
+        let data = serde_json::json!([{ "ordId": "v-1", "clOrdId": "c1", "instId": "BTC-USDT", "accFillSz": "0" }]);
+        assert_eq!(parse_open_orders(&data)[0].venue_order_id, "v-1");
+    }
+
+    #[test]
+    fn order_status_looks_up_by_client_id_without_a_venue_id() {
+        let id = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
+        assert_eq!(order_lookup_path("BTC-USDT", id, "v-1"), "/api/v5/trade/order?instId=BTC-USDT&ordId=v-1");
+        assert_eq!(order_lookup_path("BTC-USDT", id, ""), "/api/v5/trade/order?instId=BTC-USDT&clOrdId=3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b");
+    }
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
     const CL_ORD_ID: &str = "3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b";

@@ -282,6 +282,7 @@ pub(crate) fn parse_open_orders(body: &serde_json::Value) -> Vec<BrokerOpenOrder
         .filter_map(|o| {
             Some(BrokerOpenOrder {
                 client_order_id: o["client_order_id"].as_str()?.to_string(),
+                venue_order_id: o["order_id"].as_str().unwrap_or_default().to_string(),
                 symbol: o["product_id"].as_str()?.to_string(),
                 executed_qty: num(&o["filled_size"]).unwrap_or(0.0),
             })
@@ -346,6 +347,10 @@ impl BrokerAdapter for CoinbaseAdapter {
         external_order_id: &str,
         _symbol: &str,
     ) -> Result<BrokerOrderState, BrokerError> {
+        if external_order_id.is_empty() {
+            // Advanced Trade reads one order only by its own id.
+            return Err(BrokerError::NotConfigured("Coinbase cannot look an order up by client order id".into()));
+        }
         let body = self.get(&format!("/orders/historical/{external_order_id}"), "", true).await?;
         Ok(parse_order_state(&body["order"]))
     }
@@ -384,6 +389,12 @@ impl InstrumentProvider for CoinbaseAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_orders_carry_the_venue_order_id() {
+        let body = serde_json::json!({ "orders": [{ "order_id": "v-1", "client_order_id": "c-1", "product_id": "BTC-USD", "filled_size": "0" }] });
+        assert_eq!(parse_open_orders(&body)[0].venue_order_id, "v-1");
+    }
     use base64::Engine;
     use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
     use p256::pkcs8::EncodePrivateKey;

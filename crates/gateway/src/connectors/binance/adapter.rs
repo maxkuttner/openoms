@@ -209,15 +209,17 @@ impl BinanceAdapter {
         symbol: &str,
         external_order_id: &str,
     ) -> Result<serde_json::Value, BrokerError> {
-        let params = [
-            ("symbol", symbol.to_string()),
-            ("orderId", external_order_id.to_string()),
-        ];
+        self.get_order_by(symbol, "", external_order_id).await
+    }
+
+    /// One order, by Binance's id when known, else by our client order id.
+    async fn get_order_by(&self, symbol: &str, client_order_id: &str, external_order_id: &str) -> Result<serde_json::Value, BrokerError> {
+        let params = order_lookup_params(symbol, client_order_id, external_order_id);
         let resp = self.signed(Method::GET, "/api/v3/order", &params).await?;
         if resp.status().is_success() {
             resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))
         } else {
-            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+            Err(lookup_error(resp.text().await.unwrap_or_default()))
         }
     }
 }
@@ -293,27 +295,18 @@ impl BrokerAdapter for BinanceAdapter {
         }
         let body: serde_json::Value =
             resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-        let orders = body.as_array().cloned().unwrap_or_default();
-        Ok(orders
-            .iter()
-            .filter_map(|o| {
-                let client_order_id = o["clientOrderId"].as_str()?.to_string();
-                let symbol = o["symbol"].as_str()?.to_string();
-                let (executed_qty, _) = exec_stats(o);
-                Some(BrokerOpenOrder { client_order_id, symbol, executed_qty })
-            })
-            .collect())
+        Ok(parse_open_orders(&body))
     }
 
     /// One order's current state via GET /api/v3/order, normalized to a
     /// [`BrokerOrderState`] for the reconcile shell.
     async fn order_status(
         &self,
-        _client_order_id: &str,
+        client_order_id: &str,
         external_order_id: &str,
         symbol: &str,
     ) -> Result<BrokerOrderState, BrokerError> {
-        let order = self.get_order(symbol, external_order_id).await?;
+        let order = self.get_order_by(symbol, client_order_id, external_order_id).await?;
         let (executed_qty, avg_px) = exec_stats(&order);
         let outcome = match order["status"].as_str().unwrap_or("") {
             "FILLED" => BrokerOrderOutcome::Filled,
@@ -403,9 +396,63 @@ impl InstrumentProvider for BinanceAdapter {
     }
 }
 
+/// `GET /api/v3/order` parameters: by Binance's id when known, else by our
+/// client order id.
+pub(crate) fn order_lookup_params(symbol: &str, client_order_id: &str, external_order_id: &str) -> Vec<(&'static str, String)> {
+    if external_order_id.is_empty() {
+        vec![("symbol", symbol.to_string()), ("origClientOrderId", client_order_id.to_string())]
+    } else {
+        vec![("symbol", symbol.to_string()), ("orderId", external_order_id.to_string())]
+    }
+}
+
+/// A failed order lookup: Binance's -2013 means it has no such order.
+pub(crate) fn lookup_error(body: String) -> BrokerError {
+    if body.contains("\"code\":-2013") {
+        BrokerError::NoSuchOrder(body)
+    } else {
+        BrokerError::BrokerRejected(body)
+    }
+}
+
+/// `GET /api/v3/openOrders` as snapshot rows.
+pub(crate) fn parse_open_orders(body: &serde_json::Value) -> Vec<BrokerOpenOrder> {
+    body.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let (executed_qty, _) = exec_stats(o);
+            Some(BrokerOpenOrder {
+                client_order_id: o["clientOrderId"].as_str()?.to_string(),
+                venue_order_id: o["orderId"].as_i64().map(|i| i.to_string()).unwrap_or_default(),
+                symbol: o["symbol"].as_str()?.to_string(),
+                executed_qty,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_binance_24hr_stats;
+    use super::*;
+
+    #[test]
+    fn open_orders_carry_the_venue_order_id() {
+        let body = serde_json::json!([{ "orderId": 42, "clientOrderId": "c-1", "symbol": "BTCUSDT", "executedQty": "0", "cummulativeQuoteQty": "0" }]);
+        assert_eq!(parse_open_orders(&body)[0].venue_order_id, "42");
+    }
+
+    #[test]
+    fn order_status_looks_up_by_client_id_without_a_venue_id() {
+        assert_eq!(order_lookup_params("BTCUSDT", "c-1", "42")[1], ("orderId", "42".to_string()));
+        assert_eq!(order_lookup_params("BTCUSDT", "c-1", "")[1], ("origClientOrderId", "c-1".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_order_is_no_such_order() {
+        assert!(matches!(lookup_error(r#"{"code":-2013,"msg":"Order does not exist."}"#.into()), BrokerError::NoSuchOrder(_)));
+        assert!(matches!(lookup_error(r#"{"code":-1021,"msg":"Timestamp"}"#.into()), BrokerError::BrokerRejected(_)));
+    }
 
     #[test]
     fn parses_prev_close_price_from_24hr_ticker_array() {

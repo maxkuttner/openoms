@@ -26,11 +26,11 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlx::{PgPool, Row};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use gateway::adapter::{BrokerAdapter, BrokerError};
-use gateway::contract::{BrokerOpenOrder, EngineHandle, ExecEvent, ExecKind, ExecSource};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderState, EngineHandle, ExecEvent, ExecKind, ExecSource};
 
 const EPS: f64 = 1e-9;
 
@@ -111,7 +111,7 @@ pub fn plan_order_recon(oms: &[OmsWorkingOrder], broker_open: &[BrokerOpenOrder]
 /// `"IBKR"`): status `routed` or `partially_filled`, resolved to their broker symbol
 /// and external order id. Orders without a routed external id are skipped (nothing to
 /// ask the broker about).
-pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<OmsWorkingOrder> {
+pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str, environment: &str) -> Vec<OmsWorkingOrder> {
     // One round-trip: join the broker symbol and pull the routed external id inline,
     // rather than two per-order lookups (this runs on every reconnect + a 30s heartbeat).
     let rows = match sqlx::query(
@@ -125,9 +125,10 @@ pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<Om
          JOIN broker_connection bc ON bc.code = os.broker_connection_code \
          JOIN broker_instrument bi \
            ON bi.instrument_id = os.instrument_id::bigint AND bi.broker_code = $1 \
-         WHERE os.status IN ('routed', 'partially_filled') AND bc.broker_code = $1",
+         WHERE os.status IN ('routed', 'partially_filled') AND bc.broker_code = $1 AND bc.environment = $2",
     )
     .bind(broker_code)
+    .bind(environment)
     .fetch_all(pool)
     .await
     {
@@ -162,11 +163,70 @@ pub async fn run_order_reconcile(
     pool: &PgPool,
     adapter: &dyn BrokerAdapter,
     broker_code: &'static str,
+    environment: &'static str,
     actor: &'static str,
     engine: &EngineHandle,
 ) {
-    let oms = load_oms_working_orders(pool, broker_code).await;
-    reconcile_with(&oms, adapter, broker_code, actor, engine).await;
+    let oms = load_oms_working_orders(pool, broker_code, environment).await;
+    let stuck = load_stuck_orders(pool, broker_code, environment).await;
+    reconcile_with(&oms, &stuck, adapter, broker_code, actor, engine).await;
+}
+
+/// How long an order may stay `submitted` before recon asks the venue about it:
+/// routing normally records the venue's id within a second or two.
+pub const STUCK_AFTER_SECS: u64 = 60;
+
+/// Orders left `submitted` past the grace period on one connection (`$1` broker
+/// code, `$2` environment): routing failed to record the venue's answer.
+pub const STUCK_ORDERS_SQL: &str = "SELECT os.order_id, bi.broker_symbol AS symbol \
+     FROM order_state os \
+     JOIN broker_connection bc ON bc.code = os.broker_connection_code \
+     JOIN broker_instrument bi ON bi.instrument_id = os.instrument_id::bigint AND bi.broker_code = $1 \
+     WHERE os.status = 'submitted' AND bc.broker_code = $1 AND bc.environment = $2 \
+       AND os.created_at < now() - interval '60 seconds'";
+
+/// An order stuck in `submitted`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StuckOrder {
+    pub order_id: Uuid,
+    pub symbol: String,
+}
+
+pub async fn load_stuck_orders(pool: &PgPool, broker_code: &str, environment: &str) -> Vec<StuckOrder> {
+    match sqlx::query_as::<_, (Uuid, String)>(STUCK_ORDERS_SQL).bind(broker_code).bind(environment).fetch_all(pool).await {
+        Ok(rows) => rows.into_iter().map(|(order_id, symbol)| StuckOrder { order_id, symbol }).collect(),
+        Err(e) => {
+            warn!(broker = broker_code, error = %e, "order recon: could not load stuck orders");
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StuckAction {
+    /// The venue works it: record its id (fills heal as for any routed order).
+    Route { order_id: Uuid, venue_order_id: String },
+    /// Not open at the venue: ask how it ended, or whether it ever arrived.
+    AskStatus { order_id: Uuid, symbol: String },
+}
+
+pub fn plan_stuck(stuck: &[StuckOrder], broker_open: &[BrokerOpenOrder]) -> Vec<StuckAction> {
+    stuck
+        .iter()
+        .map(|s| match broker_open.iter().find(|b| b.client_order_id == s.order_id.to_string()) {
+            Some(b) => StuckAction::Route { order_id: s.order_id, venue_order_id: b.venue_order_id.clone() },
+            None => StuckAction::AskStatus { order_id: s.order_id, symbol: s.symbol.clone() },
+        })
+        .collect()
+}
+
+/// What a stuck order's status answer books; `None` leaves it as it is.
+pub fn stuck_outcome(answer: &Result<BrokerOrderState, BrokerError>) -> Option<ExecKind> {
+    match answer {
+        Ok(state) => Some(ExecKind::Terminal(state.clone())),
+        Err(BrokerError::NoSuchOrder(_)) => Some(ExecKind::Rejected { reason: "never reached the broker".into() }),
+        Err(_) => None,
+    }
 }
 
 /// Snapshot the broker's open orders, diff against `oms`, and act on each
@@ -176,6 +236,7 @@ pub async fn run_order_reconcile(
 /// live fill may have overtaken while recon waited on the broker.
 pub async fn reconcile_with(
     oms: &[OmsWorkingOrder],
+    stuck: &[StuckOrder],
     adapter: &dyn BrokerAdapter,
     broker_code: &'static str,
     actor: &'static str,
@@ -190,9 +251,35 @@ pub async fn reconcile_with(
         }
     };
 
-    if oms.is_empty() && broker_open.is_empty() {
+    if oms.is_empty() && broker_open.is_empty() && stuck.is_empty() {
         return;
     }
+
+    for action in plan_stuck(stuck, &broker_open) {
+        let (order_id, kind) = match action {
+            StuckAction::Route { order_id, venue_order_id } => {
+                info!(order_id = %order_id, %venue_order_id, "order recon: a stuck order is open at the broker; routing it");
+                (order_id, ExecKind::Ack { venue_order_id })
+            }
+            StuckAction::AskStatus { order_id, symbol } => {
+                let answer = adapter.order_status(&order_id.to_string(), "", &symbol).await;
+                match stuck_outcome(&answer) {
+                    Some(kind) => (order_id, kind),
+                    None => {
+                        error!(order_id = %order_id, answer = ?answer.err(), "order recon: cannot tell what became of a stuck order; left submitted");
+                        continue;
+                    }
+                }
+            }
+        };
+        engine.exec(ExecEvent { order_id, venue: broker_code.to_string(), actor, source: ExecSource::Snapshot, kind }).await;
+    }
+
+    // A stuck order is settled above, not reported as an orphan.
+    let broker_open: Vec<BrokerOpenOrder> = broker_open
+        .into_iter()
+        .filter(|b| !stuck.iter().any(|s| s.order_id.to_string() == b.client_order_id))
+        .collect();
 
     for action in plan_order_recon(oms, &broker_open) {
         match action {
@@ -312,6 +399,36 @@ mod tests {
         }
     }
 
+    /// Has no open orders and no order by any id.
+    struct NeverSaw;
+
+    #[async_trait::async_trait]
+    impl BrokerAdapter for NeverSaw {
+        async fn submit_order(&self, _: &gateway::adapter::BrokerOrderRequest) -> Result<gateway::adapter::BrokerOrderResponse, BrokerError> {
+            unimplemented!()
+        }
+        async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
+            unimplemented!()
+        }
+        async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+            Ok(Vec::new())
+        }
+        async fn order_status(&self, client: &str, external: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
+            assert!(external.is_empty(), "a stuck order is asked about by our id");
+            Err(BrokerError::NoSuchOrder(client.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn recon_rejects_a_stuck_order_the_venue_never_saw() {
+        let order_id = Uuid::new_v4();
+        let (engine, mut rx) = gateway::contract::EngineHandle::new();
+        reconcile_with(&[], &[stuck(order_id)], &NeverSaw, "FAKE", "fake", &engine).await;
+        let Ok(gateway::contract::GatewayMsg::Exec(ev)) = rx.try_recv() else { panic!("an exec event") };
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.kind, ExecKind::Rejected { reason: "never reached the broker".into() });
+    }
+
     /// Recon only asks the broker; the order engine books, against what is
     /// booked when it gets there — never against the snapshot recon read at its
     /// start, which a live fill may have overtaken.
@@ -321,7 +438,7 @@ mod tests {
         let oms = [OmsWorkingOrder { order_id, symbol: "X".into(), ext_id: "e1".into(), cum_qty: 0.0, avg_px: None }];
         let (engine, mut rx) = gateway::contract::EngineHandle::new();
 
-        reconcile_with(&oms, &ClosedAtBroker, "FAKE", "fake", &engine).await;
+        reconcile_with(&oms, &[], &ClosedAtBroker, "FAKE", "fake", &engine).await;
 
         let Ok(gateway::contract::GatewayMsg::Exec(ev)) = rx.try_recv() else { panic!("an exec event") };
         assert_eq!(ev.order_id, order_id);
@@ -348,7 +465,42 @@ mod tests {
         OmsWorkingOrder { order_id: id, symbol: "BTCUSDT".into(), ext_id: "9".into(), cum_qty: cum, avg_px: None }
     }
     fn open(id: &str, executed: f64) -> BrokerOpenOrder {
-        BrokerOpenOrder { client_order_id: id.into(), symbol: "BTCUSDT".into(), executed_qty: executed }
+        BrokerOpenOrder { client_order_id: id.into(), venue_order_id: format!("v-{id}"), symbol: "BTCUSDT".into(), executed_qty: executed }
+    }
+
+    fn stuck(id: Uuid) -> StuckOrder {
+        StuckOrder { order_id: id, symbol: "BTCUSDT".into() }
+    }
+
+    #[test]
+    fn a_stuck_order_open_at_the_broker_is_routed() {
+        let id = Uuid::new_v4();
+        let actions = plan_stuck(&[stuck(id)], &[open(&id.to_string(), 0.5)]);
+        assert_eq!(actions, vec![StuckAction::Route { order_id: id, venue_order_id: format!("v-{id}") }]);
+    }
+
+    #[test]
+    fn a_stuck_order_absent_at_the_broker_is_asked_about() {
+        let id = Uuid::new_v4();
+        assert_eq!(plan_stuck(&[stuck(id)], &[]), vec![StuckAction::AskStatus { order_id: id, symbol: "BTCUSDT".into() }]);
+    }
+
+    #[test]
+    fn a_young_submitted_order_is_left_alone() {
+        assert!(STUCK_ORDERS_SQL.contains(&format!("interval '{STUCK_AFTER_SECS} seconds'")));
+        assert_eq!(STUCK_AFTER_SECS, 60);
+    }
+
+    #[test]
+    fn an_unknown_outcome_leaves_the_order() {
+        assert!(stuck_outcome(&Err(BrokerError::NotConfigured("no lookup".into()))).is_none());
+        assert!(stuck_outcome(&Err(BrokerError::Network("timeout".into()))).is_none());
+        assert!(matches!(
+            stuck_outcome(&Err(BrokerError::NoSuchOrder("x".into()))),
+            Some(ExecKind::Rejected { reason }) if reason == "never reached the broker"
+        ));
+        let st = BrokerOrderState { outcome: gateway::contract::BrokerOrderOutcome::Filled, executed_qty: 1.0, avg_px: 2.0 };
+        assert!(matches!(stuck_outcome(&Ok(st)), Some(ExecKind::Terminal(_))));
     }
 
     #[test]

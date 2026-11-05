@@ -31,6 +31,7 @@ const VENUE: &str = "BINANCE";
 const HEARTBEAT_SECS: u64 = 30;
 
 struct BinanceSession {
+    environment: &'static str,
     adapter: Arc<BinanceAdapter>,
     health: StreamHandle,
     engine: EngineHandle,
@@ -39,7 +40,7 @@ struct BinanceSession {
 #[async_trait::async_trait]
 impl Session for BinanceSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.health, &self.engine)
+        connect_and_run(self.environment, &self.adapter, &self.health, &self.engine)
         .await
     }
 }
@@ -58,6 +59,7 @@ pub async fn run(
     // connect_and_run, so it covers the initial catch-up too — no separate call here.
 
     let session = BinanceSession {
+        environment,
         adapter,
         health: health.clone(),
         engine,
@@ -67,6 +69,7 @@ pub async fn run(
 }
 
 async fn connect_and_run(
+    environment: &'static str,
     adapter: &Arc<BinanceAdapter>,
     health: &StreamHandle,
     engine: &EngineHandle,
@@ -92,7 +95,7 @@ async fn connect_and_run(
             // Periodic liveness probe + catch-up sweep for missed terminal reports.
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                engine.reconcile(VENUE, "binance", adapter.clone()).await;
+                engine.reconcile(VENUE, environment, "binance", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -144,7 +147,7 @@ async fn connect_and_run(
                     // Snapshot-on-(re)connect: diff the broker's open orders against
                     // the OMS working set now that the live stream is up, so anything
                     // that resolved during the outage is healed immediately.
-                    engine.reconcile(VENUE, "binance", adapter.clone()).await;
+                    engine.reconcile(VENUE, environment, "binance", adapter.clone()).await;
                 } else {
                     return Err(format!("userDataStream.subscribe failed: {}", v).into());
                 }

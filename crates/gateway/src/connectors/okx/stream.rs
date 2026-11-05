@@ -35,6 +35,7 @@ const VENUE: &str = "OKX";
 const HEARTBEAT_SECS: u64 = 20;
 
 struct OkxSession {
+    environment: &'static str,
     adapter: Arc<OkxAdapter>,
     health: StreamHandle,
     engine: EngineHandle,
@@ -43,7 +44,7 @@ struct OkxSession {
 #[async_trait::async_trait]
 impl Session for OkxSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(&self.adapter, &self.health, &self.engine).await
+        connect_and_run(self.environment, &self.adapter, &self.health, &self.engine).await
     }
 }
 
@@ -54,7 +55,7 @@ pub async fn run(
     engine: EngineHandle,
 ) {
     info!(env = environment, "starting OKX private stream");
-    let session = OkxSession { adapter, health: health.clone(), engine };
+    let session = OkxSession { environment, adapter, health: health.clone(), engine };
     let name: &'static str = if environment == "LIVE" { "OKX/LIVE" } else { "OKX/PAPER" };
     supervise(name, health, session).await
 }
@@ -119,6 +120,7 @@ fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
 }
 
 async fn connect_and_run(
+    environment: &'static str,
     adapter: &Arc<OkxAdapter>,
     health: &StreamHandle,
     engine: &EngineHandle,
@@ -134,7 +136,7 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Text("ping".into())).await?;
-                engine.reconcile(VENUE, "okx", adapter.clone()).await;
+                engine.reconcile(VENUE, environment, "okx", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -178,7 +180,7 @@ async fn connect_and_run(
                 info!("OKX private WS subscribed to orders");
                 health.set_live();
                 // Snapshot-on-(re)connect: heal anything that resolved during the outage.
-                engine.reconcile(VENUE, "okx", adapter.clone()).await;
+                engine.reconcile(VENUE, environment, "okx", adapter.clone()).await;
             }
             Some("login") | Some("error") => {
                 return Err(format!("OKX WS {}: {} (code {})", v["event"], v["msg"], v["code"]).into());
