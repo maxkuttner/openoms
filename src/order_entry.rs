@@ -14,7 +14,7 @@ use gateway::contract::{ExecEvent, ExecKind, ExecSource};
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
-use crate::domain::orders::commands::{CancelOrder, OrderCommand, RouteOrder};
+use crate::domain::orders::commands::{CancelOrder, ExecutionReport, OrderCommand, ReceiveExecutionReport, RouteOrder, SubmitOrder};
 use crate::domain::orders::state::{OrderAggregateState, OrderStatus, TimeInForce};
 use crate::event_bus::publish_appended;
 use crate::event_store::OrderEventStore;
@@ -48,7 +48,6 @@ impl Origin {
 /// A pre-trade rejection as the API reports it; the reason names the check.
 fn risk_api_error(order_id: Uuid, rejection: RiskRejection) -> ApiError {
     warn!(order_id = %order_id, code = %rejection.code, message = %rejection.message, "order rejected by pre-trade risk");
-    // TODO: also persist an OrderDenied audit event for rejected orders.
     ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
         message: format!("risk check failed [{}]: {}", rejection.code, rejection.message),
@@ -80,6 +79,118 @@ async fn strategy_route(pool: &sqlx::PgPool, strategy: &Strategy, req: &SubmitOr
     })?
     .ok_or_else(|| unprocessable(format!("{symbol} is not tradeable on {venue}")))?;
     Ok(Some((account, instrument_id)))
+}
+
+/// Insert an order's state row (status and quantities as `s` has them).
+async fn insert_order_state(
+    conn: &mut sqlx::PgConnection,
+    order_id: Uuid,
+    s: &OrderAggregateState,
+    principal_id: Uuid,
+    broker_connection_code: &str,
+    origin: &Origin,
+    fix_cl_ord_id: &Option<String>,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO order_state (
+            order_id,
+            client_order_id,
+            principal_id,
+            portfolio_id,
+            account_id,
+            instrument_id,
+            side,
+            order_type,
+            time_in_force,
+            limit_price,
+            original_qty,
+            leaves_qty,
+            cum_qty,
+            avg_px,
+            status,
+            resume_to_status,
+            version,
+            broker_connection_code,
+            origin,
+            fix_cl_ord_id
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+        )
+        "#
+    )
+    .bind(order_id)
+    .bind(&s.client_order_id)
+    .bind(principal_id)
+    .bind(Uuid::parse_str(&s.portfolio_id).unwrap())
+    .bind(Uuid::parse_str(&s.account_id).unwrap())
+    .bind(&s.instrument_id)
+    .bind(s.side.as_str())
+    .bind(s.order_type.as_str())
+    .bind(s.time_in_force.as_str())
+    .bind(s.limit_price)
+    .bind(s.original_qty)
+    .bind(s.leaves_qty)
+    .bind(s.cum_qty)
+    .bind(s.avg_px)
+    .bind(s.status.as_str())
+    .bind(s.resume_to_status.map(|status| status.as_str()))
+    .bind(s.version)
+    .bind(broker_connection_code)
+    .bind(origin.as_str())
+    .bind(fix_cl_ord_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to insert order state: {:?}", err),
+    })?;
+    Ok(())
+}
+
+/// Store an order the pre-trade checks refused: submitted, then rejected with
+/// the check's reason, in one transaction, published after commit. The audit
+/// trail and the blotter show it, and a FIX strategy is told from the queue.
+#[allow(clippy::too_many_arguments)]
+async fn record_rejection(
+    state: &AppState,
+    auth: &AuthContext,
+    order_id: Uuid,
+    cmd: SubmitOrder,
+    broker_connection_code: &str,
+    origin: &Origin,
+    fix_cl_ord_id: &Option<String>,
+    rejection: &RiskRejection,
+) -> Result<(), ApiError> {
+    let internal = |what: &str, err: String| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to {what}: {err}") };
+    let mut aggregate = OrderAggregate::empty();
+    let mut events = Vec::new();
+    for command in [
+        OrderCommand::SubmitOrder(cmd),
+        OrderCommand::ReceiveExecutionReport(ReceiveExecutionReport {
+            order_id: order_id.to_string(),
+            report: ExecutionReport::Reject { reason: format!("{}: {}", rejection.code, rejection.message), venue: None },
+        }),
+    ] {
+        let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor_for(auth) };
+        let decided = aggregate.decide(command, metadata).map_err(map_rejection_to_api_error)?;
+        for event in &decided {
+            aggregate.apply(event).map_err(|e| internal("apply rejection", format!("{e:?}")))?;
+        }
+        events.extend(decided);
+    }
+    let final_state = aggregate.state.clone().ok_or_else(|| internal("record rejection", "no state".into()))?;
+    let new_events = events.iter().map(domain_event_to_new_event).collect::<Result<Vec<_>, _>>()?;
+
+    let mut tx = state.pool().begin().await.map_err(|e| internal("start transaction", e.to_string()))?;
+    insert_order_state(&mut tx, order_id, &final_state, auth.principal_id, broker_connection_code, origin, fix_cl_ord_id).await?;
+    let appended = OrderEventStore::new(state.pool().clone())
+        .append_events_in_tx(&mut tx, order_id, 0, &new_events)
+        .await
+        .map_err(|e| internal("append rejection events", format!("{e:?}")))?;
+    tx.commit().await.map_err(|e| internal("commit rejection", e.to_string()))?;
+    publish_appended(state.event_bus(), order_id, &new_events, &appended);
+    Ok(())
 }
 
 /// What a failed broker call means for an order already stored.
@@ -333,7 +444,13 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
                 asset_class: instrument_row.get("asset_class"),
                 venue: instrument_row.get("venue"),
             };
-            guard::reference(state, s, &inst).await.map_err(|r| risk_api_error(order_id, r))?
+            match guard::reference(state, s, &inst).await {
+                Ok(mark) => mark,
+                Err(rejection) => {
+                    record_rejection(state, auth, order_id, cmd.clone(), &broker_connection_code, &origin, &fix_cl_ord_id, &rejection).await?;
+                    return Err(risk_api_error(order_id, rejection));
+                }
+            }
         }
         None => None,
     };
@@ -418,13 +535,21 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         Ok(None) => RiskEngine::new(PgRiskDataProvider::new(&mut *tx)).check_submit(portfolio_id, &cmd, contract_size).await,
         Err(e) => Err(RiskCheckError::Data(e)),
     };
-    risk.map_err(|err| match err {
-        RiskCheckError::Rejected(rejection) => risk_api_error(order_id, rejection),
-        RiskCheckError::Data(err) => ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("failed to evaluate pre-trade risk: {:?}", err),
-        },
-    })?;
+    match risk {
+        Ok(()) => {}
+        Err(RiskCheckError::Rejected(rejection)) => {
+            // Release this transaction's locks, then keep the refusal on record.
+            drop(tx);
+            record_rejection(state, auth, order_id, cmd.clone(), &broker_connection_code, &origin, &fix_cl_ord_id, &rejection).await?;
+            return Err(risk_api_error(order_id, rejection));
+        }
+        Err(RiskCheckError::Data(err)) => {
+            return Err(ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("failed to evaluate pre-trade risk: {:?}", err),
+            })
+        }
+    }
 
     // create empty aggregate
     let aggregate = OrderAggregate::empty();
@@ -456,60 +581,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         message: "missing aggregate state after submit".to_string(),
     })?;
 
-    sqlx::query(
-        r#"
-        INSERT INTO order_state (
-            order_id,
-            client_order_id,
-            principal_id,
-            portfolio_id,
-            account_id,
-            instrument_id,
-            side,
-            order_type,
-            time_in_force,
-            limit_price,
-            original_qty,
-            leaves_qty,
-            cum_qty,
-            avg_px,
-            status,
-            resume_to_status,
-            version,
-            broker_connection_code,
-            origin,
-            fix_cl_ord_id
-        ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
-        )
-        "#
-    )
-    .bind(order_id)
-    .bind(&state_after_submit.client_order_id)
-    .bind(auth.principal_id)
-    .bind(Uuid::parse_str(&state_after_submit.portfolio_id).unwrap())
-    .bind(Uuid::parse_str(&state_after_submit.account_id).unwrap())
-    .bind(&state_after_submit.instrument_id)
-    .bind(state_after_submit.side.as_str())
-    .bind(state_after_submit.order_type.as_str())
-    .bind(state_after_submit.time_in_force.as_str())
-    .bind(state_after_submit.limit_price)
-    .bind(state_after_submit.original_qty)
-    .bind(state_after_submit.leaves_qty)
-    .bind(state_after_submit.cum_qty)
-    .bind(state_after_submit.avg_px)
-    .bind(state_after_submit.status.as_str())
-    .bind(state_after_submit.resume_to_status.map(|status| status.as_str()))
-    .bind(state_after_submit.version)
-    .bind(&broker_connection_code)
-    .bind(origin.as_str())
-    .bind(&fix_cl_ord_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to insert order state: {:?}", err),
-    })?;
+    insert_order_state(&mut tx, order_id, &state_after_submit, auth.principal_id, &broker_connection_code, &origin, &fix_cl_ord_id).await?;
 
 
     // add events to be stored to db in order_event
