@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use gateway::adapter::{BrokerError, BrokerOrderRequest};
+use gateway::contract::{ExecEvent, ExecKind, ExecSource};
 
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
@@ -79,6 +80,36 @@ async fn strategy_route(pool: &sqlx::PgPool, strategy: &Strategy, req: &SubmitOr
     })?
     .ok_or_else(|| unprocessable(format!("{symbol} is not tradeable on {venue}")))?;
     Ok(Some((account, instrument_id)))
+}
+
+/// What a failed broker call means for an order already stored.
+#[derive(Debug, PartialEq)]
+pub enum RouteFailure {
+    /// The venue said no: the order is rejected.
+    Rejected(String),
+    /// The order may or may not have reached the venue: recon settles it.
+    Unknown,
+}
+
+pub fn route_failure(err: &BrokerError) -> RouteFailure {
+    match err {
+        BrokerError::BrokerRejected(reason) => RouteFailure::Rejected(reason.clone()),
+        _ => RouteFailure::Unknown,
+    }
+}
+
+/// Book a definite reject of a stored order through the order engine.
+async fn book_reject(state: &AppState, order_id: Uuid, broker_code: &str, reason: String) {
+    state
+        .engine()
+        .exec(ExecEvent {
+            order_id,
+            venue: broker_code.to_string(),
+            actor: "oms",
+            source: ExecSource::Session,
+            kind: ExecKind::Rejected { reason },
+        })
+        .await;
 }
 
 /// What a cancel did: asked the broker (it confirms on the execution stream),
@@ -517,7 +548,8 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     let adapter = match state.registry().get(&broker_code, &environment) {
         Some(a) => a,
         None => {
-            warn!(broker_code = %broker_code, environment = %environment, "no adapter registered — order left as Submitted");
+            warn!(broker_code = %broker_code, environment = %environment, "no adapter registered — order rejected");
+            book_reject(state, order_id, &broker_code, format!("no adapter configured for {broker_code}/{environment}")).await;
             return Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: format!("no adapter configured for {broker_code}/{environment}"),
@@ -540,20 +572,23 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
 
     let broker_resp = match adapter.submit_order(&broker_req).await {
         Ok(resp) => resp,
-        Err(BrokerError::BrokerRejected(msg)) => {
-            warn!(broker_code = %broker_code, error = %msg, "broker rejected order — order left as Submitted");
-            return Err(ApiError {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!("broker rejected order: {msg}"),
-            });
-        }
-        Err(err) => {
-            error!(broker_code = %broker_code, error = %err, "adapter error routing order — order left as Submitted");
-            return Err(ApiError {
-                status: StatusCode::BAD_GATEWAY,
-                message: format!("failed to route order to {broker_code}: {err}"),
-            });
-        }
+        Err(err) => match route_failure(&err) {
+            RouteFailure::Rejected(msg) => {
+                warn!(broker_code = %broker_code, error = %msg, "broker rejected order");
+                book_reject(state, order_id, &broker_code, msg.clone()).await;
+                return Err(ApiError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("broker rejected order: {msg}"),
+                });
+            }
+            RouteFailure::Unknown => {
+                error!(broker_code = %broker_code, error = %err, "adapter error routing order — left as Submitted for recon");
+                return Err(ApiError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("failed to route order to {broker_code}: {err}"),
+                });
+            }
+        },
     };
 
     info!(
@@ -1007,6 +1042,21 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_venue_reject_is_a_reject() {
+        assert_eq!(
+            route_failure(&BrokerError::BrokerRejected("insufficient balance".into())),
+            RouteFailure::Rejected("insufficient balance".into())
+        );
+    }
+
+    /// The order may have reached the venue: only recon may settle it.
+    #[test]
+    fn a_transport_error_is_not_a_reject() {
+        assert_eq!(route_failure(&BrokerError::Network("timed out".into())), RouteFailure::Unknown);
+        assert_eq!(route_failure(&BrokerError::NotConfigured("session down".into())), RouteFailure::Unknown);
+    }
     use crate::strategies::test_support;
 
     fn request(portfolio_id: Uuid, symbol: &str, venue: &str) -> SubmitOrderRequest {

@@ -311,6 +311,12 @@ fn rejected(cl_ord_id: &str, symbol: &str, side: Side, qty: f64, text: String) -
     }
 }
 
+/// Whether a failed new order is answered at once: only when nothing was
+/// stored, since a stored order's reject reaches the strategy from the queue.
+pub fn needs_sync_reject(order_stored: bool) -> bool {
+    !order_stored
+}
+
 /// The OMS order a strategy's ClOrdID names.
 async fn order_by_cl_ord_id(pool: &PgPool, strategy: &Strategy, cl_ord_id: &str) -> Result<Option<Uuid>, sqlx::Error> {
     sqlx::query_scalar("SELECT order_id FROM order_state WHERE portfolio_id = $1 AND fix_cl_ord_id = $2")
@@ -357,7 +363,11 @@ async fn handle(state: &AppState, strategy: &Strategy, request: ClientRequest) -
             };
             match order_entry::submit(state, &auth(strategy), req, Origin::Fix { cl_ord_id: cl_ord_id.clone() }).await {
                 Ok(_) => None,
-                Err(e) => Some(rejected(&cl_ord_id, &symbol, side, qty, e.message)),
+                Err(e) => {
+                    // A stored order reports its reject through the queue.
+                    let stored = matches!(order_by_cl_ord_id(pool, strategy, &cl_ord_id).await, Ok(Some(_)));
+                    needs_sync_reject(stored).then(|| rejected(&cl_ord_id, &symbol, side, qty, e.message))
+                }
             }
         }
         ClientRequest::Cancel { cl_ord_id, orig_cl_ord_id } => {
@@ -634,6 +644,12 @@ mod tests {
         assert_eq!(logon_decision(Some(&s), Some("pw"), false).unwrap_err(), "strategy is stopped");
         s.state = TradingState::Halted;
         assert_eq!(logon_decision(Some(&s), Some("pw"), false).unwrap_err(), "strategy is halted");
+    }
+
+    #[test]
+    fn a_stored_reject_is_reported_from_the_queue_only() {
+        assert!(!needs_sync_reject(true));
+        assert!(needs_sync_reject(false));
     }
 
     #[test]
