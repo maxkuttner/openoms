@@ -6,6 +6,7 @@
 //! the order path read without a query; every admin write reloads it.
 
 pub mod admin;
+pub mod control;
 pub mod guard;
 pub mod session;
 #[cfg(test)]
@@ -131,6 +132,12 @@ pub fn new_fix_password() -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
+/// The code of the stopped (killed or flattened) strategy `principal_id`
+/// trades as, if any: its REST token is refused until Enable.
+pub fn stopped_strategy(strategies: &[Strategy], principal_id: Uuid) -> Option<String> {
+    strategies.iter().find(|s| s.principal_id == principal_id && !s.rest_enabled).map(|s| s.code.clone())
+}
+
 /// The registry as last loaded, read without a query.
 #[derive(Clone, Default)]
 pub struct RegistrySnapshot(Arc<ArcSwap<Vec<Strategy>>>);
@@ -165,6 +172,16 @@ impl RegistrySnapshot {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_stopped_strategys_token_is_refused() {
+        let mut s = sample("s", "S", "OMS");
+        s.principal_id = Uuid::new_v4();
+        assert_eq!(stopped_strategy(&[s.clone()], s.principal_id), None);
+        s.rest_enabled = false;
+        assert_eq!(stopped_strategy(&[s.clone()], s.principal_id), Some("s".to_string()));
+        assert_eq!(stopped_strategy(&[s], Uuid::new_v4()), None);
+    }
 
     #[test]
     fn a_fix_password_verifies_against_its_hash_only() {

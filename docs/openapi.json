@@ -2381,6 +2381,121 @@
         ]
       }
     },
+    "/admin/strategies/{code}/enable": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Let a killed or flattened strategy trade and log on again.",
+        "operationId": "enable_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Enabled"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/flatten": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Kill, leave the strategy reducing only, and close every position with a",
+        "description": "limit order inside its price band.",
+        "operationId": "flatten_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Flattening",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlReport"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/kill": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Halt the strategy, refuse its REST token, cancel every open order and log",
+        "description": "its FIX session out. Positions are left as they are.",
+        "operationId": "kill_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Killed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlReport"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/strategies/{code}/password": {
       "post": {
         "tags": [
@@ -3886,6 +4001,38 @@
           },
           "broker_code": {
             "type": "string"
+          }
+        }
+      },
+      "ControlReport": {
+        "type": "object",
+        "description": "What a control action did, for the cockpit.",
+        "required": [
+          "cancelled",
+          "cancel_failures",
+          "flatten_orders",
+          "skipped"
+        ],
+        "properties": {
+          "cancel_failures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "cancelled": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "flatten_orders": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },

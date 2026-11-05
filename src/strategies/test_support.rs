@@ -85,7 +85,56 @@ pub async fn seed_strategy(pool: &PgPool) -> String {
     .execute(pool)
     .await
     .expect("seed strategy");
+    sqlx::query(
+        "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
+         VALUES ($1, $2, $3, true, true, false)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(service)
+    .bind(portfolio)
+    .execute(pool)
+    .await
+    .expect("seed grant");
     code
+}
+
+/// A working order that never reached a broker (so a cancel is local), on an
+/// existing account of the shared dev DB.
+pub async fn seed_open_order(pool: &PgPool, code: &str, origin: &str) -> Uuid {
+    let (portfolio, principal): (Uuid, Uuid) = sqlx::query_as("SELECT portfolio_id, principal_id FROM strategy WHERE code = $1")
+        .bind(code)
+        .fetch_one(pool)
+        .await
+        .expect("strategy");
+    let (account, connection): (Uuid, String) =
+        sqlx::query_as("SELECT id, broker_connection_code FROM account LIMIT 1").fetch_one(pool).await.expect("an account");
+    let order_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO order_state (order_id, client_order_id, principal_id, portfolio_id, account_id, broker_connection_code, \
+            instrument_id, side, order_type, time_in_force, limit_price, original_qty, leaves_qty, cum_qty, status, version, origin) \
+         VALUES ($1, 'test', $2, $3, $4, $5, '1', 'buy', 'limit', 'gtc', 1, 1, 1, 0, 'submitted', 0, $6)",
+    )
+    .bind(order_id)
+    .bind(principal)
+    .bind(portfolio)
+    .bind(account)
+    .bind(connection)
+    .bind(origin)
+    .execute(pool)
+    .await
+    .expect("seed order");
+    order_id
+}
+
+pub async fn order_status(pool: &PgPool, order_id: Uuid) -> String {
+    sqlx::query_scalar("SELECT status FROM order_state WHERE order_id = $1").bind(order_id).fetch_one(pool).await.expect("order")
+}
+
+pub async fn drop_orders(pool: &PgPool, code: &str) {
+    let portfolio: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM strategy WHERE code = $1").bind(code).fetch_one(pool).await.expect("strategy");
+    sqlx::query("DELETE FROM order_event WHERE order_id IN (SELECT order_id FROM order_state WHERE portfolio_id = $1)")
+        .bind(portfolio).execute(pool).await.expect("drop events");
+    sqlx::query("DELETE FROM order_state WHERE portfolio_id = $1").bind(portfolio).execute(pool).await.expect("drop orders");
 }
 
 pub async fn drop_strategy(pool: &PgPool, code: &str) {
@@ -96,6 +145,7 @@ pub async fn drop_strategy(pool: &PgPool, code: &str) {
             .await
             .expect("strategy");
     sqlx::query("DELETE FROM strategy WHERE code = $1").bind(code).execute(pool).await.expect("drop strategy");
+    sqlx::query("DELETE FROM principal_portfolio_grant WHERE portfolio_id = $1").bind(portfolio).execute(pool).await.expect("drop grants");
     sqlx::query("DELETE FROM portfolio WHERE id = $1").bind(portfolio).execute(pool).await.expect("drop portfolio");
     sqlx::query("DELETE FROM principal WHERE id = ANY($1)").bind(vec![owner, service]).execute(pool).await.expect("drop principals");
 }

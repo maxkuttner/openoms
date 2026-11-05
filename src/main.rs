@@ -166,6 +166,9 @@ mod boundary_tests;
         strategies::admin::reset_password,
         strategies::admin::restart_acceptor,
         strategies::admin::strategy_securities,
+        strategies::admin::kill_strategy,
+        strategies::admin::enable_strategy,
+        strategies::admin::flatten_strategy,
         auth_api::login,
         auth_api::callback,
         auth_api::logout,
@@ -202,7 +205,7 @@ mod boundary_tests;
         auth_api::MeResponse,
         strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
         strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::AcceptorRestarted,
-        strategies::admin::TradeableInstrument,
+        strategies::admin::TradeableInstrument, strategies::control::ControlReport,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -1154,6 +1157,7 @@ async fn serve() {
     if let Err(e) = state.fix_sessions().start(&state, file_cfg.and_then(|f| f.fix_acceptor())) {
         error!(error = %e, "FIX acceptor did not start; strategies cannot log on over FIX");
     }
+    strategies::control::boot_recovery(&state).await;
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -1502,6 +1506,9 @@ async fn serve() {
         .route("/admin/strategies/:code/connections", axum::routing::put(strategies::admin::put_connections))
         .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
         .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
+        .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
+        .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
+        .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))

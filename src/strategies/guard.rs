@@ -76,7 +76,8 @@ pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, q
 pub fn check_price_band(limit_price: Option<f64>, mid: f64, band_pct: f64) -> Result<(), RiskRejection> {
     let Some(px) = limit_price else { return Ok(()) };
     let off = (px - mid).abs() / mid * 100.0;
-    if off > band_pct {
+    // A price exactly at the edge (Flatten's) passes despite float rounding.
+    if off > band_pct * (1.0 + 1e-9) {
         return Err(reject(
             "price_band",
             format!("limit {px} is {off:.2}% from mark {mid} (band {band_pct}%)"),

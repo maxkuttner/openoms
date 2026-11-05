@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::admin::{map_db_error, AdminError};
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
+use super::control::ControlReport;
 
 #[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct StrategyRow {
@@ -132,6 +133,7 @@ pub async fn create_strategy(
 ) -> Result<Json<StrategyRow>, AdminError> {
     validate_comp_ids(&p.sender_comp_id, &p.target_comp_id)?;
     info!(code = %p.code, "admin create strategy");
+    let mut tx = state.pool().begin().await.map_err(map_db_error)?;
     let row = sqlx::query_as::<_, StrategyRow>(&format!(
         "INSERT INTO strategy (code, name, portfolio_id, owner_principal_id, principal_id, sender_comp_id, \
             target_comp_id, allowed_addresses, max_order_quantity, max_order_notional, max_position_quantity, \
@@ -151,9 +153,23 @@ pub async fn create_strategy(
     .bind(p.max_position_quantity)
     .bind(p.max_position_notional)
     .bind(p.price_band_pct)
-    .fetch_one(state.pool())
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_db_error)?;
+    // The strategy trades its portfolio as its own principal, so it needs the
+    // trade grant every order path checks.
+    sqlx::query(
+        "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
+         VALUES ($1, $2, $3, true, true, false) \
+         ON CONFLICT (principal_id, portfolio_id) DO UPDATE SET can_trade = true, can_view = true",
+    )
+    .bind(Uuid::new_v4())
+    .bind(p.principal_id)
+    .bind(p.portfolio_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_error)?;
+    tx.commit().await.map_err(map_db_error)?;
     reload(&state).await;
     Ok(Json(row))
 }
@@ -323,6 +339,48 @@ pub async fn reset_password(State(state): State<AppState>, Path(code): Path<Stri
     }
     reload(&state).await;
     Ok(Json(NewPassword { password }))
+}
+
+fn control_error(e: crate::handlers::ApiError) -> AdminError {
+    AdminError::new(e.status, e.message)
+}
+
+/// Halt the strategy, refuse its REST token, cancel every open order and log
+/// its FIX session out. Positions are left as they are.
+#[utoipa::path(
+    post, path = "/admin/strategies/{code}/kill", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    responses((status = 200, description = "Killed", body = ControlReport), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
+pub async fn kill_strategy(State(state): State<AppState>, Path(code): Path<String>) -> Result<Json<ControlReport>, AdminError> {
+    info!(%code, "admin kill strategy");
+    super::control::kill(&state, &code).await.map(Json).map_err(control_error)
+}
+
+/// Let a killed or flattened strategy trade and log on again.
+#[utoipa::path(
+    post, path = "/admin/strategies/{code}/enable", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    responses((status = 204, description = "Enabled"), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
+pub async fn enable_strategy(State(state): State<AppState>, Path(code): Path<String>) -> Result<StatusCode, AdminError> {
+    info!(%code, "admin enable strategy");
+    super::control::enable(&state, &code).await.map(|_| StatusCode::NO_CONTENT).map_err(control_error)
+}
+
+/// Kill, leave the strategy reducing only, and close every position with a
+/// limit order inside its price band.
+#[utoipa::path(
+    post, path = "/admin/strategies/{code}/flatten", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    responses((status = 200, description = "Flattening", body = ControlReport), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
+pub async fn flatten_strategy(State(state): State<AppState>, Path(code): Path<String>) -> Result<Json<ControlReport>, AdminError> {
+    info!(%code, "admin flatten strategy");
+    super::control::flatten(&state, &code).await.map(Json).map_err(control_error)
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]

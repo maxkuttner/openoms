@@ -181,7 +181,11 @@ async fn run(state: AppState, mut inbound: mpsc::UnboundedReceiver<(SessionKey, 
                 tokio::spawn(async move { replay(&state, &strategy).await });
             }
             Inbound::LoggedOut => {
-                state.fix_sessions().logged_out(&strategy.code);
+                // A refused logon never had a session: nothing to cancel.
+                if state.fix_sessions().logged_out(&strategy.code) {
+                    let state = state.clone();
+                    tokio::spawn(async move { super::control::on_session_end(&state, &strategy).await });
+                }
             }
             Inbound::Request(request) => {
                 // Each request on its own task: one leg never waits on another.
@@ -196,7 +200,7 @@ async fn run(state: AppState, mut inbound: mpsc::UnboundedReceiver<(SessionKey, 
     }
 }
 
-fn auth(strategy: &Strategy) -> AuthContext {
+pub(crate) fn auth(strategy: &Strategy) -> AuthContext {
     AuthContext { principal_id: strategy.principal_id, principal_code: format!("strategy:{}", strategy.code) }
 }
 
