@@ -62,12 +62,25 @@ impl LogCallback for TracingFixLog {
         debug!(target: "fix::wire", dir = "out", "{}", redact_fix_secrets(msg).replace('\x01', "|"));
     }
     fn on_event(&self, _session: Option<&SessionId>, msg: &str) {
-        info!(target: "fix::wire", "{}", msg);
+        info!(target: "fix::wire", "{}", event_line(msg));
     }
+}
+
+/// A session event as logged. QuickFIX quotes whole messages in some events
+/// ("Session not found for incoming message: …"), so secrets are redacted here too.
+fn event_line(msg: &str) -> String {
+    redact_fix_secrets(msg).replace('\x01', "|")
 }
 
 #[cfg(test)]
 mod tracing_fix_log_tests {
+    #[test]
+    fn an_event_quoting_a_logon_does_not_log_its_password() {
+        let line = super::event_line("Session not found for incoming message: 8=FIX.4.4\x0135=A\x01554=s3cret\x0110=195\x01");
+        assert!(!line.contains("s3cret"), "{line}");
+        assert!(line.contains("554="), "{line}");
+    }
+
     use super::redact_fix_secrets;
 
     /// The IBKR logon: tag 554 carries the account password. Everything else

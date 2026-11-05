@@ -307,6 +307,13 @@ impl AcceptorHandle {
                     })
                     .count();
                 let _ = acceptor.stop();
+                // Free the sessions before answering: QuickFIX keeps one
+                // process-wide session table, and freeing them after a restart
+                // has registered the same CompIDs would drop the new ones.
+                drop(acceptor);
+                drop(log);
+                drop(store);
+                drop(app);
                 info!(logged_out = live, "FIX acceptor stopped");
                 if let Some(reply) = reply {
                     let _ = reply.send(live);
@@ -529,6 +536,19 @@ mod tests {
         assert!(again.is_err(), "logged on again while disabled");
 
         acceptor.enable(&key("CLIENT3"));
+        assert!(matches!(next(&mut inbound).await, Inbound::LoggedOn));
+        acceptor.stop();
+    }
+
+    /// A restart keeps the session table right: the old acceptor's sessions
+    /// are gone before the new one registers the same CompIDs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_acceptor_takes_logons() {
+        let port = free_port();
+        let (old, _old_inbound) = start(port, "CLIENT4");
+        old.stop();
+        let (acceptor, mut inbound) = start(port, "CLIENT4");
+        let _seen = client(port, "CLIENT4", "pw");
         assert!(matches!(next(&mut inbound).await, Inbound::LoggedOn));
         acceptor.stop();
     }
