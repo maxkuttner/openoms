@@ -757,7 +757,7 @@ mod tests {
         let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM fix_report_queue WHERE strategy_code = $1").bind(&code).fetch_one(&pool).await.unwrap();
         assert_eq!(queued, 1);
 
-        sqlx::query("DELETE FROM order_event WHERE order_id = $1").bind(order_id).execute(&pool).await.unwrap();
+        // order_event is append-only: the event stays.
         sqlx::query("DELETE FROM order_state WHERE order_id = $1").bind(order_id).execute(&pool).await.unwrap();
         test_support::drop_strategy(&pool, &code).await;
     }
@@ -768,10 +768,12 @@ mod tests {
     #[ignore]
     async fn rest_and_fix_security_lists_agree() {
         let pool = crate::strategies::test_support::dev_pool().await;
+        let (symbol, instrument) = crate::strategies::test_support::seed_pair(&pool, &["BINANCE", "BYBIT"]).await;
         let mut s = sample("s", "S", "OMS");
         s.connections.insert("BINANCE".into(), Uuid::new_v4());
         let list = tradeable(&pool, &s).await.unwrap();
-        assert!(!list.is_empty());
+        crate::strategies::test_support::drop_pair(&pool, instrument).await;
+        assert!(list.iter().any(|(_, sym, _)| *sym == symbol), "the seeded pair is listed");
         assert!(list.iter().all(|(venue, _, _)| venue == "BINANCE"));
     }
 }

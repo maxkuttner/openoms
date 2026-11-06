@@ -1194,14 +1194,17 @@ mod tests {
     #[ignore]
     async fn two_legs_resolve_to_their_own_accounts() {
         let pool = test_support::dev_pool().await;
+        let (symbol, instrument) = test_support::seed_pair(&pool, &["BINANCE", "BYBIT"]).await;
         let mut s = crate::strategies::tests::sample("s", "S", "OMS");
         let (binance, bybit) = (Uuid::new_v4(), Uuid::new_v4());
         s.connections.insert("BINANCE".into(), binance);
         s.connections.insert("BYBIT".into(), bybit);
-        let leg1 = strategy_route(&pool, &s, &request(s.portfolio_id, "BTCUSDT", "BINANCE")).await.unwrap().unwrap();
-        let leg2 = strategy_route(&pool, &s, &request(s.portfolio_id, "BTCUSDT", "BYBIT")).await.unwrap().unwrap();
-        assert_eq!((leg1.0, leg2.0), (binance, bybit));
-        let e = strategy_route(&pool, &s, &request(s.portfolio_id, "BTCUSDT", "OKX")).await.unwrap_err();
+        let leg1 = strategy_route(&pool, &s, &request(s.portfolio_id, &symbol, "BINANCE")).await;
+        let leg2 = strategy_route(&pool, &s, &request(s.portfolio_id, &symbol, "BYBIT")).await;
+        let e = strategy_route(&pool, &s, &request(s.portfolio_id, &symbol, "OKX")).await;
+        test_support::drop_pair(&pool, instrument).await;
+        assert_eq!((leg1.unwrap().unwrap().0, leg2.unwrap().unwrap().0), (binance, bybit));
+        let e = e.unwrap_err();
         assert_eq!(e.message, "strategy has no connection for OKX");
     }
 

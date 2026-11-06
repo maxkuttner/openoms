@@ -217,14 +217,19 @@ mod tests {
         let pool = t::dev_pool().await;
         let code = t::seed_strategy(&pool).await;
         let state = t::state(pool.clone());
-        let (account,): (Uuid,) = sqlx::query_as("SELECT id FROM account a JOIN broker_connection bc ON bc.code = a.broker_connection_code WHERE bc.broker_code = 'BINANCE' LIMIT 1")
-            .fetch_one(&pool).await.unwrap();
+        // Reads Binance testnet's public exchange info with any Ed25519 key;
+        // without one (CI) there is nothing to run against.
+        let Ok(pem) = std::env::var("BINANCE_TEST_PRIVATE_KEY") else {
+            eprintln!("skipped: set BINANCE_TEST_PRIVATE_KEY to run against Binance testnet");
+            t::drop_strategy(&pool, &code).await;
+            return;
+        };
+        let portfolio: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM strategy WHERE code = $1").bind(&code).fetch_one(&pool).await.unwrap();
+        let account = t::seed_account(&pool, portfolio).await;
         sqlx::query("INSERT INTO strategy_connection (strategy_code, broker_code, account_id) VALUES ($1, 'BINANCE', $2)")
             .bind(&code).bind(account).execute(&pool).await.unwrap();
         state.strategies().reload(&pool).await.unwrap();
         let strategy = state.strategies().by_code(&code).unwrap();
-        // Any testnet Ed25519 key: only public exchange info is read.
-        let pem = std::env::var("BINANCE_TEST_PRIVATE_KEY").expect("BINANCE_TEST_PRIVATE_KEY");
         let adapter = BinanceAdapter::new("unused".into(), &pem, "PAPER").expect("a testnet adapter");
         let fill = ExternalFill { trade_id: "1".into(), venue_order_id: "9".into(), client_order_id: "mm1-q-1".into(),
             symbol: "ETHBTC".into(), buy: true, qty: 0.001, price: 0.03 };
