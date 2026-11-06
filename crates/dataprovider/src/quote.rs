@@ -130,6 +130,36 @@ pub trait FeedSymbology: DataProvider {
     fn to_feed_symbol(&self, symbol: &str) -> Option<String>;
 }
 
+/// What the core tells a market data gateway about one held instrument: enough
+/// for a feed to decide whether it covers it and what to call it. Plain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstrumentRef {
+    pub id: i64,
+    pub symbol: String,
+    pub instrument_class: Option<String>,
+    pub asset_class: Option<String>,
+    pub venue: Option<String>,
+}
+
+/// Whether `feed` subscribes this instrument: every `Some` field of
+/// [`FeedSymbology::candidates`] must match, *and*
+/// [`FeedSymbology::to_feed_symbol`] must accept the symbol. Checking only some
+/// of the filter would over-report coverage.
+pub fn covers(feed: &dyn FeedSymbology, i: &InstrumentRef) -> bool {
+    let f = feed.candidates();
+    let matches = |want: Option<&str>, have: &Option<String>| match (want, have) {
+        (None, _) => true,
+        (Some(w), Some(h)) => w == h,
+        // The filter constrains a column the instrument has no value for: not a match.
+        (Some(_), None) => false,
+    };
+
+    matches(f.instrument_class, &i.instrument_class)
+        && matches(f.asset_class, &i.asset_class)
+        && matches(f.venue, &i.venue)
+        && feed.to_feed_symbol(&i.symbol).is_some()
+}
+
 /// A source of live quotes.
 #[async_trait::async_trait]
 pub trait LiveQuoteFeed: DataProvider {
@@ -151,6 +181,44 @@ pub trait LiveQuoteFeed: DataProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SpotOnX;
+
+    impl DataProvider for SpotOnX {
+        fn code(&self) -> &'static str {
+            "TEST"
+        }
+    }
+
+    impl FeedSymbology for SpotOnX {
+        fn candidates(&self) -> InstrumentFilter {
+            InstrumentFilter { instrument_class: Some("SPOT"), asset_class: None, venue: Some("X") }
+        }
+        fn to_feed_symbol(&self, symbol: &str) -> Option<String> {
+            (symbol != "BAD").then(|| symbol.to_lowercase())
+        }
+    }
+
+    fn held(symbol: &str, class: Option<&str>, venue: Option<&str>) -> InstrumentRef {
+        InstrumentRef {
+            id: 1,
+            symbol: symbol.into(),
+            instrument_class: class.map(Into::into),
+            asset_class: None,
+            venue: venue.map(Into::into),
+        }
+    }
+
+    /// Every `Some` field of the filter must match, a filter field against a
+    /// missing column is no match, and a symbol the feed declines is not covered.
+    #[test]
+    fn covers_requires_every_filter_field_and_a_feed_symbol() {
+        assert!(covers(&SpotOnX, &held("ABC", Some("SPOT"), Some("X"))));
+        assert!(!covers(&SpotOnX, &held("ABC", Some("SPOT"), Some("Y"))));
+        assert!(!covers(&SpotOnX, &held("ABC", Some("OPTION"), Some("X"))));
+        assert!(!covers(&SpotOnX, &held("ABC", None, Some("X"))));
+        assert!(!covers(&SpotOnX, &held("BAD", Some("SPOT"), Some("X"))));
+    }
 
     #[test]
     fn empty_filter_adds_nothing() {

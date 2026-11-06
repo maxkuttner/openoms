@@ -1,0 +1,8 @@
+[package]
+name = "colo-risk"
+version = "0.1.0"
+edition = "2021"
+description = "In-memory pre-trade checks for co-located strategies"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,4 @@
+{"code":"0","msg":"","data":[
+{"instType":"SPOT","instId":"BTC-USDT","ordId":"312269865356374016","clOrdId":"3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b","state":"partially_filled","sz":"0.001","accFillSz":"0.0005","avgPx":"65000","side":"buy","ordType":"limit"},
+{"instType":"SPOT","instId":"ETH-USDT","ordId":"312269865356374017","clOrdId":"","state":"live","sz":"1","accFillSz":"0","avgPx":"","side":"sell","ordType":"limit"}
+]}

@@ -3,13 +3,15 @@ use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use symbology::{Identifier, InMemoryCache, OpenFigiClient};
-use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::adapters::BrokerRegistry;
-use crate::kafka::KafkaClient;
+use gateway::adapter::BrokerRegistry;
+use gateway::md::daily_stats::DailyStatsRegistry;
+use gateway::md::MarketDataGateway;
+use crate::event_bus::EventBus;
+use gateway::contract::EngineHandle;
 use crate::marks::MarkStore;
-use crate::stream_health::StreamHealthRegistry;
+use gateway::stream_health::StreamHealthRegistry;
 
 /// The OpenFIGI-backed instrument identification engine, with an in-memory cache.
 pub type SymbologyEngine = Identifier<OpenFigiClient, InMemoryCache>;
@@ -65,51 +67,6 @@ impl StreamRegistry {
     }
 }
 
-/// Fan-out targets for the "a fill changed positions, go re-check what's held"
-/// doorbell, keyed by feed code.
-///
-/// Keyed, rather than a plain `Vec`, so that restarting a feed *replaces* its
-/// entry instead of appending a second one: the old sender's receiver is owned
-/// by the task `StreamRegistry::abort_and_remove` just aborted, so an
-/// unreplaced old entry would sit forever pointing at a dead channel, and
-/// every future ring would keep `try_send`ing into it for no reason.
-///
-/// `std::sync::Mutex`, not an `ArcSwap`: the critical section here is the
-/// `try_send` loop in `ring_all`, which never awaits, and it only ever runs on
-/// the fill path, which is not high-frequency — the same reasoning as
-/// `StreamRegistry`'s mutex, and the opposite of the broker registry's
-/// `ArcSwap`, which sits on the much hotter, latency-sensitive order path.
-#[derive(Clone, Default)]
-pub struct DoorbellRegistry {
-    senders: Arc<Mutex<HashMap<String, mpsc::Sender<()>>>>,
-}
-
-impl DoorbellRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Register `tx` as the doorbell target for `code`, replacing whatever was
-    /// registered there before (see the struct doc comment for why replacing,
-    /// not accumulating, matters).
-    pub fn set(&self, code: impl Into<String>, tx: mpsc::Sender<()>) {
-        self.senders.lock().unwrap().insert(code.into(), tx);
-    }
-
-    pub fn remove(&self, code: &str) {
-        self.senders.lock().unwrap().remove(code);
-    }
-
-    /// Wake every registered feed. Non-blocking: a full per-feed channel
-    /// already means "reload pending" for that feed, so a failed `try_send`
-    /// is fine to ignore.
-    pub fn ring_all(&self) {
-        for tx in self.senders.lock().unwrap().values() {
-            let _ = tx.try_send(());
-        }
-    }
-}
-
 /// Shared application state injected into every Axum handler via State<AppState>.
 #[derive(Clone)]
 pub struct AppState {
@@ -127,10 +84,12 @@ pub struct AppState {
     /// already routing holds its own `Arc` and finishes against the adapter it
     /// started with. A `Mutex` here would put a lock on every order.
     registry: Arc<ArcSwap<BrokerRegistry>>,
+    /// Previous-close sources, swapped together with `registry` so a reload
+    /// never publishes one without the other.
+    daily_stats_sources: Arc<ArcSwap<DailyStatsRegistry>>,
     /// Serialize the entire reload, including store reads and stream joins.
     /// Order readers still use ArcSwap and never acquire this lock.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
-    kafka: Option<KafkaClient>,
     symbology: Arc<SymbologyEngine>,
     stream_health: StreamHealthRegistry,
     marks: MarkStore,
@@ -138,21 +97,22 @@ pub struct AppState {
     /// Handles for Databento and Alpaca/Binance REST execution tasks. Public
     /// Binance/Bybit market-data feeds are never registered here.
     streams: StreamRegistry,
-    /// Fan-out targets for the fill→marks doorbell. Owned here — not just a
-    /// `serve()` local — so the reload handler can register a restarted feed's
-    /// replacement sender into the exact map the boot-time fan-out task already
-    /// reads from; see `DoorbellRegistry`'s own doc comment for why keyed
-    /// replacement, not accumulation, matters.
-    doorbells: DoorbellRegistry,
-    /// Sender half of the fill→marks doorbell, so a reload can hand a restarted
-    /// FIX/Alpaca adapter the *same* channel boot wired up rather than a copy
-    /// nothing reads. `None` only in a test fixture that never signs up for the
-    /// doorbell at all.
-    position_changed_tx: Option<mpsc::Sender<()>>,
-    /// Where every market-data feed publishes quotes. Stored so a reload can
-    /// hand a restarted feed the same channel the boot-time `mark_router` task
-    /// already reads from, instead of constructing a second, disconnected one.
-    quote_tx: mpsc::Sender<dataprovider::Quote>,
+    /// The in-process event bus. Stored so a reload can hand a restarted
+    /// adapter or feed the *same* bus boot wired up rather than a copy nothing
+    /// reads.
+    event_bus: EventBus,
+    /// The order engine's inbox, so a reload can hand restarted connectors the
+    /// same engine boot started.
+    engine: EngineHandle,
+    /// The market data gateway. Stored so a reload can restart a credentialed
+    /// feed on the same gateway whose quotes the boot-time `mark_router` reads.
+    market_data: Arc<MarketDataGateway>,
+    /// The strategy registry as last loaded; admin writes reload it.
+    strategies: crate::strategies::RegistrySnapshot,
+    /// Strategies' FIX sessions (the acceptor, when configured).
+    fix_sessions: crate::strategies::session::FixSessions,
+    /// Co-located strategies' runtime state and follow sink.
+    colo: crate::colo::ColoHub,
 }
 
 impl AppState {
@@ -162,11 +122,11 @@ impl AppState {
         admin_token: String,
         admin_auth_enabled: bool,
         registry: BrokerRegistry,
-        kafka: Option<KafkaClient>,
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
-        position_changed_tx: Option<mpsc::Sender<()>>,
-        quote_tx: mpsc::Sender<dataprovider::Quote>,
+        event_bus: EventBus,
+        engine: EngineHandle,
+        market_data: Arc<MarketDataGateway>,
         session_config: crate::sessions::SessionConfig,
     ) -> Self {
         Self {
@@ -175,16 +135,19 @@ impl AppState {
             admin_auth_enabled,
             session_config,
             registry: Arc::new(ArcSwap::from_pointee(registry)),
+            daily_stats_sources: Arc::new(ArcSwap::from_pointee(DailyStatsRegistry::new())),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
-            kafka,
             symbology: Arc::new(symbology),
             stream_health,
             marks: MarkStore::new(),
             daily_stats: crate::daily_stats::DailyStatsStore::new(),
             streams: StreamRegistry::new(),
-            doorbells: DoorbellRegistry::new(),
-            position_changed_tx,
-            quote_tx,
+            event_bus,
+            engine,
+            market_data,
+            strategies: crate::strategies::RegistrySnapshot::default(),
+            fix_sessions: crate::strategies::session::FixSessions::default(),
+            colo: crate::colo::ColoHub::default(),
         }
     }
 
@@ -198,21 +161,20 @@ impl AppState {
         self.registry.load()
     }
 
-    /// Publish a new registry. Readers see it on their next `registry()` call;
-    /// anything already holding an adapter is unaffected. Called by the
-    /// `/admin/connections/reload` handler in `admin.rs`, and by boot itself
-    /// (see `serve()`) so the very first publish exercises the same path.
-    pub fn swap_registry(&self, next: BrokerRegistry) {
-        self.registry.store(Arc::new(next));
+    /// Publish a new registry and its previous-close sources. Readers see them
+    /// on their next load; anything already holding an adapter is unaffected.
+    /// Called by the `/admin/connections/reload` handler in `admin.rs`, and by
+    /// boot itself (see `serve()`) so the very first publish exercises the same
+    /// path.
+    pub fn swap_registries(&self, registry: BrokerRegistry, daily_stats: DailyStatsRegistry) {
+        self.registry.store(Arc::new(registry));
+        self.daily_stats_sources.store(Arc::new(daily_stats));
     }
 
     pub async fn lock_reload(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.reload_lock.lock().await
     }
 
-    pub fn kafka(&self) -> Option<&KafkaClient> {
-        self.kafka.as_ref()
-    }
 
     pub fn symbology(&self) -> &Arc<SymbologyEngine> {
         &self.symbology
@@ -226,41 +188,49 @@ impl AppState {
 
     pub fn daily_stats(&self) -> &crate::daily_stats::DailyStatsStore { &self.daily_stats }
 
-    /// The registry's own swappable handle, for a long-running task
+    /// The previous-close sources' swappable handle, for a long-running task
     /// (`daily_stats_poller::run`) that needs to `.load()` fresh on every
     /// iteration rather than holding one `Guard` for its whole lifetime.
-    pub fn registry_handle(&self) -> Arc<ArcSwap<BrokerRegistry>> {
-        self.registry.clone()
+    pub fn daily_stats_handle(&self) -> Arc<ArcSwap<DailyStatsRegistry>> {
+        self.daily_stats_sources.clone()
     }
 
     pub fn streams(&self) -> &StreamRegistry {
         &self.streams
     }
 
-    pub fn doorbells(&self) -> &DoorbellRegistry {
-        &self.doorbells
+    /// The process's one event bus. Cloning it is cheap — it hands out handles
+    /// onto the same two lanes.
+    pub fn event_bus(&self) -> &EventBus {
+        &self.event_bus
     }
 
-    /// A fresh handle on the fill→marks doorbell sender, for handing to a
-    /// freshly built `RegistrationDeps` (see `reload.rs`). Cloning a
-    /// `mpsc::Sender` is cheap — it is a handle onto the shared channel state,
-    /// not the channel itself.
-    pub fn position_changed_tx(&self) -> Option<mpsc::Sender<()>> {
-        self.position_changed_tx.clone()
+    pub fn engine(&self) -> &EngineHandle {
+        &self.engine
     }
 
-    /// A fresh handle on the shared quote channel every market-data feed
-    /// publishes onto, for restarting a feed outside of boot (see
-    /// `reload::restart_databento_feed`).
-    pub fn quote_tx(&self) -> mpsc::Sender<dataprovider::Quote> {
-        self.quote_tx.clone()
+    /// The market data gateway, for starting feeds and telling it what is held.
+    pub fn market_data(&self) -> &MarketDataGateway {
+        &self.market_data
+    }
+
+    pub fn strategies(&self) -> &crate::strategies::RegistrySnapshot {
+        &self.strategies
+    }
+
+    pub fn fix_sessions(&self) -> &crate::strategies::session::FixSessions {
+        &self.fix_sessions
+    }
+
+    pub fn colo(&self) -> &crate::colo::ColoHub {
+        &self.colo
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::alpaca::AlpacaAdapter;
+    use gateway::connectors::alpaca::adapter::AlpacaAdapter;
 
     /// `PgPool::connect_lazy` builds a pool without ever connecting, so `AppState`
     /// can be constructed in a unit test without a real database.
@@ -269,21 +239,19 @@ mod tests {
             .expect("connect_lazy never actually connects");
         let symbology = Identifier::new(OpenFigiClient::new(None), InMemoryCache::new());
         let mut registry = BrokerRegistry::new();
-        registry.register_alpaca("PAPER", sample_alpaca_adapter());
-        // Nothing in these tests drains either channel — they only exercise the
-        // registry swap and the stream/doorbell registries, never a real fill or
-        // a real quote.
-        let (quote_tx, _quote_rx) = mpsc::channel(1);
+        registry.register("ALPACA", "PAPER", sample_alpaca_adapter());
+        // Nothing in these tests drains the quote channel — they only exercise
+        // the registry swap and the stream registry, never a real quote.
         AppState::new(
             pool,
             "test-admin-token".to_string(),
             false,
             registry,
-            None,
             symbology,
             StreamHealthRegistry::new(),
-            None,
-            quote_tx,
+            EventBus::new(),
+            EngineHandle::new().0,
+            Arc::new(MarketDataGateway::new(StreamHealthRegistry::new()).0),
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
                 ttl: crate::sessions::SessionTtl::default(),
@@ -314,14 +282,14 @@ mod tests {
         let state = sample_state();
 
         let before = state.registry();
-        let had_alpaca = before.get_alpaca("PAPER").is_some();
+        let had_alpaca = before.get("ALPACA", "PAPER").is_some();
 
-        state.swap_registry(BrokerRegistry::new()); // empty: everything removed
+        state.swap_registries(BrokerRegistry::new(), DailyStatsRegistry::new()); // empty: everything removed
 
         // The guard taken before the swap still sees the old registry.
-        assert_eq!(before.get_alpaca("PAPER").is_some(), had_alpaca);
+        assert_eq!(before.get("ALPACA", "PAPER").is_some(), had_alpaca);
         // A guard taken after sees the new one.
-        assert!(state.registry().get_alpaca("PAPER").is_none());
+        assert!(state.registry().get("ALPACA", "PAPER").is_none());
     }
 
     /// Two swaps in a row must both land — a writer must not be able to publish a
@@ -329,11 +297,25 @@ mod tests {
     #[tokio::test]
     async fn the_last_swap_wins() {
         let state = sample_state();
-        state.swap_registry(BrokerRegistry::new());
+        state.swap_registries(BrokerRegistry::new(), DailyStatsRegistry::new());
         let mut second = BrokerRegistry::new();
-        second.register_alpaca("LIVE", sample_alpaca_adapter());
-        state.swap_registry(second);
-        assert!(state.registry().get_alpaca("LIVE").is_some());
+        second.register("ALPACA", "LIVE", sample_alpaca_adapter());
+        state.swap_registries(second, DailyStatsRegistry::new());
+        assert!(state.registry().get("ALPACA", "LIVE").is_some());
+    }
+
+    /// A reload publishes both registries together: a connection removed from
+    /// the order side stops being asked for previous closes in the same step.
+    #[tokio::test]
+    async fn swapping_registries_replaces_daily_stats_too() {
+        let state = sample_state();
+        let mut stats = DailyStatsRegistry::new();
+        stats.register("ALPACA", "PAPER", sample_alpaca_adapter());
+        state.swap_registries(BrokerRegistry::new(), stats);
+        assert!(state.daily_stats_handle().load().get("ALPACA", "PAPER").is_some());
+
+        state.swap_registries(BrokerRegistry::new(), DailyStatsRegistry::new());
+        assert!(state.daily_stats_handle().load().get("ALPACA", "PAPER").is_none());
     }
 
     /// Aborting a feed must actually stop it, and re-inserting under the same
@@ -355,7 +337,7 @@ mod tests {
 
         // The sender was dropped with the task, so the channel closes — this is
         // the actual proof the task was aborted, not just unregistered.
-        assert_eq!(rx.try_recv(), Err(mpsc::error::TryRecvError::Disconnected),
+        assert_eq!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
             "stop must finish cancellation before returning, not at a later await");
         // And the map entry itself is gone, not just the task inside it left
         // to dangle — reached via the private field directly (this test module
@@ -363,24 +345,5 @@ mod tests {
         // expose) now that the diagnostics-only accessor is gone.
         assert!(reg.handles.lock().unwrap().is_empty(), "abort_and_remove must also remove the map entry");
         assert!(!reg.abort_and_remove("databento-opra").await);
-    }
-
-    /// Replacing a feed's doorbell must overwrite its entry, not add a second
-    /// one — otherwise a restarted feed's old, now-dead sender keeps
-    /// accumulating on every reload, and `ring_all` keeps trying (harmlessly,
-    /// but pointlessly) to wake a receiver nothing is listening on anymore.
-    #[tokio::test]
-    async fn replacing_a_doorbell_reaches_only_the_new_channel() {
-        let reg = DoorbellRegistry::new();
-        let (tx1, mut rx1) = tokio::sync::mpsc::channel::<()>(1);
-        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<()>(1);
-
-        reg.set("databento-opra", tx1);
-        reg.set("databento-opra", tx2);
-
-        reg.ring_all();
-
-        assert!(rx2.try_recv().is_ok(), "the new channel should have been rung");
-        assert!(rx1.try_recv().is_err(), "the old channel should not have been rung");
     }
 }

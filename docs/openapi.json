@@ -914,6 +914,35 @@
         ]
       }
     },
+    "/admin/fix-acceptor/restart": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Restart the FIX acceptor with a session per strategy as registered now.",
+        "operationId": "restart_acceptor",
+        "responses": {
+          "200": {
+            "description": "Restarted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AcceptorRestarted"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The acceptor did not start again"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/instruments": {
       "get": {
         "tags": [
@@ -2156,6 +2185,442 @@
         ]
       }
     },
+    "/admin/strategies": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list_strategies",
+        "responses": {
+          "200": {
+            "description": "Every strategy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StrategyRow"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "create_strategy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateStrategy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyRow"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing CompIDs"
+          },
+          "409": {
+            "description": "Code, portfolio, principal or CompIDs already used"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}": {
+      "delete": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "delete_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "update_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateStrategy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyRow"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/connections": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "The strategy's connections: one account per broker code.",
+        "operationId": "get_connections",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Its connections",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ConnectionEntry"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Replace the strategy's connections. Each account must belong to the",
+        "description": "strategy's portfolio and sit on a connection of the named broker; a broker\ncode may appear once.",
+        "operationId": "put_connections",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ConnectionEntry"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Replaced"
+          },
+          "400": {
+            "description": "A broker twice, or an account of another portfolio or broker"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/enable": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Let a killed or flattened strategy trade and log on again.",
+        "operationId": "enable_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Enabled"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/flatten": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Kill, leave the strategy reducing only, and close every position with a",
+        "description": "limit order inside its price band.",
+        "operationId": "flatten_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Flattening",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlReport"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/follow-credentials": {
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Store the OMS's follow-only key for a co-located strategy, sealed with the",
+        "description": "master key. It is never returned.",
+        "operationId": "put_follow_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FollowCredentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stored"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "503": {
+            "description": "No master key"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/kill": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Halt the strategy, refuse its REST token, cancel every open order and log",
+        "description": "its FIX session out. Positions are left as they are.",
+        "operationId": "kill_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Killed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlReport"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/password": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Set a new FIX password and return it once.",
+        "operationId": "reset_password",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The new password, shown once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewPassword"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/symbology/backfill": {
       "post": {
         "tags": [
@@ -3191,10 +3656,55 @@
           }
         ]
       }
+    },
+    "/strategies/securities": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "summary": "What the calling strategy may trade.",
+        "operationId": "strategy_securities",
+        "responses": {
+          "200": {
+            "description": "Tradeable instruments",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TradeableInstrument"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The caller is not a strategy"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
     }
   },
   "components": {
     "schemas": {
+      "AcceptorRestarted": {
+        "type": "object",
+        "required": [
+          "logged_out"
+        ],
+        "properties": {
+          "logged_out": {
+            "type": "integer",
+            "description": "Strategy sessions that were logged on and were logged out by the restart.",
+            "minimum": 0
+          }
+        }
+      },
       "Account": {
         "type": "object",
         "required": [
@@ -3563,6 +4073,54 @@
           }
         }
       },
+      "ConnectionEntry": {
+        "type": "object",
+        "required": [
+          "broker_code",
+          "account_id"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "broker_code": {
+            "type": "string"
+          }
+        }
+      },
+      "ControlReport": {
+        "type": "object",
+        "description": "What a control action did, for the cockpit.",
+        "required": [
+          "cancelled",
+          "cancel_failures",
+          "flatten_orders",
+          "skipped"
+        ],
+        "properties": {
+          "cancel_failures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "cancelled": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "flatten_orders": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "CreateAccount": {
         "type": "object",
         "required": [
@@ -3756,6 +4314,97 @@
           }
         }
       },
+      "CreateStrategy": {
+        "type": "object",
+        "required": [
+          "code",
+          "name",
+          "portfolio_id",
+          "owner_principal_id",
+          "principal_id",
+          "sender_comp_id",
+          "target_comp_id"
+        ],
+        "properties": {
+          "allowed_addresses": {
+            "type": "string",
+            "description": "Comma-separated IP addresses; empty means any.",
+            "nullable": true
+          },
+          "code": {
+            "type": "string"
+          },
+          "dead_man_secs": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "follow_environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "kill_when_unmonitored": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "max_order_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_order_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_orders_per_sec": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "max_position_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "mode": {
+            "type": "string",
+            "description": "`VIA_OMS` (default) or `COLOCATED`.",
+            "nullable": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner_principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "price_band_pct": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "sender_comp_id": {
+            "type": "string"
+          },
+          "target_comp_id": {
+            "type": "string"
+          }
+        }
+      },
       "CreateTradingToken": {
         "type": "object",
         "required": [
@@ -3870,6 +4519,23 @@
             "type": "integer",
             "format": "int32",
             "description": "Ranked failover preference within the class; lower wins."
+          }
+        }
+      },
+      "FollowCredentials": {
+        "type": "object",
+        "required": [
+          "api_key",
+          "private_key"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "description": "The OMS's own key on the strategy's venue account (read + cancel)."
+          },
+          "private_key": {
+            "type": "string",
+            "description": "Its Ed25519 private key (PEM)."
           }
         }
       },
@@ -4148,6 +4814,18 @@
           },
           "principal_id": {
             "type": "string"
+          }
+        }
+      },
+      "NewPassword": {
+        "type": "object",
+        "required": [
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string",
+            "description": "Shown once; only its hash is stored."
           }
         }
       },
@@ -4841,6 +5519,169 @@
           }
         }
       },
+      "StrategyRow": {
+        "type": "object",
+        "required": [
+          "code",
+          "name",
+          "portfolio_id",
+          "owner_principal_id",
+          "principal_id",
+          "sender_comp_id",
+          "target_comp_id",
+          "has_fix_password",
+          "allowed_addresses",
+          "state",
+          "rest_enabled",
+          "mode",
+          "has_follow_credentials",
+          "dead_man_secs",
+          "kill_when_unmonitored",
+          "limits_version",
+          "session_live",
+          "link_connected",
+          "acked_limits_version",
+          "open_orders",
+          "placed_per_min",
+          "cancelled_per_min",
+          "fighting",
+          "kill_ack_late"
+        ],
+        "properties": {
+          "acked_limits_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "alarm": {
+            "type": "string",
+            "nullable": true
+          },
+          "allowed_addresses": {
+            "type": "string",
+            "description": "Comma-separated IP addresses; empty means any."
+          },
+          "cancelled_per_min": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "code": {
+            "type": "string"
+          },
+          "dead_man_secs": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "fighting": {
+            "type": "boolean"
+          },
+          "follow_environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "has_fix_password": {
+            "type": "boolean"
+          },
+          "has_follow_credentials": {
+            "type": "boolean"
+          },
+          "kill_ack_late": {
+            "type": "boolean",
+            "description": "Killed, and the strategy has not acknowledged it within 5 s."
+          },
+          "kill_when_unmonitored": {
+            "type": "boolean"
+          },
+          "last_heard_secs": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "last_logon_error": {
+            "type": "string",
+            "nullable": true
+          },
+          "limits_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "link_connected": {
+            "type": "boolean",
+            "description": "Co-located strategies: the control link and the followed account."
+          },
+          "max_order_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_order_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_orders_per_sec": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "max_position_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "mode": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "open_orders": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "owner_principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "placed_per_min": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "price_band_pct": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "rest_enabled": {
+            "type": "boolean"
+          },
+          "sender_comp_id": {
+            "type": "string"
+          },
+          "session_live": {
+            "type": "boolean",
+            "description": "Whether its FIX session is logged on right now."
+          },
+          "state": {
+            "type": "string"
+          },
+          "target_comp_id": {
+            "type": "string"
+          }
+        }
+      },
       "SubmitOrder": {
         "type": "object",
         "required": [
@@ -4996,6 +5837,28 @@
           "ioc",
           "fok"
         ]
+      },
+      "TradeableInstrument": {
+        "type": "object",
+        "required": [
+          "venue",
+          "symbol",
+          "instrument_id"
+        ],
+        "properties": {
+          "instrument_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "symbol": {
+            "type": "string",
+            "description": "That broker's symbol (FIX tag 55)."
+          },
+          "venue": {
+            "type": "string",
+            "description": "The broker code an order names as its `venue` (FIX tag 100)."
+          }
+        }
       },
       "TradingTokenCreated": {
         "type": "object",
@@ -5236,6 +6099,76 @@
             "nullable": true
           },
           "trading_state": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "UpdateStrategy": {
+        "type": "object",
+        "properties": {
+          "allowed_addresses": {
+            "type": "string",
+            "description": "Comma-separated IP addresses; empty means any.",
+            "nullable": true
+          },
+          "dead_man_secs": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "follow_environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "kill_when_unmonitored": {
+            "type": "boolean",
+            "nullable": true
+          },
+          "max_order_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_order_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_orders_per_sec": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "max_position_notional": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "max_position_quantity": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "mode": {
+            "type": "string",
+            "description": "`VIA_OMS` (default) or `COLOCATED`.",
+            "nullable": true
+          },
+          "name": {
+            "type": "string",
+            "nullable": true
+          },
+          "price_band_pct": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "sender_comp_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "target_comp_id": {
             "type": "string",
             "nullable": true
           }

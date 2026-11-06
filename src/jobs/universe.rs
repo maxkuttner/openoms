@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::{create, CreateError, JobHandle, JobKind};
 #[cfg(test)]
 use super::{get, JobStatus};
-use crate::adapters::InstrumentProvider;
+use gateway::adapter::InstrumentProvider;
 use crate::setup::brokers::{self, Broker, LoadOptions, LoadProgress};
 
 /// Cockpit and boot loads: base instruments only, no OpenFIGI enrichment (that
@@ -184,7 +184,7 @@ impl LoadProgress for ChannelProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::{BrokerError, BrokerInstrument, InstrumentProvider};
+    use gateway::adapter::{BrokerError, BrokerInstrument, InstrumentProvider};
     use crate::setup::brokers::{Broker, LoadOptions};
     use dataprovider::InstrumentDef;
 
@@ -301,7 +301,7 @@ mod tests {
         ]));
         let h = new_job(&pool, &subject).await;
 
-        run_job(&h, &provider, Broker::Alpaca, &opts(), LONG).await;
+        run_job(&h, &provider, Broker::by_code("ALPACA").unwrap(), &opts(), LONG).await;
 
         let (job, log) = get(&pool, h.id).await.unwrap().unwrap();
         cleanup(&pool, &subject, &prefix).await;
@@ -321,7 +321,7 @@ mod tests {
         let provider = FakeProvider(Err("401 unauthorized".to_string()));
         let h = new_job(&pool, &subject).await;
 
-        run_job(&h, &provider, Broker::Alpaca, &opts(), LONG).await;
+        run_job(&h, &provider, Broker::by_code("ALPACA").unwrap(), &opts(), LONG).await;
 
         let (job, _) = get(&pool, h.id).await.unwrap().unwrap();
         cleanup(&pool, &subject, &prefix).await;
@@ -339,7 +339,7 @@ mod tests {
         let subject = format!("test-{}", uuid::Uuid::new_v4().simple());
         let h = new_job(&pool, &subject).await;
 
-        run_job(&h, &PanickingProvider, Broker::Alpaca, &opts(), LONG).await;
+        run_job(&h, &PanickingProvider, Broker::by_code("ALPACA").unwrap(), &opts(), LONG).await;
 
         let (job, _) = get(&pool, h.id).await.unwrap().unwrap();
         cleanup(&pool, &subject, "ZZNOTHING").await;
@@ -355,7 +355,7 @@ mod tests {
         let subject = format!("test-{}", uuid::Uuid::new_v4().simple());
         let h = new_job(&pool, &subject).await;
 
-        run_job(&h, &HangingProvider, Broker::Alpaca, &opts(), std::time::Duration::from_millis(300)).await;
+        run_job(&h, &HangingProvider, Broker::by_code("ALPACA").unwrap(), &opts(), std::time::Duration::from_millis(300)).await;
 
         let (job, _) = get(&pool, h.id).await.unwrap().unwrap();
         cleanup(&pool, &subject, "ZZNOTHING").await;

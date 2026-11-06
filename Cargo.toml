@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/symbology", "crates/dataprovider"]
+members = [".", "crates/symbology", "crates/dataprovider", "crates/gateway", "crates/colo-risk", "crates/colo-link", "crates/colo-example"]
 resolver = "2"
 
 [package]
@@ -14,6 +14,10 @@ name = "oms"
 path = "src/main.rs"
 
 [dependencies]
+colo-risk = { path = "crates/colo-risk" }
+colo-link = { path = "crates/colo-link" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "migrate", "uuid", "json"] }
@@ -39,7 +43,9 @@ base64 = "0.22"
 bcrypt = "0.15"
 # Session cookie values are hashed, not bcrypted: see src/sessions.rs.
 sha2 = "0.10"
-# Bybit's v5 request signing (HMAC-SHA256); also used by src/oidc.rs's TestSigner.
+# Coinbase test keys in src/reload.rs (the signing itself is in crates/gateway).
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+# src/oidc.rs's TestSigner (venue signing is in crates/gateway).
 hmac = "0.12"
 # `oms update`: unpack the release tarball and compare release versions.
 flate2 = "1"
@@ -52,12 +58,8 @@ aes-gcm = "0.10"
 databento = { version = "0.54.0", default-features = false, features = ["live", "chrono"]}
 csv = "1"
 
-# Binance request signing (Ed25519 over the query string; also for the WS-API
-# session.logon). Ed25519 is the only key type Binance supports for the WebSocket
-# user-data stream, so we use it for REST signing too — one credential.
-ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 dotenvy = "0.15"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 # Kafka producer
 rdkafka = { version = "0.34", features = ["tokio"] }
@@ -83,6 +85,7 @@ symbology = { path = "crates/symbology" }
 
 # In-repo data-provider abstraction (universe discovery + seeding + enrichment)
 dataprovider = { path = "crates/dataprovider" }
+gateway = { path = "crates/gateway" }
 
 # CLI (oms setup universe …)
 clap = { version = "4", features = ["derive"] }
@@ -93,10 +96,6 @@ include_dir = "0.7"
 # Content types for the embedded cockpit bundle
 mime_guess = "2"
 
-# FIX connectivity (IBKR 4.2, Binance 4.4) — Rust bindings over the QuickFIX C++
-# engine. It owns the session layer (logon/heartbeat/seqnum/resend+gap-fill) and
-# TLS; we implement its ApplicationCallback. Needs cmake + a C++ compiler to build.
-quickfix = { version = "0.2", features = ["build-with-ssl"] }
 
 # OIDC relying-party protocol: discovery, the code exchange, and ID-token
 # verification. Not a session framework — sessions are ours (src/sessions.rs).
@@ -109,3 +108,5 @@ tempfile = "3"
 # ID-token verification can be tested against real signatures without an IdP.
 # Already an indirect dependency of openidconnect; pinned here to use it directly.
 rsa = "0.9"
+# Test-only: paused clock, so src/live_updates.rs can test its heartbeat without waiting.
+tokio = { version = "1", features = ["test-util"] }

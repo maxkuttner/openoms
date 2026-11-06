@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Mark {
     pub bid: f64,
     pub ask: f64,
@@ -15,6 +15,8 @@ impl Mark {
     pub fn mid(&self) -> f64 { (self.bid + self.ask) / 2.0 }
 }
 
+// latest accepted mark per instrument; the event bus's price lane mirrors every
+// write (see `mark_router::apply_accepted`)
 #[derive(Clone, Default)]
 pub struct MarkStore {
     // create a atomic smart pointer to a multiple-readers single-writer hashmap
@@ -24,6 +26,11 @@ pub struct MarkStore {
 
 impl MarkStore {
     pub fn new() -> Self { Self::default() }
+
+    #[cfg(test)]
+    pub fn set_at(&self, instrument_id: i64, bid: f64, ask: f64, ts: DateTime<Utc>) {
+        self.inner.write().unwrap().insert(instrument_id, Mark { bid, ask, ts });
+    }
 
     pub fn set(&self, instrument_id: i64, bid: f64, ask: f64) {
         // acquire a write lock on the inner hashmap and insert a mark

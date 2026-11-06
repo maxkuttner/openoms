@@ -200,7 +200,7 @@ async fn report_held(pool: &PgPool) {
     // drift from what actually gets subscribed.
     let unpriceable: Vec<&str> = live
         .iter()
-        .filter(|r| !crate::feeds::ALL.iter().any(|feed| covers(*feed, r)))
+        .filter(|r| !crate::feeds::all().iter().any(|feed| covers(*feed, r)))
         .filter_map(|r| r.symbol.as_deref())
         .collect();
     if !unpriceable.is_empty() {
@@ -236,8 +236,8 @@ async fn report_held(pool: &PgPool) {
     }
 
     // One line per feed, so the healthy case is a glance rather than an absence.
-    for feed in crate::feeds::ALL {
-        let n = live.iter().filter(|r| covers(*feed, r)).count();
+    for feed in crate::feeds::all() {
+        let n = live.iter().filter(|r| covers(feed, r)).count();
         info!("preflight: {} covers {} of {} held instrument(s)", feed.code(), n, live.len());
     }
 }
@@ -254,25 +254,24 @@ struct HeldRow {
     venue: Option<String>,
 }
 
-/// Whether `feed` would actually subscribe this instrument.
-///
-/// Mirrors `load_subscribable` exactly: every `Some` field of `candidates()` must
-/// match, *and* `to_feed_symbol` must accept the symbol. Checking only some of the
-/// filter would over-report coverage and hide the very positions this exists to
-/// surface.
-fn covers(feed: &dyn dataprovider::FeedSymbology, row: &HeldRow) -> bool {
-    let f = feed.candidates();
-    let matches = |want: Option<&str>, have: &Option<String>| match (want, have) {
-        (None, _) => true,
-        (Some(w), Some(h)) => w == h,
-        // The filter constrains a column the row has no value for: not a match.
-        (Some(_), None) => false,
-    };
+impl HeldRow {
+    /// What the market data gateway is told about this position's instrument;
+    /// `None` when the instrument is gone or has no symbol.
+    fn instrument(&self) -> Option<dataprovider::InstrumentRef> {
+        Some(dataprovider::InstrumentRef {
+            id: self.id?,
+            symbol: self.symbol.clone()?,
+            instrument_class: self.instrument_class.clone(),
+            asset_class: self.asset_class.clone(),
+            venue: self.venue.clone(),
+        })
+    }
+}
 
-    matches(f.instrument_class, &row.instrument_class)
-        && matches(f.asset_class, &row.asset_class)
-        && matches(f.venue, &row.venue)
-        && row.symbol.as_deref().is_some_and(|s| feed.to_feed_symbol(s).is_some())
+/// Whether `feed` would actually subscribe this position's instrument — the
+/// same check the market data gateway makes (`dataprovider::covers`).
+fn covers(feed: &dyn dataprovider::FeedSymbology, row: &HeldRow) -> bool {
+    row.instrument().is_some_and(|i| dataprovider::covers(feed, &i))
 }
 
 /// Render up to [`SAMPLE`] names, noting how many were withheld.
@@ -327,14 +326,14 @@ mod tests {
     #[test]
     fn equity_is_not_covered_by_the_opra_feed() {
         let held = row("SPY", "SPOT", "EQUITY", "ARCX");
-        assert!(!covers(&crate::opra_stream::DatabentoOpraFeed::new(String::new()), &held));
-        assert!(!crate::feeds::ALL.iter().any(|f| covers(*f, &held)));
+        assert!(!covers(&gateway::md::opra::DatabentoOpraFeed::new(String::new()), &held));
+        assert!(!crate::feeds::all().iter().any(|f| covers(*f, &held)));
     }
 
     #[test]
     fn opra_feed_covers_a_held_option() {
         let held = row("SPY260724P00739000", "OPTION", "EQUITY", "OPRA");
-        assert!(covers(&crate::opra_stream::DatabentoOpraFeed::new(String::new()), &held));
+        assert!(covers(&gateway::md::opra::DatabentoOpraFeed::new(String::new()), &held));
     }
 
     /// Bybit leaves `venue` open, so it prices the pair wherever it is listed —
@@ -342,12 +341,12 @@ mod tests {
     #[test]
     fn open_venue_filter_covers_another_venues_listing() {
         let held = row("BTCUSDT", "SPOT", "CRYPTO", "BINANCE");
-        assert!(covers(&crate::bybit_feed::BybitFeed, &held));
-        assert!(covers(&crate::binance_feed::BinanceFeed, &held));
+        assert!(covers(&gateway::connectors::bybit::feed::BybitFeed, &held));
+        assert!(covers(&gateway::connectors::binance::feed::BinanceFeed, &held));
 
         let elsewhere = row("BTCUSDT", "SPOT", "CRYPTO", "XNAS");
-        assert!(covers(&crate::bybit_feed::BybitFeed, &elsewhere));
-        assert!(!covers(&crate::binance_feed::BinanceFeed, &elsewhere));
+        assert!(covers(&gateway::connectors::bybit::feed::BybitFeed, &elsewhere));
+        assert!(!covers(&gateway::connectors::binance::feed::BinanceFeed, &elsewhere));
     }
 
     /// A symbol inside `candidates` that the symbology still declines is not
@@ -355,6 +354,6 @@ mod tests {
     #[test]
     fn declined_symbol_is_not_covered_despite_matching_the_filter() {
         let malformed = row("SPY", "OPTION", "EQUITY", "OPRA");
-        assert!(!covers(&crate::opra_stream::DatabentoOpraFeed::new(String::new()), &malformed));
+        assert!(!covers(&gateway::md::opra::DatabentoOpraFeed::new(String::new()), &malformed));
     }
 }

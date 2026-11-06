@@ -13,10 +13,12 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::jobs::api::JobStarted;
-use crate::credentials::{BrokerCredentials, Connection, CredentialState, FeedCredentials, RedactedField};
-use crate::credentials_api::{self, CredentialSubmission, TestOutcome};
+use gateway::credentials::BrokerCredentials;
+use crate::credentials::{Connection, CredentialState, FeedCredentials, RedactedField};
+use gateway::verify::TestOutcome;
+use crate::credentials_api::{self, CredentialSubmission};
 use crate::reload;
-use crate::stream_health::StreamHealth;
+use gateway::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
 use crate::symbology_resolver::{self, ResolveError, ResolveOutcome};
 use symbology::InstrumentQuery;
@@ -576,6 +578,18 @@ pub async fn update_account(
 /// but doesn't match one of those literals passes reload silently and then
 /// 503s every order routed through it — see `setup::brokers::known_broker_codes`
 /// for why the accepted set is sourced from there rather than repeated here.
+/// A connection may only use an environment its venue offers (Coinbase: LIVE).
+fn validate_environment(broker_code: &str, environment: &str) -> Result<(), AdminError> {
+    if crate::venues::environment_allowed(broker_code, environment) {
+        Ok(())
+    } else {
+        Err(AdminError {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("{broker_code} does not offer a {environment} environment"),
+        })
+    }
+}
+
 fn validate_broker_code(code: &str) -> Result<(), AdminError> {
     let known = crate::setup::brokers::known_broker_codes();
     if known.contains(&code) {
@@ -609,6 +623,7 @@ pub async fn create_broker_connection(
         });
     }
     validate_broker_code(&payload.broker_code)?;
+    validate_environment(&payload.broker_code, &payload.environment)?;
     info!(code = %payload.code, broker_code = %payload.broker_code, environment = %payload.environment, "admin create broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
@@ -630,7 +645,7 @@ pub async fn create_broker_connection(
 
 /// The venues a broker connection can point at, with their credential fields:
 /// the cockpit builds its create form and credentials drawer from this.
-pub async fn list_venues() -> Json<Vec<crate::venues::Venue>> {
+pub async fn list_venues() -> Json<Vec<gateway::venue::Venue>> {
     Json(crate::venues::venues())
 }
 
@@ -790,6 +805,21 @@ pub async fn update_broker_connection(
     if let Some(ref broker_code) = payload.broker_code {
         validate_broker_code(broker_code)?;
     }
+    if payload.broker_code.is_some() || payload.environment.is_some() {
+        // Judge the pair the row will end up with, filling in what isn't changing.
+        let current: Option<(String, String)> =
+            sqlx::query_as("SELECT broker_code, environment FROM broker_connection WHERE code = $1")
+                .bind(&code)
+                .fetch_optional(state.pool())
+                .await
+                .map_err(map_db_error)?;
+        if let Some((broker_code, environment)) = current {
+            validate_environment(
+                payload.broker_code.as_deref().unwrap_or(&broker_code),
+                payload.environment.as_deref().unwrap_or(&environment),
+            )?;
+        }
+    }
     info!(broker_connection_code = %code, "admin update broker connection");
     let record = sqlx::query_as::<_, BrokerConnection>(
         r#"
@@ -822,7 +852,7 @@ pub async fn update_broker_connection(
 /// key must not be hidden behind that story. Shared so `GET`, `PUT`,
 /// `DELETE`, `test`, and `reload_connections` cannot each resolve this a
 /// different way.
-fn resolve_master_key() -> Result<Option<crate::secrets::MasterKey>, AdminError> {
+pub(crate) fn resolve_master_key() -> Result<Option<crate::secrets::MasterKey>, AdminError> {
     match crate::config::master_key(crate::config::load()) {
         Some(Ok(k)) => Ok(Some(k)),
         Some(Err(e)) => Err(AdminError {
@@ -1314,11 +1344,9 @@ async fn apply_reload(
 
     info!("admin reload connections");
 
-    let deps = reload::RegistrationDeps {
-        pool: state.pool().clone(),
+    let deps = gateway::connectors::RegistrationDeps {
         stream_health: state.stream_health().clone(),
-        kafka: state.kafka().cloned(),
-        position_changed_tx: state.position_changed_tx(),
+        engine: state.engine().clone(),
     };
 
     // Release this snapshot after registration, before joining old streams.
@@ -1327,17 +1355,15 @@ async fn apply_reload(
     let reload::RegistrationOutput {
         registry,
         mut report,
-        alpaca_creds,
-        // Always empty on a reload: every active Binance connection classifies
-        // `RestartRequired` here (see `classify`'s doc comment), so
-        // `build_registry` never takes the "build a fresh REST adapter" branch
-        // outside of boot. Nothing to spawn a stream for.
-        binance_rest_adapters: _binance_rest_adapters,
-        bybit_adapters,
-    } = reload::build_registry(&broker_connections, false, &current, &deps).await;
+        // A session-bound connection (FIX, and Binance on either transport)
+        // classifies `RestartRequired` on reload and is carried forward, so it
+        // never appears here outside of boot.
+        exec_streams,
+        daily_stats,
+    } = reload::build_registry(&broker_connections, false, &current, &state.daily_stats_handle().load(), &deps).await;
     drop(current);
 
-    state.swap_registry(registry);
+    state.swap_registries(registry, daily_stats);
 
     // `build_registry` pushes exactly one report entry per input connection,
     // in order (verified by reading every branch), which is what makes the
@@ -1355,76 +1381,26 @@ async fn apply_reload(
         "build_registry must report exactly one outcome per input connection, in order"
     );
 
-    // For each broker connection: restart its execution stream if this pass
-    // re-registered it, or stop one still running under a credential that is
-    // no longer live if this pass did not.
-    //
-    // `restarts_execution_stream` is true only for `Registered`, and
-    // `classify` never reports `Registered` for a FIX connection on reload
-    // (see its own doc comment) — so the restart arm only ever fires for
-    // Alpaca. Using it here, rather than re-deriving the same answer from
-    // `alpaca_creds` membership, is what makes this loop follow the outcome
-    // the report already committed to, instead of a second, potentially
-    // diverging judgment call.
-    //
-    // The stop arm covers `Disabled` and `Unconfigured`, and a `Failed` that
-    // truly has nothing running: nothing before this task ever stopped the
-    // *execution stream* for one of them — an operator disabling
-    // `alpaca-paper` because a key leaked would see the report say `Disabled`
-    // while the trade-update websocket kept ingesting fills on the old
-    // credential. `RestartRequired` is deliberately excluded: its adapter is
-    // carried forward and is still meant to be running.
-    //
-    // The condition is "no Alpaca adapter survived this pass for this
-    // environment", not "the outcome wasn't Registered" — those differ for
-    // exactly one case: an `Error`ed Alpaca connection whose credential
-    // failed to decrypt but whose adapter was carried forward from `current`
-    // (see `build_registry`'s `Error` arm, added for the same "one bad row
-    // must not disarm a working connection" reason `RestartRequired` already
-    // gets). Aborting the stream there, on the outcome alone, would stop
-    // fills while orders kept routing through the surviving adapter —
-    // recreating, in miniature, the exact order/fill split Task 4 closed for
-    // the double-stream case, just from the opposite direction (zero streams
-    // instead of two). `alpaca_exec_stream_code` is keyed by environment, not
-    // by broker kind, so checking `get_alpaca` from a non-Alpaca connection's
-    // iteration (e.g. an IBKR row sharing the same environment) is always a
-    // harmless no-op — nothing is ever registered under that key for them.
-    for (conn, (_, outcome)) in broker_connections.iter().zip(report.connections.iter()) {
-        let env_name: &'static str = match conn.environment.as_deref() {
-            Some("PAPER") => "PAPER",
-            Some("LIVE") => "LIVE",
-            _ => continue,
-        };
-        let alpaca_adapter = state.registry().get_alpaca(env_name);
-        if reload::restarts_execution_stream(outcome) {
-            if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), alpaca_adapter) {
-                streams.alpaca(env_name, (key.clone(), secret.clone()), adapter, &deps, state.streams()).await;
-            }
-        } else if should_stop_alpaca_stream(outcome, alpaca_adapter.is_some()) {
-            stop_execution_stream(&state, "ALPACA", env_name, &reload::alpaca_exec_stream_code(env_name)).await;
-        }
-    }
-
-    // Bybit, unlike Binance, applies on reload: every connection registered
-    // fresh this pass gets its private stream (re)started on the new adapter.
-    // One carried forward after a decrypt error is not in `bybit_adapters` and
-    // keeps its running stream; one that is gone is stopped just below.
-    for (env_name, adapter) in bybit_adapters {
-        streams.bybit(env_name, adapter, &deps, state.streams()).await;
+    // Every connection built fresh this pass gets its execution stream
+    // (re)started on the new adapter. One carried forward — restart required,
+    // or an unreadable credential whose adapter survived — is not in
+    // `exec_streams` and keeps its running stream.
+    for stream in exec_streams {
+        streams.exec(stream, &deps, state.streams()).await;
     }
 
     // Reconcile known execution tasks against the resulting registry, not just
-    // input rows: a deleted row has no iteration in the loop above. Binance REST
-    // is restart-required but its existing task must still stop when disabled.
-    for env_name in ["PAPER", "LIVE"] {
-        if state.registry().get_alpaca(env_name).is_none() {
-            stop_execution_stream(&state, "ALPACA", env_name, &reload::alpaca_exec_stream_code(env_name)).await;
-        }
-        if state.registry().get("BINANCE", env_name).is_none() {
-            stop_execution_stream(&state, "BINANCE", env_name, &reload::binance_exec_stream_code(env_name)).await;
-        }
-        if state.registry().get("BYBIT", env_name).is_none() {
-            stop_execution_stream(&state, "BYBIT", env_name, &reload::bybit_exec_stream_code(env_name)).await;
+    // input rows: a deleted row has no iteration in the loop above. A stream is
+    // stopped exactly when no adapter for its connection survived this pass —
+    // not on the outcome alone: an unreadable credential whose adapter was
+    // carried forward must keep its fills flowing while orders still route
+    // through it.
+    for connector in gateway::connectors::all().iter().filter(|c| c.manifest().exec_stream) {
+        let code = connector.manifest().code;
+        for env_name in ["PAPER", "LIVE"] {
+            if state.registry().get(code, env_name).is_none() {
+                stop_execution_stream(&state, code, env_name, &reload::exec_stream_code(code, env_name)).await;
+            }
         }
     }
 
@@ -1484,17 +1460,16 @@ fn reload_store_error(error: sqlx::Error) -> AdminError {
 
 async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str, code: &str) {
     if state.streams().abort_and_remove(code).await {
-        state.stream_health().handle(broker, environment, crate::stream_health::StreamKind::Execution)
+        state.stream_health().handle(broker, environment, gateway::stream_health::StreamKind::Execution)
             .set_down("connection disabled, unconfigured, or removed");
     }
 }
 
 async fn stop_databento_feed(state: &AppState) {
     if state.streams().abort_and_remove("databento-opra").await {
-        state.stream_health().handle("DATABENTO", "OPRA", crate::stream_health::StreamKind::Feed)
+        state.stream_health().handle("DATABENTO", "OPRA", gateway::stream_health::StreamKind::Feed)
             .set_down("connection disabled, unconfigured, or removed");
     }
-    state.doorbells().remove("databento-opra");
 }
 
 /// Whether `reload_connections` must refuse rather than swap: the same
@@ -1515,24 +1490,6 @@ fn must_refuse_reload(
     let any_error = broker_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)))
         || feed_connections.iter().any(|c| matches!(c.credentials, CredentialState::Error(_)));
     crate::nothing_decrypted(any_configured, any_error)
-}
-
-/// Whether the reload loop should stop an Alpaca environment's execution
-/// stream: true iff this pass did not just restart it (`outcome` is not
-/// `Registered`) *and* nothing survived the swap to keep serving orders under
-/// it either.
-///
-/// The second half is what keeps this different from a plain "outcome wasn't
-/// `Registered`" check: an `Error`ed connection whose credential failed to
-/// decrypt can still have `alpaca_adapter_survived = true`, because
-/// `build_registry`'s `Error` arm carries the previous adapter forward (the
-/// same "one bad row must not disarm a working connection" reasoning
-/// `RestartRequired` already gets). Stopping the stream in that case would
-/// halt fills while orders kept routing through the surviving adapter —
-/// recreating, from the opposite direction, the order/fill split Task 4
-/// closed for the double-stream case.
-fn should_stop_alpaca_stream(outcome: &reload::ConnectionOutcome, alpaca_adapter_survived: bool) -> bool {
-    !reload::restarts_execution_stream(outcome) && !alpaca_adapter_survived
 }
 
 /// Classify one feed connection for the reload report — the feed-side
@@ -1563,8 +1520,8 @@ fn classify_feed(conn: &Connection<FeedCredentials>) -> reload::ConnectionOutcom
 /// Whether the reload loop should stop the Databento feed task: true only for
 /// `Disabled` and `Unconfigured` — deliberate operator states. `Registered` is
 /// handled by `restart_databento_feed` itself; `Failed` is excluded on
-/// purpose, the feed-side mirror of `should_stop_alpaca_stream`'s own
-/// asymmetry for brokers: a decrypt failure on a *stored* row is not evidence
+/// purpose, the feed-side mirror of the broker stop rule's own
+/// asymmetry (stop only when no adapter survived): a decrypt failure on a *stored* row is not evidence
 /// the feed itself stopped working, and a stopped feed means no marks, which
 /// means positions go unpriced. The task is never touched in that case, so
 /// "carry forward" here needs no extra step beyond not calling this.
@@ -2884,7 +2841,11 @@ pub struct AdminError {
 }
 
 impl AdminError {
-    fn not_found(resource: &str) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self { status, message: message.into() }
+    }
+
+    pub(crate) fn not_found(resource: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: format!("{resource} not found"),
@@ -2898,7 +2859,7 @@ impl IntoResponse for AdminError {
     }
 }
 
-fn map_db_error(err: sqlx::Error) -> AdminError {
+pub(crate) fn map_db_error(err: sqlx::Error) -> AdminError {
     if let sqlx::Error::Database(db_err) = &err {
         if db_err.code().as_deref() == Some("23505") {
             return AdminError {
@@ -2941,7 +2902,7 @@ mod tests {
     }
 
     fn good_alpaca() -> CredentialState<BrokerCredentials> {
-        CredentialState::Configured(BrokerCredentials::Alpaca { key: "k".into(), secret: "s".into() })
+        CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "k".into(), secret: "s".into() }))
     }
 
     /// The gate must never fire on a normal running system or a fresh
@@ -2992,35 +2953,6 @@ mod tests {
         let brokers = vec![broker("alpaca-paper", good_alpaca())];
         let feeds = vec![feed("databento-opra", CredentialState::Error("bad key".into()))];
         assert!(!must_refuse_reload(&brokers, &feeds));
-    }
-
-    /// A connection this pass just restarted must never also be stopped,
-    /// regardless of whether an adapter happens to already be there.
-    #[test]
-    fn a_registered_connection_is_never_stopped() {
-        assert!(!should_stop_alpaca_stream(&reload::ConnectionOutcome::Registered, true));
-        assert!(!should_stop_alpaca_stream(&reload::ConnectionOutcome::Registered, false));
-    }
-
-    /// The regression this function exists to prevent: an `Error`ed
-    /// connection whose adapter was carried forward (see `build_registry`'s
-    /// `Error` arm) must keep its execution stream running, or orders route
-    /// while fills silently stop arriving.
-    #[test]
-    fn a_failed_connection_with_a_surviving_adapter_is_not_stopped() {
-        assert!(!should_stop_alpaca_stream(
-            &reload::ConnectionOutcome::Failed("bad key".into()),
-            true,
-        ));
-    }
-
-    /// The ordinary cases this function exists for: `Disabled`, `Unconfigured`,
-    /// and a `Failed` with nothing left running all mean stop.
-    #[test]
-    fn disabled_unconfigured_and_unrecovered_failed_are_stopped() {
-        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Disabled, false));
-        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Unconfigured, false));
-        assert!(should_stop_alpaca_stream(&reload::ConnectionOutcome::Failed("bad key".into()), false));
     }
 
     /// `Disabled` and `Unconfigured` are the deliberate-operator-state cases:
@@ -3107,10 +3039,10 @@ mod tests {
     fn the_save_response_carries_no_submitted_secret() {
         let conn = broker(
             "alpaca-paper",
-            CredentialState::Configured(BrokerCredentials::Alpaca {
+            CredentialState::Configured(BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials {
                 key: "AKLIVE".into(),
                 secret: "SUPERSECRETVALUE".into(),
-            }),
+            })),
         );
         let body = serde_json::to_string(&SaveResponse {
             redacted: redact_connection(conn),
@@ -3272,7 +3204,7 @@ mod tests {
 
     #[test]
     fn an_unknown_broker_code_is_rejected() {
-        let err = validate_broker_code("COINBASE").unwrap_err();
+        let err = validate_broker_code("NOSUCHBROKER").unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
     }
 
@@ -3384,21 +3316,20 @@ mod tests {
     }
 
     fn test_app_state(pool: sqlx::PgPool) -> AppState {
-        use crate::adapters::BrokerRegistry;
-        use crate::stream_health::StreamHealthRegistry;
+        use gateway::adapter::BrokerRegistry;
+        use gateway::stream_health::StreamHealthRegistry;
         use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
-        let (quote_tx, _quote_rx) = tokio::sync::mpsc::channel(1);
         AppState::new(
             pool,
             "test-admin-token".to_string(),
             false,
             BrokerRegistry::new(),
-            None,
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
-            None,
-            quote_tx,
+            crate::event_bus::EventBus::new(),
+            gateway::contract::EngineHandle::new().0,
+            std::sync::Arc::new(gateway::md::MarketDataGateway::new(StreamHealthRegistry::new()).0),
             crate::sessions::SessionConfig {
                 cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
                 ttl: crate::sessions::SessionTtl::default(),

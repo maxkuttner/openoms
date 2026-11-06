@@ -4,6 +4,7 @@ import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, To
 import { Routes, Route, Navigate } from "react-router-dom";
 import { tradeApi, onLoginUnavailable, API_BASE } from "./api/client";
 import { TradePage } from "./pages/Trade";
+import { LiveUpdatesProvider, useLive } from "./api/liveUpdates";
 
 /// Reachability of the OMS, polled on its own rather than inferred from whichever
 /// screen happens to be mounted. `/health` is unauthenticated, so this answers
@@ -23,12 +24,13 @@ function ConnectionDot() {
     refetchInterval: 10_000,
     retry: false,
   });
+  const live = useLive();
 
   const { color, label } = health.isError
     ? { color: "var(--mantine-color-offer-6)", label: "No connection to the OMS" }
     : health.isFetching
       ? { color: "var(--mantine-color-yellow-6)", label: "Checking the connection" }
-      : { color: "var(--mantine-color-depth-6)", label: "Connected" };
+      : { color: "var(--mantine-color-depth-6)", label: live ? "Live updates" : "Connected" };
 
   return (
     <Tooltip label={label}>
@@ -97,26 +99,28 @@ export function TradeApp() {
   if (me.error) return <Text c="red">Could not load your session.</Text>;
 
   return (
-    <AppShell header={{ height: 48 }} padding="md">
-      <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between" wrap="nowrap">
-          <Text fw={700} ff="var(--mantine-font-family-headings)">
-            openOMS
-          </Text>
-          <Group gap="xs" wrap="nowrap">
-            <ConnectionDot />
-            <Text size="sm" c="dimmed">
-              {me.data?.display_name ?? me.data?.code}
+    <LiveUpdatesProvider>
+      <AppShell header={{ height: 48 }} padding="md">
+        <AppShell.Header>
+          <Group h="100%" px="md" justify="space-between" wrap="nowrap">
+            <Text fw={700} ff="var(--mantine-font-family-headings)">
+              openOMS
             </Text>
+            <Group gap="xs" wrap="nowrap">
+              <ConnectionDot />
+              <Text size="sm" c="dimmed">
+                {me.data?.display_name ?? me.data?.code}
+              </Text>
+            </Group>
           </Group>
-        </Group>
-      </AppShell.Header>
-      <AppShell.Main>
-        <Routes>
-          <Route path="/" element={<TradePage me={me.data!} />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </AppShell.Main>
-    </AppShell>
+        </AppShell.Header>
+        <AppShell.Main>
+          <Routes>
+            <Route path="/" element={<TradePage me={me.data!} />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </AppShell.Main>
+      </AppShell>
+    </LiveUpdatesProvider>
   );
 }

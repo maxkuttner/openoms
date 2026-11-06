@@ -5,9 +5,9 @@
 //! [`process_execution_report`]. It rehydrates the order aggregate, applies the
 //! report through the state machine, and — in a single transaction — updates
 //! `order_state`, maintains the position projection, and appends the resulting
-//! events. On commit it publishes to Kafka.
+//! events (the outbox trigger queues them for Kafka). On commit it publishes to
+//! the bus's order lane.
 
-use tokio::sync::mpsc;
 use chrono::Utc;
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
@@ -17,9 +17,9 @@ use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::{ExecutionReport, OrderCommand, ReceiveExecutionReport};
 use crate::domain::orders::events::OrderEventPayload;
 use crate::domain::orders::state::OrderAggregateState;
+use crate::event_bus::{publish_appended, EventBus, OrderLaneEvent};
 use crate::event_store::{NewOrderEvent, OrderEventStore};
 use crate::handlers::{parse_order_side, parse_order_status, parse_order_type, parse_time_in_force};
-use crate::kafka::{publish_events, KafkaClient};
 use crate::positions;
 
 /// Signals an optimistic-concurrency version conflict — the caller retries.
@@ -40,27 +40,15 @@ impl std::error::Error for ConcurrencyRetry {}
 /// OrderRouted version bump; re-read and re-apply rather than drop the fill.
 pub async fn process_execution_report(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     order_id: Uuid,
     report: ExecutionReport,
     actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const MAX_ATTEMPTS: u32 = 5;
     for attempt in 1..=MAX_ATTEMPTS {
-        match apply_once(pool, kafka, order_id, report.clone(), actor).await {
-            Ok(()) => {
-                if matches!(report, ExecutionReport::Fill { .. }) {
-                    if let Some(tx) = position_changed_tx {
-                        // Signal that positions changed, so the market-data feed
-                        // can subscribe to newly-held instruments. try_send, not
-                        // send: never make the fill path wait on the marks feed —
-                        // a full channel already means "reload pending".
-                        let _ = tx.try_send(());
-                    }
-                }
-                return Ok(());
-            }
+        match apply_once(pool, order_id, report.clone(), actor, bus).await {
+            Ok(()) => return Ok(()),
             Err(e) if e.downcast_ref::<ConcurrencyRetry>().is_some() => {
                 if attempt == MAX_ATTEMPTS {
                     return Err(e);
@@ -76,10 +64,10 @@ pub async fn process_execution_report(
 
 async fn apply_once(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     order_id: Uuid,
     report: ExecutionReport,
     actor: &str,
+    bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let event_store = OrderEventStore::new(pool.clone());
     let mut tx = pool.begin().await?;
@@ -204,12 +192,14 @@ async fn apply_once(
     // Maintain the position projection from any fill events, in the same tx so it
     // commits atomically with the order_state update + event append below.
     let portfolio_uuid = Uuid::parse_str(&new_state.portfolio_id)?;
+    let mut any_fill = false;
     for event in &events {
         let (fill_qty, fill_price) = match &event.payload {
             OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
             | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (*fill_qty, *fill_price),
             _ => continue,
         };
+        any_fill = true;
         positions::persist_fill(
             &mut *tx,
             portfolio_uuid,
@@ -237,7 +227,7 @@ async fn apply_once(
         })
         .collect();
 
-    event_store
+    let appended = event_store
         .append_events_in_tx(&mut tx, order_id, expected_version, &new_events)
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -253,7 +243,134 @@ async fn apply_once(
 
     info!(order_id = %order_id, status = new_state.status.as_str(), "execution report applied");
 
-    publish_events(kafka.as_ref(), &order_id.to_string(), &events).await;
+    if let Some(bus) = bus {
+        publish_appended(bus, order_id, &new_events, &appended);
+        // quote feeds re-read the held set on this, to price newly held instruments
+        if any_fill {
+            bus.publish_order(OrderLaneEvent::PositionChanged {
+                portfolio_id: portfolio_uuid,
+                instrument_id: new_state.instrument_id.clone(),
+            });
+        }
+    }
+
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::domain::orders::commands::ExecutionReport;
+    use crate::event_bus::{EventBus, OrderLaneEvent};
+    use crate::handlers::tests::{seed_instrument, seed_order_state, seed_principal, test_pool};
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    fn fill() -> ExecutionReport {
+        ExecutionReport::Fill {
+            execution_id: Uuid::new_v4().to_string(),
+            fill_qty: 1.0,
+            fill_price: 100.0,
+            venue: "TEST".to_string(),
+        }
+    }
+
+    /// `seed_order_state` writes `version = 1` with no events behind it, while the
+    /// event store checks versions against the log. `version` picks which side
+    /// of that check the order lands on. Returns (order, portfolio, instrument).
+    pub(crate) async fn seeded_order(pool: &PgPool, version: i64) -> (Uuid, Uuid, String) {
+        let (principal_id, _) = seed_principal(pool, "bus-fill").await;
+        let instrument_id = seed_instrument(pool, "BUSFILL").await;
+        let order_id = seed_order_state(pool, principal_id, instrument_id, "bus-fill").await;
+        let portfolio_id: Uuid = sqlx::query_scalar(
+            "UPDATE order_state SET version = $2 WHERE order_id = $1 RETURNING portfolio_id",
+        )
+        .bind(order_id)
+        .bind(version)
+        .fetch_one(pool)
+        .await
+        .expect("set version");
+        (order_id, portfolio_id, instrument_id.to_string())
+    }
+
+    /// Remove everything `seeded_order` and the code under test wrote, so runs
+    /// don't pile up held positions or unpublished outbox rows in the shared dev
+    /// DB. The order's events stay: `order_event` is append-only and refuses deletes.
+    pub(crate) async fn remove_seeded(pool: &PgPool, order_id: Uuid) {
+        let mut tx = pool.begin().await.expect("begin cleanup");
+        sqlx::query(
+            "DELETE FROM kafka_outbox WHERE global_position IN \
+             (SELECT global_position FROM order_event WHERE order_id = $1)",
+        )
+        .bind(order_id)
+        .execute(&mut *tx)
+        .await
+        .expect("delete outbox rows");
+        let row = sqlx::query(
+            "DELETE FROM order_state WHERE order_id = $1 \
+             RETURNING principal_id, portfolio_id, account_id, broker_connection_code, instrument_id",
+        )
+        .bind(order_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("delete order_state");
+        let portfolio_id: Uuid = row.get("portfolio_id");
+        let instrument_id: String = row.get("instrument_id");
+        for (sql, bind) in [
+            ("DELETE FROM position WHERE portfolio_id = CAST($1 AS uuid)", portfolio_id.to_string()),
+            ("DELETE FROM account WHERE id = CAST($1 AS uuid)", row.get::<Uuid, _>("account_id").to_string()),
+            ("DELETE FROM broker_connection WHERE code = $1", row.get("broker_connection_code")),
+            ("DELETE FROM portfolio WHERE id = CAST($1 AS uuid)", portfolio_id.to_string()),
+            ("DELETE FROM principal WHERE id = CAST($1 AS uuid)", row.get::<Uuid, _>("principal_id").to_string()),
+            ("DELETE FROM instrument WHERE id = CAST($1 AS bigint)", instrument_id),
+            // last: deleting the position above queued one more change
+            ("DELETE FROM kafka_position_outbox WHERE portfolio_id = CAST($1 AS uuid)", portfolio_id.to_string()),
+        ] {
+            sqlx::query(sql).bind(bind).execute(&mut *tx).await.expect(sql);
+        }
+        tx.commit().await.expect("commit cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn fill_publishes_appended_then_position_changed() {
+        let pool = test_pool().await;
+        let (order_id, portfolio_id, instrument_id) = seeded_order(&pool, 0).await;
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe_order();
+
+        let applied = process_execution_report(&pool, order_id, fill(), "bus-test", Some(&bus)).await;
+        let mut got = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            got.push(ev);
+        }
+        // before any assert, so a failing run cleans up too
+        remove_seeded(&pool, order_id).await;
+
+        applied.expect("apply fill");
+        let (last, appended) = got.split_last().expect("events published");
+        assert!(!appended.is_empty());
+        assert!(appended
+            .iter()
+            .all(|ev| matches!(ev, OrderLaneEvent::Appended { order_id: o, .. } if *o == order_id)));
+        assert_eq!(*last, OrderLaneEvent::PositionChanged { portfolio_id, instrument_id });
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn failed_append_publishes_nothing() {
+        let pool = test_pool().await;
+        // order_state says version 1, the log says 0: the append is refused
+        let (order_id, _, _) = seeded_order(&pool, 1).await;
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe_order();
+
+        let applied = apply_once(&pool, order_id, fill(), "bus-test", Some(&bus)).await;
+        remove_seeded(&pool, order_id).await;
+
+        let err = applied.expect_err("version conflict");
+
+        assert!(err.downcast_ref::<ConcurrencyRetry>().is_some());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
 }

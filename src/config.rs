@@ -73,6 +73,34 @@ pub struct FileConfig {
     pub server: ServerSection,
     #[serde(default)]
     pub auth: AuthSection,
+    #[serde(default)]
+    pub fix_acceptor: FixAcceptorSection,
+    #[serde(default)]
+    pub control_link: FixAcceptorSection,
+}
+
+/// Where co-located strategies' control links connect (TLS only).
+pub type ControlLinkSettings = FixAcceptorSettings;
+
+/// Where strategies log on over FIX (TLS only). All three set, or no acceptor.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixAcceptorSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// PEM certificate the acceptor presents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+    /// PEM private key for `certificate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixAcceptorSettings {
+    pub port: u16,
+    pub certificate: String,
+    pub private_key: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -320,6 +348,28 @@ pub fn load() -> Option<&'static FileConfig> {
 }
 
 impl FileConfig {
+    /// The co-located strategies' control-link listener, or `None` when it is
+    /// not configured. Same shape as the FIX acceptor's section.
+    pub fn control_link(&self) -> Option<ControlLinkSettings> {
+        let s = &self.control_link;
+        Some(ControlLinkSettings {
+            port: s.port?,
+            certificate: s.certificate.clone()?,
+            private_key: s.private_key.clone()?,
+        })
+    }
+
+    /// The FIX acceptor's settings, or `None` when it is not configured.
+    /// Incomplete counts as absent, like `oidc()`.
+    pub fn fix_acceptor(&self) -> Option<FixAcceptorSettings> {
+        let s = &self.fix_acceptor;
+        Some(FixAcceptorSettings {
+            port: s.port?,
+            certificate: s.certificate.clone()?,
+            private_key: s.private_key.clone()?,
+        })
+    }
+
     /// The OIDC settings, or `None` when login is not configured.
     ///
     /// Incomplete is treated as absent on purpose: a half-filled block would
@@ -401,6 +451,15 @@ pub fn master_key(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_fix_acceptor_needs_port_certificate_and_key() {
+        let full = super::parse("[fix_acceptor]\nport = 9878\ncertificate = \"c.pem\"\nprivate_key = \"k.pem\"\n").unwrap();
+        assert_eq!(full.fix_acceptor().map(|s| s.port), Some(9878));
+        let partial = super::parse("[fix_acceptor]\nport = 9878\n").unwrap();
+        assert!(partial.fix_acceptor().is_none());
+        assert!(super::parse("").unwrap().fix_acceptor().is_none());
+    }
+
     use super::*;
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

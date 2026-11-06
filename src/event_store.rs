@@ -38,6 +38,8 @@ pub struct NewOrderEvent {
 pub struct AppendResult {
     pub last_version: i64,
     pub appended: usize,
+    // the log's global position of each appended event, in event order
+    pub global_positions: Vec<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +133,7 @@ impl OrderEventStore {
             return Ok(AppendResult {
                 last_version: expected_version,
                 appended: 0,
+                global_positions: Vec::new(),
             });
         }
 
@@ -153,6 +156,7 @@ impl OrderEventStore {
             return Ok(AppendResult {
                 last_version: expected_version,
                 appended: 0,
+                global_positions: Vec::new(),
             });
         }
 
@@ -166,9 +170,10 @@ impl OrderEventStore {
             }));
         }
 
+        let mut global_positions = Vec::with_capacity(events.len());
         for (index, event) in events.iter().enumerate() {
             let version = expected_version + (index as i64) + 1;
-            sqlx::query(
+            let global_position = sqlx::query_scalar::<_, i64>(
                 "INSERT INTO order_event (
                     order_id,
                     version,
@@ -189,7 +194,8 @@ impl OrderEventStore {
                     CAST($7 AS uuid),
                     CAST($8 AS uuid),
                     $9
-                 )"
+                 )
+                 RETURNING global_position"
             )
             .bind(order_id)
             .bind(version)
@@ -200,13 +206,15 @@ impl OrderEventStore {
             .bind(&event.correlation_id)
             .bind(&event.causation_id)
             .bind(event.schema_version)
-            .execute(&mut **tx)
+            .fetch_one(&mut **tx)
             .await?;
+            global_positions.push(global_position);
         }
 
         Ok(AppendResult {
             last_version: expected_version + events.len() as i64,
             appended: events.len(),
+            global_positions,
         })
     }
 
@@ -245,20 +253,7 @@ mod tests {
     use super::*;
     use crate::setup::database::config;
 
-    /// `load_stream` had never run against a real database — nothing called it — so
-    /// its column list and its types had never been checked. `created_at` is
-    /// `TIMESTAMP` (no zone), which sqlx refuses to decode as `DateTime<Utc>`, and
-    /// the column it ordered by was spelled differently from the column that
-    /// existed. Only Postgres can catch either.
-    ///
-    /// Appends to the order log, which is append-only by design: this leaves its
-    /// events behind under a throwaway order id.
-    ///
-    /// Run with: cargo test -- --ignored
-    /// Requires: a live Postgres reachable via the usual POSTGRES_* config.
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn an_appended_event_reads_back_out_of_the_stream() {
+    async fn test_store() -> OrderEventStore {
         // `main` loads .env before resolving config; a test binary does not, so
         // without this the test would silently resolve a different database than
         // the server runs against.
@@ -279,10 +274,39 @@ mod tests {
             .connect(&cfg.url())
             .await
             .expect("connect");
-        let store = OrderEventStore::new(pool);
+        OrderEventStore::new(pool)
+    }
+
+    fn probe_event(event_type: &str) -> NewOrderEvent {
+        NewOrderEvent {
+            event_id: Uuid::new_v4().to_string(),
+            event_type: event_type.to_string(),
+            actor: "event-store-test".to_string(),
+            payload: serde_json::json!({ "probe": true }),
+            correlation_id: None,
+            causation_id: None,
+            schema_version: 0,
+        }
+    }
+
+    /// `load_stream` had never run against a real database — nothing called it — so
+    /// its column list and its types had never been checked. `created_at` is
+    /// `TIMESTAMP` (no zone), which sqlx refuses to decode as `DateTime<Utc>`, and
+    /// the column it ordered by was spelled differently from the column that
+    /// existed. Only Postgres can catch either.
+    ///
+    /// Appends to the order log, which is append-only by design: this leaves its
+    /// events behind under a throwaway order id.
+    ///
+    /// Run with: cargo test -- --ignored
+    /// Requires: a live Postgres reachable via the usual POSTGRES_* config.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn an_appended_event_reads_back_out_of_the_stream() {
+        let store = test_store().await;
         let order_id = Uuid::new_v4();
 
-        store
+        let r = store
             .append_events(
                 order_id,
                 0,
@@ -300,10 +324,32 @@ mod tests {
             .expect("append");
 
         let stream = store.load_stream(order_id).await.expect("load stream");
+        crate::kafka_outbox::ack(&store.pool, &r.global_positions).await.expect("clear outbox");
 
         assert_eq!(stream.len(), 1);
         assert_eq!(stream[0].version, 1);
         assert_eq!(stream[0].actor, "event-store-test");
         assert_eq!(stream[0].payload["probe"], true);
+    }
+
+    /// The bus publishes each appended event with its global position, so append
+    /// must hand back exactly the positions the log assigned, in event order.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn append_returns_global_positions_in_order() {
+        let store = test_store().await;
+        let order_id = Uuid::new_v4();
+
+        let r = store
+            .append_events(order_id, 0, &[probe_event("order_submitted"), probe_event("order_routed")])
+            .await
+            .expect("append");
+
+        let stream = store.load_stream(order_id).await.expect("load stream");
+        crate::kafka_outbox::ack(&store.pool, &r.global_positions).await.expect("clear outbox");
+        assert_eq!(r.global_positions.len(), 2);
+        assert!(r.global_positions[0] < r.global_positions[1]);
+        let loaded: Vec<i64> = stream.iter().map(|e| e.global_position).collect();
+        assert_eq!(r.global_positions, loaded);
     }
 }

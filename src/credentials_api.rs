@@ -8,12 +8,11 @@
 //! of this module that reaches the network.
 
 use std::collections::HashMap;
-use std::time::Duration;
 use serde::Deserialize;
 
-use crate::adapters::alpaca::AlpacaAdapter;
-use crate::adapters::bybit::BybitAdapter;
-use crate::credentials::{BrokerCredentials, FeedCredentials};
+use gateway::credentials::BrokerCredentials;
+use gateway::verify::{timed_out, TestOutcome, TEST_TIMEOUT};
+use crate::credentials::FeedCredentials;
 
 /// A submitted credential form: field name to raw string value, exactly as
 /// an HTML form or a JSON object would hand it over. Untyped on purpose —
@@ -101,25 +100,30 @@ fn field<'a>(
     }
 }
 
-fn parse_port(sub: &CredentialSubmission, existing: Option<u16>) -> Result<u16, CredentialError> {
-    match sub.get("port") {
+fn parse_port(sub: &CredentialSubmission, name: &'static str, existing: Option<u16>) -> Result<u16, CredentialError> {
+    match sub.get(name) {
         Some(v) => v.parse::<u16>().map_err(|_| CredentialError::BadField {
-            name: "port",
+            name,
             why: "not a valid port number".into(),
         }),
-        None => existing.ok_or(CredentialError::MissingField("port")),
+        None => existing.ok_or(CredentialError::MissingField(name)),
     }
 }
 
-fn parse_ssl(sub: &CredentialSubmission, existing: Option<bool>) -> Result<bool, CredentialError> {
-    match sub.get("ssl") {
+/// A flag: submitted, else stored, else the connector's default (IBKR's `ssl`
+/// defaults to true — the same default its credential applies on decode).
+fn parse_bool(
+    sub: &CredentialSubmission,
+    name: &'static str,
+    existing: Option<bool>,
+    default: bool,
+) -> Result<bool, CredentialError> {
+    match sub.get(name) {
         Some(v) => v.parse::<bool>().map_err(|_| CredentialError::BadField {
-            name: "ssl",
+            name,
             why: "not a valid boolean (expected \"true\" or \"false\")".into(),
         }),
-        // ssl defaults to true — the same default `BrokerCredentials::IbkrFix`
-        // applies on deserialize — when nothing is submitted or stored yet.
-        None => Ok(existing.unwrap_or(true)),
+        None => Ok(existing.unwrap_or(default)),
     }
 }
 
@@ -132,61 +136,30 @@ pub fn parse_broker(
     existing: Option<&BrokerCredentials>,
     sub: &CredentialSubmission,
 ) -> Result<BrokerCredentials, CredentialError> {
-    match kind {
-        "ALPACA" => {
-            let (existing_key, existing_secret) = match existing {
-                Some(BrokerCredentials::Alpaca { key, secret }) => (Some(key.as_str()), Some(secret.as_str())),
-                _ => (None, None),
-            };
-            Ok(BrokerCredentials::Alpaca {
-                key: field(sub, "key", existing_key)?.to_string(),
-                secret: field(sub, "secret", existing_secret)?.to_string(),
-            })
-        }
-        "IBKR" => {
-            let existing = match existing {
-                Some(BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl }) => {
-                    Some((host.as_str(), *port, sender_comp_id.as_str(), target_comp_id.as_str(), password.as_str(), *ssl))
-                }
-                _ => None,
-            };
-            Ok(BrokerCredentials::IbkrFix {
-                host: field(sub, "host", existing.map(|e| e.0))?.to_string(),
-                port: parse_port(sub, existing.map(|e| e.1))?,
-                sender_comp_id: field(sub, "sender_comp_id", existing.map(|e| e.2))?.to_string(),
-                target_comp_id: field(sub, "target_comp_id", existing.map(|e| e.3))?.to_string(),
-                password: field(sub, "password", existing.map(|e| e.4))?.to_string(),
-                ssl: parse_ssl(sub, existing.map(|e| e.5))?,
-            })
-        }
-        "BINANCE" => {
-            let existing = match existing {
-                Some(BrokerCredentials::BinanceFix { host, port, sender_comp_id, target_comp_id, api_key, private_key }) => {
-                    Some((host.as_str(), *port, sender_comp_id.as_str(), target_comp_id.as_str(), api_key.as_str(), private_key.as_str()))
-                }
-                _ => None,
-            };
-            Ok(BrokerCredentials::BinanceFix {
-                host: field(sub, "host", existing.map(|e| e.0))?.to_string(),
-                port: parse_port(sub, existing.map(|e| e.1))?,
-                sender_comp_id: field(sub, "sender_comp_id", existing.map(|e| e.2))?.to_string(),
-                target_comp_id: field(sub, "target_comp_id", existing.map(|e| e.3))?.to_string(),
-                api_key: field(sub, "api_key", existing.map(|e| e.4))?.to_string(),
-                private_key: field(sub, "private_key", existing.map(|e| e.5))?.to_string(),
-            })
-        }
-        "BYBIT" => {
-            let (existing_key, existing_secret) = match existing {
-                Some(BrokerCredentials::Bybit { api_key, api_secret }) => (Some(api_key.as_str()), Some(api_secret.as_str())),
-                _ => (None, None),
-            };
-            Ok(BrokerCredentials::Bybit {
-                api_key: field(sub, "api_key", existing_key)?.to_string(),
-                api_secret: field(sub, "api_secret", existing_secret)?.to_string(),
-            })
-        }
-        other => Err(CredentialError::UnknownKind(other.to_string())),
+    use gateway::connectors::{self, FieldType};
+    use serde_json::Value;
+
+    let connector = connectors::by_code(kind).ok_or_else(|| CredentialError::UnknownKind(kind.to_string()))?;
+    let m = connector.manifest();
+    // a stored credential of another kind has nothing to carry over
+    let stored = existing.filter(|e| e.kind == m.credential_kind);
+    let stored_value = |name: &str| stored.and_then(|e| e.fields.get(name));
+
+    let mut fields = serde_json::Map::new();
+    for f in (m.venue)().fields {
+        let value = match m.field_types.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t) {
+            None => Value::String(field(sub, f.name, stored_value(f.name).and_then(Value::as_str))?.to_string()),
+            Some(FieldType::Port) => {
+                let existing = stored_value(f.name).and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+                Value::from(parse_port(sub, f.name, existing)?)
+            }
+            Some(FieldType::Bool { default }) => {
+                Value::Bool(parse_bool(sub, f.name, stored_value(f.name).and_then(Value::as_bool), default)?)
+            }
+        };
+        fields.insert(f.name.to_string(), value);
     }
+    Ok(BrokerCredentials::new(m.credential_kind, fields))
 }
 
 /// Turns a submitted form into a typed feed credential, same merge rule as
@@ -212,49 +185,6 @@ pub fn parse_feed(
     }
 }
 
-/// Outcome of attempting to verify a credential before it is saved.
-///
-/// A plain `Result<(), String>` can only say "it worked" or "it didn't" — it
-/// cannot also say "we didn't try", so a FIX credential would have to fake one
-/// of the other two. Faking `Ok(())` is the dishonest "passed" the brief warns
-/// against; faking `Err(_)` would show a real credential as broken before it
-/// is even saved. A third variant is the only way to keep both meanings
-/// distinct for the caller (task 3's `tested` field).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TestOutcome {
-    /// The credential authenticated against the broker.
-    Passed,
-    /// The credential was tested and the broker rejected it (or the attempt
-    /// failed for a network reason). `String` is a message for operators and
-    /// logs — built from the failure, never from the submitted credential.
-    Failed(String),
-    /// Nothing was attempted. Reserved for credentials with no cheap,
-    /// side-effect-free way to test.
-    NotTestable(&'static str),
-}
-
-/// How long a credential test may spend talking to a provider before it is
-/// reported as a failure.
-///
-/// Neither provider client sets a timeout of its own (Alpaca's is a bare
-/// `reqwest::Client::new()`, which has none by default), so without this a
-/// provider that completes the TCP handshake and then goes silent would hold
-/// the admin request open indefinitely — and with it the cockpit's "Test"
-/// button, which has no way to cancel. Ten seconds is far longer than either
-/// check needs against a healthy provider.
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The failure reported when a provider stops responding mid-test. Says which
-/// provider and how long was waited, because "test failed" alone would be
-/// indistinguishable from a rejected credential — the operator needs to know
-/// their key was never actually judged.
-fn timed_out(provider: &str) -> TestOutcome {
-    TestOutcome::Failed(format!(
-        "{provider} did not respond within {}s — credential not verified",
-        TEST_TIMEOUT.as_secs()
-    ))
-}
-
 /// Tests a credential the cheap way, where one exists.
 ///
 /// Alpaca gets a real check: `GET /v2/account` is a lightweight, read-only,
@@ -273,34 +203,14 @@ fn timed_out(provider: &str) -> TestOutcome {
 /// rather than test anything). So this deliberately does not attempt one and
 /// says so via `NotTestable`, rather than reporting a pass it did not earn.
 pub async fn test_broker(creds: &BrokerCredentials, environment: &str) -> TestOutcome {
-    match creds {
-        BrokerCredentials::Alpaca { key, secret } => {
-            let adapter = AlpacaAdapter::new(key.clone(), secret.clone(), environment);
-            match tokio::time::timeout(TEST_TIMEOUT, adapter.get_account()).await {
-                Ok(Ok(_)) => TestOutcome::Passed,
-                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
-                Err(_) => timed_out("Alpaca"),
-            }
-        }
-        BrokerCredentials::IbkrFix { .. } => {
-            TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save")
-        }
-        BrokerCredentials::BinanceFix { .. } => {
-            TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save")
-        }
-        BrokerCredentials::Bybit { api_key, api_secret } => {
-            let adapter = BybitAdapter::new(api_key.clone(), api_secret.clone(), environment);
-            match tokio::time::timeout(TEST_TIMEOUT, adapter.api_key_info()).await {
-                Ok(Ok(_)) => TestOutcome::Passed,
-                Ok(Err(e)) => TestOutcome::Failed(e.to_string()),
-                Err(_) => timed_out("Bybit"),
-            }
-        }
+    match gateway::connectors::by_credential_kind(&creds.kind) {
+        Some(connector) => connector.verify(environment, creds).await,
+        None => TestOutcome::Failed(format!("no connector for credential kind {}", creds.kind)),
     }
 }
 
 /// The Databento dataset `test_feed` authenticates against. Mirrors
-/// `opra_stream::OPRA_DATASET` (private to that module, so not reusable
+/// `gateway::md::opra::OPRA_DATASET` (private to that module, so not reusable
 /// directly): `databento-opra` is, today, the only Databento feed connection
 /// this build ever registers (see `admin::classify_feed`'s and `serve()`'s
 /// matching "only databento-opra" guards) and it is hardcoded to OPRA options
@@ -399,7 +309,9 @@ mod tests {
         assert!(!printed.contains("sup3r-s3cret"), "leaked a value: {printed}");
     }
     use super::*;
-    use crate::credentials::{BrokerCredentials, FeedCredentials};
+
+    use gateway::credentials::BrokerCredentials;
+    use crate::credentials::FeedCredentials;
 
     fn sub(pairs: &[(&str, &str)]) -> CredentialSubmission {
         CredentialSubmission {
@@ -407,18 +319,66 @@ mod tests {
         }
     }
 
+    /// Every connector's form, filled in completely, then submitted again with
+    /// every field blank: the stored credential must come back unchanged.
+    #[test]
+    fn blank_secret_keeps_the_stored_value_for_every_connector() {
+        for c in gateway::connectors::all() {
+            let m = c.manifest();
+            let full: Vec<(String, String)> = (m.venue)()
+                .fields
+                .iter()
+                .map(|f| {
+                    let v = match m.field_types.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t) {
+                        Some(gateway::connectors::FieldType::Port) => "1234".to_string(),
+                        Some(gateway::connectors::FieldType::Bool { .. }) => "false".to_string(),
+                        None => format!("v-{}", f.name),
+                    };
+                    (f.name.to_string(), v)
+                })
+                .collect();
+            let full_sub = CredentialSubmission { fields: full.iter().cloned().collect() };
+            let stored = parse_broker(m.code, None, &full_sub).expect(m.code);
+            let blank = CredentialSubmission { fields: full.iter().map(|(k, _)| (k.clone(), String::new())).collect() };
+            let kept = parse_broker(m.code, Some(&stored), &blank).expect(m.code);
+            assert_eq!(serde_json::to_value(&kept).unwrap(), serde_json::to_value(&stored).unwrap(), "{}", m.code);
+        }
+    }
+
+    #[test]
+    fn port_and_bool_fields_keep_their_validation() {
+        let base = [("host", "h"), ("sender_comp_id", "S"), ("target_comp_id", "T"), ("password", "p")];
+        let with = |extra: (&'static str, &'static str)| {
+            let mut pairs = base.to_vec();
+            pairs.push(extra);
+            parse_broker("IBKR", None, &sub(&pairs))
+        };
+        assert!(matches!(
+            with(("port", "x")),
+            Err(CredentialError::BadField { name: "port", why }) if why == "not a valid port number"
+        ));
+        let mut pairs = base.to_vec();
+        pairs.extend([("port", "4001"), ("ssl", "maybe")]);
+        assert!(matches!(
+            parse_broker("IBKR", None, &sub(&pairs)),
+            Err(CredentialError::BadField { name: "ssl", why }) if why == "not a valid boolean (expected \"true\" or \"false\")"
+        ));
+    }
+
     fn existing_alpaca() -> BrokerCredentials {
-        BrokerCredentials::Alpaca { key: "OLDKEY".into(), secret: "OLDSECRET".into() }
+        BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "OLDKEY".into(), secret: "OLDSECRET".into() })
     }
 
     #[test]
     fn a_full_submission_replaces_everything() {
-        match parse_broker("ALPACA", None, &sub(&[("key", "NEWKEY"), ("secret", "NEWSECRET")])).expect("parse") {
-            BrokerCredentials::Alpaca { key, secret } => {
+        {
+            let c = parse_broker("ALPACA", None, &sub(&[("key", "NEWKEY"), ("secret", "NEWSECRET")])).expect("parse");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
+            {
                 assert_eq!(key, "NEWKEY");
                 assert_eq!(secret, "NEWSECRET");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -427,12 +387,14 @@ mod tests {
     /// non-secret field without re-typing the secret they cannot see.
     #[test]
     fn an_omitted_secret_keeps_the_stored_one() {
-        match parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY")])).expect("parse") {
-            BrokerCredentials::Alpaca { key, secret } => {
+        {
+            let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY")])).expect("parse");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
+            {
                 assert_eq!(key, "NEWKEY");
                 assert_eq!(secret, "OLDSECRET", "the stored secret must survive an omission");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
     }
 
@@ -440,21 +402,23 @@ mod tests {
     /// secret to empty" would silently break a working connection.
     #[test]
     fn an_empty_secret_is_treated_as_omitted() {
-        match parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse") {
-            BrokerCredentials::Alpaca { secret, .. } => assert_eq!(secret, "OLDSECRET"),
-            other => panic!("wrong variant: {other:?}"),
+        {
+            let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let gateway::connectors::alpaca::adapter::AlpacaCredentials { secret, .. } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
+            { assert_eq!(secret, "OLDSECRET"); }
         }
     }
 
     fn existing_ibkr() -> BrokerCredentials {
-        BrokerCredentials::IbkrFix {
+        BrokerCredentials::from_typed("IbkrFix", &gateway::connectors::ibkr::fix::IbkrFixCredentials {
             host: "old.fix.example".into(),
             port: 4101,
             sender_comp_id: "OLDSENDER".into(),
             target_comp_id: "OLDTARGET".into(),
             password: "OLDPASSWORD".into(),
             ssl: true,
-        }
+        })
     }
 
     /// The merge rule above is proven only for Alpaca's two fields; IBKR and
@@ -476,7 +440,8 @@ mod tests {
         )
         .expect("parse")
         {
-            BrokerCredentials::IbkrFix { host, .. } => {
+            c if c.kind == "IbkrFix" => {
+                let gateway::connectors::ibkr::fix::IbkrFixCredentials { host, .. } = c.parse::<gateway::connectors::ibkr::fix::IbkrFixCredentials>().unwrap();
                 assert_eq!(host, "old.fix.example", "an omitted host must carry over from the stored credential");
             }
             other => panic!("wrong variant: {other:?}"),
@@ -500,7 +465,8 @@ mod tests {
         )
         .expect("parse")
         {
-            BrokerCredentials::IbkrFix { host, .. } => {
+            c if c.kind == "IbkrFix" => {
+                let gateway::connectors::ibkr::fix::IbkrFixCredentials { host, .. } = c.parse::<gateway::connectors::ibkr::fix::IbkrFixCredentials>().unwrap();
                 assert_eq!(host, "old.fix.example", "an empty host must be treated as omitted, not as a value");
             }
             other => panic!("wrong variant: {other:?}"),

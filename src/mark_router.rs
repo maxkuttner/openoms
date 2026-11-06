@@ -25,6 +25,7 @@ use sqlx::{PgPool, Row};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::event_bus::{EventBus, MarkUpdate};
 use crate::marks::MarkStore;
 
 /// How long a source may go quiet before a worse-ranked source may take over.
@@ -47,7 +48,7 @@ struct Active {
 }
 
 /// Drain quotes into the store until every feed has dropped its sender.
-pub async fn run(mut quotes: mpsc::Receiver<Quote>, marks: MarkStore, pool: PgPool) {
+pub async fn run(mut quotes: mpsc::Receiver<Quote>, marks: MarkStore, pool: PgPool, bus: EventBus) {
     let policy = match load_policy(&pool).await {
         Ok(p) => {
             info!(rules = p.len(), "mark router: loaded source policy");
@@ -90,7 +91,7 @@ pub async fn run(mut quotes: mpsc::Receiver<Quote>, marks: MarkStore, pool: PgPo
             continue;
         }
 
-        marks.set(q.instrument_id, q.bid, q.ask);
+        apply_accepted(&marks, &bus, &q);
         count += 1;
         if count % 10_000 == 0 {
             debug!(quotes = count, "mark router: throughput");
@@ -98,6 +99,13 @@ pub async fn run(mut quotes: mpsc::Receiver<Quote>, marks: MarkStore, pool: PgPo
     }
 
     info!(quotes = count, "mark router: all feeds closed, stopping");
+}
+
+/// Set the mark and mirror it on the bus's price lane, which carries every
+/// accepted mark and nothing else.
+fn apply_accepted(marks: &MarkStore, bus: &EventBus, q: &Quote) {
+    marks.set(q.instrument_id, q.bid, q.ask);
+    bus.publish_mark(MarkUpdate::from(q));
 }
 
 /// Decide whether this quote may set the mark, updating ownership as a side effect.
@@ -235,6 +243,19 @@ mod tests {
 
     fn t(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    #[test]
+    fn accepted_quote_is_published_on_price_lane() {
+        let marks = MarkStore::new();
+        let bus = EventBus::new();
+        let mut price_rx = bus.subscribe_price();
+        let q = quote("BINANCE", t(0));
+
+        apply_accepted(&marks, &bus, &q);
+
+        assert_eq!(price_rx.try_recv().unwrap(), MarkUpdate::from(&q));
+        assert!(marks.get(q.instrument_id).is_some());
     }
 
     #[test]

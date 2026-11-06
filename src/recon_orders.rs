@@ -26,14 +26,11 @@
 use std::collections::{HashMap, HashSet};
 
 use sqlx::{PgPool, Row};
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::adapters::{BrokerAdapter, BrokerError};
-use crate::domain::orders::commands::ExecutionReport;
-use crate::execution::process_execution_report;
-use crate::kafka::KafkaClient;
+use gateway::adapter::{BrokerAdapter, BrokerError};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderState, EngineHandle, ExecEvent, ExecKind, ExecSource};
 
 const EPS: f64 = 1e-9;
 
@@ -47,34 +44,9 @@ pub struct OmsWorkingOrder {
     /// broker about this order.
     pub ext_id: String,
     pub cum_qty: f64,
-}
-
-/// One order the broker currently reports as open, normalized across transports.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrokerOpenOrder {
-    /// Our order UUID (the client order id we sent).
-    pub client_order_id: String,
-    pub symbol: String,
-    pub executed_qty: f64,
-}
-
-/// How the broker says a no-longer-open order finished (from `order_status`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BrokerOrderOutcome {
-    Filled,
-    Canceled,
-    Rejected,
-    /// Still open at the broker (shouldn't happen on the ResolveTerminal path).
-    Working,
-}
-
-/// One order's current state at the broker, resolved on demand for an OMS order that
-/// dropped out of the open-order snapshot.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BrokerOrderState {
-    pub outcome: BrokerOrderOutcome,
-    pub executed_qty: f64,
-    pub avg_px: f64,
+    /// Average price of what the OMS has booked so far (`None` before any fill),
+    /// against which a missed quantity is priced.
+    pub avg_px: Option<f64>,
 }
 
 /// What the diff decided to do about one order.
@@ -139,22 +111,24 @@ pub fn plan_order_recon(oms: &[OmsWorkingOrder], broker_open: &[BrokerOpenOrder]
 /// `"IBKR"`): status `routed` or `partially_filled`, resolved to their broker symbol
 /// and external order id. Orders without a routed external id are skipped (nothing to
 /// ask the broker about).
-pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<OmsWorkingOrder> {
+pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str, environment: &str) -> Vec<OmsWorkingOrder> {
     // One round-trip: join the broker symbol and pull the routed external id inline,
     // rather than two per-order lookups (this runs on every reconnect + a 30s heartbeat).
     let rows = match sqlx::query(
         "SELECT os.order_id, bi.broker_symbol AS symbol, os.cum_qty::float8 AS cum_qty, \
-                (SELECT payload_json->'payload'->>'external_order_id' \
+                os.avg_px::float8 AS avg_px, \
+                COALESCE((SELECT payload_json->'payload'->>'external_order_id' \
                    FROM order_event \
                   WHERE order_id = os.order_id AND event_type = 'order_routed' \
-                  LIMIT 1) AS ext_id \
+                  LIMIT 1), os.external_order_id) AS ext_id \
          FROM order_state os \
          JOIN broker_connection bc ON bc.code = os.broker_connection_code \
          JOIN broker_instrument bi \
            ON bi.instrument_id = os.instrument_id::bigint AND bi.broker_code = $1 \
-         WHERE os.status IN ('routed', 'partially_filled') AND bc.broker_code = $1",
+         WHERE os.status IN ('routed', 'partially_filled') AND bc.broker_code = $1 AND bc.environment = $2",
     )
     .bind(broker_code)
+    .bind(environment)
     .fetch_all(pool)
     .await
     {
@@ -176,25 +150,100 @@ pub async fn load_oms_working_orders(pool: &PgPool, broker_code: &str) -> Vec<Om
             symbol: row.get("symbol"),
             ext_id,
             cum_qty: row.get("cum_qty"),
+            avg_px: row.get("avg_px"),
         });
     }
     out
 }
 
-/// The imperative shell: snapshot the broker's open orders, diff against the OMS
-/// working set, and act on each difference. Used by both the Binance WS driver and
-/// the FIX recon driver. `broker_code` is the uppercase registry/venue code
-/// (`"BINANCE"`); `actor` labels appended events (`"binance"` / `"ibkr"`).
+/// The imperative shell: read the OMS working set, then reconcile it against the
+/// broker. `broker_code` is the uppercase registry/venue code (`"BINANCE"`);
+/// `actor` labels the events booked from it (`"binance"` / `"ibkr"`).
 pub async fn run_order_reconcile(
     pool: &PgPool,
-    kafka: &Option<KafkaClient>,
     adapter: &dyn BrokerAdapter,
-    broker_code: &str,
-    actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
+    broker_code: &'static str,
+    environment: &'static str,
+    actor: &'static str,
+    engine: &EngineHandle,
 ) {
-    let oms = load_oms_working_orders(pool, broker_code).await;
+    let oms = load_oms_working_orders(pool, broker_code, environment).await;
+    let stuck = load_stuck_orders(pool, broker_code, environment).await;
+    reconcile_with(&oms, &stuck, adapter, broker_code, actor, engine).await;
+}
 
+/// How long an order may stay `submitted` before recon asks the venue about it:
+/// routing normally records the venue's id within a second or two.
+pub const STUCK_AFTER_SECS: u64 = 60;
+
+/// Orders left `submitted` past the grace period on one connection (`$1` broker
+/// code, `$2` environment): routing failed to record the venue's answer.
+pub const STUCK_ORDERS_SQL: &str = "SELECT os.order_id, bi.broker_symbol AS symbol \
+     FROM order_state os \
+     JOIN broker_connection bc ON bc.code = os.broker_connection_code \
+     JOIN broker_instrument bi ON bi.instrument_id = os.instrument_id::bigint AND bi.broker_code = $1 \
+     WHERE os.status = 'submitted' AND bc.broker_code = $1 AND bc.environment = $2 \
+       AND os.created_at < now() - interval '60 seconds'";
+
+/// An order stuck in `submitted`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StuckOrder {
+    pub order_id: Uuid,
+    pub symbol: String,
+}
+
+pub async fn load_stuck_orders(pool: &PgPool, broker_code: &str, environment: &str) -> Vec<StuckOrder> {
+    match sqlx::query_as::<_, (Uuid, String)>(STUCK_ORDERS_SQL).bind(broker_code).bind(environment).fetch_all(pool).await {
+        Ok(rows) => rows.into_iter().map(|(order_id, symbol)| StuckOrder { order_id, symbol }).collect(),
+        Err(e) => {
+            warn!(broker = broker_code, error = %e, "order recon: could not load stuck orders");
+            Vec::new()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StuckAction {
+    /// The venue works it: record its id (fills heal as for any routed order).
+    Route { order_id: Uuid, venue_order_id: String },
+    /// Not open at the venue: ask how it ended, or whether it ever arrived.
+    AskStatus { order_id: Uuid, symbol: String },
+}
+
+pub fn plan_stuck(stuck: &[StuckOrder], broker_open: &[BrokerOpenOrder]) -> Vec<StuckAction> {
+    stuck
+        .iter()
+        .map(|s| match broker_open.iter().find(|b| b.client_order_id == s.order_id.to_string() && !b.venue_order_id.is_empty()) {
+            Some(b) => StuckAction::Route { order_id: s.order_id, venue_order_id: b.venue_order_id.clone() },
+            None => StuckAction::AskStatus { order_id: s.order_id, symbol: s.symbol.clone() },
+        })
+        .collect()
+}
+
+/// What a stuck order's status answer books; `None` leaves it as it is.
+pub fn stuck_outcome(answer: &Result<BrokerOrderState, BrokerError>) -> Option<ExecKind> {
+    match answer {
+        // Working, but not in the snapshot: no id to route with, so leave it.
+        Ok(state) if state.outcome == gateway::contract::BrokerOrderOutcome::Working => None,
+        Ok(state) => Some(ExecKind::Terminal(state.clone())),
+        Err(BrokerError::NoSuchOrder(_)) => Some(ExecKind::Rejected { reason: "never reached the broker".into() }),
+        Err(_) => None,
+    }
+}
+
+/// Snapshot the broker's open orders, diff against `oms`, and act on each
+/// difference. Recon never books: an order that closed at the broker goes to the
+/// order engine as a terminal state, and the engine books it against what is
+/// booked *then* — in arrival order with live fills — not against `oms`, which a
+/// live fill may have overtaken while recon waited on the broker.
+pub async fn reconcile_with(
+    oms: &[OmsWorkingOrder],
+    stuck: &[StuckOrder],
+    adapter: &dyn BrokerAdapter,
+    broker_code: &'static str,
+    actor: &'static str,
+    engine: &EngineHandle,
+) {
     let broker_open = match adapter.open_orders().await {
         Ok(o) => o,
         Err(BrokerError::NotConfigured(_)) => return, // adapter doesn't support snapshots
@@ -204,13 +253,39 @@ pub async fn run_order_reconcile(
         }
     };
 
-    if oms.is_empty() && broker_open.is_empty() {
+    if oms.is_empty() && broker_open.is_empty() && stuck.is_empty() {
         return;
     }
 
-    for action in plan_order_recon(&oms, &broker_open) {
+    for action in plan_stuck(stuck, &broker_open) {
+        let (order_id, kind) = match action {
+            StuckAction::Route { order_id, venue_order_id } => {
+                info!(order_id = %order_id, %venue_order_id, "order recon: a stuck order is open at the broker; routing it");
+                (order_id, ExecKind::Ack { venue_order_id })
+            }
+            StuckAction::AskStatus { order_id, symbol } => {
+                let answer = adapter.order_status(&order_id.to_string(), "", &symbol).await;
+                match stuck_outcome(&answer) {
+                    Some(kind) => (order_id, kind),
+                    None => {
+                        error!(order_id = %order_id, answer = ?answer.err(), "order recon: cannot tell what became of a stuck order; left submitted");
+                        continue;
+                    }
+                }
+            }
+        };
+        engine.exec(ExecEvent { order_id, venue: broker_code.to_string(), actor, source: ExecSource::Snapshot, kind }).await;
+    }
+
+    // A stuck order is settled above, not reported as an orphan.
+    let broker_open: Vec<BrokerOpenOrder> = broker_open
+        .into_iter()
+        .filter(|b| !stuck.iter().any(|s| s.order_id.to_string() == b.client_order_id))
+        .collect();
+
+    for action in plan_order_recon(oms, &broker_open) {
         match action {
-            ReconAction::ResolveTerminal { order_id, symbol, ext_id, oms_cum } => {
+            ReconAction::ResolveTerminal { order_id, symbol, ext_id, .. } => {
                 let st = match adapter.order_status(&order_id.to_string(), &ext_id, &symbol).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -218,7 +293,14 @@ pub async fn run_order_reconcile(
                         continue;
                     }
                 };
-                apply_terminal(pool, kafka, order_id, oms_cum, &st, broker_code, actor, position_changed_tx)
+                engine
+                    .exec(ExecEvent {
+                        order_id,
+                        venue: broker_code.to_string(),
+                        actor,
+                        source: ExecSource::Snapshot,
+                        kind: ExecKind::Terminal(st),
+                    })
                     .await;
             }
             ReconAction::PartialDrift { order_id, oms_cum, broker_executed } => {
@@ -238,85 +320,46 @@ pub async fn run_order_reconcile(
     }
 }
 
-/// Apply a terminal state the broker pushed for one order, against the OMS's own
-/// cumulative fill — for venues whose order and fill updates arrive on separate,
-/// unordered channels (Bybit), where the close can overtake its fills.
-pub(crate) async fn apply_broker_terminal(
-    pool: &PgPool,
-    kafka: &Option<KafkaClient>,
-    order_id: Uuid,
-    st: &BrokerOrderState,
-    venue: &str,
-    actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
-) {
-    let oms_cum: f64 = match sqlx::query_scalar("SELECT cum_qty::float8 FROM order_state WHERE order_id = $1")
-        .bind(order_id)
-        .fetch_optional(pool)
-        .await
-    {
-        Ok(Some(cum)) => cum,
-        Ok(None) => {
-            warn!(order_id = %order_id, "broker terminal update for an order the OMS doesn't have");
-            return;
-        }
-        Err(e) => {
-            error!(order_id = %order_id, error = %e, "broker terminal update: could not read the order's fills");
-            return;
-        }
-    };
-    apply_terminal(pool, kafka, order_id, oms_cum, st, venue, actor, position_changed_tx).await;
+/// How much of `broker_cum` the OMS hasn't booked yet, or `None` when it is
+/// already booked (a repeated, replayed or older update).
+pub(crate) fn missing_qty(oms_cum: f64, broker_cum: f64) -> Option<f64> {
+    let missing = broker_cum - oms_cum;
+    (missing > EPS).then_some(missing)
 }
 
-/// Apply the terminal outcome of an order that dropped out of the open-order set.
-/// Emits the missed fill (full executed − OMS cum) first, then the close, so a
-/// partial-then-canceled order books its trade before releasing the remainder. The
-/// terminal-state guard in [`process_execution_report`] makes every step replay-safe.
-async fn apply_terminal(
-    pool: &PgPool,
-    kafka: &Option<KafkaClient>,
-    order_id: Uuid,
-    oms_cum: f64,
-    st: &BrokerOrderState,
-    venue: &str,
-    actor: &str,
-    position_changed_tx: Option<&mpsc::Sender<()>>,
-) {
-    let apply = |report: ExecutionReport| async move {
-        if let Err(e) =
-            process_execution_report(pool, kafka, order_id, report, actor, position_changed_tx).await
-        {
-            error!(order_id = %order_id, error = %e, "order recon: apply failed");
+/// The price of the quantity the broker has filled beyond what the OMS booked,
+/// from the two cumulative states: `(avg_b·cum_b − avg_oms·cum_oms) / (cum_b −
+/// cum_oms)`. Falls back to the broker's average when nothing is booked, no
+/// booked price is known, nothing is missing, or the result isn't a positive price.
+pub(crate) fn increment_price(oms_cum: f64, oms_avg: Option<f64>, broker_cum: f64, broker_avg: f64) -> f64 {
+    let missing = broker_cum - oms_cum;
+    match oms_avg {
+        Some(oms_avg) if oms_cum > EPS && missing > EPS => {
+            let price = (broker_avg * broker_cum - oms_avg * oms_cum) / missing;
+            if price.is_finite() && price > 0.0 { price } else { broker_avg }
         }
-    };
-
-    let missed = st.executed_qty - oms_cum;
-    if missed > EPS {
-        apply(ExecutionReport::Fill {
-            execution_id: format!("recon-{order_id}"),
-            fill_qty: missed,
-            fill_price: st.avg_px,
-            venue: venue.to_string(),
-        })
-        .await;
+        _ => broker_avg,
     }
+}
 
-    match st.outcome {
-        BrokerOrderOutcome::Filled => {
-            // The fill above closes it (leaves → 0). Nothing else to do.
+/// The OMS's own booked state for one order — cumulative quantity and average
+/// price; `None` (logged) when the order is unknown or unreadable.
+pub(crate) async fn oms_fill_state(pool: &PgPool, order_id: Uuid) -> Option<(f64, Option<f64>)> {
+    match sqlx::query_as::<_, (f64, Option<f64>)>(
+        "SELECT cum_qty::float8, avg_px::float8 FROM order_state WHERE order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(state)) => Some(state),
+        Ok(None) => {
+            warn!(order_id = %order_id, "broker update for an order the OMS doesn't have");
+            None
         }
-        BrokerOrderOutcome::Canceled => {
-            apply(ExecutionReport::Canceled { reason: None, venue: Some(venue.to_string()) }).await;
-        }
-        BrokerOrderOutcome::Rejected => {
-            apply(ExecutionReport::Reject {
-                reason: "rejected".to_string(),
-                venue: Some(venue.to_string()),
-            })
-            .await;
-        }
-        BrokerOrderOutcome::Working => {
-            info!(order_id = %order_id, "order recon: order still working at broker, no terminal action");
+        Err(e) => {
+            error!(order_id = %order_id, error = %e, "broker update: could not read the order's fills");
+            None
         }
     }
 }
@@ -324,12 +367,160 @@ async fn apply_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gateway::contract::{BrokerOrderOutcome, BrokerOrderState};
+
+    // Cumulative venues (Coinbase, OKX) book "venue cumulative − OMS cum_qty", so
+    // a repeated or replayed update (same cumulative) books nothing.
+    #[test]
+    fn missing_qty_books_only_what_is_new() {
+        assert_eq!(missing_qty(0.0, 0.0005), Some(0.0005));
+        assert_eq!(missing_qty(0.0005, 0.0005), None);
+        assert_eq!(missing_qty(0.001, 0.0005), None, "an older update after a newer one");
+    }
+
+    /// A broker whose snapshot no longer lists the order, and which reports it
+    /// canceled with some quantity executed.
+    struct ClosedAtBroker;
+
+    #[async_trait::async_trait]
+    impl BrokerAdapter for ClosedAtBroker {
+        async fn submit_order(
+            &self,
+            _: &gateway::adapter::BrokerOrderRequest,
+        ) -> Result<gateway::adapter::BrokerOrderResponse, BrokerError> {
+            unreachable!()
+        }
+        async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
+            unreachable!()
+        }
+        async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+            Ok(Vec::new())
+        }
+        async fn order_status(&self, _: &str, _: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
+            Ok(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 0.4, avg_px: 10.0 })
+        }
+    }
+
+    /// Has no open orders and no order by any id.
+    struct NeverSaw;
+
+    #[async_trait::async_trait]
+    impl BrokerAdapter for NeverSaw {
+        async fn submit_order(&self, _: &gateway::adapter::BrokerOrderRequest) -> Result<gateway::adapter::BrokerOrderResponse, BrokerError> {
+            unimplemented!()
+        }
+        async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
+            unimplemented!()
+        }
+        async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+            Ok(Vec::new())
+        }
+        async fn order_status(&self, client: &str, external: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
+            assert!(external.is_empty(), "a stuck order is asked about by our id");
+            Err(BrokerError::NoSuchOrder(client.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn recon_rejects_a_stuck_order_the_venue_never_saw() {
+        let order_id = Uuid::new_v4();
+        let (engine, mut rx) = gateway::contract::EngineHandle::new();
+        reconcile_with(&[], &[stuck(order_id)], &NeverSaw, "FAKE", "fake", &engine).await;
+        let Ok(gateway::contract::GatewayMsg::Exec(ev)) = rx.try_recv() else { panic!("an exec event") };
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.kind, ExecKind::Rejected { reason: "never reached the broker".into() });
+    }
+
+    /// Recon only asks the broker; the order engine books, against what is
+    /// booked when it gets there — never against the snapshot recon read at its
+    /// start, which a live fill may have overtaken.
+    #[tokio::test]
+    async fn recon_hands_terminal_states_to_the_engine_instead_of_booking() {
+        let order_id = Uuid::new_v4();
+        let oms = [OmsWorkingOrder { order_id, symbol: "X".into(), ext_id: "e1".into(), cum_qty: 0.0, avg_px: None }];
+        let (engine, mut rx) = gateway::contract::EngineHandle::new();
+
+        reconcile_with(&oms, &[], &ClosedAtBroker, "FAKE", "fake", &engine).await;
+
+        let Ok(gateway::contract::GatewayMsg::Exec(ev)) = rx.try_recv() else { panic!("an exec event") };
+        assert_eq!(ev.order_id, order_id);
+        assert_eq!(ev.source, ExecSource::Snapshot);
+        assert_eq!(
+            ev.kind,
+            ExecKind::Terminal(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 0.4, avg_px: 10.0 })
+        );
+    }
+
+    // The missing quantity is priced from the OMS's own booked state, not from
+    // whatever a connection happened to see: 0.5 booked @100, Coinbase now says
+    // 1.0 @105 average, so the missing 0.5 filled @110.
+    #[test]
+    fn the_missing_quantity_is_priced_against_what_the_oms_booked() {
+        assert!((increment_price(0.5, Some(100.0), 1.0, 105.0) - 110.0).abs() < 1e-9);
+        assert_eq!(increment_price(0.0, None, 1.0, 105.0), 105.0, "nothing booked yet: the broker's average");
+        assert_eq!(increment_price(0.5, None, 1.0, 105.0), 105.0, "no booked price known: the broker's average");
+        assert_eq!(increment_price(1.0, Some(100.0), 1.0, 105.0), 105.0, "no missing quantity");
+        assert_eq!(increment_price(0.5, Some(300.0), 1.0, 105.0), 105.0, "a negative increment price falls back");
+    }
 
     fn oms(id: Uuid, cum: f64) -> OmsWorkingOrder {
-        OmsWorkingOrder { order_id: id, symbol: "BTCUSDT".into(), ext_id: "9".into(), cum_qty: cum }
+        OmsWorkingOrder { order_id: id, symbol: "BTCUSDT".into(), ext_id: "9".into(), cum_qty: cum, avg_px: None }
     }
     fn open(id: &str, executed: f64) -> BrokerOpenOrder {
-        BrokerOpenOrder { client_order_id: id.into(), symbol: "BTCUSDT".into(), executed_qty: executed }
+        BrokerOpenOrder { client_order_id: id.into(), venue_order_id: format!("v-{id}"), symbol: "BTCUSDT".into(), executed_qty: executed }
+    }
+
+    fn stuck(id: Uuid) -> StuckOrder {
+        StuckOrder { order_id: id, symbol: "BTCUSDT".into() }
+    }
+
+    #[test]
+    fn a_stuck_order_open_at_the_broker_is_routed() {
+        let id = Uuid::new_v4();
+        let actions = plan_stuck(&[stuck(id)], &[open(&id.to_string(), 0.5)]);
+        assert_eq!(actions, vec![StuckAction::Route { order_id: id, venue_order_id: format!("v-{id}") }]);
+    }
+
+    /// Without the venue's id the order would be routed with none and never
+    /// reconciled again: ask about it instead.
+    #[test]
+    fn a_stuck_order_listed_without_a_venue_id_is_asked_about() {
+        let id = Uuid::new_v4();
+        let mut listed = open(&id.to_string(), 0.0);
+        listed.venue_order_id.clear();
+        assert_eq!(plan_stuck(&[stuck(id)], &[listed]), vec![StuckAction::AskStatus { order_id: id, symbol: "BTCUSDT".into() }]);
+    }
+
+    /// A venue that says the order is still working, though its snapshot did not
+    /// list it, gives no id to route with: leave it rather than book a terminal.
+    #[test]
+    fn a_working_answer_leaves_the_stuck_order() {
+        let st = BrokerOrderState { outcome: gateway::contract::BrokerOrderOutcome::Working, executed_qty: 0.5, avg_px: 2.0 };
+        assert!(stuck_outcome(&Ok(st)).is_none());
+    }
+
+    #[test]
+    fn a_stuck_order_absent_at_the_broker_is_asked_about() {
+        let id = Uuid::new_v4();
+        assert_eq!(plan_stuck(&[stuck(id)], &[]), vec![StuckAction::AskStatus { order_id: id, symbol: "BTCUSDT".into() }]);
+    }
+
+    #[test]
+    fn a_young_submitted_order_is_left_alone() {
+        assert!(STUCK_ORDERS_SQL.contains(&format!("interval '{STUCK_AFTER_SECS} seconds'")));
+        assert_eq!(STUCK_AFTER_SECS, 60);
+    }
+
+    #[test]
+    fn an_unknown_outcome_leaves_the_order() {
+        assert!(stuck_outcome(&Err(BrokerError::NotConfigured("no lookup".into()))).is_none());
+        assert!(stuck_outcome(&Err(BrokerError::Network("timeout".into()))).is_none());
+        assert!(matches!(
+            stuck_outcome(&Err(BrokerError::NoSuchOrder("x".into()))),
+            Some(ExecKind::Rejected { reason }) if reason == "never reached the broker"
+        ));
+        let st = BrokerOrderState { outcome: gateway::contract::BrokerOrderOutcome::Filled, executed_qty: 1.0, avg_px: 2.0 };
+        assert!(matches!(stuck_outcome(&Ok(st)), Some(ExecKind::Terminal(_))));
     }
 
     #[test]

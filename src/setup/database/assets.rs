@@ -92,8 +92,8 @@ mod tests {
     /// `init` report success having created no schema at all.
     #[test]
     fn embeds_every_migration() {
-        assert_eq!(migrations(&TARGETS[0]).len(), 24, "public migrations");
-        assert_eq!(migrations(&TARGETS[1]).len(), 31, "oms migrations");
+        assert_eq!(migrations(&TARGETS[0]).len(), 26, "public migrations");
+        assert_eq!(migrations(&TARGETS[1]).len(), 41, "oms migrations");
         for t in &TARGETS {
             for (name, sql) in migrations(t) {
                 assert!(name.ends_with(".sql"), "{name} is not .sql");

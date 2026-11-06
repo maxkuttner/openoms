@@ -1,0 +1,16 @@
+[package]
+name = "colo-example"
+version = "0.1.0"
+edition = "2021"
+description = "Reference co-located market maker: quotes one Binance pair under the OMS's control link"
+publish = false
+
+[dependencies]
+gateway = { path = "../gateway", default-features = false }
+dataprovider = { path = "../dataprovider" }
+colo-risk = { path = "../colo-risk" }
+colo-link = { path = "../colo-link" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

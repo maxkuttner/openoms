@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
 import { Button, Group, Paper, Stack, Text, Title } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
+import { useLive } from "../api/liveUpdates";
 import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
 import type { MarkRow } from "../types";
 
@@ -36,6 +37,7 @@ export function Watchlist({
   onSelectInstrument: (instrument: { id: string; symbol: string; venue: string; name: string }) => void;
 }) {
   const queryClient = useQueryClient();
+  const live = useLive();
   const [adding, setAdding] = useState(false);
   const [pendingInstrument, setPendingInstrument] = useState<string | null>(null);
 
@@ -49,7 +51,7 @@ export function Watchlist({
     queryKey: ["/marks", instrumentIds],
     queryFn: () => tradeApi.get<MarkRow[]>(`/marks?instrument_ids=${instrumentIds.join(",")}`),
     enabled: instrumentIds.length > 0,
-    refetchInterval: 3000,
+    refetchInterval: live ? false : 3000,
   });
   const markByInstrument = new Map((marks.data ?? []).map((m) => [String(m.instrument_id), m]));
 

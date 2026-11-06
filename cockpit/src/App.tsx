@@ -11,6 +11,7 @@ import { PortfoliosPage } from "./pages/Portfolios";
 import { AccountsPage } from "./pages/Accounts";
 import { BrokerConnectionsPage } from "./pages/BrokerConnections";
 import { RiskLimitsPage } from "./pages/RiskLimits";
+import { StrategiesPage } from "./pages/Strategies";
 import { BlotterPage } from "./pages/Blotter";
 import { InstrumentsPage } from "./pages/Instruments";
 import { DataFeedsPage } from "./pages/DataFeeds";
@@ -25,6 +26,7 @@ const NAV = [
   { to: "/broker-connections", label: "Broker connections" },
   { to: "/data-feeds", label: "Data feeds" },
   { to: "/risk-limits", label: "Risk limits" },
+  { to: "/strategies", label: "Strategies" },
   { to: "/blotter", label: "Blotter" },
   { to: "/instruments", label: "Instruments" },
 ];
@@ -93,6 +95,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
           <Route path="/broker-connections" element={<BrokerConnectionsPage />} />
           <Route path="/data-feeds" element={<DataFeedsPage />} />
           <Route path="/risk-limits" element={<RiskLimitsPage />} />
+          <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/blotter" element={<BlotterPage />} />
           <Route path="/instruments" element={<InstrumentsPage />} />
         </Routes>

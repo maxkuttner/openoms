@@ -5,6 +5,7 @@ import {
   Alert, Badge, Button, Drawer, Group, Loader, Select, Stack, Table, Text, Title, Tooltip,
 } from "@mantine/core";
 import { tradeApi, ApiError } from "../api/client";
+import { useLive } from "../api/liveUpdates";
 import { numeric, columnHeader, sideColor } from "../table";
 import { OrderTimeline } from "../../components/OrderTimeline";
 import type { BlotterRow } from "../../api/types";
@@ -71,6 +72,7 @@ export function TradeBlotter({
   // (LIMIT 100 ORDER BY created_at DESC) silently hid everything older, and
   // picking a portfolio could show "No orders" while that portfolio had plenty
   // — just none inside the newest hundred rows across all portfolios.
+  const live = useLive();
   const orders = useQuery<BlotterRow[]>({
     queryKey: ["/orders", { portfolioId, limit: BLOTTER_LIMIT }],
     queryFn: () => {
@@ -78,7 +80,7 @@ export function TradeBlotter({
       if (portfolioId) params.set("portfolio_id", portfolioId);
       return tradeApi.get<BlotterRow[]>(`/orders?${params.toString()}`);
     },
-    refetchInterval: 2000,
+    refetchInterval: live ? false : 2000,
   });
 
   // The order the ticket just sent, watched on its own until it leaves
@@ -91,9 +93,10 @@ export function TradeBlotter({
     queryKey: ["/orders", followOrderId, "state"],
     queryFn: () => tradeApi.get<OrderState>(`/orders/${followOrderId}`),
     enabled: followOrderId !== null,
-    // Stop polling once it has moved: there is nothing further to learn.
+    // Stop polling once it has moved: there is nothing further to learn. While
+    // live, the orders notice refreshes it instead.
     refetchInterval: (query) =>
-      query.state.data && query.state.data.status !== "submitted" ? false : 2000,
+      live || (query.state.data && query.state.data.status !== "submitted") ? false : 2000,
   });
   const followedStatus = followOrderId ? followed.data?.status ?? null : null;
 

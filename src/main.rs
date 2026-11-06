@@ -1,4 +1,3 @@
-mod adapters;
 mod event_store;
 mod order_events;
 mod domain;
@@ -17,10 +16,12 @@ mod sessions;
 mod oidc;
 mod auth_api;
 
-use crate::adapters::BrokerRegistry;
+use gateway::adapter::BrokerRegistry;
+use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::app_state::AppState;
 use crate::credentials::{CredentialState, FeedCredentials};
-use crate::reload::{RegistrationDeps, RegistrationOutput};
+use gateway::connectors::RegistrationDeps;
+use crate::reload::RegistrationOutput;
 use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
 use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit, BlotterRow};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
@@ -55,20 +56,21 @@ use utoipa::OpenApi;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 mod kafka;
 mod execution;
-mod alpaca_stream;
-mod binance_stream;
-mod bybit_stream;
-mod stream_health;
+mod event_bus;
+mod kafka_outbox;
+mod live_updates;
+mod order_engine;
+
 mod venues;
 mod marks;
 mod daily_stats;
-mod opra_stream;
-mod stream_supervisor;
-mod quote_feed;
+
+mod market_data;
+mod order_entry;
+mod colo;
+mod strategies;
 mod mark_router;
 mod daily_stats_poller;
-mod binance_feed;
-mod bybit_feed;
 mod feeds;
 mod preflight;
 mod config;
@@ -77,11 +79,12 @@ mod credentials;
 mod credentials_api;
 mod expiry;
 mod jobs;
-mod fix;
 mod reload;
 mod cockpit;
 #[cfg(test)]
 mod reload_tests;
+#[cfg(test)]
+mod boundary_tests;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -156,6 +159,19 @@ mod reload_tests;
         admin::expiry_sweep,
         admin::setup_status,
         admin::revoke_principal_sessions,
+        strategies::admin::list_strategies,
+        strategies::admin::create_strategy,
+        strategies::admin::update_strategy,
+        strategies::admin::delete_strategy,
+        strategies::admin::put_connections,
+        strategies::admin::get_connections,
+        strategies::admin::reset_password,
+        strategies::admin::put_follow_credentials,
+        strategies::admin::restart_acceptor,
+        strategies::admin::strategy_securities,
+        strategies::admin::kill_strategy,
+        strategies::admin::enable_strategy,
+        strategies::admin::flatten_strategy,
         auth_api::login,
         auth_api::callback,
         auth_api::logout,
@@ -190,6 +206,9 @@ mod reload_tests;
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         admin::RevokedSessions,
         auth_api::MeResponse,
+        strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
+        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted,
+        strategies::admin::TradeableInstrument, strategies::control::ControlReport,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -965,10 +984,11 @@ async fn serve() {
         return;
     }
 
-    // Init kafka client from .env (optional — publishing is disabled if not configured)
-    let kafka_client: Option<kafka::KafkaClient> = match kafka::KafkaConfig::from_env() {
+    // Init kafka client from .env (optional — publishing is disabled if not configured).
+    // The config is kept alongside the client for the outbox bridge's topic names.
+    let kafka_setup: Option<(kafka::KafkaConfig, kafka::KafkaClient)> = match kafka::KafkaConfig::from_env() {
         Ok(cfg) => match cfg.create_producer_client() {
-            Ok(client) => { info!("Kafka producer ready (topic: {})", cfg.orders_topic); Some(client) }
+            Ok(client) => { info!("Kafka producer ready (topic: {})", cfg.orders_topic); Some((cfg, client)) }
             Err(err) => { warn!("Kafka producer failed, publishing disabled: {}", err); None }
         },
         Err(err) => { info!("Kafka not configured ({}), publishing disabled", err); None }
@@ -1034,32 +1054,29 @@ async fn serve() {
         }
     }
 
-    // Stream health + the fill→marks doorbell are created here (before the broker
+    // Stream health + the event bus are created here (before the broker
     // registry) because FIX sessions register their adapter *and* start their
     // session in one step, so they need both up front. The same StreamHealthRegistry
     // is handed to AppState so REST/WS streams spawned later share it.
-    let stream_health = stream_health::StreamHealthRegistry::new();
+    let stream_health = gateway::stream_health::StreamHealthRegistry::new();
 
-    // Doorbell from the fill path to the marks feeds: a fill moved a position, so
-    // re-read the held set. bounded(1) — a queued signal already means "reload",
-    // so extras are redundant and try_send never blocks the fill path. A fan-out
-    // task (spawned below, once every feed has registered) relays to each feed's
-    // own doorbell, so execution.rs need not know how many feeds exist.
-    //
-    // The registry that fan-out reads from (keyed by feed code, so a restarted
-    // feed's fresh sender replaces its old one rather than accumulating a dead
-    // entry — see `DoorbellRegistry`'s doc comment) lives on `AppState` itself,
-    // not as a local here: the `/admin/connections/reload` handler needs to
-    // reach the exact same map this fan-out task drains, and a `serve()`-local
-    // would be unreachable from a request handler.
-    let (position_changed_tx, mut position_changed_rx) = tokio::sync::mpsc::channel::<()>(1);
+    // The in-process event bus (see `event_bus.rs`). The fill path publishes
+    // committed events and position changes on its order lane; market-data feeds
+    // subscribe to it to re-read the held set. One bus for the whole process,
+    // held by `AppState` so a reload hands restarted streams the same one.
+    let event_bus = event_bus::EventBus::new();
 
-    // Quote channel every market-data feed publishes onto. Created here, ahead
-    // of `AppState`, for the same reason: a runtime reload needs to hand a
-    // restarted feed this exact sender, not a disconnected second channel, so
-    // it has to be a value `AppState` can hold and hand back out, not a
-    // `serve()`-local threaded only through the boot-time spawns below.
-    let (quote_tx, quote_rx) = tokio::sync::mpsc::channel::<dataprovider::Quote>(1024);
+    // The order engine: the only place that books. Connectors send it execution
+    // events instead of writing to the database (see `order_engine.rs`). Started
+    // before any connector, though its channel would buffer either way.
+    let (engine, engine_rx) = gateway::contract::EngineHandle::new();
+    tokio::spawn(order_engine::run(engine_rx, engine.clone(), pool.clone(), event_bus.clone()));
+
+    // The market data gateway, and the one receiver of every quote it emits.
+    // Created here, ahead of `AppState`, for the same reason: a runtime reload
+    // restarts a credentialed feed on this exact gateway, so its quotes reach
+    // the one mark router boot started.
+    let (market_data, quote_rx) = gateway::md::MarketDataGateway::new(stream_health.clone());
 
     // Adapters come from the store, not the environment. `build_registry` is the
     // one code path that turns a credential into an adapter, so a credential
@@ -1069,10 +1086,8 @@ async fn serve() {
     // `broker_connections` was loaded once, above, alongside the master-key
     // resolution.
     let registration_deps = RegistrationDeps {
-        pool: pool.clone(),
         stream_health: stream_health.clone(),
-        kafka: kafka_client.clone(),
-        position_changed_tx: Some(position_changed_tx.clone()),
+        engine: engine.clone(),
     };
     let RegistrationOutput {
         registry,
@@ -1080,10 +1095,9 @@ async fn serve() {
         // response body. Every connection's outcome is already logged above by
         // `build_registry`, so there is nothing left to do with it here.
         report: _report,
-        alpaca_creds,
-        binance_rest_adapters,
-        bybit_adapters,
-    } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &registration_deps).await;
+        exec_streams,
+        daily_stats,
+    } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &registration_deps).await;
 
     // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
     // (OPENFIGI_API_KEY) raises the limits and batch size.
@@ -1099,12 +1113,12 @@ async fn serve() {
     );
 
     // AppState. Constructed with an empty registry and immediately swapped to the
-    // one `build_registry` just produced — the same `swap_registry` call a
+    // one `build_registry` just produced — the same `swap_registries` call a
     // runtime reload will use — so boot itself exercises that path rather than
-    // being the one caller that bypasses it. `position_changed_tx` and
-    // `quote_tx` are handed in (not just kept as `serve()` locals) so the
+    // being the one caller that bypasses it. `event_bus` and the market data
+    // gateway are handed in (not just kept as `serve()` locals) so the
     // `/admin/connections/reload` handler can rebuild an equivalent
-    // `RegistrationDeps` and restart feeds against the same channels boot used.
+    // `RegistrationDeps` and restart feeds on the same gateway boot used.
     // Session cookie policy is derived once here from the OIDC public base URL
     // — the browser's own view of this server, so a TLS terminator in front of
     // a loopback bind still gets `Secure` and the `__Host-` prefix — falling
@@ -1132,14 +1146,39 @@ async fn serve() {
         admin_token,
         admin_auth_enabled,
         BrokerRegistry::new(),
-        kafka_client,
         symbology,
         stream_health,
-        Some(position_changed_tx.clone()),
-        quote_tx.clone(),
+        event_bus,
+        engine,
+        std::sync::Arc::new(market_data),
         session_config,
     );
-    state.swap_registry(registry);
+    state.swap_registries(registry, daily_stats);
+    if let Err(e) = state.strategies().reload(state.pool()).await {
+        error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");
+    }
+    // Co-located strategies: consume what their follow streams report, then
+    // start following their accounts.
+    {
+        let (hub, s) = (state.colo().clone(), state.clone());
+        tokio::spawn(async move { hub.run(s).await });
+    }
+    tokio::spawn(colo::control::positions_loop(state.clone()));
+    tokio::spawn(colo::control::sweep_loop(state.clone()));
+    colo::follow::sync_follows(&state).await;
+    match file_cfg.and_then(|f| f.control_link()) {
+        Some(settings) => {
+            tokio::spawn(colo::link_server::serve(state.clone(), settings));
+        }
+        None => info!("control link: not configured"),
+    }
+
+    // Before the acceptor opens: a strategy that reconnects at once must not
+    // have its new orders taken for leftovers.
+    strategies::control::boot_recovery(&state).await;
+    if let Err(e) = state.fix_sessions().start(&state, file_cfg.and_then(|f| f.fix_acceptor())) {
+        error!(error = %e, "FIX acceptor did not start; strategies cannot log on over FIX");
+    }
 
     // One-time backfill: if the position projection is empty, rebuild it from the
     // event log so existing fills are reflected. No-op on a fresh install.
@@ -1155,54 +1194,49 @@ async fn serve() {
         Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
-    // (stream_health, position_changed_tx/rx and quote_tx/rx were created
+    // (stream_health, event_bus and the market data gateway were created
     // before the broker registry so FIX sessions could use them, and before
     // `AppState` so it could be constructed holding them.)
 
-    // Spawn Alpaca trade-update stream tasks (one per configured environment),
-    // registered in `StreamRegistry` under a distinct key
-    // (`reload::restart_alpaca_stream`'s `alpaca_exec_stream_code`) so a later
-    // credential swap can abort and respawn just this task rather than leaving
-    // fills arriving against a credential orders no longer route on — the same
-    // split Plan 2 closed at boot, reintroduced at reload without this. Boot
-    // exercises the exact call a runtime reload will use, same as
-    // `restart_databento_feed` below. Credentials come from `alpaca_creds`,
-    // stashed when the adapter was registered above — a second read of the
-    // store (let alone the environment) here could in principle see a
-    // different answer than what was just registered; reusing the same values
-    // makes that impossible by construction.
-    for env_name in ["PAPER", "LIVE"] {
-        if let (Some((key, secret)), Some(adapter)) = (alpaca_creds.get(env_name), state.registry().get_alpaca(env_name)) {
-            reload::restart_alpaca_stream(env_name, key.clone(), secret.clone(), adapter, &registration_deps, state.streams()).await;
-        }
-    }
-
-    // Spawn the Binance user-data stream for every REST-transport adapter
-    // registered above (`binance_stream::run` needs no credentials of its own —
-    // the adapter already holds them).
-    for (env_name, adapter) in binance_rest_adapters {
-        let health = state.stream_health().handle("BINANCE", env_name, stream_health::StreamKind::Execution);
-        let handle = tokio::spawn(binance_stream::run(env_name, state.pool().clone(), state.kafka().cloned(), adapter, health, Some(position_changed_tx.clone())));
-        state.streams().insert(reload::binance_exec_stream_code(env_name), handle);
-    }
-
-    // And the Bybit private stream for every Bybit adapter registered above —
-    // the same call a reload makes, so boot and reload cannot drift apart.
-    for (env_name, adapter) in bybit_adapters {
-        reload::restart_bybit_stream(env_name, adapter, &registration_deps, state.streams()).await;
+    // Start every registered connection's execution stream — the same call a
+    // runtime reload makes (`reload::restart_exec_stream`), so boot and reload
+    // cannot drift apart. Each is registered in `StreamRegistry` under
+    // `exec_stream_code`, so a later credential swap can abort and respawn just
+    // that task rather than leave fills arriving against a credential orders no
+    // longer route on.
+    for stream in &exec_streams {
+        reload::restart_exec_stream(stream, &registration_deps, state.streams()).await;
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside
     // `AppState`); the router is the sole writer to MarkStore. Adding a vendor
     // means spawning another feed here — nothing downstream changes.
-    tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone()));
+    tokio::spawn(mark_router::run(quote_rx, state.marks().clone(), state.pool().clone(), state.event_bus().clone()));
+
+    // Kafka bridge: publishes committed order events from the outbox, catching up
+    // after an outage. Without Kafka, events still queue; say how many wait.
+    match kafka_setup {
+        Some((cfg, client)) => {
+            tokio::spawn(kafka_outbox::run(
+                state.pool().clone(),
+                std::sync::Arc::new(kafka::KafkaSink(client)),
+                state.event_bus().subscribe_order(),
+                cfg.topics(),
+            ));
+        }
+        None => match kafka_outbox::pending_count(state.pool()).await {
+            Ok(n) if n > 0 => info!("kafka outbox: {n} events waiting; Kafka not configured"),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "kafka outbox: could not count pending events"),
+        },
+    }
 
     // Periodically refresh previous-close data for the interesting set (held
     // positions + watchlist) so Day P&L has a baseline even before a live quote
     // arrives. See `daily_stats_poller` for cadence and selection.
     tokio::spawn(daily_stats_poller::run(
         state.pool().clone(),
-        state.registry_handle(),
+        state.daily_stats_handle(),
         state.daily_stats().clone(),
     ));
 
@@ -1267,74 +1301,26 @@ async fn serve() {
                     continue;
                 }
                 // Credential-driven, so its task is registered in `StreamRegistry`
-                // and its doorbell in `DoorbellRegistry` (unlike the public
-                // Binance/Bybit feeds below): a later credential change can abort
-                // and replace it without a process restart. `restart_databento_feed`
-                // owns its own doorbell channel pair — see its doc comment — so
-                // boot exercises the exact same call a runtime reload will use.
+                // (unlike the public Binance/Bybit feeds below): a later credential
+                // change can abort and replace it without a process restart. Boot
+                // exercises the exact same call a runtime reload will use.
                 reload::restart_databento_feed(
                     api_key.clone(),
-                    state.pool().clone(),
+                    state.market_data(),
                     state.stream_health(),
                     state.streams(),
-                    state.doorbells(),
-                    quote_tx.clone(),
                 ).await;
                 info!(code = %conn.code, "registered DATABENTO/OPRA feed");
             }
         }
     }
 
-    // Binance public market data — no credentials, so it is always on. Each feed
-    // needs its own doorbell receiver (an mpsc has exactly one consumer), so the
-    // sender is cloned per feed rather than shared. Not registered in
-    // `StreamRegistry`: there is no credential that could change under it, so
-    // there is nothing for a reload to restart here — leave it running for the
-    // life of the process, same as before this feature existed.
-    {
-        let (binance_pos_tx, binance_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        state.doorbells().set("BINANCE/SPOT", binance_pos_tx);
-        let health = state.stream_health().handle("BINANCE", "SPOT", stream_health::StreamKind::Feed);
-        let session = quote_feed::QuoteFeedSession::new(
-            binance_feed::BinanceFeed,
-            state.pool().clone(),
-            quote_tx.clone(),
-            binance_pos_rx,
-            health.clone(),
-        );
-        tokio::spawn(stream_supervisor::supervise("BINANCE/SPOT", health, session));
-    }
-
-    // Bybit public market data — a second source for the same crypto pairs, so a
-    // Binance outage does not leave positions unmarked. Ranked below Binance in
-    // provider_feed_policy; the router decides which one owns the mark. Also not
-    // credential-driven, so — like Binance above — not registered in
-    // `StreamRegistry`.
-    {
-        let (bybit_pos_tx, bybit_pos_rx) = tokio::sync::mpsc::channel::<()>(1);
-        state.doorbells().set("BYBIT/SPOT", bybit_pos_tx);
-        let health = state.stream_health().handle("BYBIT", "SPOT", stream_health::StreamKind::Feed);
-        let session = quote_feed::QuoteFeedSession::new(
-            bybit_feed::BybitFeed,
-            state.pool().clone(),
-            quote_tx.clone(),
-            bybit_pos_rx,
-            health.clone(),
-        );
-        tokio::spawn(stream_supervisor::supervise("BYBIT/SPOT", health, session));
-    }
-
-    // Relay the fill path's single doorbell to every feed. `ring_all`'s
-    // `try_send`: a full per-feed channel already means "reload pending", and
-    // this must never block. Cloned rather than moved so a later credential
-    // reload can still register a replacement doorbell through the same
-    // `DoorbellRegistry` after this task has started — see its doc comment.
-    let fanout_doorbells = state.doorbells().clone();
-    tokio::spawn(async move {
-        while position_changed_rx.recv().await.is_some() {
-            fanout_doorbells.ring_all();
-        }
-    });
+    // Public market data: every connector whose venue has a public quote feed
+    // runs it on the market data gateway — no credentials, so it is always on,
+    // for the life of the process. What they price is what is held: the core
+    // keeps the gateway's subscriptions in step with the position table.
+    state.market_data().start_public_feeds();
+    tokio::spawn(market_data::run(state.pool().clone(), state.market_data().handle(), state.event_bus().subscribe_order()));
 
     // Load each credentialed broker's never-loaded instrument universe as a
     // background job, after everything above so the load never delays the server
@@ -1404,6 +1390,7 @@ async fn serve() {
         .route("/orders/:id", get(handlers::get_order))
         .route("/orders/:id/events", get(order_events::get_order_events))
         .route("/orders", get(handlers::list_orders))
+        .route("/strategies/securities", get(strategies::admin::strategy_securities))
         .route("/portfolios", get(handlers::list_portfolios))
         .route(
             "/watchlist",
@@ -1411,6 +1398,7 @@ async fn serve() {
         )
         .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
         .route("/marks", get(handlers::get_marks))
+        .route("/updates", get(live_updates::ws_updates))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
         .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
         .route(
@@ -1528,6 +1516,24 @@ async fn serve() {
                 .patch(admin::update_risk_limit)
                 .delete(admin::delete_risk_limit),
         )
+        .route(
+            "/admin/strategies",
+            post(strategies::admin::create_strategy).get(strategies::admin::list_strategies),
+        )
+        .route(
+            "/admin/strategies/:code",
+            axum::routing::patch(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
+        )
+        .route(
+            "/admin/strategies/:code/connections",
+            axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
+        )
+        .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
+        .route("/admin/strategies/:code/follow-credentials", axum::routing::put(strategies::admin::put_follow_credentials))
+        .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
+        .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
+        .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
+        .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))

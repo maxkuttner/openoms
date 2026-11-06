@@ -9,41 +9,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::secrets::{self, MasterKey};
-
-/// Credentials for one broker connection, tagged by broker so a blob read back
-/// from the database identifies itself.
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(tag = "kind")]
-pub enum BrokerCredentials {
-    Alpaca {
-        key: String,
-        secret: String,
-    },
-    IbkrFix {
-        host: String,
-        port: u16,
-        sender_comp_id: String,
-        target_comp_id: String,
-        password: String,
-        #[serde(default = "default_true")]
-        ssl: bool,
-    },
-    BinanceFix {
-        host: String,
-        port: u16,
-        sender_comp_id: String,
-        target_comp_id: String,
-        api_key: String,
-        /// PEM contents, not a path. A filesystem path is precisely what stops a
-        /// credential being configurable from anywhere but the server's shell.
-        private_key: String,
-    },
-    /// A Bybit v5 HMAC key pair (System-generated API key).
-    Bybit {
-        api_key: String,
-        api_secret: String,
-    },
-}
+use gateway::credentials::{BrokerCredentials, Shown};
 
 fn default_true() -> bool {
     true
@@ -92,33 +58,25 @@ fn masked(name: &str, hint: impl ToString) -> RedactedField {
     RedactedField { name: name.to_string(), value: None, secret: false, hint: Some(hint.to_string()) }
 }
 
+
+/// Each kind's fields in display order and how each may be shown — from the
+/// connector that owns the kind; a kind no connector owns shows nothing.
+fn redaction(kind: &str) -> &'static [(&'static str, Shown)] {
+    gateway::connectors::by_credential_kind(kind).map_or(&[], |c| c.manifest().redaction)
+}
+
 impl Redact for BrokerCredentials {
     fn redact(&self) -> Redacted {
-        let fields = match self {
-            BrokerCredentials::Alpaca { key, .. } => vec![
+        let fields = redaction(&self.kind)
+            .iter()
+            .map(|&(name, how)| match how {
+                Shown::Clear => shown(name, self.text(name).unwrap_or_else(|| self.default_text(name))),
+                Shown::Hidden => hidden(name),
                 // The last four characters identify which key is installed without
                 // being enough to use it — the same trick every payment UI uses.
-                masked("key", format!("…{}", tail4(key))),
-                hidden("secret"),
-            ],
-            BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, ssl, .. } => vec![
-                shown("host", host),
-                shown("port", port),
-                shown("sender_comp_id", sender_comp_id),
-                shown("target_comp_id", target_comp_id),
-                shown("ssl", ssl),
-                hidden("password"),
-            ],
-            BrokerCredentials::BinanceFix { host, port, sender_comp_id, target_comp_id, .. } => vec![
-                shown("host", host),
-                shown("port", port),
-                shown("sender_comp_id", sender_comp_id),
-                shown("target_comp_id", target_comp_id),
-                hidden("api_key"),
-                hidden("private_key"),
-            ],
-            BrokerCredentials::Bybit { .. } => vec![hidden("api_key"), hidden("api_secret")],
-        };
+                Shown::Tail => masked(name, format!("…{}", tail4(&self.text(name).unwrap_or_default()))),
+            })
+            .collect();
         Redacted { fields }
     }
 }
@@ -140,14 +98,9 @@ fn tail4(s: &str) -> String {
     chars[chars.len() - 4..].iter().collect()
 }
 
-// Hand-written for both enums: deriving Debug would print every secret they hold
-// the first time one appears in a panic message or a log line.
-impl std::fmt::Debug for BrokerCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "BrokerCredentials{:?}", self.redact().fields)
-    }
-}
-
+// Hand-written: deriving Debug would print every secret it holds the first
+// time one appears in a panic message or a log line. (BrokerCredentials has its
+// own, in the gateway.)
 impl std::fmt::Debug for FeedCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "FeedCredentials{:?}", self.redact().fields)
@@ -425,32 +378,52 @@ mod tests {
     use crate::secrets::{parse_master_key, seal};
 
     fn alpaca() -> BrokerCredentials {
-        BrokerCredentials::Alpaca { key: "AKTESTKEY123".into(), secret: "SUPERSECRETVALUE".into() }
+        BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "AKTESTKEY123".into(), secret: "SUPERSECRETVALUE".into() })
+    }
+
+    #[test]
+    fn a_coinbase_credential_round_trips_and_redacts_both_fields() {
+        let c = BrokerCredentials::from_typed("Coinbase", &gateway::connectors::coinbase::adapter::CoinbaseCredentials { api_key: "organizations/o/apiKeys/k".into(), private_key: "pem".into() });
+        let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(back.kind == "Coinbase" && matches!(back.parse::<gateway::connectors::coinbase::adapter::CoinbaseCredentials>().unwrap(), gateway::connectors::coinbase::adapter::CoinbaseCredentials { ref api_key, ref private_key } if api_key == "organizations/o/apiKeys/k" && private_key == "pem"));
+        let fields = redacted_fields(&c);
+        assert_eq!(fields.len(), 2);
+        assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
+    }
+
+    #[test]
+    fn an_okx_credential_round_trips_and_redacts_all_three_fields() {
+        let c = BrokerCredentials::from_typed("Okx", &gateway::connectors::okx::adapter::OkxCredentials { api_key: "k".into(), api_secret: "s".into(), passphrase: "p".into() });
+        let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
+        assert!(back.kind == "Okx" && matches!(back.parse::<gateway::connectors::okx::adapter::OkxCredentials>().unwrap(), gateway::connectors::okx::adapter::OkxCredentials { ref api_key, ref api_secret, ref passphrase } if api_key == "k" && api_secret == "s" && passphrase == "p"));
+        let fields = redacted_fields(&c);
+        assert_eq!(fields.len(), 3);
+        assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
     }
 
     #[test]
     fn a_bybit_credential_round_trips_and_redacts_both_fields() {
-        let c = BrokerCredentials::Bybit { api_key: "k".into(), api_secret: "s".into() };
+        let c = BrokerCredentials::from_typed("Bybit", &gateway::connectors::bybit::adapter::BybitCredentials { api_key: "k".into(), api_secret: "s".into() });
         let back: BrokerCredentials = serde_json::from_slice(&serde_json::to_vec(&c).unwrap()).unwrap();
-        assert!(matches!(back, BrokerCredentials::Bybit { ref api_key, ref api_secret } if api_key == "k" && api_secret == "s"));
+        assert!(back.kind == "Bybit" && matches!(back.parse::<gateway::connectors::bybit::adapter::BybitCredentials>().unwrap(), gateway::connectors::bybit::adapter::BybitCredentials { ref api_key, ref api_secret } if api_key == "k" && api_secret == "s"));
         let fields = redacted_fields(&c);
         assert_eq!(fields.len(), 2);
         assert!(fields.iter().all(|f| f.secret && f.value.is_none()));
     }
 
     fn binance() -> BrokerCredentials {
-        BrokerCredentials::BinanceFix {
+        BrokerCredentials::from_typed("BinanceFix", &gateway::connectors::binance::adapter::BinanceCredentials {
             host: "fix-oe.testnet.binance.vision".into(),
             port: 9000,
             sender_comp_id: "OMS".into(),
             target_comp_id: "SPOT".into(),
             api_key: "BNKEY999".into(),
             private_key: "-----BEGIN PRIVATE KEY-----\nMIIBSECRET\n-----END PRIVATE KEY-----".into(),
-        }
+        })
     }
 
     fn ibkr() -> BrokerCredentials {
-        BrokerCredentials::IbkrFix {
+        BrokerCredentials::from_typed("IbkrFix", &gateway::connectors::ibkr::fix::IbkrFixCredentials {
             host: "ibkr-gateway.example.com".into(),
             port: 4001,
             sender_comp_id: "OMSIB".into(),
@@ -459,7 +432,7 @@ mod tests {
             // Explicitly false so the round-trip test can catch the serde default
             // silently overriding a stored value.
             ssl: false,
-        }
+        })
     }
 
     /// The tag is what tells us which broker a blob belongs to when it comes back
@@ -470,29 +443,36 @@ mod tests {
         // comparing rendered strings would pass even if a secret were lost in the
         // round trip — the one thing this test exists to catch.
         let json = serde_json::to_vec(&alpaca()).expect("serialize");
-        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
-            BrokerCredentials::Alpaca { key, secret } => {
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize");
+            assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
+            let gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
+            {
                 assert_eq!(key, "AKTESTKEY123");
                 assert_eq!(secret, "SUPERSECRETVALUE");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
 
         let json = serde_json::to_vec(&binance()).expect("serialize");
-        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
-            BrokerCredentials::BinanceFix { host, port, api_key, private_key, target_comp_id, .. } => {
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize");
+            assert_eq!(c.kind, "BinanceFix", "wrong kind: {c:?}");
+            let gateway::connectors::binance::adapter::BinanceCredentials { host, port, api_key, private_key, target_comp_id, .. } = c.parse::<gateway::connectors::binance::adapter::BinanceCredentials>().unwrap();
+            {
                 assert_eq!(host, "fix-oe.testnet.binance.vision");
                 assert_eq!(port, 9000);
                 assert_eq!(target_comp_id, "SPOT");
                 assert_eq!(api_key, "BNKEY999");
                 assert!(private_key.contains("MIIBSECRET"), "PEM body must survive intact");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
 
         let json = serde_json::to_vec(&ibkr()).expect("serialize");
-        match serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize") {
-            BrokerCredentials::IbkrFix { host, port, sender_comp_id, target_comp_id, password, ssl } => {
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(&json).expect("deserialize");
+            assert_eq!(c.kind, "IbkrFix", "wrong kind: {c:?}");
+            let gateway::connectors::ibkr::fix::IbkrFixCredentials { host, port, sender_comp_id, target_comp_id, password, ssl } = c.parse::<gateway::connectors::ibkr::fix::IbkrFixCredentials>().unwrap();
+            {
                 assert_eq!(host, "ibkr-gateway.example.com");
                 assert_eq!(port, 4001);
                 assert_eq!(sender_comp_id, "OMSIB");
@@ -502,7 +482,6 @@ mod tests {
                 // as true via the serde default.
                 assert!(!ssl, "explicit ssl:false must survive the round trip");
             }
-            other => panic!("wrong variant: {other:?}"),
         }
 
         let f = FeedCredentials::Databento { api_key: "db-key".into() };
@@ -517,9 +496,11 @@ mod tests {
     #[test]
     fn ibkr_ssl_defaults_to_true_when_absent_from_the_blob() {
         let json = br#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p"}"#;
-        match serde_json::from_slice::<BrokerCredentials>(json).expect("deserialize") {
-            BrokerCredentials::IbkrFix { ssl, .. } => assert!(ssl, "missing ssl must default to true"),
-            other => panic!("wrong variant: {other:?}"),
+        {
+            let c = serde_json::from_slice::<BrokerCredentials>(json).expect("deserialize");
+            assert_eq!(c.kind, "IbkrFix", "wrong kind: {c:?}");
+            let gateway::connectors::ibkr::fix::IbkrFixCredentials { ssl, .. } = c.parse::<gateway::connectors::ibkr::fix::IbkrFixCredentials>().unwrap();
+            { assert!(ssl, "missing ssl must default to true"); }
         }
     }
 
@@ -630,11 +611,14 @@ mod tests {
         assert!(!r.contains("IBKRPASSWORD777"), "leaked in Debug: {r}");
     }
 
-    /// An unknown tag is data written by a newer version, not garbage to guess at.
+    /// The cockpit pre-ticks the TLS box from the redacted value: a blob from
+    /// before `ssl` existed runs with TLS on, so it must show "true", not "".
     #[test]
-    fn unknown_variant_is_an_error_not_a_panic() {
-        let r: Result<BrokerCredentials, _> = serde_json::from_slice(br#"{"kind":"Nasdaq"}"#);
-        assert!(r.is_err());
+    fn redaction_shows_the_default_for_a_flag_the_blob_predates() {
+        let json = r#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p"}"#;
+        let creds: BrokerCredentials = serde_json::from_str(json).unwrap();
+        let ssl = creds.redact().fields.into_iter().find(|f| f.name == "ssl").expect("ssl shown");
+        assert_eq!(ssl.value.as_deref(), Some("true"));
     }
 
     /// A key too short to usefully mask must not come back whole — that would
@@ -656,7 +640,8 @@ mod tests {
         let json = serde_json::to_vec(&alpaca()).expect("ser");
         let sealed = seal(&key(), "alpaca-paper", &json);
         match decode_broker(Some(&key()), "alpaca-paper", Some(sealed)) {
-            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, .. }) => {
+            CredentialState::Configured(c) if c.kind == "Alpaca" => {
+                let gateway::connectors::alpaca::adapter::AlpacaCredentials { key: k, .. } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
                 assert_eq!(k, "AKTESTKEY123");
             }
             other => panic!("expected Configured, got {other:?}"),
@@ -829,7 +814,7 @@ mod tests {
         let new_key = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("key");
 
         let broker_creds =
-            BrokerCredentials::Alpaca { key: "AKROUNDTRIP".into(), secret: "ROUNDTRIPSECRET".into() };
+            BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials { key: "AKROUNDTRIP".into(), secret: "ROUNDTRIPSECRET".into() });
         let feed_creds = FeedCredentials::Databento { api_key: "db-roundtrip-key".into() };
 
         save_broker(&pool, &old_key, broker_code, &broker_creds).await.expect("save_broker");
@@ -844,7 +829,8 @@ mod tests {
 
         let brokers = load_brokers(&pool, Some(&old_key)).await.expect("load_brokers");
         match &brokers.iter().find(|c| c.code == broker_code).expect("broker row present").credentials {
-            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, secret: s }) => {
+            CredentialState::Configured(c) if c.kind == "Alpaca" => {
+                let gateway::connectors::alpaca::adapter::AlpacaCredentials { key: k, secret: s } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
                 assert_eq!(k, "AKROUNDTRIP");
                 assert_eq!(s, "ROUNDTRIPSECRET");
             }
@@ -866,7 +852,8 @@ mod tests {
 
         let brokers_after = load_brokers(&pool, Some(&new_key)).await.expect("load_brokers after rotate");
         match &brokers_after.iter().find(|c| c.code == broker_code).expect("broker row present").credentials {
-            CredentialState::Configured(BrokerCredentials::Alpaca { key: k, secret: s }) => {
+            CredentialState::Configured(c) if c.kind == "Alpaca" => {
+                let gateway::connectors::alpaca::adapter::AlpacaCredentials { key: k, secret: s } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
                 assert_eq!(k, "AKROUNDTRIP");
                 assert_eq!(s, "ROUNDTRIPSECRET");
             }

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader, Paper, Select, SimpleGrid, Stack, Table, Text, Title, Group } from "@mantine/core";
 import { tradeApi } from "../api/client";
+import { useLive } from "../api/liveUpdates";
 import { numeric, columnHeader } from "../table";
 import type { Me } from "../App";
 import type { MarkRow } from "../types";
@@ -50,11 +51,12 @@ export function PositionsPage({ me }: { me: Me }) {
   const viewable = me.portfolios.filter((p) => p.can_view);
   const [portfolioId, setPortfolioId] = useState<string | null>(viewable[0]?.portfolio_id ?? null);
 
+  const live = useLive();
   const positions = useQuery<PositionRow[]>({
     queryKey: ["/portfolios", portfolioId, "positions"],
     queryFn: () => tradeApi.get<PositionRow[]>(`/portfolios/${portfolioId}/positions`),
     enabled: portfolioId !== null,
-    refetchInterval: 5000,
+    refetchInterval: live ? false : 5000,
   });
 
   const rows = positions.data ?? [];
@@ -76,7 +78,7 @@ export function PositionsPage({ me }: { me: Me }) {
     queryKey: ["/marks", heldInstrumentIds],
     queryFn: () => tradeApi.get<MarkRow[]>(`/marks?instrument_ids=${heldInstrumentIds.join(",")}`),
     enabled: heldInstrumentIds.length > 0,
-    refetchInterval: 3000,
+    refetchInterval: live ? false : 3000,
   });
   const markByInstrument = new Map((marks.data ?? []).map((m) => [String(m.instrument_id), m]));
 

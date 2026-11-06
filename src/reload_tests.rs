@@ -8,14 +8,18 @@ use std::time::Duration;
 
 use axum::{extract::State, middleware, routing::post, Router};
 use sqlx::{postgres::PgConnectOptions, PgPool};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 
-use crate::adapters::{alpaca::AlpacaAdapter, BrokerRegistry};
+use gateway::adapter::BrokerRegistry;
+use gateway::md::daily_stats::DailyStatsRegistry;
+use gateway::connectors::alpaca::adapter::AlpacaAdapter;
 use crate::app_state::{AppState, StreamRegistry};
-use crate::credentials::{self, BrokerCredentials, FeedCredentials};
-use crate::reload::{self, RegistrationDeps, ReloadStreams};
+use gateway::credentials::BrokerCredentials;
+use crate::credentials::{self, FeedCredentials};
+use gateway::connectors::RegistrationDeps;
+use crate::reload::{self, ReloadStreams};
 use crate::secrets::{parse_master_key, MasterKey};
-use crate::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
+use gateway::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
 
 fn key() -> MasterKey {
     parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap()
@@ -26,10 +30,10 @@ fn adapter() -> Arc<AlpacaAdapter> {
 }
 
 fn state(pool: PgPool) -> AppState {
-    let (quote_tx, _) = mpsc::channel(1);
-    AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(), None,
+    AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(),
         symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
-        StreamHealthRegistry::new(), None, quote_tx,
+        StreamHealthRegistry::new(), crate::event_bus::EventBus::new(),
+        gateway::contract::EngineHandle::new().0, std::sync::Arc::new(gateway::md::MarketDataGateway::new(StreamHealthRegistry::new()).0),
         crate::sessions::SessionConfig {
             cookie_policy: crate::sessions::cookie_policy("localhost:3001", None),
             ttl: crate::sessions::SessionTtl::default(),
@@ -40,7 +44,7 @@ fn state(pool: PgPool) -> AppState {
 #[derive(Clone, Default)]
 struct FakeStreams {
     active: Arc<Mutex<HashMap<String, usize>>>,
-    adapters: Arc<Mutex<HashMap<String, Arc<AlpacaAdapter>>>>,
+    adapters: Arc<Mutex<HashMap<String, Arc<dyn gateway::adapter::BrokerAdapter>>>>,
     gate: Arc<Mutex<Option<StartGate>>>,
 }
 
@@ -88,34 +92,33 @@ impl FakeStreams {
 
 #[async_trait::async_trait]
 impl ReloadStreams for FakeStreams {
-    async fn alpaca(&self, environment: &'static str, _: (String, String),
-        adapter: Arc<AlpacaAdapter>, _: &RegistrationDeps, streams: &StreamRegistry) {
-        let gate = self.gate.lock().unwrap().take();
-        if let Some(StartGate { entered, release }) = gate {
-            entered.notify_one();
-            release.notified().await;
+    async fn exec(&self, stream: reload::ExecStreamStart, _: &RegistrationDeps, streams: &StreamRegistry) {
+        // the reload-overlap test pauses the Alpaca start; the others never wait
+        if stream.code == "ALPACA" {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(StartGate { entered, release }) = gate {
+                entered.notify_one();
+                release.notified().await;
+            }
         }
-        let code = reload::alpaca_exec_stream_code(environment);
+        let code = reload::exec_stream_code(stream.code, stream.env);
         streams.abort_and_remove(&code).await;
         self.spawn(&code, streams);
-        self.adapters.lock().unwrap().insert(environment.into(), adapter);
-    }
-
-    async fn bybit(&self, environment: &'static str, _: Arc<crate::adapters::bybit::BybitAdapter>,
-        _: &RegistrationDeps, streams: &StreamRegistry) {
-        let code = reload::bybit_exec_stream_code(environment);
-        streams.abort_and_remove(&code).await;
-        self.spawn(&code, streams);
+        if stream.code == "ALPACA" {
+            self.adapters.lock().unwrap().insert(stream.env.into(), stream.adapter);
+        }
     }
 
     async fn databento(&self, _: String, state: &AppState) {
         state.streams().abort_and_remove("databento-opra").await;
         self.spawn("databento-opra", state.streams());
-        let (tx, mut rx) = mpsc::channel(1);
-        state.doorbells().set("databento-opra", tx);
-        state.doorbells().ring_all();
-        assert!(rx.try_recv().is_ok(), "replacement feed must receive doorbells");
     }
+}
+
+/// The same adapter instance (compares the data pointer; a `dyn` vtable pointer
+/// may differ between codegen units).
+fn same_adapter(a: &Arc<dyn gateway::adapter::BrokerAdapter>, b: &Arc<dyn gateway::adapter::BrokerAdapter>) -> bool {
+    std::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
 }
 
 async fn serve(state: AppState, fake: FakeStreams) -> (String, tokio::task::JoinHandle<()>) {
@@ -151,8 +154,8 @@ async fn reload_http_auth_and_store_failure_preserve_state() {
     let state = state(pool);
     let before = adapter();
     let mut registry = BrokerRegistry::new();
-    registry.register_alpaca("PAPER", before.clone());
-    state.swap_registry(registry);
+    registry.register("ALPACA", "PAPER", before.clone());
+    state.swap_registries(registry, DailyStatsRegistry::new());
     let fake = FakeStreams::default();
     fake.spawn("alpaca-paper:exec", state.streams());
     let (url, server) = serve(state.clone(), fake.clone()).await;
@@ -160,7 +163,7 @@ async fn reload_http_auth_and_store_failure_preserve_state() {
     assert_eq!(client().post(&url).send().await.unwrap().status(), 403);
     assert_eq!(client().post(&url).bearer_auth("wrong").send().await.unwrap().status(), 403);
     assert_eq!(post_reload(&url).await.0, 500);
-    assert!(Arc::ptr_eq(&before, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn gateway::adapter::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
 
     state.streams().abort_and_remove("alpaca-paper:exec").await;
@@ -200,20 +203,24 @@ async fn reload_http_lifecycle_against_postgres() {
     insert_broker(&pool, "ibkr-paper", "IBKR").await;
     insert_broker(&pool, "binance-paper", "BINANCE").await;
     insert_broker(&pool, "bybit-paper", "BYBIT").await;
-    credentials::save_broker(&pool, &key(), "alpaca-paper", &BrokerCredentials::Alpaca {
+    insert_broker(&pool, "okx-paper", "OKX").await;
+    credentials::save_broker(&pool, &key(), "alpaca-paper", &BrokerCredentials::from_typed("Alpaca", &gateway::connectors::alpaca::adapter::AlpacaCredentials {
         key: "SYNTHETIC-API-KEY".into(), secret: "SYNTHETIC-SECRET".into(),
-    }).await.unwrap();
-    credentials::save_broker(&pool, &key(), "ibkr-paper", &BrokerCredentials::IbkrFix {
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "ibkr-paper", &BrokerCredentials::from_typed("IbkrFix", &gateway::connectors::ibkr::fix::IbkrFixCredentials {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
         target_comp_id: "IBKR".into(), password: "SYNTHETIC-FIX-PASSWORD".into(), ssl: true,
-    }).await.unwrap();
-    credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::BinanceFix {
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::from_typed("BinanceFix", &gateway::connectors::binance::adapter::BinanceCredentials {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
         target_comp_id: "SPOT".into(), api_key: "SYNTHETIC-BINANCE".into(), private_key: "SYNTHETIC-PEM".into(),
-    }).await.unwrap();
-    credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::Bybit {
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::from_typed("Bybit", &gateway::connectors::bybit::adapter::BybitCredentials {
         api_key: "SYNTHETIC-BYBIT".into(), api_secret: "SYNTHETIC-BYBIT-SECRET".into(),
-    }).await.unwrap();
+    })).await.unwrap();
+    credentials::save_broker(&pool, &key(), "okx-paper", &BrokerCredentials::from_typed("Okx", &gateway::connectors::okx::adapter::OkxCredentials {
+        api_key: "SYNTHETIC-OKX".into(), api_secret: "SYNTHETIC-OKX-SECRET".into(), passphrase: "SYNTHETIC-OKX-PASS".into(),
+    })).await.unwrap();
     credentials::save_feed(&pool, &key(), "databento-opra", &FeedCredentials::Databento {
         api_key: "SYNTHETIC-DATABENTO".into(),
     }).await.unwrap();
@@ -221,7 +228,7 @@ async fn reload_http_lifecycle_against_postgres() {
     let mut registry = BrokerRegistry::new();
     registry.register("IBKR", "PAPER", adapter());
     registry.register("BINANCE", "PAPER", adapter());
-    state.swap_registry(registry);
+    state.swap_registries(registry, DailyStatsRegistry::new());
     let held_fix = state.registry().get("IBKR", "PAPER").unwrap();
     fake.spawn("binance-paper:exec", state.streams());
     for _ in 0..3 {
@@ -234,9 +241,11 @@ async fn reload_http_lifecycle_against_postgres() {
         // Bybit applies on every reload and never runs two streams.
         assert_eq!(outcome(&body, "bybit-paper"), "Registered");
         assert_eq!(fake.count("bybit-paper:exec"), 1);
+        assert_eq!(outcome(&body, "okx-paper"), "Registered");
+        assert_eq!(fake.count("okx-paper:exec"), 1);
         assert!(!body.to_string().contains("SYNTHETIC"));
         assert!(Arc::ptr_eq(&held_fix, &state.registry().get("IBKR", "PAPER").unwrap()));
-        assert!(Arc::ptr_eq(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get_alpaca("PAPER").unwrap()));
+        assert!(same_adapter(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get("ALPACA", "PAPER").unwrap()));
         assert_eq!(fake.count("alpaca-paper:exec"), 1);
         assert_eq!(fake.count("databento-opra"), 1);
     }
@@ -248,20 +257,20 @@ async fn reload_http_lifecycle_against_postgres() {
         async move { crate::admin::reload_using(state, Some(key()), fake).await }
     });
     tokio::time::timeout(Duration::from_secs(5), entered.notified()).await.unwrap();
-    let during = state.registry().get_alpaca("PAPER").unwrap();
+    let during = state.registry().get("ALPACA", "PAPER").unwrap();
     let mut second = tokio::spawn({ let url = url.clone(); async move { post_reload(&url).await } });
     assert!(tokio::time::timeout(Duration::from_millis(100), &mut second).await.is_err());
-    assert!(Arc::ptr_eq(&during, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(Arc::ptr_eq(&during, &state.registry().get("ALPACA", "PAPER").unwrap()));
     // Cancel the caller. The owned reload must still finish and release its lock.
     first.abort();
     let _ = first.await;
     release.notify_one();
     assert_eq!(second.await.unwrap().0, 200);
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
-    assert!(Arc::ptr_eq(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&fake.adapters.lock().unwrap()["PAPER"], &state.registry().get("ALPACA", "PAPER").unwrap()));
 
     // Partial unreadability preserves the exact old adapter and feed task.
-    let before = state.registry().get_alpaca("PAPER").unwrap();
+    let before = state.registry().get("ALPACA", "PAPER").unwrap();
     sqlx::query("UPDATE oms.broker_connection SET credentials = '\\x00'::bytea WHERE code = 'alpaca-paper'")
         .execute(&pool).await.unwrap();
     sqlx::query("UPDATE oms.feed_connection SET credentials = '\\x00'::bytea")
@@ -270,14 +279,14 @@ async fn reload_http_lifecycle_against_postgres() {
     assert_eq!(status, 200);
     assert!(outcome(&body, "alpaca-paper")["Failed"].is_string());
     assert!(outcome(&body, "databento-opra")["Failed"].is_string());
-    assert!(Arc::ptr_eq(&before, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn gateway::adapter::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("databento-opra"), 1);
 
     // No readable rows: refuse before swapping or stopping anything.
     sqlx::query("UPDATE oms.broker_connection SET credentials = '\\x00'::bytea")
         .execute(&pool).await.unwrap();
     assert_eq!(post_reload(&url).await.0, 500);
-    assert!(Arc::ptr_eq(&before, &state.registry().get_alpaca("PAPER").unwrap()));
+    assert!(same_adapter(&(before.clone() as Arc<dyn gateway::adapter::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("alpaca-paper:exec"), 1);
     assert_eq!(fake.count("binance-paper:exec"), 1);
     assert_eq!(fake.count("databento-opra"), 1);
@@ -295,21 +304,21 @@ async fn reload_http_lifecycle_against_postgres() {
     assert_eq!(status, 200);
     assert_eq!(outcome(&body, "alpaca-paper"), "Disabled");
     assert_eq!(outcome(&body, "databento-opra"), "Unconfigured");
-    assert!(state.registry().get_alpaca("PAPER").is_none());
+    assert!(state.registry().get("ALPACA", "PAPER").is_none());
     assert!(state.registry().get("IBKR", "PAPER").is_none());
-    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "databento-opra"] {
+    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {
         assert_eq!(fake.count(code), 0);
     }
     assert!(state.stream_health().snapshot().iter().all(|h| h.state == StreamState::Down));
 
     // Deleted rows have no report iteration, but their old tasks still stop.
-    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "databento-opra"] {
+    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {
         fake.spawn(code, state.streams());
     }
     sqlx::query("DELETE FROM oms.broker_connection").execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM oms.feed_connection").execute(&pool).await.unwrap();
     assert_eq!(post_reload(&url).await, (200, serde_json::json!({"connections": []})));
-    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "databento-opra"] {
+    for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {
         assert_eq!(fake.count(code), 0);
     }
 

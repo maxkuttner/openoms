@@ -1,0 +1,312 @@
+[
+  {
+    "code": "ALPACA",
+    "name": "Alpaca",
+    "description": "US stocks, ETFs and options",
+    "docs_url": "https://maxkuttner.github.io/openoms/integrations/alpaca/",
+    "universe": "About 14,400 stocks and ETFs",
+    "environments": [
+      {
+        "code": "PAPER",
+        "label": "paper trading account",
+        "keys_url": "https://app.alpaca.markets/paper/dashboard/overview"
+      },
+      {
+        "code": "LIVE",
+        "label": "live account",
+        "keys_url": "https://app.alpaca.markets/brokerage/dashboard/overview"
+      }
+    ],
+    "fields": [
+      {
+        "name": "key",
+        "label": "API key ID",
+        "secret": false,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "secret",
+        "label": "Secret key",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      }
+    ]
+  },
+  {
+    "code": "BINANCE",
+    "name": "Binance",
+    "description": "Crypto spot pairs",
+    "docs_url": "https://maxkuttner.github.io/openoms/integrations/binance/",
+    "universe": "About 2,000 spot pairs",
+    "environments": [
+      {
+        "code": "PAPER",
+        "label": "spot testnet",
+        "keys_url": "https://testnet.binance.vision/"
+      },
+      {
+        "code": "LIVE",
+        "label": "live account",
+        "keys_url": "https://www.binance.com/en/my/settings/api-management"
+      }
+    ],
+    "fields": [
+      {
+        "name": "api_key",
+        "label": "API key",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "private_key",
+        "label": "Private key (PEM)",
+        "secret": true,
+        "input": "textarea",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": "fix-oe.testnet.binance.vision",
+        "live": "fix-oe.binance.com"
+      },
+      {
+        "name": "port",
+        "label": "Port",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": "9000",
+        "live": "9000"
+      },
+      {
+        "name": "sender_comp_id",
+        "label": "SenderCompID",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": "OMS",
+        "live": "OMS"
+      },
+      {
+        "name": "target_comp_id",
+        "label": "TargetCompID",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": "SPOT",
+        "live": "SPOT"
+      }
+    ]
+  },
+  {
+    "code": "BYBIT",
+    "name": "Bybit",
+    "description": "Crypto spot pairs",
+    "docs_url": "https://maxkuttner.github.io/openoms/integrations/bybit/",
+    "universe": "About 800 spot pairs",
+    "environments": [
+      {
+        "code": "PAPER",
+        "label": "spot testnet",
+        "keys_url": "https://testnet.bybit.com/app/user/api-management"
+      },
+      {
+        "code": "LIVE",
+        "label": "live account",
+        "keys_url": "https://www.bybit.com/app/user/api-management"
+      }
+    ],
+    "fields": [
+      {
+        "name": "api_key",
+        "label": "API key",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "api_secret",
+        "label": "API secret",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      }
+    ]
+  },
+  {
+    "code": "COINBASE",
+    "name": "Coinbase",
+    "description": "Crypto spot pairs",
+    "docs_url": "https://maxkuttner.github.io/openoms/integrations/coinbase/",
+    "universe": "About 900 spot pairs",
+    "environments": [
+      {
+        "code": "LIVE",
+        "label": "live account",
+        "keys_url": "https://portal.cdp.coinbase.com/projects/api-keys"
+      }
+    ],
+    "fields": [
+      {
+        "name": "api_key",
+        "label": "API key",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "private_key",
+        "label": "Private key (PEM)",
+        "secret": true,
+        "input": "textarea",
+        "section": null,
+        "paper": null,
+        "live": null
+      }
+    ]
+  },
+  {
+    "code": "OKX",
+    "name": "OKX",
+    "description": "Crypto spot pairs",
+    "docs_url": "https://maxkuttner.github.io/openoms/integrations/okx/",
+    "universe": "About 700 spot pairs",
+    "environments": [
+      {
+        "code": "PAPER",
+        "label": "demo trading",
+        "keys_url": "https://www.okx.com/account/my-api"
+      },
+      {
+        "code": "LIVE",
+        "label": "live account",
+        "keys_url": "https://www.okx.com/account/my-api"
+      }
+    ],
+    "fields": [
+      {
+        "name": "api_key",
+        "label": "API key",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "api_secret",
+        "label": "API secret",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "passphrase",
+        "label": "Passphrase",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      }
+    ]
+  },
+  {
+    "code": "IBKR",
+    "name": "Interactive Brokers",
+    "description": "Multi-asset over FIX; experimental, no instrument loading",
+    "docs_url": "https://maxkuttner.github.io/openoms/integrations/interactive-brokers/",
+    "universe": null,
+    "environments": [
+      {
+        "code": "PAPER",
+        "label": "paper account",
+        "keys_url": null
+      },
+      {
+        "code": "LIVE",
+        "label": "live account",
+        "keys_url": null
+      }
+    ],
+    "fields": [
+      {
+        "name": "password",
+        "label": "Password",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "host",
+        "label": "Host",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "port",
+        "label": "Port",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "sender_comp_id",
+        "label": "SenderCompID",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "target_comp_id",
+        "label": "TargetCompID",
+        "secret": false,
+        "input": "text",
+        "section": "FIX session",
+        "paper": "IBKR",
+        "live": "IBKR"
+      },
+      {
+        "name": "ssl",
+        "label": "TLS",
+        "secret": false,
+        "input": "checkbox",
+        "section": "FIX session",
+        "paper": "true",
+        "live": "true"
+      }
+    ]
+  }
+]

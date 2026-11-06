@@ -584,6 +584,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "colo-example"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "colo-link",
+ "colo-risk",
+ "dataprovider",
+ "gateway",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "colo-link"
+version = "0.1.0"
+dependencies = [
+ "colo-risk",
+ "futures-util",
+ "native-tls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+]
+
+[[package]]
+name = "colo-risk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1321,6 +1356,31 @@ dependencies = [
  "pin-project-lite",
  "pin-utils",
  "slab",
+]
+
+[[package]]
+name = "gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "databento",
+ "dataprovider",
+ "ed25519-dalek",
+ "futures-util",
+ "hmac",
+ "p256",
+ "quickfix",
+ "rand 0.8.6",
+ "reqwest 0.13.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3075,25 +3135,28 @@ dependencies = [
  "bcrypt",
  "chrono",
  "clap",
+ "colo-link",
+ "colo-risk",
  "csv",
  "databento",
  "dataprovider",
  "dialoguer",
  "domain",
  "dotenvy",
- "ed25519-dalek",
  "flate2",
  "futures-util",
+ "gateway",
  "hmac",
  "include_dir",
  "mime_guess",
  "openidconnect",
- "quickfix",
+ "p256",
  "rand 0.8.6",
  "rdkafka",
  "reqwest 0.12.28",
  "reqwest 0.13.1",
  "rsa",
+ "rustls",
  "scalar_api_reference",
  "semver",
  "serde",
@@ -3105,6 +3168,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.21.0",
  "toml",
  "tower 0.4.13",
@@ -3368,6 +3432,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -4373,6 +4443,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

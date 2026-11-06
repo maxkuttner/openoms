@@ -111,6 +111,10 @@ pub async fn auth_middleware(
 
     enforce_origin_for_session(kind, req.headers(), req.method(), &state.session_config)?;
 
+    if let Some(code) = crate::strategies::stopped_strategy(&state.strategies().all(), ctx.principal_id) {
+        return Err(axum::response::IntoResponse::into_response((StatusCode::FORBIDDEN, format!("strategy {code} is stopped"))));
+    }
+
     req.extensions_mut().insert(ctx);
     Ok(next.run(req).await)
 }
