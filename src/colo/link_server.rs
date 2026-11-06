@@ -34,14 +34,23 @@ pub trait LinkBackend: Send + Sync {
     async fn initial_state(&self, code: &str) -> ToStrategy;
 }
 
-pub fn tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<tokio_native_tls::TlsAcceptor, String> {
-    let identity = native_tls::Identity::from_pkcs8(cert_pem, key_pem).map_err(|e| e.to_string())?;
-    let acceptor = native_tls::TlsAcceptor::new(identity).map_err(|e| e.to_string())?;
-    Ok(tokio_native_tls::TlsAcceptor::from(acceptor))
+/// The link's TLS server identity. rustls, not the platform's TLS: on macOS
+/// that would import the private key into a keychain and prompt for it.
+pub fn tls_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<tokio_rustls::TlsAcceptor, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let certs = CertificateDer::pem_slice_iter(cert_pem).collect::<Result<Vec<_>, _>>().map_err(|e| format!("certificate: {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| format!("private key: {e}"))?;
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| e.to_string())?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 /// Accept links on `listener` until the process ends.
-pub async fn serve_on(listener: TcpListener, acceptor: tokio_native_tls::TlsAcceptor, backend: Arc<dyn LinkBackend>, hub: ColoHub) {
+pub async fn serve_on(listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, backend: Arc<dyn LinkBackend>, hub: ColoHub) {
     loop {
         let Ok((tcp, peer)) = listener.accept().await else { continue };
         let (acceptor, backend, hub) = (acceptor.clone(), backend.clone(), hub.clone());
@@ -56,7 +65,7 @@ pub async fn serve_on(listener: TcpListener, acceptor: tokio_native_tls::TlsAcce
 async fn handle(
     tcp: tokio::net::TcpStream,
     peer: SocketAddr,
-    acceptor: tokio_native_tls::TlsAcceptor,
+    acceptor: tokio_rustls::TlsAcceptor,
     backend: Arc<dyn LinkBackend>,
     hub: ColoHub,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
