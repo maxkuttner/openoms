@@ -584,6 +584,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "colo-link"
+version = "0.1.0"
+dependencies = [
+ "colo-risk",
+ "futures-util",
+ "native-tls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.21.0",
+ "tracing",
+]
+
+[[package]]
 name = "colo-risk"
 version = "0.1.0"
 dependencies = [

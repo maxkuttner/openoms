@@ -1,0 +1,15 @@
+[package]
+name = "colo-link"
+version = "0.1.0"
+edition = "2021"
+description = "The control link between a co-located strategy and the OMS"
+
+[dependencies]
+colo-risk = { path = "../colo-risk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+native-tls = "0.2"
+futures-util = "0.3"
+tracing = "0.1"

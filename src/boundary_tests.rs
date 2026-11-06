@@ -7,6 +7,7 @@ fn gateway_depends_on_no_database_or_kafka() {
     for (krate, manifest) in [
         ("gateway", include_str!("../crates/gateway/Cargo.toml")),
         ("colo-risk", include_str!("../crates/colo-risk/Cargo.toml")),
+        ("colo-link", include_str!("../crates/colo-link/Cargo.toml")),
     ] {
         for dep in ["sqlx", "rdkafka", "axum"] {
             assert!(!manifest.contains(dep), "crates/{krate} depends on {dep}");
