@@ -23,6 +23,7 @@ pub mod alpaca;
 pub mod binance;
 pub mod bybit;
 pub mod coinbase;
+#[cfg(feature = "fix")]
 pub mod ibkr;
 pub mod okx;
 
@@ -166,7 +167,10 @@ pub fn exec_stream_code(code: &str, env: &str) -> String {
 
 /// Every connector, in the order the cockpit lists them.
 pub fn all() -> &'static [&'static dyn Connector] {
-    &[&alpaca::Alpaca, &binance::Binance, &bybit::Bybit, &coinbase::Coinbase, &okx::Okx, &ibkr::Ibkr]
+    #[cfg(feature = "fix")]
+    return &[&alpaca::Alpaca, &binance::Binance, &bybit::Bybit, &coinbase::Coinbase, &okx::Okx, &ibkr::Ibkr];
+    #[cfg(not(feature = "fix"))]
+    return &[&alpaca::Alpaca, &binance::Binance, &bybit::Bybit, &coinbase::Coinbase, &okx::Okx];
 }
 
 pub fn by_code(code: &str) -> Option<&'static dyn Connector> {

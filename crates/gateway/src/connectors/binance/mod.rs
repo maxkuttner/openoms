@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod stream;
 pub mod feed;
+#[cfg(feature = "fix")]
 pub mod fix;
 
 use futures_util::future::BoxFuture;
@@ -10,13 +11,20 @@ use std::sync::Arc;
 
 use crate::credentials::BrokerCredentials;
 use crate::connectors::RegistrationDeps;
+#[cfg(feature = "fix")]
 use crate::connectors::binance::fix::BinanceDialect;
+#[cfg(feature = "fix")]
 use tracing::{error, info};
 
+#[cfg(feature = "fix")]
 use crate::fix::adapter::FixBrokerAdapter;
+#[cfg(feature = "fix")]
 use crate::fix::dialect::FixDialect;
+#[cfg(feature = "fix")]
 use crate::fix::{start_session, FixConfig};
+#[cfg(feature = "fix")]
 use crate::contract::EngineHandle;
+#[cfg(feature = "fix")]
 use crate::stream_health::StreamHealthRegistry;
 
 use super::{FIX_NOT_TESTABLE, PublicFeed, typed, Connected};
@@ -53,10 +61,16 @@ impl Connector for Binance {
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
         use crate::adapter::Transport;
         match Transport::from_env(&format!("BINANCE_{env}"), Transport::Rest) {
+            #[cfg(feature = "fix")]
             Transport::Fix => {
                 let adapter = start_binance(env, creds, &deps.stream_health, deps.engine.clone())
                     .ok_or_else(|| "Binance FIX session could not start".to_string())?;
                 Ok(Connected { adapter, exec_stream: None, daily_stats: None })
+            }
+            #[cfg(not(feature = "fix"))]
+            Transport::Fix => {
+                let _ = deps;
+                Err("this build has no FIX".to_string())
             }
             Transport::Rest => {
                 let c: crate::connectors::binance::adapter::BinanceCredentials = typed(creds, MANIFEST.credential_kind)?;
@@ -117,6 +131,7 @@ fn venue() -> Venue {
     }
 }
 
+#[cfg(feature = "fix")]
 /// Wire a Binance Spot FIX order-entry session for `env_name` from an
 /// already-decrypted credential. `creds` must be a `BinanceFix` credential
 /// — see `start_ibkr`'s doc comment for why a mismatch is logged, not panicked.

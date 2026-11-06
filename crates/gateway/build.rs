@@ -36,6 +36,10 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+    // Only the FIX engine links OpenSSL.
+    if std::env::var_os("CARGO_FEATURE_FIX").is_none() {
+        return;
+    }
 
     let want_static = std::env::var(STATIC_ENV).is_ok_and(|v| !v.is_empty());
 

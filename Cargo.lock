@@ -584,6 +584,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "colo-example"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "colo-link",
+ "colo-risk",
+ "dataprovider",
+ "gateway",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "colo-link"
 version = "0.1.0"
 dependencies = [

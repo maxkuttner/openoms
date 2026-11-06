@@ -7,7 +7,9 @@ pub mod adapter;
 pub mod connectors;
 pub mod contract;
 pub mod credentials;
+#[cfg(feature = "fix")]
 pub mod fix;
+#[cfg(feature = "fix")]
 pub mod fix_acceptor;
 pub mod md;
 pub mod stream_health;
