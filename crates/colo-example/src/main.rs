@@ -7,7 +7,6 @@
 
 mod quote;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,7 +55,7 @@ struct Args {
 /// Mid prices from Binance's public feed.
 fn spawn_mid_feed(symbol: &str) -> watch::Receiver<Option<f64>> {
     let (tx, rx) = watch::channel(None);
-    let symbols: HashMap<String, i64> = HashMap::from([(symbol.to_lowercase(), 1)]);
+    let symbols = quote::feed_symbols(symbol);
     tokio::spawn(async move {
         loop {
             let (quote_tx, mut quote_rx) = mpsc::channel(256);
@@ -73,10 +72,81 @@ fn spawn_mid_feed(symbol: &str) -> watch::Receiver<Option<f64>> {
     rx
 }
 
-async fn cancel_all(adapter: &BinanceAdapter, symbol: &str, working: &mut Vec<String>) {
-    for id in working.drain(..) {
-        if let Err(e) = adapter.cancel_order(&id, symbol).await {
-            warn!(order = %id, error = %e, "cancel failed");
+struct MarketMaker {
+    args: Args,
+    adapter: Arc<BinanceAdapter>,
+    link: Link,
+    dead: DeadMan,
+    risk: RiskBook,
+    working: Vec<String>,
+    n: u64,
+}
+
+impl MarketMaker {
+    fn may_trade(&self) -> bool {
+        self.args.ignore_kill || self.dead.may_trade(Instant::now())
+    }
+
+    async fn cancel_all(&mut self) {
+        for id in self.working.drain(..) {
+            if let Err(e) = self.adapter.cancel_order(&id, &self.args.symbol).await {
+                warn!(order = %id, error = %e, "cancel failed");
+            }
+        }
+    }
+
+    async fn on_control(&mut self, msg: ToStrategy) {
+        self.dead.heard(Instant::now());
+        self.dead.apply(&msg);
+        match msg {
+            ToStrategy::State { active, limits, limits_version, positions, dead_man_secs } => {
+                info!(active, limits_version, dead_man_secs, "state from the OMS");
+                self.risk.set_limits(limits, limits_version);
+                self.risk.set_positions(positions.into_iter().map(|p| (p.symbol, p.qty)));
+                self.link.send(FromStrategy::AckLimits { limits_version }).await;
+            }
+            ToStrategy::Limits { limits, limits_version } => {
+                self.risk.set_limits(limits, limits_version);
+                self.link.send(FromStrategy::AckLimits { limits_version }).await;
+            }
+            ToStrategy::Positions { positions } => self.risk.set_positions(positions.into_iter().map(|p| (p.symbol, p.qty))),
+            ToStrategy::Kill => {
+                info!("killed by the OMS");
+                // Acknowledge first: the OMS is cancelling with its own key anyway.
+                self.link.send(FromStrategy::AckKill).await;
+                if !self.args.ignore_kill {
+                    self.cancel_all().await;
+                }
+            }
+            ToStrategy::Resume => info!("resumed by the OMS"),
+            ToStrategy::Heartbeat => {}
+        }
+    }
+
+    async fn quote(&mut self, buy: bool, price: f64, mid: f64) {
+        let intent = OrderIntent { symbol: &self.args.symbol, quote_currency: &self.args.quote_currency, buy, qty: self.args.qty, price };
+        if let Err(r) = self.risk.check(&intent, mid, Instant::now()) {
+            warn!(code = r.code, message = %r.message, "risk refused a quote");
+            return;
+        }
+        self.n += 1;
+        let req = BrokerOrderRequest {
+            order_id: quote::client_id(&self.args.tag, self.n),
+            symbol: self.args.symbol.clone(),
+            native_id: None,
+            quantity: self.args.qty,
+            side: if buy { "buy" } else { "sell" }.into(),
+            order_type: "limit".into(),
+            time_in_force: "gtc".into(),
+            limit_price: Some(price),
+            external_account_ref: String::new(),
+        };
+        match self.adapter.submit_order(&req).await {
+            Ok(resp) => {
+                info!(side = if buy { "buy" } else { "sell" }, price, order = %resp.external_order_id, "quote placed");
+                self.working.push(resp.external_order_id);
+            }
+            Err(e) => warn!(error = %e, "quote not placed"),
         }
     }
 }
@@ -92,11 +162,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (link, mut control) = Link::spawn(LinkConfig { url: args.link.clone(), token: args.token.clone(), ca_pem });
     let mut mid = spawn_mid_feed(&args.symbol);
 
-    // The OMS's first state sets the real timeout.
-    let mut dead = DeadMan::new(Duration::from_secs(5), Instant::now());
-    let mut risk = RiskBook::new(Limits::default(), 0);
-    let mut working: Vec<String> = Vec::new();
-    let mut n = 0u64;
+    let mut mm = MarketMaker {
+        // The OMS's first state sets the real timeout.
+        dead: DeadMan::new(Duration::from_secs(5), Instant::now()),
+        risk: RiskBook::new(Limits::default(), 0),
+        working: Vec::new(),
+        n: 0,
+        adapter,
+        link,
+        args,
+    };
     let mut requote = tokio::time::interval(Duration::from_secs(2));
     // The switch is checked far more often than quotes are refreshed, so
     // quotes come down within a fraction of a second of the timeout.
@@ -107,35 +182,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             msg = control.recv() => {
                 let Some(msg) = msg else { break };
-                dead.heard(Instant::now());
-                dead.apply(&msg);
-                match msg {
-                    ToStrategy::State { limits, limits_version, positions, .. } => {
-                        risk.set_limits(limits, limits_version);
-                        risk.set_positions(positions.into_iter().map(|p| (p.symbol, p.qty)));
-                        link.send(FromStrategy::AckLimits { limits_version }).await;
-                    }
-                    ToStrategy::Limits { limits, limits_version } => {
-                        risk.set_limits(limits, limits_version);
-                        link.send(FromStrategy::AckLimits { limits_version }).await;
-                    }
-                    ToStrategy::Positions { positions } => risk.set_positions(positions.into_iter().map(|p| (p.symbol, p.qty))),
-                    ToStrategy::Kill => {
-                        info!("killed by the OMS");
-                        if !args.ignore_kill {
-                            cancel_all(&adapter, &args.symbol, &mut working).await;
-                        }
-                        link.send(FromStrategy::AckKill).await;
-                    }
-                    ToStrategy::Resume => info!("resumed by the OMS"),
-                    ToStrategy::Heartbeat => {}
-                }
+                mm.on_control(msg).await;
             }
             _ = watch_switch.tick() => {
-                let trading = args.ignore_kill || dead.may_trade(Instant::now());
+                let trading = mm.may_trade();
                 if was_trading && !trading {
                     warn!("lost the OMS or stopped by it: cancelling quotes");
-                    cancel_all(&adapter, &args.symbol, &mut working).await;
+                    mm.cancel_all().await;
+                }
+                if !was_trading && trading {
+                    info!("cleared to trade: quoting");
                 }
                 was_trading = trading;
             }
@@ -143,31 +199,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !was_trading {
                     continue;
                 }
-                let Some(m) = *mid.borrow_and_update() else { continue };
-                cancel_all(&adapter, &args.symbol, &mut working).await;
-                let (bid, ask) = quote::quotes(m, args.half_spread_bps, args.tick);
+                let Some(m) = *mid.borrow_and_update() else {
+                    warn!("no mid price yet; not quoting");
+                    continue;
+                };
+                mm.cancel_all().await;
+                let (bid, ask) = quote::quotes(m, mm.args.half_spread_bps, mm.args.tick);
                 for (buy, price) in [(true, bid), (false, ask)] {
-                    let intent = OrderIntent { symbol: &args.symbol, quote_currency: &args.quote_currency, buy, qty: args.qty, price };
-                    if let Err(r) = risk.check(&intent, m, Instant::now()) {
-                        warn!(code = r.code, message = %r.message, "risk refused a quote");
-                        continue;
+                    // A kill or a lost OMS that arrived while this cycle
+                    // waited on the venue stops the very next order.
+                    while let Ok(msg) = control.try_recv() {
+                        mm.on_control(msg).await;
                     }
-                    n += 1;
-                    let req = BrokerOrderRequest {
-                        order_id: quote::client_id(&args.tag, n),
-                        symbol: args.symbol.clone(),
-                        native_id: None,
-                        quantity: args.qty,
-                        side: if buy { "buy" } else { "sell" }.into(),
-                        order_type: "limit".into(),
-                        time_in_force: "gtc".into(),
-                        limit_price: Some(price),
-                        external_account_ref: String::new(),
-                    };
-                    match adapter.submit_order(&req).await {
-                        Ok(resp) => working.push(resp.external_order_id),
-                        Err(e) => warn!(error = %e, "quote not placed"),
+                    if !mm.may_trade() {
+                        break;
                     }
+                    mm.quote(buy, price, m).await;
                 }
             }
         }

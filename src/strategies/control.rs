@@ -111,6 +111,7 @@ pub fn flatten_allowed(mode: Mode) -> Result<(), ApiError> {
 /// Halt, stop REST, cancel every open order, log the session out. A
 /// co-located strategy is cancelled at its venue and told over its link.
 pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiError> {
+    crate::colo::control::announce_kill(state.colo(), state.strategies().by_code(code).map(|s| s.mode), code);
     let strategy = set_state(state, code, "HALTED", false).await?;
     if strategy.mode == Mode::Colocated {
         return Ok(crate::colo::control::kill(state, &strategy).await);

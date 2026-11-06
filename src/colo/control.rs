@@ -136,15 +136,39 @@ pub async fn positions_loop(state: AppState) {
     }
 }
 
-async fn cancel(adapter: &BinanceAdapter, venue_order_id: &str, symbol: &str) -> Result<(), String> {
-    adapter.cancel_order(venue_order_id, symbol).await.map_err(|e| e.to_string())
+#[derive(Debug, PartialEq)]
+pub enum Cancel {
+    Done,
+    /// Filled or cancelled already (the strategy often cancels its own first).
+    AlreadyGone,
+    Failed(String),
 }
 
-/// Kill a co-located strategy (already set HALTED): tell it, and cancel every
+/// Binance answers -2011 to a cancel of an order that is no longer open.
+pub fn cancel_outcome(result: Result<(), String>) -> Cancel {
+    match result {
+        Ok(()) => Cancel::Done,
+        Err(e) if e.contains("\"code\":-2011") => Cancel::AlreadyGone,
+        Err(e) => Cancel::Failed(e),
+    }
+}
+
+async fn cancel(adapter: &BinanceAdapter, venue_order_id: &str, symbol: &str) -> Cancel {
+    cancel_outcome(adapter.cancel_order(venue_order_id, symbol).await.map_err(|e| e.to_string()))
+}
+
+/// Tell a co-located strategy it is killed: the first thing Kill does,
+/// before any database work, so the strategy stops as soon as it can.
+pub fn announce_kill(hub: &ColoHub, mode: Option<crate::strategies::Mode>, code: &str) {
+    if mode == Some(crate::strategies::Mode::Colocated) {
+        hub.push(code, ToStrategy::Kill);
+    }
+}
+
+/// Kill a co-located strategy (already told, and set HALTED): cancel every
 /// open order on its account with the OMS's key, without waiting for it.
 pub async fn kill(state: &AppState, strategy: &Strategy) -> ControlReport {
     let hub = state.colo();
-    hub.push(&strategy.code, ToStrategy::Kill);
     let mut report = ControlReport::default();
     let Some(adapter) = hub.adapter(&strategy.code) else {
         report.cancel_failures.push("no follow key: cannot cancel at the venue".into());
@@ -154,8 +178,9 @@ pub async fn kill(state: &AppState, strategy: &Strategy) -> ControlReport {
         Ok(open) => {
             for order in open {
                 match cancel(&adapter, &order.venue_order_id, &order.symbol).await {
-                    Ok(()) => report.cancelled += 1,
-                    Err(e) => report.cancel_failures.push(format!("{}: {e}", order.venue_order_id)),
+                    Cancel::Done => report.cancelled += 1,
+                    Cancel::AlreadyGone => {}
+                    Cancel::Failed(e) => report.cancel_failures.push(format!("{}: {e}", order.venue_order_id)),
                 }
             }
         }
@@ -200,7 +225,7 @@ pub async fn sweep_loop(state: AppState) {
                 if !hub.cancel_rates.lock().unwrap().entry(code.clone()).or_default().allow(Instant::now()) {
                     break;
                 }
-                if let Err(e) = cancel(&adapter, &order.venue_order_id, &order.symbol).await {
+                if let Cancel::Failed(e) = cancel(&adapter, &order.venue_order_id, &order.symbol).await {
                     warn!(strategy = %code, venue_order_id = %order.venue_order_id, error = %e, "co-located: sweep could not cancel");
                 }
             }
@@ -223,7 +248,7 @@ pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adap
         if allowed {
             let (adapter, code) = (adapter.clone(), strategy.code.clone());
             tokio::spawn(async move {
-                if let Err(e) = cancel(&adapter, &venue_order_id, &symbol).await {
+                if let Cancel::Failed(e) = cancel(&adapter, &venue_order_id, &symbol).await {
                     warn!(strategy = %code, %venue_order_id, error = %e, "co-located: could not cancel a killed strategy's order");
                 }
             });
@@ -306,6 +331,24 @@ mod tests {
         via_oms.code = "fix1".into();
         via_oms.mode = Mode::ViaOms;
         assert_eq!(to_sweep(&[killed, active, via_oms]), ["mm1"]);
+    }
+
+    #[test]
+    fn an_order_already_gone_is_not_a_failed_cancel() {
+        assert_eq!(cancel_outcome(Ok(())), Cancel::Done);
+        assert_eq!(cancel_outcome(Err(r#"broker rejected: {"code":-2011,"msg":"Unknown order sent."}"#.into())), Cancel::AlreadyGone);
+        assert!(matches!(cancel_outcome(Err("timeout".into())), Cancel::Failed(_)));
+    }
+
+    #[test]
+    fn a_kill_reaches_the_link_before_anything_else() {
+        use crate::strategies::Mode;
+        let hub = ColoHub::default();
+        let (_conn, mut rx) = hub.connect("mm1");
+        announce_kill(&hub, Some(Mode::ViaOms), "mm1");
+        assert!(rx.try_recv().is_err(), "a strategy trading through the OMS has no link");
+        announce_kill(&hub, Some(Mode::Colocated), "mm1");
+        assert_eq!(rx.try_recv().unwrap(), ToStrategy::Kill);
     }
 
     #[test]
