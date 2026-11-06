@@ -311,7 +311,7 @@ pub async fn load_universe(
     broker: Broker,
     provider: &dyn InstrumentProvider,
     opts: &LoadOptions,
-    p: &dyn LoadProgress,
+    p: &(dyn LoadProgress + Sync),
 ) -> Result<UniverseLoadReport, Box<dyn std::error::Error>> {
     p.log("info", &format!("fetching {} catalog …", broker.code()));
     let catalog = provider.list_instruments(&opts.underlyings).await?;

@@ -111,6 +111,8 @@ pub struct AppState {
     strategies: crate::strategies::RegistrySnapshot,
     /// Strategies' FIX sessions (the acceptor, when configured).
     fix_sessions: crate::strategies::session::FixSessions,
+    /// Co-located strategies' runtime state and follow sink.
+    colo: crate::colo::ColoHub,
 }
 
 impl AppState {
@@ -145,6 +147,7 @@ impl AppState {
             market_data,
             strategies: crate::strategies::RegistrySnapshot::default(),
             fix_sessions: crate::strategies::session::FixSessions::default(),
+            colo: crate::colo::ColoHub::default(),
         }
     }
 
@@ -217,6 +220,10 @@ impl AppState {
 
     pub fn fix_sessions(&self) -> &crate::strategies::session::FixSessions {
         &self.fix_sessions
+    }
+
+    pub fn colo(&self) -> &crate::colo::ColoHub {
+        &self.colo
     }
 }
 

@@ -74,6 +74,44 @@ pub enum GatewayMsg {
     Reconcile { broker_code: &'static str, environment: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter> },
 }
 
+/// What a followed venue account (a co-located strategy's) did. The OMS did
+/// not place these orders; it only watches them, books their fills, and may
+/// cancel them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FollowEvent {
+    /// The account stream is (re)connected: time to fill any gap.
+    Connected,
+    Opened { venue_order_id: String, client_order_id: String, symbol: String, buy: bool, qty: f64, price: f64 },
+    /// `"canceled"`, `"rejected"`, `"expired"` or `"filled"`.
+    Closed { venue_order_id: String, outcome: &'static str },
+    Fill(ExternalFill),
+}
+
+/// One fill on a followed account, by the venue's trade id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExternalFill {
+    pub trade_id: String,
+    pub venue_order_id: String,
+    /// The strategy's own client id (empty when the venue's history omits it).
+    pub client_order_id: String,
+    pub symbol: String,
+    pub buy: bool,
+    pub qty: f64,
+    pub price: f64,
+}
+
+/// Where a follow stream reports, tagged with the strategy it follows.
+#[derive(Clone)]
+pub struct FollowHandle(pub mpsc::Sender<(String, FollowEvent)>);
+
+impl FollowHandle {
+    pub async fn send(&self, strategy_code: &str, event: FollowEvent) {
+        if self.0.send((strategy_code.to_string(), event)).await.is_err() {
+            error!(strategy = strategy_code, "follow sink is gone; event dropped");
+        }
+    }
+}
+
 /// How a connector reaches the engine.
 #[derive(Clone)]
 pub struct EngineHandle(mpsc::Sender<GatewayMsg>);

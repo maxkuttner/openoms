@@ -67,6 +67,7 @@ mod daily_stats;
 
 mod market_data;
 mod order_entry;
+mod colo;
 mod strategies;
 mod mark_router;
 mod daily_stats_poller;
@@ -1156,6 +1157,14 @@ async fn serve() {
     if let Err(e) = state.strategies().reload(state.pool()).await {
         error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");
     }
+    // Co-located strategies: consume what their follow streams report, then
+    // start following their accounts.
+    {
+        let (hub, s) = (state.colo().clone(), state.clone());
+        tokio::spawn(async move { hub.run(s).await });
+    }
+    colo::follow::start_follows(&state).await;
+
     // Before the acceptor opens: a strategy that reconnects at once must not
     // have its new orders taken for leftovers.
     strategies::control::boot_recovery(&state).await;

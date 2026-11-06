@@ -33,6 +33,8 @@ pub enum Origin {
     Api,
     Fix { cl_ord_id: String },
     Flatten,
+    /// A co-located strategy's fill the OMS only follows.
+    External,
 }
 
 impl Origin {
@@ -41,6 +43,7 @@ impl Origin {
             Origin::Api => "API",
             Origin::Fix { .. } => "FIX",
             Origin::Flatten => "FLATTEN",
+            Origin::External => "EXTERNAL",
         }
     }
 }
@@ -82,7 +85,7 @@ async fn strategy_route(pool: &sqlx::PgPool, strategy: &Strategy, req: &SubmitOr
 }
 
 /// Insert an order's state row (status and quantities as `s` has them).
-async fn insert_order_state(
+pub(crate) async fn insert_order_state(
     conn: &mut sqlx::PgConnection,
     order_id: Uuid,
     s: &OrderAggregateState,

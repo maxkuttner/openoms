@@ -157,49 +157,36 @@ impl BinanceAdapter {
         }
         let body: serde_json::Value =
             resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-        let symbols = body["symbols"].as_array().cloned().unwrap_or_default();
-        Ok(symbols
-            .iter()
-            .filter_map(|s| {
-                let pair = s["symbol"].as_str()?.to_string();
-                let base = s["baseAsset"].as_str()?.to_string();
-                let quote = s["quoteAsset"].as_str()?.to_string();
-                let is_spot = s["isSpotTradingAllowed"].as_bool().unwrap_or(true);
-                if !is_spot {
-                    return None;
-                }
-                let filters: Vec<serde_json::Value> =
-                    s["filters"].as_array().cloned().unwrap_or_default();
-                let definition = InstrumentDef {
-                    symbol: pair.clone(),
-                    venue: "BINANCE".to_string(),
-                    currency: quote,
-                    asset_class: "CRYPTO".to_string(),
-                    instrument_class: "SPOT".to_string(),
-                    name: None,
-                    price_precision: s["quoteAssetPrecision"].as_i64().unwrap_or(8) as i32,
-                    price_increment: filter_val(&filters, "PRICE_FILTER", "tickSize").unwrap_or(0.0),
-                    size_increment: filter_val(&filters, "LOT_SIZE", "stepSize").unwrap_or(0.0),
-                    lot_size: None,
-                    contract_size: 1.0,
-                    native_id: Some(base), // base asset — what recon matches balances on
-                    provider_exchange: Some("BINANCE".to_string()),
-                    derivative: None,
-                    identifiers: Identifiers::default(),
-                };
-                Some(BrokerInstrument {
-                    broker_symbol: pair,
-                    broker_exchange: Some("BINANCE".to_string()),
-                    is_tradeable: s["status"].as_str() == Some("TRADING"),
-                    min_quantity: filter_val(&filters, "LOT_SIZE", "minQty"),
-                    max_quantity: filter_val(&filters, "LOT_SIZE", "maxQty"),
-                    min_notional: filter_val(&filters, "NOTIONAL", "minNotional")
-                        .or_else(|| filter_val(&filters, "MIN_NOTIONAL", "minNotional")),
-                    max_notional: None,
-                    definition,
-                })
-            })
-            .collect())
+        Ok(parse_exchange_info(&body))
+    }
+
+    /// One pair's catalog entry (`exchangeInfo?symbol=`), for a pair a followed
+    /// account traded that the catalog doesn't have yet.
+    pub async fn symbol_instrument(&self, symbol: &str) -> Result<Option<BrokerInstrument>, BrokerError> {
+        let url = format!("{}/api/v3/exchangeInfo?symbol={symbol}", self.base_url);
+        let resp = self.client.get(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_exchange_info(&body).into_iter().find(|i| i.broker_symbol == symbol))
+    }
+
+    /// GET /api/v3/myTrades — the account's fills on `symbol`, from a trade id
+    /// on, for filling a follow stream's gap.
+    pub async fn my_trades(&self, symbol: &str, from_trade_id: Option<i64>) -> Result<Vec<crate::contract::ExternalFill>, BrokerError> {
+        let mut params = vec![("symbol", symbol.to_string()), ("limit", "1000".to_string())];
+        if let Some(from) = from_trade_id {
+            params.push(("fromId", from.to_string()));
+        }
+        let resp = self.signed(Method::GET, "/api/v3/myTrades", &params).await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_my_trades(&body))
     }
 
     /// GET /api/v3/order — fetch one order's state (for startup reconciliation of
@@ -443,9 +430,105 @@ pub(crate) fn parse_open_orders(body: &serde_json::Value) -> Vec<BrokerOpenOrder
         .collect()
 }
 
+/// `exchangeInfo` as catalog rows: canonical instrument records plus routing
+/// handles. Binance is the source of the master crypto instrument: the pair is
+/// the symbol, venue BINANCE, currency the quote asset, and the base asset the
+/// routing native id. Spot pairs only.
+pub(crate) fn parse_exchange_info(body: &serde_json::Value) -> Vec<BrokerInstrument> {
+    let symbols = body["symbols"].as_array().cloned().unwrap_or_default();
+    symbols
+        .iter()
+        .filter_map(|s| {
+            let pair = s["symbol"].as_str()?.to_string();
+            let base = s["baseAsset"].as_str()?.to_string();
+            let quote = s["quoteAsset"].as_str()?.to_string();
+            let is_spot = s["isSpotTradingAllowed"].as_bool().unwrap_or(true);
+            if !is_spot {
+                return None;
+            }
+            let filters: Vec<serde_json::Value> =
+                s["filters"].as_array().cloned().unwrap_or_default();
+            let definition = InstrumentDef {
+                symbol: pair.clone(),
+                venue: "BINANCE".to_string(),
+                currency: quote,
+                asset_class: "CRYPTO".to_string(),
+                instrument_class: "SPOT".to_string(),
+                name: None,
+                price_precision: s["quoteAssetPrecision"].as_i64().unwrap_or(8) as i32,
+                price_increment: filter_val(&filters, "PRICE_FILTER", "tickSize").unwrap_or(0.0),
+                size_increment: filter_val(&filters, "LOT_SIZE", "stepSize").unwrap_or(0.0),
+                lot_size: None,
+                contract_size: 1.0,
+                native_id: Some(base), // base asset — what recon matches balances on
+                provider_exchange: Some("BINANCE".to_string()),
+                derivative: None,
+                identifiers: Identifiers::default(),
+            };
+            Some(BrokerInstrument {
+                broker_symbol: pair,
+                broker_exchange: Some("BINANCE".to_string()),
+                is_tradeable: s["status"].as_str() == Some("TRADING"),
+                min_quantity: filter_val(&filters, "LOT_SIZE", "minQty"),
+                max_quantity: filter_val(&filters, "LOT_SIZE", "maxQty"),
+                min_notional: filter_val(&filters, "NOTIONAL", "minNotional")
+                    .or_else(|| filter_val(&filters, "MIN_NOTIONAL", "minNotional")),
+                max_notional: None,
+                definition,
+            })
+        })
+        .collect()
+}
+
+/// `myTrades` rows as external fills (the history carries no client order id).
+pub(crate) fn parse_my_trades(body: &serde_json::Value) -> Vec<crate::contract::ExternalFill> {
+    body.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            Some(crate::contract::ExternalFill {
+                trade_id: t["id"].as_i64()?.to_string(),
+                venue_order_id: t["orderId"].as_i64()?.to_string(),
+                client_order_id: String::new(),
+                symbol: t["symbol"].as_str()?.to_string(),
+                buy: t["isBuyer"].as_bool()?,
+                qty: t["qty"].as_str()?.parse().ok()?,
+                price: t["price"].as_str()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn my_trades_parse_into_external_fills() {
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true },
+            { "symbol": "BTCUSDT", "id": 502, "orderId": 9003, "price": "64010", "qty": "0.1", "isBuyer": false },
+        ]);
+        let fills = parse_my_trades(&body);
+        assert_eq!(fills.len(), 2);
+        assert_eq!((fills[0].trade_id.as_str(), fills[0].venue_order_id.as_str(), fills[0].buy, fills[0].qty), ("501", "9001", true, 0.25));
+        assert!(!fills[1].buy);
+    }
+
+    #[test]
+    fn instrument_from_exchange_info() {
+        let body = serde_json::json!({ "symbols": [{
+            "symbol": "SOLBTC", "baseAsset": "SOL", "quoteAsset": "BTC", "status": "TRADING", "quoteAssetPrecision": 8,
+            "filters": [
+                { "filterType": "PRICE_FILTER", "tickSize": "0.0000001" },
+                { "filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001", "maxQty": "9000" }
+            ]
+        }]});
+        let list = parse_exchange_info(&body);
+        assert_eq!(list.len(), 1);
+        assert_eq!((list[0].broker_symbol.as_str(), list[0].definition.currency.as_str()), ("SOLBTC", "BTC"));
+        assert!(list[0].is_tradeable);
+    }
 
     #[test]
     fn an_unknown_execution_status_is_not_a_rejection() {
