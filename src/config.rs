@@ -75,7 +75,12 @@ pub struct FileConfig {
     pub auth: AuthSection,
     #[serde(default)]
     pub fix_acceptor: FixAcceptorSection,
+    #[serde(default)]
+    pub control_link: FixAcceptorSection,
 }
+
+/// Where co-located strategies' control links connect (TLS only).
+pub type ControlLinkSettings = FixAcceptorSettings;
 
 /// Where strategies log on over FIX (TLS only). All three set, or no acceptor.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -343,6 +348,17 @@ pub fn load() -> Option<&'static FileConfig> {
 }
 
 impl FileConfig {
+    /// The co-located strategies' control-link listener, or `None` when it is
+    /// not configured. Same shape as the FIX acceptor's section.
+    pub fn control_link(&self) -> Option<ControlLinkSettings> {
+        let s = &self.control_link;
+        Some(ControlLinkSettings {
+            port: s.port?,
+            certificate: s.certificate.clone()?,
+            private_key: s.private_key.clone()?,
+        })
+    }
+
     /// The FIX acceptor's settings, or `None` when it is not configured.
     /// Incomplete counts as absent, like `oidc()`.
     pub fn fix_acceptor(&self) -> Option<FixAcceptorSettings> {

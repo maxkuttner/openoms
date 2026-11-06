@@ -5538,12 +5538,30 @@
           "dead_man_secs",
           "kill_when_unmonitored",
           "limits_version",
-          "session_live"
+          "session_live",
+          "link_connected",
+          "acked_limits_version",
+          "open_orders",
+          "placed_per_min",
+          "cancelled_per_min",
+          "fighting"
         ],
         "properties": {
+          "acked_limits_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "alarm": {
+            "type": "string",
+            "nullable": true
+          },
           "allowed_addresses": {
             "type": "string",
             "description": "Comma-separated IP addresses; empty means any."
+          },
+          "cancelled_per_min": {
+            "type": "integer",
+            "format": "int64"
           },
           "code": {
             "type": "string"
@@ -5551,6 +5569,9 @@
           "dead_man_secs": {
             "type": "integer",
             "format": "int32"
+          },
+          "fighting": {
+            "type": "boolean"
           },
           "follow_environment": {
             "type": "string",
@@ -5565,6 +5586,11 @@
           "kill_when_unmonitored": {
             "type": "boolean"
           },
+          "last_heard_secs": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
           "last_logon_error": {
             "type": "string",
             "nullable": true
@@ -5572,6 +5598,10 @@
           "limits_version": {
             "type": "integer",
             "format": "int64"
+          },
+          "link_connected": {
+            "type": "boolean",
+            "description": "Co-located strategies: the control link and the followed account."
           },
           "max_order_notional": {
             "type": "number",
@@ -5604,9 +5634,17 @@
           "name": {
             "type": "string"
           },
+          "open_orders": {
+            "type": "integer",
+            "format": "int64"
+          },
           "owner_principal_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "placed_per_min": {
+            "type": "integer",
+            "format": "int64"
           },
           "portfolio_id": {
             "type": "string",

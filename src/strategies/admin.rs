@@ -45,6 +45,23 @@ pub struct StrategyRow {
     /// Whether its FIX session is logged on right now.
     #[sqlx(default)]
     pub session_live: bool,
+    /// Co-located strategies: the control link and the followed account.
+    #[sqlx(default)]
+    pub link_connected: bool,
+    #[sqlx(default)]
+    pub last_heard_secs: Option<i64>,
+    #[sqlx(default)]
+    pub acked_limits_version: i64,
+    #[sqlx(default)]
+    pub open_orders: i64,
+    #[sqlx(default)]
+    pub placed_per_min: i64,
+    #[sqlx(default)]
+    pub cancelled_per_min: i64,
+    #[sqlx(default)]
+    pub alarm: Option<String>,
+    #[sqlx(default)]
+    pub fighting: bool,
 }
 
 const ROW_SELECT: &str = "code, name, portfolio_id, owner_principal_id, principal_id, sender_comp_id, \
@@ -205,6 +222,19 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
         .map_err(map_db_error)?;
     for row in &mut rows {
         row.session_live = state.fix_sessions().is_live(&row.code);
+        if row.mode == "COLOCATED" {
+            let hub = state.colo();
+            let link = hub.link_status(&row.code);
+            let flow = hub.flow(&row.code);
+            row.link_connected = link.connected;
+            row.last_heard_secs = link.last_heard_secs.map(|s| s as i64);
+            row.acked_limits_version = link.acked_version;
+            row.open_orders = hub.open_orders(&row.code) as i64;
+            row.placed_per_min = flow.placed as i64;
+            row.cancelled_per_min = flow.cancelled as i64;
+            row.alarm = hub.alarm(&row.code);
+            row.fighting = hub.fighting(&row.code);
+        }
     }
     Ok(Json(rows))
 }
@@ -329,6 +359,11 @@ pub async fn update_strategy(
     .ok_or_else(|| AdminError::not_found("strategy"))?;
     validate_comp_ids(&row.sender_comp_id, &row.target_comp_id)?;
     reload(&state).await;
+    if bump && row.mode == "COLOCATED" {
+        if let Some(s) = state.strategies().by_code(&code) {
+            state.colo().push(&code, colo_link::proto::ToStrategy::Limits { limits: s.risk_limits(), limits_version: s.limits_version.max(0) as u64 });
+        }
+    }
     Ok(Json(row))
 }
 

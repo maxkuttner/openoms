@@ -12,6 +12,13 @@ type Strategy = {
   code: string;
   mode: string;
   has_follow_credentials: boolean;
+  link_connected: boolean;
+  limits_version: number;
+  acked_limits_version: number;
+  open_orders: number;
+  placed_per_min: number;
+  alarm: string | null;
+  fighting: boolean;
   name: string;
   portfolio_id: string;
   state: string;
@@ -185,6 +192,28 @@ export function StrategiesPage() {
           { key: "mode", label: "Mode", render: (r: Strategy) => (isColocated(r) ? "co-located" : "through OMS") },
           { key: "state", label: "State" },
           { key: "rest_enabled", label: "REST", render: (r: Strategy) => (r.rest_enabled ? "on" : "off") },
+          {
+            key: "link_connected",
+            label: "Control link",
+            render: (r: Strategy) =>
+              isColocated(r) ? (
+                <Group gap={4}>
+                  <Badge color={r.link_connected ? "green" : "gray"}>{r.link_connected ? "connected" : "down"}</Badge>
+                  <Text fz="xs">limits {r.acked_limits_version}/{r.limits_version}</Text>
+                </Group>
+              ) : null,
+          },
+          {
+            key: "open_orders",
+            label: "Orders",
+            render: (r: Strategy) => (isColocated(r) ? `${r.open_orders} open · ${r.placed_per_min}/min` : null),
+          },
+          {
+            key: "alarm",
+            label: "Alarm",
+            render: (r: Strategy) =>
+              r.fighting ? <Badge color="red">killed, still fighting</Badge> : r.alarm ? <Badge color="red">{r.alarm}</Badge> : null,
+          },
           {
             key: "session_live",
             label: "FIX session",

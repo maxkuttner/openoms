@@ -1164,6 +1164,12 @@ async fn serve() {
         tokio::spawn(async move { hub.run(s).await });
     }
     colo::follow::start_follows(&state).await;
+    match file_cfg.and_then(|f| f.control_link()) {
+        Some(settings) => {
+            tokio::spawn(colo::link_server::serve(state.clone(), settings));
+        }
+        None => info!("control link: not configured"),
+    }
 
     // Before the acceptor opens: a strategy that reconnects at once must not
     // have its new orders taken for leftovers.

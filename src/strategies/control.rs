@@ -15,7 +15,7 @@ use crate::order_entry::{self, Origin};
 
 use super::guard::{self, MarkLookup};
 use super::session::{auth, session_key};
-use super::Strategy;
+use super::{Mode, Strategy};
 
 /// What a control action did, for the cockpit.
 #[derive(Debug, Default, Serialize, utoipa::ToSchema)]
@@ -94,9 +94,27 @@ async fn set_state(state: &AppState, code: &str, trading_state: &str, rest_enabl
     state.strategies().by_code(code).ok_or(ApiError { status: axum::http::StatusCode::NOT_FOUND, message: "strategy not found".into() })
 }
 
-/// Halt, stop REST, cancel every open order, log the session out.
+/// Whether phase 7's automatic cancels (on session end, at boot) apply: not to
+/// co-located strategies, whose own dead man's switch does that job.
+pub fn phase7_cancels_apply(mode: Mode) -> bool {
+    mode == Mode::ViaOms
+}
+
+/// Flatten is for strategies trading through the OMS only.
+pub fn flatten_allowed(mode: Mode) -> Result<(), ApiError> {
+    match mode {
+        Mode::ViaOms => Ok(()),
+        Mode::Colocated => Err(ApiError { status: axum::http::StatusCode::BAD_REQUEST, message: "co-located strategies have no Flatten".into() }),
+    }
+}
+
+/// Halt, stop REST, cancel every open order, log the session out. A
+/// co-located strategy is cancelled at its venue and told over its link.
 pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiError> {
     let strategy = set_state(state, code, "HALTED", false).await?;
+    if strategy.mode == Mode::Colocated {
+        return Ok(crate::colo::control::kill(state, &strategy).await);
+    }
     let report = cancel_open(state, &strategy, false, "strategy killed").await;
     state.fix_sessions().logout(&session_key(&strategy), "killed");
     Ok(report)
@@ -104,6 +122,10 @@ pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiErro
 
 pub async fn enable(state: &AppState, code: &str) -> Result<(), ApiError> {
     let strategy = set_state(state, code, "ACTIVE", true).await?;
+    if strategy.mode == Mode::Colocated {
+        crate::colo::control::enable(state, &strategy).await;
+        return Ok(());
+    }
     state.fix_sessions().enable(&session_key(&strategy));
     Ok(())
 }
@@ -111,6 +133,8 @@ pub async fn enable(state: &AppState, code: &str) -> Result<(), ApiError> {
 /// Kill, but leave the strategy reducing only, then close every position
 /// with a limit order inside the price band.
 pub async fn flatten(state: &AppState, code: &str) -> Result<ControlReport, ApiError> {
+    let mode = state.strategies().by_code(code).map_or(Mode::ViaOms, |s| s.mode);
+    flatten_allowed(mode)?;
     let strategy = set_state(state, code, "REDUCING", false).await?;
     let mut report = cancel_open(state, &strategy, false, "strategy flattened").await;
     state.fix_sessions().logout(&session_key(&strategy), "flattened");
@@ -190,6 +214,9 @@ pub async fn flatten(state: &AppState, code: &str) -> Result<ControlReport, ApiE
 /// A strategy's FIX session ended: cancel its working orders (Flatten's stay)
 /// and stop pricing what only it wanted.
 pub async fn on_session_end(state: &AppState, strategy: &Strategy) -> ControlReport {
+    if !phase7_cancels_apply(strategy.mode) {
+        return ControlReport::default();
+    }
     let report = cancel_open(state, strategy, true, "FIX session ended").await;
     state.market_data().handle().unsubscribe_owner(&guard::md_owner(&strategy.code));
     report
@@ -198,7 +225,7 @@ pub async fn on_session_end(state: &AppState, strategy: &Strategy) -> ControlRep
 /// At boot no strategy has a session, so none may have working orders
 /// (Flatten's excepted).
 pub async fn boot_recovery(state: &AppState) {
-    for strategy in state.strategies().all().iter() {
+    for strategy in state.strategies().all().iter().filter(|s| phase7_cancels_apply(s.mode)) {
         let report = cancel_open(state, strategy, true, "OMS restarted").await;
         if !report.cancel_failures.is_empty() {
             warn!(strategy = %strategy.code, failures = ?report.cancel_failures, "strategy: some open orders were not cancelled at boot");
@@ -218,6 +245,19 @@ mod tests {
         let recovery = main.find("strategies::control::boot_recovery(&state)").expect("boot recovery is called");
         let acceptor = main.find("state.fix_sessions().start(").expect("the acceptor is started");
         assert!(recovery < acceptor);
+    }
+
+    #[test]
+    fn colo_strategies_get_no_phase7_cancels() {
+        assert!(phase7_cancels_apply(crate::strategies::Mode::ViaOms));
+        assert!(!phase7_cancels_apply(crate::strategies::Mode::Colocated));
+    }
+
+    #[test]
+    fn flatten_refuses_a_colocated_strategy() {
+        let e = flatten_allowed(crate::strategies::Mode::Colocated).unwrap_err();
+        assert_eq!(e.message, "co-located strategies have no Flatten");
+        assert!(flatten_allowed(crate::strategies::Mode::ViaOms).is_ok());
     }
 
     #[test]

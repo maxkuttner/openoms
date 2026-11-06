@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 colo-risk = { path = "crates/colo-risk" }
 colo-link = { path = "crates/colo-link" }
+native-tls = "0.2"
+tokio-native-tls = "0.3"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "migrate", "uuid", "json"] }

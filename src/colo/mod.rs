@@ -3,7 +3,9 @@
 //! link and can kill them without their help.
 
 pub mod booking;
+pub mod control;
 pub mod follow;
+pub mod link_server;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -13,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use gateway::connectors::binance::adapter::BinanceAdapter;
+use colo_link::proto::{FromStrategy, ToStrategy};
 use gateway::contract::{FollowEvent, FollowHandle};
 
 use crate::app_state::AppState;
@@ -75,6 +78,12 @@ impl Runtime {
         }
     }
 
+    /// Orders placed within `window` of now.
+    pub fn placed_within(&self, window: Duration) -> usize {
+        let now = Instant::now();
+        self.flow.iter().filter(|(t, f)| *f == Flow::Placed && now.duration_since(*t) <= window).count()
+    }
+
     pub fn counts(&self, now: Instant) -> FlowCounts {
         let mut c = FlowCounts::default();
         for (t, f) in &self.flow {
@@ -90,6 +99,23 @@ impl Runtime {
     }
 }
 
+/// One strategy's control link, as the OMS sees it.
+struct LinkSlot {
+    tx: mpsc::UnboundedSender<ToStrategy>,
+    conn: u64,
+    last_heard: Instant,
+    acked_version: i64,
+    kill_acked: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+pub struct LinkStatus {
+    pub connected: bool,
+    pub last_heard_secs: Option<u64>,
+    pub acked_version: i64,
+    pub kill_acked: bool,
+}
+
 /// Every co-located strategy's runtime state, and the sink their follow
 /// streams report to. Cheap to clone.
 #[derive(Clone)]
@@ -98,6 +124,14 @@ pub struct ColoHub {
     rx: Arc<Mutex<Option<mpsc::Receiver<(String, FollowEvent)>>>>,
     pub(crate) runtimes: Arc<Mutex<HashMap<String, Runtime>>>,
     adapters: Arc<Mutex<HashMap<String, Arc<BinanceAdapter>>>>,
+    links: Arc<Mutex<HashMap<String, LinkSlot>>>,
+    next_conn: Arc<std::sync::atomic::AtomicU64>,
+    /// When each strategy's limits last changed (or its link connected).
+    pub(crate) limits_changed: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Strategies killed while orders keep appearing: when the last one did.
+    pub(crate) fighting: Arc<Mutex<HashMap<String, Instant>>>,
+    pub(crate) cancel_rates: Arc<Mutex<HashMap<String, control::CancelRate>>>,
+    pub(crate) alarms: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Default for ColoHub {
@@ -108,6 +142,12 @@ impl Default for ColoHub {
             rx: Arc::new(Mutex::new(Some(rx))),
             runtimes: Arc::default(),
             adapters: Arc::default(),
+            links: Arc::default(),
+            next_conn: Arc::default(),
+            limits_changed: Arc::default(),
+            fighting: Arc::default(),
+            cancel_rates: Arc::default(),
+            alarms: Arc::default(),
         }
     }
 }
@@ -124,6 +164,72 @@ impl ColoHub {
 
     pub(crate) fn set_adapter(&self, code: &str, adapter: Arc<BinanceAdapter>) {
         self.adapters.lock().unwrap().insert(code.to_string(), adapter);
+    }
+
+    /// A strategy's link connected: it replaces any older connection of it.
+    pub(crate) fn connect(&self, code: &str) -> (u64, mpsc::UnboundedReceiver<ToStrategy>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let conn = self.next_conn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.links.lock().unwrap().insert(
+            code.to_string(),
+            LinkSlot { tx, conn, last_heard: Instant::now(), acked_version: 0, kill_acked: false },
+        );
+        self.limits_changed.lock().unwrap().insert(code.to_string(), Instant::now());
+        (conn, rx)
+    }
+
+    pub(crate) fn disconnect(&self, code: &str, conn: u64) {
+        let mut links = self.links.lock().unwrap();
+        if links.get(code).is_some_and(|l| l.conn == conn) {
+            links.remove(code);
+        }
+    }
+
+    pub(crate) fn heard(&self, code: &str, conn: u64, msg: &FromStrategy) {
+        let mut links = self.links.lock().unwrap();
+        let Some(slot) = links.get_mut(code).filter(|l| l.conn == conn) else { return };
+        slot.last_heard = Instant::now();
+        match msg {
+            FromStrategy::AckLimits { limits_version } => slot.acked_version = *limits_version as i64,
+            FromStrategy::AckKill => slot.kill_acked = true,
+            FromStrategy::Heartbeat => {}
+        }
+    }
+
+    /// Send a message down a strategy's link, if it is connected.
+    pub fn push(&self, code: &str, msg: ToStrategy) {
+        if matches!(msg, ToStrategy::Kill) {
+            if let Some(slot) = self.links.lock().unwrap().get_mut(code) {
+                slot.kill_acked = false;
+            }
+        }
+        if matches!(msg, ToStrategy::Limits { .. }) {
+            self.limits_changed.lock().unwrap().insert(code.to_string(), Instant::now());
+        }
+        if let Some(slot) = self.links.lock().unwrap().get(code) {
+            let _ = slot.tx.send(msg);
+        }
+    }
+
+    pub fn link_status(&self, code: &str) -> LinkStatus {
+        match self.links.lock().unwrap().get(code) {
+            Some(l) => LinkStatus {
+                connected: true,
+                last_heard_secs: Some(l.last_heard.elapsed().as_secs()),
+                acked_version: l.acked_version,
+                kill_acked: l.kill_acked,
+            },
+            None => LinkStatus::default(),
+        }
+    }
+
+    pub fn alarm(&self, code: &str) -> Option<String> {
+        self.alarms.lock().unwrap().get(code).cloned()
+    }
+
+    /// Killed, and the strategy kept placing orders in the last minute.
+    pub fn fighting(&self, code: &str) -> bool {
+        self.fighting.lock().unwrap().get(code).is_some_and(|t| t.elapsed() < Duration::from_secs(60))
     }
 
     pub fn open_orders(&self, code: &str) -> usize {
@@ -143,12 +249,13 @@ impl ColoHub {
                 warn!(strategy = %code, "co-located: event for a strategy with no follow adapter");
                 continue;
             };
+            control::on_event(&state, self, &strategy, &adapter, &event).await;
             match event {
-                FollowEvent::Fill(fill) => {
-                    if let Err(e) = booking::book_fill(&state, &strategy, &adapter, &fill).await {
-                        error!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not booked; recon retries on the next reconnect");
-                    }
-                }
+                FollowEvent::Fill(fill) => match booking::book_fill(&state, &strategy, &adapter, &fill).await {
+                    Ok(booking::Booked::New) => control::push_positions(&state, self, &strategy).await,
+                    Ok(booking::Booked::AlreadyBooked) => {}
+                    Err(e) => error!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not booked; recon retries on the next reconnect"),
+                },
                 FollowEvent::Connected => follow::fill_gap(&state, self, &strategy, &adapter).await,
                 FollowEvent::Opened { .. } | FollowEvent::Closed { .. } => {}
             }
