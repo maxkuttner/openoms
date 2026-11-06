@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             target: aarch64-apple-darwin
           # 22.04, not ubuntu-latest: 24.04 links glibc 2.39 and the binary then
           # refuses to start on Debian 12 or Ubuntu 22.04, which is most servers.

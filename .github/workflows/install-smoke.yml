@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-14, ubuntu-22.04]
+        runner: [macos-15, ubuntu-22.04]
     runs-on: ${{ matrix.runner }}
     steps:
       - name: install exactly the way the landing page says to
@@ -53,7 +53,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: install exactly the way the docs say to
         run: brew install maxkuttner/tap/openoms
