@@ -37,6 +37,38 @@ pub struct Strategy {
     pub price_band_pct: Option<f64>,
     /// broker_code → account_id: where its orders for that broker go.
     pub connections: BTreeMap<String, Uuid>,
+    pub mode: Mode,
+    /// The environment of the followed venue account (co-located only).
+    pub follow_environment: Option<String>,
+    /// Seconds without the OMS before the strategy stops itself.
+    pub dead_man_secs: u32,
+    pub max_orders_per_sec: Option<u32>,
+    pub kill_when_unmonitored: bool,
+    /// Bumped on every limit change.
+    pub limits_version: i64,
+}
+
+/// How a strategy reaches its venue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Through the OMS's order path (FIX or REST, phase 7).
+    ViaOms,
+    /// Directly; the OMS follows its account (phase 8).
+    Colocated,
+}
+
+impl Strategy {
+    /// The limits a co-located program enforces, as the risk library takes them.
+    pub fn risk_limits(&self) -> colo_risk::Limits {
+        colo_risk::Limits {
+            max_order_qty: self.limits.max_order_quantity,
+            max_order_notional: self.limits.max_order_notional,
+            max_position_qty: self.limits.max_position_quantity,
+            max_position_notional: self.limits.max_position_notional,
+            price_band_pct: self.price_band_pct,
+            max_orders_per_sec: self.max_orders_per_sec,
+        }
+    }
 }
 
 const STRATEGY_SELECT: &str = "code, portfolio_id, principal_id, sender_comp_id, target_comp_id, \
@@ -45,7 +77,8 @@ const STRATEGY_SELECT: &str = "code, portfolio_id, principal_id, sender_comp_id,
     max_order_notional::double precision    AS max_order_notional, \
     max_position_quantity::double precision AS max_position_quantity, \
     max_position_notional::double precision AS max_position_notional, \
-    price_band_pct::double precision        AS price_band_pct";
+    price_band_pct::double precision        AS price_band_pct, \
+    mode, follow_environment, dead_man_secs, max_orders_per_sec, kill_when_unmonitored, limits_version";
 
 pub(crate) fn parse_state(s: &str) -> Result<TradingState, sqlx::Error> {
     match s {
@@ -75,6 +108,15 @@ fn from_row(row: &sqlx::postgres::PgRow) -> Result<Strategy, sqlx::Error> {
         },
         price_band_pct: row.try_get("price_band_pct")?,
         connections: BTreeMap::new(),
+        mode: match row.try_get::<String, _>("mode")?.as_str() {
+            "COLOCATED" => Mode::Colocated,
+            _ => Mode::ViaOms,
+        },
+        follow_environment: row.try_get("follow_environment")?,
+        dead_man_secs: row.try_get::<i32, _>("dead_man_secs")?.max(1) as u32,
+        max_orders_per_sec: row.try_get::<Option<i32>, _>("max_orders_per_sec")?.map(|v| v.max(1) as u32),
+        kill_when_unmonitored: row.try_get("kill_when_unmonitored")?,
+        limits_version: row.try_get("limits_version")?,
     })
 }
 
@@ -174,6 +216,16 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn risk_limits_carry_the_strategy_values() {
+        let mut s = sample("s", "S", "OMS");
+        s.limits.max_order_notional = Some(1000.0);
+        s.price_band_pct = Some(5.0);
+        s.max_orders_per_sec = Some(20);
+        let l = s.risk_limits();
+        assert_eq!((l.max_order_notional, l.price_band_pct, l.max_orders_per_sec), (Some(1000.0), Some(5.0), Some(20)));
+    }
+
+    #[test]
     fn a_stopped_strategys_token_is_refused() {
         let mut s = sample("s", "S", "OMS");
         s.principal_id = Uuid::new_v4();
@@ -218,6 +270,12 @@ pub(crate) mod tests {
             },
             price_band_pct: None,
             connections: Default::default(),
+            mode: Mode::ViaOms,
+            follow_environment: None,
+            dead_man_secs: 5,
+            max_orders_per_sec: None,
+            kill_when_unmonitored: false,
+            limits_version: 1,
         }
     }
 }

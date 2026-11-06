@@ -3121,6 +3121,8 @@ dependencies = [
  "bcrypt",
  "chrono",
  "clap",
+ "colo-link",
+ "colo-risk",
  "csv",
  "databento",
  "dataprovider",

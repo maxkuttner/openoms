@@ -35,6 +35,13 @@ pub struct StrategyRow {
     pub max_position_notional: Option<f64>,
     pub price_band_pct: Option<f64>,
     pub last_logon_error: Option<String>,
+    pub mode: String,
+    pub follow_environment: Option<String>,
+    pub has_follow_credentials: bool,
+    pub dead_man_secs: i32,
+    pub max_orders_per_sec: Option<i32>,
+    pub kill_when_unmonitored: bool,
+    pub limits_version: i64,
     /// Whether its FIX session is logged on right now.
     #[sqlx(default)]
     pub session_live: bool,
@@ -47,7 +54,9 @@ const ROW_SELECT: &str = "code, name, portfolio_id, owner_principal_id, principa
     max_order_notional::double precision AS max_order_notional, \
     max_position_quantity::double precision AS max_position_quantity, \
     max_position_notional::double precision AS max_position_notional, \
-    price_band_pct::double precision AS price_band_pct, last_logon_error";
+    price_band_pct::double precision AS price_band_pct, last_logon_error, mode, follow_environment, \
+    follow_credentials IS NOT NULL AS has_follow_credentials, dead_man_secs, max_orders_per_sec, \
+    kill_when_unmonitored, limits_version";
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateStrategy {
@@ -65,6 +74,12 @@ pub struct CreateStrategy {
     pub max_position_quantity: Option<f64>,
     pub max_position_notional: Option<f64>,
     pub price_band_pct: Option<f64>,
+    /// `VIA_OMS` (default) or `COLOCATED`.
+    pub mode: Option<String>,
+    pub follow_environment: Option<String>,
+    pub dead_man_secs: Option<i32>,
+    pub max_orders_per_sec: Option<i32>,
+    pub kill_when_unmonitored: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -79,6 +94,12 @@ pub struct UpdateStrategy {
     pub max_position_quantity: Option<f64>,
     pub max_position_notional: Option<f64>,
     pub price_band_pct: Option<f64>,
+    /// `VIA_OMS` (default) or `COLOCATED`.
+    pub mode: Option<String>,
+    pub follow_environment: Option<String>,
+    pub dead_man_secs: Option<i32>,
+    pub max_orders_per_sec: Option<i32>,
+    pub kill_when_unmonitored: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, sqlx::FromRow, utoipa::ToSchema)]
@@ -101,6 +122,62 @@ async fn reload(state: &AppState) {
 
 fn bad_request(message: impl Into<String>) -> AdminError {
     AdminError::new(StatusCode::BAD_REQUEST, message)
+}
+
+/// Whether an update changes a limit the strategy enforces (so its version moves).
+fn changes_limits(p: &UpdateStrategy) -> bool {
+    p.max_order_quantity.is_some()
+        || p.max_order_notional.is_some()
+        || p.max_position_quantity.is_some()
+        || p.max_position_notional.is_some()
+        || p.price_band_pct.is_some()
+        || p.max_orders_per_sec.is_some()
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct FollowCredentials {
+    /// The OMS's own key on the strategy's venue account (read + cancel).
+    pub api_key: String,
+    /// Its Ed25519 private key (PEM).
+    pub private_key: String,
+}
+
+/// The sealing context of a strategy's follow credential.
+pub(crate) fn follow_aad(code: &str) -> String {
+    format!("strategy:{code}:follow")
+}
+
+/// Store the OMS's follow-only key for a co-located strategy, sealed with the
+/// master key. It is never returned.
+#[utoipa::path(
+    put, path = "/admin/strategies/{code}/follow-credentials", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    request_body = FollowCredentials,
+    responses((status = 204, description = "Stored"), (status = 404, description = "Not found"), (status = 503, description = "No master key")),
+    security(("bearer_token" = []))
+)]
+pub async fn put_follow_credentials(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(p): Json<FollowCredentials>,
+) -> Result<StatusCode, AdminError> {
+    info!(%code, "admin store strategy follow credentials");
+    let key = crate::admin::resolve_master_key()?
+        .ok_or_else(|| AdminError::new(StatusCode::SERVICE_UNAVAILABLE, "no master key is configured; cannot store credentials"))?;
+    let plain = serde_json::to_vec(&serde_json::json!({ "api_key": p.api_key, "private_key": p.private_key }))
+        .map_err(|e| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let sealed = crate::secrets::seal(&key, &follow_aad(&code), &plain);
+    let done = sqlx::query("UPDATE strategy SET follow_credentials = $2, updated_at = now() WHERE code = $1")
+        .bind(&code)
+        .bind(sealed)
+        .execute(state.pool())
+        .await
+        .map_err(map_db_error)?;
+    if done.rows_affected() == 0 {
+        return Err(AdminError::not_found("strategy"));
+    }
+    reload(&state).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// "1.2.3.4, 5.6.7.8" → the addresses, blanks dropped.
@@ -152,8 +229,10 @@ pub async fn create_strategy(
     let row = sqlx::query_as::<_, StrategyRow>(&format!(
         "INSERT INTO strategy (code, name, portfolio_id, owner_principal_id, principal_id, sender_comp_id, \
             target_comp_id, allowed_addresses, max_order_quantity, max_order_notional, max_position_quantity, \
-            max_position_notional, price_band_pct) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING {ROW_SELECT}"
+            max_position_notional, price_band_pct, mode, follow_environment, dead_man_secs, max_orders_per_sec, \
+            kill_when_unmonitored) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE($14, 'VIA_OMS'), $15, \
+            COALESCE($16, 5), $17, COALESCE($18, false)) RETURNING {ROW_SELECT}"
     ))
     .bind(&p.code)
     .bind(&p.name)
@@ -168,6 +247,11 @@ pub async fn create_strategy(
     .bind(p.max_position_quantity)
     .bind(p.max_position_notional)
     .bind(p.price_band_pct)
+    .bind(p.mode)
+    .bind(p.follow_environment)
+    .bind(p.dead_man_secs)
+    .bind(p.max_orders_per_sec)
+    .bind(p.kill_when_unmonitored)
     .fetch_one(&mut *tx)
     .await
     .map_err(map_db_error)?;
@@ -202,6 +286,7 @@ pub async fn update_strategy(
     Json(p): Json<UpdateStrategy>,
 ) -> Result<Json<StrategyRow>, AdminError> {
     info!(%code, "admin update strategy");
+    let bump = changes_limits(&p);
     let row = sqlx::query_as::<_, StrategyRow>(&format!(
         "UPDATE strategy SET \
             name = COALESCE($2, name), \
@@ -213,6 +298,12 @@ pub async fn update_strategy(
             max_position_quantity = COALESCE($8, max_position_quantity), \
             max_position_notional = COALESCE($9, max_position_notional), \
             price_band_pct = COALESCE($10, price_band_pct), \
+            mode = COALESCE($11, mode), \
+            follow_environment = COALESCE($12, follow_environment), \
+            dead_man_secs = COALESCE($13, dead_man_secs), \
+            max_orders_per_sec = COALESCE($14, max_orders_per_sec), \
+            kill_when_unmonitored = COALESCE($15, kill_when_unmonitored), \
+            limits_version = limits_version + CASE WHEN $16 THEN 1 ELSE 0 END, \
             updated_at = now() \
          WHERE code = $1 RETURNING {ROW_SELECT}"
     ))
@@ -226,6 +317,12 @@ pub async fn update_strategy(
     .bind(p.max_position_quantity)
     .bind(p.max_position_notional)
     .bind(p.price_band_pct)
+    .bind(p.mode)
+    .bind(p.follow_environment)
+    .bind(p.dead_man_secs)
+    .bind(p.max_orders_per_sec)
+    .bind(p.kill_when_unmonitored)
+    .bind(bump)
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
@@ -480,6 +577,16 @@ mod tests {
 
     fn entry(broker: &str) -> ConnectionEntry {
         ConnectionEntry { broker_code: broker.into(), account_id: Uuid::nil() }
+    }
+
+    #[test]
+    fn a_limit_change_bumps_the_limits_version() {
+        let none: UpdateStrategy = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        let limit: UpdateStrategy = serde_json::from_str(r#"{"max_order_notional":5}"#).unwrap();
+        let rate: UpdateStrategy = serde_json::from_str(r#"{"max_orders_per_sec":10}"#).unwrap();
+        assert!(!changes_limits(&none));
+        assert!(changes_limits(&limit));
+        assert!(changes_limits(&rate));
     }
 
     #[test]

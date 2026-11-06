@@ -165,6 +165,7 @@ mod boundary_tests;
         strategies::admin::put_connections,
         strategies::admin::get_connections,
         strategies::admin::reset_password,
+        strategies::admin::put_follow_credentials,
         strategies::admin::restart_acceptor,
         strategies::admin::strategy_securities,
         strategies::admin::kill_strategy,
@@ -205,7 +206,7 @@ mod boundary_tests;
         admin::RevokedSessions,
         auth_api::MeResponse,
         strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
-        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::AcceptorRestarted,
+        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
     )),
     modifiers(&SecurityAddon),
@@ -1511,6 +1512,7 @@ async fn serve() {
             axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
         )
         .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
+        .route("/admin/strategies/:code/follow-credentials", axum::routing::put(strategies::admin::put_follow_credentials))
         .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
         .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
         .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))

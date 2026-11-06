@@ -2493,6 +2493,53 @@
         ]
       }
     },
+    "/admin/strategies/{code}/follow-credentials": {
+      "put": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Store the OMS's follow-only key for a co-located strategy, sealed with the",
+        "description": "master key. It is never returned.",
+        "operationId": "put_follow_credentials",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FollowCredentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Stored"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "503": {
+            "description": "No master key"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/strategies/{code}/kill": {
       "post": {
         "tags": [
@@ -4287,6 +4334,19 @@
           "code": {
             "type": "string"
           },
+          "dead_man_secs": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "follow_environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "kill_when_unmonitored": {
+            "type": "boolean",
+            "nullable": true
+          },
           "max_order_notional": {
             "type": "number",
             "format": "double",
@@ -4297,6 +4357,11 @@
             "format": "double",
             "nullable": true
           },
+          "max_orders_per_sec": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
           "max_position_notional": {
             "type": "number",
             "format": "double",
@@ -4305,6 +4370,11 @@
           "max_position_quantity": {
             "type": "number",
             "format": "double",
+            "nullable": true
+          },
+          "mode": {
+            "type": "string",
+            "description": "`VIA_OMS` (default) or `COLOCATED`.",
             "nullable": true
           },
           "name": {
@@ -4449,6 +4519,23 @@
             "type": "integer",
             "format": "int32",
             "description": "Ranked failover preference within the class; lower wins."
+          }
+        }
+      },
+      "FollowCredentials": {
+        "type": "object",
+        "required": [
+          "api_key",
+          "private_key"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "description": "The OMS's own key on the strategy's venue account (read + cancel)."
+          },
+          "private_key": {
+            "type": "string",
+            "description": "Its Ed25519 private key (PEM)."
           }
         }
       },
@@ -5446,6 +5533,11 @@
           "allowed_addresses",
           "state",
           "rest_enabled",
+          "mode",
+          "has_follow_credentials",
+          "dead_man_secs",
+          "kill_when_unmonitored",
+          "limits_version",
           "session_live"
         ],
         "properties": {
@@ -5456,12 +5548,30 @@
           "code": {
             "type": "string"
           },
+          "dead_man_secs": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "follow_environment": {
+            "type": "string",
+            "nullable": true
+          },
           "has_fix_password": {
+            "type": "boolean"
+          },
+          "has_follow_credentials": {
+            "type": "boolean"
+          },
+          "kill_when_unmonitored": {
             "type": "boolean"
           },
           "last_logon_error": {
             "type": "string",
             "nullable": true
+          },
+          "limits_version": {
+            "type": "integer",
+            "format": "int64"
           },
           "max_order_notional": {
             "type": "number",
@@ -5473,6 +5583,11 @@
             "format": "double",
             "nullable": true
           },
+          "max_orders_per_sec": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
           "max_position_notional": {
             "type": "number",
             "format": "double",
@@ -5482,6 +5597,9 @@
             "type": "number",
             "format": "double",
             "nullable": true
+          },
+          "mode": {
+            "type": "string"
           },
           "name": {
             "type": "string"
@@ -5951,6 +6069,19 @@
             "description": "Comma-separated IP addresses; empty means any.",
             "nullable": true
           },
+          "dead_man_secs": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "follow_environment": {
+            "type": "string",
+            "nullable": true
+          },
+          "kill_when_unmonitored": {
+            "type": "boolean",
+            "nullable": true
+          },
           "max_order_notional": {
             "type": "number",
             "format": "double",
@@ -5961,6 +6092,11 @@
             "format": "double",
             "nullable": true
           },
+          "max_orders_per_sec": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
           "max_position_notional": {
             "type": "number",
             "format": "double",
@@ -5969,6 +6105,11 @@
           "max_position_quantity": {
             "type": "number",
             "format": "double",
+            "nullable": true
+          },
+          "mode": {
+            "type": "string",
+            "description": "`VIA_OMS` (default) or `COLOCATED`.",
             "nullable": true
           },
           "name": {

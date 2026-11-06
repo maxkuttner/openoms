@@ -852,7 +852,7 @@ pub async fn update_broker_connection(
 /// key must not be hidden behind that story. Shared so `GET`, `PUT`,
 /// `DELETE`, `test`, and `reload_connections` cannot each resolve this a
 /// different way.
-fn resolve_master_key() -> Result<Option<crate::secrets::MasterKey>, AdminError> {
+pub(crate) fn resolve_master_key() -> Result<Option<crate::secrets::MasterKey>, AdminError> {
     match crate::config::master_key(crate::config::load()) {
         Some(Ok(k)) => Ok(Some(k)),
         Some(Err(e)) => Err(AdminError {

@@ -41,3 +41,8 @@ export function connectionEntries(
 export function savedAccounts(entries: { account_id: string }[] | undefined): string[] {
   return (entries ?? []).map((e) => e.account_id);
 }
+
+// Whether a strategy trades the venue directly (the OMS follows its account).
+export function isColocated(row: { mode?: string }): boolean {
+  return row.mode === "COLOCATED";
+}

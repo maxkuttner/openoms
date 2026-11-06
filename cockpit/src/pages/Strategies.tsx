@@ -1,15 +1,17 @@
 import { useEffect, useState } from "react";
-import { Badge, Button, Code, CopyButton, Group, Modal, MultiSelect, Stack, Text } from "@mantine/core";
+import { Badge, Button, Code, CopyButton, Group, Modal, MultiSelect, PasswordInput, Stack, Text, Textarea } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
 import { api } from "../api/client";
 import { notifyError, notifyOk, useList } from "../api/hooks";
 import { useQueryClient } from "@tanstack/react-query";
-import { connectionEntries, killLabel, reportSummary, savedAccounts, type ControlReport } from "../strategies";
+import { connectionEntries, isColocated, killLabel, reportSummary, savedAccounts, type ControlReport } from "../strategies";
 
 const PATH = "/admin/strategies";
 
 type Strategy = {
   code: string;
+  mode: string;
+  has_follow_credentials: boolean;
   name: string;
   portfolio_id: string;
   state: string;
@@ -18,6 +20,36 @@ type Strategy = {
   has_fix_password: boolean;
   last_logon_error: string | null;
 };
+
+const MODES = [
+  { value: "VIA_OMS", label: "Through the OMS" },
+  { value: "COLOCATED", label: "Co-located" },
+];
+const ENVIRONMENTS = [
+  { value: "PAPER", label: "PAPER" },
+  { value: "LIVE", label: "LIVE" },
+];
+
+function FollowKeyForm({ code, onClose }: { code: string; onClose: () => void }) {
+  const [apiKey, setApiKey] = useState("");
+  const [privateKey, setPrivateKey] = useState("");
+  const save = () =>
+    api
+      .put(`${PATH}/${code}/follow-credentials`, { api_key: apiKey, private_key: privateKey })
+      .then(() => { notifyOk("Follow key stored"); onClose(); })
+      .catch(notifyError);
+  return (
+    <Modal opened onClose={onClose} title={`Follow key — ${code}`} centered>
+      <Stack>
+        <PasswordInput label="API key" value={apiKey} onChange={(e) => setApiKey(e.currentTarget.value)} />
+        <Textarea label="Private key (PEM)" autosize minRows={4} value={privateKey} onChange={(e) => setPrivateKey(e.currentTarget.value)} />
+        <Group justify="flex-end">
+          <Button onClick={save} disabled={!apiKey || !privateKey}>Save</Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
 
 type AccountRow = { id: string; code: string; broker_connection_code: string; portfolio_id: string | null };
 type ConnectionRow = { code: string; broker_code: string };
@@ -70,6 +102,7 @@ export function StrategiesPage() {
   const [password, setPassword] = useState<{ code: string; value: string } | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; body: string; run: () => void } | null>(null);
   const [editing, setEditing] = useState<Strategy | null>(null);
+  const [followKey, setFollowKey] = useState<string | null>(null);
 
   const refresh = () => qc.invalidateQueries({ queryKey: [PATH] });
   const control = (code: string, action: "kill" | "flatten") =>
@@ -137,6 +170,11 @@ export function StrategiesPage() {
             >
               Flatten
             </Button>
+            {isColocated(row) && (
+              <Button size="xs" variant="default" onClick={() => setFollowKey(row.code)}>
+                {row.has_follow_credentials ? "Replace follow key" : "Follow key"}
+              </Button>
+            )}
             <Button size="xs" variant="default" onClick={() => resetPassword(row.code)}>Reset password</Button>
             <Button size="xs" variant="default" onClick={() => setEditing(row)}>Connections</Button>
           </Group>
@@ -144,6 +182,7 @@ export function StrategiesPage() {
         columns={[
           { key: "code", label: "Code" },
           { key: "name", label: "Name" },
+          { key: "mode", label: "Mode", render: (r: Strategy) => (isColocated(r) ? "co-located" : "through OMS") },
           { key: "state", label: "State" },
           { key: "rest_enabled", label: "REST", render: (r: Strategy) => (r.rest_enabled ? "on" : "off") },
           {
@@ -169,11 +208,17 @@ export function StrategiesPage() {
           { name: "max_position_quantity", label: "Max position quantity", type: "number" },
           { name: "max_position_notional", label: "Max position notional", type: "number" },
           { name: "price_band_pct", label: "Price band %", type: "number" },
+          { name: "mode", label: "Mode", type: "select", options: MODES, default: "VIA_OMS" },
+          { name: "follow_environment", label: "Followed account environment", type: "select", options: ENVIRONMENTS },
+          { name: "dead_man_secs", label: "Dead man's switch (s)", type: "number", default: "5" },
+          { name: "max_orders_per_sec", label: "Max orders per second", type: "number" },
+          { name: "kill_when_unmonitored", label: "Kill when unmonitored", type: "checkbox" },
         ]}
       />
 
       {confirm && <Confirm title={confirm.title} body={confirm.body} onConfirm={confirm.run} onClose={() => setConfirm(null)} />}
       {editing && <ConnectionsEditor strategy={editing} onClose={() => setEditing(null)} />}
+      {followKey && <FollowKeyForm code={followKey} onClose={() => setFollowKey(null)} />}
       {password && (
         <Modal opened onClose={() => setPassword(null)} title={`FIX password — ${password.code}`} centered>
           <Stack>
