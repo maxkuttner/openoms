@@ -1,0 +1,342 @@
+---
+// The whole system on one page, as it is built today: who trades through the
+// OMS, its core, the two gateways and the venues, plus the co-located path.
+// Hand-placed SVG rather than Mermaid: at this size an automatic layout tangles
+// the edges. It reads top to bottom so it fits the content column; edges run in
+// the gaps between columns and are drawn before the boxes. Box and text colours follow Starlight's theme variables, so the
+// figure follows light and dark mode; the five accents mean the same in both
+// (see the legend). On a narrow screen the figure keeps its size and scrolls.
+---
+
+<figure class="arch">
+  <div class="arch-scroll">
+    <svg
+      viewBox="0 0 800 1100"
+      role="img"
+      aria-labelledby="arch-title arch-desc"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <title id="arch-title">OpenOMS architecture</title>
+      <desc id="arch-desc">
+        From top to bottom: users and strategies; the OMS core with the order
+        engine, event store and event bus; the order and market data gateways;
+        the brokers, crypto venues and data vendors they connect to. At the
+        bottom, a co-located strategy trades a crypto venue directly while the
+        OMS follows its account and controls it over the control link.
+      </desc>
+      <defs>
+        {["order", "event", "price", "control"].map((k) => (
+          <marker id={`arch-arrow-${k}`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class={`arch-head-${k}`} />
+          </marker>
+        ))}
+      </defs>
+
+      <!-- Regions: drawn first, so everything sits on top -->
+      <rect class="arch-region" x="14" y="116" width="772" height="680" rx="14" />
+      <text class="arch-region-label" x="752" y="140" text-anchor="end">ONE OMS PROGRAM · one binary, one process</text>
+      <text class="arch-caps" x="525" y="168" text-anchor="middle">OMS CORE · owns all state</text>
+      <line class="arch-boundary" x1="30" y1="598" x2="770" y2="598" />
+      <text class="arch-caps" x="470" y="616" text-anchor="middle">GATEWAYS · no database, no Kafka</text>
+      <text class="arch-caps" x="60" y="24">USERS</text>
+      <text class="arch-caps" x="60" y="818">OUTSIDE</text>
+      <rect class="arch-region arch-region-colo" x="14" y="908" width="772" height="180" rx="14" />
+      <text class="arch-region-label arch-colo-label" x="30" y="932">② CO-LOCATED SERVER · a separate program, next to the venue</text>
+
+      <!-- Edges: drawn before the boxes, which cover their ends -->
+      <path class="arch-edge arch-edge-order" d="M138,96 C138,140 120,140 120,180" />
+      <path class="arch-edge arch-edge-order" d="M308,96 C308,140 160,136 160,180" />
+      <path class="arch-edge arch-edge-order" d="M478,96 C478,150 200,132 200,180" />
+      <path class="arch-edge arch-edge-order" d="M240,224 L262,224 L262,626" />
+      <text class="arch-edge-label arch-label-order" transform="translate(256 520) rotate(-90)" text-anchor="middle">NewOrder · Cancel</text>
+      <path class="arch-edge arch-edge-event" d="M288,626 L288,210 L310,210" />
+      <text class="arch-edge-label arch-label-event" transform="translate(298 470) rotate(-90)" text-anchor="middle">ExecEvent</text>
+      <path class="arch-edge arch-edge-event" d="M490,210 L560,210" />
+      <path class="arch-edge arch-edge-event" d="M650,240 L650,262" />
+      <path class="arch-edge arch-edge-event" d="M740,292 L768,292 L768,65 L725,65" />
+      <text class="arch-edge-label arch-label-event" transform="translate(762 180) rotate(-90)" text-anchor="middle">Kafka</text>
+      <path class="arch-edge arch-edge-event" d="M400,240 L400,344" />
+      <path class="arch-edge arch-edge-event" d="M400,404 L400,426" />
+      <path class="arch-edge arch-edge-event" d="M200,626 L200,568" />
+      <text class="arch-edge-label arch-label-event" x="206" y="590">followed fills</text>
+      <path class="arch-edge arch-edge-price" d="M650,626 L650,486" />
+      <text class="arch-edge-label arch-label-price" x="656" y="560">Quote</text>
+      <path class="arch-edge arch-edge-price" d="M650,426 L650,404" />
+      <path class="arch-edge arch-edge-control" d="M150,486 L150,508" />
+      <path class="arch-edge arch-edge-order" d="M140,776 L140,828" />
+      <path class="arch-edge arch-edge-order" d="M300,776 L300,828" />
+      <path class="arch-edge arch-edge-event" d="M340,828 L340,776" />
+      <path class="arch-edge arch-edge-price" d="M480,828 L480,776" />
+      <path class="arch-edge arch-edge-price" d="M660,828 L660,776" />
+      <path class="arch-edge arch-edge-order" d="M640,948 L640,906 L520,906 L520,890" />
+      <text class="arch-edge-label arch-label-order" x="648" y="934">direct orders</text>
+      <path class="arch-edge arch-edge-control" d="M60,985 L30,985 L30,540 L60,540" />
+      <text class="arch-edge-label arch-label-control" transform="translate(24 770) rotate(-90)" text-anchor="middle">control link · kill · limits · positions</text>
+
+      <!-- Users -->
+      <g class="arch-box arch-user"><rect x="60" y="34" width="155" height="62" rx="8" /><text x="138" y="60" text-anchor="middle" class="arch-name">Cockpit</text><text x="138" y="78" text-anchor="middle" class="arch-sub">admin, risk, blotter</text></g>
+      <g class="arch-box arch-user"><rect x="230" y="34" width="155" height="62" rx="8" /><text x="308" y="60" text-anchor="middle" class="arch-name">Trader UI</text><text x="308" y="78" text-anchor="middle" class="arch-sub">tickets, positions</text></g>
+      <g class="arch-box arch-strategy"><rect x="400" y="34" width="155" height="62" rx="8" /><text x="478" y="60" text-anchor="middle" class="arch-name">Strategies ①</text><text x="478" y="78" text-anchor="middle" class="arch-sub">FIX 4.4 over TLS, or REST</text></g>
+      <g class="arch-box arch-ext"><rect x="570" y="34" width="155" height="62" rx="8" /><text x="648" y="60" text-anchor="middle" class="arch-name">Other systems</text><text x="648" y="78" text-anchor="middle" class="arch-sub">risk, accounting…</text></g>
+
+      <!-- Core: three columns, four rows; the bus spans the right two -->
+      <g class="arch-box"><rect x="60" y="180" width="180" height="60" rx="8" /><text x="150" y="205" text-anchor="middle" class="arch-name">Order API + Risk</text><text x="150" y="223" text-anchor="middle" class="arch-sub">checks, then stores</text></g>
+      <g class="arch-box arch-key"><rect x="310" y="180" width="180" height="60" rx="8" /><text x="400" y="205" text-anchor="middle" class="arch-name">Order engine</text><text x="400" y="223" text-anchor="middle" class="arch-sub">the only place fills book</text></g>
+      <g class="arch-box"><rect x="560" y="180" width="180" height="60" rx="8" /><text x="650" y="205" text-anchor="middle" class="arch-name">Event store</text><text x="650" y="223" text-anchor="middle" class="arch-sub">append-only, Postgres</text></g>
+
+      <g class="arch-box"><rect x="60" y="262" width="180" height="60" rx="8" /><text x="150" y="287" text-anchor="middle" class="arch-name">Order recon</text><text x="150" y="305" text-anchor="middle" class="arch-sub">asks the gateway on reconnect</text></g>
+      <g class="arch-box"><rect x="560" y="262" width="180" height="60" rx="8" /><text x="650" y="287" text-anchor="middle" class="arch-name">Kafka outbox</text><text x="650" y="305" text-anchor="middle" class="arch-sub">optional · from the store</text></g>
+
+      <rect class="arch-bus" x="310" y="334" width="430" height="80" rx="10" />
+      <text class="arch-caps" x="525" y="356" text-anchor="middle">EVENT BUS · in memory</text>
+      <rect class="arch-lane arch-lane-event" x="326" y="370" width="200" height="30" rx="6" />
+      <text class="arch-lane-text" x="426" y="390" text-anchor="middle">order lane · after commit</text>
+      <rect class="arch-lane arch-lane-price" x="534" y="370" width="190" height="30" rx="6" />
+      <text class="arch-lane-text" x="629" y="390" text-anchor="middle">price lane · latest wins</text>
+
+      <g class="arch-box arch-strategy"><rect x="60" y="426" width="180" height="60" rx="8" /><text x="150" y="451" text-anchor="middle" class="arch-name">Strategy registry</text><text x="150" y="469" text-anchor="middle" class="arch-sub">limits · Kill · Enable</text></g>
+      <g class="arch-box"><rect x="310" y="426" width="180" height="60" rx="8" /><text x="400" y="451" text-anchor="middle" class="arch-name">Positions &amp; P&amp;L</text><text x="400" y="469" text-anchor="middle" class="arch-sub">from fills and marks</text></g>
+      <g class="arch-box"><rect x="560" y="426" width="180" height="60" rx="8" /><text x="650" y="451" text-anchor="middle" class="arch-name">Pricing</text><text x="650" y="469" text-anchor="middle" class="arch-sub">best live source → mark</text></g>
+
+      <g class="arch-box arch-strategy"><rect x="60" y="508" width="180" height="60" rx="8" /><text x="150" y="533" text-anchor="middle" class="arch-name">Co-located hub</text><text x="150" y="551" text-anchor="middle" class="arch-sub">books fills · link · alarms</text></g>
+      <g class="arch-box"><rect x="310" y="508" width="180" height="60" rx="8" /><text x="400" y="533" text-anchor="middle" class="arch-name">UI updates</text><text x="400" y="551" text-anchor="middle" class="arch-sub">bus → open screens, live</text></g>
+
+      <!-- Gateways -->
+      <g class="arch-gw"><rect x="60" y="626" width="330" height="150" rx="10" /><text x="225" y="650" text-anchor="middle" class="arch-name">Order gateway</text><text x="225" y="667" text-anchor="middle" class="arch-sub">orders and fills only · sessions, reconnect, health</text></g>
+      {[
+        ["Alpaca", 76], ["IBKR · FIX", 180], ["Binance", 284],
+      ].map(([label, x]) => (
+        <g class="arch-chip"><rect x={x} y="678" width="96" height="26" rx="13" /><text x={(x as number) + 48} y="695" text-anchor="middle">{label}</text></g>
+      ))}
+      {[
+        ["Bybit", 76], ["OKX", 180], ["Coinbase", 284],
+      ].map(([label, x]) => (
+        <g class="arch-chip"><rect x={x} y="710" width="96" height="26" rx="13" /><text x={(x as number) + 48} y="727" text-anchor="middle">{label}</text></g>
+      ))}
+      <g class="arch-chip arch-chip-strategy"><rect x="76" y="742" width="304" height="26" rx="13" /><text x="228" y="759" text-anchor="middle">follow streams · co-located accounts</text></g>
+
+      <g class="arch-gw"><rect x="410" y="626" width="330" height="150" rx="10" /><text x="575" y="650" text-anchor="middle" class="arch-name">Market data gateway</text><text x="575" y="667" text-anchor="middle" class="arch-sub">prices only · instruments the OMS holds</text></g>
+      {[
+        ["Binance", 426], ["Bybit", 530], ["OKX", 634],
+      ].map(([label, x]) => (
+        <g class="arch-chip arch-chip-price"><rect x={x} y="678" width="96" height="26" rx="13" /><text x={(x as number) + 48} y="695" text-anchor="middle">{label}</text></g>
+      ))}
+      <g class="arch-chip arch-chip-price"><rect x="426" y="710" width="96" height="26" rx="13" /><text x="474" y="727" text-anchor="middle">Coinbase</text></g>
+      <g class="arch-chip arch-chip-price"><rect x="530" y="710" width="200" height="26" rx="13" /><text x="630" y="727" text-anchor="middle">OPRA · US options</text></g>
+
+      <!-- Outside -->
+      <g class="arch-box arch-venue"><rect x="60" y="828" width="160" height="62" rx="8" /><text x="140" y="854" text-anchor="middle" class="arch-name">Brokers</text><text x="140" y="872" text-anchor="middle" class="arch-sub">IBKR · Alpaca</text></g>
+      <g class="arch-box arch-venue"><rect x="240" y="828" width="320" height="62" rx="8" /><text x="400" y="854" text-anchor="middle" class="arch-name">Crypto venues</text><text x="400" y="872" text-anchor="middle" class="arch-sub">Binance · Bybit · OKX · Coinbase · orders and prices</text></g>
+      <g class="arch-box arch-venue"><rect x="580" y="828" width="160" height="62" rx="8" /><text x="660" y="854" text-anchor="middle" class="arch-name">Data vendors</text><text x="660" y="872" text-anchor="middle" class="arch-sub">OPRA · prices</text></g>
+
+      <!-- Co-located server -->
+      <g class="arch-box arch-strategy"><rect x="60" y="948" width="180" height="74" rx="8" /><text x="150" y="974" text-anchor="middle" class="arch-name">Strategy program</text><text x="150" y="992" text-anchor="middle" class="arch-sub">market maker, arbitrage…</text><text x="150" y="1008" text-anchor="middle" class="arch-sub">never waits on the OMS</text></g>
+      {[
+        ["colo-risk", "limits · orders/sec · halt", 260],
+        ["colo-link", "dead man's switch", 440],
+        ["gateway", "venue connector, no FIX", 620],
+      ].map(([name, sub, x]) => (
+        <g class="arch-box arch-crate"><rect x={x} y="948" width="160" height="74" rx="8" /><text x={(x as number) + 80} y="979" text-anchor="middle" class="arch-name">{name}</text><text x={(x as number) + 80} y="998" text-anchor="middle" class="arch-sub">{sub}</text></g>
+      ))}
+      <text class="arch-sub arch-colo-note" x="420" y="1052" text-anchor="middle">Crates from this repository, linked into the program. It trades its own venue account;</text>
+      <text class="arch-sub arch-colo-note" x="420" y="1070" text-anchor="middle">the OMS follows that account with its own key, books every fill, and can kill it unaided.</text>
+    </svg>
+  </div>
+  <ul class="arch-legend" aria-label="Legend">
+    <li><span class="arch-swatch arch-swatch-order"></span>an order going out</li>
+    <li><span class="arch-swatch arch-swatch-event"></span>order and fill events</li>
+    <li><span class="arch-swatch arch-swatch-price"></span>prices</li>
+    <li><span class="arch-swatch arch-swatch-strategy"></span>strategies</li>
+    <li><span class="arch-swatch arch-swatch-control"></span>kill and limits</li>
+  </ul>
+</figure>
+
+<style>
+  .arch {
+    --arch-order: #3b82f6;
+    --arch-event: #25b083;
+    --arch-price: #e0962c;
+    --arch-strategy: #c45ad6;
+    --arch-control: #e5484d;
+    --arch-text: var(--sl-color-white);
+    --arch-muted: var(--sl-color-gray-3);
+    --arch-box: var(--sl-color-gray-6);
+    --arch-box-alt: var(--sl-color-gray-5);
+    --arch-line: var(--sl-color-gray-4);
+    margin-block: 1.5rem;
+  }
+  /* Starlight's grays darken fast in light mode: one step lighter there. */
+  :global(:root[data-theme="light"]) .arch {
+    --arch-box: var(--sl-color-gray-7, #f5f6f8);
+    --arch-box-alt: var(--sl-color-gray-6);
+  }
+  .arch-scroll {
+    overflow-x: auto;
+    border: 1px solid var(--sl-color-hairline);
+    border-radius: 0.75rem;
+    background: var(--sl-color-bg-nav);
+  }
+  .arch svg {
+    display: block;
+    width: 100%;
+    min-width: 560px;
+    max-width: 820px;
+    margin-inline: auto;
+    height: auto;
+    font-family: var(--sl-font, system-ui, sans-serif);
+  }
+  .arch-region {
+    fill: none;
+    stroke: var(--arch-line);
+    stroke-width: 1.2;
+    stroke-dasharray: 6 5;
+  }
+  .arch-region-colo {
+    stroke: var(--arch-strategy);
+  }
+  .arch-region-label,
+  .arch-caps {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    fill: var(--arch-muted);
+  }
+  .arch-colo-label {
+    fill: var(--arch-strategy);
+  }
+  .arch-boundary {
+    stroke: var(--arch-line);
+    stroke-width: 1.2;
+    stroke-dasharray: 3 5;
+  }
+  .arch-box rect,
+  .arch-gw rect {
+    fill: var(--arch-box);
+    stroke: var(--arch-line);
+    stroke-width: 1.2;
+  }
+  .arch-gw > rect {
+    fill: var(--arch-box-alt);
+  }
+  .arch-key rect {
+    stroke: var(--arch-event);
+    stroke-width: 2;
+  }
+  .arch-strategy rect {
+    stroke: var(--arch-strategy);
+    stroke-width: 1.6;
+  }
+  .arch-venue rect,
+  .arch-ext rect {
+    fill: var(--arch-box-alt);
+  }
+  .arch-crate rect {
+    stroke-dasharray: 4 3;
+  }
+  .arch-name {
+    font-size: 14px;
+    font-weight: 600;
+    fill: var(--arch-text);
+  }
+  .arch-sub {
+    font-size: 11.5px;
+    fill: var(--arch-muted);
+  }
+  .arch-colo-note {
+    font-size: 12.5px;
+  }
+  .arch-chip rect {
+    fill: var(--arch-box);
+    stroke: var(--arch-order);
+    stroke-width: 1.2;
+  }
+  .arch-chip-price rect {
+    stroke: var(--arch-price);
+  }
+  .arch-chip-strategy rect {
+    stroke: var(--arch-strategy);
+  }
+  .arch-chip text {
+    font-size: 12px;
+    fill: var(--arch-text);
+  }
+  .arch-bus {
+    fill: var(--arch-box-alt);
+    stroke: var(--arch-line);
+    stroke-width: 1.2;
+  }
+  .arch-lane-event {
+    fill: color-mix(in srgb, var(--arch-event) 22%, transparent);
+    stroke: var(--arch-event);
+  }
+  .arch-lane-price {
+    fill: color-mix(in srgb, var(--arch-price) 22%, transparent);
+    stroke: var(--arch-price);
+  }
+  .arch-lane-text {
+    font-size: 11.5px;
+    fill: var(--arch-text);
+  }
+  .arch-edge {
+    fill: none;
+    stroke-width: 1.8;
+  }
+  .arch-edge-order {
+    stroke: var(--arch-order);
+    marker-end: url(#arch-arrow-order);
+  }
+  .arch-edge-event {
+    stroke: var(--arch-event);
+    marker-end: url(#arch-arrow-event);
+  }
+  .arch-edge-price {
+    stroke: var(--arch-price);
+    marker-end: url(#arch-arrow-price);
+  }
+  .arch-edge-control {
+    stroke: var(--arch-control);
+    stroke-dasharray: 6 4;
+    marker-end: url(#arch-arrow-control);
+  }
+  .arch-head-order { fill: var(--arch-order); }
+  .arch-head-event { fill: var(--arch-event); }
+  .arch-head-price { fill: var(--arch-price); }
+  .arch-head-control { fill: var(--arch-control); }
+  .arch-edge-label {
+    font-size: 11px;
+    fill: var(--arch-muted);
+    paint-order: stroke;
+    stroke: var(--sl-color-bg-nav);
+    stroke-width: 4px;
+  }
+  .arch-label-order { fill: var(--arch-order); }
+  .arch-label-event { fill: var(--arch-event); }
+  .arch-label-price { fill: var(--arch-price); }
+  .arch-label-control { fill: var(--arch-control); }
+  .arch-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.25rem;
+    list-style: none;
+    padding: 0;
+    margin: 0.75rem 0 0;
+    font-size: var(--sl-text-sm);
+    color: var(--sl-color-gray-2);
+  }
+  .arch-legend li {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin: 0;
+  }
+  .arch-swatch {
+    width: 1.5rem;
+    height: 0;
+    border-top: 3px solid;
+  }
+  .arch-swatch-order { border-color: var(--arch-order); }
+  .arch-swatch-event { border-color: var(--arch-event); }
+  .arch-swatch-price { border-color: var(--arch-price); }
+  .arch-swatch-strategy { border-color: var(--arch-strategy); }
+  .arch-swatch-control { border-color: var(--arch-control); border-top-style: dashed; }
+</style>

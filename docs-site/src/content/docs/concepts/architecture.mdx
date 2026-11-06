@@ -1,12 +1,80 @@
 ---
 title: Architecture
-description: How the instrument catalog, broker routing and price feeds fit together.
+description: How orders, fills, prices and strategies move through OpenOMS, and how the instrument catalog ties them together.
 ---
 
+import ArchitectureDiagram from "../../../components/ArchitectureDiagram.astro";
 import Mermaid from "../../../components/Mermaid.astro";
 import overview from "../../../diagrams/overview.mmd?raw";
 import er from "../../../diagrams/er.mmd?raw";
 import runtime from "../../../diagrams/runtime.mmd?raw";
+
+OpenOMS is one program. Its core owns all state in Postgres. Two gateways
+inside the same program are its only contact with the outside world: one for
+orders and fills, one for prices.
+
+<ArchitectureDiagram />
+
+## The order path
+
+1. An order arrives from the cockpit, the trader UI, or a strategy over FIX or
+   REST (path ①).
+2. **Order API + Risk** checks it against the portfolio's limits and current
+   positions, then stores it.
+3. The **order gateway** sends it to the venue through that venue's connector.
+4. The venue's executions come back through the same connector as plain
+   `ExecEvent`s.
+5. The **order engine** applies them. It is the only place that books a fill,
+   and it books each fill once, however often it is reported.
+6. Every change is appended to the **event store**, then published on the event
+   bus.
+
+**Order recon** asks the gateway for open orders and order status after every
+reconnect, and lets the order engine heal anything missed while a stream was
+down.
+
+## The price path
+
+- The **market data gateway** subscribes to the instruments the OMS holds, on
+  the crypto venues' public feeds and on OPRA for options.
+- It turns each venue's messages into one shared quote.
+- **Pricing** keeps the best live source per instrument and fails over when it
+  goes stale.
+
+Prices never wait for orders and orders never wait for prices: the two paths
+share no queue.
+
+## The event bus
+
+The bus is in memory and has two lanes:
+
+| Lane | Carries | Guarantee |
+|---|---|---|
+| Order lane | order events, fills, position changes | published only after the event is stored; a subscriber that falls behind re-reads the event store |
+| Price lane | marks | latest value wins; a slow subscriber skips ahead and slows nothing |
+
+Positions & P&L, UI updates (one WebSocket to every open screen) and the
+strategy reports subscribe to it. The **Kafka outbox** reads the event store
+rather than the bus, so other systems catch up after an outage. Kafka is
+optional; without it the OMS runs fully.
+
+## Strategies
+
+- **Path ①, through the OMS.** The strategy sends its orders to the OMS over
+  FIX 4.4 (TLS) or REST, and every order passes the same checks as a trader's.
+  See [FIX](/openoms/strategies/fix/) and [REST](/openoms/strategies/rest/).
+- **Path ②, co-located.** A latency-sensitive strategy runs on its own server
+  next to the venue and trades its own venue account directly. It links three
+  crates from this repository:
+  - `colo-risk` checks every order in memory;
+  - `colo-link` holds the control link and stops the strategy when the OMS goes
+    quiet;
+  - `gateway` provides the venue connector.
+
+  The OMS follows that account with its own key and books every fill, so the
+  strategy's positions and P&L appear moments later. Kill tells the strategy,
+  and also cancels everything on the account with the OMS's key, without
+  waiting for the strategy. See [Co-located strategies](/openoms/strategies/colocated/).
 
 ## Instrument model
 
