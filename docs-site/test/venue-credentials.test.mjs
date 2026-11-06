@@ -1,16 +1,28 @@
 // The cockpit's credentials drawer shows bare field labels and links to the
-// venue's docs page for what they mean, so every field src/venues.rs lists must
-// have a row in that page's credentials table: `| <Label> | … |`.
+// venue's docs page for what they mean, so every field a connector's venue
+// lists (crates/gateway/src/connectors/<name>/mod.rs, `fn venue()`) must have a
+// row in that page's credentials table: `| <Label> | … |`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 
-const VENUES_RS = readFileSync(new URL("../../src/venues.rs", import.meta.url), "utf8");
+const CONNECTORS = new URL("../../crates/gateway/src/connectors/", import.meta.url);
+const VENUES_RS = readdirSync(CONNECTORS, { withFileTypes: true })
+  .filter((d) => d.isDirectory())
+  .map((d) => {
+    try {
+      return readFileSync(new URL(`${d.name}/mod.rs`, CONNECTORS), "utf8");
+    } catch {
+      return "";
+    }
+  })
+  .filter((source) => source.includes("fn venue() -> Venue"))
+  .map((source) => source.slice(source.indexOf("fn venue() -> Venue")))
+  .join("\n");
 const page = (slug) => readFileSync(new URL(`../src/content/docs/integrations/${slug}.md`, import.meta.url), "utf8");
 
 export function venuesFrom(source) {
-  const body = source.slice(source.indexOf("pub fn venues()"), source.indexOf("#[cfg(test)]"));
-  return body
+  return source
     .split(/\n\s*Venue \{/)
     .slice(1)
     .map((block) => ({
@@ -20,7 +32,7 @@ export function venuesFrom(source) {
     }));
 }
 
-test("the venue list is read from src/venues.rs", () => {
+test("the venue list is read from the connectors", () => {
   const venues = venuesFrom(VENUES_RS);
   assert.ok(venues.length >= 3, "expected at least Alpaca, Binance and IBKR");
   for (const v of venues) assert.ok(v.labels.length > 0, `${v.code} has no fields`);
