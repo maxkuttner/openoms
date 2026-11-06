@@ -13,7 +13,9 @@ const brokers = [
   { name: "Alpaca", file: "alpaca" },
   { name: "Binance", file: "binance" },
   { name: "Bybit", file: "bybit" },
+  { name: "Coinbase", file: "coinbase" },
   { name: "Interactive Brokers", file: "ibkr" },
+  { name: "OKX", file: "okx" },
 ];
 
 const marks = import.meta.glob<string>("../assets/brokers/*.svg", {
@@ -23,7 +25,7 @@ const marks = import.meta.glob<string>("../assets/brokers/*.svg", {
 });
 const markFor = (file: string) => marks[`../assets/brokers/${file}.svg`];
 
-// Four names are narrower than the content column, so each copy repeats them
+// Six names are narrower than the content column, so each copy repeats them
 // until it is wider than any viewport; otherwise the loop shows a gap.
 const strip = [...brokers, ...brokers, ...brokers];
 ---
