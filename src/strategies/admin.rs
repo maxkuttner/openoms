@@ -62,6 +62,9 @@ pub struct StrategyRow {
     pub alarm: Option<String>,
     #[sqlx(default)]
     pub fighting: bool,
+    /// Killed, and the strategy has not acknowledged it within 5 s.
+    #[sqlx(default)]
+    pub kill_ack_late: bool,
 }
 
 const ROW_SELECT: &str = "code, name, portfolio_id, owner_principal_id, principal_id, sender_comp_id, \
@@ -135,6 +138,7 @@ async fn reload(state: &AppState) {
     if let Err(e) = state.strategies().reload(state.pool()).await {
         warn!(error = %e, "strategies: registry reload failed; the snapshot keeps its last state");
     }
+    crate::colo::follow::sync_follows(state).await;
 }
 
 fn bad_request(message: impl Into<String>) -> AdminError {
@@ -184,7 +188,9 @@ pub async fn put_follow_credentials(
     let plain = serde_json::to_vec(&serde_json::json!({ "api_key": p.api_key, "private_key": p.private_key }))
         .map_err(|e| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let sealed = crate::secrets::seal(&key, &follow_aad(&code), &plain);
-    let done = sqlx::query("UPDATE strategy SET follow_credentials = $2, updated_at = now() WHERE code = $1")
+    let done = sqlx::query(
+        "UPDATE strategy SET follow_credentials = $2, follow_since = COALESCE(follow_since, now()), updated_at = now() WHERE code = $1",
+    )
         .bind(&code)
         .bind(sealed)
         .execute(state.pool())
@@ -234,6 +240,7 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
             row.cancelled_per_min = flow.cancelled as i64;
             row.alarm = hub.alarm(&row.code);
             row.fighting = hub.fighting(&row.code);
+            row.kill_ack_late = row.state == "HALTED" && hub.kill_ack_late(&row.code);
         }
     }
     Ok(Json(rows))

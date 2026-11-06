@@ -173,12 +173,15 @@ impl BinanceAdapter {
         Ok(parse_exchange_info(&body).into_iter().find(|i| i.broker_symbol == symbol))
     }
 
-    /// GET /api/v3/myTrades — the account's fills on `symbol`, from a trade id
-    /// on, for filling a follow stream's gap.
-    pub async fn my_trades(&self, symbol: &str, from_trade_id: Option<i64>) -> Result<Vec<crate::contract::ExternalFill>, BrokerError> {
+    /// GET /api/v3/myTrades — up to 1000 of the account's fills on `symbol`:
+    /// from a trade id on, or else from a start time (milliseconds), for
+    /// filling a follow stream's gap.
+    pub async fn my_trades(&self, symbol: &str, from_trade_id: Option<i64>, start_time_ms: Option<i64>) -> Result<Vec<crate::contract::ExternalFill>, BrokerError> {
         let mut params = vec![("symbol", symbol.to_string()), ("limit", "1000".to_string())];
-        if let Some(from) = from_trade_id {
-            params.push(("fromId", from.to_string()));
+        match (from_trade_id, start_time_ms) {
+            (Some(from), _) => params.push(("fromId", from.to_string())),
+            (None, Some(start)) => params.push(("startTime", start.to_string())),
+            (None, None) => {}
         }
         let resp = self.signed(Method::GET, "/api/v3/myTrades", &params).await?;
         if !resp.status().is_success() {

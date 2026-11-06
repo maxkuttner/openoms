@@ -20,6 +20,12 @@ use crate::config::ControlLinkSettings;
 use crate::domain::orders::risk::TradingState;
 use crate::strategies::Mode;
 
+/// A strategy not heard for 3 heartbeats is gone, even if its TCP connection
+/// is not.
+pub fn silent(last_heard: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(last_heard) > 3 * HEARTBEAT
+}
+
 /// Who may connect, and what they are told first.
 #[async_trait::async_trait]
 pub trait LinkBackend: Send + Sync {
@@ -88,7 +94,12 @@ async fn handle(
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                 },
-                _ = beat.tick() => sink.send(Message::Text(serde_json::to_string(&ToStrategy::Heartbeat)?)).await?,
+                _ = beat.tick() => {
+                    if hub.last_heard(&code, conn).is_some_and(|t| silent(t, std::time::Instant::now())) {
+                        return Err("silent for 3 heartbeats".into());
+                    }
+                    sink.send(Message::Text(serde_json::to_string(&ToStrategy::Heartbeat)?)).await?
+                }
             }
         }
     }
@@ -113,13 +124,14 @@ impl LinkBackend for AppBackend {
 
     async fn initial_state(&self, code: &str) -> ToStrategy {
         let Some(s) = self.0.strategies().by_code(code) else {
-            return ToStrategy::State { active: false, limits: Default::default(), limits_version: 0, positions: Vec::new() };
+            return ToStrategy::State { active: false, limits: Default::default(), limits_version: 0, positions: Vec::new(), dead_man_secs: 5 };
         };
         ToStrategy::State {
             active: s.state != TradingState::Halted,
             limits: s.risk_limits(),
             limits_version: s.limits_version.max(0) as u64,
             positions: super::control::positions(&self.0, &s).await,
+            dead_man_secs: s.dead_man_secs.into(),
         }
     }
 }
@@ -160,7 +172,7 @@ mod tests {
             (token == "tok").then(|| "mm1".to_string())
         }
         async fn initial_state(&self, _code: &str) -> ToStrategy {
-            ToStrategy::State { active: true, limits: Default::default(), limits_version: 1, positions: vec![] }
+            ToStrategy::State { active: true, limits: Default::default(), limits_version: 1, positions: vec![], dead_man_secs: 5 }
         }
     }
 
@@ -192,6 +204,13 @@ mod tests {
             }
         };
         assert_eq!(next, ToStrategy::Kill);
+    }
+
+    #[test]
+    fn a_link_silent_for_3_heartbeats_is_dropped() {
+        let t0 = std::time::Instant::now();
+        assert!(!silent(t0, t0 + Duration::from_millis(2900)));
+        assert!(silent(t0, t0 + Duration::from_millis(3100)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -19,7 +19,7 @@ pub struct Position {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToStrategy {
-    State { active: bool, limits: Limits, limits_version: u64, positions: Vec<Position> },
+    State { active: bool, limits: Limits, limits_version: u64, positions: Vec<Position>, dead_man_secs: u64 },
     Limits { limits: Limits, limits_version: u64 },
     Positions { positions: Vec<Position> },
     Kill,
@@ -45,7 +45,7 @@ mod tests {
         let ack: FromStrategy = serde_json::from_str(r#"{"type":"ack_limits","limits_version":7}"#).unwrap();
         assert_eq!(ack, FromStrategy::AckLimits { limits_version: 7 });
         assert_eq!(serde_json::to_string(&FromStrategy::AckKill).unwrap(), r#"{"type":"ack_kill"}"#);
-        let state = ToStrategy::State { active: true, limits: Default::default(), limits_version: 3, positions: vec![Position { symbol: "BTCUSDT".into(), qty: 0.5 }] };
+        let state = ToStrategy::State { active: true, limits: Default::default(), limits_version: 3, positions: vec![Position { symbol: "BTCUSDT".into(), qty: 0.5 }], dead_man_secs: 5 };
         let back: ToStrategy = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(back, state);
     }

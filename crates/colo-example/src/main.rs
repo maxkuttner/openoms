@@ -46,9 +46,6 @@ struct Args {
     tick: f64,
     #[arg(long, default_value = "mm1-q")]
     tag: String,
-    /// Seconds without the OMS before quoting stops.
-    #[arg(long, default_value_t = 5)]
-    dead_man_secs: u64,
     #[arg(long)]
     live: bool,
     /// Keep quoting after a kill: to watch the OMS cancel on sight.
@@ -95,11 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (link, mut control) = Link::spawn(LinkConfig { url: args.link.clone(), token: args.token.clone(), ca_pem });
     let mut mid = spawn_mid_feed(&args.symbol);
 
-    let mut dead = DeadMan::new(Duration::from_secs(args.dead_man_secs), Instant::now());
+    // The OMS's first state sets the real timeout.
+    let mut dead = DeadMan::new(Duration::from_secs(5), Instant::now());
     let mut risk = RiskBook::new(Limits::default(), 0);
     let mut working: Vec<String> = Vec::new();
     let mut n = 0u64;
     let mut requote = tokio::time::interval(Duration::from_secs(2));
+    // The switch is checked far more often than quotes are refreshed, so
+    // quotes come down within a fraction of a second of the timeout.
+    let mut watch_switch = tokio::time::interval(Duration::from_millis(250));
     let mut was_trading = false;
 
     loop {
@@ -130,17 +131,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ToStrategy::Heartbeat => {}
                 }
             }
-            _ = requote.tick() => {
+            _ = watch_switch.tick() => {
                 let trading = args.ignore_kill || dead.may_trade(Instant::now());
-                if !trading {
-                    if was_trading {
-                        warn!("lost the OMS or stopped by it: cancelling quotes");
-                        cancel_all(&adapter, &args.symbol, &mut working).await;
-                    }
-                    was_trading = false;
+                if was_trading && !trading {
+                    warn!("lost the OMS or stopped by it: cancelling quotes");
+                    cancel_all(&adapter, &args.symbol, &mut working).await;
+                }
+                was_trading = trading;
+            }
+            _ = requote.tick() => {
+                if !was_trading {
                     continue;
                 }
-                was_trading = true;
                 let Some(m) = *mid.borrow_and_update() else { continue };
                 cancel_all(&adapter, &args.symbol, &mut working).await;
                 let (bid, ask) = quote::quotes(m, args.half_spread_bps, args.tick);

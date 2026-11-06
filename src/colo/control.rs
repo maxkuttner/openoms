@@ -43,6 +43,12 @@ impl CancelRate {
 }
 
 /// The order to cancel on sight: any new order of a killed strategy.
+/// A kill (when it was sent, whether it was acknowledged) still waiting for
+/// its acknowledgement past 5 s.
+pub fn kill_ack_late(kill: Option<(Instant, bool)>, now: Instant) -> bool {
+    kill.is_some_and(|(sent, acked)| !acked && now.saturating_duration_since(sent) > ACK_KILL_WITHIN)
+}
+
 pub fn fight(killed: bool, event: &FollowEvent) -> Option<(String, String)> {
     match event {
         FollowEvent::Opened { venue_order_id, symbol, .. } if killed => Some((venue_order_id.clone(), symbol.clone())),
@@ -50,11 +56,21 @@ pub fn fight(killed: bool, event: &FollowEvent) -> Option<(String, String)> {
     }
 }
 
-/// Why a trading strategy is unmonitored, if it is: no link, or the current
-/// limits not acknowledged within 10 s of changing.
-pub fn unmonitored(connected: bool, acked: i64, current: i64, changed_at: Instant, now: Instant) -> Option<String> {
-    if !connected {
-        return Some("unmonitored: no control link".into());
+/// A kill should be acknowledged this soon.
+pub const ACK_KILL_WITHIN: Duration = Duration::from_secs(5);
+
+/// How long after its link went down (or the OMS started) a strategy may
+/// still trade: its dead man's switch running out, plus a reconnect.
+pub fn no_link_grace(dead_man_secs: u32) -> Duration {
+    Duration::from_secs(u64::from(dead_man_secs) + 2)
+}
+
+/// Why a trading strategy is unmonitored, if it is: no link for longer than
+/// `grace` (`down_for` is `None` while connected), or the current limits not
+/// acknowledged within 10 s of changing.
+pub fn unmonitored(down_for: Option<Duration>, grace: Duration, acked: i64, current: i64, changed_at: Instant, now: Instant) -> Option<String> {
+    if let Some(down_for) = down_for {
+        return (down_for > grace).then(|| "unmonitored: no control link".into());
     }
     if acked < current && now.saturating_duration_since(changed_at) > ACK_LIMITS_WITHIN {
         return Some(format!("unmonitored: limits version {current} not acknowledged"));
@@ -80,6 +96,44 @@ pub async fn positions(state: &AppState, strategy: &Strategy) -> Vec<Position> {
 
 pub async fn push_positions(state: &AppState, hub: &ColoHub, strategy: &Strategy) {
     hub.push(&strategy.code, ToStrategy::Positions { positions: positions(state, strategy).await });
+}
+
+#[derive(Debug, PartialEq)]
+pub enum PositionsPush {
+    Portfolio(uuid::Uuid),
+    /// The lane lagged: every co-located strategy may have missed a change.
+    Every,
+    Nothing,
+}
+
+pub fn positions_push(event: &Result<crate::event_bus::OrderLaneEvent, tokio::sync::broadcast::error::RecvError>) -> PositionsPush {
+    use crate::event_bus::OrderLaneEvent;
+    use tokio::sync::broadcast::error::RecvError;
+    match event {
+        Ok(OrderLaneEvent::PositionChanged { portfolio_id, .. }) => PositionsPush::Portfolio(*portfolio_id),
+        Err(RecvError::Lagged(_)) => PositionsPush::Every,
+        _ => PositionsPush::Nothing,
+    }
+}
+
+/// Send a co-located strategy its booked positions whenever they change,
+/// however they changed (its fills, a transfer, a correction).
+pub async fn positions_loop(state: AppState) {
+    let mut lane = state.event_bus().subscribe_order();
+    loop {
+        let event = lane.recv().await;
+        if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+            return;
+        }
+        let targets: Vec<Strategy> = match positions_push(&event) {
+            PositionsPush::Portfolio(p) => state.strategies().by_portfolio_id(p).into_iter().collect(),
+            PositionsPush::Every => state.strategies().all().to_vec(),
+            PositionsPush::Nothing => continue,
+        };
+        for strategy in targets.iter().filter(|s| s.mode == crate::strategies::Mode::Colocated) {
+            push_positions(&state, state.colo(), strategy).await;
+        }
+    }
 }
 
 async fn cancel(adapter: &BinanceAdapter, venue_order_id: &str, symbol: &str) -> Result<(), String> {
@@ -110,6 +164,50 @@ pub async fn kill(state: &AppState, strategy: &Strategy) -> ControlReport {
     report
 }
 
+/// How often a killed strategy's account is swept for orders the fight missed
+/// (budget spent, a dropped stream).
+pub const SWEEP_EVERY: Duration = Duration::from_secs(2);
+
+pub fn to_sweep(strategies: &[Strategy]) -> Vec<String> {
+    strategies
+        .iter()
+        .filter(|s| s.mode == crate::strategies::Mode::Colocated && s.state == TradingState::Halted)
+        .map(|s| s.code.clone())
+        .collect()
+}
+
+/// While a strategy is killed, cancel whatever is still open on its account,
+/// within the fight's cancel budget, until Enable.
+pub async fn sweep_loop(state: AppState) {
+    let mut tick = tokio::time::interval(SWEEP_EVERY);
+    loop {
+        tick.tick().await;
+        let hub = state.colo();
+        for code in to_sweep(&state.strategies().all()) {
+            let Some(adapter) = hub.adapter(&code) else { continue };
+            let open = match adapter.open_orders().await {
+                Ok(open) => open,
+                Err(e) => {
+                    warn!(strategy = %code, error = %e, "co-located: sweep could not list open orders");
+                    continue;
+                }
+            };
+            if open.is_empty() {
+                continue;
+            }
+            hub.fighting.lock().unwrap().insert(code.clone(), Instant::now());
+            for order in open {
+                if !hub.cancel_rates.lock().unwrap().entry(code.clone()).or_default().allow(Instant::now()) {
+                    break;
+                }
+                if let Err(e) = cancel(&adapter, &order.venue_order_id, &order.symbol).await {
+                    warn!(strategy = %code, venue_order_id = %order.venue_order_id, error = %e, "co-located: sweep could not cancel");
+                }
+            }
+        }
+    }
+}
+
 pub async fn enable(state: &AppState, strategy: &Strategy) {
     state.colo().fighting.lock().unwrap().remove(&strategy.code);
     state.colo().push(&strategy.code, ToStrategy::Resume);
@@ -117,15 +215,18 @@ pub async fn enable(state: &AppState, strategy: &Strategy) {
 
 /// Per follow event: fight a killed strategy's new orders, and keep the
 /// alarms current.
-pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adapter: &BinanceAdapter, event: &FollowEvent) {
+pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adapter: &std::sync::Arc<BinanceAdapter>, event: &FollowEvent) {
     let killed = strategy.state == TradingState::Halted;
     if let Some((venue_order_id, symbol)) = fight(killed, event) {
         hub.fighting.lock().unwrap().insert(strategy.code.clone(), Instant::now());
         let allowed = hub.cancel_rates.lock().unwrap().entry(strategy.code.clone()).or_default().allow(Instant::now());
         if allowed {
-            if let Err(e) = cancel(adapter, &venue_order_id, &symbol).await {
-                warn!(strategy = %strategy.code, %venue_order_id, error = %e, "co-located: could not cancel a killed strategy's order");
-            }
+            let (adapter, code) = (adapter.clone(), strategy.code.clone());
+            tokio::spawn(async move {
+                if let Err(e) = cancel(&adapter, &venue_order_id, &symbol).await {
+                    warn!(strategy = %code, %venue_order_id, error = %e, "co-located: could not cancel a killed strategy's order");
+                }
+            });
         } else {
             warn!(strategy = %strategy.code, %venue_order_id, "co-located: cancel budget spent; order left for the next sweep");
         }
@@ -136,7 +237,14 @@ pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adap
     }
     let link = hub.link_status(&strategy.code);
     let changed_at = hub.limits_changed.lock().unwrap().get(&strategy.code).copied().unwrap_or_else(Instant::now);
-    let mut alarm = unmonitored(link.connected, link.acked_version, strategy.limits_version, changed_at, Instant::now());
+    let mut alarm = unmonitored(
+        hub.link_down_for(&strategy.code),
+        no_link_grace(strategy.dead_man_secs),
+        link.acked_version,
+        strategy.limits_version,
+        changed_at,
+        Instant::now(),
+    );
     if alarm.is_none() {
         let placed = hub.runtimes.lock().unwrap().get(&strategy.code).map_or(0, |r| r.placed_within(Duration::from_secs(1)));
         if strategy.max_orders_per_sec.is_some_and(|cap| placed > cap as usize) {
@@ -176,6 +284,31 @@ mod tests {
     }
 
     #[test]
+    fn positions_go_down_the_link_on_every_position_change() {
+        use crate::event_bus::OrderLaneEvent;
+        use tokio::sync::broadcast::error::RecvError;
+        let p = uuid::Uuid::new_v4();
+        assert_eq!(positions_push(&Ok(OrderLaneEvent::PositionChanged { portfolio_id: p, instrument_id: "1".into() })), PositionsPush::Portfolio(p));
+        assert_eq!(positions_push(&Ok(OrderLaneEvent::Appended { order_id: p, global_position: 1, event_type: "Filled".into() })), PositionsPush::Nothing);
+        assert_eq!(positions_push(&Err(RecvError::Lagged(3))), PositionsPush::Every);
+    }
+
+    #[test]
+    fn only_killed_colocated_strategies_are_swept() {
+        use crate::strategies::{tests::sample, Mode};
+        let mut killed = sample("mm1", "A", "B");
+        killed.mode = Mode::Colocated;
+        killed.state = TradingState::Halted;
+        let mut active = killed.clone();
+        active.code = "mm2".into();
+        active.state = TradingState::Active;
+        let mut via_oms = killed.clone();
+        via_oms.code = "fix1".into();
+        via_oms.mode = Mode::ViaOms;
+        assert_eq!(to_sweep(&[killed, active, via_oms]), ["mm1"]);
+    }
+
+    #[test]
     fn a_killed_strategys_new_order_is_cancelled_on_sight() {
         assert_eq!(fight(true, &opened("9")), Some(("9".to_string(), "BTCUSDT".to_string())));
         assert_eq!(fight(false, &opened("9")), None);
@@ -185,10 +318,27 @@ mod tests {
     #[test]
     fn stale_limits_raise_the_alarm_after_10s() {
         let t0 = Instant::now();
-        assert_eq!(unmonitored(true, 6, 7, t0, t0 + Duration::from_secs(9)), None);
-        assert!(unmonitored(true, 6, 7, t0, t0 + Duration::from_secs(11)).is_some());
-        assert_eq!(unmonitored(true, 7, 7, t0, t0 + Duration::from_secs(60)), None);
-        assert_eq!(unmonitored(false, 7, 7, t0, t0), Some("unmonitored: no control link".to_string()));
+        let grace = Duration::from_secs(7);
+        assert_eq!(unmonitored(None, grace, 6, 7, t0, t0 + Duration::from_secs(9)), None);
+        assert!(unmonitored(None, grace, 6, 7, t0, t0 + Duration::from_secs(11)).is_some());
+        assert_eq!(unmonitored(None, grace, 7, 7, t0, t0 + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn no_link_is_an_alarm_only_once_the_strategy_should_have_stopped() {
+        let t0 = Instant::now();
+        let grace = Duration::from_secs(7);
+        assert_eq!(unmonitored(Some(Duration::from_secs(6)), grace, 7, 7, t0, t0), None, "its dead man's switch is still running out");
+        assert_eq!(unmonitored(Some(Duration::from_secs(8)), grace, 7, 7, t0, t0), Some("unmonitored: no control link".to_string()));
+    }
+
+    #[test]
+    fn a_kill_not_acknowledged_within_5s_is_flagged() {
+        let t0 = Instant::now();
+        assert!(!kill_ack_late(Some((t0, false)), t0 + Duration::from_secs(4)));
+        assert!(kill_ack_late(Some((t0, false)), t0 + Duration::from_secs(6)));
+        assert!(!kill_ack_late(Some((t0, true)), t0 + Duration::from_secs(60)));
+        assert!(!kill_ack_late(None, t0));
     }
 
     #[test]

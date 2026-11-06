@@ -19,6 +19,7 @@ type Strategy = {
   placed_per_min: number;
   alarm: string | null;
   fighting: boolean;
+  kill_ack_late: boolean;
   name: string;
   portfolio_id: string;
   state: string;
@@ -211,8 +212,12 @@ export function StrategiesPage() {
           {
             key: "alarm",
             label: "Alarm",
-            render: (r: Strategy) =>
-              r.fighting ? <Badge color="red">killed, still fighting</Badge> : r.alarm ? <Badge color="red">{r.alarm}</Badge> : null,
+            render: (r: Strategy) => (
+              <Group gap={4}>
+                {r.fighting ? <Badge color="red">killed, still fighting</Badge> : r.alarm ? <Badge color="red">{r.alarm}</Badge> : null}
+                {r.kill_ack_late ? <Badge color="orange">kill not acknowledged</Badge> : null}
+              </Group>
+            ),
           },
           {
             key: "session_live",

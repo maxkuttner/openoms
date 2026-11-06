@@ -5544,7 +5544,8 @@
           "open_orders",
           "placed_per_min",
           "cancelled_per_min",
-          "fighting"
+          "fighting",
+          "kill_ack_late"
         ],
         "properties": {
           "acked_limits_version": {
@@ -5582,6 +5583,10 @@
           },
           "has_follow_credentials": {
             "type": "boolean"
+          },
+          "kill_ack_late": {
+            "type": "boolean",
+            "description": "Killed, and the strategy has not acknowledged it within 5 s."
           },
           "kill_when_unmonitored": {
             "type": "boolean"

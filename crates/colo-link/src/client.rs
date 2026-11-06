@@ -11,8 +11,9 @@ use tracing::{info, warn};
 use crate::proto::{FromStrategy, ToStrategy, HEARTBEAT};
 
 /// Whether the strategy may trade: it has been told it is active, it is not
-/// killed, and it heard the OMS within the timeout. A reconnect's `State`
-/// re-arms it; only `Resume` lifts a kill.
+/// killed, and it heard the OMS within the timeout. The OMS's `State` (sent
+/// on every connect) is authoritative: it sets the timeout, and an active
+/// state lifts a kill the strategy missed the `Resume` of.
 pub struct DeadMan {
     timeout: Duration,
     last_heard: Instant,
@@ -33,7 +34,11 @@ impl DeadMan {
 
     pub fn apply(&mut self, msg: &ToStrategy) {
         match msg {
-            ToStrategy::State { active, .. } => self.active = *active,
+            ToStrategy::State { active, dead_man_secs, .. } => {
+                self.active = *active;
+                self.killed = !*active;
+                self.timeout = Duration::from_secs(*dead_man_secs);
+            }
             ToStrategy::Kill => self.killed = true,
             ToStrategy::Resume => {
                 self.killed = false;
@@ -138,7 +143,7 @@ mod tests {
     use crate::proto::ToStrategy;
 
     fn state(active: bool) -> ToStrategy {
-        ToStrategy::State { active, limits: Default::default(), limits_version: 1, positions: vec![] }
+        ToStrategy::State { active, limits: Default::default(), limits_version: 1, positions: vec![], dead_man_secs: 5 }
     }
 
     #[test]
@@ -158,18 +163,28 @@ mod tests {
     }
 
     #[test]
-    fn kill_holds_until_resume_even_when_heard() {
+    fn kill_holds_until_resume_or_an_active_state() {
         let t0 = Instant::now();
         let mut d = DeadMan::new(Duration::from_secs(5), t0);
         d.heard(t0);
         d.apply(&state(true));
         d.apply(&ToStrategy::Kill);
-        d.heard(t0);
         assert!(!d.may_trade(t0));
-        d.apply(&state(true));
-        assert!(!d.may_trade(t0), "a reconnect's state does not undo a kill");
         d.apply(&ToStrategy::Resume);
         assert!(d.may_trade(t0));
+        d.apply(&ToStrategy::Kill);
+        d.apply(&state(true));
+        assert!(d.may_trade(t0), "enabled while disconnected: the reconnect's state lifts the kill");
+    }
+
+    #[test]
+    fn the_oms_sets_the_timeout() {
+        let t0 = Instant::now();
+        let mut d = DeadMan::new(Duration::from_secs(5), t0);
+        d.heard(t0);
+        d.apply(&ToStrategy::State { active: true, limits: Default::default(), limits_version: 1, positions: vec![], dead_man_secs: 2 });
+        assert!(d.may_trade(t0 + Duration::from_millis(1900)));
+        assert!(!d.may_trade(t0 + Duration::from_millis(2100)));
     }
 
     #[test]

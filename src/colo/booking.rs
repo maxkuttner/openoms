@@ -24,9 +24,29 @@ use crate::strategies::Strategy;
 /// order ids the OMS generates).
 const COLO_NAMESPACE: Uuid = Uuid::from_u128(0x6f1c_3a2e_9b84_4d17_a5e0_c2b9_7d41_0f63);
 
-/// The OMS order id of one venue trade on a strategy's account.
-pub fn external_order_id(strategy_code: &str, trade_id: &str) -> Uuid {
-    Uuid::new_v5(&COLO_NAMESPACE, format!("{strategy_code}:{trade_id}").as_bytes())
+/// The OMS order id of one venue trade on a strategy's account. Binance
+/// numbers trades per pair, so the pair is part of the identity.
+pub fn external_order_id(strategy_code: &str, symbol: &str, trade_id: &str) -> Uuid {
+    Uuid::new_v5(&COLO_NAMESPACE, format!("{strategy_code}:{symbol}:{trade_id}").as_bytes())
+}
+
+/// What is already booked for one trade.
+#[derive(Debug, PartialEq)]
+pub enum Existing {
+    Missing,
+    /// The order exists but its fill never reached the engine (a crash or a
+    /// dropped event between the two steps): send the fill again.
+    NeedsFill,
+    Booked,
+}
+
+/// From the trade's order's cumulative quantity, if the order exists.
+pub fn existing_order(cum_qty: Option<f64>) -> Existing {
+    match cum_qty {
+        None => Existing::Missing,
+        Some(q) if q <= 0.0 => Existing::NeedsFill,
+        Some(_) => Existing::Booked,
+    }
 }
 
 /// The strategy's tag in a client order id: everything before its second `-`
@@ -89,14 +109,19 @@ async fn ensure_instrument(pool: &PgPool, adapter: &BinanceAdapter, symbol: &str
 /// moves the position like any other fill.
 pub async fn book_fill(state: &AppState, strategy: &Strategy, adapter: &BinanceAdapter, fill: &ExternalFill) -> Result<Booked, String> {
     let pool = state.pool();
-    let order_id = external_order_id(&strategy.code, &fill.trade_id);
-    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM order_state WHERE order_id = $1)")
+    let order_id = external_order_id(&strategy.code, &fill.symbol, &fill.trade_id);
+    let cum: Option<f64> = sqlx::query_scalar("SELECT cum_qty::double precision FROM order_state WHERE order_id = $1")
         .bind(order_id)
-        .fetch_one(pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?;
-    if exists {
-        return Ok(Booked::AlreadyBooked);
+    match existing_order(cum) {
+        Existing::Booked => return Ok(Booked::AlreadyBooked),
+        Existing::NeedsFill => {
+            send_fill(state, order_id, fill).await;
+            return Ok(Booked::New);
+        }
+        Existing::Missing => {}
     }
     let instrument = ensure_instrument(pool, adapter, &fill.symbol).await?;
     let account = *strategy.connections.get("BINANCE").ok_or("the strategy has no BINANCE account")?;
@@ -160,7 +185,12 @@ pub async fn book_fill(state: &AppState, strategy: &Strategy, adapter: &BinanceA
         Err(e) => return Err(e.to_string()),
     }
     publish_appended(state.event_bus(), order_id, &new_events, &appended);
+    send_fill(state, order_id, fill).await;
+    Ok(Booked::New)
+}
 
+/// Hand a trade's fill to the order engine, which books it and the position.
+async fn send_fill(state: &AppState, order_id: Uuid, fill: &ExternalFill) {
     state
         .engine()
         .exec(ExecEvent {
@@ -171,7 +201,6 @@ pub async fn book_fill(state: &AppState, strategy: &Strategy, adapter: &BinanceA
             kind: ExecKind::Fill { execution_id: fill.trade_id.clone(), qty: fill.qty, price: fill.price },
         })
         .await;
-    Ok(Booked::New)
 }
 
 #[cfg(test)]
@@ -207,9 +236,23 @@ mod tests {
 
     #[test]
     fn a_repeated_fill_books_once() {
-        assert_eq!(external_order_id("mm1", "77"), external_order_id("mm1", "77"));
-        assert_ne!(external_order_id("mm1", "77"), external_order_id("mm1", "78"));
-        assert_ne!(external_order_id("mm1", "77"), external_order_id("mm2", "77"));
+        assert_eq!(external_order_id("mm1", "BTCUSDT", "77"), external_order_id("mm1", "BTCUSDT", "77"));
+        assert_ne!(external_order_id("mm1", "BTCUSDT", "77"), external_order_id("mm1", "BTCUSDT", "78"));
+        assert_ne!(external_order_id("mm1", "BTCUSDT", "77"), external_order_id("mm2", "BTCUSDT", "77"));
+    }
+
+    /// Binance numbers trades per pair: the same trade id on two pairs is two fills.
+    #[test]
+    fn the_same_trade_id_on_two_pairs_is_two_fills() {
+        assert_ne!(external_order_id("mm1", "BTCUSDT", "77"), external_order_id("mm1", "ETHBTC", "77"));
+    }
+
+    /// An order created but whose fill never reached the engine is filled again.
+    #[test]
+    fn an_order_without_its_fill_gets_the_fill_again() {
+        assert_eq!(existing_order(Some(0.0)), Existing::NeedsFill);
+        assert_eq!(existing_order(Some(0.5)), Existing::Booked);
+        assert_eq!(existing_order(None), Existing::Missing);
     }
 
     #[test]

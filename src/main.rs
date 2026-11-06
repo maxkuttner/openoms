@@ -1163,7 +1163,9 @@ async fn serve() {
         let (hub, s) = (state.colo().clone(), state.clone());
         tokio::spawn(async move { hub.run(s).await });
     }
-    colo::follow::start_follows(&state).await;
+    tokio::spawn(colo::control::positions_loop(state.clone()));
+    tokio::spawn(colo::control::sweep_loop(state.clone()));
+    colo::follow::sync_follows(&state).await;
     match file_cfg.and_then(|f| f.control_link()) {
         Some(settings) => {
             tokio::spawn(colo::link_server::serve(state.clone(), settings));

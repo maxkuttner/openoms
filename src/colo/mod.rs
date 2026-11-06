@@ -42,6 +42,8 @@ enum Flow {
 pub struct Runtime {
     pub open: HashMap<String, OpenOrder>,
     flow: VecDeque<(Instant, Flow)>,
+    /// Every pair seen on the account, for gap recon.
+    pub seen_symbols: std::collections::BTreeSet<String>,
 }
 
 /// Placed / cancelled / rejected orders in the last minute.
@@ -57,6 +59,7 @@ impl Runtime {
     pub fn apply(&mut self, event: &FollowEvent, now: Instant) {
         match event {
             FollowEvent::Opened { venue_order_id, client_order_id, symbol, buy, qty, price } => {
+                self.seen_symbols.insert(symbol.clone());
                 self.open.insert(
                     venue_order_id.clone(),
                     OpenOrder { client_order_id: client_order_id.clone(), symbol: symbol.clone(), buy: *buy, qty: *qty, price: *price },
@@ -71,7 +74,10 @@ impl Runtime {
                     _ => {}
                 }
             }
-            FollowEvent::Fill(_) | FollowEvent::Connected => {}
+            FollowEvent::Fill(fill) => {
+                self.seen_symbols.insert(fill.symbol.clone());
+            }
+            FollowEvent::Connected => {}
         }
         while self.flow.front().is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(60)) {
             self.flow.pop_front();
@@ -99,13 +105,39 @@ impl Runtime {
     }
 }
 
+/// One worker task per strategy: its events stay in order, and a slow
+/// strategy (a long gap fill, a slow venue) never holds up another's.
+pub struct Workers<T>(HashMap<String, mpsc::UnboundedSender<T>>);
+
+impl<T> Default for Workers<T> {
+    fn default() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl<T> Workers<T> {
+    /// Hand `item` to `code`'s worker, starting one (again) if it has none.
+    pub fn send(&mut self, code: &str, item: T, start: impl FnOnce(&str, mpsc::UnboundedReceiver<T>)) {
+        let item = match self.0.get(code) {
+            Some(tx) => match tx.send(item) {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(item)) => item,
+            },
+            None => item,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = tx.send(item);
+        self.0.insert(code.to_string(), tx);
+        start(code, rx);
+    }
+}
+
 /// One strategy's control link, as the OMS sees it.
 struct LinkSlot {
     tx: mpsc::UnboundedSender<ToStrategy>,
     conn: u64,
     last_heard: Instant,
     acked_version: i64,
-    kill_acked: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
@@ -123,7 +155,9 @@ pub struct ColoHub {
     follow: FollowHandle,
     rx: Arc<Mutex<Option<mpsc::Receiver<(String, FollowEvent)>>>>,
     pub(crate) runtimes: Arc<Mutex<HashMap<String, Runtime>>>,
-    adapters: Arc<Mutex<HashMap<String, Arc<BinanceAdapter>>>>,
+    pub(crate) adapters: Arc<Mutex<HashMap<String, Arc<BinanceAdapter>>>>,
+    /// Strategies whose account is followed, with their follow key's fingerprint.
+    pub(crate) followed: Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
     links: Arc<Mutex<HashMap<String, LinkSlot>>>,
     next_conn: Arc<std::sync::atomic::AtomicU64>,
     /// When each strategy's limits last changed (or its link connected).
@@ -132,6 +166,12 @@ pub struct ColoHub {
     pub(crate) fighting: Arc<Mutex<HashMap<String, Instant>>>,
     pub(crate) cancel_rates: Arc<Mutex<HashMap<String, control::CancelRate>>>,
     pub(crate) alarms: Arc<Mutex<HashMap<String, String>>>,
+    /// The last kill sent to each strategy, and whether it acknowledged it.
+    kills: Arc<Mutex<HashMap<String, (Instant, bool)>>>,
+    /// When each strategy's link went down; strategies never connected count
+    /// from `started`.
+    down_since: Arc<Mutex<HashMap<String, Instant>>>,
+    started: Instant,
 }
 
 impl Default for ColoHub {
@@ -142,12 +182,16 @@ impl Default for ColoHub {
             rx: Arc::new(Mutex::new(Some(rx))),
             runtimes: Arc::default(),
             adapters: Arc::default(),
+            followed: Arc::default(),
             links: Arc::default(),
             next_conn: Arc::default(),
             limits_changed: Arc::default(),
             fighting: Arc::default(),
             cancel_rates: Arc::default(),
             alarms: Arc::default(),
+            kills: Arc::default(),
+            down_since: Arc::default(),
+            started: Instant::now(),
         }
     }
 }
@@ -172,8 +216,9 @@ impl ColoHub {
         let conn = self.next_conn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.links.lock().unwrap().insert(
             code.to_string(),
-            LinkSlot { tx, conn, last_heard: Instant::now(), acked_version: 0, kill_acked: false },
+            LinkSlot { tx, conn, last_heard: Instant::now(), acked_version: 0 },
         );
+        self.down_since.lock().unwrap().remove(code);
         self.limits_changed.lock().unwrap().insert(code.to_string(), Instant::now());
         (conn, rx)
     }
@@ -182,7 +227,26 @@ impl ColoHub {
         let mut links = self.links.lock().unwrap();
         if links.get(code).is_some_and(|l| l.conn == conn) {
             links.remove(code);
+            self.down_since.lock().unwrap().insert(code.to_string(), Instant::now());
         }
+    }
+
+    /// How long a strategy has had no link; `None` while connected.
+    pub fn link_down_for(&self, code: &str) -> Option<Duration> {
+        if self.links.lock().unwrap().contains_key(code) {
+            return None;
+        }
+        let since = self.down_since.lock().unwrap().get(code).copied().unwrap_or(self.started);
+        Some(since.elapsed())
+    }
+
+    /// When a connection last heard its strategy; `None` once it is replaced.
+    pub(crate) fn last_heard(&self, code: &str, conn: u64) -> Option<Instant> {
+        self.links.lock().unwrap().get(code).filter(|l| l.conn == conn).map(|l| l.last_heard)
+    }
+
+    pub fn kill_ack_late(&self, code: &str) -> bool {
+        control::kill_ack_late(self.kills.lock().unwrap().get(code).copied(), Instant::now())
     }
 
     pub(crate) fn heard(&self, code: &str, conn: u64, msg: &FromStrategy) {
@@ -191,17 +255,25 @@ impl ColoHub {
         slot.last_heard = Instant::now();
         match msg {
             FromStrategy::AckLimits { limits_version } => slot.acked_version = *limits_version as i64,
-            FromStrategy::AckKill => slot.kill_acked = true,
+            FromStrategy::AckKill => {
+                if let Some(kill) = self.kills.lock().unwrap().get_mut(code) {
+                    kill.1 = true;
+                }
+            }
             FromStrategy::Heartbeat => {}
         }
     }
 
     /// Send a message down a strategy's link, if it is connected.
     pub fn push(&self, code: &str, msg: ToStrategy) {
-        if matches!(msg, ToStrategy::Kill) {
-            if let Some(slot) = self.links.lock().unwrap().get_mut(code) {
-                slot.kill_acked = false;
+        match msg {
+            ToStrategy::Kill => {
+                self.kills.lock().unwrap().insert(code.to_string(), (Instant::now(), false));
             }
+            ToStrategy::Resume => {
+                self.kills.lock().unwrap().remove(code);
+            }
+            _ => {}
         }
         if matches!(msg, ToStrategy::Limits { .. }) {
             self.limits_changed.lock().unwrap().insert(code.to_string(), Instant::now());
@@ -217,7 +289,7 @@ impl ColoHub {
                 connected: true,
                 last_heard_secs: Some(l.last_heard.elapsed().as_secs()),
                 acked_version: l.acked_version,
-                kill_acked: l.kill_acked,
+                kill_acked: self.kills.lock().unwrap().get(code).is_some_and(|k| k.1),
             },
             None => LinkStatus::default(),
         }
@@ -243,24 +315,33 @@ impl ColoHub {
     /// Consume what the follow streams report, for the life of the process.
     pub async fn run(&self, state: AppState) {
         let Some(mut rx) = self.rx.lock().unwrap().take() else { return };
+        let mut workers = Workers::default();
         while let Some((code, event)) = rx.recv().await {
             self.runtimes.lock().unwrap().entry(code.clone()).or_default().apply(&event, Instant::now());
+            workers.send(&code, event, |code, events| {
+                tokio::spawn(self.clone().work(state.clone(), code.to_string(), events));
+            });
+        }
+        info!("co-located: follow sink closed");
+    }
+
+    /// One strategy's events, in order.
+    async fn work(self, state: AppState, code: String, mut events: mpsc::UnboundedReceiver<FollowEvent>) {
+        while let Some(event) = events.recv().await {
             let (Some(strategy), Some(adapter)) = (state.strategies().by_code(&code), self.adapter(&code)) else {
                 warn!(strategy = %code, "co-located: event for a strategy with no follow adapter");
                 continue;
             };
-            control::on_event(&state, self, &strategy, &adapter, &event).await;
+            control::on_event(&state, &self, &strategy, &adapter, &event).await;
             match event {
                 FollowEvent::Fill(fill) => match booking::book_fill(&state, &strategy, &adapter, &fill).await {
-                    Ok(booking::Booked::New) => control::push_positions(&state, self, &strategy).await,
-                    Ok(booking::Booked::AlreadyBooked) => {}
+                    Ok(_) => {}
                     Err(e) => error!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not booked; recon retries on the next reconnect"),
                 },
-                FollowEvent::Connected => follow::fill_gap(&state, self, &strategy, &adapter).await,
+                FollowEvent::Connected => follow::fill_gap(&state, &self, &strategy, &adapter).await,
                 FollowEvent::Opened { .. } | FollowEvent::Closed { .. } => {}
             }
         }
-        info!("co-located: follow sink closed");
     }
 }
 
@@ -270,6 +351,28 @@ mod tests {
 
     fn opened(id: &str) -> FollowEvent {
         FollowEvent::Opened { venue_order_id: id.into(), client_order_id: "mm1-q-1".into(), symbol: "BTCUSDT".into(), buy: true, qty: 1.0, price: 100.0 }
+    }
+
+    #[test]
+    fn each_strategy_gets_one_worker_in_order() {
+        let mut workers = Workers::default();
+        let (mut started, mut alive) = (Vec::new(), Vec::new());
+        for (code, n) in [("mm1", 1), ("mm2", 2), ("mm1", 3)] {
+            workers.send(code, n, |code, rx| {
+                started.push(code.to_string());
+                alive.push(rx);
+            });
+        }
+        assert_eq!(started, ["mm1", "mm2"]);
+    }
+
+    #[test]
+    fn a_dead_worker_is_restarted() {
+        let mut workers = Workers::default();
+        let mut started = 0;
+        workers.send("mm1", 1, |_, rx| { drop(rx); started += 1 });
+        workers.send("mm1", 2, |_, rx| { std::mem::forget(rx); started += 1 });
+        assert_eq!(started, 2);
     }
 
     #[test]

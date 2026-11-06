@@ -60,9 +60,9 @@ A WebSocket over TLS from the program to the OMS, with the strategy's trading to
 
 | From the OMS | Meaning |
 |---|---|
-| `state` | Always first: `active`, `limits`, `limits_version`, `positions`. |
+| `state` | Always first: `active`, `limits`, `limits_version`, `positions`, `dead_man_secs`. |
 | `limits` | New limits and their version. |
-| `positions` | The OMS's booked positions, after each fill. |
+| `positions` | The OMS's booked positions, whenever they change. |
 | `kill` / `resume` | Stop / start again. |
 | `heartbeat` | Every second. |
 
@@ -78,8 +78,12 @@ program may trade:
 - it must not be killed;
 - it must have heard the OMS within the timeout.
 
-After the timeout the program stops quoting and cancels its own orders. It resumes by
-itself when the OMS is back and says it is active; a kill holds until **Enable**.
+The timeout is the strategy's dead man's switch seconds, sent in `state`. After it the
+program stops quoting and cancels its own orders. It resumes by itself when the OMS is
+back and says it is active. A kill holds until **Enable**; if Enable happened while the
+link was down, the next `state` says active and lifts it.
+
+The OMS drops a link it has not heard for 3 heartbeats; the program reconnects.
 
 ## The risk library
 
@@ -96,11 +100,15 @@ Notional limits apply to pairs quoted in USD, USDT or USDC only.
 - **Kill:**
   1. tells the program;
   2. cancels every open order on the account with the OMS's key at once, without waiting;
-  3. while killed, cancels every new order the moment it appears (**killed, still
-     fighting** on the Strategies page).
+  3. while killed, cancels every new order the moment it appears, and sweeps the
+     account for open orders every 2 seconds (**killed, still fighting** on the
+     Strategies page). At most 10 cancels a second per strategy.
+- **Kill not acknowledged** (orange badge): the program has not answered a kill within
+  5 seconds.
 - **Enable** resumes.
-- **Unmonitored** (red badge): the strategy traded while its control link was down, or
-  did not acknowledge the current limits within 10 seconds. With **Kill when
+- **Unmonitored** (red badge): the strategy traded while its control link was down for
+  longer than its dead man's switch seconds plus 2 (after an OMS restart too), or did
+  not acknowledge the current limits within 10 seconds. With **Kill when
   unmonitored**, the OMS kills instead of only warning.
 - **Order rate:** more orders in a second than its cap.
 
