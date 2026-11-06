@@ -271,6 +271,10 @@ mod tests {
         assert_eq!(flatten_order(-3.0, 100.0, 5.0), (OrderSide::Buy, 3.0, 105.0));
     }
 
+    /// Boot recovery cancels every strategy's open orders in the database, so
+    /// these tests, which each seed open orders, must not run at the same time.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn setup() -> (sqlx::PgPool, String, AppState, Uuid, Uuid) {
         use crate::strategies::test_support as t;
         let pool = t::dev_pool().await;
@@ -292,6 +296,7 @@ mod tests {
     #[ignore]
     async fn a_dropped_session_cancels_everything_but_flatten_orders() {
         use crate::strategies::test_support::order_status;
+        let _serial = SERIAL.lock().await;
         let (pool, code, state, api, flat) = setup().await;
         let strategy = state.strategies().by_code(&code).unwrap();
         let report = on_session_end(&state, &strategy).await;
@@ -306,6 +311,7 @@ mod tests {
     #[ignore]
     async fn kill_halts_cancels_and_logs_out() {
         use crate::strategies::test_support::order_status;
+        let _serial = SERIAL.lock().await;
         let (pool, code, state, api, flat) = setup().await;
         let report = kill(&state, &code).await.unwrap();
         assert_eq!(report.cancelled, 2, "{:?}", report.cancel_failures);
@@ -320,6 +326,7 @@ mod tests {
     #[ignore]
     async fn boot_recovery_cancels_open_strategy_orders() {
         use crate::strategies::test_support::order_status;
+        let _serial = SERIAL.lock().await;
         let (pool, code, state, api, flat) = setup().await;
         boot_recovery(&state).await;
         assert_eq!(order_status(&pool, api).await, "canceled");
