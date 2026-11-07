@@ -1,15 +1,66 @@
 ---
-// The whole system on one page, as it is built today: who trades through the
-// OMS, its core, the two gateways and the venues, plus the co-located path.
+// Shipped architecture by default; target=true shows the proposed embedded runtime.
 // Hand-placed SVG rather than Mermaid: at this size an automatic layout tangles
 // the edges. It reads top to bottom so it fits the content column; edges run in
 // the gaps between columns and are drawn before the boxes. Box and text colours follow Starlight's theme variables, so the
 // figure follows light and dark mode; the five accents mean the same in both
 // (see the legend). On a narrow screen the figure keeps its size and scrolls.
+interface Props { target?: boolean }
+const { target = false } = Astro.props;
 ---
 
 <figure class="arch">
   <div class="arch-scroll">
+    {target ? (
+    <svg viewBox="0 0 800 780" role="img" aria-labelledby="target-title target-desc" xmlns="http://www.w3.org/2000/svg">
+      <title id="target-title">Proposed target: embedded co-located execution runtime</title>
+      <desc id="target-desc">Not implemented. Central OMS distributes bootstrap configuration, versioned policy and control asynchronously. Inside one co-located process, strategy calls runtime directly. Runtime uses shared risk rules, owns local positions, reservations, order lifecycle and recovery journal, and calls the venue adapter. Venue reports update runtime immediately; replayable events flow to OMS accounting. OMS independently reconciles with the venue. The OMS order path also uses the shared risk library. No per-order OMS or database round trip.</desc>
+      <defs>
+        {["order", "event", "price", "control"].map((k) => (
+          <marker id={`target-arrow-${k}`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" class={`arch-head-${k}`} />
+          </marker>
+        ))}
+      </defs>
+      <text class="arch-caps arch-colo-label" x="30" y="28">PROPOSED TARGET · NOT IMPLEMENTED</text>
+      <rect class="arch-region" x="30" y="44" width="740" height="156" rx="14" />
+      <text class="arch-region-label" x="50" y="68">CENTRAL OMS · policy, supervision and durable accounting</text>
+      <g class="arch-box arch-strategy"><rect x="50" y="86" width="210" height="88" rx="8" /><text class="arch-name" x="155" y="111" text-anchor="middle">Configuration + control</text><text class="arch-sub" x="155" y="133" text-anchor="middle">snapshot · policy · budgets</text><text class="arch-sub" x="155" y="153" text-anchor="middle">authority · kill · acknowledgements</text></g>
+      <g class="arch-box"><rect x="290" y="86" width="210" height="88" rx="8" /><text class="arch-name" x="395" y="111" text-anchor="middle">Path ① admission</text><text class="arch-sub" x="395" y="133" text-anchor="middle">shared risk rules + DB transaction</text><text class="arch-sub" x="395" y="153" text-anchor="middle">existing OMS execution path</text></g>
+      <g class="arch-box arch-key"><rect x="530" y="86" width="220" height="88" rx="8" /><text class="arch-name" x="640" y="111" text-anchor="middle">Accounting + recon</text><text class="arch-sub" x="640" y="133" text-anchor="middle">deduplicate · book · persist</text><text class="arch-sub" x="640" y="153" text-anchor="middle">independent venue observation</text></g>
+
+      <path class="arch-edge arch-edge-control target-control" d="M155,174 L155,210 L20,210 L20,318 L270,318" />
+      <text class="arch-edge-label arch-label-control" x="165" y="228">bootstrap / policy / commands ↓</text>
+      <text class="arch-edge-label" x="165" y="248">async link · policy ACKs ↑ / event ACKs ↓</text>
+      <path class="arch-edge arch-edge-event target-event target-event-acks" d="M620,312 L620,174" />
+      <text class="arch-edge-label arch-label-event" x="610" y="272" text-anchor="end">↑ lifecycle / fills / health · replay + durable ACK</text>
+
+      <rect class="arch-region arch-region-colo" x="30" y="280" width="690" height="338" rx="14" />
+      <text class="arch-region-label arch-colo-label" x="50" y="302">② ONE CO-LOCATED PROCESS · trusted strategy, dedicated account</text>
+      <g class="arch-box arch-strategy"><rect x="50" y="326" width="145" height="96" rx="8" /><text class="arch-name" x="122" y="355" text-anchor="middle">Strategy logic</text><text class="arch-sub" x="122" y="379" text-anchor="middle">decides what to trade</text><text class="arch-sub" x="122" y="402" text-anchor="middle">submit / cancel API</text></g>
+      <path class="arch-edge arch-edge-order target-order" d="M195,370 L270,370" />
+      <text class="arch-edge-label arch-label-order" x="232" y="347" text-anchor="middle">call</text>
+
+      <g class="arch-box arch-key"><rect x="270" y="312" width="430" height="202" rx="10" /><text class="arch-name" x="485" y="339" text-anchor="middle">Embedded execution runtime</text><text class="arch-sub" x="485" y="362" text-anchor="middle">atomic check + reserve · order lifecycle · local positions</text><text class="arch-sub" x="485" y="384" text-anchor="middle">cached configuration · authority / feed health · recovery</text></g>
+      <g class="arch-box arch-crate"><rect x="290" y="404" width="180" height="88" rx="8" /><text class="arch-name" x="380" y="430" text-anchor="middle">Shared risk crate</text><text class="arch-sub" x="380" y="452" text-anchor="middle">rules · units · Reducing</text><text class="arch-sub" x="380" y="474" text-anchor="middle">same evaluator as path ①</text></g>
+      <g class="arch-box"><rect x="490" y="404" width="190" height="88" rx="8" /><text class="arch-name" x="585" y="430" text-anchor="middle">Local journal</text><text class="arch-sub" x="585" y="452" text-anchor="middle">durable intent before send</text><text class="arch-sub" x="585" y="474" text-anchor="middle">recovery + event replay</text></g>
+      <path class="arch-edge arch-edge-order target-order" d="M420,514 L420,548" />
+      <path class="arch-edge arch-edge-event target-event" d="M620,548 L620,514" />
+      <text class="arch-edge-label arch-label-event" x="630" y="537">reports ↑</text>
+      <g class="arch-box"><rect x="270" y="548" width="430" height="48" rx="8" /><text class="arch-name" x="485" y="570" text-anchor="middle">Gateway crate · venue adapter + market data</text><text class="arch-sub" x="485" y="587" text-anchor="middle">linked library · no extra process or internal REST hop</text></g>
+      <path class="arch-edge arch-edge-price target-price" d="M270,572 L122,572 L122,422" />
+      <text class="arch-edge-label arch-label-price" x="132" y="548">market data ↑</text>
+
+      <path class="arch-edge arch-edge-order target-order" d="M420,596 L420,664" />
+      <text class="arch-edge-label arch-label-order" x="410" y="644" text-anchor="end">orders ↓</text>
+      <path class="arch-edge arch-edge-event target-event" d="M590,664 L590,596" />
+      <text class="arch-edge-label arch-label-event" x="600" y="644">reports / prices ↑</text>
+      <path class="arch-edge arch-edge-event target-event" d="M700,696 L760,696 L760,184 L710,184 L710,174" />
+      <text class="arch-edge-label arch-label-event" transform="translate(752 470) rotate(-90)" text-anchor="middle">independent OMS venue follow / reconciliation</text>
+      <g class="arch-box arch-venue"><rect x="270" y="664" width="430" height="62" rx="8" /><text class="arch-name" x="485" y="690" text-anchor="middle">Venue · dedicated account / subaccount</text><text class="arch-sub" x="485" y="711" text-anchor="middle">one active runtime · bounded allocation · reconcile before trading</text></g>
+      <text class="arch-sub arch-colo-note" x="400" y="758" text-anchor="middle">No per-order OMS / database round trip. Local journal latency remains part of admission.</text>
+    </svg>
+    ) : (
     <svg
       viewBox="0 0 800 1100"
       role="img"
@@ -35,7 +86,7 @@
       <!-- Regions: drawn first, so everything sits on top -->
       <rect class="arch-region" x="14" y="116" width="772" height="680" rx="14" />
       <text class="arch-region-label" x="752" y="140" text-anchor="end">ONE OMS PROGRAM · one binary, one process</text>
-      <text class="arch-caps" x="525" y="168" text-anchor="middle">OMS CORE · owns all state</text>
+      <text class="arch-caps" x="525" y="168" text-anchor="middle">OMS CORE · durable accounting state</text>
       <line class="arch-boundary" x1="30" y1="598" x2="770" y2="598" />
       <text class="arch-caps" x="470" y="616" text-anchor="middle">GATEWAYS · no database, no Kafka</text>
       <text class="arch-caps" x="60" y="24">USERS</text>
@@ -70,7 +121,7 @@
       <path class="arch-edge arch-edge-price" d="M660,828 L660,776" />
       <path class="arch-edge arch-edge-order" d="M640,948 L640,906 L520,906 L520,890" />
       <text class="arch-edge-label arch-label-order" x="648" y="934">direct orders</text>
-      <path class="arch-edge arch-edge-control" d="M60,985 L30,985 L30,540 L60,540" />
+      <path class="arch-edge arch-edge-control" d="M60,540 L30,540 L30,985 L60,985" />
       <text class="arch-edge-label arch-label-control" transform="translate(24 770) rotate(-90)" text-anchor="middle">control link · kill · limits · positions</text>
 
       <!-- Users -->
@@ -139,8 +190,9 @@
         <g class="arch-box arch-crate"><rect x={x} y="948" width="160" height="74" rx="8" /><text x={(x as number) + 80} y="979" text-anchor="middle" class="arch-name">{name}</text><text x={(x as number) + 80} y="998" text-anchor="middle" class="arch-sub">{sub}</text></g>
       ))}
       <text class="arch-sub arch-colo-note" x="420" y="1052" text-anchor="middle">Crates from this repository, linked into the program. It trades its own venue account;</text>
-      <text class="arch-sub arch-colo-note" x="420" y="1070" text-anchor="middle">the OMS follows that account with its own key, books every fill, and can kill it unaided.</text>
+      <text class="arch-sub arch-colo-note" x="420" y="1070" text-anchor="middle">the OMS follows and books fills, and independently attempts account-wide cancellation.</text>
     </svg>
+    )}
   </div>
   <ul class="arch-legend" aria-label="Legend">
     <li><span class="arch-swatch arch-swatch-order"></span>an order going out</li>
@@ -298,6 +350,11 @@
     stroke-dasharray: 6 4;
     marker-end: url(#arch-arrow-control);
   }
+  .target-order { marker-end: url(#target-arrow-order); }
+  .target-event { marker-end: url(#target-arrow-event); }
+  .target-event-acks { marker-start: url(#target-arrow-event); }
+  .target-price { marker-end: url(#target-arrow-price); }
+  .target-control { marker-start: url(#target-arrow-control); marker-end: url(#target-arrow-control); }
   .arch-head-order { fill: var(--arch-order); }
   .arch-head-event { fill: var(--arch-event); }
   .arch-head-price { fill: var(--arch-price); }

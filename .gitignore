@@ -38,3 +38,6 @@ FIX-*.pdf
 
 # openoms bootstrap config — holds the master key
 oms.toml
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

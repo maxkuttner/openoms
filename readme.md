@@ -26,15 +26,7 @@ Silicon) and Linux (x86_64, OpenSSL 3).
 
 ## Documentation
 
-**[openoms.dev](https://openoms.dev/)**
-
-- [Getting started](https://openoms.dev/getting-started/): install, `oms init`, first login
-- [Your first paper trade](https://openoms.dev/getting-started/first-paper-trade/) — Alpaca paper, end to end
-- [Your first API call](https://openoms.dev/getting-started/first-api-call/) — curl and the Python client
-- [Configuration](https://openoms.dev/configuration/reference/) — `oms.toml`, environment variables, [login (OIDC)](https://openoms.dev/configuration/login/)
-- [Integrations](https://openoms.dev/integrations/alpaca/) — Alpaca, Binance, IBKR, Bybit, Databento
-- [Operations](https://openoms.dev/operations/updating/) — updating, running as a service, database, backups, [troubleshooting](https://openoms.dev/operations/troubleshooting/)
-- [API reference](https://openoms.dev/api/)
+**[openoms.dev](https://openoms.dev)**
 
 ## Develop
 
