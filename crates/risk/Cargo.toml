@@ -1,0 +1,8 @@
+[package]
+name = "risk"
+version = "0.1.0"
+edition = "2021"
+description = "Pure pre-trade risk rules shared by the OMS and embedded runtimes"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

@@ -1,23 +1,13 @@
-//! Pre-trade checks a co-located strategy runs before every order: the limits
-//! the OMS holds for it, a price band and an orders-per-second cap. Pure and
-//! in memory — nothing here waits on I/O, so it sits on the order path.
+//! Legacy adapter over the shared [`risk`] evaluator. It keeps the v1
+//! `RiskBook` API and its orders-per-second window, but it is **not** a
+//! reservation runtime: it sees neither working orders nor venue balances.
+//! Kept only until the example strategy moves onto `colo-runtime`.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Quote currencies notional limits are read in. Any other quote needs its
-/// own per-symbol limit (the OMS's rule, phase 7).
-pub const USD_LIKE: [&str; 3] = ["USD", "USDT", "USDC"];
-
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Limits {
-    pub max_order_qty: Option<f64>,
-    pub max_order_notional: Option<f64>,
-    pub max_position_qty: Option<f64>,
-    pub max_position_notional: Option<f64>,
-    pub price_band_pct: Option<f64>,
-    pub max_orders_per_sec: Option<u32>,
-}
+pub use risk::Limits;
+pub use risk::USD_LIKE;
 
 pub struct OrderIntent<'a> {
     pub symbol: &'a str,
@@ -84,40 +74,36 @@ impl RiskBook {
             return reject("halted", "trading is halted".into());
         }
         let l = &self.limits;
-        if let Some(max) = l.max_order_qty {
-            if o.qty > max {
-                return reject("max_order_qty", format!("order qty {} > {max}", o.qty));
-            }
-        }
         let has_notional = l.max_order_notional.is_some() || l.max_position_notional.is_some();
         if has_notional && !USD_LIKE.contains(&o.quote_currency) {
             return reject("no_notional_limit", format!("no notional limit for quote currency {}", o.quote_currency));
         }
-        if let Some(max) = l.max_order_notional {
-            let notional = o.qty * o.price;
-            if notional > max {
-                return reject("max_order_notional", format!("order notional {notional} > {max}"));
-            }
-        }
+
         let position = self.positions.get(o.symbol).copied().unwrap_or(0.0);
-        let projected = position + if o.buy { o.qty } else { -o.qty };
-        if let Some(max) = l.max_position_qty {
-            if projected.abs() > max {
-                return reject("max_position_qty", format!("projected position {projected} > {max}"));
-            }
+        let input = risk::RiskInput {
+            order: risk::OrderInput {
+                side: if o.buy { risk::Side::Buy } else { risk::Side::Sell },
+                quantity: o.qty,
+                limit_price: Some(o.price),
+                multiplier: 1.0,
+            },
+            exposure: risk::Exposure {
+                position_qty: position,
+                working_buy_qty: 0.0,
+                working_sell_qty: 0.0,
+            },
+            limits: *l,
+            state: risk::TradingState::Active,
+            valuation: risk::Valuation {
+                order_price: Some(o.price),
+                position_price: Some(o.price),
+                reference_price: Some(reference),
+            },
+        };
+        if let Err(e) = risk::evaluate(&input) {
+            return reject(legacy_code(&e.code), e.message);
         }
-        if let Some(max) = l.max_position_notional {
-            let notional = projected.abs() * o.price;
-            if notional > max {
-                return reject("max_position_notional", format!("projected position notional {notional} > {max}"));
-            }
-        }
-        if let Some(band) = l.price_band_pct {
-            let off = (o.price - reference).abs() / reference * 100.0;
-            if off > band * (1.0 + 1e-9) {
-                return reject("price_band", format!("price {} is {off:.2}% from {reference} (band {band}%)", o.price));
-            }
-        }
+
         if let Some(cap) = l.max_orders_per_sec {
             while self.window.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) {
                 self.window.pop_front();
@@ -128,6 +114,18 @@ impl RiskBook {
             self.window.push_back(now);
         }
         Ok(())
+    }
+}
+
+fn legacy_code(code: &str) -> &'static str {
+    match code {
+        "max_order_qty" => "max_order_qty",
+        "max_order_notional" => "max_order_notional",
+        "max_position_qty" => "max_position_qty",
+        "max_position_notional" => "max_position_notional",
+        "no_notional_limit" => "no_notional_limit",
+        "price_band" => "price_band",
+        _ => "risk",
     }
 }
 

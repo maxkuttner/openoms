@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/symbology", "crates/dataprovider", "crates/gateway", "crates/colo-risk", "crates/colo-link", "crates/colo-example"]
+members = [".", "crates/symbology", "crates/dataprovider", "crates/gateway", "crates/risk", "crates/colo-risk", "crates/colo-link", "crates/colo-example"]
 resolver = "2"
 
 [package]

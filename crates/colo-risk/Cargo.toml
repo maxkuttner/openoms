@@ -5,4 +5,5 @@ edition = "2021"
 description = "In-memory pre-trade checks for co-located strategies"
 
 [dependencies]
+risk = { path = "../risk" }
 serde = { version = "1", features = ["derive"] }
