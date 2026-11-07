@@ -8,6 +8,7 @@ use dataprovider::InstrumentDef;
 
 
 /// Broker-agnostic order request passed to any adapter.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BrokerOrderRequest {
     /// Our internal order UUID — sent as client_order_id so brokers echo it back on updates.
     pub order_id: String,

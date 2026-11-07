@@ -1,0 +1,15 @@
+[package]
+name = "colo-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic admission, reservations and order book for a co-located runtime"
+
+[dependencies]
+gateway = { path = "../gateway", default-features = false }
+risk = { path = "../risk" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+chrono = "0.4"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
