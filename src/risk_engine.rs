@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::domain::orders::commands::SubmitOrder;
 use crate::domain::orders::risk::{
-    check_limit, check_trading_state, Exposure, RiskLimits, RiskRejection, TradingState,
+    evaluate, Exposure, RiskLimits, RiskRejection, TradingState,
 };
 
 /// The (portfolio, instrument) slice that limits and exposure are keyed by.
@@ -91,16 +91,30 @@ impl<P: RiskDataProvider> RiskEngine<P> {
 
         let exposure = self.provider.exposure(&scope).await?;
 
-        // Cheap gate first, then the limit math.
-        check_trading_state(config.trading_state, cmd.side, exposure.position_qty)
-            .map_err(RiskCheckError::Rejected)?;
-
-        // est_price comes from the limit price, scaled by the contract multiplier
-        // so option notional reflects the ×100 deliverable. Market orders carry
-        // None and intentionally skip the notional checks (documented in risk.rs).
-        let est_price = cmd.limit_price.map(|p| p * contract_size);
-        check_limit(cmd.side, cmd.quantity, est_price, config.limits, exposure)
-            .map_err(RiskCheckError::Rejected)
+        // One pure evaluation covers the state gate and every numeric limit.
+        // The multiplier stays separate from the price so it is applied once.
+        // Market orders carry no limit price and intentionally skip notional
+        // checks when no order valuation is supplied (documented in risk.rs).
+        let input = risk::RiskInput {
+            order: risk::OrderInput {
+                side: match cmd.side {
+                    crate::domain::orders::state::OrderSide::Buy => risk::Side::Buy,
+                    crate::domain::orders::state::OrderSide::Sell => risk::Side::Sell,
+                },
+                quantity: cmd.quantity,
+                limit_price: cmd.limit_price,
+                multiplier: contract_size,
+            },
+            exposure,
+            limits: config.limits,
+            state: config.trading_state,
+            valuation: risk::Valuation {
+                order_price: cmd.limit_price,
+                position_price: cmd.limit_price,
+                reference_price: None,
+            },
+        };
+        evaluate(&input).map_err(RiskCheckError::Rejected)
     }
 }
 
@@ -122,7 +136,7 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
         // the same scope block here until the holding transaction commits, so
         // the exposure read below always sees the winner's inserted order.
         let row = sqlx::query(
-            "SELECT trading_state, \
+             "SELECT trading_state, \
                     max_order_quantity::double precision    AS max_order_quantity, \
                     max_order_notional::double precision    AS max_order_notional, \
                     max_position_quantity::double precision AS max_position_quantity, \
@@ -143,29 +157,25 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
         Ok(Some(RiskConfig {
             trading_state: parse_trading_state(row.get::<String, _>("trading_state"))?,
             limits: RiskLimits {
-                max_order_quantity: row.get("max_order_quantity"),
+                max_order_qty: row.get("max_order_quantity"),
                 max_order_notional: row.get("max_order_notional"),
-                max_position_quantity: row.get("max_position_quantity"),
+                max_position_qty: row.get("max_position_quantity"),
                 max_position_notional: row.get("max_position_notional"),
+                ..RiskLimits::default()
             },
         }))
     }
 
     async fn exposure(&mut self, scope: &RiskScope<'_>) -> Result<Exposure, sqlx::Error> {
-        // position_qty: O(1) read of the signed net holding from the `position`
-        // projection (maintained on fills; covers external fills too). 0 if flat.
-        let position_qty: f64 = sqlx::query_scalar(
-            "SELECT COALESCE((SELECT net_qty::double precision FROM position \
-                              WHERE portfolio_id = $1 AND instrument_id = $2), 0)",
-        )
-        .bind(scope.portfolio_id)
-        .bind(scope.instrument_id)
-        .fetch_one(&mut *self.conn)
-        .await?;
-
-        // working_qty: signed open quantity of live (unfilled) orders only.
-        let working_qty: f64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(CASE WHEN side = 'buy' THEN leaves_qty ELSE -leaves_qty END), 0)::double precision \
+        // One snapshot: the signed position and each side's working leaves are
+        // read in a single statement, so a fill moving quantity from a working
+        // order into the position cannot make exposure disappear between reads.
+        let row = sqlx::query(
+            "SELECT \
+                COALESCE((SELECT net_qty::double precision FROM position \
+                          WHERE portfolio_id = $1 AND instrument_id = $2), 0)::double precision AS position_qty, \
+                COALESCE(SUM(CASE WHEN side = 'buy' THEN leaves_qty ELSE 0 END), 0)::double precision AS working_buy_qty, \
+                COALESCE(SUM(CASE WHEN side = 'sell' THEN leaves_qty ELSE 0 END), 0)::double precision AS working_sell_qty \
              FROM order_state \
              WHERE portfolio_id = $1 AND instrument_id = $2 \
                AND status IN ('submitted', 'routed', 'partially_filled')",
@@ -175,7 +185,11 @@ impl RiskDataProvider for PgRiskDataProvider<'_> {
         .fetch_one(&mut *self.conn)
         .await?;
 
-        Ok(Exposure { position_qty, working_qty })
+        Ok(Exposure {
+            position_qty: row.get("position_qty"),
+            working_buy_qty: row.get("working_buy_qty"),
+            working_sell_qty: row.get("working_sell_qty"),
+        })
     }
 }
 
@@ -242,17 +256,19 @@ mod tests {
     }
 
     const NO_LIMITS: RiskLimits = RiskLimits {
-        max_order_quantity: None,
+        max_order_qty: None,
         max_order_notional: None,
-        max_position_quantity: None,
+        max_position_qty: None,
         max_position_notional: None,
+        price_band_pct: None,
+        max_orders_per_sec: None,
     };
 
     #[tokio::test]
     async fn no_config_passes() {
         let provider = StubProvider {
             config: None,
-            exposure: Exposure { position_qty: 0.0, working_qty: 0.0 },
+            exposure: Exposure { position_qty: 0.0, working_buy_qty: 0.0, working_sell_qty: 0.0 },
         };
         let r = run(provider, &submit(OrderSide::Buy, 1_000_000.0, None)).await;
         assert!(r.is_ok());
@@ -262,7 +278,7 @@ mod tests {
     async fn halted_scope_rejects() {
         let provider = StubProvider {
             config: config(TradingState::Halted, NO_LIMITS),
-            exposure: Exposure { position_qty: 0.0, working_qty: 0.0 },
+            exposure: Exposure { position_qty: 0.0, working_buy_qty: 0.0, working_sell_qty: 0.0 },
         };
         let err = run(provider, &submit(OrderSide::Buy, 1.0, None)).await.unwrap_err();
         match err {
@@ -276,9 +292,9 @@ mod tests {
         let provider = StubProvider {
             config: config(
                 TradingState::Active,
-                RiskLimits { max_order_quantity: Some(100.0), ..NO_LIMITS },
+                RiskLimits { max_order_qty: Some(100.0), ..NO_LIMITS },
             ),
-            exposure: Exposure { position_qty: 0.0, working_qty: 0.0 },
+            exposure: Exposure { position_qty: 0.0, working_buy_qty: 0.0, working_sell_qty: 0.0 },
         };
         let err = run(provider, &submit(OrderSide::Buy, 150.0, None)).await.unwrap_err();
         match err {
@@ -293,9 +309,9 @@ mod tests {
         let provider = StubProvider {
             config: config(
                 TradingState::Active,
-                RiskLimits { max_position_quantity: Some(100.0), ..NO_LIMITS },
+                RiskLimits { max_position_qty: Some(100.0), ..NO_LIMITS },
             ),
-            exposure: Exposure { position_qty: 80.0, working_qty: 15.0 },
+            exposure: Exposure { position_qty: 80.0, working_buy_qty: 15.0, working_sell_qty: 0.0 },
         };
         let err = run(provider, &submit(OrderSide::Buy, 10.0, None)).await.unwrap_err();
         match err {
@@ -313,7 +329,7 @@ mod tests {
         let pass = run_with(
             StubProvider {
                 config: config(TradingState::Active, limits),
-                exposure: Exposure { position_qty: 0.0, working_qty: 0.0 },
+                exposure: Exposure { position_qty: 0.0, working_buy_qty: 0.0, working_sell_qty: 0.0 },
             },
             &submit(OrderSide::Buy, 1.0, Some(3.0)),
             1.0,
@@ -324,7 +340,7 @@ mod tests {
         let err = run_with(
             StubProvider {
                 config: config(TradingState::Active, limits),
-                exposure: Exposure { position_qty: 0.0, working_qty: 0.0 },
+                exposure: Exposure { position_qty: 0.0, working_buy_qty: 0.0, working_sell_qty: 0.0 },
             },
             &submit(OrderSide::Buy, 1.0, Some(3.0)),
             100.0,
@@ -338,18 +354,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opposing_working_orders_reserve_separately() {
+        let provider = StubProvider {
+            config: config(
+                TradingState::Active,
+                RiskLimits { max_position_qty: Some(100.0), ..NO_LIMITS },
+            ),
+            exposure: Exposure {
+                position_qty: 0.0,
+                working_buy_qty: 100.0,
+                working_sell_qty: 100.0,
+            },
+        };
+        let err = run(provider, &submit(OrderSide::Buy, 100.0, None)).await.unwrap_err();
+        match err {
+            RiskCheckError::Rejected(r) => assert_eq!(r.code, "max_position_quantity"),
+            other => panic!("expected rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn market_order_without_price_skips_notional() {
+        let provider = StubProvider {
+            config: config(
+                TradingState::Active,
+                RiskLimits { max_order_notional: Some(1.0), ..NO_LIMITS },
+            ),
+            exposure: Exposure::default(),
+        };
+        let r = run(provider, &submit(OrderSide::Buy, 50.0, None)).await;
+        assert!(r.is_ok());
+    }
+
+    /// A disposable database selected explicitly, never the shared dev config.
+    /// Run with `COLO_TEST_DATABASE_URL=postgres://… cargo test -- --ignored`.
+    async fn isolated_pool() -> sqlx::PgPool {
+        let url = std::env::var("COLO_TEST_DATABASE_URL")
+            .expect("set COLO_TEST_DATABASE_URL to a disposable database");
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&url)
+            .await
+            .expect("connect isolated test database")
+    }
+
+    struct Fixture {
+        principal_id: Uuid,
+        portfolio_id: Uuid,
+        account_id: Uuid,
+        broker_code: String,
+        instrument_id: String,
+    }
+
+    async fn seed_fixture(pool: &sqlx::PgPool) -> Fixture {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let fixture = Fixture {
+            principal_id: Uuid::new_v4(),
+            portfolio_id: Uuid::new_v4(),
+            account_id: Uuid::new_v4(),
+            broker_code: format!("test-{}", &suffix[..12]),
+            instrument_id: format!("TEST{}", &suffix[..12]),
+        };
+        sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, $2, 'STRATEGY', 'ACTIVE')")
+            .bind(fixture.principal_id)
+            .bind(format!("p-{suffix}"))
+            .execute(pool)
+            .await
+            .expect("seed principal");
+        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'risk test', 'ACTIVE')")
+            .bind(fixture.portfolio_id)
+            .bind(format!("pf-{suffix}"))
+            .execute(pool)
+            .await
+            .expect("seed portfolio");
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, 'TEST', 'PAPER', 'ACTIVE')")
+            .bind(&fixture.broker_code)
+            .execute(pool)
+            .await
+            .expect("seed broker connection");
+        sqlx::query("INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) VALUES ($1, $2, $3, $4, 'ACTIVE')")
+            .bind(fixture.account_id)
+            .bind(format!("a-{suffix}"))
+            .bind(&fixture.broker_code)
+            .bind(format!("ext-{suffix}"))
+            .execute(pool)
+            .await
+            .expect("seed account");
+        fixture
+    }
+
+    async fn cleanup_fixture(pool: &sqlx::PgPool, fixture: &Fixture) {
+        for (sql, bind) in [
+            ("DELETE FROM order_state WHERE portfolio_id = $1", fixture.portfolio_id),
+            ("DELETE FROM risk_limits WHERE portfolio_id = $1", fixture.portfolio_id),
+            ("DELETE FROM position WHERE portfolio_id = $1", fixture.portfolio_id),
+            ("DELETE FROM account WHERE id = $1", fixture.account_id),
+        ] {
+            let _ = sqlx::query(sql).bind(bind).execute(pool).await;
+        }
+        let _ = sqlx::query("DELETE FROM broker_connection WHERE code = $1")
+            .bind(&fixture.broker_code)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM portfolio WHERE id = $1")
+            .bind(fixture.portfolio_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM principal WHERE id = $1")
+            .bind(fixture.principal_id)
+            .execute(pool)
+            .await;
+    }
+
+    async fn seed_order(
+        pool: &sqlx::PgPool,
+        fixture: &Fixture,
+        side: &str,
+        leaves: f64,
+        status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO order_state \
+             (order_id, client_order_id, principal_id, portfolio_id, account_id, broker_connection_code, \
+              instrument_id, side, order_type, time_in_force, original_qty, leaves_qty, cum_qty, status, version) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'limit', 'day', $9, $9, 0, $10, 0)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(format!("c-{}", Uuid::new_v4()))
+        .bind(fixture.principal_id)
+        .bind(fixture.portfolio_id)
+        .bind(fixture.account_id)
+        .bind(&fixture.broker_code)
+        .bind(&fixture.instrument_id)
+        .bind(side)
+        .bind(leaves)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed order");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn directional_exposure_reads_one_snapshot() {
+        let pool = isolated_pool().await;
+        let fixture = seed_fixture(&pool).await;
+        sqlx::query("INSERT INTO position (portfolio_id, instrument_id, net_qty, avg_cost, realized_pnl) VALUES ($1, $2, 25, 100, 0)")
+            .bind(fixture.portfolio_id)
+            .bind(&fixture.instrument_id)
+            .execute(&pool)
+            .await
+            .expect("seed position");
+        seed_order(&pool, &fixture, "buy", 100.0, "submitted").await;
+        seed_order(&pool, &fixture, "sell", 100.0, "partially_filled").await;
+
+        let mut tx = pool.begin().await.expect("begin");
+        let exposure = PgRiskDataProvider::new(&mut tx)
+            .exposure(&RiskScope {
+                portfolio_id: fixture.portfolio_id,
+                instrument_id: &fixture.instrument_id,
+            })
+            .await
+            .expect("read exposure");
+        tx.rollback().await.expect("rollback");
+
+        cleanup_fixture(&pool, &fixture).await;
+
+        assert_eq!(exposure.position_qty, 25.0);
+        assert_eq!(exposure.working_buy_qty, 100.0);
+        assert_eq!(exposure.working_sell_qty, 100.0);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn concurrent_submits_share_capacity() {
+        let pool = isolated_pool().await;
+        let fixture = seed_fixture(&pool).await;
+        sqlx::query("INSERT INTO risk_limits (portfolio_id, instrument_id, trading_state, max_position_quantity) VALUES ($1, $2, 'ACTIVE', 100)")
+            .bind(fixture.portfolio_id)
+            .bind(&fixture.instrument_id)
+            .execute(&pool)
+            .await
+            .expect("seed risk limits");
+        let cmd = SubmitOrder {
+            order_id: Uuid::new_v4().to_string(),
+            client_order_id: "race".into(),
+            portfolio_id: fixture.portfolio_id.to_string(),
+            account_id: fixture.account_id.to_string(),
+            instrument_id: fixture.instrument_id.clone(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Day,
+            limit_price: Some(100.0),
+            quantity: 60.0,
+        };
+
+        let first_pool = pool.clone();
+        let first_fixture = Fixture {
+            principal_id: fixture.principal_id,
+            portfolio_id: fixture.portfolio_id,
+            account_id: fixture.account_id,
+            broker_code: fixture.broker_code.clone(),
+            instrument_id: fixture.instrument_id.clone(),
+        };
+        let first_cmd = cmd.clone();
+        let first = tokio::spawn(async move {
+            let mut tx = first_pool.begin().await.expect("begin first");
+            RiskEngine::new(PgRiskDataProvider::new(&mut tx))
+                .check_submit(first_fixture.portfolio_id, &first_cmd, 1.0)
+                .await
+                .expect("first submit passes");
+            sqlx::query(
+                "INSERT INTO order_state \
+                 (order_id, client_order_id, principal_id, portfolio_id, account_id, broker_connection_code, \
+                  instrument_id, side, order_type, time_in_force, limit_price, original_qty, leaves_qty, cum_qty, status, version) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'buy', 'limit', 'day', 100, 60, 60, 0, 'submitted', 0)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(format!("c-{}", Uuid::new_v4()))
+            .bind(first_fixture.principal_id)
+            .bind(first_fixture.portfolio_id)
+            .bind(first_fixture.account_id)
+            .bind(&first_fixture.broker_code)
+            .bind(&first_fixture.instrument_id)
+            .execute(&mut *tx)
+            .await
+            .expect("insert first order");
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tx.commit().await.expect("commit first");
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut tx = pool.begin().await.expect("begin second");
+        let second = RiskEngine::new(PgRiskDataProvider::new(&mut tx))
+            .check_submit(fixture.portfolio_id, &cmd, 1.0)
+            .await;
+        tx.rollback().await.expect("rollback second");
+        first.await.expect("first task");
+
+        cleanup_fixture(&pool, &fixture).await;
+
+        match second {
+            Err(RiskCheckError::Rejected(r)) => assert_eq!(r.code, "max_position_quantity"),
+            other => panic!("expected the second submit to be rejected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn within_limits_passes() {
         let provider = StubProvider {
             config: config(
                 TradingState::Active,
                 RiskLimits {
-                    max_order_quantity: Some(100.0),
+                    max_order_qty: Some(100.0),
                     max_order_notional: Some(10_000.0),
-                    max_position_quantity: Some(500.0),
+                    max_position_qty: Some(500.0),
                     max_position_notional: Some(50_000.0),
+                    ..NO_LIMITS
                 },
             ),
-            exposure: Exposure { position_qty: 50.0, working_qty: 10.0 },
+            exposure: Exposure { position_qty: 50.0, working_buy_qty: 10.0, working_sell_qty: 0.0 },
         };
         let r = run(provider, &submit(OrderSide::Buy, 20.0, Some(100.0))).await;
         assert!(r.is_ok());

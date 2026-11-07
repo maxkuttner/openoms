@@ -5,7 +5,7 @@ edition = "2021"
 description = "The control link between a co-located strategy and the OMS"
 
 [dependencies]
-colo-risk = { path = "../colo-risk" }
+risk = { path = "../risk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

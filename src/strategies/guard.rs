@@ -20,15 +20,14 @@ use dataprovider::InstrumentRef;
 use gateway::md::MdHandle;
 
 use crate::domain::orders::commands::SubmitOrder;
-use crate::domain::orders::risk::{check_limit, check_trading_state, RiskLimits, RiskRejection};
+use crate::domain::orders::risk::{
+    check_trading_state, evaluate, Exposure, RiskLimits, RiskRejection, TradingState,
+};
 use crate::domain::orders::state::OrderSide;
 use crate::marks::{Mark, MarkStore};
 use crate::risk_engine::{PgRiskDataProvider, RiskDataProvider, RiskScope};
 
 use super::Strategy;
-
-/// Quote currencies the strategy-wide notional defaults are read in.
-pub const USD_LIKE: [&str; 3] = ["USD", "USDT", "USDC"];
 
 /// How long an order waits for a first quote on an instrument nobody priced yet.
 pub const HOLD_FOR_MARK: Duration = Duration::from_secs(2);
@@ -66,47 +65,61 @@ pub fn may_trade(strategy: &Strategy, principal_id: Uuid) -> Result<(), RiskReje
     }
 }
 
-pub fn check_state(strategy: &Strategy, side: OrderSide, position_qty: f64) -> Result<(), RiskRejection> {
-    check_trading_state(strategy.state, side, position_qty)
+pub fn check_state(
+    strategy: &Strategy,
+    side: OrderSide,
+    quantity: f64,
+    exposure: &Exposure,
+) -> Result<(), RiskRejection> {
+    check_trading_state(strategy.state, side, quantity, exposure)
 }
 
 /// The limits for one instrument: each field of its `risk_limits` row, else
 /// the strategy's default for that field. A default notional limit is only
-/// read in a USD-like quote; any other quote needs its own.
+/// read in a USD-like quote; any other quote needs its own. Price band and
+/// order-rate come from the strategy, never the per-instrument row.
 pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, quote_currency: &str) -> Result<RiskLimits, RiskRejection> {
-    let d = strategy.limits;
-    let o = override_row.unwrap_or(RiskLimits {
-        max_order_quantity: None,
-        max_order_notional: None,
-        max_position_quantity: None,
-        max_position_notional: None,
-    });
-    let falls_back = |own: Option<f64>, default: Option<f64>| own.is_none() && default.is_some();
-    let default_notional = falls_back(o.max_order_notional, d.max_order_notional)
-        || falls_back(o.max_position_notional, d.max_position_notional);
-    if default_notional && !USD_LIKE.contains(&quote_currency) {
-        return Err(reject("no_notional_limit", format!("no notional limit for quote currency {quote_currency}")));
-    }
-    Ok(RiskLimits {
-        max_order_quantity: o.max_order_quantity.or(d.max_order_quantity),
-        max_order_notional: o.max_order_notional.or(d.max_order_notional),
-        max_position_quantity: o.max_position_quantity.or(d.max_position_quantity),
-        max_position_notional: o.max_position_notional.or(d.max_position_notional),
-    })
+    let defaults = RiskLimits {
+        price_band_pct: strategy.price_band_pct,
+        max_orders_per_sec: strategy.max_orders_per_sec,
+        ..strategy.limits
+    };
+    let overrides = override_row.unwrap_or_default();
+    risk::resolve_limits(&defaults, &overrides, quote_currency)
+        .map_err(|e| RiskRejection { code: e.code, message: e.message })
 }
 
 /// A limit price more than `band_pct` percent from `mid` is rejected.
 pub fn check_price_band(limit_price: Option<f64>, mid: f64, band_pct: f64) -> Result<(), RiskRejection> {
-    let Some(px) = limit_price else { return Ok(()) };
-    let off = (px - mid).abs() / mid * 100.0;
-    // A price exactly at the edge (Flatten's) passes despite float rounding.
-    if off > band_pct * (1.0 + 1e-9) {
-        return Err(reject(
-            "price_band",
-            format!("limit {px} is {off:.2}% from mark {mid} (band {band_pct}%)"),
-        ));
+    crate::domain::orders::risk::check_price_band(limit_price, mid, band_pct)
+}
+
+/// A mark captured before admission can age while the scope lock is waited
+/// on. Re-check it once admission actually runs; stale supplied data is a
+/// rejection, not a silent skip.
+fn admission_mark(mark: Option<Mark>) -> Result<Option<Mark>, RiskRejection> {
+    let Some(mark) = mark else { return Ok(None) };
+    let fresh = chrono::Utc::now()
+        .signed_duration_since(mark.ts)
+        .to_std()
+        .map_or(true, |age| age <= MAX_MARK_AGE);
+    if fresh {
+        Ok(Some(mark))
+    } else {
+        Err(reject(
+            "no_reference_price",
+            format!("reference price is older than {}s", MAX_MARK_AGE.as_secs()),
+        ))
     }
-    Ok(())
+}
+
+fn strictest(a: TradingState, b: TradingState) -> TradingState {
+    use TradingState::*;
+    match (a, b) {
+        (Halted, _) | (_, Halted) => Halted,
+        (Reducing, _) | (_, Reducing) => Reducing,
+        (Active, Active) => Active,
+    }
 }
 
 #[derive(Debug)]
@@ -174,22 +187,35 @@ pub async fn check(
     let row = provider.risk_config(&scope).await?;
     let exposure = provider.exposure(&scope).await?;
 
-    check_state(strategy, cmd.side, exposure.position_qty).map_err(RiskCheckError::Rejected)?;
-    if let Some(row) = &row {
-        check_trading_state(row.trading_state, cmd.side, exposure.position_qty).map_err(RiskCheckError::Rejected)?;
-    }
-    let limits = effective_limits(strategy, row.map(|r| r.limits), quote_currency).map_err(RiskCheckError::Rejected)?;
+    let state = row
+        .as_ref()
+        .map_or(strategy.state, |r| strictest(strategy.state, r.trading_state));
+    let limits = effective_limits(strategy, row.map(|r| r.limits), quote_currency)
+        .map_err(RiskCheckError::Rejected)?;
 
-    let est_price = match mark {
-        Some(m) => {
-            if let Some(band) = strategy.price_band_pct {
-                check_price_band(cmd.limit_price, m.mid(), band).map_err(RiskCheckError::Rejected)?;
-            }
-            Some(cmd.limit_price.unwrap_or(m.mid()) * contract_size)
-        }
-        None => cmd.limit_price.map(|p| p * contract_size),
+    let mark = admission_mark(mark).map_err(RiskCheckError::Rejected)?;
+    let mid = mark.map(|m| m.mid());
+
+    let input = risk::RiskInput {
+        order: risk::OrderInput {
+            side: match cmd.side {
+                OrderSide::Buy => risk::Side::Buy,
+                OrderSide::Sell => risk::Side::Sell,
+            },
+            quantity: cmd.quantity,
+            limit_price: cmd.limit_price,
+            multiplier: contract_size,
+        },
+        exposure,
+        limits,
+        state,
+        valuation: risk::Valuation {
+            order_price: mid,
+            position_price: mid,
+            reference_price: mid,
+        },
     };
-    check_limit(cmd.side, cmd.quantity, est_price, limits, exposure).map_err(RiskCheckError::Rejected)
+    evaluate(&input).map_err(RiskCheckError::Rejected)
 }
 
 #[cfg(test)]
@@ -202,15 +228,45 @@ mod tests {
     use crate::strategies::tests::sample;
 
     fn limits(max_order_notional: Option<f64>) -> RiskLimits {
-        RiskLimits { max_order_quantity: None, max_order_notional, max_position_quantity: None, max_position_notional: None }
+        RiskLimits { max_order_qty: None, max_order_notional, max_position_qty: None, max_position_notional: None, ..RiskLimits::default() }
     }
 
     #[test]
     fn a_halted_strategy_admits_nothing() {
         let mut s = sample("s", "S", "OMS");
         s.state = TradingState::Halted;
-        let e = check_state(&s, OrderSide::Sell, 5.0).unwrap_err();
+        let e = check_state(&s, OrderSide::Sell, 5.0, &Exposure::default()).unwrap_err();
         assert_eq!(e.code, "trading_halted");
+    }
+
+    #[test]
+    fn reducing_orders_reserve_working_sells() {
+        let mut s = sample("s", "S", "OMS");
+        s.state = TradingState::Reducing;
+        let exposure = Exposure {
+            position_qty: 10.0,
+            working_buy_qty: 0.0,
+            working_sell_qty: 6.0,
+        };
+
+        let e = check_state(&s, OrderSide::Sell, 5.0, &exposure).unwrap_err();
+
+        assert_eq!(e.code, "trading_reducing");
+    }
+
+    #[test]
+    fn a_mark_that_ages_while_queued_is_refused() {
+        let stale = Mark {
+            bid: 99.0,
+            ask: 101.0,
+            ts: chrono::Utc::now() - chrono::Duration::minutes(5),
+        };
+        let fresh = Mark { ts: chrono::Utc::now(), ..stale };
+
+        let e = admission_mark(Some(stale)).unwrap_err();
+        assert_eq!(e.code, "no_reference_price");
+        assert!(admission_mark(Some(fresh)).unwrap().is_some());
+        assert!(admission_mark(None).unwrap().is_none());
     }
 
     #[test]
@@ -236,16 +292,16 @@ mod tests {
     #[test]
     fn an_override_row_replaces_only_the_fields_it_sets() {
         let mut s = sample("s", "S", "OMS");
-        s.limits = RiskLimits { max_order_quantity: Some(7.0), ..limits(Some(10_000.0)) };
-        let qty_only = RiskLimits { max_order_quantity: Some(1.0), ..limits(None) };
+        s.limits = RiskLimits { max_order_qty: Some(7.0), ..limits(Some(10_000.0)) };
+        let qty_only = RiskLimits { max_order_qty: Some(1.0), ..limits(None) };
         // A non-USD quote whose notional would fall back to the default is refused.
         assert!(effective_limits(&s, Some(qty_only), "BTC").is_err());
         // A USD-like quote keeps the default notional beside the overridden quantity.
         let merged = effective_limits(&s, Some(qty_only), "USDT").unwrap();
-        assert_eq!((merged.max_order_quantity, merged.max_order_notional), (Some(1.0), Some(10_000.0)));
+        assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(1.0), Some(10_000.0)));
         // A non-USD quote with its own notional keeps the default quantity.
         let merged = effective_limits(&s, Some(limits(Some(0.5))), "BTC").unwrap();
-        assert_eq!((merged.max_order_quantity, merged.max_order_notional), (Some(7.0), Some(0.5)));
+        assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(7.0), Some(0.5)));
     }
 
     #[test]

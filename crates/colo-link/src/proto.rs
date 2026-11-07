@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub use colo_risk::Limits;
+pub use risk::Limits;
 
 /// Both sides heartbeat this often.
 pub const HEARTBEAT: Duration = Duration::from_secs(1);

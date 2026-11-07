@@ -1,127 +1,114 @@
-use super::state::OrderSide;
+use crate::domain::orders::state::OrderSide;
 
-// A strategy/portfolio/trader is in a particular trading state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TradingState { Active, Reducing, Halted}
+pub use risk::{Exposure, Limits as RiskLimits, TradingState};
 
+/// The existing HTTP/FIX rejection shape, kept as an adapter over [`risk`].
+pub type RiskRejection = risk::Reject;
 
-// TODO: refine which risk limit shall be part of the oms risk check
-#[derive(Debug, Clone, Copy)]
-pub struct RiskLimits {
-    pub max_order_quantity: Option<f64>,
-    pub max_order_notional: Option<f64>,
-    pub max_position_quantity: Option<f64>,
-    pub max_position_notional: Option<f64>,
+fn shared_side(side: OrderSide) -> risk::Side {
+    match side {
+        OrderSide::Buy => risk::Side::Buy,
+        OrderSide::Sell => risk::Side::Sell,
+    }
 }
 
-
-#[derive(Debug, Clone, Copy)]
-pub struct Exposure {
-    pub position_qty: f64, // filled position qty
-    pub working_qty: f64,  // still open position qty
+fn adapt(rejection: risk::Reject) -> RiskRejection {
+    // The OMS/FIX surface has used the long spelling since before the shared
+    // evaluator; keep that wire shape.
+    let code = if rejection.code == "max_position_qty" {
+        "max_position_quantity".to_string()
+    } else {
+        rejection.code
+    };
+    RiskRejection { code, message: rejection.message }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RiskRejection { pub code: String, pub message: String}
+/// Run the shared evaluator, mapping its rejection codes to the OMS surface.
+pub fn evaluate(input: &risk::RiskInput) -> Result<(), RiskRejection> {
+    risk::evaluate(input).map_err(adapt)
+}
 
-
+/// Trading-state gate only: no limits, no valuation. `quantity` and the full
+/// directional exposure are required so `Reducing` can reserve working orders.
 pub fn check_trading_state(
     state: TradingState,
     side: OrderSide,
-    position_qty: f64,
-) -> Result<(), RiskRejection>{
-    match state {
-        TradingState::Active => Ok(()),
-        TradingState::Halted => Err(
-            RiskRejection {
-                code: "trading_halted".into(),
-                message: "trading halted".to_string(),
-        }),
-        TradingState::Reducing => {
-            // Only orders which shrink abs(position) are allowed
-            let reduces = match side {
-                OrderSide::Buy => position_qty < 0.0,
-                OrderSide::Sell => position_qty > 0.0,
-            };
-            if reduces {
-                Ok(())
-            } else {
-                Err(RiskRejection {
-                    code: "trading_reducing".to_string(),
-                    message: format!("trading state reducing; order {} does not reduce the current position", side.as_str()).to_string(),
-                })
-            }
-        }
-    }
+    quantity: f64,
+    exposure: &Exposure,
+) -> Result<(), RiskRejection> {
+    evaluate(&risk::RiskInput {
+        order: risk::OrderInput {
+            side: shared_side(side),
+            quantity,
+            limit_price: None,
+            multiplier: 1.0,
+        },
+        exposure: *exposure,
+        limits: RiskLimits::default(),
+        state,
+        valuation: risk::Valuation::default(),
+    })
 }
 
-
+/// Numeric limits only. `limit_price` values the candidate when present;
+/// `price` values a market order and the projected position when supplied.
+/// `multiplier` is applied exactly once.
 pub fn check_limit(
     side: OrderSide,
     quantity: f64,
-    est_price: Option<f64>,
+    limit_price: Option<f64>,
+    price: Option<f64>,
+    multiplier: f64,
     limits: RiskLimits,
-    exposure: Exposure,
+    exposure: &Exposure,
 ) -> Result<(), RiskRejection> {
-
-    // 1) check order quantity
-    if let Some(max) = limits.max_order_quantity {
-        if quantity > max {
-            return Err(RiskRejection {
-                code: "max_order_qty".into(),
-                message: format!("order qty {quantity} exceeds max {max}"),
-            });
-        }
-    }
-
-    // 2) check order notional
-    if let (Some(max), Some(px)) = (limits.max_order_notional, est_price) {
-        let notional = quantity * px;
-        if notional > max {
-            return Err(RiskRejection {
-                code: "max_order_notional".into(),
-                message: format!("order notional exceeds {max} < {notional}")
-            });
-        }
-    }
-
-    // 3) check max instrument position
-    let signed = match side { OrderSide::Buy => quantity, OrderSide::Sell => -quantity};
-    let projected_qty = exposure.position_qty + exposure.working_qty + signed;
-    if let Some(max) = limits.max_position_quantity {
-        if projected_qty.abs() > max {
-            return Err(RiskRejection {
-                code: "max_position_quantity".into(),
-                message: format!("order qty exceeds max position quantity {max}")
-            })
-        }
-    }
-
-    // 4) check resulting positional notional
-    if let (Some(max), Some(px)) = (limits.max_position_notional, est_price){
-        let notional = projected_qty.abs() * px;
-        if notional > max {
-            return Err(RiskRejection {
-                code: "max_position_notional".into(),
-                message: format!("projected positional notional {notional} exceeds max {max}")
-            });
-        }
-    }
-
-    // else -> ()
-    Ok(())
+    evaluate(&risk::RiskInput {
+        order: risk::OrderInput {
+            side: shared_side(side),
+            quantity,
+            limit_price,
+            multiplier,
+        },
+        exposure: *exposure,
+        limits,
+        state: TradingState::Active,
+        valuation: risk::Valuation {
+            order_price: price,
+            position_price: price,
+            reference_price: None,
+        },
+    })
 }
 
+/// Price-band only. `None` limit price passes (market orders have no price to
+/// band-check).
+pub fn check_price_band(
+    limit_price: Option<f64>,
+    reference: f64,
+    band_pct: f64,
+) -> Result<(), RiskRejection> {
+    evaluate(&risk::RiskInput {
+        order: risk::OrderInput {
+            side: shared_side(OrderSide::Buy),
+            quantity: 1.0,
+            limit_price,
+            multiplier: 1.0,
+        },
+        exposure: Exposure::default(),
+        limits: RiskLimits { price_band_pct: Some(band_pct), ..RiskLimits::default() },
+        state: TradingState::Active,
+        valuation: risk::Valuation {
+            order_price: None,
+            position_price: None,
+            reference_price: Some(reference),
+        },
+    })
+}
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::orders::risk::{
-        check_limit, check_trading_state, Exposure, RiskLimits, RiskRejection, TradingState,
-    };
-    use crate::domain::orders::state::OrderSide;
+    use super::*;
 
-    // --- helpers -----------------------------------------------------------
-    // Fresh structs per call, because `check_limit` takes them by value.
     fn limits(
         max_order_quantity: Option<f64>,
         max_order_notional: Option<f64>,
@@ -129,15 +116,16 @@ mod tests {
         max_position_notional: Option<f64>,
     ) -> RiskLimits {
         RiskLimits {
-            max_order_quantity,
+            max_order_qty: max_order_quantity,
             max_order_notional,
-            max_position_quantity,
+            max_position_qty: max_position_quantity,
             max_position_notional,
+            ..RiskLimits::default()
         }
     }
 
-    fn exposure(position_qty: f64, working_qty: f64) -> Exposure {
-        Exposure { position_qty, working_qty }
+    fn exposure(position_qty: f64, working_buy_qty: f64, working_sell_qty: f64) -> Exposure {
+        Exposure { position_qty, working_buy_qty, working_sell_qty }
     }
 
     fn assert_rejected(result: Result<(), RiskRejection>, expected_code: &str) {
@@ -146,134 +134,245 @@ mod tests {
     }
 
     #[test]
-    fn check_trading_state_halted(){
-        let state = TradingState::Halted;
-        let err = check_trading_state(state, OrderSide::Buy, 123.123).unwrap_err();
+    fn check_trading_state_halted() {
+        let err = check_trading_state(
+            TradingState::Halted,
+            OrderSide::Buy,
+            1.0,
+            &Exposure::default(),
+        )
+        .unwrap_err();
         assert_eq!(err.code, "trading_halted");
     }
 
     #[test]
-    fn check_trading_state_active(){
-        let state = TradingState::Active;
-        assert!(check_trading_state(state, OrderSide::Buy, 123.123).is_ok());
+    fn check_trading_state_active() {
+        assert!(check_trading_state(
+            TradingState::Active,
+            OrderSide::Buy,
+            1.0,
+            &Exposure::default()
+        )
+        .is_ok());
     }
 
     #[test]
-    fn check_trading_state_reducing_err(){
-        let state = TradingState::Reducing;
-        let err = check_trading_state(state, OrderSide::Buy, 123.123).unwrap_err();
+    fn check_trading_state_reducing_err() {
+        let err = check_trading_state(
+            TradingState::Reducing,
+            OrderSide::Buy,
+            1.0,
+            &exposure(123.123, 0.0, 0.0),
+        )
+        .unwrap_err();
         assert_eq!(err.code, "trading_reducing");
     }
 
-
     #[test]
-    fn check_trading_state_reducing_ok(){
-        let state = TradingState::Reducing;
-        assert!(check_trading_state(state, OrderSide::Buy, -123.123).is_ok());
+    fn check_trading_state_reducing_ok() {
+        assert!(check_trading_state(
+            TradingState::Reducing,
+            OrderSide::Buy,
+            1.0,
+            &exposure(-123.123, 0.0, 0.0)
+        )
+        .is_ok());
     }
 
-    // --- check_limit: no limits configured ---------------------------------
+    #[test]
+    fn check_trading_state_reducing_reserves_working_sells() {
+        let err = check_trading_state(
+            TradingState::Reducing,
+            OrderSide::Sell,
+            5.0,
+            &exposure(10.0, 0.0, 6.0),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "trading_reducing");
+    }
+
     #[test]
     fn no_limits_configured_ok() {
-        let r = check_limit(
-            OrderSide::Buy, 999.0, Some(999.0),
+        assert!(check_limit(
+            OrderSide::Buy,
+            999.0,
+            Some(999.0),
+            Some(999.0),
+            1.0,
             limits(None, None, None, None),
-            exposure(0.0, 0.0),
-        );
-        assert!(r.is_ok());
+            &exposure(0.0, 0.0, 0.0),
+        )
+        .is_ok());
     }
 
-    // --- check_limit: max_order_quantity -----------------------------------
     #[test]
     fn order_qty_within_limit_ok() {
-        let r = check_limit(
-            OrderSide::Buy, 50.0, None,
+        assert!(check_limit(
+            OrderSide::Buy,
+            50.0,
+            None,
+            None,
+            1.0,
             limits(Some(100.0), None, None, None),
-            exposure(0.0, 0.0),
-        );
-        assert!(r.is_ok());
+            &exposure(0.0, 0.0, 0.0),
+        )
+        .is_ok());
     }
 
     #[test]
     fn order_qty_exceeds_limit_rejected() {
-        let r = check_limit(
-            OrderSide::Buy, 150.0, None,
-            limits(Some(100.0), None, None, None),
-            exposure(0.0, 0.0),
+        assert_rejected(
+            check_limit(
+                OrderSide::Buy,
+                150.0,
+                None,
+                None,
+                1.0,
+                limits(Some(100.0), None, None, None),
+                &exposure(0.0, 0.0, 0.0),
+            ),
+            "max_order_qty",
         );
-        assert_rejected(r, "max_order_qty");
     }
 
-    // --- check_limit: max_order_notional -----------------------------------
     #[test]
     fn order_notional_exceeds_limit_rejected() {
-        // 50 * 10 = 500 > 400
-        let r = check_limit(
-            OrderSide::Buy, 50.0, Some(10.0),
-            limits(None, Some(400.0), None, None),
-            exposure(0.0, 0.0),
+        assert_rejected(
+            check_limit(
+                OrderSide::Buy,
+                50.0,
+                Some(10.0),
+                Some(10.0),
+                1.0,
+                limits(None, Some(400.0), None, None),
+                &exposure(0.0, 0.0, 0.0),
+            ),
+            "max_order_notional",
         );
-        assert_rejected(r, "max_order_notional");
     }
 
     #[test]
     fn order_notional_skipped_without_price() {
-        // No est_price -> notional check is a no-op even with a tiny limit.
-        // Documents the market-order gap *intentionally*.
-        let r = check_limit(
-            OrderSide::Buy, 50.0, None,
+        assert!(check_limit(
+            OrderSide::Buy,
+            50.0,
+            None,
+            None,
+            1.0,
             limits(None, Some(1.0), None, None),
-            exposure(0.0, 0.0),
-        );
-        assert!(r.is_ok());
+            &exposure(0.0, 0.0, 0.0),
+        )
+        .is_ok());
     }
 
-    // --- check_limit: max_position_quantity --------------------------------
     #[test]
     fn projected_position_exceeds_limit_rejected() {
-        // position 80 + working 0 + buy 50 = 130 > 100
-        let r = check_limit(
-            OrderSide::Buy, 50.0, None,
-            limits(None, None, Some(100.0), None),
-            exposure(80.0, 0.0),
+        assert_rejected(
+            check_limit(
+                OrderSide::Buy,
+                50.0,
+                None,
+                None,
+                1.0,
+                limits(None, None, Some(100.0), None),
+                &exposure(80.0, 0.0, 0.0),
+            ),
+            "max_position_quantity",
         );
-        assert_rejected(r, "max_position_quantity");
     }
 
     #[test]
     fn working_orders_count_toward_position_limit() {
-        // order itself is tiny (10), but position 60 + working 60 + 10 = 130 > 100
-        let r = check_limit(
-            OrderSide::Buy, 10.0, None,
-            limits(None, None, Some(100.0), None),
-            exposure(60.0, 60.0),
+        assert_rejected(
+            check_limit(
+                OrderSide::Buy,
+                10.0,
+                None,
+                None,
+                1.0,
+                limits(None, None, Some(100.0), None),
+                &exposure(60.0, 60.0, 0.0),
+            ),
+            "max_position_quantity",
         );
-        assert_rejected(r, "max_position_quantity");
+    }
+
+    #[test]
+    fn opposing_working_orders_do_not_offset() {
+        assert_rejected(
+            check_limit(
+                OrderSide::Buy,
+                100.0,
+                None,
+                None,
+                1.0,
+                limits(None, None, Some(100.0), None),
+                &exposure(0.0, 100.0, 100.0),
+            ),
+            "max_position_quantity",
+        );
     }
 
     #[test]
     fn large_sell_that_reduces_long_position_ok() {
-        // long 90, sell 80 -> projected 10; checks the *resulting* position,
-        // not the order size, so this passes a position cap of 100.
-        let r = check_limit(
-            OrderSide::Sell, 80.0, None,
+        assert!(check_limit(
+            OrderSide::Sell,
+            80.0,
+            None,
+            None,
+            1.0,
             limits(None, None, Some(100.0), None),
-            exposure(90.0, 0.0),
-        );
-        assert!(r.is_ok());
+            &exposure(90.0, 0.0, 0.0),
+        )
+        .is_ok());
     }
 
-    // --- check_limit: max_position_notional --------------------------------
     #[test]
     fn projected_position_notional_exceeds_limit_rejected() {
-        // position 80 + buy 50 = 130; 130 * 10 = 1300 > 1000.
-        // Regression guard for the bug where this used order qty (50*10=500).
-        let r = check_limit(
-            OrderSide::Buy, 50.0, Some(10.0),
-            limits(None, None, None, Some(1000.0)),
-            exposure(80.0, 0.0),
+        assert_rejected(
+            check_limit(
+                OrderSide::Buy,
+                50.0,
+                Some(10.0),
+                Some(10.0),
+                1.0,
+                limits(None, None, None, Some(1000.0)),
+                &exposure(80.0, 0.0, 0.0),
+            ),
+            "max_position_notional",
         );
-        assert_rejected(r, "max_position_notional");
+    }
+
+    #[test]
+    fn contract_multiplier_is_applied_once() {
+        assert_rejected(
+            check_limit(
+                OrderSide::Buy,
+                2.0,
+                Some(50.0),
+                None,
+                100.0,
+                limits(None, Some(9_999.0), None, None),
+                &Exposure::default(),
+            ),
+            "max_order_notional",
+        );
+        assert!(check_limit(
+            OrderSide::Buy,
+            2.0,
+            Some(50.0),
+            None,
+            100.0,
+            limits(None, Some(10_000.0), None, None),
+            &Exposure::default(),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn price_band_rejects_far_limit() {
+        assert!(check_price_band(Some(104.0), 100.0, 5.0).is_ok());
+        assert_rejected(check_price_band(Some(106.0), 100.0, 5.0), "price_band");
+        assert!(check_price_band(None, 100.0, 5.0).is_ok());
     }
 }
-

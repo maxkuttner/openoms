@@ -58,15 +58,13 @@ pub enum Mode {
 }
 
 impl Strategy {
-    /// The limits a co-located program enforces, as the risk library takes them.
-    pub fn risk_limits(&self) -> colo_risk::Limits {
-        colo_risk::Limits {
-            max_order_qty: self.limits.max_order_quantity,
-            max_order_notional: self.limits.max_order_notional,
-            max_position_qty: self.limits.max_position_quantity,
-            max_position_notional: self.limits.max_position_notional,
+    /// The limits a co-located program enforces, as the shared risk library
+    /// takes them (the v1 control protocol serializes the same field names).
+    pub fn risk_limits(&self) -> risk::Limits {
+        risk::Limits {
             price_band_pct: self.price_band_pct,
             max_orders_per_sec: self.max_orders_per_sec,
+            ..self.limits
         }
     }
 }
@@ -101,10 +99,11 @@ fn from_row(row: &sqlx::postgres::PgRow) -> Result<Strategy, sqlx::Error> {
         state: parse_state(&row.try_get::<String, _>("state")?)?,
         rest_enabled: row.try_get("rest_enabled")?,
         limits: RiskLimits {
-            max_order_quantity: row.try_get("max_order_quantity")?,
+            max_order_qty: row.try_get("max_order_quantity")?,
             max_order_notional: row.try_get("max_order_notional")?,
-            max_position_quantity: row.try_get("max_position_quantity")?,
+            max_position_qty: row.try_get("max_position_quantity")?,
             max_position_notional: row.try_get("max_position_notional")?,
+            ..RiskLimits::default()
         },
         price_band_pct: row.try_get("price_band_pct")?,
         connections: BTreeMap::new(),
@@ -263,10 +262,11 @@ pub(crate) mod tests {
             state: crate::domain::orders::risk::TradingState::Active,
             rest_enabled: true,
             limits: crate::domain::orders::risk::RiskLimits {
-                max_order_quantity: None,
+                max_order_qty: None,
                 max_order_notional: None,
-                max_position_quantity: None,
+                max_position_qty: None,
                 max_position_notional: None,
+                ..Default::default()
             },
             price_band_pct: None,
             connections: Default::default(),

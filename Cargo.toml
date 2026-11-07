@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 colo-risk = { path = "crates/colo-risk" }
 colo-link = { path = "crates/colo-link" }
+risk = { path = "crates/risk" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 axum = { version = "0.7", features = ["ws"] }
