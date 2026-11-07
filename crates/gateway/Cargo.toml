@@ -35,3 +35,7 @@ quickfix = { version = "0.2", features = ["build-with-ssl"], optional = true }
 # builds without the C++ engine and OpenSSL: what a co-located program needs.
 default = ["fix"]
 fix = ["dep:quickfix"]
+
+[[example]]
+name = "fix_client"
+required-features = ["fix"]

@@ -12,6 +12,7 @@ pub mod fix;
 #[cfg(feature = "fix")]
 pub mod fix_acceptor;
 pub mod md;
+pub mod runtime;
 pub mod stream_health;
 pub mod stream_supervisor;
 pub mod venue;

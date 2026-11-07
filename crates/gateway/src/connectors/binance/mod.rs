@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod runtime;
 pub mod stream;
 pub mod feed;
 #[cfg(feature = "fix")]
@@ -201,7 +202,7 @@ fn start_binance(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "fix"))]
 mod tests {
     use super::*;
 

@@ -187,11 +187,33 @@ mod tests {
 
     /// `GET /admin/venues` drives the cockpit's connection form; moving each
     /// venue's description into its connector must not change one byte of it.
-    /// The golden file is `venues()`'s output captured before the move.
+    /// The golden file is `venues()`'s output captured before the move. The
+    /// no-FIX build intentionally omits IBKR, so compare the venues it has.
     #[test]
     fn venues_json_is_unchanged() {
         let golden: serde_json::Value = serde_json::from_str(include_str!("testdata/venues.json")).unwrap();
-        assert_eq!(serde_json::to_value(all().iter().map(|c| (c.manifest().venue)()).collect::<Vec<_>>()).unwrap(), golden);
+        let actual: serde_json::Value =
+            serde_json::to_value(all().iter().map(|c| (c.manifest().venue)()).collect::<Vec<_>>()).unwrap();
+        let expected = if cfg!(feature = "fix") {
+            golden
+        } else {
+            let codes: Vec<&str> = actual
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v["code"].as_str())
+                .collect();
+            serde_json::Value::Array(
+                golden
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|v| v["code"].as_str().is_some_and(|c| codes.contains(&c)))
+                    .cloned()
+                    .collect(),
+            )
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]

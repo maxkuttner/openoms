@@ -104,6 +104,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fix")]
     #[test]
     fn ibkr_without_ssl_defaults_to_true() {
         let json = r#"{"kind":"IbkrFix","host":"h","port":4001,"sender_comp_id":"S","target_comp_id":"T","password":"p"}"#;

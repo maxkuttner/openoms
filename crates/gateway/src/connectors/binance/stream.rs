@@ -12,16 +12,27 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::Duration;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::connectors::binance::adapter::BinanceAdapter;
+use crate::connectors::binance::runtime::{
+    health_event, parse_raw_order, parse_raw_trade, runtime_events,
+};
 use crate::contract::VenueReport;
 use crate::contract::{EngineHandle, ExecEvent, ExternalFill, FollowEvent, FollowHandle};
+use crate::runtime::{
+    AccountIdentity, RuntimeOrderState, StreamState, TradeProvenance, VenueEvent,
+};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const VENUE: &str = "BINANCE";
 
@@ -96,35 +107,40 @@ pub async fn follow(
     supervise("BINANCE/FOLLOW", health, session).await
 }
 
-/// What one `executionReport` on a followed account means.
+/// What one `executionReport` on a followed account means. The trade/order
+/// normalization is the same code the runtime path uses.
 pub(crate) fn follow_events(event: &serde_json::Value) -> Vec<FollowEvent> {
-    let num = |k: &str| event[k].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-    let id = |k: &str| event[k].as_i64().map(|i| i.to_string()).unwrap_or_default();
-    let text = |k: &str| event[k].as_str().unwrap_or("").to_string();
-    let venue_order_id = id("i");
-    let client = match event["C"].as_str() {
-        Some(c) if !c.is_empty() => c.to_string(),
-        _ => text("c"),
+    let closed = |outcome: &'static str| FollowEvent::Closed {
+        venue_order_id: event["i"]
+            .as_i64()
+            .map(|i| i.to_string())
+            .or_else(|| event["i"].as_str().map(str::to_string))
+            .unwrap_or_default(),
+        outcome,
     };
-    let closed = |outcome| FollowEvent::Closed { venue_order_id: venue_order_id.clone(), outcome };
     match event["x"].as_str().unwrap_or("") {
-        "NEW" => vec![FollowEvent::Opened {
-            venue_order_id: venue_order_id.clone(),
-            client_order_id: client,
-            symbol: text("s"),
-            buy: event["S"].as_str() == Some("BUY"),
-            qty: num("q"),
-            price: num("p"),
-        }],
+        "NEW" => parse_raw_order(event, RuntimeOrderState::New)
+            .map(|order| {
+                vec![FollowEvent::Opened {
+                    venue_order_id: order.venue_order_id,
+                    client_order_id: order.client_order_id,
+                    symbol: order.symbol,
+                    buy: order.side == crate::runtime::Side::Buy,
+                    qty: order.original_quantity,
+                    price: order.limit_price.unwrap_or(0.0),
+                }]
+            })
+            .unwrap_or_default(),
         "TRADE" => {
+            let Some(trade) = parse_raw_trade(event) else { return Vec::new() };
             let mut out = vec![FollowEvent::Fill(ExternalFill {
-                trade_id: id("t"),
-                venue_order_id: venue_order_id.clone(),
-                client_order_id: client,
-                symbol: text("s"),
-                buy: event["S"].as_str() == Some("BUY"),
-                qty: num("l"),
-                price: num("L"),
+                trade_id: trade.trade_id,
+                venue_order_id: trade.venue_order_id,
+                client_order_id: trade.client_order_id,
+                symbol: trade.symbol,
+                buy: trade.side == crate::runtime::Side::Buy,
+                qty: trade.quantity,
+                price: trade.price,
             })];
             if event["X"].as_str() == Some("FILLED") {
                 out.push(closed("filled"));
@@ -137,6 +153,139 @@ pub(crate) fn follow_events(event: &serde_json::Value) -> Vec<FollowEvent> {
         _ => Vec::new(),
     }
 }
+
+/// Runtime push stream: health, orders and fees reach `tx`. Reconnects forever
+/// with an explicit stale/closed health event so the runtime can suspend.
+pub(crate) async fn runtime(
+    identity: AccountIdentity,
+    adapter: Arc<BinanceAdapter>,
+    tx: mpsc::Sender<VenueEvent>,
+) {
+    loop {
+        match runtime_once(&identity, &adapter, &tx).await {
+            Ok(()) => {
+                if tx.send(health_event(StreamState::Closed)).await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Binance runtime stream failed");
+                if tx.send(health_event(StreamState::Stale)).await.is_err() {
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn runtime_once(
+    identity: &AccountIdentity,
+    adapter: &Arc<BinanceAdapter>,
+    tx: &mpsc::Sender<VenueEvent>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (mut ws, _) = connect_async(adapter.ws_url()).await?;
+    info!("Binance WS-API connected for runtime");
+    handshake(&mut ws, adapter).await?;
+    info!("Binance WS-API runtime subscribed");
+    if tx.send(health_event(StreamState::Live)).await.is_err() {
+        return Ok(());
+    }
+
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
+    heartbeat.tick().await;
+    loop {
+        let text = tokio::select! {
+            _ = heartbeat.tick() => {
+                ws.send(Message::Ping(Vec::new())).await?;
+                continue;
+            }
+            msg = ws.next() => {
+                let Some(msg) = msg else { return Ok(()) };
+                match msg? {
+                    Message::Text(t) => t,
+                    Message::Binary(b) => match String::from_utf8(b) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    },
+                    Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
+                    Message::Close(_) => return Ok(()),
+                    _ => continue,
+                }
+            }
+        };
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => { warn!(error = %e, "Binance runtime WS: parse failed"); continue; }
+        };
+        if v.get("event").is_some() && v["event"]["e"].as_str() == Some("executionReport") {
+            for event in runtime_events(&v["event"], identity, TradeProvenance::Stream) {
+                if tx.send(event).await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Authenticate and subscribe. The caller owns the read loop after this.
+async fn handshake(
+    ws: &mut Ws,
+    adapter: &BinanceAdapter,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ts = Utc::now().timestamp_millis();
+    let payload = format!("apiKey={}&timestamp={}", adapter.api_key(), ts);
+    let logon = serde_json::json!({
+        "id": "logon",
+        "method": "session.logon",
+        "params": { "apiKey": adapter.api_key(), "timestamp": ts, "signature": adapter.sign(&payload) }
+    });
+    ws.send(Message::Text(logon.to_string())).await?;
+    wait_ack(ws, "logon", "session.logon").await?;
+
+    let sub = serde_json::json!({ "id": "sub", "method": "userDataStream.subscribe" });
+    ws.send(Message::Text(sub.to_string())).await?;
+    wait_ack(ws, "sub", "userDataStream.subscribe").await
+}
+
+async fn wait_ack(
+    ws: &mut Ws,
+    id: &str,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        let Some(msg) = ws.next().await else {
+            return Err(format!("{label}: socket closed before acknowledgement").into());
+        };
+        match msg? {
+            Message::Text(t) => {
+                let v: serde_json::Value = serde_json::from_str(&t)?;
+                if v["id"].as_str() == Some(id) {
+                    if v["status"].as_i64() == Some(200) {
+                        return Ok(());
+                    }
+                    return Err(format!("{label} failed: {v}").into());
+                }
+            }
+            Message::Binary(b) => {
+                let Ok(t) = String::from_utf8(b) else { continue };
+                let v: serde_json::Value = serde_json::from_str(&t)?;
+                if v["id"].as_str() == Some(id) {
+                    if v["status"].as_i64() == Some(200) {
+                        return Ok(());
+                    }
+                    return Err(format!("{label} failed: {v}").into());
+                }
+            }
+            Message::Ping(p) => ws.send(Message::Pong(p)).await?,
+            Message::Close(_) => {
+                return Err(format!("{label}: socket closed before acknowledgement").into());
+            }
+            _ => {}
+        }
+    }
+}
+
 
 async fn connect_and_run(
     environment: &'static str,

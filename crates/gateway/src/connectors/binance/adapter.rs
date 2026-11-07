@@ -110,7 +110,7 @@ impl BinanceAdapter {
     /// Send a SIGNED request: append `timestamp`, sign the query, append the
     /// signature, attach the API-key header. Params values here (symbols, numeric
     /// quantities, UUID client ids) contain no characters needing URL-encoding.
-    async fn signed(
+    pub(crate) async fn signed(
         &self,
         method: Method,
         endpoint: &str,
@@ -177,6 +177,13 @@ impl BinanceAdapter {
     /// from a trade id on, or else from a start time (milliseconds), for
     /// filling a follow stream's gap.
     pub async fn my_trades(&self, symbol: &str, from_trade_id: Option<i64>, start_time_ms: Option<i64>) -> Result<Vec<crate::contract::ExternalFill>, BrokerError> {
+        let body = self.my_trades_body(symbol, from_trade_id, start_time_ms).await?;
+        Ok(parse_my_trades(&body))
+    }
+
+    /// Raw `myTrades` rows, so the runtime path can retain fees and original
+    /// timestamps the follow path does not need.
+    pub(crate) async fn my_trades_body(&self, symbol: &str, from_trade_id: Option<i64>, start_time_ms: Option<i64>) -> Result<serde_json::Value, BrokerError> {
         let mut params = vec![("symbol", symbol.to_string()), ("limit", "1000".to_string())];
         match (from_trade_id, start_time_ms) {
             (Some(from), _) => params.push(("fromId", from.to_string())),
@@ -188,8 +195,7 @@ impl BinanceAdapter {
             let status = resp.status().as_u16();
             return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
         }
-        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
-        Ok(parse_my_trades(&body))
+        resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))
     }
 
     /// GET /api/v3/order — fetch one order's state (for startup reconciliation of
@@ -203,7 +209,7 @@ impl BinanceAdapter {
     }
 
     /// One order, by Binance's id when known, else by our client order id.
-    async fn get_order_by(&self, symbol: &str, client_order_id: &str, external_order_id: &str) -> Result<serde_json::Value, BrokerError> {
+    pub(crate) async fn get_order_by(&self, symbol: &str, client_order_id: &str, external_order_id: &str) -> Result<serde_json::Value, BrokerError> {
         let params = order_lookup_params(symbol, client_order_id, external_order_id);
         let resp = self.signed(Method::GET, "/api/v3/order", &params).await?;
         if resp.status().is_success() {
