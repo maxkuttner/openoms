@@ -1,6 +1,6 @@
 # The published image: ghcr.io/maxkuttner/openoms, built by .github/workflows/release.yml
 # for linux/amd64 and linux/arm64. Run it with compose: see
-# https://maxkuttner.github.io/openoms/getting-started/installation/
+# https://openoms.dev/getting-started/installation/
 #
 # Multi-stage like deploy/Dockerfile: the cockpit's dist is embedded into the binary
 # at compile time (src/cockpit.rs), so it must exist before `cargo build`.

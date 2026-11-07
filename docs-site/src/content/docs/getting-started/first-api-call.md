@@ -5,7 +5,7 @@ description: Authenticate with a trading token and drive orders from curl or Pyt
 
 Everything a trader does goes through the trading API on the same port as the cockpit.
 This page assumes you have a trading token from
-[your first paper trade](/openoms/getting-started/first-paper-trade/) in
+[your first paper trade](/getting-started/first-paper-trade/) in
 `OMS_TRADING_TOKEN`.
 
 ## Authentication
@@ -30,17 +30,17 @@ The cockpit password is a different credential: it is for `/admin` and the cockp
 
 | Call | What it does |
 |---|---|
-| [`GET /portfolios`](/openoms/api/operations/list_my_portfolios/) | Portfolios this token may act on |
-| [`GET /instruments?search=AAPL`](/openoms/api/operations/list_instruments_for_trader/) | Search the catalog, best match first |
-| [`POST /orders/submit`](/openoms/api/operations/orders_submit/) | Place an order |
-| [`GET /orders`](/openoms/api/operations/list_orders/) | Your blotter, newest first |
-| [`GET /orders/{id}`](/openoms/api/operations/get_order/) | One order's current state |
-| [`GET /orders/{id}/events`](/openoms/api/operations/get_order_events/) | One order's full history |
-| [`POST /orders/cancel`](/openoms/api/operations/orders_cancel/) | Cancel an order |
-| [`GET /portfolios/{id}/positions`](/openoms/api/operations/get_portfolio_positions/) | Positions in a portfolio |
+| [`GET /portfolios`](/api/operations/list_my_portfolios/) | Portfolios this token may act on |
+| [`GET /instruments?search=AAPL`](/api/operations/list_instruments_for_trader/) | Search the catalog, best match first |
+| [`POST /orders/submit`](/api/operations/orders_submit/) | Place an order |
+| [`GET /orders`](/api/operations/list_orders/) | Your blotter, newest first |
+| [`GET /orders/{id}`](/api/operations/get_order/) | One order's current state |
+| [`GET /orders/{id}/events`](/api/operations/get_order_events/) | One order's full history |
+| [`POST /orders/cancel`](/api/operations/orders_cancel/) | Cancel an order |
+| [`GET /portfolios/{id}/positions`](/api/operations/get_portfolio_positions/) | Positions in a portfolio |
 
 Every endpoint, with request and response schemas, is in the
-[API reference](/openoms/api/). A running server also serves its own spec at
+[API reference](/api/). A running server also serves its own spec at
 `/api-docs/openapi.json` and an interactive explorer at `/scalar`.
 
 ### Search, then submit

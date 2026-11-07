@@ -76,7 +76,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
           {/* The docs live on the public site now — they are what someone reads *before*
               installing, so they do not belong behind a login. */}
           <Anchor
-            href="https://maxkuttner.github.io/openoms/"
+            href="https://openoms.dev/"
             target="_blank"
             rel="noreferrer"
             fz="sm"

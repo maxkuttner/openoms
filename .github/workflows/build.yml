@@ -141,12 +141,12 @@ jobs:
 
       # Builds the Starlight site (links validated during the build) and runs
       # docs-site/test: install.sh served byte-identical, every link resolving
-      # under /openoms/, the generated API reference complete, and every `oms`
+      # under /, the generated API reference complete, and every `oms`
       # command in the docs a real subcommand.
       - run: npm ci
         working-directory: docs-site
       - run: npm run check
         working-directory: docs-site
-      # Published at /openoms/compose.yaml for the Docker install.
+      # Published at /compose.yaml for the Docker install.
       - name: compose.yaml is valid
         run: POSTGRES_PASSWORD=ci docker compose -f docs-site/public/compose.yaml config -q

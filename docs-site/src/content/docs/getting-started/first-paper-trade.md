@@ -5,7 +5,7 @@ description: Connect Alpaca paper in the cockpit, load its instruments, set up a
 
 This guide takes a fresh install to a real order at Alpaca's paper-trading venue: one
 share of AAPL. Everything until the order itself happens in the cockpit. No market-data
-subscription is needed. It assumes the server is running ([Getting started](/openoms/getting-started/))
+subscription is needed. It assumes the server is running ([Getting started](/getting-started/))
 and you are logged in to the cockpit at `http://localhost:3001/cockpit/`.
 
 :::tip[On a remote server?]
@@ -116,7 +116,7 @@ confirms — usually within seconds.
 A working install routing to Alpaca paper. Equity prices are not streamed yet — the
 OMS has no live equity price feed, so equity positions are not marked to market.
 
-Next: [the trading API in more depth](/openoms/getting-started/first-api-call/), including
+Next: [the trading API in more depth](/getting-started/first-api-call/), including
 the Python client.
 
 ## Prefer the API?
@@ -147,4 +147,4 @@ export OMS_TRADING_TOKEN=$(curl -s -X POST $B/admin/trading-tokens -H "$A" -H "$
 ```
 
 Credentials themselves are entered in the cockpit (or imported once with
-`oms config import-env`). Every endpoint is in the [API reference](/openoms/api/).
+`oms config import-env`). Every endpoint is in the [API reference](/api/).

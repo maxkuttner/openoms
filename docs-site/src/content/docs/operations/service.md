@@ -50,7 +50,7 @@ If the process dies, systemd starts it again after five seconds.
 ## As a system service
 
 For a machine-wide install, run it as a dedicated user with the config in
-`/etc/oms/oms.toml` ([config file locations](/openoms/configuration/file-locations/)):
+`/etc/oms/oms.toml` ([config file locations](/configuration/file-locations/)):
 
 ```ini
 [Unit]

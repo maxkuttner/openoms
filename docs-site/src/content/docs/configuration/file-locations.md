@@ -49,4 +49,4 @@ Neither overrides a variable already set in the real environment, and `./.env` w
 the one beside the config.
 
 Use it for settings with no `oms.toml` key, such as `OMS_OIDC_CLIENT_SECRET` or
-`OMS_SYNC_ON_BOOT` — see [the reference](/openoms/configuration/reference/#other-environment-variables).
+`OMS_SYNC_ON_BOOT` — see [the reference](/configuration/reference/#other-environment-variables).

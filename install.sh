@@ -1,7 +1,7 @@
 #!/bin/sh
 # openoms installer.
 #
-#   curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+#   curl -fsSL https://openoms.dev/install.sh | sh
 #
 # Downloads the released `oms` binary for this platform, verifies it against the
 # release's SHA256SUMS, installs it into ~/.local/bin and, if that is not on PATH,

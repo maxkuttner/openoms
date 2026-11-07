@@ -10,7 +10,7 @@ one file. Follow the steps to go from installation to running managing the `open
 
 ## 1. Install
 
-Install `oms` as described on [Installation](/openoms/getting-started/installation/), then
+Install `oms` as described on [Installation](/getting-started/installation/), then
 come back here.
 
 ## 2. Set up
@@ -33,7 +33,7 @@ migration and loads reference data (currencies, ~2,800 venues, trading calendars
 <Aside type="caution" title="Back up oms.toml">
 The master key in `oms.toml` is the only thing that can decrypt the broker credentials you
 store later. Lose it and they are gone. See
-[Master key and backups](/openoms/operations/master-key-and-backups/).
+[Master key and backups](/operations/master-key-and-backups/).
 
 TODO: Come up with better system than master key.
 </Aside>
@@ -41,7 +41,7 @@ TODO: Come up with better system than master key.
 There a couple of commands that let you work and setup the database for this application (see)
 To upgrade an existing
 database, use `oms database migrate` — with a Docker database, see
-[Updating](/openoms/operations/updating/) for where its superuser password lives.
+[Updating](/operations/updating/) for where its superuser password lives.
 
 ## 3. Start
 
@@ -63,7 +63,7 @@ ssh -L 3001:localhost:3001 your-server
 
 Forgot a generated password? It is `admin_password` in `~/.config/oms/oms.toml`.
 
-**Next:** [your first paper trade](/openoms/getting-started/first-paper-trade/)
+**Next:** [your first paper trade](/getting-started/first-paper-trade/)
 
 ## Updating
 
@@ -71,5 +71,5 @@ Forgot a generated password? It is `admin_password` in `~/.config/oms/oms.toml`.
 oms update
 ```
 
-See [Installation](/openoms/getting-started/installation/#upgrading) and
-[Updating](/openoms/operations/updating/).
+See [Installation](/getting-started/installation/#upgrading) and
+[Updating](/operations/updating/).

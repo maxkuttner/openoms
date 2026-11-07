@@ -9,7 +9,7 @@ the strategy's venue account and shows its fills, positions and P&L moments afte
 happen. It can stop the strategy at any time without the strategy's help.
 
 This page covers Binance. Strategies that can afford a few milliseconds per order are
-simpler to run [through the OMS](/openoms/strategies/fix/).
+simpler to run [through the OMS](/strategies/fix/).
 
 ## Setup
 

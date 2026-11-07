@@ -31,7 +31,7 @@ Login is **off** by default: with no `[auth.oidc]` block, `/auth/*` and `/trade/
    ```
 
    A `.env` next to `oms.toml` works (see
-   [Config file locations](/openoms/configuration/file-locations/#env-files)).
+   [Config file locations](/configuration/file-locations/#env-files)).
 
 4. Restart the OMS.
 

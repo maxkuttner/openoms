@@ -61,7 +61,7 @@
    image is near-black, so in light mode the page keeps its plain background. */
 :root[data-theme="dark"][data-has-hero] {
   background-color: var(--oms-black);
-  background-image: url("/openoms/landing-bg.webp");
+  background-image: url("/landing-bg.webp");
   background-size: cover;
   background-position: center;
   background-attachment: fixed;

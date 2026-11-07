@@ -62,7 +62,7 @@ optional; without it the OMS runs fully.
 
 - **Path ①, through the OMS.** The strategy sends its orders to the OMS over
   FIX 4.4 (TLS) or REST, and every order passes the same checks as a trader's.
-  See [FIX](/openoms/strategies/fix/) and [REST](/openoms/strategies/rest/).
+  See [FIX](/strategies/fix/) and [REST](/strategies/rest/).
 - **Path ②, co-located.** A latency-sensitive strategy runs on its own server
   next to the venue and trades its own venue account directly. It links three
   crates from this repository:
@@ -74,7 +74,7 @@ optional; without it the OMS runs fully.
   The OMS follows that account with its own key and books every fill, so the
   strategy's positions and P&L appear moments later. Kill tells the strategy,
   and also cancels everything on the account with the OMS's key, without
-  waiting for the strategy. See [Co-located strategies](/openoms/strategies/colocated/).
+  waiting for the strategy. See [Co-located strategies](/strategies/colocated/).
 
 ## Instrument model
 
@@ -124,4 +124,4 @@ broker trades, and a broker can trade an instrument no feed prices.
 
 <Mermaid name="runtime" code={runtime} caption="The pricing path and the execution path never cross." />
 
-See also the [API reference](/openoms/api/).
+See also the [API reference](/api/).

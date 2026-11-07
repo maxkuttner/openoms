@@ -4,7 +4,7 @@
 
 use serde::Serialize;
 
-pub const DOCS: &str = "https://maxkuttner.github.io/openoms/integrations";
+pub const DOCS: &str = "https://openoms.dev/integrations";
 
 /// The section a venue's FIX session settings go in, after the credentials.
 pub const FIX_SESSION: &str = "FIX session";

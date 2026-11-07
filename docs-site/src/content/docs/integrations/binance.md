@@ -19,7 +19,7 @@ testnet, is still to come.
 | Executions | The user-data stream (REST) or FIX execution reports |
 | Instruments | Spot pairs |
 | Catalog | Broker connections → **Instrument universe** in the cockpit |
-| Prices | Binance's public spot book; [Bybit](/openoms/integrations/bybit/)'s as backup |
+| Prices | Binance's public spot book; [Bybit](/integrations/bybit/)'s as backup |
 
 ## Credentials
 
