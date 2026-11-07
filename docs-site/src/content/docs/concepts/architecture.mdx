@@ -9,9 +9,15 @@ import overview from "../../../diagrams/overview.mmd?raw";
 import er from "../../../diagrams/er.mmd?raw";
 import runtime from "../../../diagrams/runtime.mmd?raw";
 
-OpenOMS is one program. Its core owns all state in Postgres. Two gateways
-inside the same program are its only contact with the outside world: one for
-orders and fills, one for prices.
+The central OMS is one program. Its core owns durable accounting state in
+Postgres. Two embedded gateways connect it to venues: one for orders and fills,
+one for prices. Co-located strategies are separate programs with direct venue
+connections and an asynchronous control link to the OMS.
+
+## Shipped architecture
+
+This illustration shows the existing implementation. The proposed embedded
+runtime is shown separately under [Target architecture](#target-architecture).
 
 <ArchitectureDiagram />
 
@@ -75,6 +81,87 @@ optional; without it the OMS runs fully.
   strategy's positions and P&L appear moments later. Kill tells the strategy,
   and also cancels everything on the account with the OMS's key, without
   waiting for the strategy. See [Co-located strategies](/openoms/strategies/colocated/).
+
+## Target architecture
+
+**Proposed design, not implemented.** Path ② evolves into a strategy linked with
+an embedded execution runtime. It is one process: strategy calls runtime, runtime
+checks and reserves exposure, then calls the venue adapter. There is no internal
+REST/IPC hop and no per-order OMS or database round trip. Venue protocol latency
+and proposed local durable journal writes still contribute to admission latency.
+
+<ArchitectureDiagram target />
+
+### State and responsibility
+
+| Component | Target responsibility |
+|---|---|
+| Shared `risk` crate | Consistent units, effective-policy rules, directional exposure, strict Reducing and rejection reasons for both paths |
+| Embedded runtime (proposed `colo-runtime`) | Atomic admission and reservations, order lifecycle, immediate positions, rate counters, journal and recovery |
+| `gateway` crate | Venue execution reports, order/query operations and market data; linked into the same process |
+| `colo-link` | Authenticated bootstrap, versioned policy/control, authority, acknowledgements and replayable events |
+| Central OMS | Policy and bounded allocations, consolidated accounting, monitoring and independent venue reconciliation |
+
+The proposed initial scope is **trusted strategies, one active runtime per dedicated venue
+account/subaccount**, with Binance Spot as the first proposed adapter target.
+Sharing an account or global allocation across independent runtimes requires
+additional coordination; copying the same global limit to each process is unsafe.
+
+### Configuration is cached; execution state is maintained
+
+On startup, the OMS supplies a versioned snapshot of instruments, permissions,
+effective limits, account identity and execution settings. The runtime installs
+updates atomically and acknowledges their exact version. Secrets are provisioned
+separately from ordinary configuration and event logs.
+
+Local positions, pending/working orders and reservations advance from venue events
+immediately. A partial fill moves exposure from working quantity to position in
+one transition. A timeout remains an unknown commitment, and requesting a cancel
+does not release capacity. Opposing working orders do not simply net to zero.
+Spot orders also reserve shared quote/base assets across instruments, including
+fee allowances; separate symbol limits must not spend the same balance twice.
+
+The runtime reconciles its journal and OMS baseline against venue orders and fills
+before enabling trading. An OMS position snapshot cannot overwrite newer local
+fills without a matching checkpoint. Errors or missing history must not become an
+empty account. The OMS order path retains transactional admission while reusing
+the same risk evaluator with a coherent database exposure snapshot.
+
+### Asynchronous supervision and accounting
+
+OMS-to-runtime traffic carries bootstrap, policy, bounded authority and commands.
+Runtime-to-OMS traffic carries submissions, execution reports (including fills),
+health and acknowledgements. Events have stable identities and sequences, survive
+reconnect through replay, and are acknowledged after durable acceptance. The OMS
+deduplicates runtime reports against its independent venue-follow stream so one
+economic fill is booked once.
+
+On authority expiry, the runtime stops new risk and attempts cancellation; unknown
+orders and existing positions remain charged. A replacement cannot start spending
+the allocation until the previous owner is stopped and recovery completes.
+In-process checks are cooperative controls for trusted code, not an independent
+security boundary. Neither a kill command nor an in-process watchdog guarantees
+that a crashed or bypassing strategy's orders disappear within a fixed deadline.
+Venue-native protections must be verified for the specific API and product.
+Suspended or expired runtimes permit cancellation/recovery only. Kill remains
+latched across restart until an explicit newer Enable command and successful
+recovery authorize resumption; ordinary policy updates do not clear it.
+
+### Changes from the shipped design
+
+1. Extract common `risk` semantics from the OMS checks and `colo-risk`, resolving
+   differences in valuation, working exposure and Reducing explicitly.
+2. Move ad hoc strategy execution into the embedded runtime with reservations,
+   a recoverable journal and locally maintained positions.
+3. Extend the control link to full bootstrap/policy and replayable event contracts.
+4. Preserve independent OMS venue follow, adding cross-source event deduplication.
+5. Verify restart, disconnect, unknown-order and concurrent-admission behavior,
+   and measure tail latency before rollout.
+
+The detailed design is in repository file
+`docs/superpowers/specs/2026-11-07-colocated-runtime-design.md`. Initial venue/account
+scope, opening-inventory accounting, authority/freshness defaults and the
+durable-before-send latency budget require review before implementation.
 
 ## Instrument model
 
