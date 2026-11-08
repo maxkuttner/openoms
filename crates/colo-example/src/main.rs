@@ -28,7 +28,6 @@ use gateway::connectors::binance::feed::BinanceFeed;
 use gateway::connectors::binance::runtime::BinanceRuntimeVenue;
 
 const MAX_JOURNAL_BYTES: u64 = 1 << 30;
-const COMPACT_ABOVE_BYTES: u64 = 512 << 20;
 const EVENT_QUEUE: usize = 4096;
 
 #[derive(Parser)]
@@ -177,7 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bootstrap,
             journal_path: args.journal_dir.join("journal"),
             max_journal_bytes: MAX_JOURNAL_BYTES,
-            compact_above_bytes: COMPACT_ABOVE_BYTES,
             event_queue_capacity: EVENT_QUEUE,
             control_url: Some(args.oms_url.clone()),
             events_url: Some(args.oms_url.clone()),

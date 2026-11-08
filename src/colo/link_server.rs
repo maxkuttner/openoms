@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 use colo_link::proto::{FromStrategy, ToStrategy, HEARTBEAT};
 use colo_link::v2::{
-    Bootstrap, EventAck as V2EventAck, FromRuntime, ToRuntime, ToRuntimeEnvelope, PROTOCOL_VERSION,
+    Authority, Bootstrap, EventAck as V2EventAck, FromRuntime, ToRuntime, ToRuntimeEnvelope,
+    PROTOCOL_VERSION,
 };
 use uuid::Uuid;
 
@@ -214,14 +215,32 @@ async fn handle_v2(
             revision,
             binding.session_nonce.to_string(),
         );
+        hub.push_v2_control(
+            binding.deployment.id,
+            ToRuntime::Authority {
+                authority: Authority { valid_for_secs: binding.authority_secs as u64 },
+            },
+        );
         Some((conn, rx))
     } else {
         None
     };
     let session = binding.session_nonce.to_string();
+    let mut authority = tokio::time::interval(Duration::from_secs(
+        u64::from(binding.authority_secs.max(2) / 2),
+    ));
+    authority.tick().await;
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
         loop {
             tokio::select! {
+                _ = authority.tick(), if control => {
+                    hub.push_v2_control(
+                        binding.deployment.id,
+                        ToRuntime::Authority {
+                            authority: Authority { valid_for_secs: binding.authority_secs as u64 },
+                        },
+                    );
+                }
                 push = async {
                     match pushes.as_mut() {
                         Some((_, rx)) => rx.recv().await,
@@ -432,6 +451,7 @@ mod tests {
                 epoch: 1,
                 session_nonce: self.nonce,
                 account: self.account.clone(),
+                authority_secs: 5,
             })
         }
         async fn bootstrap_v2(&self, _: &Deployment) -> Result<Bootstrap, String> {
@@ -552,12 +572,16 @@ mod tests {
         })
         .await
         .unwrap();
+        let mut saw_authority = false;
         let ack = loop {
             let msg = tokio::time::timeout(Duration::from_secs(5), link.recv_control()).await.unwrap().unwrap();
-            if let ToRuntime::EventAck { ack } = msg.message {
-                break ack;
+            match msg.message {
+                ToRuntime::Authority { .. } => saw_authority = true,
+                ToRuntime::EventAck { ack } => break ack,
+                _ => {}
             }
         };
+        assert!(saw_authority, "control socket never delivered authority");
         assert_eq!(ack.through_sequence, 1);
         assert_eq!(backend.batches.lock().unwrap().len(), 1);
     }

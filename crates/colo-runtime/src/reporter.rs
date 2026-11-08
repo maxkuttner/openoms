@@ -30,7 +30,10 @@ impl Reporter {
         let acked = journal.acked();
         let sent = records
             .iter()
-            .filter(|r| r.sequence <= acked && !matches!(r.record, JournalRecord::Ack { .. }))
+            .filter(|r| {
+                r.sequence <= acked
+                    && !matches!(r.record, JournalRecord::Ack { .. } | JournalRecord::Cursor { .. })
+            })
             .count() as u64;
         let mut session = V2Session::new(identity.clone(), epoch, session_nonce, 1);
         session.seed_event_sequence(sent);

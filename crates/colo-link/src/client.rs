@@ -376,21 +376,43 @@ async fn run_v2_once(
 pub struct V2RuntimeLink {
     link: V2Link,
     control: tokio::sync::Mutex<mpsc::Receiver<ToRuntimeEnvelope>>,
+    account: AccountIdentity,
+    epoch: u64,
+    session_nonce: String,
 }
 
 impl V2RuntimeLink {
     pub fn spawn(cfg: V2LinkConfig) -> Arc<Self> {
+        let account = cfg.account.clone();
+        let epoch = cfg.epoch;
+        let session_nonce = cfg.session_nonce.clone();
         let (link, control, mut events) = V2Link::spawn(cfg);
         tokio::spawn(async move { while events.recv().await.is_some() {} });
-        Arc::new(Self { link, control: tokio::sync::Mutex::new(control) })
+        Arc::new(Self {
+            link,
+            control: tokio::sync::Mutex::new(control),
+            account,
+            epoch,
+            session_nonce,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl RuntimeLink for V2RuntimeLink {
     async fn recv_control(&self) -> Option<Received<ToRuntime>> {
-        let envelope = self.control.lock().await.recv().await?;
-        Some(Received::new(envelope.message, Instant::now()))
+        loop {
+            let envelope = self.control.lock().await.recv().await?;
+            if envelope.protocol_version != PROTOCOL_VERSION
+                || envelope.account != self.account
+                || envelope.epoch != self.epoch
+                || envelope.session_nonce != self.session_nonce
+            {
+                tracing::warn!("v2 runtime link: dropped mismatched control envelope");
+                continue;
+            }
+            return Some(Received::new(envelope.message, Instant::now()));
+        }
     }
 
     async fn send_events(&self, envelope: FromRuntimeEnvelope) -> Result<(), ProtocolError> {

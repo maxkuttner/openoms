@@ -887,6 +887,7 @@ pub struct V2Binding {
     pub epoch: u64,
     pub session_nonce: Uuid,
     pub account: AccountIdentity,
+    pub authority_secs: u32,
 }
 
 /// Authorize one of the two v2 sockets. Control acquires (or reuses) the
@@ -923,7 +924,13 @@ pub async fn authorize_v2(
         environment: deployment.environment.clone(),
         external_account_ref: deployment.external_account_ref.clone(),
     };
-    Ok(V2Binding { deployment, epoch, session_nonce, account })
+    Ok(V2Binding {
+        authority_secs: deployment.authority_secs.max(1) as u32,
+        deployment,
+        epoch,
+        session_nonce,
+        account,
+    })
 }
 
 

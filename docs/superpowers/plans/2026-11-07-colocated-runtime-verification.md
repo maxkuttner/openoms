@@ -60,6 +60,10 @@ Verified there:
   `RuntimeLink`; its live/testnet behavior remains unverified.
 - Journal fsync cost is synchronous by design and is not included in the latency
   sample above. Measure it before claiming a production latency target.
+- Automatic journal compaction is deliberately not wired: compaction currently
+  drops historical trade records without a durable position checkpoint. The
+  journal can grow until admission stops at its configured limit; explicit
+  `Journal::compact` is tested but not safe to automate yet.
 
 ## Shipped vs unverified
 
@@ -72,7 +76,9 @@ injected link transport, and a replay reporter connected through that link.
 Execution cursors persist in the journal; stale marks, missing resolved limits
 and unsupported Place operations are rejected; follow fills carry venue
 fee/time; duplicate control authority is idempotent; v2 control socket
-ownership is connection-generation checked.
+ownership is connection-generation checked; the OMS sends and renews authority
+on the control socket; runtime returns to Ready after bootstrap/Enable when
+recovery was already complete.
 
 Unverified until the remaining gates run: venue/testnet order behavior,
 end-to-end journal-inclusive latency, and live runtime orchestration. The

@@ -254,6 +254,12 @@ impl Book {
         self.max_price_age = Some(max_age);
     }
 
+    pub fn cancel_requested(&self, client_order_id: &str) -> bool {
+        self.orders
+            .get(client_order_id)
+            .is_some_and(|o| o.state == LocalState::CancelRequested)
+    }
+
     pub fn working_client_ids(&self, instrument: &str) -> Vec<String> {
         self.orders
             .values()

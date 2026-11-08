@@ -201,8 +201,8 @@ pub async fn drain_inbox(
         let record: EventRecord = serde_json::from_value(payload)
             .map_err(|e| IngestError::Invalid(e.to_string()))?;
         if let RuntimeEvent::Venue { account: _, event: VenueEvent::Trade(trade) } = &record.event {
-            let receipt = observe_trade(state, &identity, trade).await?;
-            if receipt.inserted {
+            observe_trade(state, &identity, trade).await?;
+            {
                 let strategy = state
                     .strategies()
                     .by_code(&strategy_code)
