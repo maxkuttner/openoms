@@ -87,13 +87,29 @@ The OMS drops a link it has not heard for 3 heartbeats; the program reconnects.
 
 ## The risk library
 
-The `colo-risk` crate runs every order through, in memory:
+`crates/risk` is the single pure evaluator shared with the ordinary OMS path.
+The embedded runtime (`crates/colo-runtime`) additionally owns reservations,
+the durable local journal, recovery and the native-asset ledger. It runs every
+order through, in memory:
 - the strategy's limits: order and position size and notional;
-- a price band around the program's own mid;
+- directional worst-case exposure, with opposing working orders never netted;
+- a price band around the strategy's configured reference price;
 - a max-orders-per-second cap;
-- the halted state.
+- the halted/reducing state.
 
-Notional limits apply to pairs quoted in USD, USDT or USDC only.
+Notional defaults inherited into a non-USD-like quote are rejected; an explicit
+per-instrument override may use any quote. The runtime adds account-wide Spot
+asset reservations: BTC/USDT and ETH/USDT share the same USDT capacity, and fees
+in a third asset live in their own ledger row without FX conversion.
+
+## Control protocol
+
+v2 uses two authenticated WSS connections. `/v2/control` carries bootstrap,
+policy, authority, kill and enable; `/v2/events` carries bounded event batches
+and durable ACKs. Both are bound to the same deployment, epoch and session
+nonce. An event backlog therefore cannot delay a kill, and the event connection
+cannot authorize trading. Receipt-time authority expiry includes time spent
+queued; heartbeats do not renew it.
 
 ## Kill and alarms
 
@@ -116,7 +132,10 @@ Notional limits apply to pairs quoted in USD, USDT or USDC only.
 
 `crates/colo-example` is a small market maker on one pair:
 - it quotes a bid and an ask around the mid from Binance's public feed;
-- it runs every quote through the risk library, under the control link.
+- it runs every quote through the shared `risk` evaluator under the legacy v1
+  control link. The example's migration to the embedded runtime is an open gate;
+  the runtime, v2 protocol, recovery, journal and inbox are implemented in this
+  branch but still require live/testnet and latency evidence before rollout.
 
 ```
 BINANCE_API_KEY=… BINANCE_PRIVATE_KEY="$(cat key.pem)" \

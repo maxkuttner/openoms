@@ -589,9 +589,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "colo-link",
- "colo-risk",
  "dataprovider",
  "gateway",
+ "risk",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -612,14 +612,6 @@ dependencies = [
  "tokio-tungstenite 0.21.0",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "colo-risk"
-version = "0.1.0"
-dependencies = [
- "risk",
- "serde",
 ]
 
 [[package]]
@@ -3175,7 +3167,6 @@ dependencies = [
  "chrono",
  "clap",
  "colo-link",
- "colo-risk",
  "csv",
  "databento",
  "dataprovider",

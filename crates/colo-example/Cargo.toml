@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 gateway = { path = "../gateway", default-features = false }
 dataprovider = { path = "../dataprovider" }
-colo-risk = { path = "../colo-risk" }
+risk = { path = "../risk" }
 colo-link = { path = "../colo-link" }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

@@ -183,9 +183,9 @@ const { target = false } = Astro.props;
       <!-- Co-located server -->
       <g class="arch-box arch-strategy"><rect x="60" y="948" width="180" height="74" rx="8" /><text x="150" y="974" text-anchor="middle" class="arch-name">Strategy program</text><text x="150" y="992" text-anchor="middle" class="arch-sub">market maker, arbitrage…</text><text x="150" y="1008" text-anchor="middle" class="arch-sub">never waits on the OMS</text></g>
       {[
-        ["colo-risk", "limits · orders/sec · halt", 260],
-        ["colo-link", "dead man's switch", 440],
-        ["gateway", "venue connector, no FIX", 620],
+        ["risk", "shared pre-trade rules", 260],
+        ["colo-runtime", "journal · reservations", 440],
+        ["colo-link + gateway", "v2 control · venue", 620],
       ].map(([name, sub, x]) => (
         <g class="arch-box arch-crate"><rect x={x} y="948" width="160" height="74" rx="8" /><text x={(x as number) + 80} y="979" text-anchor="middle" class="arch-name">{name}</text><text x={(x as number) + 80} y="998" text-anchor="middle" class="arch-sub">{sub}</text></g>
       ))}

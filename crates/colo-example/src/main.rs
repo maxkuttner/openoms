@@ -7,6 +7,7 @@
 
 mod quote;
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,6 @@ use tracing::{info, warn};
 
 use colo_link::client::{DeadMan, Link, LinkConfig};
 use colo_link::proto::{FromStrategy, ToStrategy};
-use colo_risk::{Limits, OrderIntent, RiskBook};
 use dataprovider::{LiveQuoteFeed, NoFeedHealth};
 use gateway::adapter::{BrokerAdapter, BrokerOrderRequest};
 use gateway::connectors::binance::adapter::BinanceAdapter;
@@ -72,6 +72,102 @@ fn spawn_mid_feed(symbol: &str) -> watch::Receiver<Option<f64>> {
     rx
 }
 
+struct OrderIntent<'a> {
+    symbol: &'a str,
+    quote_currency: &'a str,
+    buy: bool,
+    qty: f64,
+    price: f64,
+}
+
+struct Rejection {
+    code: String,
+    message: String,
+}
+
+/// A small local admission wrapper over the shared pure evaluator. The
+/// production runtime adds durable reservations; this example demonstrates the
+/// same rule source on the v1 control link.
+struct RiskBook {
+    limits: risk::Limits,
+    version: u64,
+    positions: BTreeMap<String, f64>,
+    state: risk::TradingState,
+    working_buy: f64,
+    working_sell: f64,
+    accepted: VecDeque<Instant>,
+}
+
+impl RiskBook {
+    fn new(limits: risk::Limits, version: u64) -> Self {
+        Self {
+            limits,
+            version,
+            positions: BTreeMap::new(),
+            state: risk::TradingState::Active,
+            working_buy: 0.0,
+            working_sell: 0.0,
+            accepted: VecDeque::new(),
+        }
+    }
+
+    fn set_limits(&mut self, limits: risk::Limits, version: u64) {
+        self.limits = limits;
+        self.version = version;
+    }
+
+    fn set_positions(&mut self, positions: impl IntoIterator<Item = (String, f64)>) {
+        self.positions = positions.into_iter().collect();
+    }
+
+    fn set_state(&mut self, state: risk::TradingState) {
+        self.state = state;
+    }
+
+    fn release_all(&mut self) {
+        self.working_buy = 0.0;
+        self.working_sell = 0.0;
+    }
+
+    fn check(&mut self, intent: &OrderIntent<'_>, mid: f64, now: Instant) -> Result<(), Rejection> {
+        while self.accepted.front().is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1)) {
+            self.accepted.pop_front();
+        }
+        if self.limits.max_orders_per_sec.is_some_and(|max| self.accepted.len() >= max as usize) {
+            return Err(Rejection { code: "rate_limited".into(), message: "order rate exceeded".into() });
+        }
+        let side = if intent.buy { risk::Side::Buy } else { risk::Side::Sell };
+        let exposure = risk::Exposure {
+            position_qty: self.positions.get(intent.symbol).copied().unwrap_or(0.0),
+            working_buy_qty: self.working_buy,
+            working_sell_qty: self.working_sell,
+        };
+        risk::evaluate(&risk::RiskInput {
+            order: risk::OrderInput { side, quantity: intent.qty, limit_price: Some(intent.price), multiplier: 1.0 },
+            exposure,
+            limits: self.limits,
+            state: self.state,
+            valuation: risk::Valuation {
+                order_price: Some(mid),
+                position_price: Some(mid),
+                reference_price: Some(mid),
+            },
+        })
+        .map_err(|r| Rejection { code: r.code, message: r.message })?;
+        if !risk::USD_LIKE.contains(&intent.quote_currency) && intent.quote_currency != intent.symbol {
+            // The shared evaluator already rejects inherited notional defaults
+            // for a non-USD quote; nothing extra is inferred here.
+        }
+        if intent.buy {
+            self.working_buy += intent.qty;
+        } else {
+            self.working_sell += intent.qty;
+        }
+        self.accepted.push_back(now);
+        Ok(())
+    }
+}
+
 struct MarketMaker {
     args: Args,
     adapter: Arc<BinanceAdapter>,
@@ -93,6 +189,7 @@ impl MarketMaker {
                 warn!(order = %id, error = %e, "cancel failed");
             }
         }
+        self.risk.release_all();
     }
 
     async fn on_control(&mut self, msg: ToStrategy) {
@@ -102,6 +199,7 @@ impl MarketMaker {
             ToStrategy::State { active, limits, limits_version, positions, dead_man_secs } => {
                 info!(active, limits_version, dead_man_secs, "state from the OMS");
                 self.risk.set_limits(limits, limits_version);
+                self.risk.set_state(if active { risk::TradingState::Active } else { risk::TradingState::Halted });
                 self.risk.set_positions(positions.into_iter().map(|p| (p.symbol, p.qty)));
                 self.link.send(FromStrategy::AckLimits { limits_version }).await;
             }
@@ -112,13 +210,17 @@ impl MarketMaker {
             ToStrategy::Positions { positions } => self.risk.set_positions(positions.into_iter().map(|p| (p.symbol, p.qty))),
             ToStrategy::Kill => {
                 info!("killed by the OMS");
+                self.risk.set_state(risk::TradingState::Halted);
                 // Acknowledge first: the OMS is cancelling with its own key anyway.
                 self.link.send(FromStrategy::AckKill).await;
                 if !self.args.ignore_kill {
                     self.cancel_all().await;
                 }
             }
-            ToStrategy::Resume => info!("resumed by the OMS"),
+            ToStrategy::Resume => {
+                self.risk.set_state(risk::TradingState::Active);
+                info!("resumed by the OMS");
+            }
             ToStrategy::Heartbeat => {}
         }
     }
@@ -165,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mm = MarketMaker {
         // The OMS's first state sets the real timeout.
         dead: DeadMan::new(Duration::from_secs(5), Instant::now()),
-        risk: RiskBook::new(Limits::default(), 0),
+        risk: RiskBook::new(risk::Limits::default(), 0),
         working: Vec::new(),
         n: 0,
         adapter,

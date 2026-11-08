@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/symbology", "crates/dataprovider", "crates/gateway", "crates/risk", "crates/colo-risk", "crates/colo-link", "crates/colo-example", "crates/colo-runtime"]
+members = [".", "crates/symbology", "crates/dataprovider", "crates/gateway", "crates/risk", "crates/colo-link", "crates/colo-example", "crates/colo-runtime"]
 resolver = "2"
 
 [package]
@@ -14,7 +14,6 @@ name = "oms"
 path = "src/main.rs"
 
 [dependencies]
-colo-risk = { path = "crates/colo-risk" }
 colo-link = { path = "crates/colo-link" }
 risk = { path = "crates/risk" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

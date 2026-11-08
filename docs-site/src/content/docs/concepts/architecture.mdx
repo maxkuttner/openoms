@@ -70,12 +70,14 @@ optional; without it the OMS runs fully.
   FIX 4.4 (TLS) or REST, and every order passes the same checks as a trader's.
   See [FIX](/openoms/strategies/fix/) and [REST](/openoms/strategies/rest/).
 - **Path ②, co-located.** A latency-sensitive strategy runs on its own server
-  next to the venue and trades its own venue account directly. It links three
+  next to the venue and trades its own venue account directly. It links four
   crates from this repository:
-  - `colo-risk` checks every order in memory;
-  - `colo-link` holds the control link and stops the strategy when the OMS goes
-    quiet;
+  - `risk` is the shared pure pre-trade evaluator;
+  - `colo-runtime` owns reservations, the durable journal and recovery;
+  - `colo-link` holds two authenticated v2 sockets — control and events;
   - `gateway` provides the venue connector.
+  The v2 event socket cannot authorize trading; authority arrives only on the
+  control socket and is valid from receipt time.
 
   The OMS follows that account with its own key and books every fill, so the
   strategy's positions and P&L appear moments later. Kill tells the strategy,
@@ -149,8 +151,8 @@ recovery authorize resumption; ordinary policy updates do not clear it.
 
 ### Changes from the shipped design
 
-1. Extract common `risk` semantics from the OMS checks and `colo-risk`, resolving
-   differences in valuation, working exposure and Reducing explicitly.
+1. Shared `risk` semantics are extracted from the OMS checks and the legacy
+   co-located risk book, with valuation, working exposure and Reducing explicit.
 2. Move ad hoc strategy execution into the embedded runtime with reservations,
    a recoverable journal and locally maintained positions.
 3. Extend the control link to full bootstrap/policy and replayable event contracts.
