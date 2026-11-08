@@ -94,6 +94,7 @@ async fn start(dir: &TempDir, venue: Arc<Fake>, identity: &AccountIdentity, kill
             identity: identity.clone(), epoch: 1, bootstrap: bootstrap(killed), journal_path: dir.path().join("journal"),
             max_journal_bytes: 1_000_000, event_queue_capacity: 128,
             control_url: None, events_url: None, credential_reference: None,
+            link: None, session_nonce: String::new(),
         },
         venue,
     ).await.unwrap();

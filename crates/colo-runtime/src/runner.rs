@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::Utc;
-use colo_link::v2::{Bootstrap, Received, ToRuntime};
+use colo_link::v2::{Bootstrap, Received, RuntimeLink, ToRuntime};
 use gateway::adapter::BrokerError;
 use gateway::runtime::{
     AccountIdentity, RuntimeEvent, RuntimeOrder, RuntimeOrderState, RuntimeVenue, StreamState,
@@ -21,6 +21,7 @@ use crate::book::{Book, InstrumentPrices, Intent, Prices, Submission};
 use crate::control::{ControlAction, ControlState, RuntimeState};
 use crate::journal::{Journal, JournalRecord};
 use crate::recovery::{recover, RecoveredBook};
+use crate::reporter::Reporter;
 use crate::RuntimeError;
 
 pub struct RuntimeConfig {
@@ -33,6 +34,11 @@ pub struct RuntimeConfig {
     pub control_url: Option<String>,
     pub events_url: Option<String>,
     pub credential_reference: Option<String>,
+    /// Injected by the caller; the runtime never sees the token or CA material.
+    pub link: Option<Arc<dyn RuntimeLink>>,
+    /// Stable for this process/run; reconnects reuse it. A new run is a new
+    /// owner and requires the OMS's verified-stop takeover rule.
+    pub session_nonce: String,
 }
 
 struct Core {
@@ -52,11 +58,13 @@ struct Inner {
     identity: AccountIdentity,
     suspended: AtomicBool,
     shutdown: tokio::sync::Notify,
+    report_now: tokio::sync::Notify,
 }
 
 pub struct Runtime {
     inner: Arc<Inner>,
     events_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    link_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Runtime {
@@ -103,6 +111,17 @@ impl Runtime {
         } else {
             control.suspend("recovery is incomplete");
         }
+        let reporter = if config.link.is_some() {
+            Some(Arc::new(AsyncMutex::new(Reporter::new(
+                config.identity.clone(),
+                config.epoch,
+                config.session_nonce.clone(),
+                config.bootstrap.baseline.sequence,
+                &journal,
+            )?)))
+        } else {
+            None
+        };
         let inner = Arc::new(Inner {
             core: AsyncMutex::new(Core {
                 book,
@@ -118,12 +137,23 @@ impl Runtime {
             identity: config.identity,
             suspended: AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
+            report_now: tokio::sync::Notify::new(),
         });
         let task = {
             let weak = Arc::downgrade(&inner);
             spawn_venue_events(weak, events)
         };
-        Ok(Self { inner, events_task: Mutex::new(Some(task)) })
+        let link_tasks = match (&config.link, reporter) {
+            (Some(link), Some(reporter)) => {
+                spawn_link_tasks(Arc::downgrade(&inner), link.clone(), reporter)
+            }
+            _ => Vec::new(),
+        };
+        Ok(Self {
+            inner,
+            events_task: Mutex::new(Some(task)),
+            link_tasks: Mutex::new(link_tasks),
+        })
     }
 
     pub fn identity(&self) -> &AccountIdentity {
@@ -145,76 +175,7 @@ impl Runtime {
     /// Public for tests and the control reader: applies a receipt-time message
     /// without touching venue I/O.
     pub async fn apply_control(&self, message: Received<ToRuntime>) -> Result<Vec<ControlAction>, RuntimeError> {
-        let incoming = message.message.clone();
-        let (actions, kill, cancellations) = {
-            let mut core = self.inner.core.lock().await;
-            let actions = core.control.apply(message)?;
-            for action in &actions {
-                match action {
-                    ControlAction::KillLatched { .. } => core.book.set_trading_state_halted(),
-                    ControlAction::KillCleared { .. } => core.book.set_trading_state_active(),
-                    _ => {}
-                }
-            }
-            match &incoming {
-                ToRuntime::Bootstrap { bootstrap } => {
-                    core.book.install_policy(
-                        bootstrap.limits.clone(),
-                        bootstrap.trading_state,
-                        bootstrap.instrument_states.clone(),
-                    );
-                    core.book.set_allocation(
-                        bootstrap.allocation.quote_asset.clone(),
-                        bootstrap.allocation.max_notional,
-                        bootstrap.allocation.max_position_qty,
-                    );
-                }
-                ToRuntime::Policy { policy } => {
-                    core.book.install_policy(
-                        policy.limits.clone(),
-                        policy.trading_state,
-                        policy.instrument_states.clone(),
-                    );
-                }
-                _ => {}
-            }
-            if core.control.kill_latched().is_some() {
-                core.book.set_trading_state_halted();
-            }
-            let kill = match &incoming {
-                ToRuntime::Kill { kill } => Some(JournalRecord::Kill {
-                    epoch: core.control.kill_latched().unwrap_or(0),
-                    command_id: kill.command_id.clone(),
-                }),
-                ToRuntime::Enable { enable } => Some(JournalRecord::Enable {
-                    epoch: enable.stopped_epoch,
-                    command_id: enable.command_id.clone(),
-                }),
-                _ => None,
-            };
-            let mut cancellations = Vec::new();
-            for action in &actions {
-                if let ControlAction::CancelWorking { instruments } = action {
-                    for instrument in instruments {
-                        for id in core.book.working_client_ids(instrument) {
-                            let _ = core.book.request_cancel(&id);
-                            cancellations.push(id);
-                        }
-                    }
-                }
-            }
-            (actions, kill, cancellations)
-        };
-        if let Some(record) = kill {
-            if let Err(e) = append(&self.inner.journal, record).await {
-                self.inner.suspended.store(true, Ordering::SeqCst);
-                return Err(e);
-            }
-        }
-        for id in cancellations {
-            let _ = self.cancel(&id).await;
-        }
-        Ok(actions)
+        apply_control_inner(&self.inner, message).await
     }
 
     pub async fn submit(&self, intent: Intent) -> Result<Submission, RuntimeError> {
@@ -226,18 +187,12 @@ impl Runtime {
             }
             core.control.may_submit(now)?;
             let prices = core.prices.clone();
-            let prepared = core.book.prepare(intent, &prices, now)?;
-            prepared
+            core.book.prepare(intent, &prices, now)?
         };
         let bytes = self.inner.journal.lock().map_err(|_| RuntimeError::JournalIo("journal lock".into()))?.byte_len();
         if bytes > self.inner.journal_limit {
             self.inner.suspended.store(true, Ordering::SeqCst);
-            self.inner
-                .core
-                .lock()
-                .await
-                .book
-                .abort_order(&prepared.submission.client_order_id);
+            self.inner.core.lock().await.book.abort_order(&prepared.submission.client_order_id);
             return Err(RuntimeError::NotReady("journal is over its limit".into()));
         }
         let record = JournalRecord::Intent {
@@ -247,14 +202,10 @@ impl Runtime {
         };
         if let Err(e) = append(&self.inner.journal, record).await {
             self.inner.suspended.store(true, Ordering::SeqCst);
-            self.inner
-                .core
-                .lock()
-                .await
-                .book
-                .abort_order(&prepared.submission.client_order_id);
+            self.inner.core.lock().await.book.abort_order(&prepared.submission.client_order_id);
             return Err(e);
         }
+        self.inner.report_now.notify_one();
 
         {
             let core = self.inner.core.lock().await;
@@ -276,9 +227,7 @@ impl Runtime {
                     inner.push_event(RuntimeEvent::SubmitOutcome {
                         account: inner.identity.clone(),
                         client_order_id: task_submission.client_order_id,
-                        outcome: SubmitOutcome::Unknown {
-                            reason: "admission stopped before send".into(),
-                        },
+                        outcome: SubmitOutcome::Unknown { reason: "admission stopped before send".into() },
                     });
                     return;
                 }
@@ -287,11 +236,7 @@ impl Runtime {
             let (state, venue_id, outcome) = match result {
                 Ok(response) => {
                     let venue_order_id = response.external_order_id.clone();
-                    (
-                        RuntimeOrderState::New,
-                        response.external_order_id,
-                        SubmitOutcome::Accepted { venue_order_id },
-                    )
+                    (RuntimeOrderState::New, response.external_order_id, SubmitOutcome::Accepted { venue_order_id })
                 }
                 Err(BrokerError::BrokerRejected(reason)) => (
                     RuntimeOrderState::Rejected,
@@ -321,6 +266,7 @@ impl Runtime {
             };
             let event = VenueEvent::Order(order);
             if append(&inner.journal, JournalRecord::Venue { event: event.clone() }).await.is_ok() {
+                inner.report_now.notify_one();
                 let mut core = inner.core.lock().await;
                 let _ = core.book.apply(&event);
             } else {
@@ -336,15 +282,7 @@ impl Runtime {
     }
 
     pub async fn cancel(&self, client_id: &str) -> Result<(), RuntimeError> {
-        let request = self.inner.core.lock().await.book.request_cancel(client_id)?;
-        if let Some(venue_order_id) = request.venue_order_id {
-            let venue = self.inner.venue.clone();
-            let symbol = request.symbol;
-            tokio::spawn(async move {
-                let _ = venue.cancel_order(&venue_order_id, &symbol).await;
-            });
-        }
-        Ok(())
+        cancel_on(&self.inner, client_id).await
     }
 
     pub async fn position(&self, instrument: &str) -> f64 {
@@ -366,6 +304,10 @@ impl Runtime {
         if let Some(task) = task {
             let _ = task.await;
         }
+        let tasks = self.link_tasks.lock().ok().map(|mut t| std::mem::take(&mut *t)).unwrap_or_default();
+        for task in tasks {
+            let _ = task.await;
+        }
         Ok(())
     }
 
@@ -380,6 +322,162 @@ impl Runtime {
     }
 }
 
+
+async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -> Result<Vec<ControlAction>, RuntimeError> {
+    let incoming = message.message.clone();
+    let (actions, kill, cancellations) = {
+        let mut core = inner.core.lock().await;
+        let actions = core.control.apply(message)?;
+        for action in &actions {
+            match action {
+                ControlAction::KillLatched { .. } => core.book.set_trading_state_halted(),
+                ControlAction::KillCleared { .. } => core.book.set_trading_state_active(),
+                _ => {}
+            }
+        }
+        match &incoming {
+            ToRuntime::Bootstrap { bootstrap } => {
+                core.book.install_policy(
+                    bootstrap.limits.clone(),
+                    bootstrap.trading_state,
+                    bootstrap.instrument_states.clone(),
+                );
+                core.book.set_allocation(
+                    bootstrap.allocation.quote_asset.clone(),
+                    bootstrap.allocation.max_notional,
+                    bootstrap.allocation.max_position_qty,
+                );
+            }
+            ToRuntime::Policy { policy } => {
+                core.book.install_policy(
+                    policy.limits.clone(),
+                    policy.trading_state,
+                    policy.instrument_states.clone(),
+                );
+            }
+            _ => {}
+        }
+        if core.control.kill_latched().is_some() {
+            core.book.set_trading_state_halted();
+        }
+        let kill = match &incoming {
+            ToRuntime::Kill { kill } => Some(JournalRecord::Kill {
+                epoch: core.control.kill_latched().unwrap_or(0),
+                command_id: kill.command_id.clone(),
+            }),
+            ToRuntime::Enable { enable } => Some(JournalRecord::Enable {
+                epoch: enable.stopped_epoch,
+                command_id: enable.command_id.clone(),
+            }),
+            _ => None,
+        };
+        let mut cancellations = Vec::new();
+        for action in &actions {
+            if let ControlAction::CancelWorking { instruments } = action {
+                for instrument in instruments {
+                    for id in core.book.working_client_ids(instrument) {
+                        let _ = core.book.request_cancel(&id);
+                        cancellations.push(id);
+                    }
+                }
+            }
+        }
+        (actions, kill, cancellations)
+    };
+    if let Some(record) = kill {
+        if let Err(e) = append(&inner.journal, record).await {
+            inner.suspended.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
+        inner.report_now.notify_one();
+    }
+    for id in cancellations {
+        let _ = cancel_on(inner, &id).await;
+    }
+    Ok(actions)
+}
+
+async fn cancel_on(inner: &Arc<Inner>, client_id: &str) -> Result<(), RuntimeError> {
+    let request = inner.core.lock().await.book.request_cancel(client_id)?;
+    if let Some(venue_order_id) = request.venue_order_id {
+        let venue = inner.venue.clone();
+        let symbol = request.symbol;
+        tokio::spawn(async move {
+            let _ = venue.cancel_order(&venue_order_id, &symbol).await;
+        });
+    }
+    Ok(())
+}
+
+fn spawn_link_tasks(
+    weak: std::sync::Weak<Inner>,
+    link: Arc<dyn RuntimeLink>,
+    reporter: Arc<AsyncMutex<Reporter>>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let control_weak = weak.clone();
+    let control_link = link.clone();
+    let control_reporter = reporter.clone();
+    let control = tokio::spawn(async move {
+        loop {
+            let Some(inner) = control_weak.upgrade() else { break };
+            let message = tokio::select! {
+                _ = inner.shutdown.notified() => break,
+                msg = control_link.recv_control() => match msg { Some(m) => m, None => break },
+            };
+            if let ToRuntime::EventAck { ack } = &message.message {
+                let mut reporter = control_reporter.lock().await;
+                if let Ok(mut journal) = inner.journal.lock() {
+                    if let Err(e) = reporter.ack(&mut journal, ack.through_sequence) {
+                        tracing::warn!(error = %e, "runtime: reporter ACK not durable");
+                    }
+                }
+            }
+            if let Err(e) = apply_control_inner(&inner, message).await {
+                tracing::warn!(error = %e, "runtime: control message rejected");
+            }
+        }
+    });
+    let report_weak = weak;
+    let report_link = link;
+    let report = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            let Some(inner) = report_weak.upgrade() else { break };
+            tokio::select! {
+                _ = inner.shutdown.notified() => break,
+                _ = inner.report_now.notified() => {}
+                _ = tick.tick() => {}
+            }
+            let prepared = {
+                let mut reporter = reporter.lock().await;
+                let journal = match inner.journal.lock() {
+                    Ok(journal) => journal,
+                    Err(_) => break,
+                };
+                match reporter.next_batch(&journal, crate::reporter::REPORT_BATCH) {
+                    Ok(Some(batch)) => match reporter.encode(&batch) {
+                        Ok(envelope) => Some(envelope),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "runtime: reporter encode failed");
+                            None
+                        }
+                    },
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "runtime: reporter batch failed");
+                        None
+                    }
+                }
+            };
+            if let Some(envelope) = prepared {
+                if let Err(e) = report_link.send_events(envelope).await {
+                    tracing::warn!(error = %e, "runtime: event send failed; pending stays durable");
+                }
+            }
+        }
+    });
+    vec![control, report]
+}
 
 fn spawn_venue_events(
     weak: std::sync::Weak<Inner>,
@@ -408,6 +506,7 @@ fn spawn_venue_events(
                     inner.suspended.store(true, Ordering::SeqCst);
                     continue;
                 }
+                inner.report_now.notify_one();
                 let mut core = inner.core.lock().await;
                 if core.book.apply(&event).is_err() {
                     core.control.suspend("venue event did not match local state");
@@ -425,6 +524,11 @@ impl Drop for Runtime {
         self.inner.shutdown.notify_waiters();
         if let Ok(mut task) = self.events_task.lock() {
             if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+        if let Ok(mut tasks) = self.link_tasks.lock() {
+            for task in tasks.drain(..) {
                 task.abort();
             }
         }

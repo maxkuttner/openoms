@@ -9,6 +9,7 @@ gateway = { path = "../gateway", default-features = false }
 risk = { path = "../risk" }
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
 serde_json = "1"
 colo-link = { path = "../colo-link" }
 tokio = { version = "1", features = ["full"] }

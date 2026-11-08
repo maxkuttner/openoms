@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use colo_link::v2::{
-    Allocation, Authority, Bootstrap, Kill, Received, RuntimeCheckpoint, Timings, ToRuntime,
+    Allocation, Authority, Bootstrap, FromRuntime, FromRuntimeEnvelope, Kill, ProtocolError,
+    Received, RuntimeCheckpoint, RuntimeLink, Timings, ToRuntime,
 };
 use colo_runtime::{
     AccountIdentity, AssetBalance, InstrumentRules, Intent,
@@ -157,6 +158,8 @@ async fn start() -> (Runtime, Arc<FakeVenue>, TempDir) {
             control_url: None,
             events_url: None,
             credential_reference: None,
+            link: None,
+            session_nonce: String::new(),
         },
         venue.clone(),
     )
@@ -169,6 +172,89 @@ async fn start() -> (Runtime, Arc<FakeVenue>, TempDir) {
         )
         .await;
     (runtime, venue, dir)
+}
+
+struct FakeLink {
+    control: tokio::sync::Mutex<mpsc::Receiver<Received<ToRuntime>>>,
+    events: std::sync::Mutex<Vec<FromRuntimeEnvelope>>,
+}
+
+#[async_trait::async_trait]
+impl RuntimeLink for FakeLink {
+    async fn recv_control(&self) -> Option<Received<ToRuntime>> {
+        self.control.lock().await.recv().await
+    }
+    async fn send_events(&self, envelope: FromRuntimeEnvelope) -> Result<(), ProtocolError> {
+        self.events.lock().unwrap().push(envelope);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn an_injected_link_drives_control_and_receives_reported_events() {
+    let dir = TempDir::new().unwrap();
+    let venue = Arc::new(FakeVenue::new());
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let link = Arc::new(FakeLink {
+        control: tokio::sync::Mutex::new(control_rx),
+        events: std::sync::Mutex::new(Vec::new()),
+    });
+    let runtime = Runtime::start(
+        RuntimeConfig {
+            identity: identity(),
+            epoch: 1,
+            bootstrap: bootstrap(),
+            journal_path: dir.path().join("journal"),
+            max_journal_bytes: 1_000_000,
+            event_queue_capacity: 128,
+            control_url: None,
+            events_url: None,
+            credential_reference: None,
+            link: Some(link.clone()),
+            session_nonce: "n1".into(),
+        },
+        venue.clone(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .set_price("BTCUSDT", colo_runtime::InstrumentPrices::new(Some(100.0), Some(100.0), Some(100.0), Instant::now()))
+        .await;
+    control_tx
+        .send(Received::new(
+            ToRuntime::Authority { authority: Authority { valid_for_secs: 5 } },
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if runtime.state().await == RuntimeState::Ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut submitted = false;
+    for _ in 0..100 {
+        if runtime.submit(intent(1.0)).await.is_ok() {
+            submitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(submitted, "authority was not applied");
+    for _ in 0..100 {
+        if link.events.lock().unwrap().iter().any(|e| matches!(e.message, FromRuntime::Events { .. })) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(link
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.message, FromRuntime::Events { .. })));
+    runtime.shutdown().await.unwrap();
 }
 
 async fn grant(runtime: &Runtime) {

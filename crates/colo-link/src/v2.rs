@@ -661,3 +661,12 @@ impl EventInbox {
 pub fn heartbeat_interval() -> Duration {
     HEARTBEAT
 }
+
+/// The runtime's transport seam. The caller constructs the authenticated link
+/// and credentials; the runtime sees only this trait and never stores secrets.
+#[async_trait::async_trait]
+pub trait RuntimeLink: Send + Sync {
+    /// Next control message, stamped when the socket yielded it.
+    async fn recv_control(&self) -> Option<Received<ToRuntime>>;
+    async fn send_events(&self, envelope: FromRuntimeEnvelope) -> Result<(), ProtocolError>;
+}

@@ -1,6 +1,7 @@
 //! The strategy's side of the link: a client that keeps reconnecting, and the
 //! dead man's switch that decides whether the strategy may trade.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -12,7 +13,8 @@ use gateway::runtime::AccountIdentity;
 
 use crate::proto::{FromStrategy, ToStrategy, HEARTBEAT};
 use crate::v2::{
-    FromRuntime, FromRuntimeEnvelope, ToRuntimeEnvelope, PROTOCOL_VERSION,
+    FromRuntime, FromRuntimeEnvelope, ProtocolError, Received, RuntimeLink, ToRuntime,
+    ToRuntimeEnvelope, PROTOCOL_VERSION,
 };
 
 const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -144,7 +146,8 @@ async fn run_once(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
+use std::time::{Duration, Instant};
 
     use super::*;
     use crate::proto::ToStrategy;
@@ -365,5 +368,35 @@ async fn run_v2_once(
                 sink.send(Message::Text(serde_json::to_string(&heartbeat)?)).await?;
             },
         }
+    }
+}
+
+
+/// Adapter from the two-socket v2 transport to the runtime's transport seam.
+pub struct V2RuntimeLink {
+    link: V2Link,
+    control: tokio::sync::Mutex<mpsc::Receiver<ToRuntimeEnvelope>>,
+}
+
+impl V2RuntimeLink {
+    pub fn spawn(cfg: V2LinkConfig) -> Arc<Self> {
+        let (link, control, mut events) = V2Link::spawn(cfg);
+        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        Arc::new(Self { link, control: tokio::sync::Mutex::new(control) })
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeLink for V2RuntimeLink {
+    async fn recv_control(&self) -> Option<Received<ToRuntime>> {
+        let envelope = self.control.lock().await.recv().await?;
+        Some(Received::new(envelope.message, Instant::now()))
+    }
+
+    async fn send_events(&self, envelope: FromRuntimeEnvelope) -> Result<(), ProtocolError> {
+        self.link
+            .send_events_envelope(envelope)
+            .await
+            .map_err(|_| ProtocolError::InvalidBatch("v2 event connection closed".into()))
     }
 }

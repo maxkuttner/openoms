@@ -57,11 +57,12 @@ Implemented and unit-tested: shared risk evaluator, Binance runtime recovery
 contract, deterministic Book/asset reservations, durable journal, v2 protocol,
 deployment registration/bootstrap/admin endpoints, recovery barrier/control
 state, durable OMS inbox/economic trade identity/native-asset ledger, runtime
-runner with post-start event ingestion and policy/allocation application, and a
-replay reporter (not yet connected to the runtime sockets).
+runner with post-start event ingestion, policy/allocation application, an
+injected link transport, and a replay reporter connected through that link.
 
 Unverified until the gates above run: production migration, isolated database
 behaviour, local TLS two-socket flow, venue/testnet behaviour, end-to-end
 journal-inclusive latency, and reference-program runtime migration. The
-reporter still needs to be wired into the runtime's control/event sockets; the
-runtime currently ingests venue events but does not itself open v2 connections.
+runtime deliberately does not build sockets itself: the caller injects an
+authenticated `RuntimeLink`; `V2RuntimeLink` is the production adapter. That
+real two-socket path still needs the local TLS/OMS fixture.
