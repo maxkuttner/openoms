@@ -176,6 +176,7 @@ mod boundary_tests;
         colo::deployment::list,
         colo::deployment::get,
         colo::deployment::retire,
+        colo::ingest::adjustment,
         auth_api::login,
         auth_api::callback,
         auth_api::logout,
@@ -215,7 +216,7 @@ mod boundary_tests;
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
         colo::deployment::Deployment, colo::deployment::DeploymentRegistration,
         colo::deployment::InstrumentBaseline, colo::deployment::AssetHolding,
-        colo::deployment::RetireRequest,
+        colo::deployment::RetireRequest, colo::ingest::AdjustmentRequest,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -1549,6 +1550,10 @@ async fn serve() {
         .route(
             "/admin/strategies/:code/deployments/:id/retire",
             post(colo::deployment::retire),
+        )
+        .route(
+            "/admin/strategies/:code/deployments/:id/adjustments",
+            post(colo::ingest::adjustment),
         )
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/feeds", get(admin::list_feeds))

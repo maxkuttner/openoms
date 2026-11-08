@@ -421,6 +421,16 @@ pub async fn register_deployment(
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+        sqlx::query(
+            "INSERT INTO colo_asset_balance (account_id, asset, quantity) VALUES ($1, $2, $3) \
+             ON CONFLICT (account_id, asset) DO UPDATE SET quantity = EXCLUDED.quantity, updated_at = now()",
+        )
+        .bind(input.account_id)
+        .bind(&asset.asset)
+        .bind(asset.quantity)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
     }
 
     let policy = policy_for(&mut tx, deployment_id, &input.strategy_code, portfolio_id).await?;

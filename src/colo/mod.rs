@@ -6,6 +6,7 @@ pub mod booking;
 pub mod control;
 pub mod deployment;
 pub mod follow;
+pub mod ingest;
 pub mod link_server;
 
 use std::collections::{HashMap, VecDeque};
@@ -396,9 +397,16 @@ impl ColoHub {
             };
             control::on_event(&state, &self, &strategy, &adapter, &event).await;
             match event {
-                FollowEvent::Fill(fill) => match booking::book_fill(&state, &strategy, &adapter, &fill).await {
-                    Ok(_) => {}
-                    Err(e) => error!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not booked; recon retries on the next reconnect"),
+                FollowEvent::Fill(fill) => {
+                    if let Ok(Some(identity)) = ingest::identity_for_strategy(state.pool(), &strategy.code).await {
+                        if let Err(e) = ingest::observe_external_fill(&state, &identity, &fill).await {
+                            warn!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not recorded in the durable ledger");
+                        }
+                    }
+                    match booking::book_fill(&state, &strategy, &adapter, &fill).await {
+                        Ok(_) => {}
+                        Err(e) => error!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not booked; recon retries on the next reconnect"),
+                    }
                 },
                 FollowEvent::Connected => follow::fill_gap(&state, &self, &strategy, &adapter).await,
                 FollowEvent::Opened { .. } | FollowEvent::Closed { .. } => {}

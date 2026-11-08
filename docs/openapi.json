@@ -2557,6 +2557,61 @@
         ]
       }
     },
+    "/admin/strategies/{code}/deployments/{id}/adjustments": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "adjustment",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Deployment id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdjustmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Adjusted"
+          },
+          "400": {
+            "description": "Deployment not stopped or invalid"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/strategies/{code}/deployments/{id}/retire": {
       "post": {
         "tags": [
@@ -3945,6 +4000,26 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "AdjustmentRequest": {
+        "type": "object",
+        "required": [
+          "asset",
+          "amount",
+          "reason"
+        ],
+        "properties": {
+          "amount": {
+            "type": "number",
+            "format": "double"
+          },
+          "asset": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
           }
         }
       },
