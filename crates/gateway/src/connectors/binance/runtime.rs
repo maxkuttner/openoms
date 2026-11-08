@@ -618,6 +618,34 @@ mod tests {
         assert_eq!(trades[0].fee, Some(Fee { amount: 0.01, currency: "BNB".into() }));
     }
 
+    #[tokio::test]
+    #[ignore = "needs BINANCE_TEST_API_KEY and BINANCE_TEST_PRIVATE_KEY for testnet"]
+    async fn testnet_read_only_smoke() {
+        use reqwest::Method;
+        let api_key = std::env::var("BINANCE_TEST_API_KEY").expect("BINANCE_TEST_API_KEY");
+        let private_key = std::env::var("BINANCE_TEST_PRIVATE_KEY").expect("BINANCE_TEST_PRIVATE_KEY");
+        let adapter = BinanceAdapter::new(api_key, &private_key, "PAPER").expect("testnet adapter");
+        let instruments = adapter.list_spot_instruments().await.expect("exchangeInfo");
+        assert!(!instruments.is_empty(), "testnet returned no spot instruments");
+
+        let account = adapter.signed(Method::GET, "/api/v3/account", &[]).await.expect("signed account");
+        assert!(account.status().is_success(), "signed account status {}", account.status());
+        let body: Value = account.json().await.expect("account json");
+        let balances = parse_balances(&body);
+
+        let open = adapter.signed(Method::GET, "/api/v3/openOrders", &[]).await.expect("signed openOrders");
+        assert!(open.status().is_success(), "signed openOrders status {}", open.status());
+        let body: Value = open.json().await.expect("openOrders json");
+        let orders = parse_runtime_orders(&body);
+
+        eprintln!(
+            "testnet read-only: instruments={}, balances={}, open_orders={}",
+            instruments.len(),
+            balances.len(),
+            orders.len()
+        );
+    }
+
     #[test]
     fn stream_health_distinguishes_stale_from_closed() {
         assert_ne!(health_event(StreamState::Stale), health_event(StreamState::Closed));

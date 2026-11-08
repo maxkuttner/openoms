@@ -13,6 +13,7 @@ Host: macOS, aarch64, rustc 1.93.1.
 | `COLO_TEST_DATABASE_URL=… scripts/test-colo-isolated.sh` against a disposable `postgres:16` container on a private port | system 4, deployment 7, ingest 2, risk-engine 2 — all passed; migrations `0041`/`0042` applied |
 | `cargo test -p colo-example` | 5 passed |
 | `cargo run --release -p colo-runtime --example latency -- 2000` | `p50 18,125 ns`, `p99 35,583 ns`, `p999 37,625 ns`, max `110,250 ns`, 2,000 samples, 0 errors |
+| `cargo test -p gateway --no-default-features connectors::binance::runtime::tests::testnet_read_only_smoke -- --ignored` | passed: 1,373 spot instruments, 517 balances, 0 open orders from Binance Spot testnet; no order placed/cancelled |
 | `npm run check` in `docs-site` | 38 tests passed, 0 failed |
 | `git diff --check` | clean |
 
@@ -48,8 +49,10 @@ Verified there:
 - A local TLS two-socket fixture now runs in `link_server` tests: bootstrap over
   `/v2/control`, a bounded batch over `/v2/events`, durable accept, and ACK back
   over control. Real OMS/Postgres binding still needs the isolated DB harness.
-- No Binance testnet or live venue traffic was used. Venue-specific recovery,
-  cancellation and fee-asset reconciliation remain unverified.
+- Binance Spot testnet was reached read-only: signed account and open-orders
+  requests plus public exchangeInfo passed. Order placement/cancellation,
+  user-data streams, recovery and fee-asset reconciliation remain unverified
+  and require explicit approval for side-effecting testnet orders.
 - The reference example still uses the v1 control link with the shared `risk`
   evaluator; it has not yet been migrated to the embedded runtime. This is an
   explicit open gate, not a completed feature.
