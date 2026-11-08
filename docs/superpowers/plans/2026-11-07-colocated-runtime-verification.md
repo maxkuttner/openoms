@@ -39,10 +39,9 @@ the following remain unverified in this environment:
 
 ## Live/TLS gates still open
 
-- No local TLS v2 control/event system fixture was run in this pass. The pure
-  protocol/state tests run, and the OMS event socket now durably accepts batches
-  and pushes ACKs, but two-socket reconnect/OMS binding still needs the isolated
-  system harness.
+- A local TLS two-socket fixture now runs in `link_server` tests: bootstrap over
+  `/v2/control`, a bounded batch over `/v2/events`, durable accept, and ACK back
+  over control. Real OMS/Postgres binding still needs the isolated DB harness.
 - No Binance testnet or live venue traffic was used. Venue-specific recovery,
   cancellation and fee-asset reconciliation remain unverified.
 - The reference example still uses the v1 control link with the shared `risk`
@@ -64,5 +63,6 @@ Unverified until the gates above run: production migration, isolated database
 behaviour, local TLS two-socket flow, venue/testnet behaviour, end-to-end
 journal-inclusive latency, and reference-program runtime migration. The
 runtime deliberately does not build sockets itself: the caller injects an
-authenticated `RuntimeLink`; `V2RuntimeLink` is the production adapter. That
-real two-socket path still needs the local TLS/OMS fixture.
+authenticated `RuntimeLink`; `V2RuntimeLink` is the production adapter. The
+local TLS two-socket fixture passes; a real OMS deployment still needs the
+isolated DB harness.

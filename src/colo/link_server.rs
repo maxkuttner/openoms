@@ -374,8 +374,15 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use colo_link::client::{Link, LinkConfig};
+    use chrono::Utc;
+    use colo_link::client::{Link, LinkConfig, V2LinkConfig, V2RuntimeLink};
     use colo_link::proto::{FromStrategy, ToStrategy};
+    use colo_link::v2::{
+        Allocation, EventAck as V2EventAck, EventBatch, EventRecord, FromRuntime,
+        FromRuntimeEnvelope, RuntimeCheckpoint, RuntimeLink, Timings, ToRuntime,
+    };
+    use super::deployment::V2Binding;
+    use gateway::runtime::{AccountIdentity, ExecutionCursor, RuntimeEvent, StreamState};
 
     use super::*;
 
@@ -388,6 +395,59 @@ mod tests {
         }
         async fn initial_state(&self, _code: &str) -> ToStrategy {
             ToStrategy::State { active: true, limits: Default::default(), limits_version: 1, positions: vec![], dead_man_secs: 5 }
+        }
+    }
+
+    fn deployment() -> Deployment {
+        let now = Utc::now();
+        Deployment {
+            id: Uuid::new_v4(), strategy_code: "mm1".into(), account_id: Uuid::new_v4(),
+            venue: "BINANCE".into(), environment: "PAPER".into(), external_account_ref: "sub".into(),
+            epoch: 1, status: "ACTIVE".into(), authority_secs: 5, market_data_max_age_secs: 2,
+            heartbeat_secs: 1, allocation_quote_asset: "USDT".into(), allocation_max_notional: 1_000.0,
+            allocation_max_position_qty: None, policy_revision: 1, kill_epoch: None,
+            kill_command_id: None, verified_stop_at: None, verified_stop_epoch: None,
+            retired_at: None, shutdown_evidence: None, created_at: now, updated_at: now,
+        }
+    }
+
+    struct V2Stub {
+        deployment: Deployment,
+        account: AccountIdentity,
+        nonce: Uuid,
+        hub: ColoHub,
+        batches: Arc<std::sync::Mutex<Vec<EventBatch>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LinkBackend for V2Stub {
+        async fn authorize(&self, _: &str, _: SocketAddr) -> Option<String> { None }
+        async fn initial_state(&self, _: &str) -> ToStrategy {
+            ToStrategy::State { active: false, limits: Default::default(), limits_version: 0, positions: vec![], dead_man_secs: 5 }
+        }
+        async fn authorize_v2(&self, token: &str, _: SocketAddr, deployment_id: Uuid, nonce: Uuid, _: bool) -> Option<V2Binding> {
+            (token == "tok" && deployment_id == self.deployment.id && nonce == self.nonce).then(|| V2Binding {
+                deployment: self.deployment.clone(),
+                epoch: 1,
+                session_nonce: self.nonce,
+                account: self.account.clone(),
+            })
+        }
+        async fn bootstrap_v2(&self, _: &Deployment) -> Result<Bootstrap, String> {
+            Ok(Bootstrap {
+                instruments: vec![], limits: Default::default(), trading_state: risk::TradingState::Active,
+                instrument_states: Default::default(), timings: Timings { heartbeat_secs: 1, authority_secs: 5, market_data_max_age_secs: 2 },
+                baseline: RuntimeCheckpoint { sequence: 0, positions: Default::default(), open_client_ids: vec![], execution_cursor: ExecutionCursor::default(), complete: true },
+                asset_baseline: Default::default(), killed_epoch: None,
+                allocation: Allocation { quote_asset: "USDT".into(), max_notional: 1_000.0, max_position_qty: None },
+                recovery_universe: vec![],
+            })
+        }
+        async fn accept_events(&self, deployment: &Deployment, batch: &EventBatch) -> Result<u64, String> {
+            self.batches.lock().unwrap().push(batch.clone());
+            let through = batch.last_sequence();
+            self.hub.push_v2_control(deployment.id, ToRuntime::EventAck { ack: V2EventAck { through_sequence: through } });
+            Ok(through)
         }
     }
 
@@ -437,5 +497,67 @@ mod tests {
         let (_link, mut rx) = Link::spawn(LinkConfig { url: format!("wss://localhost:{port}"), token: "nope".into(), ca_pem: Some(CERT.to_vec()) });
         assert!(tokio::time::timeout(Duration::from_secs(2), rx.recv()).await.is_err(), "a wrong token got a state");
         assert!(!hub.link_status("mm1").connected);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_tls_v2_sockets_bind_bootstrap_events_and_ack() {
+        let hub = crate::colo::ColoHub::default();
+        let deployment = deployment();
+        let nonce = Uuid::new_v4();
+        let account = AccountIdentity {
+            account_id: deployment.account_id,
+            venue: "BINANCE".into(),
+            environment: "PAPER".into(),
+            external_account_ref: "sub".into(),
+        };
+        let backend = Arc::new(V2Stub {
+            deployment: deployment.clone(),
+            account: account.clone(),
+            nonce,
+            hub: hub.clone(),
+            batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_on(listener, tls_acceptor(CERT, KEY).unwrap(), backend.clone(), hub));
+        let link = V2RuntimeLink::spawn(V2LinkConfig {
+            control_url: format!("wss://localhost:{port}/v2/control?deployment={}&nonce={nonce}", deployment.id),
+            events_url: format!("wss://localhost:{port}/v2/events?deployment={}&nonce={nonce}", deployment.id),
+            token: "tok".into(),
+            ca_pem: Some(CERT.to_vec()),
+            account: account.clone(),
+            epoch: 1,
+            session_nonce: nonce.to_string(),
+            policy_revision: 1,
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), link.recv_control()).await.unwrap().unwrap();
+        assert!(matches!(first.message, ToRuntime::Bootstrap { .. }));
+
+        let batch = EventBatch {
+            first_sequence: 1,
+            records: vec![EventRecord {
+                sequence: 1,
+                event: RuntimeEvent::Health { account: account.clone(), state: StreamState::Live, observed_at: Utc::now() },
+            }],
+        };
+        link.send_events(FromRuntimeEnvelope {
+            protocol_version: 2,
+            account,
+            epoch: 1,
+            policy_revision: 1,
+            sequence: 1,
+            session_nonce: nonce.to_string(),
+            message: FromRuntime::Events { batch },
+        })
+        .await
+        .unwrap();
+        let ack = loop {
+            let msg = tokio::time::timeout(Duration::from_secs(5), link.recv_control()).await.unwrap().unwrap();
+            if let ToRuntime::EventAck { ack } = msg.message {
+                break ack;
+            }
+        };
+        assert_eq!(ack.through_sequence, 1);
+        assert_eq!(backend.batches.lock().unwrap().len(), 1);
     }
 }
