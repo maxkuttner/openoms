@@ -175,7 +175,7 @@ fn a_policy_revision_rollback_is_rejected() {
         "n1",
         2,
         2,
-        ToRuntime::Policy { policy: Policy { limits: BTreeMap::new(), trading_state: risk::TradingState::Active, instrument_states: BTreeMap::new() } },
+        ToRuntime::Policy { policy: Policy { revision: 3, limits: BTreeMap::new(), trading_state: risk::TradingState::Active, instrument_states: BTreeMap::new() } },
     );
     assert!(matches!(
         session.receive_control(msg, Instant::now()),

@@ -281,6 +281,58 @@ impl Book {
         self.sequence
     }
 
+    /// Recreate a locally admitted order from the durable journal before
+    /// replaying its venue events. The reservation is charged again from the
+    /// restored opening inventory.
+    pub fn restore_order(
+        &mut self,
+        submission: &Submission,
+        intent: &Intent,
+        reservation: &Reservation,
+    ) -> Result<(), RuntimeError> {
+        if self.orders.contains_key(&submission.client_order_id) {
+            return Ok(());
+        }
+        if !self.instruments.contains_key(&intent.instrument) {
+            return Err(RuntimeError::UnknownInstrument(intent.instrument.clone()));
+        }
+        self.assets.reserve(&reservation.asset, reservation.amount)?;
+        self.sequence = self.sequence.max(submission.sequence);
+        let per_unit = reservation.amount / intent.quantity;
+        self.orders.insert(
+            submission.client_order_id.clone(),
+            RestingOrder {
+                client_order_id: submission.client_order_id.clone(),
+                venue_order_id: None,
+                instrument: intent.instrument.clone(),
+                side: intent.side,
+                original_quantity: intent.quantity,
+                executed_quantity: 0.0,
+                leaves_quantity: intent.quantity,
+                limit_price: intent.limit_price,
+                state: LocalState::Pending,
+                reservation_asset: reservation.asset.clone(),
+                reserved_per_unit: per_unit,
+                reserved_amount: reservation.amount,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn pending_client_ids(&self) -> Vec<String> {
+        self.orders
+            .values()
+            .filter(|o| matches!(o.state, LocalState::Pending | LocalState::Unknown))
+            .map(|o| o.client_order_id.clone())
+            .collect()
+    }
+
+    pub fn order_symbol(&self, client_order_id: &str) -> Option<&str> {
+        self.orders
+            .get(client_order_id)
+            .map(|o| o.instrument.as_str())
+    }
+
     pub fn is_paused(&self) -> bool {
         self.pause_reason.is_some()
     }

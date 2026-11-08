@@ -126,6 +126,7 @@ impl Bootstrap {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
+    pub revision: u64,
     pub limits: BTreeMap<String, risk::Limits>,
     pub trading_state: risk::TradingState,
     #[serde(default)]

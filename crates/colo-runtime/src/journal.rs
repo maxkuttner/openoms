@@ -122,6 +122,10 @@ impl Journal {
         })
     }
 
+    pub fn identity(&self) -> &AccountIdentity {
+        &self.identity
+    }
+
     pub fn append_durable(&mut self, record: &JournalRecord) -> Result<u64, RuntimeError> {
         if self.fail_next_write {
             self.fail_next_write = false;

@@ -13,7 +13,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use colo_link::v2::{Allocation, Bootstrap, Policy, RuntimeCheckpoint, Timings, ToRuntime};
-use gateway::runtime::{AccountIdentity, ExecutionCursor as Cursor, InstrumentRules, Operation, VenueCapabilities};
+use gateway::runtime::{AccountIdentity, ExecutionCursor as Cursor, InstrumentRules, Operation, SymbolCursor, VenueCapabilities};
 
 use crate::admin::AdminError;
 use crate::app_state::AppState;
@@ -968,6 +968,7 @@ pub async fn publish_policy(state: &AppState, strategy_code: &str) -> Result<usi
         updates.push((
             deployment_id,
             Policy {
+                revision: revision as u64,
                 limits: policy.limits,
                 trading_state: policy.trading_state,
                 instrument_states: policy.instrument_states,
@@ -1124,11 +1125,18 @@ pub async fn bootstrap(state: &AppState, deployment: &Deployment) -> Result<Boot
     .await
     .map_err(db_bootstrap)?;
 
+    let mut execution_cursor = Cursor::default();
+    for symbol in &symbols {
+        execution_cursor.positions.insert(
+            symbol.clone(),
+            SymbolCursor { last_trade_id: None, start_time: Some(current.created_at) },
+        );
+    }
     let baseline = RuntimeCheckpoint {
         sequence: revision,
         positions,
         open_client_ids,
-        execution_cursor: Cursor::default(),
+        execution_cursor,
         complete: true,
     };
     let limits = policy.limits;

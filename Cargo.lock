@@ -626,7 +626,9 @@ dependencies = [
 name = "colo-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
+ "colo-link",
  "crc32fast",
  "fs2",
  "gateway",

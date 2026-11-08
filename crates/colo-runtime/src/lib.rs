@@ -4,11 +4,15 @@
 
 mod assets;
 mod book;
+pub mod control;
 pub mod journal;
+pub mod recovery;
 
 pub use journal::{Journal, JournalRecord, SequencedRecord};
 
 pub use assets::{AssetLedger, Reservation};
+pub use control::{ControlAction, ControlState, RuntimeState};
+pub use recovery::{recover, RecoveredBook};
 pub use book::{
     Book, CancelRequest, InstrumentPrices, Intent, PreparedOrder, Prices, Submission,
 };
@@ -35,6 +39,10 @@ pub enum RuntimeError {
     InvalidConfig(String),
     DuplicateOrder(String),
     JournalIo(String),
+    NotReady(String),
+    KillLatched,
+    StaleAuthority,
+    InvalidControl(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -55,6 +63,10 @@ impl std::fmt::Display for RuntimeError {
             Self::InvalidConfig(msg) => write!(f, "invalid configuration: {msg}"),
             Self::DuplicateOrder(id) => write!(f, "duplicate order id {id}"),
             Self::JournalIo(msg) => write!(f, "journal I/O failed: {msg}"),
+            Self::NotReady(msg) => write!(f, "runtime is not ready: {msg}"),
+            Self::KillLatched => write!(f, "persistent kill latch is set"),
+            Self::StaleAuthority => write!(f, "authority is stale or expired"),
+            Self::InvalidControl(msg) => write!(f, "invalid control message: {msg}"),
         }
     }
 }
