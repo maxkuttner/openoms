@@ -4,6 +4,9 @@
 
 mod assets;
 mod book;
+pub mod journal;
+
+pub use journal::{Journal, JournalRecord, SequencedRecord};
 
 pub use assets::{AssetLedger, Reservation};
 pub use book::{
@@ -31,6 +34,7 @@ pub enum RuntimeError {
     OrderNotWorking(String),
     InvalidConfig(String),
     DuplicateOrder(String),
+    JournalIo(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -50,6 +54,7 @@ impl std::fmt::Display for RuntimeError {
             Self::OrderNotWorking(id) => write!(f, "order {id} is not working"),
             Self::InvalidConfig(msg) => write!(f, "invalid configuration: {msg}"),
             Self::DuplicateOrder(id) => write!(f, "duplicate order id {id}"),
+            Self::JournalIo(msg) => write!(f, "journal I/O failed: {msg}"),
         }
     }
 }

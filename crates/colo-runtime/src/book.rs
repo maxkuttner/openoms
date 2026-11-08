@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use gateway::adapter::BrokerOrderRequest;
+use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+
 use gateway::runtime::{
     AccountIdentity, AssetBalance, InstrumentRules, OrderType, RuntimeEvent, RuntimeOrder,
     RuntimeOrderState, Side, StreamState, TimeInForce, Trade, TradeKey, VenueEvent,
@@ -10,7 +13,7 @@ use gateway::runtime::{
 use crate::assets::{AssetLedger, Reservation};
 use crate::RuntimeError;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Intent {
     pub instrument: String,
     pub side: Side,
@@ -60,7 +63,7 @@ impl Prices {
 }
 
 /// Identifies local acceptance. It is not venue acknowledgement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
     pub client_order_id: String,
     pub sequence: u64,
@@ -269,6 +272,15 @@ impl Book {
         self.assets.free(asset)
     }
 
+    /// Restore the last durable sequence after replay. Never moves backwards.
+    pub fn restore_sequence(&mut self, sequence: u64) {
+        self.sequence = self.sequence.max(sequence);
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     pub fn is_paused(&self) -> bool {
         self.pause_reason.is_some()
     }
@@ -372,7 +384,7 @@ impl Book {
         }
 
         let sequence = self.sequence.saturating_add(1);
-        let client_order_id = format!("cr-{sequence:016x}");
+        let client_order_id = Uuid::new_v5(&self.identity.account_id, &sequence.to_be_bytes()).to_string();
         if self.orders.contains_key(&client_order_id) {
             return Err(RuntimeError::DuplicateOrder(client_order_id));
         }

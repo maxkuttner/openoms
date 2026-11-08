@@ -131,8 +131,11 @@ fn cap_ten_admits_first_buy_six_and_rejects_second() {
     let mut book = book(limits, &[("USDT", 10_000.0)]);
     let btc = prices("BTCUSDT", 100.0);
     let now = Instant::now();
-    book.prepare(intent("BTCUSDT", Side::Buy, 6.0, 100.0), &btc, now)
+    let first = book
+        .prepare(intent("BTCUSDT", Side::Buy, 6.0, 100.0), &btc, now)
         .expect("first buy");
+    assert_eq!(first.submission.client_order_id.len(), 36);
+    assert!(first.submission.client_order_id.parse::<Uuid>().is_ok());
     let second = book
         .prepare(intent("BTCUSDT", Side::Buy, 6.0, 100.0), &btc, now)
         .unwrap_err();

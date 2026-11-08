@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use gateway::runtime::AssetBalance;
+use serde::{Deserialize, Serialize};
 
 use crate::RuntimeError;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Reservation {
     pub asset: String,
     pub amount: f64,
