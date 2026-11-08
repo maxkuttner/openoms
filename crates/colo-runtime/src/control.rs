@@ -178,7 +178,12 @@ impl ControlState {
     }
 
     fn install_limits(&mut self, limits: &BTreeMap<String, risk::Limits>, actions: &mut Vec<ControlAction>) {
-        let mut reduced = Vec::new();
+        let mut reduced: Vec<String> = self
+            .limits
+            .keys()
+            .filter(|symbol| !limits.contains_key(*symbol))
+            .cloned()
+            .collect();
         for (symbol, next) in limits {
             if let Some(previous) = self.limits.get(symbol) {
                 if is_reduction(previous, next) {
@@ -218,10 +223,15 @@ fn is_reduction(previous: &risk::Limits, next: &risk::Limits) -> bool {
     ];
     let numeric = fields
         .into_iter()
-        .any(|(old, new)| matches!((old, new), (Some(old), Some(new)) if new < old));
-    let rate = matches!(
-        (previous.max_orders_per_sec, next.max_orders_per_sec),
-        (Some(old), Some(new)) if new < old
-    );
+        .any(|(old, new)| match (old, new) {
+            (None, Some(_)) => true,
+            (Some(old), Some(new)) => new < old,
+            _ => false,
+        });
+    let rate = match (previous.max_orders_per_sec, next.max_orders_per_sec) {
+        (None, Some(_)) => true,
+        (Some(old), Some(new)) => new < old,
+        _ => false,
+    };
     numeric || rate
 }

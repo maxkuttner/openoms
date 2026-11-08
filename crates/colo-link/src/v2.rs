@@ -398,6 +398,9 @@ impl V2Session {
             if self.last_control.is_none() {
                 return Err(ProtocolError::SequenceGap { expected: 1, got: seq });
             }
+            if self.last_control.as_ref().is_some_and(|(_, m)| *m == envelope.message) {
+                return Ok(Received::new(envelope.message, received_at));
+            }
         } else if seq > self.last_control_sequence + 1 {
             return Err(ProtocolError::SequenceGap {
                 expected: self.last_control_sequence + 1,
@@ -504,6 +507,11 @@ impl V2Session {
 
     pub fn killed(&self) -> bool {
         self.killed
+    }
+
+    pub fn seed_event_sequence(&mut self, sequence: u64) {
+        self.last_sent_event_sequence = sequence;
+        self.last_acked_event_sequence = sequence;
     }
 
     pub fn queue_events(&mut self, events: Vec<RuntimeEvent>) -> Result<EventBatch, ProtocolError> {

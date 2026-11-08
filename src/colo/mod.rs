@@ -250,6 +250,9 @@ impl ColoHub {
     pub(crate) fn push_v2_control(&self, deployment_id: Uuid, message: ToRuntime) -> bool {
         let mut links = self.v2_control.lock().unwrap();
         let Some(slot) = links.get_mut(&deployment_id) else { return false };
+        if let ToRuntime::Policy { policy } = &message {
+            slot.policy_revision = policy.revision;
+        }
         let sequence = slot.next_sequence;
         slot.next_sequence = slot.next_sequence.saturating_add(1);
         let envelope = ToRuntimeEnvelope {

@@ -40,8 +40,9 @@ the following remain unverified in this environment:
 ## Live/TLS gates still open
 
 - No local TLS v2 control/event system fixture was run in this pass. The pure
-  protocol/state tests run, but two-socket reconnect and OMS binding need the
-  isolated system harness.
+  protocol/state tests run, and the OMS event socket now durably accepts batches
+  and pushes ACKs, but two-socket reconnect/OMS binding still needs the isolated
+  system harness.
 - No Binance testnet or live venue traffic was used. Venue-specific recovery,
   cancellation and fee-asset reconciliation remain unverified.
 - The reference example still uses the v1 control link with the shared `risk`
@@ -56,8 +57,11 @@ Implemented and unit-tested: shared risk evaluator, Binance runtime recovery
 contract, deterministic Book/asset reservations, durable journal, v2 protocol,
 deployment registration/bootstrap/admin endpoints, recovery barrier/control
 state, durable OMS inbox/economic trade identity/native-asset ledger, runtime
-runner and replay reporter.
+runner with post-start event ingestion and policy/allocation application, and a
+replay reporter (not yet connected to the runtime sockets).
 
 Unverified until the gates above run: production migration, isolated database
 behaviour, local TLS two-socket flow, venue/testnet behaviour, end-to-end
-journal-inclusive latency, and reference-program runtime migration.
+journal-inclusive latency, and reference-program runtime migration. The
+reporter still needs to be wired into the runtime's control/event sockets; the
+runtime currently ingests venue events but does not itself open v2 connections.

@@ -13,9 +13,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use colo_link::v2::{EventBatch, EventRecord};
-use gateway::runtime::{
-    AccountIdentity, RuntimeEvent, Side, Trade, TradeKey, VenueEvent,
-};
+use gateway::contract::ExternalFill;
+use gateway::runtime::{AccountIdentity, RuntimeEvent, Side, Trade, TradeKey, VenueEvent};
 
 use crate::admin::AdminError;
 use crate::app_state::AppState;
@@ -165,7 +164,7 @@ pub async fn drain_inbox(
     deployment_id: Uuid,
 ) -> Result<DrainProgress, IngestError> {
     let deployment = sqlx::query(
-        "SELECT account_id, venue, environment, external_account_ref, status, ingest_suspended_reason \
+        "SELECT strategy_code, account_id, venue, environment, external_account_ref, status, ingest_suspended_reason \
          FROM colo_deployment WHERE id = $1",
     )
     .bind(deployment_id)
@@ -185,6 +184,7 @@ pub async fn drain_inbox(
         environment: deployment.get("environment"),
         external_account_ref: deployment.get("external_account_ref"),
     };
+    let strategy_code: String = deployment.get("strategy_code");
     let rows = sqlx::query(
         "SELECT sequence, payload FROM colo_event_inbox \
          WHERE deployment_id = $1 AND processed_at IS NULL ORDER BY sequence",
@@ -201,7 +201,29 @@ pub async fn drain_inbox(
         let record: EventRecord = serde_json::from_value(payload)
             .map_err(|e| IngestError::Invalid(e.to_string()))?;
         if let RuntimeEvent::Venue { account: _, event: VenueEvent::Trade(trade) } = &record.event {
-            observe_trade(state, &identity, trade).await?;
+            let receipt = observe_trade(state, &identity, trade).await?;
+            if receipt.inserted {
+                let strategy = state
+                    .strategies()
+                    .by_code(&strategy_code)
+                    .ok_or_else(|| IngestError::Invalid(format!("unknown strategy {strategy_code}")))?;
+                let adapter = state
+                    .colo()
+                    .adapter(&strategy_code)
+                    .ok_or_else(|| IngestError::Invalid("no venue adapter for booking".into()))?;
+                let fill = ExternalFill {
+                    trade_id: trade.key.trade_id.clone(),
+                    venue_order_id: trade.venue_order_id.clone(),
+                    client_order_id: trade.client_order_id.clone(),
+                    symbol: trade.key.symbol.clone(),
+                    buy: trade.side == Side::Buy,
+                    qty: trade.quantity,
+                    price: trade.price,
+                };
+                super::booking::book_fill(state, &strategy, &adapter, &fill)
+                    .await
+                    .map_err(IngestError::Invalid)?;
+            }
         }
         sqlx::query(
             "UPDATE colo_event_inbox SET processed_at = now() \
@@ -537,6 +559,16 @@ pub async fn adjust_balance(
          ON CONFLICT (account_id, asset) DO UPDATE SET quantity = colo_asset_balance.quantity + EXCLUDED.quantity, updated_at = now()",
     )
     .bind(account)
+    .bind(asset)
+    .bind(amount)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
+    sqlx::query(
+        "INSERT INTO colo_deployment_asset_baseline (deployment_id, asset, quantity) VALUES ($1, $2, $3) \
+         ON CONFLICT (deployment_id, asset) DO UPDATE SET quantity = colo_deployment_asset_baseline.quantity + EXCLUDED.quantity",
+    )
+    .bind(deployment_id)
     .bind(asset)
     .bind(amount)
     .execute(&mut *tx)

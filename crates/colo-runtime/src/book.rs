@@ -147,6 +147,8 @@ pub struct Book {
     by_venue: HashMap<String, String>,
     assets: AssetLedger,
     state: TradingState,
+    instrument_states: BTreeMap<String, TradingState>,
+    allocation: Option<(String, f64, Option<f64>)>,
     fee_allowance_bps: f64,
     health: BookHealth,
     rate: VecDeque<Instant>,
@@ -185,6 +187,8 @@ impl Book {
             by_venue: HashMap::new(),
             assets: AssetLedger::default(),
             state: TradingState::Active,
+            instrument_states: BTreeMap::new(),
+            allocation: None,
             fee_allowance_bps: 0.0,
             health: BookHealth::Unknown,
             rate: VecDeque::new(),
@@ -213,6 +217,53 @@ impl Book {
         }
         self.positions.insert(instrument.into(), quantity);
         Ok(())
+    }
+
+    pub fn install_policy(
+        &mut self,
+        limits: BTreeMap<String, risk::Limits>,
+        state: risk::TradingState,
+        instrument_states: BTreeMap<String, risk::TradingState>,
+    ) {
+        self.limits = limits;
+        self.state = match state {
+            risk::TradingState::Active => TradingState::Active,
+            risk::TradingState::Reducing => TradingState::Reducing,
+            risk::TradingState::Halted => TradingState::Halted,
+        };
+        self.instrument_states = instrument_states
+            .into_iter()
+            .map(|(symbol, state)| {
+                let state = match state {
+                    risk::TradingState::Active => TradingState::Active,
+                    risk::TradingState::Reducing => TradingState::Reducing,
+                    risk::TradingState::Halted => TradingState::Halted,
+                };
+                (symbol, state)
+            })
+            .collect();
+    }
+
+    pub fn set_allocation(&mut self, quote_asset: String, max_notional: f64, max_position_qty: Option<f64>) {
+        self.allocation = Some((quote_asset, max_notional, max_position_qty));
+    }
+
+    pub fn working_client_ids(&self, instrument: &str) -> Vec<String> {
+        self.orders
+            .values()
+            .filter(|o| o.instrument == instrument && o.state.is_working())
+            .map(|o| o.client_order_id.clone())
+            .collect()
+    }
+
+    /// Undo a prepared order whose durable intent write failed.
+    pub fn abort_order(&mut self, client_order_id: &str) {
+        if let Some(order) = self.orders.remove(client_order_id) {
+            self.assets.release(&order.reservation_asset, order.reserved_amount);
+            if let Some(venue) = order.venue_order_id {
+                self.by_venue.remove(&venue);
+            }
+        }
     }
 
     pub fn set_trading_state_active(&mut self) {
@@ -410,7 +461,12 @@ impl Book {
             },
             exposure,
             limits: risk_limits,
-            state: risk_state(self.state),
+            state: risk_state(
+                self.instrument_states
+                    .get(&intent.instrument)
+                    .copied()
+                    .unwrap_or(self.state),
+            ),
             valuation: risk::Valuation {
                 order_price: if intent.order_type == OrderType::Market { valuation.order } else { None },
                 position_price: valuation.position,
@@ -421,6 +477,31 @@ impl Book {
 
         let (reservation_asset, reservation_amount, reserved_per_unit) =
             self.required_reservation(&intent, &rules, quote_price)?;
+        if let Some((quote, max_notional, max_position)) = &self.allocation {
+            if intent.side == Side::Buy
+                && *quote == reservation_asset
+                && self.assets.committed(quote) + reservation_amount > *max_notional
+            {
+                return Err(RuntimeError::Rejected(risk::Reject::new(
+                    "allocation_notional",
+                    "deployment allocation would be exceeded",
+                )));
+            }
+            if let Some(max_position) = max_position {
+                let projected = (exposure.position_qty
+                    + match intent.side {
+                        Side::Buy => exposure.working_buy_qty + intent.quantity,
+                        Side::Sell => -exposure.working_sell_qty - intent.quantity,
+                    })
+                .abs();
+                if projected > *max_position {
+                    return Err(RuntimeError::Rejected(risk::Reject::new(
+                        "allocation_position",
+                        "deployment allocation position would be exceeded",
+                    )));
+                }
+            }
+        }
         if !self.assets.can_reserve(&reservation_asset, reservation_amount) {
             let available = self.assets.free(&reservation_asset);
             return Err(RuntimeError::InsufficientAssets {
@@ -559,10 +640,14 @@ impl Book {
                 let price = quote_price.ok_or_else(|| {
                     RuntimeError::InvalidIntent("buy requires a price to reserve quote currency".into())
                 })?;
-                let notional = intent.quantity * price * rules.multiplier;
+                let notional = if intent.order_type == OrderType::Market {
+                    intent.max_quote_spend.unwrap_or(intent.quantity * price * rules.multiplier)
+                } else {
+                    intent.quantity * price * rules.multiplier
+                };
                 let fee = notional * self.fee_allowance_bps / 10_000.0;
-                let per_unit = (price * rules.multiplier) * (1.0 + self.fee_allowance_bps / 10_000.0);
-                Ok((rules.quote_asset.clone(), notional + fee, per_unit))
+                let amount = notional + fee;
+                Ok((rules.quote_asset.clone(), amount, amount / intent.quantity))
             }
             Side::Sell => {
                 let per_unit = rules.multiplier;

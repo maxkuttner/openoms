@@ -411,9 +411,7 @@ pub(crate) fn advance_symbol_cursor(
         .iter()
         .filter_map(|t| t.key.trade_id.parse::<i64>().ok())
         .max();
-    let last_trade_id = last
-        .map(|id| id.saturating_add(1))
-        .or(current.last_trade_id);
+    let last_trade_id = last.or(current.last_trade_id);
     let start_time = if last.is_some() { None } else { current.start_time };
     (
         SymbolCursor { last_trade_id, start_time },
@@ -557,7 +555,7 @@ mod tests {
         let trades = parse_trade_rows(&body, &identity(), TradeProvenance::Recovery);
         let (next, more) = advance_symbol_cursor(&SymbolCursor::default(), &trades, TRADE_PAGE_LIMIT);
         assert!(more);
-        assert_eq!(next.last_trade_id, Some(TRADE_PAGE_LIMIT as i64));
+        assert_eq!(next.last_trade_id, Some((TRADE_PAGE_LIMIT - 1) as i64));
         assert!(next.start_time.is_none());
     }
 

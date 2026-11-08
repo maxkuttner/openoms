@@ -212,6 +212,10 @@ async fn journal_failure_stops_the_send() {
         runtime.submit(intent(1.0)).await,
         Err(colo_runtime::RuntimeError::JournalIo(_))
     ));
+    assert!(matches!(
+        runtime.submit(intent(1.0)).await,
+        Err(colo_runtime::RuntimeError::NotReady(_))
+    ));
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(venue.submitted.load(Ordering::SeqCst), 0);
 }
@@ -234,6 +238,31 @@ async fn a_blocking_venue_call_does_not_block_kill() {
         .unwrap();
     assert_eq!(runtime.state().await, RuntimeState::Suspended);
     venue.gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn a_halted_policy_reaches_the_book() {
+    let (runtime, venue, _dir) = start().await;
+    grant(&runtime).await;
+    runtime
+        .apply_control(Received::new(
+            ToRuntime::Policy {
+                policy: colo_link::v2::Policy {
+                    revision: 2,
+                    limits: BTreeMap::new(),
+                    trading_state: risk::TradingState::Halted,
+                    instrument_states: BTreeMap::new(),
+                },
+            },
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        runtime.submit(intent(1.0)).await,
+        Err(colo_runtime::RuntimeError::Rejected(r)) if r.code == "trading_halted"
+    ));
+    assert_eq!(venue.submitted.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

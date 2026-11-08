@@ -18,6 +18,7 @@ const MAX_HISTORY_PAGES: usize = 100;
 
 pub struct RecoveredBook {
     pub book: Book,
+    pub events: mpsc::Receiver<VenueEvent>,
     pub execution_cursor: ExecutionCursor,
     pub balances: Vec<AssetBalance>,
     pub orders: Vec<RuntimeOrder>,
@@ -155,7 +156,7 @@ pub async fn recover(
         evidence.push(format!("kill latch retained from epoch {killed}"));
     }
     let complete = evidence.is_empty();
-    Ok(RecoveredBook { book, execution_cursor: cursor, balances, orders, evidence, complete })
+    Ok(RecoveredBook { book, events: rx, execution_cursor: cursor, balances, orders, evidence, complete })
 }
 
 async fn reconcile_history(

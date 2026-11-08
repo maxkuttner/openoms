@@ -14,18 +14,34 @@ pub struct Reporter {
     identity: AccountIdentity,
     last_acked: u64,
     journal_acked: u64,
+    sent_journal: u64,
     journal_boundaries: std::collections::BTreeMap<u64, u64>,
 }
 
 impl Reporter {
-    pub fn new(identity: AccountIdentity, epoch: u64, session_nonce: impl Into<String>, _policy_revision: u64) -> Self {
-        Self {
-            session: V2Session::new(identity.clone(), epoch, session_nonce, 1),
+    pub fn new(
+        identity: AccountIdentity,
+        epoch: u64,
+        session_nonce: impl Into<String>,
+        _policy_revision: u64,
+        journal: &Journal,
+    ) -> Result<Self, RuntimeError> {
+        let records = journal.replay()?;
+        let acked = journal.acked();
+        let sent = records
+            .iter()
+            .filter(|r| r.sequence <= acked && !matches!(r.record, JournalRecord::Ack { .. }))
+            .count() as u64;
+        let mut session = V2Session::new(identity.clone(), epoch, session_nonce, 1);
+        session.seed_event_sequence(sent);
+        Ok(Self {
+            session,
             identity,
-            last_acked: 0,
-            journal_acked: 0,
+            last_acked: sent,
+            journal_acked: acked,
+            sent_journal: acked,
             journal_boundaries: std::collections::BTreeMap::new(),
-        }
+        })
     }
 
     pub fn reconnect(&mut self, session_nonce: impl Into<String>) {
@@ -38,8 +54,11 @@ impl Reporter {
         journal: &Journal,
         limit: usize,
     ) -> Result<Option<EventBatch>, RuntimeError> {
+        if let Some(pending) = self.session.resend_pending().first() {
+            return Ok(Some(pending.clone()));
+        }
         let limit = limit.min(REPORT_BATCH);
-        let records = journal.unacked(self.journal_acked.saturating_add(1), limit)?;
+        let records = journal.unacked(self.sent_journal.saturating_add(1), limit)?;
         let journal_last = records.last().map(|r| r.sequence).unwrap_or(self.journal_acked);
         let events: Vec<RuntimeEvent> = records
             .into_iter()
@@ -52,6 +71,7 @@ impl Reporter {
             .session
             .queue_events(events)
             .map_err(|e| RuntimeError::InvalidControl(e.to_string()))?;
+        self.sent_journal = journal_last;
         self.journal_boundaries.insert(batch.last_sequence(), journal_last);
         Ok(Some(batch))
     }
@@ -83,6 +103,7 @@ impl Reporter {
         self.journal_boundaries.retain(|protocol, _| *protocol > through);
         self.last_acked = through;
         self.journal_acked = journal_through;
+        self.sent_journal = self.sent_journal.max(journal_through);
         Ok(())
     }
 

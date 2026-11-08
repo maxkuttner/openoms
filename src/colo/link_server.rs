@@ -14,7 +14,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use colo_link::proto::{FromStrategy, ToStrategy, HEARTBEAT};
-use colo_link::v2::{Bootstrap, FromRuntime, ToRuntime, ToRuntimeEnvelope, PROTOCOL_VERSION};
+use colo_link::v2::{
+    Bootstrap, EventAck as V2EventAck, FromRuntime, ToRuntime, ToRuntimeEnvelope, PROTOCOL_VERSION,
+};
 use uuid::Uuid;
 
 use super::deployment::{self, Deployment, V2Binding};
@@ -48,6 +50,13 @@ pub trait LinkBackend: Send + Sync {
     }
     async fn bootstrap_v2(&self, _deployment: &Deployment) -> Result<Bootstrap, String> {
         Err("v2 bootstrap not supported".into())
+    }
+    async fn accept_events(
+        &self,
+        _deployment: &Deployment,
+        _batch: &colo_link::v2::EventBatch,
+    ) -> Result<u64, String> {
+        Err("v2 event ingest not supported".into())
     }
 }
 
@@ -232,8 +241,16 @@ async fn handle_v2(
                                 || msg.session_nonce != session
                             {
                                 warn!(deployment = %deployment_id, "v2 link: envelope does not match the bound deployment");
-                            } else if matches!(msg.message, FromRuntime::Heartbeat { .. }) {
-                                last_seen = Instant::now();
+                            } else {
+                                match &msg.message {
+                                    FromRuntime::Events { batch } => {
+                                        if let Err(e) = backend.accept_events(&binding.deployment, batch).await {
+                                            warn!(deployment = %deployment_id, error = %e, "v2 link: durable event accept failed");
+                                        }
+                                    }
+                                    FromRuntime::Heartbeat { .. } => last_seen = Instant::now(),
+                                    _ => {}
+                                }
                             }
                         }
                         Err(e) => warn!(error = %e, "v2 link: unreadable envelope"),
@@ -298,6 +315,26 @@ impl LinkBackend for AppBackend {
 
     async fn bootstrap_v2(&self, deployment: &Deployment) -> Result<Bootstrap, String> {
         deployment::bootstrap(&self.0, deployment).await.map_err(|e| e.to_string())
+    }
+
+    async fn accept_events(
+        &self,
+        deployment: &Deployment,
+        batch: &colo_link::v2::EventBatch,
+    ) -> Result<u64, String> {
+        let ack = super::ingest::accept_batch(self.0.pool(), deployment, batch)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.0.colo().push_v2_control(
+            deployment.id,
+            ToRuntime::EventAck {
+                ack: V2EventAck { through_sequence: ack.through_sequence },
+            },
+        );
+        if let Err(e) = super::ingest::drain_inbox(&self.0, deployment.id).await {
+            warn!(deployment = %deployment.id, error = %e, "v2 link: inbox drain deferred");
+        }
+        Ok(ack.through_sequence)
     }
 
     async fn initial_state(&self, code: &str) -> ToStrategy {
