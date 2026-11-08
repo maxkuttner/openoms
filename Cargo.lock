@@ -601,7 +601,9 @@ dependencies = [
 name = "colo-link"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-util",
+ "gateway",
  "native-tls",
  "risk",
  "serde",
@@ -609,6 +611,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.21.0",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

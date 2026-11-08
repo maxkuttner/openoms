@@ -8,7 +8,14 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tracing::{info, warn};
 
+use gateway::runtime::AccountIdentity;
+
 use crate::proto::{FromStrategy, ToStrategy, HEARTBEAT};
+use crate::v2::{
+    FromRuntime, FromRuntimeEnvelope, ToRuntimeEnvelope, PROTOCOL_VERSION,
+};
+
+const V2_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Whether the strategy may trade: it has been told it is active, it is not
 /// killed, and it heard the OMS within the timeout. The OMS's `State` (sent
@@ -192,5 +199,171 @@ mod tests {
         let t0 = Instant::now();
         let d = DeadMan::new(Duration::from_secs(5), t0);
         assert!(!d.may_trade(t0));
+    }
+}
+
+
+/// Configuration for the two-connection v2 link: control carries bootstrap,
+/// policy, authority and kills; events carries bounded batches and ACKs.
+#[derive(Clone)]
+pub struct V2LinkConfig {
+    pub control_url: String,
+    pub events_url: String,
+    pub token: String,
+    pub ca_pem: Option<Vec<u8>>,
+    pub account: AccountIdentity,
+    pub epoch: u64,
+    pub session_nonce: String,
+    pub policy_revision: u64,
+}
+
+/// The runtime's sending half. The control and event queues are separate, so a
+/// delayed event write cannot hold up a kill.
+#[derive(Clone)]
+pub struct V2Link {
+    control: mpsc::Sender<FromRuntimeEnvelope>,
+    events: mpsc::Sender<FromRuntimeEnvelope>,
+    account: AccountIdentity,
+    epoch: u64,
+    policy_revision: u64,
+    session_nonce: String,
+}
+
+impl V2Link {
+    pub fn spawn(
+        cfg: V2LinkConfig,
+    ) -> (
+        V2Link,
+        mpsc::Receiver<ToRuntimeEnvelope>,
+        mpsc::Receiver<ToRuntimeEnvelope>,
+    ) {
+        let (control_tx, control_rx) = mpsc::channel::<FromRuntimeEnvelope>(256);
+        let (events_tx, events_rx) = mpsc::channel::<FromRuntimeEnvelope>(256);
+        let (control_in_tx, control_in_rx) = mpsc::channel::<ToRuntimeEnvelope>(256);
+        let (events_in_tx, events_in_rx) = mpsc::channel::<ToRuntimeEnvelope>(256);
+
+        let control_cfg = cfg.clone();
+        tokio::spawn(async move {
+            run_v2(&control_cfg, control_cfg.control_url.clone(), control_rx, control_in_tx).await;
+        });
+        let event_cfg = cfg.clone();
+        tokio::spawn(async move {
+            run_v2(&event_cfg, event_cfg.events_url.clone(), events_rx, events_in_tx).await;
+        });
+
+        (
+            V2Link {
+                control: control_tx,
+                events: events_tx,
+                account: cfg.account,
+                epoch: cfg.epoch,
+                policy_revision: cfg.policy_revision,
+                session_nonce: cfg.session_nonce,
+            },
+            control_in_rx,
+            events_in_rx,
+        )
+    }
+
+    pub async fn send_control(&self, message: FromRuntime) -> Result<(), ()> {
+        self.control.send(self.envelope(message)).await.map_err(|_| ())
+    }
+
+    pub async fn send_events(&self, message: FromRuntime) -> Result<(), ()> {
+        self.events.send(self.envelope(message)).await.map_err(|_| ())
+    }
+
+    pub async fn send_control_envelope(&self, envelope: FromRuntimeEnvelope) -> Result<(), ()> {
+        self.control.send(envelope).await.map_err(|_| ())
+    }
+
+    pub async fn send_events_envelope(&self, envelope: FromRuntimeEnvelope) -> Result<(), ()> {
+        self.events.send(envelope).await.map_err(|_| ())
+    }
+
+    fn envelope(&self, message: FromRuntime) -> FromRuntimeEnvelope {
+        FromRuntimeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            account: self.account.clone(),
+            epoch: self.epoch,
+            policy_revision: self.policy_revision,
+            sequence: 0,
+            session_nonce: self.session_nonce.clone(),
+            message,
+        }
+    }
+}
+
+async fn run_v2(
+    cfg: &V2LinkConfig,
+    url: String,
+    mut out_rx: mpsc::Receiver<FromRuntimeEnvelope>,
+    in_tx: mpsc::Sender<ToRuntimeEnvelope>,
+) {
+    loop {
+        if let Err(e) = run_v2_once(cfg, &url, &mut out_rx, &in_tx).await {
+            warn!(error = %e, "v2 link: down; reconnecting");
+        }
+        if in_tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn run_v2_once(
+    cfg: &V2LinkConfig,
+    url: &str,
+    out_rx: &mut mpsc::Receiver<FromRuntimeEnvelope>,
+    in_tx: &mpsc::Sender<ToRuntimeEnvelope>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut tls = native_tls::TlsConnector::builder();
+    if let Some(pem) = &cfg.ca_pem {
+        tls.add_root_certificate(native_tls::Certificate::from_pem(pem)?);
+    }
+    let mut request = url.into_client_request()?;
+    request.headers_mut().insert("Authorization", format!("Bearer {}", cfg.token).parse()?);
+    let (ws, _) = tokio::time::timeout(
+        V2_HANDSHAKE_TIMEOUT,
+        tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::NativeTls(tls.build()?)),
+        ),
+    )
+    .await
+    .map_err(|_| "v2 handshake timed out")??;
+    info!(url, "v2 link: connected");
+    let (mut sink, mut stream) = ws.split();
+    let mut beat = tokio::time::interval(HEARTBEAT);
+    loop {
+        tokio::select! {
+            frame = stream.next() => match frame {
+                Some(Ok(Message::Text(text))) => match serde_json::from_str::<ToRuntimeEnvelope>(&text) {
+                    Ok(msg) => { if in_tx.send(msg).await.is_err() { return Ok(()); } }
+                    Err(e) => warn!(error = %e, "v2 link: unreadable message"),
+                },
+                Some(Ok(Message::Close(_))) | None => return Ok(()),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.into()),
+            },
+            msg = out_rx.recv() => match msg {
+                Some(msg) => sink.send(Message::Text(serde_json::to_string(&msg)?)).await?,
+                None => return Ok(()),
+            },
+            _ = beat.tick() => {
+                let heartbeat = FromRuntimeEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    account: cfg.account.clone(),
+                    epoch: cfg.epoch,
+                    policy_revision: cfg.policy_revision,
+                    sequence: 0,
+                    session_nonce: cfg.session_nonce.clone(),
+                    message: FromRuntime::Heartbeat { last_event_sequence: 0 },
+                };
+                sink.send(Message::Text(serde_json::to_string(&heartbeat)?)).await?;
+            },
+        }
     }
 }
