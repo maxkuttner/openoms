@@ -366,9 +366,14 @@ pub async fn update_strategy(
     .ok_or_else(|| AdminError::not_found("strategy"))?;
     validate_comp_ids(&row.sender_comp_id, &row.target_comp_id)?;
     reload(&state).await;
-    if bump && row.mode == "COLOCATED" {
-        if let Some(s) = state.strategies().by_code(&code) {
-            state.colo().push(&code, colo_link::proto::ToStrategy::Limits { limits: s.risk_limits(), limits_version: s.limits_version.max(0) as u64 });
+    if row.mode == "COLOCATED" {
+        if bump {
+            if let Some(s) = state.strategies().by_code(&code) {
+                state.colo().push(&code, colo_link::proto::ToStrategy::Limits { limits: s.risk_limits(), limits_version: s.limits_version.max(0) as u64 });
+            }
+        }
+        if let Err(e) = crate::colo::deployment::publish_policy(&state, &code).await {
+            warn!(%code, error = %e, "strategies: could not publish the v2 policy snapshot");
         }
     }
     Ok(Json(row))
@@ -472,6 +477,9 @@ pub async fn put_connections(
     }
     tx.commit().await.map_err(map_db_error)?;
     reload(&state).await;
+    if let Err(e) = crate::colo::deployment::publish_policy(&state, &code).await {
+        warn!(%code, error = %e, "strategies: could not publish the v2 policy snapshot");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -58,8 +58,15 @@ pub struct Bootstrap {
     pub instruments: Vec<InstrumentRules>,
     pub limits: BTreeMap<String, risk::Limits>,
     pub trading_state: risk::TradingState,
+    #[serde(default)]
+    pub instrument_states: BTreeMap<String, risk::TradingState>,
     pub timings: Timings,
     pub baseline: RuntimeCheckpoint,
+    #[serde(default)]
+    pub asset_baseline: BTreeMap<String, f64>,
+    /// Persistent stop latch; an Active policy cannot clear it.
+    #[serde(default)]
+    pub killed_epoch: Option<u64>,
     pub allocation: Allocation,
     pub recovery_universe: Vec<String>,
 }
@@ -121,6 +128,8 @@ impl Bootstrap {
 pub struct Policy {
     pub limits: BTreeMap<String, risk::Limits>,
     pub trading_state: risk::TradingState,
+    #[serde(default)]
+    pub instrument_states: BTreeMap<String, risk::TradingState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

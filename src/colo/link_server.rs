@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -13,7 +14,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use colo_link::proto::{FromStrategy, ToStrategy, HEARTBEAT};
+use colo_link::v2::{Bootstrap, FromRuntime, ToRuntime, ToRuntimeEnvelope, PROTOCOL_VERSION};
+use uuid::Uuid;
 
+use super::deployment::{self, Deployment, V2Binding};
 use super::ColoHub;
 use crate::app_state::AppState;
 use crate::config::ControlLinkSettings;
@@ -32,6 +36,19 @@ pub trait LinkBackend: Send + Sync {
     /// The co-located strategy a token and peer belong to; `None` refuses.
     async fn authorize(&self, token: &str, peer: SocketAddr) -> Option<String>;
     async fn initial_state(&self, code: &str) -> ToStrategy;
+    async fn authorize_v2(
+        &self,
+        _token: &str,
+        _peer: SocketAddr,
+        _deployment_id: Uuid,
+        _session_nonce: Uuid,
+        _control: bool,
+    ) -> Option<V2Binding> {
+        None
+    }
+    async fn bootstrap_v2(&self, _deployment: &Deployment) -> Result<Bootstrap, String> {
+        Err("v2 bootstrap not supported".into())
+    }
 }
 
 /// The link's TLS server identity. rustls, not the platform's TLS: on macOS
@@ -71,13 +88,20 @@ async fn handle(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls = acceptor.accept(tcp).await?;
     let mut token = String::new();
+    let mut path = String::new();
+    let mut query = String::new();
     let ws = tokio_tungstenite::accept_hdr_async(tls, |req: &Request, res: Response| {
         if let Some(v) = req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
             token = v.strip_prefix("Bearer ").unwrap_or("").to_string();
         }
+        path = req.uri().path().to_string();
+        query = req.uri().query().unwrap_or("").to_string();
         Ok(res)
     })
     .await?;
+    if path == "/v2/control" || path == "/v2/events" {
+        return handle_v2(ws, &token, peer, &path, &query, backend, hub).await;
+    }
     let Some(code) = backend.authorize(&token, peer).await else {
         warn!(%peer, "control link: refused (unknown token, not co-located, or address not allowed)");
         return Ok(());
@@ -119,6 +143,121 @@ async fn handle(
 }
 
 /// The OMS's backend: trading tokens, the strategy registry and its positions.
+
+type ServerWs = tokio_tungstenite::WebSocketStream<
+    tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+>;
+
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
+async fn handle_v2(
+    ws: ServerWs,
+    token: &str,
+    peer: SocketAddr,
+    path: &str,
+    query: &str,
+    backend: Arc<dyn LinkBackend>,
+    hub: ColoHub,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let deployment_id = query_param(query, "deployment")
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .ok_or("v2: missing deployment")?;
+    let session_nonce = query_param(query, "nonce")
+        .and_then(|v| Uuid::parse_str(v).ok())
+        .ok_or("v2: missing session nonce")?;
+    let control = path == "/v2/control";
+    let Some(binding) = backend
+        .authorize_v2(token, peer, deployment_id, session_nonce, control)
+        .await
+    else {
+        warn!(%peer, "v2 link: refused (unknown token, deployment or session)");
+        return Ok(());
+    };
+    let (mut sink, mut stream) = ws.split();
+    let mut beat = tokio::time::interval(HEARTBEAT);
+    let mut last_seen = Instant::now();
+
+    let mut pushes = if control {
+        let bootstrap = backend
+            .bootstrap_v2(&binding.deployment)
+            .await
+            .map_err(|e| format!("v2 bootstrap: {e}"))?;
+        let revision = bootstrap.baseline.sequence;
+        let first = ToRuntimeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            account: binding.account.clone(),
+            epoch: binding.epoch,
+            policy_revision: revision,
+            sequence: 1,
+            session_nonce: binding.session_nonce.to_string(),
+            message: ToRuntime::Bootstrap { bootstrap },
+        };
+        sink.send(Message::Text(serde_json::to_string(&first)?)).await?;
+        Some(hub.register_v2_control(
+            binding.deployment.id,
+            binding.account.clone(),
+            binding.epoch,
+            revision,
+            binding.session_nonce.to_string(),
+        ))
+    } else {
+        None
+    };
+    let session = binding.session_nonce.to_string();
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+        loop {
+            tokio::select! {
+                push = async {
+                    match pushes.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match push {
+                        Some(msg) => sink.send(Message::Text(serde_json::to_string(&msg)?)).await?,
+                        None => return Ok(()),
+                    }
+                }
+                frame = stream.next() => match frame {
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<colo_link::v2::FromRuntimeEnvelope>(&text) {
+                        Ok(msg) => {
+                            if msg.protocol_version != PROTOCOL_VERSION
+                                || msg.account != binding.account
+                                || msg.epoch != binding.epoch
+                                || msg.session_nonce != session
+                            {
+                                warn!(deployment = %deployment_id, "v2 link: envelope does not match the bound deployment");
+                            } else if matches!(msg.message, FromRuntime::Heartbeat { .. }) {
+                                last_seen = Instant::now();
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "v2 link: unreadable envelope"),
+                    },
+                    Some(Ok(Message::Close(_))) | None => return Ok(()),
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e.into()),
+                },
+                _ = beat.tick() => {
+                    if last_seen.elapsed() > Duration::from_secs(3) {
+                        return Err("v2 link: silent for 3 heartbeats".into());
+                    }
+                    sink.send(Message::Ping(Vec::new())).await?;
+                }
+            }
+        }
+    }
+    .await;
+    if control {
+        hub.disconnect_v2_control(deployment_id);
+    }
+    result
+}
+
 struct AppBackend(AppState);
 
 #[async_trait::async_trait]
@@ -129,6 +268,36 @@ impl LinkBackend for AppBackend {
         let strategy = self.0.strategies().all().iter().find(|s| s.principal_id == principal_id && s.mode == Mode::Colocated).cloned()?;
         let ip = peer.ip().to_string();
         (strategy.allowed_addresses.is_empty() || strategy.allowed_addresses.contains(&ip)).then_some(strategy.code)
+    }
+
+    async fn authorize_v2(
+        &self,
+        token: &str,
+        peer: SocketAddr,
+        deployment_id: Uuid,
+        session_nonce: Uuid,
+        control: bool,
+    ) -> Option<V2Binding> {
+        let (key_id, secret) = token.split_once('.')?;
+        let (principal_id, _) = crate::auth::verify_key(self.0.pool(), key_id, secret).await.ok()??;
+        let strategy = self
+            .0
+            .strategies()
+            .all()
+            .iter()
+            .find(|s| s.principal_id == principal_id && s.mode == Mode::Colocated)?
+            .clone();
+        let ip = peer.ip().to_string();
+        if !strategy.allowed_addresses.is_empty() && !strategy.allowed_addresses.contains(&ip) {
+            return None;
+        }
+        deployment::authorize_v2(self.0.pool(), &strategy.code, deployment_id, session_nonce, control)
+            .await
+            .ok()
+    }
+
+    async fn bootstrap_v2(&self, deployment: &Deployment) -> Result<Bootstrap, String> {
+        deployment::bootstrap(&self.0, deployment).await.map_err(|e| e.to_string())
     }
 
     async fn initial_state(&self, code: &str) -> ToStrategy {

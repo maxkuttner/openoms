@@ -2419,6 +2419,206 @@
         ]
       }
     },
+    "/admin/strategies/{code}/deployments": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "list",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deployments",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Deployment"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "register",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeploymentRegistration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Registered",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Deployment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid deployment"
+          },
+          "409": {
+            "description": "Account already registered"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/deployments/{id}": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "get",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Deployment id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deployment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Deployment"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/deployments/{id}/retire": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "retire",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Deployment id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Retired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Deployment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Shutdown not verified"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/strategies/{code}/enable": {
       "post": {
         "tags": [
@@ -3845,6 +4045,22 @@
           }
         }
       },
+      "AssetHolding": {
+        "type": "object",
+        "required": [
+          "asset",
+          "quantity"
+        ],
+        "properties": {
+          "asset": {
+            "type": "string"
+          },
+          "quantity": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
       "BackfillRequest": {
         "type": "object",
         "properties": {
@@ -4436,6 +4652,192 @@
           "type": "string"
         }
       },
+      "Deployment": {
+        "type": "object",
+        "required": [
+          "id",
+          "strategy_code",
+          "account_id",
+          "venue",
+          "environment",
+          "external_account_ref",
+          "epoch",
+          "status",
+          "authority_secs",
+          "market_data_max_age_secs",
+          "heartbeat_secs",
+          "allocation_quote_asset",
+          "allocation_max_notional",
+          "policy_revision",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "allocation_max_notional": {
+            "type": "number",
+            "format": "double"
+          },
+          "allocation_max_position_qty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "allocation_quote_asset": {
+            "type": "string"
+          },
+          "authority_secs": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "epoch": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "external_account_ref": {
+            "type": "string"
+          },
+          "heartbeat_secs": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "kill_command_id": {
+            "type": "string",
+            "nullable": true
+          },
+          "kill_epoch": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "market_data_max_age_secs": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "policy_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "retired_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "shutdown_evidence": {
+            "type": "string",
+            "nullable": true
+          },
+          "status": {
+            "type": "string"
+          },
+          "strategy_code": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "venue": {
+            "type": "string"
+          },
+          "verified_stop_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "verified_stop_epoch": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          }
+        }
+      },
+      "DeploymentRegistration": {
+        "type": "object",
+        "required": [
+          "account_id",
+          "venue",
+          "environment",
+          "external_account_ref",
+          "authority_secs",
+          "market_data_max_age_secs",
+          "allocation_quote_asset",
+          "allocation_max_notional",
+          "instruments",
+          "assets"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "allocation_max_notional": {
+            "type": "number",
+            "format": "double"
+          },
+          "allocation_max_position_qty": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "allocation_quote_asset": {
+            "type": "string"
+          },
+          "assets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AssetHolding"
+            },
+            "description": "Explicit per-asset opening holdings; never inferred from instrument pairs."
+          },
+          "authority_secs": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "external_account_ref": {
+            "type": "string"
+          },
+          "heartbeat_secs": {
+            "type": "integer",
+            "format": "int32",
+            "nullable": true
+          },
+          "instruments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/InstrumentBaseline"
+            },
+            "description": "Explicit allowed universe, each with its opening position/cost baseline."
+          },
+          "market_data_max_age_secs": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "strategy_code": {
+            "type": "string"
+          },
+          "venue": {
+            "type": "string"
+          }
+        }
+      },
       "ExpirySweepResult": {
         "type": "object",
         "required": [
@@ -4620,6 +5022,28 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "InstrumentBaseline": {
+        "type": "object",
+        "required": [
+          "instrument_id",
+          "quantity",
+          "cost_basis"
+        ],
+        "properties": {
+          "cost_basis": {
+            "type": "number",
+            "format": "double"
+          },
+          "instrument_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "quantity": {
+            "type": "number",
+            "format": "double"
           }
         }
       },
@@ -5342,6 +5766,21 @@
           "ticker": {
             "type": "string",
             "nullable": true
+          }
+        }
+      },
+      "RetireRequest": {
+        "type": "object",
+        "required": [
+          "shutdown_evidence",
+          "verified_shutdown"
+        ],
+        "properties": {
+          "shutdown_evidence": {
+            "type": "string"
+          },
+          "verified_shutdown": {
+            "type": "boolean"
           }
         }
       },

@@ -53,6 +53,7 @@ fn bootstrap(complete: bool) -> Bootstrap {
         instruments: vec![rules()],
         limits: BTreeMap::new(),
         trading_state: risk::TradingState::Active,
+        instrument_states: BTreeMap::new(),
         timings: Timings {
             heartbeat_secs: 1,
             authority_secs: 5,
@@ -65,6 +66,8 @@ fn bootstrap(complete: bool) -> Bootstrap {
             execution_cursor: ExecutionCursor::default(),
             complete,
         },
+        asset_baseline: BTreeMap::new(),
+        killed_epoch: None,
         allocation: Allocation {
             quote_asset: "USDT".into(),
             max_notional: 10_000.0,
@@ -172,7 +175,7 @@ fn a_policy_revision_rollback_is_rejected() {
         "n1",
         2,
         2,
-        ToRuntime::Policy { policy: Policy { limits: BTreeMap::new(), trading_state: risk::TradingState::Active } },
+        ToRuntime::Policy { policy: Policy { limits: BTreeMap::new(), trading_state: risk::TradingState::Active, instrument_states: BTreeMap::new() } },
     );
     assert!(matches!(
         session.receive_control(msg, Instant::now()),

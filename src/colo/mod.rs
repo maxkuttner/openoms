@@ -4,6 +4,7 @@
 
 pub mod booking;
 pub mod control;
+pub mod deployment;
 pub mod follow;
 pub mod link_server;
 
@@ -11,11 +12,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use uuid::Uuid;
+
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use gateway::connectors::binance::adapter::BinanceAdapter;
 use colo_link::proto::{FromStrategy, ToStrategy};
+use colo_link::v2::{FromRuntimeEnvelope, ToRuntime, ToRuntimeEnvelope, PROTOCOL_VERSION};
 use gateway::contract::{FollowEvent, FollowHandle};
 
 use crate::app_state::AppState;
@@ -172,6 +176,16 @@ pub struct ColoHub {
     /// from `started`.
     down_since: Arc<Mutex<HashMap<String, Instant>>>,
     started: Instant,
+    v2_control: Arc<Mutex<HashMap<Uuid, V2ControlSlot>>>,
+}
+
+struct V2ControlSlot {
+    tx: mpsc::UnboundedSender<ToRuntimeEnvelope>,
+    account: gateway::runtime::AccountIdentity,
+    epoch: u64,
+    policy_revision: u64,
+    session_nonce: String,
+    next_sequence: u64,
 }
 
 impl Default for ColoHub {
@@ -192,6 +206,7 @@ impl Default for ColoHub {
             kills: Arc::default(),
             down_since: Arc::default(),
             started: Instant::now(),
+            v2_control: Arc::default(),
         }
     }
 }
@@ -199,6 +214,53 @@ impl Default for ColoHub {
 impl ColoHub {
     pub fn follow_handle(&self) -> FollowHandle {
         self.follow.clone()
+    }
+
+    /// Register the deployment's control socket. Bootstrap was already sent
+    /// with sequence 1, so commands start at 2.
+    pub(crate) fn register_v2_control(
+        &self,
+        deployment_id: Uuid,
+        account: gateway::runtime::AccountIdentity,
+        epoch: u64,
+        policy_revision: u64,
+        session_nonce: String,
+    ) -> mpsc::UnboundedReceiver<ToRuntimeEnvelope> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.v2_control.lock().unwrap().insert(
+            deployment_id,
+            V2ControlSlot {
+                tx,
+                account,
+                epoch,
+                policy_revision,
+                session_nonce,
+                next_sequence: 2,
+            },
+        );
+        rx
+    }
+
+    pub(crate) fn disconnect_v2_control(&self, deployment_id: Uuid) {
+        self.v2_control.lock().unwrap().remove(&deployment_id);
+    }
+
+    /// Queue a durable command on the deployment's control socket, if connected.
+    pub(crate) fn push_v2_control(&self, deployment_id: Uuid, message: ToRuntime) -> bool {
+        let mut links = self.v2_control.lock().unwrap();
+        let Some(slot) = links.get_mut(&deployment_id) else { return false };
+        let sequence = slot.next_sequence;
+        slot.next_sequence = slot.next_sequence.saturating_add(1);
+        let envelope = ToRuntimeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            account: slot.account.clone(),
+            epoch: slot.epoch,
+            policy_revision: slot.policy_revision,
+            sequence,
+            session_nonce: slot.session_nonce.clone(),
+            message,
+        };
+        slot.tx.send(envelope).is_ok()
     }
 
     /// The OMS's follow-only adapter on a strategy's account.

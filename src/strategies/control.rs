@@ -108,10 +108,35 @@ pub fn flatten_allowed(mode: Mode) -> Result<(), ApiError> {
     }
 }
 
+fn deployment_error(e: crate::colo::deployment::DeploymentError) -> ApiError {
+    let status = if matches!(e, crate::colo::deployment::DeploymentError::Database(_)) {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        axum::http::StatusCode::BAD_REQUEST
+    };
+    ApiError { status, message: e.to_string() }
+}
+
 /// Halt, stop REST, cancel every open order, log the session out. A
-/// co-located strategy is cancelled at its venue and told over its link.
+/// co-located strategy is cancelled at its venue and told over its link. The
+/// durable kill command is written before the link is told, so an ACK cannot
+/// outlive the latch.
 pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiError> {
-    crate::colo::control::announce_kill(state.colo(), state.strategies().by_code(code).map(|s| s.mode), code);
+    let mode = state.strategies().by_code(code).map(|s| s.mode);
+    if mode == Some(Mode::Colocated) {
+        if let Some(receipt) = crate::colo::deployment::record_kill_for_strategy(state.pool(), code)
+            .await
+            .map_err(deployment_error)?
+        {
+            state.colo().push_v2_control(
+                receipt.deployment_id,
+                colo_link::v2::ToRuntime::Kill {
+                    kill: colo_link::v2::Kill { command_id: receipt.command_id },
+                },
+            );
+        }
+    }
+    crate::colo::control::announce_kill(state.colo(), mode, code);
     let strategy = set_state(state, code, "HALTED", false).await?;
     if strategy.mode == Mode::Colocated {
         return Ok(crate::colo::control::kill(state, &strategy).await);
@@ -124,6 +149,20 @@ pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiErro
 pub async fn enable(state: &AppState, code: &str) -> Result<(), ApiError> {
     let strategy = set_state(state, code, "ACTIVE", true).await?;
     if strategy.mode == Mode::Colocated {
+        if let Some(receipt) = crate::colo::deployment::record_enable_for_strategy(state.pool(), code)
+            .await
+            .map_err(deployment_error)?
+        {
+            state.colo().push_v2_control(
+                receipt.deployment_id,
+                colo_link::v2::ToRuntime::Enable {
+                    enable: colo_link::v2::Enable {
+                        stopped_epoch: receipt.stopped_epoch.unwrap_or(0),
+                        command_id: receipt.command_id,
+                    },
+                },
+            );
+        }
         crate::colo::control::enable(state, &strategy).await;
         return Ok(());
     }

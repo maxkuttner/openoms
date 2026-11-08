@@ -172,6 +172,10 @@ mod boundary_tests;
         strategies::admin::kill_strategy,
         strategies::admin::enable_strategy,
         strategies::admin::flatten_strategy,
+        colo::deployment::register,
+        colo::deployment::list,
+        colo::deployment::get,
+        colo::deployment::retire,
         auth_api::login,
         auth_api::callback,
         auth_api::logout,
@@ -209,6 +213,9 @@ mod boundary_tests;
         strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
         strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
+        colo::deployment::Deployment, colo::deployment::DeploymentRegistration,
+        colo::deployment::InstrumentBaseline, colo::deployment::AssetHolding,
+        colo::deployment::RetireRequest,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -1534,6 +1541,15 @@ async fn serve() {
         .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
         .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
         .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
+        .route(
+            "/admin/strategies/:code/deployments",
+            post(colo::deployment::register).get(colo::deployment::list),
+        )
+        .route("/admin/strategies/:code/deployments/:id", get(colo::deployment::get))
+        .route(
+            "/admin/strategies/:code/deployments/:id/retire",
+            post(colo::deployment::retire),
+        )
         .route("/admin/instruments", get(admin::list_instruments))
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
