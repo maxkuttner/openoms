@@ -15,12 +15,6 @@ pub fn quotes(mid: f64, half_spread_bps: f64, tick: f64) -> (f64, f64) {
     (bid, ask)
 }
 
-/// A client order id carrying the strategy's tag (`mm1-q-000007`), which the
-/// OMS shows on the fill.
-pub fn client_id(tag: &str, n: u64) -> String {
-    format!("{tag}-{n:06}")
-}
-
 /// The public feed's symbol map: Binance reports pairs uppercase, and the
 /// feed matches on what it reports.
 pub fn feed_symbols(symbol: &str) -> std::collections::HashMap<String, i64> {
@@ -63,10 +57,5 @@ mod tests {
     #[test]
     fn a_whole_number_tick_still_quotes_on_the_tick() {
         assert_eq!(quotes(1_003.0, 0.0, 5.0), (1_000.0, 1_005.0));
-    }
-
-    #[test]
-    fn client_ids_carry_the_tag() {
-        assert_eq!(client_id("mm1-q", 7), "mm1-q-000007");
     }
 }

@@ -131,17 +131,19 @@ queued; heartbeats do not renew it.
 ## The reference program
 
 `crates/colo-example` is a small market maker on one pair:
-- it quotes a bid and an ask around the mid from Binance's public feed;
-- it runs every quote through the shared `risk` evaluator under the legacy v1
-  control link. The example's migration to the embedded runtime is an open gate;
-  the runtime, v2 protocol, recovery, journal and inbox are implemented in this
-  branch but still require live/testnet and latency evidence before rollout.
+- it receives v2 bootstrap from the OMS and quotes through the embedded runtime;
+- it runs every quote through the shared evaluator and deterministic reservations;
+- it sends orders only while the runtime is Ready and authority is current.
 
 ```
 BINANCE_API_KEY=… BINANCE_PRIVATE_KEY="$(cat key.pem)" \
-  cargo run -p colo-example -- --link wss://oms-host:9879 --token <trading token> \
-  --ca link.pem --symbol BTCUSDT
+  cargo run -p colo-example -- \
+  --oms-url wss://oms-host:9879 --deployment <uuid> --token <trading token> \
+  --account-id <uuid> --account-ref <subaccount> --ca link.pem \
+  --journal-dir ./colo-journal --symbol BTCUSDT
 ```
 
-It builds the gateway without FIX (`default-features = false`), so no C++ toolchain is
-needed on the co-located server.
+The caller owns the token, CA and session nonce; `colo-runtime` receives only an
+injected `RuntimeLink`. It builds the gateway without FIX
+(`default-features = false`), so no C++ toolchain is needed on the co-located
+server.

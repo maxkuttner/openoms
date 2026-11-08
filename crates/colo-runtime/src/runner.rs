@@ -30,6 +30,7 @@ pub struct RuntimeConfig {
     pub bootstrap: Bootstrap,
     pub journal_path: PathBuf,
     pub max_journal_bytes: u64,
+    pub compact_above_bytes: u64,
     pub event_queue_capacity: usize,
     pub control_url: Option<String>,
     pub events_url: Option<String>,
@@ -55,6 +56,7 @@ struct Inner {
     events: Mutex<VecDeque<RuntimeEvent>>,
     capacity: usize,
     journal_limit: u64,
+    compact_above: u64,
     identity: AccountIdentity,
     suspended: AtomicBool,
     shutdown: tokio::sync::Notify,
@@ -69,7 +71,7 @@ pub struct Runtime {
 
 impl Runtime {
     pub async fn start(config: RuntimeConfig, venue: Arc<dyn RuntimeVenue>) -> Result<Self, RuntimeError> {
-        if config.max_journal_bytes == 0 || config.event_queue_capacity == 0 {
+        if config.max_journal_bytes == 0 || config.compact_above_bytes == 0 || config.event_queue_capacity == 0 {
             return Err(RuntimeError::InvalidConfig("queue and journal limits must be explicit".into()));
         }
         let mut journal = Journal::open(&config.journal_path, &config.identity)?;
@@ -137,6 +139,7 @@ impl Runtime {
             events: Mutex::new(VecDeque::new()),
             capacity: config.event_queue_capacity,
             journal_limit: config.max_journal_bytes,
+            compact_above: config.compact_above_bytes,
             identity: config.identity,
             suspended: AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
@@ -429,10 +432,23 @@ fn spawn_link_tasks(
             };
             if let ToRuntime::EventAck { ack } = &message.message {
                 let mut reporter = control_reporter.lock().await;
-                if let Ok(mut journal) = inner.journal.lock() {
+                let should_compact = if let Ok(mut journal) = inner.journal.lock() {
                     if let Err(e) = reporter.ack(&mut journal, ack.through_sequence) {
                         tracing::warn!(error = %e, "runtime: reporter ACK not durable");
                     }
+                    journal.byte_len() > inner.compact_above
+                } else {
+                    false
+                };
+                if should_compact {
+                    let journal = inner.journal.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(mut journal) = journal.lock() {
+                            if let Err(e) = journal.compact() {
+                                tracing::warn!(error = %e, "runtime: journal compaction failed");
+                            }
+                        }
+                    });
                 }
             }
             if let Err(e) = apply_control_inner(&inner, message).await {

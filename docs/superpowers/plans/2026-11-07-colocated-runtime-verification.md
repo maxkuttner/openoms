@@ -56,9 +56,8 @@ Verified there:
   created. Order placement/cancellation, user-data streams, recovery and
   fee-asset reconciliation remain unverified and need a fresh test credential
   plus explicit approval.
-- The reference example still uses the v1 control link with the shared `risk`
-  evaluator; it has not yet been migrated to the embedded runtime. This is an
-  explicit open gate, not a completed feature.
+- The reference example now uses the embedded runtime through an injected
+  `RuntimeLink`; its live/testnet behavior remains unverified.
 - Journal fsync cost is synchronous by design and is not included in the latency
   sample above. Measure it before claiming a production latency target.
 
@@ -75,8 +74,8 @@ and unsupported Place operations are rejected; follow fills carry venue
 fee/time; duplicate control authority is idempotent; v2 control socket
 ownership is connection-generation checked.
 
-Unverified until the remaining gates run: venue/testnet behaviour, end-to-end
-journal-inclusive latency, and reference-program runtime migration. The runtime
-deliberately does not build sockets itself: the caller injects an authenticated
-`RuntimeLink`; `V2RuntimeLink` is the production adapter. Both isolated DB and
-local TLS two-socket fixtures pass.
+Unverified until the remaining gates run: venue/testnet order behavior,
+end-to-end journal-inclusive latency, and live runtime orchestration. The
+runtime deliberately does not build sockets itself: the caller injects an
+authenticated `RuntimeLink`; `V2RuntimeLink` is the production adapter. Both
+isolated DB and local TLS two-socket fixtures pass.

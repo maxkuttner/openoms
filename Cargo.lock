@@ -589,12 +589,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "colo-link",
+ "colo-runtime",
  "dataprovider",
  "gateway",
- "risk",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
