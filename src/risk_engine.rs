@@ -393,6 +393,12 @@ mod tests {
             .expect("set COLO_TEST_DATABASE_URL to a disposable database");
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
             .connect(&url)
             .await
             .expect("connect isolated test database")
@@ -412,7 +418,7 @@ mod tests {
             principal_id: Uuid::new_v4(),
             portfolio_id: Uuid::new_v4(),
             account_id: Uuid::new_v4(),
-            broker_code: format!("test-{}", &suffix[..12]),
+            broker_code: format!("T{}", &suffix[..10].to_uppercase()),
             instrument_id: format!("TEST{}", &suffix[..12]),
         };
         sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, $2, 'STRATEGY', 'ACTIVE')")
@@ -427,7 +433,8 @@ mod tests {
             .execute(pool)
             .await
             .expect("seed portfolio");
-        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, 'TEST', 'PAPER', 'ACTIVE')")
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
+            .bind(&fixture.broker_code)
             .bind(&fixture.broker_code)
             .execute(pool)
             .await

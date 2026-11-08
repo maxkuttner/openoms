@@ -1339,12 +1339,27 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("portfolio");
-        let account = t::seed_account(pool, portfolio).await;
-        let external: String = sqlx::query_scalar("SELECT external_account_ref FROM account WHERE id = $1")
-            .bind(account)
-            .fetch_one(pool)
-            .await
-            .expect("external ref");
+        let suffix = Uuid::new_v4().simple().to_string();
+        let connection: String = sqlx::query_scalar(
+            "SELECT code FROM broker_connection WHERE broker_code = 'BINANCE' AND environment = 'PAPER' LIMIT 1",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("seeded BINANCE PAPER connection");
+        let account = Uuid::new_v4();
+        let external = format!("colo-{}", &suffix[..12]);
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
+             VALUES ($1, $2, $3, $4, 'ACTIVE', $5)",
+        )
+        .bind(account)
+        .bind(format!("colo-account-{suffix}"))
+        .bind(&connection)
+        .bind(&external)
+        .bind(portfolio)
+        .execute(pool)
+        .await
+        .expect("seed deployment account");
         sqlx::query("UPDATE strategy SET mode = 'COLOCATED', follow_environment = $2 WHERE code = $1")
             .bind(&code)
             .bind(environment)
@@ -1470,12 +1485,15 @@ mod tests {
         let (_, _, _, input) = seed_registration(&pool, "PAPER").await;
         let deployment = register_deployment(&pool, &input).await.unwrap();
         let session = acquire_session(&pool, deployment.id, Uuid::new_v4()).await.unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let kill_id = format!("kill-{}", &suffix[..12]);
+        let enable_id = format!("enable-{}", &suffix[..12]);
         let stale = apply_command(
             &pool,
             &ControlCommand {
                 deployment_id: deployment.id,
                 epoch: session.epoch - 1,
-                command_id: "stale".into(),
+                command_id: format!("stale-{}", &suffix[..12]),
                 kind: CommandKind::Kill,
             },
         )
@@ -1486,7 +1504,7 @@ mod tests {
             &ControlCommand {
                 deployment_id: deployment.id,
                 epoch: session.epoch,
-                command_id: "kill-1".into(),
+                command_id: kill_id.clone(),
                 kind: CommandKind::Kill,
             },
         )
@@ -1494,11 +1512,11 @@ mod tests {
         .unwrap();
         let reloaded = get_deployment(&pool, &deployment.strategy_code, deployment.id).await.unwrap();
         assert_eq!(reloaded.kill_epoch, Some(session.epoch as i64));
-        assert_eq!(reloaded.kill_command_id.as_deref(), Some("kill-1"));
+        assert_eq!(reloaded.kill_command_id.as_deref(), Some(kill_id.as_str()));
         assert!(kill.acknowledges(&ControlCommand {
             deployment_id: deployment.id,
             epoch: session.epoch,
-            command_id: "kill-1".into(),
+            command_id: kill_id,
             kind: CommandKind::Kill,
         }));
         apply_command(
@@ -1506,7 +1524,7 @@ mod tests {
             &ControlCommand {
                 deployment_id: deployment.id,
                 epoch: session.epoch,
-                command_id: "enable-1".into(),
+                command_id: enable_id,
                 kind: CommandKind::Enable { stopped_epoch: session.epoch },
             },
         )

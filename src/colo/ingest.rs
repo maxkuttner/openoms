@@ -749,9 +749,22 @@ mod tests {
         let (symbol, instrument_id) = t::seed_pair(pool, &["BINANCE"]).await;
         let portfolio: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM strategy WHERE code = $1")
             .bind(&code).fetch_one(pool).await.unwrap();
-        let account = t::seed_account(pool, portfolio).await;
-        let external: String = sqlx::query_scalar("SELECT external_account_ref FROM account WHERE id = $1")
-            .bind(account).fetch_one(pool).await.unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let connection: String = sqlx::query_scalar(
+            "SELECT code FROM broker_connection WHERE broker_code = 'BINANCE' AND environment = 'PAPER' LIMIT 1",
+        ).fetch_one(pool).await.unwrap();
+        let account = Uuid::new_v4();
+        let external = format!("ingest-{}", &suffix[..12]);
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
+             VALUES ($1, $2, $3, $4, 'ACTIVE', $5)",
+        )
+        .bind(account)
+        .bind(format!("ingest-account-{suffix}"))
+        .bind(&connection)
+        .bind(&external)
+        .bind(portfolio)
+        .execute(pool).await.unwrap();
         let quote: String = sqlx::query_scalar("SELECT currency FROM instrument WHERE id = $1")
             .bind(instrument_id).fetch_one(pool).await.unwrap();
         sqlx::query("UPDATE strategy SET mode = 'COLOCATED', follow_environment = 'PAPER' WHERE code = $1")
@@ -801,6 +814,14 @@ mod tests {
         };
         assert_eq!(accept_batch(&pool, &deployment, &batch).await.unwrap().through_sequence, 1);
         assert_eq!(accept_batch(&pool, &deployment, &batch).await.unwrap().through_sequence, 1);
+        let gap = EventBatch {
+            first_sequence: 3,
+            records: vec![EventRecord { sequence: 3, event }],
+        };
+        assert!(matches!(
+            accept_batch(&pool, &deployment, &gap).await,
+            Err(IngestError::SequenceGap { .. })
+        ));
         let conflict = EventBatch {
             first_sequence: 1,
             records: vec![EventRecord {
@@ -820,14 +841,6 @@ mod tests {
         assert!(matches!(
             accept_batch(&pool, &deployment, &conflict).await,
             Err(IngestError::ConflictingDuplicate(_))
-        ));
-        let gap = EventBatch {
-            first_sequence: 3,
-            records: vec![EventRecord { sequence: 3, event }],
-        };
-        assert!(matches!(
-            accept_batch(&pool, &deployment, &gap).await,
-            Err(IngestError::SequenceGap { .. })
         ));
     }
 
