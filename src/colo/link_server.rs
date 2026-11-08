@@ -207,13 +207,14 @@ async fn handle_v2(
             message: ToRuntime::Bootstrap { bootstrap },
         };
         sink.send(Message::Text(serde_json::to_string(&first)?)).await?;
-        Some(hub.register_v2_control(
+        let (conn, rx) = hub.register_v2_control(
             binding.deployment.id,
             binding.account.clone(),
             binding.epoch,
             revision,
             binding.session_nonce.to_string(),
-        ))
+        );
+        Some((conn, rx))
     } else {
         None
     };
@@ -223,7 +224,7 @@ async fn handle_v2(
             tokio::select! {
                 push = async {
                     match pushes.as_mut() {
-                        Some(rx) => rx.recv().await,
+                        Some((_, rx)) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
@@ -269,8 +270,8 @@ async fn handle_v2(
         }
     }
     .await;
-    if control {
-        hub.disconnect_v2_control(deployment_id);
+    if let Some((conn, _)) = pushes {
+        hub.disconnect_v2_control(deployment_id, conn);
     }
     result
 }

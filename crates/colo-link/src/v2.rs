@@ -92,6 +92,11 @@ impl Bootstrap {
                 "limits reference an instrument without rules".into(),
             ));
         }
+        if symbols.iter().any(|symbol| !self.limits.contains_key(symbol)) {
+            return Err(ProtocolError::InvalidBootstrap(
+                "every instrument needs a resolved limit entry".into(),
+            ));
+        }
         if self.timings.heartbeat_secs == 0 {
             return Err(ProtocolError::InvalidBootstrap("heartbeat must be positive".into()));
         }

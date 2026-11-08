@@ -2,13 +2,13 @@
 //! monotonic sequences and an atomic compaction. A torn final append is
 //! recoverable; complete-length corruption is not.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use gateway::runtime::{AccountIdentity, RuntimeOrderState, VenueEvent};
+use gateway::runtime::{AccountIdentity, RuntimeOrderState, SymbolCursor, VenueEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::book::{Intent, Submission};
@@ -46,6 +46,10 @@ pub enum JournalRecord {
     /// Durable acknowledgement that OMS events through `through` were applied.
     Ack {
         through: u64,
+    },
+    /// Persisted execution watermarks; survives compaction of old trades.
+    Cursor {
+        positions: BTreeMap<String, SymbolCursor>,
     },
 }
 
@@ -190,7 +194,10 @@ impl Journal {
         Ok(self
             .records
             .iter()
-            .filter(|r| r.sequence >= start && !matches!(r.record, JournalRecord::Ack { .. }))
+            .filter(|r| {
+                r.sequence >= start
+                    && !matches!(r.record, JournalRecord::Ack { .. } | JournalRecord::Cursor { .. })
+            })
             .take(limit)
             .cloned()
             .collect())
@@ -233,6 +240,12 @@ impl Journal {
             .filter(|r| matches!(r.record, JournalRecord::Policy { .. }))
             .map(|r| r.sequence)
             .max();
+        let latest_cursor = self
+            .records
+            .iter()
+            .filter(|r| matches!(r.record, JournalRecord::Cursor { .. }))
+            .map(|r| r.sequence)
+            .max();
 
         let keep: Vec<SequencedRecord> = self
             .records
@@ -242,6 +255,7 @@ impl Journal {
                     || matches!(r.record, JournalRecord::Kill { .. } | JournalRecord::Enable { .. })
                     || Some(r.sequence) == latest_ack
                     || Some(r.sequence) == latest_policy
+                    || Some(r.sequence) == latest_cursor
                     || match &r.record {
                         JournalRecord::Intent { submission, .. } => live.contains(&submission.client_order_id),
                         JournalRecord::Venue { event } => event_client(event).is_some_and(|id| live.contains(id)),

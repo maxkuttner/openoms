@@ -141,6 +141,9 @@ pub(crate) fn follow_events(event: &serde_json::Value) -> Vec<FollowEvent> {
                 buy: trade.side == crate::runtime::Side::Buy,
                 qty: trade.quantity,
                 price: trade.price,
+                fee_amount: trade.fee.as_ref().map(|f| f.amount),
+                fee_currency: trade.fee.as_ref().map(|f| f.currency.clone()),
+                executed_at: Some(trade.executed_at),
             })];
             if event["X"].as_str() == Some("FILLED") {
                 out.push(closed("filled"));
@@ -441,6 +444,7 @@ async fn handle_execution_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use crate::contract::{EngineHandle, ExecKind, GatewayMsg};
 
     use crate::contract::{ExternalFill, FollowEvent};
@@ -456,6 +460,7 @@ mod tests {
             vec![FollowEvent::Fill(ExternalFill {
                 trade_id: "77".into(), venue_order_id: "9001".into(), client_order_id: "mm1-q-000001".into(),
                 symbol: "BTCUSDT".into(), buy: true, qty: 0.25, price: 64000.5,
+                fee_amount: None, fee_currency: None, executed_at: Some(Utc.timestamp_millis_opt(0).unwrap()),
             })]
         );
         let last = serde_json::json!({

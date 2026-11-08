@@ -90,6 +90,9 @@ impl Runtime {
             config.bootstrap.allocation.max_notional,
             config.bootstrap.allocation.max_position_qty,
         );
+        book.set_max_price_age(std::time::Duration::from_secs(
+            config.bootstrap.timings.market_data_max_age_secs.max(1),
+        ));
         let mut control = ControlState::new(config.epoch);
         let now = Instant::now();
         control.apply(Received::new(

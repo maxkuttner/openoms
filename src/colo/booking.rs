@@ -232,7 +232,8 @@ mod tests {
         let strategy = state.strategies().by_code(&code).unwrap();
         let adapter = BinanceAdapter::new("unused".into(), &pem, "PAPER").expect("a testnet adapter");
         let fill = ExternalFill { trade_id: "1".into(), venue_order_id: "9".into(), client_order_id: "mm1-q-1".into(),
-            symbol: "ETHBTC".into(), buy: true, qty: 0.001, price: 0.03 };
+            symbol: "ETHBTC".into(), buy: true, qty: 0.001, price: 0.03,
+            fee_amount: None, fee_currency: None, executed_at: None };
         assert_eq!(book_fill(&state, &strategy, &adapter, &fill).await.unwrap(), Booked::New);
         assert_eq!(book_fill(&state, &strategy, &adapter, &fill).await.unwrap(), Booked::AlreadyBooked);
         t::drop_orders(&pool, &code).await;

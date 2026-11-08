@@ -219,6 +219,9 @@ pub async fn drain_inbox(
                     buy: trade.side == Side::Buy,
                     qty: trade.quantity,
                     price: trade.price,
+                    fee_amount: trade.fee.as_ref().map(|f| f.amount),
+                    fee_currency: trade.fee.as_ref().map(|f| f.currency.clone()),
+                    executed_at: Some(trade.executed_at),
                 };
                 super::booking::book_fill(state, &strategy, &adapter, &fill)
                     .await
@@ -707,6 +710,9 @@ mod tests {
             buy: true,
             qty: 1.0,
             price: 100.0,
+            fee_amount: None,
+            fee_currency: None,
+            executed_at: None,
         }
     }
 

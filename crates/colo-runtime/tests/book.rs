@@ -287,6 +287,21 @@ fn a_free_plus_locked_snapshot_does_not_charge_the_same_order_twice() {
 }
 
 #[test]
+fn stale_market_data_is_rejected() {
+    let mut book = book(BTreeMap::new(), &[("USDT", 1_000.0)]);
+    book.set_max_price_age(std::time::Duration::from_secs(1));
+    let mut stale = Prices::new();
+    stale.set(
+        "BTCUSDT",
+        InstrumentPrices::new(Some(100.0), Some(100.0), Some(100.0), Instant::now() - std::time::Duration::from_secs(2)),
+    );
+    let err = book
+        .prepare(intent("BTCUSDT", Side::Buy, 1.0, 100.0), &stale, Instant::now())
+        .unwrap_err();
+    assert!(matches!(err, RuntimeError::InvalidIntent(msg) if msg.contains("older")));
+}
+
+#[test]
 fn unbounded_market_spend_is_rejected() {
     let mut book = book(BTreeMap::new(), &[("USDT", 1_000.0)]);
     let mut market = intent("BTCUSDT", Side::Buy, 1.0, 100.0);

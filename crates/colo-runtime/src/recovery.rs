@@ -39,6 +39,13 @@ pub async fn recover(
 
     let replay = journal.replay()?;
     let mut cursor = bootstrap.baseline.execution_cursor.clone();
+    if let Some(JournalRecord::Cursor { positions }) = replay
+        .iter()
+        .rev()
+        .find_map(|r| matches!(&r.record, JournalRecord::Cursor { .. }).then_some(&r.record))
+    {
+        cursor.positions = positions.clone();
+    }
     for record in &replay {
         if let JournalRecord::Venue { event: VenueEvent::Trade(trade) } = &record.record {
             if let Some(position) = cursor.positions.get_mut(&trade.key.symbol) {
@@ -156,6 +163,7 @@ pub async fn recover(
         evidence.push(format!("kill latch retained from epoch {killed}"));
     }
     let complete = evidence.is_empty();
+    journal.append_durable(&JournalRecord::Cursor { positions: cursor.positions.clone() })?;
     Ok(RecoveredBook { book, events: rx, execution_cursor: cursor, balances, orders, evidence, complete })
 }
 

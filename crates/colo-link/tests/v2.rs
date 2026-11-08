@@ -51,7 +51,7 @@ fn rules() -> InstrumentRules {
 fn bootstrap(complete: bool) -> Bootstrap {
     Bootstrap {
         instruments: vec![rules()],
-        limits: BTreeMap::new(),
+        limits: BTreeMap::from([("BTCUSDT".into(), risk::Limits::default())]),
         trading_state: risk::TradingState::Active,
         instrument_states: BTreeMap::new(),
         timings: Timings {
@@ -373,6 +373,13 @@ async fn a_blocked_event_write_does_not_block_control() {
         control_rx.recv().await,
         Some(FromRuntime::Hello { .. })
     ));
+}
+
+#[test]
+fn every_bootstrap_instrument_needs_a_resolved_limit() {
+    let mut b = bootstrap(true);
+    b.limits.clear();
+    assert!(b.validate().is_err());
 }
 
 #[test]

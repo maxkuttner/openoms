@@ -181,6 +181,7 @@ pub struct ColoHub {
 }
 
 struct V2ControlSlot {
+    conn: u64,
     tx: mpsc::UnboundedSender<ToRuntimeEnvelope>,
     account: gateway::runtime::AccountIdentity,
     epoch: u64,
@@ -226,11 +227,13 @@ impl ColoHub {
         epoch: u64,
         policy_revision: u64,
         session_nonce: String,
-    ) -> mpsc::UnboundedReceiver<ToRuntimeEnvelope> {
+    ) -> (u64, mpsc::UnboundedReceiver<ToRuntimeEnvelope>) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let conn = self.next_conn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.v2_control.lock().unwrap().insert(
             deployment_id,
             V2ControlSlot {
+                conn,
                 tx,
                 account,
                 epoch,
@@ -239,11 +242,14 @@ impl ColoHub {
                 next_sequence: 2,
             },
         );
-        rx
+        (conn, rx)
     }
 
-    pub(crate) fn disconnect_v2_control(&self, deployment_id: Uuid) {
-        self.v2_control.lock().unwrap().remove(&deployment_id);
+    pub(crate) fn disconnect_v2_control(&self, deployment_id: Uuid, conn: u64) {
+        let mut links = self.v2_control.lock().unwrap();
+        if links.get(&deployment_id).is_some_and(|slot| slot.conn == conn) {
+            links.remove(&deployment_id);
+        }
     }
 
     /// Queue a durable command on the deployment's control socket, if connected.

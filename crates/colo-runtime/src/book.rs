@@ -6,8 +6,8 @@ use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 
 use gateway::runtime::{
-    AccountIdentity, AssetBalance, InstrumentRules, OrderType, RuntimeEvent, RuntimeOrder,
-    RuntimeOrderState, Side, StreamState, TimeInForce, Trade, TradeKey, VenueEvent,
+    AccountIdentity, AssetBalance, InstrumentRules, Operation, OrderType, RuntimeEvent,
+    RuntimeOrder, RuntimeOrderState, Side, StreamState, TimeInForce, Trade, TradeKey, VenueEvent,
 };
 
 use crate::assets::{AssetLedger, Reservation};
@@ -149,6 +149,7 @@ pub struct Book {
     state: TradingState,
     instrument_states: BTreeMap<String, TradingState>,
     allocation: Option<(String, f64, Option<f64>)>,
+    max_price_age: Option<Duration>,
     fee_allowance_bps: f64,
     health: BookHealth,
     rate: VecDeque<Instant>,
@@ -189,6 +190,7 @@ impl Book {
             state: TradingState::Active,
             instrument_states: BTreeMap::new(),
             allocation: None,
+            max_price_age: None,
             fee_allowance_bps: 0.0,
             health: BookHealth::Unknown,
             rate: VecDeque::new(),
@@ -246,6 +248,10 @@ impl Book {
 
     pub fn set_allocation(&mut self, quote_asset: String, max_notional: f64, max_position_qty: Option<f64>) {
         self.allocation = Some((quote_asset, max_notional, max_position_qty));
+    }
+
+    pub fn set_max_price_age(&mut self, max_age: Duration) {
+        self.max_price_age = Some(max_age);
     }
 
     pub fn working_client_ids(&self, instrument: &str) -> Vec<String> {
@@ -419,6 +425,18 @@ impl Book {
         if valuation.received_at > now {
             return Err(RuntimeError::CorruptState(
                 "price receipt time is in the future".into(),
+            ));
+        }
+        if let Some(max_age) = self.max_price_age {
+            if now.saturating_duration_since(valuation.received_at) > max_age {
+                return Err(RuntimeError::InvalidIntent(
+                    "market data is older than the bootstrap freshness limit".into(),
+                ));
+            }
+        }
+        if !rules.operations.contains(&Operation::Place) {
+            return Err(RuntimeError::InvalidIntent(
+                "venue rules do not declare Place support".into(),
             ));
         }
         validate_intent(&intent)?;

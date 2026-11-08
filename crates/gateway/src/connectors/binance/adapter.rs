@@ -11,6 +11,7 @@
 //! balances report and reconciliation matches on.
 
 use base64::Engine;
+use chrono::{TimeZone, Utc};
 use dataprovider::{Identifiers, InstrumentDef};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
@@ -503,6 +504,9 @@ pub(crate) fn parse_my_trades(body: &serde_json::Value) -> Vec<crate::contract::
                 buy: t["isBuyer"].as_bool()?,
                 qty: t["qty"].as_str()?.parse().ok()?,
                 price: t["price"].as_str()?.parse().ok()?,
+                fee_amount: t["commission"].as_str().and_then(|v| v.parse().ok()),
+                fee_currency: t["commissionAsset"].as_str().map(str::to_string),
+                executed_at: t["time"].as_i64().and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
             })
         })
         .collect()
@@ -515,13 +519,16 @@ mod tests {
     #[test]
     fn my_trades_parse_into_external_fills() {
         let body = serde_json::json!([
-            { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true },
+            { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0.01", "commissionAsset": "BNB" },
             { "symbol": "BTCUSDT", "id": 502, "orderId": 9003, "price": "64010", "qty": "0.1", "isBuyer": false },
         ]);
         let fills = parse_my_trades(&body);
         assert_eq!(fills.len(), 2);
         assert_eq!((fills[0].trade_id.as_str(), fills[0].venue_order_id.as_str(), fills[0].buy, fills[0].qty), ("501", "9001", true, 0.25));
         assert!(!fills[1].buy);
+        assert_eq!(fills[0].fee_amount, Some(0.01));
+        assert_eq!(fills[0].fee_currency.as_deref(), Some("BNB"));
+        assert!(fills[0].executed_at.is_some());
     }
 
     #[test]

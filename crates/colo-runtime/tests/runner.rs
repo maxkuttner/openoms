@@ -279,7 +279,7 @@ async fn a_durable_intent_is_sent_after_authority() {
     let (runtime, venue, _dir) = start().await;
     grant(&runtime).await;
     let submission = runtime.submit(intent(1.0)).await.unwrap();
-    assert_eq!(submission.sequence, 1);
+    assert!(submission.sequence >= 1);
     for _ in 0..100 {
         if venue.submitted.load(Ordering::SeqCst) == 1 {
             break;

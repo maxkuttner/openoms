@@ -70,6 +70,10 @@ deployment registration/bootstrap/admin endpoints, recovery barrier/control
 state, durable OMS inbox/economic trade identity/native-asset ledger, runtime
 runner with post-start event ingestion, policy/allocation application, an
 injected link transport, and a replay reporter connected through that link.
+Execution cursors persist in the journal; stale marks, missing resolved limits
+and unsupported Place operations are rejected; follow fills carry venue
+fee/time; duplicate control authority is idempotent; v2 control socket
+ownership is connection-generation checked.
 
 Unverified until the remaining gates run: venue/testnet behaviour, end-to-end
 journal-inclusive latency, and reference-program runtime migration. The runtime

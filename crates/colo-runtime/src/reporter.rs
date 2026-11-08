@@ -91,6 +91,9 @@ impl Reporter {
 
     /// Durably record the OMS ACK and release the corresponding journal tail.
     pub fn ack(&mut self, journal: &mut Journal, through: u64) -> Result<(), RuntimeError> {
+        if through <= self.last_acked {
+            return Ok(());
+        }
         self.session
             .ack_events(through)
             .map_err(|e| RuntimeError::InvalidControl(e.to_string()))?;
@@ -152,7 +155,7 @@ fn runtime_event(record: &JournalRecord, account: &AccountIdentity) -> Option<Ru
             epoch: *epoch,
             applied: true,
         }),
-        JournalRecord::Ack { .. } => None,
+        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } => None,
     }
 }
 

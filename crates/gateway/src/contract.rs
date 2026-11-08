@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use tokio::sync::mpsc;
 use tracing::error;
 use uuid::Uuid;
@@ -98,6 +100,11 @@ pub struct ExternalFill {
     pub buy: bool,
     pub qty: f64,
     pub price: f64,
+    /// `None` means the venue did not report a fee; not a zero fee.
+    pub fee_amount: Option<f64>,
+    pub fee_currency: Option<String>,
+    /// Venue execution time; `None` only when the source omitted it.
+    pub executed_at: Option<DateTime<Utc>>,
 }
 
 /// Where a follow stream reports, tagged with the strategy it follows.
