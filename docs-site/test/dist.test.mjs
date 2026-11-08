@@ -91,7 +91,7 @@ test("every internal href in dist resolves to a built file", () => {
   assert.deepEqual(broken, []);
 });
 
-// The trading endpoints a reader of "Your first API call" needs. Each must have
+// The trading endpoints API users need most. Each must have
 // its own generated page, so a plugin change or a spec-shape the plugin skips
 // cannot silently drop them from the reference.
 const TRADING_OPERATIONS = [

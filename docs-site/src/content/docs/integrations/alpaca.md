@@ -4,8 +4,7 @@ description: Route US equities and options to Alpaca, paper or live.
 ---
 
 Alpaca is the quickest way to a working setup: free paper trading, US equities and
-options, REST order entry and a streaming execution feed. [Your first paper
-trade](/getting-started/first-paper-trade/) walks through it end to end.
+options, REST order entry and a streaming execution feed.
 
 ## What it covers
 

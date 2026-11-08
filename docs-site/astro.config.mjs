@@ -34,8 +34,6 @@ export default defineConfig({
           items: [
             "getting-started/installation",
             "getting-started",
-            "getting-started/first-paper-trade",
-            "getting-started/first-api-call",
           ],
         },
         {
