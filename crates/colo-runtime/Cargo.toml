@@ -8,6 +8,7 @@ description = "Deterministic admission, reservations and order book for a co-loc
 gateway = { path = "../gateway", default-features = false }
 risk = { path = "../risk" }
 serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
 colo-link = { path = "../colo-link" }
 tokio = { version = "1", features = ["full"] }

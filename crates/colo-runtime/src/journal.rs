@@ -126,6 +126,10 @@ impl Journal {
         &self.identity
     }
 
+    pub fn byte_len(&self) -> u64 {
+        self.file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
     pub fn append_durable(&mut self, record: &JournalRecord) -> Result<u64, RuntimeError> {
         if self.fail_next_write {
             self.fail_next_write = false;

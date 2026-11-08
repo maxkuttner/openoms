@@ -7,12 +7,16 @@ mod book;
 pub mod control;
 pub mod journal;
 pub mod recovery;
+pub mod reporter;
+pub mod runner;
 
 pub use journal::{Journal, JournalRecord, SequencedRecord};
 
 pub use assets::{AssetLedger, Reservation};
 pub use control::{ControlAction, ControlState, RuntimeState};
 pub use recovery::{recover, RecoveredBook};
+pub use reporter::Reporter;
+pub use runner::{Runtime, RuntimeConfig};
 pub use book::{
     Book, CancelRequest, InstrumentPrices, Intent, PreparedOrder, Prices, Submission,
 };
