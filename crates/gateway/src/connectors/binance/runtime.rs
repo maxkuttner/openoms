@@ -646,6 +646,102 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "needs BINANCE_TEST_API_KEY and BINANCE_TEST_PRIVATE_KEY; places and cancels a testnet order"]
+    async fn testnet_place_and_cancel_smoke() {
+        use reqwest::Method;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+        let api_key = std::env::var("BINANCE_TEST_API_KEY").expect("BINANCE_TEST_API_KEY");
+        let private_key = std::env::var("BINANCE_TEST_PRIVATE_KEY").expect("BINANCE_TEST_PRIVATE_KEY");
+        let adapter = BinanceAdapter::new(api_key, &private_key, "PAPER").expect("testnet adapter");
+
+        let account = adapter.signed(Method::GET, "/api/v3/account", &[]).await.expect("account");
+        assert!(account.status().is_success(), "account status {}", account.status());
+        let body: Value = account.json().await.expect("account json");
+        let free: HashMap<String, f64> = parse_balances(&body)
+            .into_iter()
+            .map(|b| (b.asset, b.free))
+            .collect();
+
+        let prices: Value = reqwest::Client::new()
+            .get("https://testnet.binance.vision/api/v3/ticker/price")
+            .send()
+            .await
+            .expect("ticker")
+            .json()
+            .await
+            .expect("ticker json");
+        let prices: HashMap<String, f64> = prices.as_array().into_iter().flatten().filter_map(|p| {
+            Some((p["symbol"].as_str()?.to_string(), p["price"].as_str()?.parse().ok()?))
+        }).collect();
+
+        let instruments = adapter.list_spot_instruments().await.expect("exchangeInfo");
+        let mut candidates: Vec<_> = instruments.into_iter().filter(|i| {
+            i.is_tradeable
+                && prices.get(&i.broker_symbol).copied().is_some_and(|p| p > 0.0)
+                && free.get(&i.definition.currency).copied().unwrap_or(0.0) >= 10.0
+        }).collect();
+        candidates.sort_by(|a, b| a.broker_symbol.cmp(&b.broker_symbol));
+        assert!(!candidates.is_empty(), "no testnet pair with a funded quote asset");
+
+        let mut placed: Option<(String, String, String)> = None;
+        for instrument in candidates.iter().take(8) {
+            let symbol = instrument.broker_symbol.clone();
+            let mark = prices[&symbol];
+            let limit = mark * 0.9;
+            let step = instrument.definition.size_increment;
+            let min_qty = instrument.min_quantity.unwrap_or(step);
+            let min_notional = instrument.min_notional.unwrap_or(5.0);
+            let qty = ((min_notional / limit).max(min_qty) / step).ceil() * step;
+            let quote = instrument.definition.currency.clone();
+            if qty * limit > free.get(&quote).copied().unwrap_or(0.0) * 0.8 {
+                continue;
+            }
+            let client_id = format!("colo-smoke-{}", &Uuid::new_v4().simple().to_string()[..20]);
+            let request = BrokerOrderRequest {
+                order_id: client_id.clone(),
+                symbol: symbol.clone(),
+                native_id: None,
+                quantity: qty,
+                side: "buy".into(),
+                order_type: "limit".into(),
+                time_in_force: "gtc".into(),
+                limit_price: Some(limit),
+                external_account_ref: String::new(),
+            };
+            match adapter.submit_order(&request).await {
+                Ok(response) => {
+                    eprintln!(
+                        "testnet order placed: symbol={symbol}, qty={qty:.8}, limit={limit:.8}, venue_order_id={}",
+                        response.external_order_id
+                    );
+                    placed = Some((client_id, response.external_order_id, symbol));
+                    break;
+                }
+                Err(e) => eprintln!("testnet candidate {symbol} rejected: {e}"),
+            }
+        }
+        let Some((client_id, venue_order_id, symbol)) = placed else {
+            panic!("no testnet order was accepted");
+        };
+        let before = adapter.order_status(&client_id, &venue_order_id, &symbol).await;
+        let cancel = adapter.cancel_order(&venue_order_id, &symbol).await;
+        assert!(cancel.is_ok(), "testnet cancel failed: {cancel:?}");
+        let after = adapter
+            .order_status(&client_id, &venue_order_id, &symbol)
+            .await
+            .expect("status after cancel");
+        eprintln!(
+            "testnet order cancelled: symbol={symbol}, status={:?}, observed_before_cancel={before:?}",
+            after.outcome
+        );
+        assert!(
+            !matches!(after.outcome, crate::contract::BrokerOrderOutcome::Working),
+            "order still working after cancel"
+        );
+    }
+
     #[test]
     fn stream_health_distinguishes_stale_from_closed() {
         assert_ne!(health_event(StreamState::Stale), health_event(StreamState::Closed));
