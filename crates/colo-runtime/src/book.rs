@@ -268,6 +268,15 @@ impl Book {
             .collect()
     }
 
+    /// Every order that may still rest at the venue, across instruments.
+    pub fn all_working_client_ids(&self) -> Vec<String> {
+        self.orders
+            .values()
+            .filter(|o| o.state.is_working())
+            .map(|o| o.client_order_id.clone())
+            .collect()
+    }
+
     /// Undo a prepared order whose durable intent write failed.
     pub fn abort_order(&mut self, client_order_id: &str) {
         if let Some(order) = self.orders.remove(client_order_id) {

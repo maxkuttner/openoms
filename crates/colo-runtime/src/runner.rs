@@ -385,6 +385,13 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
             _ => None,
         };
         let mut cancellations = Vec::new();
+        if actions.iter().any(|a| matches!(a, ControlAction::KillLatched { .. })) {
+            // A kill pulls every resting order, whatever the instrument.
+            for id in core.book.all_working_client_ids() {
+                let _ = core.book.request_cancel(&id);
+                cancellations.push(id);
+            }
+        }
         for action in &actions {
             if let ControlAction::CancelWorking { instruments } = action {
                 for instrument in instruments {
@@ -397,15 +404,19 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
         }
         (actions, kill, cancellations)
     };
+    // Cancels go out before the kill is journalled: a failed journal write
+    // must not leave orders resting at the venue.
+    for id in cancellations {
+        if let Err(e) = cancel_on(inner, &id).await {
+            tracing::warn!(client_order_id = %id, error = %e, "runtime: cancel not sent");
+        }
+    }
     if let Some(record) = kill {
         if let Err(e) = append(&inner.journal, record).await {
             inner.suspended.store(true, Ordering::SeqCst);
             return Err(e);
         }
         inner.report_now.notify_one();
-    }
-    for id in cancellations {
-        let _ = cancel_on(inner, &id).await;
     }
     Ok(actions)
 }

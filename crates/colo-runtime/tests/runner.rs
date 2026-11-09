@@ -83,6 +83,7 @@ fn bootstrap() -> Bootstrap {
 
 struct FakeVenue {
     submitted: Arc<AtomicUsize>,
+    cancels: Arc<AtomicUsize>,
     block: AtomicBool,
     gate: Arc<Notify>,
     started: Arc<Notify>,
@@ -92,6 +93,7 @@ impl FakeVenue {
     fn new() -> Self {
         Self {
             submitted: Arc::new(AtomicUsize::new(0)),
+            cancels: Arc::new(AtomicUsize::new(0)),
             block: AtomicBool::new(false),
             gate: Arc::new(Notify::new()),
             started: Arc::new(Notify::new()),
@@ -109,7 +111,10 @@ impl BrokerAdapter for FakeVenue {
         self.submitted.fetch_add(1, Ordering::SeqCst);
         Ok(BrokerOrderResponse { external_order_id: "v-1".into() })
     }
-    async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> { Ok(()) }
+    async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
     async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> { Ok(vec![]) }
     async fn order_status(&self, _: &str, _: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
         Err(BrokerError::NoSuchOrder("fake".into()))
@@ -365,5 +370,61 @@ async fn a_killed_runtime_cannot_submit() {
     assert!(matches!(
         runtime.submit(intent(1.0)).await,
         Err(colo_runtime::RuntimeError::KillLatched)
+    ));
+}
+
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// Submits one order and waits until the venue has accepted it and the book
+/// holds it as live.
+async fn live_order(runtime: &Runtime, venue: &FakeVenue) -> String {
+    grant(runtime).await;
+    let submission = runtime.submit(intent(1.0)).await.unwrap();
+    wait_for("venue submit", || venue.submitted.load(Ordering::SeqCst) == 1).await;
+    for _ in 0..200 {
+        if runtime.next_event().is_some_and(|e| matches!(e, colo_runtime::RuntimeEvent::SubmitOutcome { .. })) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    submission.client_order_id
+}
+
+async fn kill(runtime: &Runtime) -> Result<(), colo_runtime::RuntimeError> {
+    runtime
+        .apply_control(Received::new(
+            ToRuntime::Kill { kill: Kill { command_id: "k".into() } },
+            Instant::now(),
+        ))
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn kill_cancels_every_working_order() {
+    let (runtime, venue, _dir) = start().await;
+    live_order(&runtime, &venue).await;
+    kill(&runtime).await.unwrap();
+    wait_for("cancel sent", || venue.cancels.load(Ordering::SeqCst) == 1).await;
+}
+
+#[tokio::test]
+async fn kill_cancels_even_when_the_journal_write_fails() {
+    let (runtime, venue, _dir) = start().await;
+    live_order(&runtime, &venue).await;
+    runtime.fail_next_journal_write_for_test();
+    assert!(kill(&runtime).await.is_err(), "the failed kill record is still reported");
+    wait_for("cancel sent", || venue.cancels.load(Ordering::SeqCst) == 1).await;
+    assert!(matches!(
+        runtime.submit(intent(1.0)).await,
+        Err(colo_runtime::RuntimeError::KillLatched | colo_runtime::RuntimeError::NotReady(_))
     ));
 }
