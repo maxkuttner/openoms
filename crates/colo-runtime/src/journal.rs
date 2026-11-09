@@ -43,6 +43,12 @@ pub enum JournalRecord {
         epoch: u64,
         command_id: String,
     },
+    /// A journalled intent that was never sent to the venue. Its reservation
+    /// is released; recovery treats the order as closed.
+    Abandoned {
+        client_order_id: String,
+        reason: String,
+    },
     /// Durable acknowledgement that OMS events through `through` were applied.
     Ack {
         through: u64,
@@ -469,6 +475,9 @@ fn live_orders(records: &[SequencedRecord]) -> BTreeSet<String> {
                         live.remove(&order.client_order_id);
                     }
                 }
+            }
+            JournalRecord::Abandoned { client_order_id, .. } => {
+                live.remove(client_order_id);
             }
             _ => {}
         }

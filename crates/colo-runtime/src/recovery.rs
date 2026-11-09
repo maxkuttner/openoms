@@ -82,6 +82,9 @@ pub async fn recover(
             JournalRecord::Venue { event } => {
                 book.apply(event)?;
             }
+            JournalRecord::Abandoned { client_order_id, .. } => {
+                book.abort_order(client_order_id);
+            }
             _ => {}
         }
     }

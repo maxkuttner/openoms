@@ -23,7 +23,8 @@ use uuid::Uuid;
 
 fn identity() -> AccountIdentity {
     AccountIdentity {
-        account_id: Uuid::new_v4(),
+        // Fixed, so a restarted runtime opens the same journal.
+        account_id: Uuid::from_u128(0x6f6d_7331),
         venue: "BINANCE".into(),
         environment: "LIVE".into(),
         external_account_ref: "sub-1".into(),
@@ -187,6 +188,12 @@ fn intent(qty: f64) -> Intent {
 
 async fn start() -> (Runtime, Arc<FakeVenue>, TempDir) {
     let dir = TempDir::new().unwrap();
+    let (runtime, venue) = start_in(&dir).await;
+    (runtime, venue, dir)
+}
+
+/// Starts a runtime on the journal in `dir`, as a restart would.
+async fn start_in(dir: &TempDir) -> (Runtime, Arc<FakeVenue>) {
     let venue = Arc::new(FakeVenue::new());
     let runtime = Runtime::start(
         RuntimeConfig {
@@ -212,7 +219,7 @@ async fn start() -> (Runtime, Arc<FakeVenue>, TempDir) {
             colo_runtime::InstrumentPrices::new(Some(100.0), Some(100.0), Some(100.0), Instant::now()),
         )
         .await;
-    (runtime, venue, dir)
+    (runtime, venue)
 }
 
 struct FakeLink {
@@ -556,4 +563,38 @@ async fn a_found_unclear_order_keeps_its_exposure() {
     wait_for("lookup", || venue.lookups.load(Ordering::SeqCst) >= 1).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(runtime.leaves(&submission.client_order_id).await, Some(1.0));
+}
+
+#[tokio::test]
+async fn an_order_cancelled_before_send_is_released_and_survives_restart() {
+    let dir = TempDir::new().unwrap();
+    let (runtime, venue) = start_in(&dir).await;
+    grant(&runtime).await;
+    let submission = runtime.submit(intent(1.0)).await.unwrap();
+    // Single-threaded test runtime: the send task has not run yet.
+    runtime.cancel(&submission.client_order_id).await.unwrap();
+    let mut outcome = None;
+    for _ in 0..200 {
+        if let Some(colo_runtime::RuntimeEvent::SubmitOutcome { outcome: o, .. }) = runtime.next_event() {
+            outcome = Some(o);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        matches!(outcome, Some(gateway::runtime::SubmitOutcome::Rejected { .. })),
+        "not sent, so not unknown: {outcome:?}"
+    );
+    assert_eq!(venue.submitted.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.leaves(&submission.client_order_id).await, None, "reservation released");
+    runtime.submit(intent(1.0)).await.expect("admission stays open");
+    // Let that send finish so its task releases the journal before restart.
+    wait_for("second order sent", || venue.submitted.load(Ordering::SeqCst) == 1).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+
+    let (restarted, _venue) = start_in(&dir).await;
+    assert_eq!(restarted.state().await, RuntimeState::Ready, "recovery is not stuck on the unsent order");
+    assert_eq!(restarted.leaves(&submission.client_order_id).await, None);
 }

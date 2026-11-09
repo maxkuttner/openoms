@@ -215,12 +215,10 @@ impl Runtime {
         }
         self.inner.report_now.notify_one();
 
-        {
-            let core = self.inner.core.lock().await;
-            if let Err(e) = core.control.may_submit(Instant::now()) {
-                self.inner.suspend(Suspension::LapsedAfterIntent);
-                return Err(e);
-            }
+        let lapsed = self.inner.core.lock().await.control.may_submit(Instant::now()).err();
+        if let Some(e) = lapsed {
+            abandon(&self.inner, &prepared.submission.client_order_id, "admission closed before send").await;
+            return Err(e);
         }
 
         let request = prepared.broker_request.clone();
@@ -229,24 +227,19 @@ impl Runtime {
         let intent = prepared.intent.clone();
         let inner = self.inner.clone();
         tokio::spawn(async move {
-            {
+            let not_sent = {
                 let core = inner.core.lock().await;
                 if core.book.cancel_requested(&task_submission.client_order_id) {
-                    inner.push_event(RuntimeEvent::SubmitOutcome {
-                        account: inner.identity.clone(),
-                        client_order_id: task_submission.client_order_id,
-                        outcome: SubmitOutcome::Unknown { reason: "cancelled before send".into() },
-                    });
-                    return;
+                    Some("cancelled before send")
+                } else if core.control.may_submit(Instant::now()).is_err() {
+                    Some("admission stopped before send")
+                } else {
+                    None
                 }
-                if core.control.may_submit(Instant::now()).is_err() {
-                    inner.push_event(RuntimeEvent::SubmitOutcome {
-                        account: inner.identity.clone(),
-                        client_order_id: task_submission.client_order_id,
-                        outcome: SubmitOutcome::Unknown { reason: "admission stopped before send".into() },
-                    });
-                    return;
-                }
+            };
+            if let Some(reason) = not_sent {
+                abandon(&inner, &task_submission.client_order_id, reason).await;
+                return;
             }
             let result = inner.venue.submit_order(&request).await;
             let (state, venue_id, outcome) = match result {
@@ -440,6 +433,27 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
         inner.report_now.notify_one();
     }
     Ok(actions)
+}
+
+/// Closes a journalled intent that was never sent: records why, releases its
+/// reservation and tells the strategy. If the record cannot be written the
+/// reservation is kept, since a restart would still see the bare intent.
+async fn abandon(inner: &Arc<Inner>, client_order_id: &str, reason: &str) {
+    let record = JournalRecord::Abandoned {
+        client_order_id: client_order_id.to_string(),
+        reason: reason.to_string(),
+    };
+    if append(&inner.journal, record).await.is_err() {
+        inner.suspend(Suspension::Journal);
+        return;
+    }
+    inner.report_now.notify_one();
+    inner.core.lock().await.book.abort_order(client_order_id);
+    inner.push_event(RuntimeEvent::SubmitOutcome {
+        account: inner.identity.clone(),
+        client_order_id: client_order_id.to_string(),
+        outcome: SubmitOutcome::Rejected { reason: format!("not sent: {reason}") },
+    });
 }
 
 /// First lookup delay for an order whose submit answer was lost.
@@ -672,8 +686,6 @@ enum Suspension {
     CancelFailed(String),
     /// The submit answer was lost; the venue may have taken this order.
     UnclearOrder(String),
-    /// Admission closed between journalling an intent and sending it.
-    LapsedAfterIntent,
     /// The strategy stopped draining runtime events.
     EventQueueFull,
 }
@@ -684,7 +696,6 @@ impl std::fmt::Display for Suspension {
             Self::Journal => write!(f, "journal write failed"),
             Self::CancelFailed(id) => write!(f, "cancel of {id} failed"),
             Self::UnclearOrder(id) => write!(f, "order {id} has no confirmed venue state"),
-            Self::LapsedAfterIntent => write!(f, "admission closed after an intent was journalled"),
             Self::EventQueueFull => write!(f, "event queue is full"),
         }
     }

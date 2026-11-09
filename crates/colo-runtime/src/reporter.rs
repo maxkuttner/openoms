@@ -158,6 +158,11 @@ fn runtime_event(record: &JournalRecord, account: &AccountIdentity) -> Option<Ru
             epoch: *epoch,
             applied: true,
         }),
+        JournalRecord::Abandoned { client_order_id, reason } => Some(RuntimeEvent::SubmitOutcome {
+            account: account.clone(),
+            client_order_id: client_order_id.clone(),
+            outcome: gateway::runtime::SubmitOutcome::Rejected { reason: format!("not sent: {reason}") },
+        }),
         JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } => None,
     }
 }
