@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -56,7 +56,7 @@ struct Inner {
     capacity: usize,
     journal_limit: u64,
     identity: AccountIdentity,
-    suspended: AtomicBool,
+    suspensions: Mutex<std::collections::BTreeSet<Suspension>>,
     shutdown: tokio::sync::Notify,
     report_now: tokio::sync::Notify,
     recovered: AtomicBool,
@@ -139,7 +139,7 @@ impl Runtime {
             capacity: config.event_queue_capacity,
             journal_limit: config.max_journal_bytes,
             identity: config.identity,
-            suspended: AtomicBool::new(false),
+            suspensions: Mutex::new(std::collections::BTreeSet::new()),
             shutdown: tokio::sync::Notify::new(),
             report_now: tokio::sync::Notify::new(),
             recovered: AtomicBool::new(recovered_ok),
@@ -187,8 +187,11 @@ impl Runtime {
         let now = Instant::now();
         let prepared = {
             let mut core = self.inner.core.lock().await;
-            if core.closed || self.inner.suspended.load(Ordering::SeqCst) {
-                return Err(RuntimeError::NotReady("runtime is suspended".into()));
+            if core.closed {
+                return Err(RuntimeError::NotReady("runtime is shut down".into()));
+            }
+            if let Some(reasons) = self.inner.suspension_reasons() {
+                return Err(RuntimeError::NotReady(format!("runtime is suspended: {reasons}")));
             }
             core.control.may_submit(now)?;
             let prices = core.prices.clone();
@@ -196,7 +199,7 @@ impl Runtime {
         };
         let bytes = self.inner.journal.lock().map_err(|_| RuntimeError::JournalIo("journal lock".into()))?.byte_len();
         if bytes > self.inner.journal_limit {
-            self.inner.suspended.store(true, Ordering::SeqCst);
+            self.inner.suspend(Suspension::Journal);
             self.inner.core.lock().await.book.abort_order(&prepared.submission.client_order_id);
             return Err(RuntimeError::NotReady("journal is over its limit".into()));
         }
@@ -206,7 +209,7 @@ impl Runtime {
             reservation: prepared.reservation.clone(),
         };
         if let Err(e) = append(&self.inner.journal, record).await {
-            self.inner.suspended.store(true, Ordering::SeqCst);
+            self.inner.suspend(Suspension::Journal);
             self.inner.core.lock().await.book.abort_order(&prepared.submission.client_order_id);
             return Err(e);
         }
@@ -215,7 +218,7 @@ impl Runtime {
         {
             let core = self.inner.core.lock().await;
             if let Err(e) = core.control.may_submit(Instant::now()) {
-                self.inner.suspended.store(true, Ordering::SeqCst);
+                self.inner.suspend(Suspension::LapsedAfterIntent);
                 return Err(e);
             }
         }
@@ -263,7 +266,7 @@ impl Runtime {
                 ),
             };
             if state == RuntimeOrderState::Unknown {
-                inner.suspended.store(true, Ordering::SeqCst);
+                inner.suspend(Suspension::UnclearOrder(task_submission.client_order_id.clone()));
             }
             let order = RuntimeOrder {
                 client_order_id: task_submission.client_order_id.clone(),
@@ -294,7 +297,14 @@ impl Runtime {
                     );
                 }
             } else {
-                inner.suspended.store(true, Ordering::SeqCst);
+                inner.suspend(Suspension::Journal);
+            }
+            if state == RuntimeOrderState::Unknown {
+                spawn_resolve(
+                    Arc::downgrade(&inner),
+                    task_submission.client_order_id.clone(),
+                    intent.instrument.clone(),
+                );
             }
             inner.push_event(RuntimeEvent::SubmitOutcome {
                 account: inner.identity.clone(),
@@ -424,12 +434,60 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
     }
     if let Some(record) = kill {
         if let Err(e) = append(&inner.journal, record).await {
-            inner.suspended.store(true, Ordering::SeqCst);
+            inner.suspend(Suspension::Journal);
             return Err(e);
         }
         inner.report_now.notify_one();
     }
     Ok(actions)
+}
+
+/// First lookup delay for an order whose submit answer was lost.
+const RESOLVE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+/// Lookups never back off further than this.
+const RESOLVE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Looks an unclear order up at the venue until its state is known, then
+/// records it and lifts that order's suspension. "No such order" is not taken
+/// as proof it was never placed: the venue may not show it yet, so the
+/// runtime keeps looking and stays stopped.
+fn spawn_resolve(weak: std::sync::Weak<Inner>, client_id: String, symbol: String) {
+    tokio::spawn(async move {
+        let mut delay = RESOLVE_BACKOFF;
+        loop {
+            let Some(inner) = weak.upgrade() else { return };
+            match inner.venue.lookup(&client_id, &symbol).await {
+                Ok(order) if order.state != RuntimeOrderState::Unknown => {
+                    let venue_order_id = order.venue_order_id.clone();
+                    let event = VenueEvent::Order(order);
+                    if append(&inner.journal, JournalRecord::Venue { event: event.clone() }).await.is_err() {
+                        inner.suspend(Suspension::Journal);
+                        return;
+                    }
+                    inner.report_now.notify_one();
+                    let mut core = inner.core.lock().await;
+                    if let Err(e) = core.book.apply(&event) {
+                        tracing::error!(client_order_id = %client_id, error = %e, "runtime: settled order does not match the book");
+                        return;
+                    }
+                    if !venue_order_id.is_empty() && core.book.cancel_requested(&client_id) {
+                        spawn_cancel(inner.clone(), client_id.clone(), venue_order_id, symbol.clone());
+                    }
+                    drop(core);
+                    inner.lift(&Suspension::UnclearOrder(client_id.clone()));
+                    tracing::info!(client_order_id = %client_id, "runtime: unclear order settled by lookup");
+                    return;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(client_order_id = %client_id, error = %e, "runtime: unclear order lookup failed, retrying");
+                }
+            }
+            drop(inner);
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(RESOLVE_MAX_BACKOFF);
+        }
+    });
 }
 
 /// Cancel attempts per order before admission is stopped.
@@ -464,7 +522,7 @@ fn spawn_cancel(inner: Arc<Inner>, client_id: String, venue_order_id: String, sy
                         attempts = attempt,
                         "runtime: cancel failed; order may still rest at the venue, admission stopped"
                     );
-                    inner.suspended.store(true, Ordering::SeqCst);
+                    inner.suspend(Suspension::CancelFailed(client_id.clone()));
                     return;
                 }
                 Err(e) => {
@@ -571,7 +629,7 @@ fn spawn_venue_events(
                 }
                 let record = JournalRecord::Venue { event: event.clone() };
                 if append(&inner.journal, record).await.is_err() {
-                    inner.suspended.store(true, Ordering::SeqCst);
+                    inner.suspend(Suspension::Journal);
                     continue;
                 }
                 inner.report_now.notify_one();
@@ -603,13 +661,63 @@ impl Drop for Runtime {
     }
 }
 
+/// Why admission is stopped. Only `UnclearOrder` lifts itself (when a venue
+/// lookup settles the order); every other reason needs a restart, because the
+/// local record or the venue's state can no longer be trusted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Suspension {
+    /// A journal write failed or the journal is over its limit.
+    Journal,
+    /// Every cancel attempt for this order failed; it may still rest.
+    CancelFailed(String),
+    /// The submit answer was lost; the venue may have taken this order.
+    UnclearOrder(String),
+    /// Admission closed between journalling an intent and sending it.
+    LapsedAfterIntent,
+    /// The strategy stopped draining runtime events.
+    EventQueueFull,
+}
+
+impl std::fmt::Display for Suspension {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Journal => write!(f, "journal write failed"),
+            Self::CancelFailed(id) => write!(f, "cancel of {id} failed"),
+            Self::UnclearOrder(id) => write!(f, "order {id} has no confirmed venue state"),
+            Self::LapsedAfterIntent => write!(f, "admission closed after an intent was journalled"),
+            Self::EventQueueFull => write!(f, "event queue is full"),
+        }
+    }
+}
+
 impl Inner {
+    fn suspend(&self, reason: Suspension) {
+        if let Ok(mut set) = self.suspensions.lock() {
+            set.insert(reason);
+        }
+    }
+
+    fn lift(&self, reason: &Suspension) {
+        if let Ok(mut set) = self.suspensions.lock() {
+            set.remove(reason);
+        }
+    }
+
+    /// `None` when admission is open. A poisoned lock counts as suspended.
+    fn suspension_reasons(&self) -> Option<String> {
+        match self.suspensions.lock() {
+            Ok(set) if set.is_empty() => None,
+            Ok(set) => Some(set.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")),
+            Err(_) => Some("suspension state is poisoned".into()),
+        }
+    }
+
     fn push_event(&self, event: RuntimeEvent) {
         if let Ok(mut events) = self.events.lock() {
             if events.len() < self.capacity {
                 events.push_back(event);
             } else {
-                self.suspended.store(true, Ordering::SeqCst);
+                self.suspend(Suspension::EventQueueFull);
             }
         }
     }

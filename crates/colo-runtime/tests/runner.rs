@@ -86,6 +86,11 @@ struct FakeVenue {
     cancels: Arc<AtomicUsize>,
     /// Cancel attempts that fail before one succeeds; `usize::MAX` fails all.
     cancel_failures: AtomicUsize,
+    /// The next submit fails with a network error: the venue may have the order.
+    submit_unclear: AtomicBool,
+    /// Lookups find the order resting; otherwise they fail with a network error.
+    lookup_finds: AtomicBool,
+    lookups: AtomicUsize,
     block: AtomicBool,
     gate: Arc<Notify>,
     started: Arc<Notify>,
@@ -97,6 +102,9 @@ impl FakeVenue {
             submitted: Arc::new(AtomicUsize::new(0)),
             cancels: Arc::new(AtomicUsize::new(0)),
             cancel_failures: AtomicUsize::new(0),
+            submit_unclear: AtomicBool::new(false),
+            lookup_finds: AtomicBool::new(false),
+            lookups: AtomicUsize::new(0),
             block: AtomicBool::new(false),
             gate: Arc::new(Notify::new()),
             started: Arc::new(Notify::new()),
@@ -112,6 +120,9 @@ impl BrokerAdapter for FakeVenue {
             self.gate.notified().await;
         }
         self.submitted.fetch_add(1, Ordering::SeqCst);
+        if self.submit_unclear.swap(false, Ordering::SeqCst) {
+            return Err(BrokerError::Network("timed out".into()));
+        }
         Ok(BrokerOrderResponse { external_order_id: "v-1".into() })
     }
     async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
@@ -141,8 +152,23 @@ impl RuntimeVenue for FakeVenue {
     async fn executions(&self, cursor: &ExecutionCursor) -> Result<ExecutionPage, BrokerError> {
         Ok(ExecutionPage { trades: vec![], next: cursor.clone(), complete: true, missing: vec![] })
     }
-    async fn lookup(&self, _: &str, _: &str) -> Result<colo_runtime::RuntimeOrder, BrokerError> {
-        Err(BrokerError::NoSuchOrder("fake".into()))
+    async fn lookup(&self, client_order_id: &str, symbol: &str) -> Result<colo_runtime::RuntimeOrder, BrokerError> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        if !self.lookup_finds.load(Ordering::SeqCst) {
+            return Err(BrokerError::Network("lookup timed out".into()));
+        }
+        Ok(colo_runtime::RuntimeOrder {
+            client_order_id: client_order_id.into(),
+            venue_order_id: "v-1".into(),
+            symbol: symbol.into(),
+            side: Side::Buy,
+            original_quantity: 1.0,
+            executed_quantity: 0.0,
+            leaves_quantity: 1.0,
+            limit_price: Some(100.0),
+            state: colo_runtime::RuntimeOrderState::New,
+            original_time: chrono::Utc::now(),
+        })
     }
     async fn subscribe(&self, _: mpsc::Sender<VenueEvent>) -> Result<(), BrokerError> { Ok(()) }
 }
@@ -479,4 +505,55 @@ async fn a_cancel_requested_before_acceptance_is_sent_once_accepted() {
     assert_eq!(venue.cancels.load(Ordering::SeqCst), 0, "no venue id yet");
     venue.gate.notify_waiters();
     wait_for("cancel after acceptance", || venue.cancels.load(Ordering::SeqCst) == 1).await;
+}
+
+async fn unclear_submit(runtime: &Runtime, venue: &FakeVenue) {
+    grant(runtime).await;
+    venue.submit_unclear.store(true, Ordering::SeqCst);
+    runtime.submit(intent(1.0)).await.unwrap();
+    wait_for("venue submit", || venue.submitted.load(Ordering::SeqCst) == 1).await;
+    wait_for("lookup", || venue.lookups.load(Ordering::SeqCst) >= 1).await;
+}
+
+#[tokio::test]
+async fn an_unclear_submit_stops_admission_until_a_lookup_settles_it() {
+    let (runtime, venue, _dir) = start().await;
+    unclear_submit(&runtime, &venue).await;
+    assert!(matches!(
+        runtime.submit(intent(1.0)).await,
+        Err(colo_runtime::RuntimeError::NotReady(_))
+    ));
+    venue.lookup_finds.store(true, Ordering::SeqCst);
+    let mut reopened = false;
+    for _ in 0..400 {
+        if runtime.submit(intent(1.0)).await.is_ok() {
+            reopened = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reopened, "admission stayed stopped after the order was found");
+}
+
+#[tokio::test]
+async fn an_unsettled_unclear_submit_keeps_admission_stopped() {
+    let (runtime, venue, _dir) = start().await;
+    unclear_submit(&runtime, &venue).await;
+    wait_for("retried lookups", || venue.lookups.load(Ordering::SeqCst) >= 3).await;
+    assert!(matches!(
+        runtime.submit(intent(1.0)).await,
+        Err(colo_runtime::RuntimeError::NotReady(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_found_unclear_order_keeps_its_exposure() {
+    let (runtime, venue, _dir) = start().await;
+    venue.lookup_finds.store(true, Ordering::SeqCst);
+    grant(&runtime).await;
+    venue.submit_unclear.store(true, Ordering::SeqCst);
+    let submission = runtime.submit(intent(1.0)).await.unwrap();
+    wait_for("lookup", || venue.lookups.load(Ordering::SeqCst) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(runtime.leaves(&submission.client_order_id).await, Some(1.0));
 }
