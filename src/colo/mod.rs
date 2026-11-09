@@ -178,6 +178,9 @@ pub struct ColoHub {
     down_since: Arc<Mutex<HashMap<String, Instant>>>,
     started: Instant,
     v2_control: Arc<Mutex<HashMap<Uuid, V2ControlSlot>>>,
+    /// One inbox drain at a time per deployment, so the background drain and
+    /// the drain after a new batch never book the same fill twice.
+    drains: Arc<Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 struct V2ControlSlot {
@@ -208,6 +211,7 @@ impl Default for ColoHub {
             kills: Arc::default(),
             down_since: Arc::default(),
             started: Instant::now(),
+            drains: Arc::new(Mutex::new(HashMap::new())),
             v2_control: Arc::default(),
         }
     }
@@ -253,6 +257,10 @@ impl ColoHub {
     }
 
     /// Queue a durable command on the deployment's control socket, if connected.
+    pub(crate) fn drain_guard(&self, deployment_id: Uuid) -> Arc<tokio::sync::Mutex<()>> {
+        self.drains.lock().unwrap().entry(deployment_id).or_default().clone()
+    }
+
     pub(crate) fn push_v2_control(&self, deployment_id: Uuid, message: ToRuntime) -> bool {
         let mut links = self.v2_control.lock().unwrap();
         let Some(slot) = links.get_mut(&deployment_id) else { return false };

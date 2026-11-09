@@ -159,10 +159,53 @@ pub async fn accept_batch(
 
 /// Process committed records in sequence order. Booking is idempotent, so a
 /// crash between booking and marking processed replays safely.
+/// How often accepted-but-unbooked inbox events are retried.
+pub const DRAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Active deployments with inbox events not yet booked, ingest not suspended.
+pub async fn pending_deployments(pool: &PgPool) -> Result<Vec<Uuid>, IngestError> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT i.deployment_id FROM colo_event_inbox i \
+         JOIN colo_deployment d ON d.id = i.deployment_id \
+         WHERE i.processed_at IS NULL AND d.status = 'ACTIVE' AND d.ingest_suspended_reason IS NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db)
+}
+
+/// Retries booking accepted events in the background. The runtime's events
+/// are acknowledged once stored, so a booking that failed (no adapter yet, a
+/// database error) would otherwise wait for the deployment's next batch.
+pub async fn drain_loop(state: AppState) {
+    let mut tick = tokio::time::interval(DRAIN_EVERY);
+    loop {
+        tick.tick().await;
+        let pending = match pending_deployments(state.pool()).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                warn!(error = %e, "co-located: could not list undrained inboxes");
+                continue;
+            }
+        };
+        for deployment_id in pending {
+            match drain_inbox(&state, deployment_id).await {
+                Ok(progress) if progress.processed > 0 => {
+                    tracing::info!(deployment = %deployment_id, booked = progress.processed, "co-located: inbox drained on retry");
+                }
+                Ok(_) => {}
+                Err(e) => warn!(deployment = %deployment_id, error = %e, "co-located: inbox drain failed; will retry"),
+            }
+        }
+    }
+}
+
 pub async fn drain_inbox(
     state: &AppState,
     deployment_id: Uuid,
 ) -> Result<DrainProgress, IngestError> {
+    let guard = state.colo().drain_guard(deployment_id);
+    let _draining = guard.lock().await;
     let deployment = sqlx::query(
         "SELECT strategy_code, account_id, venue, environment, external_account_ref, status, ingest_suspended_reason \
          FROM colo_deployment WHERE id = $1",
@@ -803,6 +846,44 @@ mod tests {
             symbol,
             quote,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn a_deployment_with_unbooked_events_is_pending_until_booked() {
+        let pool = isolated_pool().await;
+        let (deployment, identity, _, _) = seeded(&pool).await;
+        assert!(!pending_deployments(&pool).await.unwrap().contains(&deployment.id));
+        let batch = EventBatch {
+            first_sequence: 1,
+            records: vec![EventRecord {
+                sequence: 1,
+                event: RuntimeEvent::Health {
+                    account: identity,
+                    state: gateway::runtime::StreamState::Live,
+                    observed_at: Utc::now(),
+                },
+            }],
+        };
+        accept_batch(&pool, &deployment, &batch).await.unwrap();
+        assert!(pending_deployments(&pool).await.unwrap().contains(&deployment.id), "accepted, not booked");
+        sqlx::query("UPDATE colo_deployment SET ingest_suspended_reason = 'x' WHERE id = $1")
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!pending_deployments(&pool).await.unwrap().contains(&deployment.id), "suspended ingest is left alone");
+        sqlx::query("UPDATE colo_deployment SET ingest_suspended_reason = NULL WHERE id = $1")
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE colo_event_inbox SET processed_at = now() WHERE deployment_id = $1")
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!pending_deployments(&pool).await.unwrap().contains(&deployment.id));
     }
 
     #[tokio::test]

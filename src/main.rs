@@ -1173,6 +1173,7 @@ async fn serve() {
     }
     tokio::spawn(colo::control::positions_loop(state.clone()));
     tokio::spawn(colo::control::sweep_loop(state.clone()));
+    tokio::spawn(colo::ingest::drain_loop(state.clone()));
     colo::follow::sync_follows(&state).await;
     match file_cfg.and_then(|f| f.control_link()) {
         Some(settings) => {
