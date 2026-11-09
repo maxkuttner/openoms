@@ -166,6 +166,7 @@ impl ControlState {
                 self.state = RuntimeState::Recovering;
                 actions.push(ControlAction::KillCleared { stopped_epoch: latched });
             }
+            ToRuntime::Rebaseline { .. } => {}
             ToRuntime::EventAck { ack } => {
                 actions.push(ControlAction::Acked { through: ack.through_sequence });
             }

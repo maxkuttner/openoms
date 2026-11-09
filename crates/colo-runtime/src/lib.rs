@@ -4,6 +4,7 @@
 
 mod assets;
 mod book;
+pub mod inventory;
 pub mod control;
 pub mod journal;
 pub mod recovery;

@@ -49,6 +49,12 @@ pub enum JournalRecord {
         client_order_id: String,
         reason: String,
     },
+    /// A new starting point for the expected inventory, taken from venue
+    /// balances on an operator's rebaseline command.
+    Baseline {
+        command_id: String,
+        amounts: BTreeMap<String, f64>,
+    },
     /// Durable acknowledgement that OMS events through `through` were applied.
     Ack {
         through: u64,
@@ -223,7 +229,10 @@ impl Journal {
                 r.sequence >= start
                     && !matches!(
                         r.record,
-                        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } | JournalRecord::Checkpoint { .. }
+                        JournalRecord::Ack { .. }
+                            | JournalRecord::Cursor { .. }
+                            | JournalRecord::Checkpoint { .. }
+                            | JournalRecord::Baseline { .. }
                     )
             })
             .take(limit)

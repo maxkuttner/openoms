@@ -85,6 +85,7 @@ pub async fn recover(
             })
             .collect();
         book.install_balances(&opening);
+        book.rebaseline_inventory(&bootstrap.asset_baseline);
         for (symbol, quantity) in &bootstrap.baseline.positions {
             book.install_position(symbol.clone(), *quantity)?;
         }
@@ -99,6 +100,9 @@ pub async fn recover(
             }
             JournalRecord::Abandoned { client_order_id, .. } => {
                 book.abort_order(client_order_id);
+            }
+            JournalRecord::Baseline { amounts, .. } => {
+                book.rebaseline_inventory(amounts);
             }
             _ => {}
         }
@@ -152,6 +156,8 @@ pub async fn recover(
         ));
     }
     drain(&mut rx, &mut book)?;
+    // These snapshots are stable, so one shortfall is already confirmed.
+    book.check_inventory(&balances, true);
 
     let mut evidence = Vec::new();
     for client_id in book.pending_client_ids() {

@@ -11,6 +11,7 @@ use gateway::runtime::{
 };
 
 use crate::assets::{AssetLedger, Reservation};
+use crate::inventory::{Inventory, Shortfall};
 use crate::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -137,6 +138,9 @@ pub struct BookCheckpoint {
     /// Client order id counter, so ids are never reused after a restart.
     pub sequence: u64,
     orders: Vec<RestingOrder>,
+    /// Expected venue inventory; empty in checkpoints written before it existed.
+    #[serde(default)]
+    pub inventory: Inventory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +177,11 @@ pub struct Book {
     sequence: u64,
     journal_id: Uuid,
     pause_reason: Option<String>,
+    inventory: Inventory,
+    /// Confirmed shortfalls; sticky until a rebaseline.
+    drift: Option<Vec<Shortfall>>,
+    /// Fills applied since this book was built; never decreases.
+    fills_applied: u64,
 }
 
 impl Book {
@@ -215,6 +224,9 @@ impl Book {
             journal_id: Uuid::nil(),
             sequence: 0,
             pause_reason: None,
+            inventory: Inventory::default(),
+            drift: None,
+            fills_applied: 0,
         })
     }
 
@@ -383,6 +395,7 @@ impl Book {
             asset_totals: self.assets.totals(),
             sequence: self.sequence,
             orders: self.orders.values().filter(|o| o.state.is_working()).cloned().collect(),
+            inventory: self.inventory.clone(),
         }
     }
 
@@ -416,7 +429,55 @@ impl Book {
             self.orders.insert(order.client_order_id.clone(), order.clone());
         }
         self.sequence = self.sequence.max(checkpoint.sequence);
+        self.inventory = checkpoint.inventory.clone();
+        self.drift = None;
         Ok(())
+    }
+
+    /// Starts the expected inventory from these amounts and clears any drift.
+    /// A base asset tolerates at least two venue steps.
+    pub fn rebaseline_inventory(&mut self, amounts: &BTreeMap<String, f64>) {
+        let mut floors: BTreeMap<String, f64> = BTreeMap::new();
+        for rules in self.instruments.values() {
+            let floor = 2.0 * rules.step_size * rules.multiplier;
+            let entry = floors.entry(rules.base_asset.clone()).or_insert(0.0);
+            *entry = entry.max(floor);
+        }
+        self.inventory.rebaseline(amounts, &floors);
+        self.drift = None;
+    }
+
+    /// Fills applied so far, to tell whether one landed between two reads.
+    pub fn fills_applied(&self) -> u64 {
+        self.fills_applied
+    }
+
+    pub fn inventory(&self) -> &Inventory {
+        &self.inventory
+    }
+
+    /// Shortfalls confirmed against venue balances, until a rebaseline.
+    pub fn inventory_drift(&self) -> Option<&[Shortfall]> {
+        self.drift.as_deref()
+    }
+
+    /// Checks one balance snapshot. `confirmed` treats a single settled
+    /// shortfall as final, for a snapshot that recovery already stabilised.
+    pub fn check_inventory(&mut self, balances: &[AssetBalance], confirmed: bool) {
+        if self.drift.is_some() {
+            return;
+        }
+        let settled = self.pending_client_ids().is_empty();
+        if confirmed {
+            if settled && self.inventory.is_tracking() {
+                let found = self.inventory.shortfalls(balances);
+                if !found.is_empty() {
+                    self.drift = Some(found);
+                }
+            }
+            return;
+        }
+        self.drift = self.inventory.check(balances, settled);
     }
 
     /// Restore the last durable sequence after replay. Never moves backwards.
@@ -708,6 +769,7 @@ impl Book {
             }
             VenueEvent::Balances { balances } => {
                 self.assets.snapshot(balances);
+                self.check_inventory(balances, false);
                 Ok(vec![RuntimeEvent::Venue { account, event: event.clone() }])
             }
             VenueEvent::Health { state, observed_at } => {
@@ -820,6 +882,7 @@ impl Book {
         }
 
         self.seen_trades.insert(trade.key.clone());
+        self.fills_applied += 1;
         order.trades.push(trade.key.clone());
         order.executed_quantity += trade.quantity;
         order.leaves_quantity = (order.leaves_quantity - trade.quantity).max(0.0);
@@ -828,6 +891,20 @@ impl Book {
             Side::Sell => -trade.quantity,
         };
         *self.positions.entry(order.instrument.clone()).or_insert(0.0) += signed;
+        if let Some(rules) = self.instruments.get(&order.instrument) {
+            let base = trade.quantity * rules.multiplier;
+            let quote = base * trade.price;
+            let (base_delta, quote_delta) = match trade.side {
+                Side::Buy => (base, -quote),
+                Side::Sell => (-base, quote),
+            };
+            self.inventory.record(&rules.base_asset, base_delta);
+            self.inventory.record(&rules.quote_asset, quote_delta);
+        }
+        // An unreported fee counts as zero; the shortfall check catches it.
+        if let Some(fee) = &trade.fee {
+            self.inventory.record(&fee.currency, -fee.amount);
+        }
         if !trade.venue_order_id.is_empty() {
             order.venue_order_id = Some(trade.venue_order_id.clone());
             self.by_venue.insert(trade.venue_order_id.clone(), client.clone());

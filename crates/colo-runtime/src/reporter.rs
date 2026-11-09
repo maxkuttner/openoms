@@ -171,7 +171,10 @@ fn runtime_event(record: &JournalRecord, account: &AccountIdentity) -> Option<Ru
             client_order_id: client_order_id.clone(),
             outcome: gateway::runtime::SubmitOutcome::Rejected { reason: format!("not sent: {reason}") },
         }),
-        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } | JournalRecord::Checkpoint { .. } => None,
+        JournalRecord::Ack { .. }
+        | JournalRecord::Cursor { .. }
+        | JournalRecord::Checkpoint { .. }
+        | JournalRecord::Baseline { .. } => None,
     }
 }
 

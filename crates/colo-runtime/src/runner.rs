@@ -199,7 +199,9 @@ impl Runtime {
             ),
             _ => Vec::new(),
         };
+        inner.raise_drift(&*inner.core.lock().await);
         link_tasks.push(spawn_compaction(Arc::downgrade(&inner)));
+        link_tasks.push(spawn_balance_poll(Arc::downgrade(&inner)));
         Ok(Self {
             inner,
             events_task: Mutex::new(Some(task)),
@@ -403,6 +405,13 @@ impl Runtime {
 
 
 async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -> Result<Vec<ControlAction>, RuntimeError> {
+    if let ToRuntime::Rebaseline { rebaseline } = &message.message {
+        let command = rebaseline.command_id.clone();
+        inner.acknowledge(&command, ControlAckStage::Received);
+        rebaseline_inventory(inner, &command).await?;
+        inner.acknowledge(&command, ControlAckStage::ConfirmedClear);
+        return Ok(Vec::new());
+    }
     let incoming = message.message.clone();
     let command = match &incoming {
         ToRuntime::Kill { kill } => Some(kill.command_id.clone()),
@@ -832,11 +841,89 @@ async fn ingest(inner: &Arc<Inner>, event: VenueEvent) -> bool {
     let mut core = inner.core.lock().await;
     let applied = core.book.apply(&event);
     inner.settle_kill(&mut core);
+    inner.raise_drift(&core);
     if applied.is_err() {
         core.control.suspend("venue event did not match local state");
         return false;
     }
     true
+}
+
+/// Attempts to read balances with no fill landing in between.
+const REBASELINE_ATTEMPTS: usize = 3;
+
+/// Takes the venue's current balances as the expected inventory. Refused
+/// while an order's venue state is unknown; retried if a fill lands between
+/// the balance read and the update, since the read may not include it.
+async fn rebaseline_inventory(inner: &Arc<Inner>, command_id: &str) -> Result<(), RuntimeError> {
+    for _ in 0..REBASELINE_ATTEMPTS {
+        let fills_before = {
+            let core = inner.core.lock().await;
+            if !core.book.pending_client_ids().is_empty() {
+                return Err(RuntimeError::InvalidControl(
+                    "an order's venue state is unknown; rebaseline once it settles".into(),
+                ));
+            }
+            core.book.fills_applied()
+        };
+        let balances = inner
+            .venue
+            .balances()
+            .await
+            .map_err(|e| RuntimeError::InvalidControl(format!("balances for rebaseline: {e}")))?;
+        let _writing = inner.writing();
+        let mut core = inner.core.lock().await;
+        if core.book.fills_applied() != fills_before || !core.book.pending_client_ids().is_empty() {
+            continue;
+        }
+        let mut amounts = std::collections::BTreeMap::new();
+        for balance in &balances {
+            *amounts.entry(balance.asset.clone()).or_insert(0.0) += balance.total();
+        }
+        // Journalled under the book lock, so no fill is applied before the
+        // baseline it would otherwise be counted against.
+        if let Err(e) = append(
+            &inner.journal,
+            JournalRecord::Baseline { command_id: command_id.to_string(), amounts: amounts.clone() },
+        )
+        .await
+        {
+            inner.suspend(Suspension::Journal);
+            return Err(e);
+        }
+        core.book.install_balances(&balances);
+        core.book.rebaseline_inventory(&amounts);
+        inner.lift(&Suspension::BalanceDrift);
+        inner.send(FromRuntime::InventoryStatus { shortfalls: Vec::new() });
+        tracing::info!(command_id, "runtime: inventory rebaselined from venue balances");
+        return Ok(());
+    }
+    Err(RuntimeError::InvalidControl("fills kept arriving; rebaseline again".into()))
+}
+
+/// How often venue balances are read and checked against the inventory.
+const BALANCE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn spawn_balance_poll(weak: std::sync::Weak<Inner>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Some(inner) = weak.upgrade() else { break };
+            tokio::select! {
+                _ = inner.stopped() => break,
+                _ = tokio::time::sleep(BALANCE_POLL) => {}
+            }
+            // A resync reads balances itself, after the fills it catches up on.
+            if inner.resyncing.load(Ordering::SeqCst) || inner.is_suspended_for(&Suspension::FeedLost) {
+                continue;
+            }
+            match inner.venue.balances().await {
+                Ok(balances) => {
+                    ingest(&inner, VenueEvent::Balances { balances }).await;
+                }
+                Err(e) => tracing::warn!(error = %e, "runtime: balance poll failed"),
+            }
+        }
+    })
 }
 
 /// History pages read per resync before giving up.
@@ -938,6 +1025,9 @@ enum Suspension {
     EventQueueFull,
     /// The venue feed went stale or closed; lifted by a completed resync.
     FeedLost,
+    /// Venue balances fell short of the expected inventory; lifted only by
+    /// an operator rebaseline.
+    BalanceDrift,
 }
 
 impl std::fmt::Display for Suspension {
@@ -948,6 +1038,7 @@ impl std::fmt::Display for Suspension {
             Self::UnclearOrder(id) => write!(f, "order {id} has no confirmed venue state"),
             Self::EventQueueFull => write!(f, "event queue is full"),
             Self::FeedLost => write!(f, "venue feed was lost; resyncing"),
+            Self::BalanceDrift => write!(f, "venue balances fell short of the expected inventory"),
         }
     }
 }
@@ -991,6 +1082,19 @@ impl Inner {
                 self.acknowledge(&command, ControlAckStage::ConfirmedClear);
             }
         }
+    }
+
+    /// Suspends admission and tells the OMS the first time the book
+    /// confirms an inventory shortfall.
+    fn raise_drift(&self, core: &Core) {
+        let Some(drift) = core.book.inventory_drift() else { return };
+        if self.is_suspended_for(&Suspension::BalanceDrift) {
+            return;
+        }
+        let shortfalls: Vec<String> = drift.iter().map(ToString::to_string).collect();
+        tracing::warn!(shortfalls = ?shortfalls, "runtime: venue inventory short; orders stopped");
+        self.suspend(Suspension::BalanceDrift);
+        self.send(FromRuntime::InventoryStatus { shortfalls });
     }
 
     fn suspend(&self, reason: Suspension) {

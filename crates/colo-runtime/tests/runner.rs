@@ -963,3 +963,57 @@ async fn a_failed_resync_keeps_orders_stopped() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(matches!(runtime.submit(intent(0.01)).await, Err(colo_runtime::RuntimeError::NotReady(_))));
 }
+
+fn inventory_reports(link: &FakeLink) -> Vec<Vec<String>> {
+    link.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.message {
+            FromRuntime::InventoryStatus { shortfalls } => Some(shortfalls.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_inventory_shortfall_stops_orders_until_an_operator_rebaseline() {
+    let (runtime, venue, link, _control, _dir) = start_linked().await;
+    grant(&runtime).await;
+    let stream = venue.stream.lock().unwrap().clone().expect("subscribed");
+    // The approved baseline is 1,000 USDT; the venue now shows 500.
+    let short = vec![AssetBalance { asset: "USDT".into(), free: 500.0, locked: 0.0 }];
+    for _ in 0..3 {
+        stream.send(VenueEvent::Balances { balances: short.clone() }).await.unwrap();
+    }
+    wait_for("drift reported", || inventory_reports(&link).iter().any(|s| !s.is_empty())).await;
+    assert!(matches!(runtime.submit(intent(1.0)).await, Err(colo_runtime::RuntimeError::NotReady(_))));
+
+    // The operator approves the venue's current balances.
+    runtime
+        .apply_control(Received::new(
+            ToRuntime::Rebaseline { rebaseline: colo_link::v2::Rebaseline { command_id: "r".into() } },
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+    wait_for_stages(&link, "r", &[colo_link::v2::ControlAckStage::Received, colo_link::v2::ControlAckStage::ConfirmedClear]).await;
+    assert_eq!(inventory_reports(&link).last(), Some(&Vec::new()));
+    assert!(submit_allowed(&runtime).await, "orders resume after the rebaseline");
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_single_short_snapshot_does_not_stop_orders() {
+    let (runtime, venue, link, _control, _dir) = start_linked().await;
+    grant(&runtime).await;
+    let stream = venue.stream.lock().unwrap().clone().expect("subscribed");
+    stream
+        .send(VenueEvent::Balances { balances: vec![AssetBalance { asset: "USDT".into(), free: 500.0, locked: 0.0 }] })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(inventory_reports(&link).is_empty());
+    assert!(submit_allowed(&runtime).await);
+    runtime.shutdown().await.unwrap();
+}

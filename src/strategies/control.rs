@@ -170,6 +170,38 @@ pub async fn enable(state: &AppState, code: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Approve the venue's current balances as a co-located strategy's expected
+/// inventory, after a withdrawal, deposit or manual trade. Lifts an inventory
+/// suspension once the runtime confirms.
+pub async fn rebaseline(state: &AppState, code: &str) -> Result<String, ApiError> {
+    let mode = state.strategies().by_code(code).map(|s| s.mode);
+    let not_found = || ApiError { status: axum::http::StatusCode::NOT_FOUND, message: format!("strategy {code} not found") };
+    match mode {
+        None => return Err(not_found()),
+        Some(Mode::ViaOms) => {
+            return Err(ApiError {
+                status: axum::http::StatusCode::BAD_REQUEST,
+                message: "only co-located strategies keep an inventory to rebaseline".into(),
+            })
+        }
+        Some(Mode::Colocated) => {}
+    }
+    let receipt = crate::colo::deployment::record_rebaseline_for_strategy(state.pool(), code)
+        .await
+        .map_err(deployment_error)?
+        .ok_or_else(|| ApiError {
+            status: axum::http::StatusCode::BAD_REQUEST,
+            message: format!("strategy {code} has no active deployment"),
+        })?;
+    state.colo().push_v2_control(
+        receipt.deployment_id,
+        colo_link::v2::ToRuntime::Rebaseline {
+            rebaseline: colo_link::v2::Rebaseline { command_id: receipt.command_id.clone() },
+        },
+    );
+    Ok(receipt.command_id)
+}
+
 /// Kill, but leave the strategy reducing only, then close every position
 /// with a limit order inside the price band.
 pub async fn flatten(state: &AppState, code: &str) -> Result<ControlReport, ApiError> {

@@ -559,6 +559,37 @@ pub async fn enable_strategy(State(state): State<AppState>, Path(code): Path<Str
     super::control::enable(&state, &code).await.map(|_| StatusCode::NO_CONTENT).map_err(control_error)
 }
 
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct RebaselineIssued {
+    /// The command the runtime acknowledges: RECEIVED, then CONFIRMED_CLEAR
+    /// once it has taken the venue's balances as its expected inventory.
+    pub command_id: String,
+}
+
+/// Approve a co-located strategy's current venue balances as its expected
+/// inventory, after a withdrawal, deposit or manual trade. Clears an
+/// inventory shortfall that stopped its orders.
+#[utoipa::path(
+    post, path = "/admin/strategies/{code}/rebaseline", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    responses(
+        (status = 202, description = "Sent to the runtime", body = RebaselineIssued),
+        (status = 400, description = "Not co-located, or no active deployment"),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn rebaseline_strategy(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+) -> Result<(StatusCode, Json<RebaselineIssued>), AdminError> {
+    info!(%code, "admin rebaseline strategy inventory");
+    super::control::rebaseline(&state, &code)
+        .await
+        .map(|command_id| (StatusCode::ACCEPTED, Json(RebaselineIssued { command_id })))
+        .map_err(control_error)
+}
+
 /// Kill, leave the strategy reducing only, and close every position with a
 /// limit order inside its price band.
 #[utoipa::path(

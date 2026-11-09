@@ -388,6 +388,14 @@ impl LinkBackend for AppBackend {
                     warn!(deployment = %deployment.id, missing = ?missing, "v2 link: runtime recovered incompletely");
                 }
             }
+            FromRuntime::InventoryStatus { shortfalls } => {
+                deployment::record_inventory_status(pool, deployment.id, shortfalls)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !shortfalls.is_empty() {
+                    warn!(deployment = %deployment.id, ?shortfalls, "v2 link: venue inventory short; runtime stopped orders");
+                }
+            }
             FromRuntime::Hello { versions, .. } => {
                 info!(deployment = %deployment.id, ?versions, "v2 link: runtime said hello");
             }
@@ -469,6 +477,7 @@ mod tests {
             retired_at: None, shutdown_evidence: None, created_at: now, updated_at: now,
             kill_ack_stage: None, acked_policy_revision: None, recovery_ready: None,
             recovery_missing: None, recovery_reported_at: None,
+            inventory_shortfall: None, inventory_reported_at: None,
         }
     }
 

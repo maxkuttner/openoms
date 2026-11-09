@@ -489,3 +489,69 @@ fn a_stale_or_closed_feed_refuses_new_orders() {
             .expect("a live feed admits again");
     }
 }
+
+fn balances(amounts: &[(&str, f64)]) -> VenueEvent {
+    VenueEvent::Balances {
+        balances: amounts
+            .iter()
+            .map(|(asset, total)| AssetBalance { asset: (*asset).into(), free: *total, locked: 0.0 })
+            .collect(),
+    }
+}
+
+/// A book with an inventory baseline and one live buy filled for 2 at 100,
+/// paying 0.01 BNB in fees.
+fn filled_book() -> Book {
+    let mut book = book(BTreeMap::new(), &[("USDT", 1_000.0), ("BNB", 1.0)]);
+    book.rebaseline_inventory(&BTreeMap::from([("USDT".into(), 1_000.0), ("BNB".into(), 1.0)]));
+    let order = book
+        .prepare(intent("BTCUSDT", Side::Buy, 2.0, 100.0), &prices("BTCUSDT", 100.0), Instant::now())
+        .expect("prepare");
+    book.apply(&order_event(&order, RuntimeOrderState::New, 2.0, 0.0)).expect("live");
+    let mut fill = trade(book.identity(), &order, "1", 2.0, 100.0);
+    fill.fee = Some(gateway::runtime::Fee { amount: 0.01, currency: "BNB".into() });
+    book.apply(&VenueEvent::Trade(fill)).expect("fill");
+    book
+}
+
+#[test]
+fn fills_and_fees_move_the_expected_inventory() {
+    let book = filled_book();
+    assert_eq!(book.inventory().expected("BTC"), 2.0);
+    assert_eq!(book.inventory().expected("USDT"), 800.0);
+    assert!((book.inventory().expected("BNB") - 0.99).abs() < 1e-12);
+}
+
+#[test]
+fn matching_balances_never_raise_drift() {
+    let mut book = filled_book();
+    for _ in 0..5 {
+        book.apply(&balances(&[("BTC", 2.0), ("USDT", 800.0), ("BNB", 0.99)])).expect("snapshot");
+    }
+    assert!(book.inventory_drift().is_none());
+}
+
+#[test]
+fn a_persistent_shortfall_raises_drift_until_rebaselined() {
+    let mut book = filled_book();
+    let short = balances(&[("BTC", 2.0), ("USDT", 700.0), ("BNB", 0.99)]);
+    book.apply(&short).expect("1");
+    book.apply(&short).expect("2");
+    assert!(book.inventory_drift().is_none());
+    book.apply(&short).expect("3");
+    let drift = book.inventory_drift().expect("drift");
+    assert_eq!(drift[0].asset, "USDT");
+    // Sticky: a clean snapshot does not clear it.
+    book.apply(&balances(&[("BTC", 2.0), ("USDT", 800.0), ("BNB", 0.99)])).expect("clean");
+    assert!(book.inventory_drift().is_some());
+    book.rebaseline_inventory(&BTreeMap::from([("USDT".into(), 700.0)]));
+    assert!(book.inventory_drift().is_none());
+}
+
+#[test]
+fn the_expected_inventory_survives_a_checkpoint() {
+    let book = filled_book();
+    let mut restored = empty_book_like(&book);
+    restored.restore_checkpoint(&book.checkpoint()).expect("restore");
+    assert_eq!(restored.inventory().expected("USDT"), 800.0);
+}

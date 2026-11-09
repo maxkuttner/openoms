@@ -171,6 +171,7 @@ mod boundary_tests;
         strategies::admin::strategy_securities,
         strategies::admin::kill_strategy,
         strategies::admin::enable_strategy,
+        strategies::admin::rebaseline_strategy,
         strategies::admin::flatten_strategy,
         colo::deployment::register,
         colo::deployment::list,
@@ -212,7 +213,7 @@ mod boundary_tests;
         admin::RevokedSessions,
         auth_api::MeResponse,
         strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
-        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted,
+        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted, strategies::admin::RebaselineIssued,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
         colo::deployment::Deployment, colo::deployment::DeploymentRegistration,
         colo::deployment::InstrumentBaseline, colo::deployment::AssetHolding,
@@ -1542,6 +1543,7 @@ async fn serve() {
         .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
         .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
         .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
+        .route("/admin/strategies/:code/rebaseline", post(strategies::admin::rebaseline_strategy))
         .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
         .route(
             "/admin/strategies/:code/deployments",

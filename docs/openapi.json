@@ -2876,6 +2876,50 @@
         ]
       }
     },
+    "/admin/strategies/{code}/rebaseline": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Approve a co-located strategy's current venue balances as its expected",
+        "description": "inventory, after a withdrawal, deposit or manual trade. Clears an\ninventory shortfall that stopped its orders.",
+        "operationId": "rebaseline_strategy",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Sent to the runtime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RebaselineIssued"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not co-located, or no active deployment"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/symbology/backfill": {
       "post": {
         "tags": [
@@ -4801,6 +4845,16 @@
             "type": "string",
             "format": "uuid"
           },
+          "inventory_reported_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "inventory_shortfall": {
+            "type": "string",
+            "description": "Venue balances the runtime found short of its expected inventory, one\nasset per line; trading is stopped until a rebaseline. NULL when clean.",
+            "nullable": true
+          },
           "kill_ack_stage": {
             "type": "string",
             "description": "How far the runtime has acknowledged the active kill:\nRECEIVED, ADMISSION_STOPPED, CANCELS_SENT or CONFIRMED_CLEAR.",
@@ -5675,6 +5729,18 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "RebaselineIssued": {
+        "type": "object",
+        "required": [
+          "command_id"
+        ],
+        "properties": {
+          "command_id": {
+            "type": "string",
+            "description": "The command the runtime acknowledges: RECEIVED, then CONFIRMED_CLEAR\nonce it has taken the venue's balances as its expected inventory."
           }
         }
       },

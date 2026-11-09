@@ -165,6 +165,13 @@ pub struct Enable {
     pub command_id: String,
 }
 
+/// Operator approval of the venue's current balances as the new expected
+/// inventory, after a withdrawal, deposit or manual trade.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Rebaseline {
+    pub command_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventAck {
     pub through_sequence: u64,
@@ -185,6 +192,7 @@ pub enum ToRuntime {
     Authority { authority: Authority },
     Kill { kill: Kill },
     Enable { enable: Enable },
+    Rebaseline { rebaseline: Rebaseline },
     EventAck { ack: EventAck },
     ResyncRequired { resync: ResyncRequired },
 }
@@ -304,6 +312,8 @@ pub enum FromRuntime {
     Heartbeat { last_event_sequence: u64 },
     Events { batch: EventBatch },
     RecoveryStatus { ready: bool, checkpoint: RuntimeCheckpoint, missing: Vec<String> },
+    /// Confirmed inventory shortfalls; empty once the inventory is clean again.
+    InventoryStatus { shortfalls: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -554,6 +564,7 @@ impl V2Session {
                 self.killed = false;
                 self.kill_epoch = None;
             }
+            ToRuntime::Rebaseline { .. } => {}
             ToRuntime::EventAck { ack } => {
                 if self.tracks_events {
                     self.ack_events(ack.through_sequence)?;

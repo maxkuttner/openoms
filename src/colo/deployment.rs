@@ -26,7 +26,8 @@ const DEPLOYMENT_SELECT: &str = "id, strategy_code, account_id, venue, environme
     kill_epoch, kill_command_id, verified_stop_at, verified_stop_epoch, retired_at, \
     shutdown_evidence, created_at, updated_at, \
     (SELECT c.ack_stage FROM colo_deployment_command c WHERE c.command_id = kill_command_id) AS kill_ack_stage, \
-    acked_policy_revision, recovery_ready, recovery_missing, recovery_reported_at";
+    acked_policy_revision, recovery_ready, recovery_missing, recovery_reported_at, \
+    inventory_shortfall, inventory_reported_at";
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct Deployment {
@@ -64,6 +65,10 @@ pub struct Deployment {
     pub recovery_ready: Option<bool>,
     pub recovery_missing: Option<String>,
     pub recovery_reported_at: Option<DateTime<Utc>>,
+    /// Venue balances the runtime found short of its expected inventory, one
+    /// asset per line; trading is stopped until a rebaseline. NULL when clean.
+    pub inventory_shortfall: Option<String>,
+    pub inventory_reported_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -923,6 +928,57 @@ pub async fn record_recovery_status(
     Ok(())
 }
 
+/// Stores the runtime's latest inventory report; an empty one clears it.
+pub async fn record_inventory_status(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    shortfalls: &[String],
+) -> Result<(), DeploymentError> {
+    sqlx::query(
+        "UPDATE colo_deployment SET inventory_shortfall = $2, inventory_reported_at = now(), \
+         updated_at = now() WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .bind((!shortfalls.is_empty()).then(|| shortfalls.join("\n")))
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Records an operator rebaseline for the strategy's active deployment: the
+/// runtime is to take the venue's current balances as its expected
+/// inventory. Returns the command id to send, or `None` without a deployment.
+pub async fn record_rebaseline_for_strategy(
+    pool: &PgPool,
+    strategy_code: &str,
+) -> Result<Option<CommandReceipt>, DeploymentError> {
+    let row = sqlx::query(
+        "SELECT id, epoch FROM colo_deployment WHERE strategy_code = $1 AND status = 'ACTIVE' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(strategy_code)
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    let Some(row) = row else { return Ok(None) };
+    let deployment_id: Uuid = row.get("id");
+    let epoch = row.get::<i64, _>("epoch") as u64;
+    let command_id = format!("rebaseline-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO colo_deployment_command (id, deployment_id, command_id, kind, epoch) \
+         VALUES ($1, $2, $3, 'REBASELINE', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(deployment_id)
+    .bind(&command_id)
+    .bind(epoch as i64)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(Some(CommandReceipt { deployment_id, epoch, command_id, kind: "rebaseline", stopped_epoch: None }))
+}
+
 pub async fn record_kill_for_strategy(
     pool: &PgPool,
     strategy_code: &str,
@@ -1697,6 +1753,34 @@ mod tests {
         assert_eq!(reloaded.recovery_ready, Some(false));
         assert_eq!(reloaded.recovery_missing.as_deref(), Some("order c-1 has no venue evidence"));
         assert!(reloaded.recovery_reported_at.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn a_rebaseline_is_recorded_and_acknowledged_and_shortfalls_are_stored() {
+        use colo_link::v2::ControlAckStage::*;
+        let pool = isolated_pool().await;
+        let (_, _, _, input) = seed_registration(&pool, "PAPER").await;
+        let deployment = register_deployment(&pool, &input).await.unwrap();
+        let session = acquire_session(&pool, deployment.id, Uuid::new_v4()).await.unwrap();
+
+        record_inventory_status(&pool, deployment.id, &["USDT is 500 short".into(), "BTC is 1 short".into()])
+            .await
+            .unwrap();
+        let reloaded = get_deployment(&pool, &deployment.strategy_code, deployment.id).await.unwrap();
+        assert_eq!(reloaded.inventory_shortfall.as_deref(), Some("USDT is 500 short\nBTC is 1 short"));
+        assert!(reloaded.inventory_reported_at.is_some());
+
+        let receipt = record_rebaseline_for_strategy(&pool, &deployment.strategy_code).await.unwrap().unwrap();
+        assert_eq!(receipt.deployment_id, deployment.id);
+        assert_eq!(receipt.epoch, session.epoch);
+        assert!(record_control_ack(&pool, deployment.id, session.epoch, &receipt.command_id, Received).await.unwrap());
+        assert!(record_control_ack(&pool, deployment.id, session.epoch, &receipt.command_id, ConfirmedClear).await.unwrap());
+        record_inventory_status(&pool, deployment.id, &[]).await.unwrap();
+        let reloaded = get_deployment(&pool, &deployment.strategy_code, deployment.id).await.unwrap();
+        assert_eq!(reloaded.inventory_shortfall, None);
+        assert_eq!(reloaded.kill_epoch, None, "a rebaseline is not a kill");
+        assert!(record_rebaseline_for_strategy(&pool, "NO-SUCH-STRATEGY").await.unwrap().is_none());
     }
 
     #[tokio::test]
