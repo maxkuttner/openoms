@@ -223,8 +223,24 @@ fn a_write_failure_returns_no_durable_sequence() {
     assert_eq!(journal.unacked(1, 10).unwrap().len(), 0);
 }
 
+fn checkpoint_record(id: &AccountIdentity) -> JournalRecord {
+    let book = colo_runtime::Book::new(id.clone(), Default::default()).unwrap();
+    JournalRecord::Checkpoint { book: book.checkpoint(), cursor: Default::default() }
+}
+
 #[test]
-fn compaction_keeps_live_orders_the_kill_latch_and_the_watermark() {
+fn compaction_without_a_checkpoint_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let id = identity();
+    let (mut journal, _) = journal(&dir, &id);
+    journal.append_durable(&intent_record("pending")).unwrap();
+    journal.ack_through(1).unwrap();
+    assert!(journal.compact().is_err(), "positions would be lost");
+    assert!(journal.replay().unwrap().iter().any(|r| matches!(r.record, JournalRecord::Intent { .. })));
+}
+
+#[test]
+fn compaction_drops_what_the_checkpoint_covers_and_keeps_the_kill_latch() {
     let dir = TempDir::new().unwrap();
     let id = identity();
     let (mut journal, path) = journal(&dir, &id);
@@ -239,14 +255,14 @@ fn compaction_keeps_live_orders_the_kill_latch_and_the_watermark() {
     journal
         .append_durable(&JournalRecord::Policy { policy_id: "p".into(), revision: 3, epoch: 7 })
         .unwrap();
+    journal.append_durable(&checkpoint_record(&id)).unwrap();
     let last = journal.last_sequence();
     journal.ack_through(last).unwrap();
-    assert!(journal.ack_through(last).is_ok());
     journal.compact().unwrap();
 
     let replay = journal.replay().unwrap();
-    assert!(replay.iter().any(|r| matches!(&r.record, JournalRecord::Intent { submission, .. } if submission.client_order_id == "live")));
-    assert!(!replay.iter().any(|r| matches!(&r.record, JournalRecord::Intent { submission, .. } if submission.client_order_id == "done")));
+    assert!(!replay.iter().any(|r| matches!(r.record, JournalRecord::Intent { .. })), "orders live in the checkpoint");
+    assert!(replay.iter().any(|r| matches!(r.record, JournalRecord::Checkpoint { .. })));
     assert!(replay.iter().any(|r| matches!(r.record, JournalRecord::Kill { .. })));
     assert!(replay.iter().any(|r| matches!(r.record, JournalRecord::Policy { .. })));
     assert!(journal.kill_latched());
@@ -260,13 +276,20 @@ fn compaction_keeps_live_orders_the_kill_latch_and_the_watermark() {
 }
 
 #[test]
-fn compaction_keeps_an_unknown_pending_order() {
+fn compaction_keeps_records_after_the_checkpoint_and_unacknowledged_ones() {
     let dir = TempDir::new().unwrap();
     let id = identity();
     let (mut journal, _) = journal(&dir, &id);
-    journal.append_durable(&intent_record("pending")).unwrap();
-    journal.ack_through(1).unwrap();
+    journal.append_durable(&intent_record("unacked")).unwrap();
+    journal.append_durable(&checkpoint_record(&id)).unwrap();
+    journal.append_durable(&intent_record("after")).unwrap();
     journal.compact().unwrap();
     let replay = journal.replay().unwrap();
-    assert!(replay.iter().any(|r| matches!(&r.record, JournalRecord::Intent { submission, .. } if submission.client_order_id == "pending")));
+    let kept = |name: &str| {
+        replay.iter().any(|r| matches!(&r.record, JournalRecord::Intent { submission, .. } if submission.client_order_id == name))
+    };
+    assert!(kept("unacked"), "the OMS has not acknowledged it yet");
+    assert!(kept("after"));
+    assert!(journal.unacked(1, 10).unwrap().iter().all(|r| !matches!(r.record, JournalRecord::Checkpoint { .. })),
+        "a checkpoint is local state, not an event for the OMS");
 }

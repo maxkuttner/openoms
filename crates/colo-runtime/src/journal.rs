@@ -2,13 +2,13 @@
 //! monotonic sequences and an atomic compaction. A torn final append is
 //! recoverable; complete-length corruption is not.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use gateway::runtime::{AccountIdentity, RuntimeOrderState, SymbolCursor, VenueEvent};
+use gateway::runtime::{AccountIdentity, SymbolCursor, VenueEvent};
 use serde::{Deserialize, Serialize};
 
 use crate::book::{Intent, Submission};
@@ -52,6 +52,12 @@ pub enum JournalRecord {
     /// Durable acknowledgement that OMS events through `through` were applied.
     Ack {
         through: u64,
+    },
+    /// The book and execution watermarks at this sequence. Recovery starts
+    /// here and applies only later records; compaction may drop earlier ones.
+    Checkpoint {
+        book: crate::book::BookCheckpoint,
+        cursor: BTreeMap<String, SymbolCursor>,
     },
     /// Persisted execution watermarks; survives compaction of old trades.
     Cursor {
@@ -202,7 +208,10 @@ impl Journal {
             .iter()
             .filter(|r| {
                 r.sequence >= start
-                    && !matches!(r.record, JournalRecord::Ack { .. } | JournalRecord::Cursor { .. })
+                    && !matches!(
+                        r.record,
+                        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } | JournalRecord::Checkpoint { .. }
+                    )
             })
             .take(limit)
             .cloned()
@@ -230,43 +239,39 @@ impl Journal {
         latched
     }
 
-    /// Rewrite the journal atomically, retaining unacknowledged events, live or
-    /// unknown orders, the latest policy/ACK watermark and the kill/enable chain.
+    /// The sequence of the latest checkpoint, if any.
+    pub fn latest_checkpoint(&self) -> Option<u64> {
+        self.records
+            .iter()
+            .filter(|r| matches!(r.record, JournalRecord::Checkpoint { .. }))
+            .map(|r| r.sequence)
+            .max()
+    }
+
+    /// Rewrite the journal atomically without what the latest checkpoint
+    /// covers. Kept: the checkpoint, everything after it, events the OMS has
+    /// not acknowledged, the kill/enable chain and the latest ACK and policy.
+    /// Refused without a checkpoint: recovery rebuilds positions from the
+    /// records, so dropping them would lose positions.
     pub fn compact(&mut self) -> Result<(), RuntimeError> {
-        let live = live_orders(&self.records);
-        let latest_ack = self
-            .records
-            .iter()
-            .filter(|r| matches!(r.record, JournalRecord::Ack { .. }))
-            .map(|r| r.sequence)
-            .max();
-        let latest_policy = self
-            .records
-            .iter()
-            .filter(|r| matches!(r.record, JournalRecord::Policy { .. }))
-            .map(|r| r.sequence)
-            .max();
-        let latest_cursor = self
-            .records
-            .iter()
-            .filter(|r| matches!(r.record, JournalRecord::Cursor { .. }))
-            .map(|r| r.sequence)
-            .max();
+        let checkpoint = self.latest_checkpoint().ok_or_else(|| {
+            RuntimeError::JournalIo("compaction needs a checkpoint; none has been written".into())
+        })?;
+        let latest = |pick: fn(&JournalRecord) -> bool| {
+            self.records.iter().filter(|r| pick(&r.record)).map(|r| r.sequence).max()
+        };
+        let latest_ack = latest(|r| matches!(r, JournalRecord::Ack { .. }));
+        let latest_policy = latest(|r| matches!(r, JournalRecord::Policy { .. }));
 
         let keep: Vec<SequencedRecord> = self
             .records
             .iter()
             .filter(|r| {
-                r.sequence > self.acked
+                r.sequence >= checkpoint
+                    || r.sequence > self.acked
                     || matches!(r.record, JournalRecord::Kill { .. } | JournalRecord::Enable { .. })
                     || Some(r.sequence) == latest_ack
                     || Some(r.sequence) == latest_policy
-                    || Some(r.sequence) == latest_cursor
-                    || match &r.record {
-                        JournalRecord::Intent { submission, .. } => live.contains(&submission.client_order_id),
-                        JournalRecord::Venue { event } => event_client(event).is_some_and(|id| live.contains(id)),
-                        _ => false,
-                    }
             })
             .cloned()
             .collect();
@@ -460,45 +465,4 @@ fn sync_parent(path: &Path) {
             let _ = dir.sync_all();
         }
     }
-}
-
-fn live_orders(records: &[SequencedRecord]) -> BTreeSet<String> {
-    let mut live = BTreeSet::new();
-    for record in records {
-        match &record.record {
-            JournalRecord::Intent { submission, .. } => {
-                live.insert(submission.client_order_id.clone());
-            }
-            JournalRecord::Venue { event } => {
-                if let VenueEvent::Order(order) = event {
-                    if is_terminal(order.state) && !order.client_order_id.is_empty() {
-                        live.remove(&order.client_order_id);
-                    }
-                }
-            }
-            JournalRecord::Abandoned { client_order_id, .. } => {
-                live.remove(client_order_id);
-            }
-            _ => {}
-        }
-    }
-    live
-}
-
-fn event_client(event: &VenueEvent) -> Option<&str> {
-    match event {
-        VenueEvent::Order(order) if !order.client_order_id.is_empty() => Some(&order.client_order_id),
-        VenueEvent::Trade(trade) if !trade.client_order_id.is_empty() => Some(&trade.client_order_id),
-        _ => None,
-    }
-}
-
-fn is_terminal(state: RuntimeOrderState) -> bool {
-    matches!(
-        state,
-        RuntimeOrderState::Filled
-            | RuntimeOrderState::Canceled
-            | RuntimeOrderState::Rejected
-            | RuntimeOrderState::Expired
-    )
 }

@@ -32,7 +32,10 @@ impl Reporter {
             .iter()
             .filter(|r| {
                 r.sequence <= acked
-                    && !matches!(r.record, JournalRecord::Ack { .. } | JournalRecord::Cursor { .. })
+                    && !matches!(
+                        r.record,
+                        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } | JournalRecord::Checkpoint { .. }
+                    )
             })
             .count() as u64;
         let mut session = V2Session::new(identity.clone(), epoch, session_nonce, 1);
@@ -163,7 +166,7 @@ fn runtime_event(record: &JournalRecord, account: &AccountIdentity) -> Option<Ru
             client_order_id: client_order_id.clone(),
             outcome: gateway::runtime::SubmitOutcome::Rejected { reason: format!("not sent: {reason}") },
         }),
-        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } => None,
+        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } | JournalRecord::Checkpoint { .. } => None,
     }
 }
 
