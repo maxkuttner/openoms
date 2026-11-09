@@ -4752,6 +4752,12 @@
             "type": "string",
             "format": "uuid"
           },
+          "acked_policy_revision": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Newest policy revision the runtime reports as installed.",
+            "nullable": true
+          },
           "allocation_max_notional": {
             "type": "number",
             "format": "double"
@@ -4790,6 +4796,11 @@
             "type": "string",
             "format": "uuid"
           },
+          "kill_ack_stage": {
+            "type": "string",
+            "description": "How far the runtime has acknowledged the active kill:\nRECEIVED, ADMISSION_STOPPED, CANCELS_SENT or CONFIRMED_CLEAR.",
+            "nullable": true
+          },
           "kill_command_id": {
             "type": "string",
             "nullable": true
@@ -4806,6 +4817,20 @@
           "policy_revision": {
             "type": "integer",
             "format": "int64"
+          },
+          "recovery_missing": {
+            "type": "string",
+            "nullable": true
+          },
+          "recovery_ready": {
+            "type": "boolean",
+            "description": "The runtime's last recovery report: ready to trade, and what was\nmissing if not (one item per line).",
+            "nullable": true
+          },
+          "recovery_reported_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
           },
           "retired_at": {
             "type": "string",

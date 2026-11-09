@@ -23,7 +23,9 @@ const DEPLOYMENT_SELECT: &str = "id, strategy_code, account_id, venue, environme
     allocation_quote_asset, allocation_max_notional::double precision AS allocation_max_notional, \
     allocation_max_position_qty::double precision AS allocation_max_position_qty, policy_revision, \
     kill_epoch, kill_command_id, verified_stop_at, verified_stop_epoch, retired_at, \
-    shutdown_evidence, created_at, updated_at";
+    shutdown_evidence, created_at, updated_at, \
+    (SELECT c.ack_stage FROM colo_deployment_command c WHERE c.command_id = kill_command_id) AS kill_ack_stage, \
+    acked_policy_revision, recovery_ready, recovery_missing, recovery_reported_at";
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
 pub struct Deployment {
@@ -50,6 +52,16 @@ pub struct Deployment {
     pub shutdown_evidence: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// How far the runtime has acknowledged the active kill:
+    /// RECEIVED, ADMISSION_STOPPED, CANCELS_SENT or CONFIRMED_CLEAR.
+    pub kill_ack_stage: Option<String>,
+    /// Newest policy revision the runtime reports as installed.
+    pub acked_policy_revision: Option<i64>,
+    /// The runtime's last recovery report: ready to trade, and what was
+    /// missing if not (one item per line).
+    pub recovery_ready: Option<bool>,
+    pub recovery_missing: Option<String>,
+    pub recovery_reported_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
@@ -793,6 +805,77 @@ pub async fn apply_command(
     })
 }
 
+/// Records a kill/enable acknowledgement stage. Matches the command exactly
+/// (deployment, command id and epoch) and only moves the stage forward, so a
+/// late or replayed acknowledgement cannot undo a later one. Returns whether
+/// anything changed.
+pub async fn record_control_ack(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    epoch: u64,
+    command_id: &str,
+    stage: colo_link::v2::ControlAckStage,
+) -> Result<bool, DeploymentError> {
+    use colo_link::v2::ControlAckStage::*;
+    let stage = match stage {
+        Received => "RECEIVED",
+        AdmissionStopped => "ADMISSION_STOPPED",
+        CancelsSent => "CANCELS_SENT",
+        ConfirmedClear => "CONFIRMED_CLEAR",
+    };
+    let updated = sqlx::query(
+        "UPDATE colo_deployment_command SET ack_stage = $4, acked_at = now() \
+         WHERE deployment_id = $1 AND command_id = $2 AND epoch = $3 \
+           AND (ack_stage IS NULL OR \
+                array_position(ARRAY['RECEIVED','ADMISSION_STOPPED','CANCELS_SENT','CONFIRMED_CLEAR'], ack_stage) \
+              < array_position(ARRAY['RECEIVED','ADMISSION_STOPPED','CANCELS_SENT','CONFIRMED_CLEAR'], $4::text))",
+    )
+    .bind(deployment_id)
+    .bind(command_id)
+    .bind(epoch as i64)
+    .bind(stage)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(updated.rows_affected() == 1)
+}
+
+/// Records the newest policy revision the runtime installed. A revision the
+/// OMS has not published yet is ignored, and the value never goes back.
+pub async fn record_policy_ack(pool: &PgPool, deployment_id: Uuid, revision: u64) -> Result<(), DeploymentError> {
+    sqlx::query(
+        "UPDATE colo_deployment \
+         SET acked_policy_revision = GREATEST(COALESCE(acked_policy_revision, 0), $2), updated_at = now() \
+         WHERE id = $1 AND $2 <= policy_revision AND $2 > 0",
+    )
+    .bind(deployment_id)
+    .bind(revision as i64)
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
+/// Stores the recovery status the runtime last reported.
+pub async fn record_recovery_status(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    ready: bool,
+    missing: &[String],
+) -> Result<(), DeploymentError> {
+    sqlx::query(
+        "UPDATE colo_deployment SET recovery_ready = $2, recovery_missing = $3, \
+         recovery_reported_at = now(), updated_at = now() WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .bind(ready)
+    .bind((!missing.is_empty()).then(|| missing.join("\n")))
+    .execute(pool)
+    .await
+    .map_err(db)?;
+    Ok(())
+}
+
 pub async fn record_kill_for_strategy(
     pool: &PgPool,
     strategy_code: &str,
@@ -1347,12 +1430,22 @@ mod tests {
             .await
             .expect("portfolio");
         let suffix = Uuid::new_v4().simple().to_string();
+        // Seeded here when missing: CI runs these against a fresh database.
+        // One connection per broker and environment, shared by parallel tests.
+        sqlx::query(
+            "INSERT INTO broker_connection (code, broker_code, environment, status) \
+             VALUES ('colo-test-binance-paper', 'BINANCE', 'PAPER', 'ACTIVE') \
+             ON CONFLICT (broker_code, environment) DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .expect("seed BINANCE PAPER connection");
         let connection: String = sqlx::query_scalar(
-            "SELECT code FROM broker_connection WHERE broker_code = 'BINANCE' AND environment = 'PAPER' LIMIT 1",
+            "SELECT code FROM broker_connection WHERE broker_code = 'BINANCE' AND environment = 'PAPER'",
         )
         .fetch_one(pool)
         .await
-        .expect("seeded BINANCE PAPER connection");
+        .expect("BINANCE PAPER connection");
         let account = Uuid::new_v4();
         let external = format!("colo-{}", &suffix[..12]);
         sqlx::query(
@@ -1483,6 +1576,52 @@ mod tests {
         let second = bootstrap(&state, &deployment).await.unwrap();
         assert!(second.baseline.sequence > first.baseline.sequence);
         assert!(second.limits.values().any(|l| l.max_order_qty == Some(5.0)));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn runtime_acknowledgements_are_recorded_and_never_move_back() {
+        use colo_link::v2::ControlAckStage::*;
+        let pool = isolated_pool().await;
+        let (_, _, _, input) = seed_registration(&pool, "PAPER").await;
+        let deployment = register_deployment(&pool, &input).await.unwrap();
+        let session = acquire_session(&pool, deployment.id, Uuid::new_v4()).await.unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let kill_id = format!("kill-{}", &suffix[..12]);
+        apply_command(
+            &pool,
+            &ControlCommand {
+                deployment_id: deployment.id,
+                epoch: session.epoch,
+                command_id: kill_id.clone(),
+                kind: CommandKind::Kill,
+            },
+        )
+        .await
+        .unwrap();
+        let stage = || async {
+            get_deployment(&pool, &deployment.strategy_code, deployment.id).await.unwrap().kill_ack_stage
+        };
+        assert_eq!(stage().await, None);
+        assert!(record_control_ack(&pool, deployment.id, session.epoch, &kill_id, CancelsSent).await.unwrap());
+        assert_eq!(stage().await.as_deref(), Some("CANCELS_SENT"));
+        assert!(!record_control_ack(&pool, deployment.id, session.epoch, &kill_id, Received).await.unwrap(), "late ACK");
+        assert!(!record_control_ack(&pool, deployment.id, session.epoch - 1, &kill_id, ConfirmedClear).await.unwrap(), "stale epoch");
+        assert!(!record_control_ack(&pool, deployment.id, session.epoch, "kill-other", ConfirmedClear).await.unwrap());
+        assert_eq!(stage().await.as_deref(), Some("CANCELS_SENT"));
+        assert!(record_control_ack(&pool, deployment.id, session.epoch, &kill_id, ConfirmedClear).await.unwrap());
+        assert_eq!(stage().await.as_deref(), Some("CONFIRMED_CLEAR"));
+
+        let published = deployment.policy_revision as u64;
+        record_policy_ack(&pool, deployment.id, published + 5).await.unwrap();
+        record_policy_ack(&pool, deployment.id, published).await.unwrap();
+        record_policy_ack(&pool, deployment.id, published.saturating_sub(1).max(1)).await.unwrap();
+        record_recovery_status(&pool, deployment.id, false, &["order c-1 has no venue evidence".into()]).await.unwrap();
+        let reloaded = get_deployment(&pool, &deployment.strategy_code, deployment.id).await.unwrap();
+        assert_eq!(reloaded.acked_policy_revision, Some(published as i64), "unpublished and older revisions ignored");
+        assert_eq!(reloaded.recovery_ready, Some(false));
+        assert_eq!(reloaded.recovery_missing.as_deref(), Some("order c-1 has no venue evidence"));
+        assert!(reloaded.recovery_reported_at.is_some());
     }
 
     #[tokio::test]

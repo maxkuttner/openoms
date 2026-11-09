@@ -52,6 +52,11 @@ pub trait LinkBackend: Send + Sync {
     async fn bootstrap_v2(&self, _deployment: &Deployment) -> Result<Bootstrap, String> {
         Err("v2 bootstrap not supported".into())
     }
+    /// A runtime message that is not an event batch: acknowledgements, hello
+    /// and recovery status. Ignored unless the backend records it.
+    async fn runtime_message(&self, _deployment: &Deployment, _message: &FromRuntime) -> Result<(), String> {
+        Ok(())
+    }
     async fn accept_events(
         &self,
         _deployment: &Deployment,
@@ -269,7 +274,11 @@ async fn handle_v2(
                                         }
                                     }
                                     FromRuntime::Heartbeat { .. } => last_seen = Instant::now(),
-                                    _ => {}
+                                    other => {
+                                        if let Err(e) = backend.runtime_message(&binding.deployment, other).await {
+                                            warn!(deployment = %deployment_id, error = %e, "v2 link: runtime message not recorded");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -357,6 +366,36 @@ impl LinkBackend for AppBackend {
         Ok(ack.through_sequence)
     }
 
+    async fn runtime_message(&self, deployment: &Deployment, message: &FromRuntime) -> Result<(), String> {
+        let pool = self.0.pool();
+        match message {
+            FromRuntime::ControlAck { epoch, command_id, stage } => {
+                let moved = deployment::record_control_ack(pool, deployment.id, *epoch, command_id, *stage)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                info!(deployment = %deployment.id, command = %command_id, ?stage, moved, "v2 link: control acknowledged");
+            }
+            FromRuntime::PolicyAck { policy_revision } => {
+                deployment::record_policy_ack(pool, deployment.id, *policy_revision)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            FromRuntime::RecoveryStatus { ready, missing, .. } => {
+                deployment::record_recovery_status(pool, deployment.id, *ready, missing)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if !ready {
+                    warn!(deployment = %deployment.id, missing = ?missing, "v2 link: runtime recovered incompletely");
+                }
+            }
+            FromRuntime::Hello { versions, .. } => {
+                info!(deployment = %deployment.id, ?versions, "v2 link: runtime said hello");
+            }
+            FromRuntime::Events { .. } | FromRuntime::Heartbeat { .. } => {}
+        }
+        Ok(())
+    }
+
     async fn initial_state(&self, code: &str) -> ToStrategy {
         let Some(s) = self.0.strategies().by_code(code) else {
             return ToStrategy::State { active: false, limits: Default::default(), limits_version: 0, positions: Vec::new(), dead_man_secs: 5 };
@@ -428,6 +467,8 @@ mod tests {
             allocation_max_position_qty: None, policy_revision: 1, kill_epoch: None,
             kill_command_id: None, verified_stop_at: None, verified_stop_epoch: None,
             retired_at: None, shutdown_evidence: None, created_at: now, updated_at: now,
+            kill_ack_stage: None, acked_policy_revision: None, recovery_ready: None,
+            recovery_missing: None, recovery_reported_at: None,
         }
     }
 
@@ -437,6 +478,7 @@ mod tests {
         nonce: Uuid,
         hub: ColoHub,
         batches: Arc<std::sync::Mutex<Vec<EventBatch>>>,
+        runtime_messages: Arc<std::sync::Mutex<Vec<FromRuntime>>>,
     }
 
     #[async_trait::async_trait]
@@ -463,6 +505,10 @@ mod tests {
                 allocation: Allocation { quote_asset: "USDT".into(), max_notional: 1_000.0, max_position_qty: None },
                 recovery_universe: vec![],
             })
+        }
+        async fn runtime_message(&self, _: &Deployment, message: &FromRuntime) -> Result<(), String> {
+            self.runtime_messages.lock().unwrap().push(message.clone());
+            Ok(())
         }
         async fn accept_events(&self, deployment: &Deployment, batch: &EventBatch) -> Result<u64, String> {
             self.batches.lock().unwrap().push(batch.clone());
@@ -537,6 +583,7 @@ mod tests {
             nonce,
             hub: hub.clone(),
             batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            runtime_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -561,6 +608,7 @@ mod tests {
                 event: RuntimeEvent::Health { account: account.clone(), state: StreamState::Live, observed_at: Utc::now() },
             }],
         };
+        let account_for_ack = account.clone();
         link.send_events(FromRuntimeEnvelope {
             protocol_version: 2,
             account,
@@ -584,5 +632,33 @@ mod tests {
         assert!(saw_authority, "control socket never delivered authority");
         assert_eq!(ack.through_sequence, 1);
         assert_eq!(backend.batches.lock().unwrap().len(), 1);
+
+        // Acknowledgements and status reach the backend, not just events.
+        let envelope = |message| FromRuntimeEnvelope {
+            protocol_version: 2,
+            account: account_for_ack.clone(),
+            epoch: 1,
+            policy_revision: 1,
+            sequence: 1,
+            session_nonce: nonce.to_string(),
+            message,
+        };
+        link.send_events(envelope(FromRuntime::ControlAck {
+            epoch: 1,
+            command_id: "kill-1".into(),
+            stage: colo_link::v2::ControlAckStage::CancelsSent,
+        }))
+        .await
+        .unwrap();
+        link.send_events(envelope(FromRuntime::PolicyAck { policy_revision: 1 })).await.unwrap();
+        for _ in 0..200 {
+            if backend.runtime_messages.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let seen = backend.runtime_messages.lock().unwrap().clone();
+        assert!(seen.iter().any(|m| matches!(m, FromRuntime::ControlAck { command_id, .. } if command_id == "kill-1")));
+        assert!(seen.iter().any(|m| matches!(m, FromRuntime::PolicyAck { policy_revision: 1 })));
     }
 }
