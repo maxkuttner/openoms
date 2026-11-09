@@ -94,6 +94,7 @@ impl Runtime {
         let recovered = recover(&*venue, &mut journal, &config.bootstrap).await?;
         let RecoveredBook { mut book, events, complete: recovered_ok, evidence, execution_cursor, .. } = recovered;
         book.restore_sequence(journal.last_sequence());
+        book.set_journal_id(journal.id());
         book.install_policy(
             config.bootstrap.limits.clone(),
             config.bootstrap.trading_state,

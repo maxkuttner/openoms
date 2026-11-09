@@ -293,3 +293,21 @@ fn compaction_keeps_records_after_the_checkpoint_and_unacknowledged_ones() {
     assert!(journal.unacked(1, 10).unwrap().iter().all(|r| !matches!(r.record, JournalRecord::Checkpoint { .. })),
         "a checkpoint is local state, not an event for the OMS");
 }
+
+#[test]
+fn a_journal_keeps_its_own_id_through_reopen_and_compaction() {
+    let dir = TempDir::new().unwrap();
+    let id = identity();
+    let (mut first, path) = journal(&dir, &id);
+    let own = first.id();
+    assert!(!own.is_nil());
+    first.append_durable(&checkpoint_record(&id)).unwrap();
+    first.compact().unwrap();
+    assert_eq!(first.id(), own);
+    drop(first);
+    assert_eq!(Journal::open(&path, &id).unwrap().id(), own);
+
+    let other = TempDir::new().unwrap();
+    let (fresh, _) = journal(&other, &id);
+    assert_ne!(fresh.id(), own, "a fresh journal never shares an id");
+}

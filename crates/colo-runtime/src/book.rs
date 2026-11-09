@@ -171,6 +171,7 @@ pub struct Book {
     rate: VecDeque<Instant>,
     seen_trades: HashSet<TradeKey>,
     sequence: u64,
+    journal_id: Uuid,
     pause_reason: Option<String>,
 }
 
@@ -211,6 +212,7 @@ impl Book {
             health: BookHealth::Unknown,
             rate: VecDeque::new(),
             seen_trades: HashSet::new(),
+            journal_id: Uuid::nil(),
             sequence: 0,
             pause_reason: None,
         })
@@ -316,6 +318,21 @@ impl Book {
     }
 
     /// Conservative fee allowance reserved on buys, in basis points of notional.
+    /// Ties client order ids to the journal that numbers them, so a fresh
+    /// journal never repeats an earlier one's ids. A nil id (an older journal)
+    /// keeps ids derived from the account alone, as they always were.
+    pub fn set_journal_id(&mut self, journal_id: Uuid) {
+        self.journal_id = journal_id;
+    }
+
+    fn id_namespace(&self) -> Uuid {
+        if self.journal_id.is_nil() {
+            self.identity.account_id
+        } else {
+            Uuid::new_v5(&self.identity.account_id, self.journal_id.as_bytes())
+        }
+    }
+
     pub fn set_fee_allowance_bps(&mut self, bps: f64) -> Result<(), RuntimeError> {
         if !bps.is_finite() || bps < 0.0 {
             return Err(RuntimeError::InvalidConfig("fee allowance must be finite and non-negative".into()));
@@ -619,7 +636,7 @@ impl Book {
         }
 
         let sequence = self.sequence.saturating_add(1);
-        let client_order_id = Uuid::new_v5(&self.identity.account_id, &sequence.to_be_bytes()).to_string();
+        let client_order_id = Uuid::new_v5(&self.id_namespace(), &sequence.to_be_bytes()).to_string();
         if self.orders.contains_key(&client_order_id) {
             return Err(RuntimeError::DuplicateOrder(client_order_id));
         }

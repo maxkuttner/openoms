@@ -877,3 +877,21 @@ async fn the_bootstrap_fee_allowance_holds_back_headroom_on_buys() {
     assert!(matches!(runtime.submit(intent(10.0)).await, Err(colo_runtime::RuntimeError::Rejected(_))));
     runtime.submit(intent(9.0)).await.expect("room for the fee");
 }
+
+#[tokio::test]
+async fn a_fresh_journal_never_reuses_order_ids() {
+    let first_dir = TempDir::new().unwrap();
+    let (first, _venue) = start_with(&first_dir, bootstrap()).await;
+    grant(&first).await;
+    let a = first.submit(intent(1.0)).await.unwrap();
+    first.shutdown().await.unwrap();
+
+    // Same account, journal lost or a new owner after takeover.
+    let second_dir = TempDir::new().unwrap();
+    let (second, _venue) = start_with(&second_dir, bootstrap()).await;
+    grant(&second).await;
+    let b = second.submit(intent(1.0)).await.unwrap();
+    assert_eq!(a.sequence, b.sequence, "both journals start counting from the same place");
+    assert_ne!(a.client_order_id, b.client_order_id);
+    second.shutdown().await.unwrap();
+}

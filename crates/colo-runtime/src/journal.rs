@@ -78,6 +78,11 @@ struct FileHeader {
     identity: AccountIdentity,
     /// High-water mark, so compaction never makes sequence numbers reusable.
     last_sequence: u64,
+    /// Random per journal, kept through compaction. Order ids derive from it,
+    /// so a fresh journal (lost disk, takeover) never reuses an earlier one's
+    /// ids. Nil in journals written before it existed.
+    #[serde(default)]
+    journal_id: uuid::Uuid,
 }
 
 pub struct Journal {
@@ -87,6 +92,7 @@ pub struct Journal {
     records: Vec<SequencedRecord>,
     acked: u64,
     last_sequence: u64,
+    journal_id: uuid::Uuid,
     fail_next_write: bool,
 }
 
@@ -110,10 +116,11 @@ impl Journal {
         file.read_to_end(&mut bytes)
             .map_err(|e| RuntimeError::JournalIo(format!("read journal: {e}")))?;
 
-        let (records, acked, last_sequence, valid_end) = if bytes.is_empty() {
-            write_header(&mut file, identity, 0)?;
+        let (records, acked, last_sequence, valid_end, journal_id) = if bytes.is_empty() {
+            let journal_id = uuid::Uuid::new_v4();
+            write_header(&mut file, identity, 0, journal_id)?;
             sync_parent(path);
-            (Vec::new(), 0, 0, file.metadata().map(|m| m.len() as usize).unwrap_or(0))
+            (Vec::new(), 0, 0, file.metadata().map(|m| m.len() as usize).unwrap_or(0), journal_id)
         } else {
             parse_file(&bytes, identity)?
         };
@@ -134,12 +141,18 @@ impl Journal {
             records,
             acked,
             last_sequence,
+            journal_id,
             fail_next_write: false,
         })
     }
 
     pub fn identity(&self) -> &AccountIdentity {
         &self.identity
+    }
+
+    /// This journal's own id; nil for a journal written before ids existed.
+    pub fn id(&self) -> uuid::Uuid {
+        self.journal_id
     }
 
     pub fn byte_len(&self) -> u64 {
@@ -324,6 +337,7 @@ impl Journal {
             schema_version: SCHEMA_VERSION,
             identity: self.identity.clone(),
             last_sequence: self.last_sequence,
+            journal_id: self.journal_id,
         };
         let header_payload = serde_json::to_vec(&header)
             .map_err(|e| RuntimeError::JournalIo(format!("serialize journal header: {e}")))?;
@@ -359,11 +373,17 @@ impl Journal {
     }
 }
 
-fn write_header(file: &mut File, identity: &AccountIdentity, last_sequence: u64) -> Result<(), RuntimeError> {
+fn write_header(
+    file: &mut File,
+    identity: &AccountIdentity,
+    last_sequence: u64,
+    journal_id: uuid::Uuid,
+) -> Result<(), RuntimeError> {
     let header = FileHeader {
         schema_version: SCHEMA_VERSION,
         identity: identity.clone(),
         last_sequence,
+        journal_id,
     };
     let payload = serde_json::to_vec(&header)
         .map_err(|e| RuntimeError::JournalIo(format!("serialize journal header: {e}")))?;
@@ -384,7 +404,7 @@ fn write_header(file: &mut File, identity: &AccountIdentity, last_sequence: u64)
 fn parse_file(
     bytes: &[u8],
     expected: &AccountIdentity,
-) -> Result<(Vec<SequencedRecord>, u64, u64, usize), RuntimeError> {
+) -> Result<(Vec<SequencedRecord>, u64, u64, usize, uuid::Uuid), RuntimeError> {
     if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
         return Err(RuntimeError::CorruptState("journal magic is missing".into()));
     }
@@ -451,7 +471,7 @@ fn parse_file(
     let last_sequence = header
         .last_sequence
         .max(records.last().map(|r| r.sequence).unwrap_or(0));
-    Ok((records, acked, last_sequence, valid_end))
+    Ok((records, acked, last_sequence, valid_end, header.journal_id))
 }
 
 enum Frame<'a> {
