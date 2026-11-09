@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::proto::HEARTBEAT;
 
 pub const PROTOCOL_VERSION: u32 = 2;
+/// 10%: a fee allowance above this is a configuration mistake.
+pub const MAX_FEE_ALLOWANCE_BPS: f64 = 1_000.0;
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_EVENT_RECORDS: usize = 128;
 
@@ -51,6 +53,10 @@ pub struct Allocation {
     pub quote_asset: String,
     pub max_notional: f64,
     pub max_position_qty: Option<f64>,
+    /// Fee headroom held back on every buy, in basis points of its notional,
+    /// so the last funds are not spent on an order whose fee cannot be paid.
+    #[serde(default)]
+    pub fee_allowance_bps: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +120,11 @@ impl Bootstrap {
         }
         if !self.allocation.max_notional.is_finite() || self.allocation.max_notional <= 0.0 {
             return Err(ProtocolError::InvalidBootstrap("allocation must be positive".into()));
+        }
+        if !self.allocation.fee_allowance_bps.is_finite()
+            || !(0.0..=MAX_FEE_ALLOWANCE_BPS).contains(&self.allocation.fee_allowance_bps)
+        {
+            return Err(ProtocolError::InvalidBootstrap("fee allowance must be 0 to 1000 bps".into()));
         }
         if self.allocation.quote_asset.trim().is_empty() {
             return Err(ProtocolError::InvalidBootstrap("allocation quote asset is empty".into()));

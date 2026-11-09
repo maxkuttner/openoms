@@ -72,6 +72,7 @@ fn bootstrap(complete: bool) -> Bootstrap {
             quote_asset: "USDT".into(),
             max_notional: 10_000.0,
             max_position_qty: Some(10.0),
+            fee_allowance_bps: 0.0,
         },
         recovery_universe: vec!["BTCUSDT".into()],
     }

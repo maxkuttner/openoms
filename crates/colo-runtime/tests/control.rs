@@ -59,6 +59,7 @@ fn bootstrap(limit: Option<f64>, killed: Option<u64>) -> Bootstrap {
             quote_asset: "USDT".into(),
             max_notional: 1_000.0,
             max_position_qty: None,
+            fee_allowance_bps: 0.0,
         },
         recovery_universe: vec!["BTCUSDT".into()],
     }

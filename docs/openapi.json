@@ -4743,6 +4743,7 @@
           "heartbeat_secs",
           "allocation_quote_asset",
           "allocation_max_notional",
+          "allocation_fee_allowance_bps",
           "policy_revision",
           "created_at",
           "updated_at"
@@ -4757,6 +4758,10 @@
             "format": "int64",
             "description": "Newest policy revision the runtime reports as installed.",
             "nullable": true
+          },
+          "allocation_fee_allowance_bps": {
+            "type": "number",
+            "format": "double"
           },
           "allocation_max_notional": {
             "type": "number",
@@ -4877,6 +4882,7 @@
           "market_data_max_age_secs",
           "allocation_quote_asset",
           "allocation_max_notional",
+          "allocation_fee_allowance_bps",
           "instruments",
           "assets"
         ],
@@ -4884,6 +4890,11 @@
           "account_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "allocation_fee_allowance_bps": {
+            "type": "number",
+            "format": "double",
+            "description": "Fee headroom held back on every buy, in basis points of its notional\n(0 to 1000). Required: e.g. 10 for a 0.1% taker fee."
           },
           "allocation_max_notional": {
             "type": "number",

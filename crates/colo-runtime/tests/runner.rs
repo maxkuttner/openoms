@@ -77,6 +77,7 @@ fn bootstrap() -> Bootstrap {
             quote_asset: "USDT".into(),
             max_notional: 1_000.0,
             max_position_qty: None,
+            fee_allowance_bps: 0.0,
         },
         recovery_universe: vec!["BTCUSDT".into()],
     }
@@ -200,12 +201,16 @@ async fn start() -> (Runtime, Arc<FakeVenue>, TempDir) {
 
 /// Starts a runtime on the journal in `dir`, as a restart would.
 async fn start_in(dir: &TempDir) -> (Runtime, Arc<FakeVenue>) {
+    start_with(dir, bootstrap()).await
+}
+
+async fn start_with(dir: &TempDir, bootstrap: Bootstrap) -> (Runtime, Arc<FakeVenue>) {
     let venue = Arc::new(FakeVenue::new());
     let runtime = Runtime::start(
         RuntimeConfig {
             identity: identity(),
             epoch: 1,
-            bootstrap: bootstrap(),
+            bootstrap,
             journal_path: dir.path().join("journal"),
             max_journal_bytes: 1_000_000,
             event_queue_capacity: 128,
@@ -859,4 +864,16 @@ async fn an_enable_and_a_policy_are_acknowledged() {
     })
     .await;
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_bootstrap_fee_allowance_holds_back_headroom_on_buys() {
+    let dir = TempDir::new().unwrap();
+    let mut boot = bootstrap();
+    boot.allocation.fee_allowance_bps = 10.0;
+    let (runtime, _venue) = start_with(&dir, boot).await;
+    grant(&runtime).await;
+    // 10 @ 100 spends all 1,000 USDT and leaves nothing for the fee.
+    assert!(matches!(runtime.submit(intent(10.0)).await, Err(colo_runtime::RuntimeError::Rejected(_))));
+    runtime.submit(intent(9.0)).await.expect("room for the fee");
 }

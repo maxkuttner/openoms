@@ -464,7 +464,7 @@ mod tests {
             venue: "BINANCE".into(), environment: "PAPER".into(), external_account_ref: "sub".into(),
             epoch: 1, status: "ACTIVE".into(), authority_secs: 5, market_data_max_age_secs: 2,
             heartbeat_secs: 1, allocation_quote_asset: "USDT".into(), allocation_max_notional: 1_000.0,
-            allocation_max_position_qty: None, policy_revision: 1, kill_epoch: None,
+            allocation_max_position_qty: None, allocation_fee_allowance_bps: 0.0, policy_revision: 1, kill_epoch: None,
             kill_command_id: None, verified_stop_at: None, verified_stop_epoch: None,
             retired_at: None, shutdown_evidence: None, created_at: now, updated_at: now,
             kill_ack_stage: None, acked_policy_revision: None, recovery_ready: None,
@@ -516,7 +516,7 @@ mod tests {
                 instrument_states: Default::default(), timings: Timings { heartbeat_secs: 1, authority_secs: 5, market_data_max_age_secs: 2 },
                 baseline: RuntimeCheckpoint { sequence: 0, positions: Default::default(), open_client_ids: vec![], execution_cursor: ExecutionCursor::default(), complete: true },
                 asset_baseline: Default::default(), killed_epoch: None,
-                allocation: Allocation { quote_asset: "USDT".into(), max_notional: 1_000.0, max_position_qty: None },
+                allocation: Allocation { quote_asset: "USDT".into(), max_notional: 1_000.0, max_position_qty: None, fee_allowance_bps: 0.0 },
                 recovery_universe: vec!["BTCUSDT".into()],
             })
         }

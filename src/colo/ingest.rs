@@ -787,6 +787,7 @@ mod tests {
             allocation_quote_asset: quote.clone(),
             allocation_max_notional: 10_000.0,
             allocation_max_position_qty: Some(10.0),
+            allocation_fee_allowance_bps: 10.0,
             instruments: vec![d::InstrumentBaseline { instrument_id, quantity: 0.0, cost_basis: 0.0 }],
             assets: vec![d::AssetHolding { asset: quote.clone(), quantity: 1_000.0 }],
         };

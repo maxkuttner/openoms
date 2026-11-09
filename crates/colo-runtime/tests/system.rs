@@ -47,7 +47,7 @@ fn bootstrap(killed: Option<u64>) -> Bootstrap {
         baseline: RuntimeCheckpoint { sequence: 1, positions: BTreeMap::new(), open_client_ids: vec![], execution_cursor: ExecutionCursor::default(), complete: true },
         asset_baseline: BTreeMap::from([("USDT".into(), 1_000.0)]),
         killed_epoch: killed,
-        allocation: Allocation { quote_asset: "USDT".into(), max_notional: 1_000.0, max_position_qty: None },
+        allocation: Allocation { quote_asset: "USDT".into(), max_notional: 1_000.0, max_position_qty: None, fee_allowance_bps: 0.0 },
         recovery_universe: vec!["BTCUSDT".into()],
     }
 }

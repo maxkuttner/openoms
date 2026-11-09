@@ -73,7 +73,7 @@ fn bootstrap(assets: &[(&str, f64)], killed: Option<u64>) -> Bootstrap {
         },
         asset_baseline: assets.iter().map(|(a, q)| ((*a).into(), *q)).collect(),
         killed_epoch: killed,
-        allocation: Allocation { quote_asset: "USDT".into(), max_notional: 10_000.0, max_position_qty: Some(10.0) },
+        allocation: Allocation { quote_asset: "USDT".into(), max_notional: 10_000.0, max_position_qty: Some(10.0), fee_allowance_bps: 0.0 },
         recovery_universe: vec!["BTCUSDT".into()],
     }
 }

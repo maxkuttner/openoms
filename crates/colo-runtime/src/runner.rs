@@ -104,6 +104,7 @@ impl Runtime {
             config.bootstrap.allocation.max_notional,
             config.bootstrap.allocation.max_position_qty,
         );
+        book.set_fee_allowance_bps(config.bootstrap.allocation.fee_allowance_bps)?;
         book.set_max_price_age(std::time::Duration::from_secs(
             config.bootstrap.timings.market_data_max_age_secs.max(1),
         ));
@@ -443,6 +444,7 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
                     bootstrap.allocation.max_notional,
                     bootstrap.allocation.max_position_qty,
                 );
+                core.book.set_fee_allowance_bps(bootstrap.allocation.fee_allowance_bps)?;
             }
             ToRuntime::Policy { policy } => {
                 core.book.install_policy(

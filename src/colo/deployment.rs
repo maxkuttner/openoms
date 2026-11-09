@@ -21,7 +21,8 @@ use crate::app_state::AppState;
 const DEPLOYMENT_SELECT: &str = "id, strategy_code, account_id, venue, environment, \
     external_account_ref, epoch, status, authority_secs, market_data_max_age_secs, heartbeat_secs, \
     allocation_quote_asset, allocation_max_notional::double precision AS allocation_max_notional, \
-    allocation_max_position_qty::double precision AS allocation_max_position_qty, policy_revision, \
+    allocation_max_position_qty::double precision AS allocation_max_position_qty, \
+    allocation_fee_allowance_bps::double precision AS allocation_fee_allowance_bps, policy_revision, \
     kill_epoch, kill_command_id, verified_stop_at, verified_stop_epoch, retired_at, \
     shutdown_evidence, created_at, updated_at, \
     (SELECT c.ack_stage FROM colo_deployment_command c WHERE c.command_id = kill_command_id) AS kill_ack_stage, \
@@ -43,6 +44,7 @@ pub struct Deployment {
     pub allocation_quote_asset: String,
     pub allocation_max_notional: f64,
     pub allocation_max_position_qty: Option<f64>,
+    pub allocation_fee_allowance_bps: f64,
     pub policy_revision: i64,
     pub kill_epoch: Option<i64>,
     pub kill_command_id: Option<String>,
@@ -92,6 +94,9 @@ pub struct DeploymentRegistration {
     pub allocation_quote_asset: String,
     pub allocation_max_notional: f64,
     pub allocation_max_position_qty: Option<f64>,
+    /// Fee headroom held back on every buy, in basis points of its notional
+    /// (0 to 1000). Required: e.g. 10 for a 0.1% taker fee.
+    pub allocation_fee_allowance_bps: f64,
     /// Explicit allowed universe, each with its opening position/cost baseline.
     pub instruments: Vec<InstrumentBaseline>,
     /// Explicit per-asset opening holdings; never inferred from instrument pairs.
@@ -271,6 +276,11 @@ fn validate_registration(input: &DeploymentRegistration) -> Result<(), Deploymen
     {
         return Err(DeploymentError::InvalidInput("allocation position must be positive".into()));
     }
+    if !input.allocation_fee_allowance_bps.is_finite()
+        || !(0.0..=colo_link::v2::MAX_FEE_ALLOWANCE_BPS).contains(&input.allocation_fee_allowance_bps)
+    {
+        return Err(DeploymentError::InvalidInput("fee allowance must be 0 to 1000 bps".into()));
+    }
     if input.instruments.is_empty() {
         return Err(DeploymentError::MissingBaseline("allowed instrument universe is empty".into()));
     }
@@ -365,8 +375,8 @@ pub async fn register_deployment(
         "INSERT INTO colo_deployment \
          (id, strategy_code, account_id, venue, environment, external_account_ref, authority_secs, \
           market_data_max_age_secs, heartbeat_secs, allocation_quote_asset, allocation_max_notional, \
-          allocation_max_position_qty) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING {DEPLOYMENT_SELECT}"
+          allocation_max_position_qty, allocation_fee_allowance_bps) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING {DEPLOYMENT_SELECT}"
     ))
     .bind(deployment_id)
     .bind(&input.strategy_code)
@@ -380,6 +390,7 @@ pub async fn register_deployment(
     .bind(&input.allocation_quote_asset)
     .bind(input.allocation_max_notional)
     .bind(input.allocation_max_position_qty)
+    .bind(input.allocation_fee_allowance_bps)
     .fetch_one(&mut *tx)
     .await
     .map_err(db)?;
@@ -1261,6 +1272,7 @@ pub async fn bootstrap(state: &AppState, deployment: &Deployment) -> Result<Boot
             quote_asset: current.allocation_quote_asset,
             max_notional: current.allocation_max_notional,
             max_position_qty: current.allocation_max_position_qty,
+            fee_allowance_bps: current.allocation_fee_allowance_bps,
         },
         recovery_universe: symbols,
     })
@@ -1380,6 +1392,9 @@ mod tests {
         input.assets.clear();
         assert!(matches!(validate_registration(&input), Err(DeploymentError::MissingBaseline(_))));
         let mut input = sample_registration();
+        input.allocation_fee_allowance_bps = 1_500.0;
+        assert!(matches!(validate_registration(&input), Err(DeploymentError::InvalidInput(_))));
+        let mut input = sample_registration();
         input.instruments.clear();
         assert!(matches!(validate_registration(&input), Err(DeploymentError::MissingBaseline(_))));
     }
@@ -1397,6 +1412,7 @@ mod tests {
             allocation_quote_asset: "USDT".into(),
             allocation_max_notional: 1000.0,
             allocation_max_position_qty: Some(10.0),
+            allocation_fee_allowance_bps: 10.0,
             instruments: vec![InstrumentBaseline { instrument_id: 1, quantity: 0.0, cost_basis: 0.0 }],
             assets: vec![AssetHolding { asset: "USDT".into(), quantity: 1000.0 }],
         }
@@ -1435,7 +1451,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO broker_connection (code, broker_code, environment, status) \
              VALUES ('colo-test-binance-paper', 'BINANCE', 'PAPER', 'ACTIVE') \
-             ON CONFLICT (broker_code, environment) DO NOTHING",
+             ON CONFLICT DO NOTHING",
         )
         .execute(pool)
         .await
@@ -1479,6 +1495,7 @@ mod tests {
             allocation_quote_asset: "USDT".into(),
             allocation_max_notional: 1_000.0,
             allocation_max_position_qty: Some(10.0),
+            allocation_fee_allowance_bps: 10.0,
             instruments: vec![InstrumentBaseline { instrument_id, quantity: 0.0, cost_basis: 0.0 }],
             assets: vec![AssetHolding { asset: "USDT".into(), quantity: 1_000.0 }],
         };
