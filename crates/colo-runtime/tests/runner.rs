@@ -711,3 +711,152 @@ async fn the_journal_is_compacted_and_a_restart_keeps_position_and_open_order() 
     assert_eq!(restarted.position("BTCUSDT").await, 0.4);
     assert_eq!(restarted.leaves(&id).await, Some(0.6));
 }
+
+/// A runtime whose link records everything it sends to the OMS.
+async fn start_linked() -> (Runtime, Arc<FakeVenue>, Arc<FakeLink>, mpsc::Sender<Received<ToRuntime>>, TempDir) {
+    let dir = TempDir::new().unwrap();
+    let venue = Arc::new(FakeVenue::new());
+    let (control_tx, control_rx) = mpsc::channel(64);
+    let link = Arc::new(FakeLink {
+        control: tokio::sync::Mutex::new(control_rx),
+        events: std::sync::Mutex::new(Vec::new()),
+    });
+    let runtime = Runtime::start(
+        RuntimeConfig {
+            identity: identity(),
+            epoch: 1,
+            bootstrap: bootstrap(),
+            journal_path: dir.path().join("journal"),
+            max_journal_bytes: 1_000_000,
+            event_queue_capacity: 128,
+            control_url: None,
+            events_url: None,
+            credential_reference: None,
+            link: Some(link.clone()),
+            session_nonce: "n1".into(),
+        },
+        venue.clone(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .set_price("BTCUSDT", colo_runtime::InstrumentPrices::new(Some(100.0), Some(100.0), Some(100.0), Instant::now()))
+        .await;
+    (runtime, venue, link, control_tx, dir)
+}
+
+/// Kill/enable acknowledgement stages sent so far, in order.
+fn ack_stages(link: &FakeLink, command: &str) -> Vec<colo_link::v2::ControlAckStage> {
+    link.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.message {
+            FromRuntime::ControlAck { command_id, stage, .. } if command_id == command => Some(*stage),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn wait_for_stages(link: &FakeLink, command: &str, want: &[colo_link::v2::ControlAckStage]) {
+    for _ in 0..400 {
+        if ack_stages(link, command) == want {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("stages for {command}: got {:?}, want {want:?}", ack_stages(link, command));
+}
+
+#[tokio::test]
+async fn the_link_opens_with_hello_and_recovery_status() {
+    let (runtime, _venue, link, _control, _dir) = start_linked().await;
+    for _ in 0..200 {
+        if link.events.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let sent = link.events.lock().unwrap().clone();
+    assert!(matches!(&sent[0].message, FromRuntime::Hello { versions, .. } if versions.contains(&colo_link::v2::PROTOCOL_VERSION)));
+    assert!(matches!(&sent[1].message, FromRuntime::RecoveryStatus { ready: true, missing, .. } if missing.is_empty()));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_kill_with_nothing_resting_is_confirmed_clear_at_once() {
+    use colo_link::v2::ControlAckStage::*;
+    let (runtime, _venue, link, _control, _dir) = start_linked().await;
+    grant(&runtime).await;
+    kill(&runtime).await.unwrap();
+    wait_for_stages(&link, "k", &[Received, AdmissionStopped, CancelsSent, ConfirmedClear]).await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_kill_is_confirmed_clear_only_once_the_venue_reports_the_cancel() {
+    use colo_link::v2::ControlAckStage::*;
+    let (runtime, venue, link, _control, _dir) = start_linked().await;
+    let id = live_order(&runtime, &venue).await;
+    kill(&runtime).await.unwrap();
+    wait_for_stages(&link, "k", &[Received, AdmissionStopped, CancelsSent]).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(ack_stages(&link, "k").len(), 3, "not clear while the order may rest");
+
+    let stream = venue.stream.lock().unwrap().clone().expect("subscribed");
+    stream
+        .send(VenueEvent::Order(colo_runtime::RuntimeOrder {
+            client_order_id: id,
+            venue_order_id: "v-1".into(),
+            symbol: "BTCUSDT".into(),
+            side: Side::Buy,
+            original_quantity: 1.0,
+            executed_quantity: 0.0,
+            leaves_quantity: 0.0,
+            limit_price: Some(100.0),
+            state: colo_runtime::RuntimeOrderState::Canceled,
+            original_time: chrono::Utc::now(),
+        }))
+        .await
+        .unwrap();
+    wait_for_stages(&link, "k", &[Received, AdmissionStopped, CancelsSent, ConfirmedClear]).await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_enable_and_a_policy_are_acknowledged() {
+    let (runtime, _venue, link, _control, _dir) = start_linked().await;
+    grant(&runtime).await;
+    kill(&runtime).await.unwrap();
+    runtime
+        .apply_control(Received::new(
+            ToRuntime::Enable { enable: colo_link::v2::Enable { stopped_epoch: 1, command_id: "e".into() } },
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+    wait_for_stages(&link, "e", &[colo_link::v2::ControlAckStage::Received]).await;
+    runtime
+        .apply_control(Received::new(
+            ToRuntime::Policy {
+                policy: colo_link::v2::Policy {
+                    revision: 2,
+                    limits: BTreeMap::new(),
+                    trading_state: risk::TradingState::Active,
+                    instrument_states: BTreeMap::new(),
+                },
+            },
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+    wait_for("policy ack", || {
+        link.events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.message, FromRuntime::PolicyAck { policy_revision: 2 }))
+    })
+    .await;
+    runtime.shutdown().await.unwrap();
+}

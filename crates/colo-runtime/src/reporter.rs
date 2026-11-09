@@ -1,7 +1,7 @@
 //! Bounded journal-to-link reporting: batches stop at the last durable ACK and
 //! replay after reconnect until the OMS acknowledges them.
 
-use colo_link::v2::{EventBatch, FromRuntimeEnvelope, ProtocolError, V2Session};
+use colo_link::v2::{EventBatch, FromRuntime, FromRuntimeEnvelope, ProtocolError, V2Session};
 use gateway::runtime::{AccountIdentity, RuntimeEvent};
 
 use crate::journal::{Journal, JournalRecord};
@@ -80,6 +80,11 @@ impl Reporter {
         self.sent_journal = journal_last;
         self.journal_boundaries.insert(batch.last_sequence(), journal_last);
         Ok(Some(batch))
+    }
+
+    /// Envelope for a non-event message on this session.
+    pub fn envelope(&self, message: FromRuntime) -> FromRuntimeEnvelope {
+        self.session.encode_message(message)
     }
 
     pub fn encode(&self, batch: &EventBatch) -> Result<FromRuntimeEnvelope, RuntimeError> {

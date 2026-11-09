@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use chrono::Utc;
-use colo_link::v2::{Bootstrap, Received, RuntimeLink, ToRuntime};
+use colo_link::v2::{
+    Bootstrap, ControlAckStage, FromRuntime, Received, RuntimeCheckpoint, RuntimeLink, ToRuntime,
+    PROTOCOL_VERSION,
+};
 use gateway::adapter::BrokerError;
 use gateway::runtime::{
     AccountIdentity, RuntimeEvent, RuntimeOrder, RuntimeOrderState, RuntimeVenue, StreamState,
@@ -46,6 +49,8 @@ struct Core {
     control: ControlState,
     prices: Prices,
     closed: bool,
+    /// The kill command still waiting for the venue to show no working orders.
+    pending_clear: Option<String>,
 }
 
 struct Inner {
@@ -56,11 +61,16 @@ struct Inner {
     capacity: usize,
     journal_limit: u64,
     identity: AccountIdentity,
+    epoch: u64,
+    /// Messages for the OMS that are not journal events (hello, recovery
+    /// status, acknowledgements). `None` without a link.
+    outbox: Option<tokio::sync::mpsc::UnboundedSender<FromRuntime>>,
     suspensions: Mutex<std::collections::BTreeSet<Suspension>>,
     /// Book-changing journal writes not yet applied to the book. A checkpoint
     /// is only taken at zero, so it never claims a record the book lacks.
     writing: AtomicUsize,
-    shutdown: tokio::sync::Notify,
+    /// Set once and never cleared, so a task that checks late still stops.
+    shutdown: tokio::sync::watch::Sender<bool>,
     report_now: tokio::sync::Notify,
     recovered: AtomicBool,
 }
@@ -82,7 +92,7 @@ impl Runtime {
         }
         let journal_killed = journal.kill_latched();
         let recovered = recover(&*venue, &mut journal, &config.bootstrap).await?;
-        let RecoveredBook { mut book, events, complete: recovered_ok, .. } = recovered;
+        let RecoveredBook { mut book, events, complete: recovered_ok, evidence, execution_cursor, .. } = recovered;
         book.restore_sequence(journal.last_sequence());
         book.install_policy(
             config.bootstrap.limits.clone(),
@@ -129,12 +139,33 @@ impl Runtime {
         } else {
             None
         };
+        let (outbox, outbox_rx) = if config.link.is_some() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            // The OMS hears who it is talking to and how recovery went before
+            // any event or acknowledgement.
+            let _ = tx.send(FromRuntime::Hello { versions: vec![PROTOCOL_VERSION], last_acked_control: 0 });
+            let _ = tx.send(FromRuntime::RecoveryStatus {
+                ready: control.state() == RuntimeState::Ready,
+                checkpoint: RuntimeCheckpoint {
+                    sequence: journal.last_sequence(),
+                    positions: book.checkpoint().positions,
+                    open_client_ids: book.all_working_client_ids(),
+                    execution_cursor,
+                    complete: recovered_ok,
+                },
+                missing: evidence,
+            });
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let inner = Arc::new(Inner {
             core: AsyncMutex::new(Core {
                 book,
                 control,
                 prices: Prices::new(),
                 closed: false,
+                pending_clear: None,
             }),
             journal: Arc::new(Mutex::new(journal)),
             venue,
@@ -142,9 +173,11 @@ impl Runtime {
             capacity: config.event_queue_capacity,
             journal_limit: config.max_journal_bytes,
             identity: config.identity,
+            epoch: config.epoch,
+            outbox,
             suspensions: Mutex::new(std::collections::BTreeSet::new()),
             writing: AtomicUsize::new(0),
-            shutdown: tokio::sync::Notify::new(),
+            shutdown: tokio::sync::watch::channel(false).0,
             report_now: tokio::sync::Notify::new(),
             recovered: AtomicBool::new(recovered_ok),
         });
@@ -153,9 +186,12 @@ impl Runtime {
             spawn_venue_events(weak, events)
         };
         let mut link_tasks = match (&config.link, reporter) {
-            (Some(link), Some(reporter)) => {
-                spawn_link_tasks(Arc::downgrade(&inner), link.clone(), reporter)
-            }
+            (Some(link), Some(reporter)) => spawn_link_tasks(
+                Arc::downgrade(&inner),
+                link.clone(),
+                reporter,
+                outbox_rx.expect("a link has an outbox"),
+            ),
             _ => Vec::new(),
         };
         link_tasks.push(spawn_compaction(Arc::downgrade(&inner)));
@@ -288,6 +324,7 @@ impl Runtime {
                 inner.report_now.notify_one();
                 let mut core = inner.core.lock().await;
                 let _ = core.book.apply(&event);
+                inner.settle_kill(&mut core);
                 // A cancel asked for while the submit was in flight had no
                 // venue id to send; send it now that the venue has one.
                 if !accepted_venue_id.is_empty() && core.book.cancel_requested(&task_submission.client_order_id) {
@@ -336,7 +373,7 @@ impl Runtime {
 
     pub async fn shutdown(&self) -> Result<(), RuntimeError> {
         self.inner.core.lock().await.closed = true;
-        self.inner.shutdown.notify_waiters();
+        self.inner.shutdown.send_replace(true);
         let task = self.events_task.lock().ok().and_then(|mut t| t.take());
         if let Some(task) = task {
             let _ = task.await;
@@ -362,9 +399,31 @@ impl Runtime {
 
 async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -> Result<Vec<ControlAction>, RuntimeError> {
     let incoming = message.message.clone();
+    let command = match &incoming {
+        ToRuntime::Kill { kill } => Some(kill.command_id.clone()),
+        ToRuntime::Enable { enable } => Some(enable.command_id.clone()),
+        _ => None,
+    };
+    if let Some(command) = &command {
+        inner.acknowledge(command, ControlAckStage::Received);
+    }
     let (actions, kill, cancellations) = {
         let mut core = inner.core.lock().await;
         let actions = core.control.apply(message)?;
+        for action in &actions {
+            match action {
+                ControlAction::KillLatched { .. } => {
+                    if let Some(command) = &command {
+                        inner.acknowledge(command, ControlAckStage::AdmissionStopped);
+                        core.pending_clear = Some(command.clone());
+                    }
+                }
+                ControlAction::PolicyInstalled { revision } => {
+                    inner.send(FromRuntime::PolicyAck { policy_revision: *revision });
+                }
+                _ => {}
+            }
+        }
         for action in &actions {
             match action {
                 ControlAction::KillLatched { .. } => core.book.set_trading_state_halted(),
@@ -435,6 +494,13 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
             tracing::warn!(client_order_id = %id, error = %e, "runtime: cancel not sent");
         }
     }
+    if matches!(incoming, ToRuntime::Kill { .. }) {
+        if let Some(command) = &command {
+            inner.acknowledge(command, ControlAckStage::CancelsSent);
+        }
+        let mut core = inner.core.lock().await;
+        inner.settle_kill(&mut core);
+    }
     if let Some(record) = kill {
         if let Err(e) = append(&inner.journal, record).await {
             inner.suspend(Suspension::Journal);
@@ -459,7 +525,11 @@ async fn abandon(inner: &Arc<Inner>, client_order_id: &str, reason: &str) {
         return;
     }
     inner.report_now.notify_one();
-    inner.core.lock().await.book.abort_order(client_order_id);
+    {
+        let mut core = inner.core.lock().await;
+        core.book.abort_order(client_order_id);
+        inner.settle_kill(&mut core);
+    }
     inner.push_event(RuntimeEvent::SubmitOutcome {
         account: inner.identity.clone(),
         client_order_id: client_order_id.to_string(),
@@ -480,7 +550,7 @@ fn spawn_compaction(weak: std::sync::Weak<Inner>) -> tokio::task::JoinHandle<()>
         loop {
             let Some(inner) = weak.upgrade() else { break };
             tokio::select! {
-                _ = inner.shutdown.notified() => break,
+                _ = inner.stopped() => break,
                 _ = tick.tick() => {}
             }
             let (bytes, acked) = match inner.journal.lock() {
@@ -564,6 +634,7 @@ fn spawn_resolve(weak: std::sync::Weak<Inner>, client_id: String, symbol: String
                         tracing::error!(client_order_id = %client_id, error = %e, "runtime: settled order does not match the book");
                         return;
                     }
+                    inner.settle_kill(&mut core);
                     if !venue_order_id.is_empty() && core.book.cancel_requested(&client_id) {
                         spawn_cancel(inner.clone(), client_id.clone(), venue_order_id, symbol.clone());
                     }
@@ -633,6 +704,7 @@ fn spawn_link_tasks(
     weak: std::sync::Weak<Inner>,
     link: Arc<dyn RuntimeLink>,
     reporter: Arc<AsyncMutex<Reporter>>,
+    mut outbox: tokio::sync::mpsc::UnboundedReceiver<FromRuntime>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let control_weak = weak.clone();
     let control_link = link.clone();
@@ -641,7 +713,7 @@ fn spawn_link_tasks(
         loop {
             let Some(inner) = control_weak.upgrade() else { break };
             let message = tokio::select! {
-                _ = inner.shutdown.notified() => break,
+                _ = inner.stopped() => break,
                 msg = control_link.recv_control() => match msg { Some(m) => m, None => break },
             };
             if let ToRuntime::EventAck { ack } = &message.message {
@@ -664,7 +736,17 @@ fn spawn_link_tasks(
         loop {
             let Some(inner) = report_weak.upgrade() else { break };
             tokio::select! {
-                _ = inner.shutdown.notified() => break,
+                biased;
+                _ = inner.stopped() => break,
+                // Acknowledgements and status go out ahead of event batches.
+                message = outbox.recv() => {
+                    let Some(message) = message else { break };
+                    let envelope = reporter.lock().await.envelope(message);
+                    if let Err(e) = report_link.send_events(envelope).await {
+                        tracing::warn!(error = %e, "runtime: control acknowledgement not sent");
+                    }
+                    continue;
+                }
                 _ = inner.report_now.notified() => {}
                 _ = tick.tick() => {}
             }
@@ -707,7 +789,7 @@ fn spawn_venue_events(
             loop {
                 let Some(inner) = weak.upgrade() else { break };
                 let event = tokio::select! {
-                    _ = inner.shutdown.notified() => break,
+                    _ = inner.stopped() => break,
                     event = rx.recv() => match event {
                         Some(event) => event,
                         None => break,
@@ -729,7 +811,9 @@ fn spawn_venue_events(
                 }
                 inner.report_now.notify_one();
                 let mut core = inner.core.lock().await;
-                if core.book.apply(&event).is_err() {
+                let applied = core.book.apply(&event);
+                inner.settle_kill(&mut core);
+                if applied.is_err() {
                     core.control.suspend("venue event did not match local state");
                 }
             }
@@ -742,7 +826,7 @@ fn recovered_complete(book: &Book, control: &ControlState, bootstrap_killed: Opt
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        self.inner.shutdown.notify_waiters();
+        self.inner.shutdown.send_replace(true);
         if let Ok(mut task) = self.events_task.lock() {
             if let Some(task) = task.take() {
                 task.abort();
@@ -795,6 +879,32 @@ impl Inner {
     fn writing(&self) -> Writing<'_> {
         self.writing.fetch_add(1, Ordering::SeqCst);
         Writing(&self.writing)
+    }
+
+    /// Resolves once shutdown has begun, including when it began earlier.
+    async fn stopped(&self) {
+        let mut rx = self.shutdown.subscribe();
+        let _ = rx.wait_for(|stopping| *stopping).await;
+    }
+
+    /// Queues a message for the OMS; dropped silently without a link.
+    fn send(&self, message: FromRuntime) {
+        if let Some(outbox) = &self.outbox {
+            let _ = outbox.send(message);
+        }
+    }
+
+    fn acknowledge(&self, command_id: &str, stage: ControlAckStage) {
+        self.send(FromRuntime::ControlAck { epoch: self.epoch, command_id: command_id.to_string(), stage });
+    }
+
+    /// Confirms a kill clear once no order may still rest at the venue.
+    fn settle_kill(&self, core: &mut Core) {
+        if core.pending_clear.is_some() && core.book.all_working_client_ids().is_empty() {
+            if let Some(command) = core.pending_clear.take() {
+                self.acknowledge(&command, ControlAckStage::ConfirmedClear);
+            }
+        }
     }
 
     fn suspend(&self, reason: Suspension) {

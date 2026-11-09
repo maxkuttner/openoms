@@ -545,6 +545,20 @@ impl V2Session {
         Ok(batch)
     }
 
+    /// Wraps a non-event message (hello, acknowledgements, recovery status)
+    /// in this session's envelope. Its sequence is the last event sent.
+    pub fn encode_message(&self, message: FromRuntime) -> FromRuntimeEnvelope {
+        FromRuntimeEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            account: self.account.clone(),
+            epoch: self.epoch,
+            policy_revision: self.last_policy_revision,
+            sequence: self.last_sent_event_sequence,
+            session_nonce: self.session_nonce.clone(),
+            message,
+        }
+    }
+
     pub fn encode_events(&self, batch: &EventBatch) -> Result<FromRuntimeEnvelope, ProtocolError> {
         Ok(FromRuntimeEnvelope {
             protocol_version: PROTOCOL_VERSION,
