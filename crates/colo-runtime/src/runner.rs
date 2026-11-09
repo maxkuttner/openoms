@@ -277,11 +277,22 @@ impl Runtime {
                 state,
                 original_time: Utc::now(),
             };
+            let accepted_venue_id = order.venue_order_id.clone();
             let event = VenueEvent::Order(order);
             if append(&inner.journal, JournalRecord::Venue { event: event.clone() }).await.is_ok() {
                 inner.report_now.notify_one();
                 let mut core = inner.core.lock().await;
                 let _ = core.book.apply(&event);
+                // A cancel asked for while the submit was in flight had no
+                // venue id to send; send it now that the venue has one.
+                if !accepted_venue_id.is_empty() && core.book.cancel_requested(&task_submission.client_order_id) {
+                    spawn_cancel(
+                        inner.clone(),
+                        task_submission.client_order_id.clone(),
+                        accepted_venue_id,
+                        intent.instrument.clone(),
+                    );
+                }
             } else {
                 inner.suspended.store(true, Ordering::SeqCst);
             }
@@ -421,16 +432,49 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
     Ok(actions)
 }
 
+/// Cancel attempts per order before admission is stopped.
+const CANCEL_ATTEMPTS: u32 = 5;
+/// First retry delay; doubles per attempt (50, 100, 200, 400 ms).
+const CANCEL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Marks the order cancel-requested and sends the cancel if the venue knows
+/// the order. An order still awaiting its submit answer is cancelled when the
+/// acceptance arrives (see `submit`).
 async fn cancel_on(inner: &Arc<Inner>, client_id: &str) -> Result<(), RuntimeError> {
     let request = inner.core.lock().await.book.request_cancel(client_id)?;
     if let Some(venue_order_id) = request.venue_order_id {
-        let venue = inner.venue.clone();
-        let symbol = request.symbol;
-        tokio::spawn(async move {
-            let _ = venue.cancel_order(&venue_order_id, &symbol).await;
-        });
+        spawn_cancel(inner.clone(), client_id.to_string(), venue_order_id, request.symbol);
     }
     Ok(())
+}
+
+/// Sends a cancel, retrying with backoff. When every attempt fails the order
+/// may still be resting, so admission stops until an operator looks.
+fn spawn_cancel(inner: Arc<Inner>, client_id: String, venue_order_id: String, symbol: String) {
+    tokio::spawn(async move {
+        let mut delay = CANCEL_BACKOFF;
+        for attempt in 1..=CANCEL_ATTEMPTS {
+            match inner.venue.cancel_order(&venue_order_id, &symbol).await {
+                // Gone already: filled or cancelled; its report settles the book.
+                Ok(()) | Err(BrokerError::NoSuchOrder(_)) => return,
+                Err(e) if attempt == CANCEL_ATTEMPTS => {
+                    tracing::error!(
+                        client_order_id = %client_id,
+                        error = %e,
+                        attempts = attempt,
+                        "runtime: cancel failed; order may still rest at the venue, admission stopped"
+                    );
+                    inner.suspended.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(client_order_id = %client_id, error = %e, attempt, "runtime: cancel failed, retrying");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+    });
 }
 
 fn spawn_link_tasks(

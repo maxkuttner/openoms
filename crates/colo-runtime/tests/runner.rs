@@ -84,6 +84,8 @@ fn bootstrap() -> Bootstrap {
 struct FakeVenue {
     submitted: Arc<AtomicUsize>,
     cancels: Arc<AtomicUsize>,
+    /// Cancel attempts that fail before one succeeds; `usize::MAX` fails all.
+    cancel_failures: AtomicUsize,
     block: AtomicBool,
     gate: Arc<Notify>,
     started: Arc<Notify>,
@@ -94,6 +96,7 @@ impl FakeVenue {
         Self {
             submitted: Arc::new(AtomicUsize::new(0)),
             cancels: Arc::new(AtomicUsize::new(0)),
+            cancel_failures: AtomicUsize::new(0),
             block: AtomicBool::new(false),
             gate: Arc::new(Notify::new()),
             started: Arc::new(Notify::new()),
@@ -113,6 +116,13 @@ impl BrokerAdapter for FakeVenue {
     }
     async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
         self.cancels.fetch_add(1, Ordering::SeqCst);
+        let left = self.cancel_failures.load(Ordering::SeqCst);
+        if left > 0 {
+            if left != usize::MAX {
+                self.cancel_failures.store(left - 1, Ordering::SeqCst);
+            }
+            return Err(BrokerError::Network("venue busy".into()));
+        }
         Ok(())
     }
     async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> { Ok(vec![]) }
@@ -427,4 +437,46 @@ async fn kill_cancels_even_when_the_journal_write_fails() {
         runtime.submit(intent(1.0)).await,
         Err(colo_runtime::RuntimeError::KillLatched | colo_runtime::RuntimeError::NotReady(_))
     ));
+}
+
+#[tokio::test]
+async fn a_failed_cancel_is_retried() {
+    let (runtime, venue, _dir) = start().await;
+    let id = live_order(&runtime, &venue).await;
+    venue.cancel_failures.store(2, Ordering::SeqCst);
+    runtime.cancel(&id).await.unwrap();
+    wait_for("third cancel attempt", || venue.cancels.load(Ordering::SeqCst) == 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(venue.cancels.load(Ordering::SeqCst), 3, "no attempts after one succeeded");
+}
+
+#[tokio::test]
+async fn a_cancel_that_keeps_failing_stops_admission() {
+    let (runtime, venue, _dir) = start().await;
+    let id = live_order(&runtime, &venue).await;
+    venue.cancel_failures.store(usize::MAX, Ordering::SeqCst);
+    runtime.cancel(&id).await.unwrap();
+    // Long enough for every retry to run out.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(matches!(
+        runtime.submit(intent(1.0)).await,
+        Err(colo_runtime::RuntimeError::NotReady(_))
+    ));
+    let attempts = venue.cancels.load(Ordering::SeqCst);
+    assert!((2..=8).contains(&attempts), "bounded retries, got {attempts}");
+}
+
+#[tokio::test]
+async fn a_cancel_requested_before_acceptance_is_sent_once_accepted() {
+    let (runtime, venue, _dir) = start().await;
+    venue.block.store(true, Ordering::SeqCst);
+    grant(&runtime).await;
+    let submission = runtime.submit(intent(1.0)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), venue.started.notified())
+        .await
+        .expect("venue call started");
+    runtime.cancel(&submission.client_order_id).await.unwrap();
+    assert_eq!(venue.cancels.load(Ordering::SeqCst), 0, "no venue id yet");
+    venue.gate.notify_waiters();
+    wait_for("cancel after acceptance", || venue.cancels.load(Ordering::SeqCst) == 1).await;
 }
