@@ -75,6 +75,11 @@ impl AssetLedger {
     }
 
     /// Release at most what this asset has committed and never go negative.
+    /// Venue totals per asset, without local commitments.
+    pub fn totals(&self) -> BTreeMap<String, f64> {
+        self.assets.iter().map(|(asset, a)| (asset.clone(), a.total)).collect()
+    }
+
     pub fn release(&mut self, asset: &str, amount: f64) {
         if !amount.is_finite() || amount <= 0.0 {
             return;

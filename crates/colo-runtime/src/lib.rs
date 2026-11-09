@@ -18,7 +18,7 @@ pub use recovery::{recover, RecoveredBook};
 pub use reporter::Reporter;
 pub use runner::{Runtime, RuntimeConfig};
 pub use book::{
-    Book, CancelRequest, InstrumentPrices, Intent, PreparedOrder, Prices, Submission,
+    Book, BookCheckpoint, CancelRequest, InstrumentPrices, Intent, PreparedOrder, Prices, Submission,
 };
 pub use gateway::runtime::{
     AccountIdentity, AssetBalance, InstrumentRules, Operation, OrderType, RuntimeEvent,

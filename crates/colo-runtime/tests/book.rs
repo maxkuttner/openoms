@@ -397,3 +397,61 @@ fn an_unknown_external_order_pauses_admission_until_recovery() {
     book.prepare(intent("BTCUSDT", Side::Buy, 1.0, 100.0), &prices("BTCUSDT", 100.0), Instant::now())
         .expect("admission resumes only after recovery");
 }
+
+/// A fresh book for the same account, as a restart builds before restoring.
+fn empty_book_like(original: &Book) -> Book {
+    let mut book = Book::new(original.identity().clone(), BTreeMap::new()).expect("book");
+    book.install_instruments([
+        rules("BTCUSDT", "BTC", "USDT", 1.0, 1.0),
+        rules("ETHUSDT", "ETH", "USDT", 1.0, 1.0),
+    ])
+    .expect("rules");
+    book
+}
+
+#[test]
+fn a_checkpoint_restores_positions_open_orders_and_their_reservations() {
+    let mut book = book(BTreeMap::new(), &[("USDT", 10_000.0)]);
+    let order = book
+        .prepare(intent("BTCUSDT", Side::Buy, 10.0, 100.0), &prices("BTCUSDT", 100.0), Instant::now())
+        .expect("prepare");
+    book.apply(&VenueEvent::Trade(trade(book.identity(), &order, "7", 4.0, 100.0))).expect("fill");
+    let checkpoint = book.checkpoint();
+
+    let mut restored = empty_book_like(&book);
+    restored.restore_checkpoint(&checkpoint).expect("restore");
+    let id = &order.submission.client_order_id;
+    assert_eq!(restored.position("BTCUSDT"), 4.0);
+    assert_eq!(restored.leaves(id), Some(6.0));
+    assert_eq!(restored.committed("USDT"), book.committed("USDT"));
+    assert_eq!(restored.free("USDT"), book.free("USDT"));
+    assert_eq!(restored.sequence(), book.sequence());
+}
+
+#[test]
+fn a_fill_counted_before_the_checkpoint_is_not_counted_again() {
+    let mut book = book(BTreeMap::new(), &[("USDT", 10_000.0)]);
+    let order = book
+        .prepare(intent("BTCUSDT", Side::Buy, 10.0, 100.0), &prices("BTCUSDT", 100.0), Instant::now())
+        .expect("prepare");
+    let fill = VenueEvent::Trade(trade(book.identity(), &order, "7", 4.0, 100.0));
+    book.apply(&fill).expect("fill");
+    let mut restored = empty_book_like(&book);
+    restored.restore_checkpoint(&book.checkpoint()).expect("restore");
+    assert!(restored.apply(&fill).expect("redelivered").is_empty());
+    assert_eq!(restored.position("BTCUSDT"), 4.0);
+}
+
+#[test]
+fn a_checkpoint_drops_finished_orders_but_keeps_their_position() {
+    let mut book = book(BTreeMap::new(), &[("USDT", 10_000.0)]);
+    let order = book
+        .prepare(intent("BTCUSDT", Side::Buy, 10.0, 100.0), &prices("BTCUSDT", 100.0), Instant::now())
+        .expect("prepare");
+    book.apply(&VenueEvent::Trade(trade(book.identity(), &order, "8", 10.0, 100.0))).expect("fill");
+    let mut restored = empty_book_like(&book);
+    restored.restore_checkpoint(&book.checkpoint()).expect("restore");
+    assert_eq!(restored.position("BTCUSDT"), 10.0);
+    assert_eq!(restored.leaves(&order.submission.client_order_id), None);
+    assert_eq!(restored.committed("USDT"), 0.0);
+}

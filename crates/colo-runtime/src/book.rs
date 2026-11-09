@@ -85,7 +85,7 @@ pub struct CancelRequest {
     pub symbol: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum LocalState {
     Pending,
     Live,
@@ -107,7 +107,7 @@ impl LocalState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct RestingOrder {
     client_order_id: String,
     venue_order_id: Option<String>,
@@ -121,6 +121,22 @@ struct RestingOrder {
     reservation_asset: String,
     reserved_per_unit: f64,
     reserved_amount: f64,
+    /// Fills already counted for this order, so a checkpoint can carry them
+    /// and a redelivered fill is not counted twice after a restart.
+    #[serde(default)]
+    trades: Vec<TradeKey>,
+}
+
+/// The book's durable state at one journal sequence: what a restart needs so
+/// the records before it can be dropped. Finished orders are left out; their
+/// effect lives on in `positions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BookCheckpoint {
+    pub positions: BTreeMap<String, f64>,
+    pub asset_totals: BTreeMap<String, f64>,
+    /// Client order id counter, so ids are never reused after a restart.
+    pub sequence: u64,
+    orders: Vec<RestingOrder>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -344,6 +360,48 @@ impl Book {
         self.assets.free(asset)
     }
 
+    pub fn checkpoint(&self) -> BookCheckpoint {
+        BookCheckpoint {
+            positions: self.positions.clone(),
+            asset_totals: self.assets.totals(),
+            sequence: self.sequence,
+            orders: self.orders.values().filter(|o| o.state.is_working()).cloned().collect(),
+        }
+    }
+
+    /// Replaces positions, asset totals and open orders with the checkpoint's,
+    /// charging each open order's reservation again.
+    pub fn restore_checkpoint(&mut self, checkpoint: &BookCheckpoint) -> Result<(), RuntimeError> {
+        if checkpoint.positions.values().any(|q| !q.is_finite()) {
+            return Err(RuntimeError::CorruptState("checkpoint position is not finite".into()));
+        }
+        self.positions = checkpoint.positions.clone();
+        self.assets = AssetLedger::default();
+        self.assets.snapshot(
+            &checkpoint
+                .asset_totals
+                .iter()
+                .map(|(asset, total)| AssetBalance { asset: asset.clone(), free: *total, locked: 0.0 })
+                .collect::<Vec<_>>(),
+        );
+        self.orders.clear();
+        self.by_venue.clear();
+        self.seen_trades.clear();
+        for order in &checkpoint.orders {
+            if !self.instruments.contains_key(&order.instrument) {
+                return Err(RuntimeError::UnknownInstrument(order.instrument.clone()));
+            }
+            self.assets.reserve(&order.reservation_asset, order.reserved_amount)?;
+            if let Some(venue) = &order.venue_order_id {
+                self.by_venue.insert(venue.clone(), order.client_order_id.clone());
+            }
+            self.seen_trades.extend(order.trades.iter().cloned());
+            self.orders.insert(order.client_order_id.clone(), order.clone());
+        }
+        self.sequence = self.sequence.max(checkpoint.sequence);
+        Ok(())
+    }
+
     /// Restore the last durable sequence after replay. Never moves backwards.
     pub fn restore_sequence(&mut self, sequence: u64) {
         self.sequence = self.sequence.max(sequence);
@@ -386,6 +444,7 @@ impl Book {
                 reservation_asset: reservation.asset.clone(),
                 reserved_per_unit: per_unit,
                 reserved_amount: reservation.amount,
+                trades: Vec::new(),
             },
         );
         Ok(())
@@ -594,6 +653,7 @@ impl Book {
             reservation_asset,
             reserved_per_unit,
             reserved_amount: reservation_amount,
+            trades: Vec::new(),
         };
         self.orders.insert(client_order_id.clone(), order);
 
@@ -733,6 +793,7 @@ impl Book {
         }
 
         self.seen_trades.insert(trade.key.clone());
+        order.trades.push(trade.key.clone());
         order.executed_quantity += trade.quantity;
         order.leaves_quantity = (order.leaves_quantity - trade.quantity).max(0.0);
         let signed = match trade.side {
