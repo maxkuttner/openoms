@@ -78,6 +78,30 @@ pub fn evaluate(input: &RiskInput) -> Result<(), Reject> {
     Ok(())
 }
 
+/// Refuses an order when a configured limit needs a price that is missing.
+/// `evaluate` skips such a limit instead (the OMS lets a market order without
+/// a mark through its notional check); callers that must not trade unchecked,
+/// like the co-located runtime, call this first.
+pub fn require_prices(input: &RiskInput) -> Result<(), Reject> {
+    let limits = &input.limits;
+    let order = &input.order;
+    if limits.max_order_notional.is_some() && order.limit_price.or(input.valuation.order_price).is_none() {
+        return Err(missing_price("max_order_notional", "an order price"));
+    }
+    if limits.max_position_notional.is_some() && input.valuation.position_price.is_none() {
+        return Err(missing_price("max_position_notional", "a position price"));
+    }
+    // The band bounds a limit price; a market order has none to bound.
+    if limits.price_band_pct.is_some() && order.limit_price.is_some() && input.valuation.reference_price.is_none() {
+        return Err(missing_price("price_band", "a reference price"));
+    }
+    Ok(())
+}
+
+fn missing_price(limit: &str, needs: &str) -> Reject {
+    Reject::new("missing_price", format!("{limit} is configured but there is no {needs}"))
+}
+
 /// Resolve per-field limits: an override wins only where it is configured;
 /// otherwise the default applies. A notional default inherited into a
 /// non-USD-like quote is rejected, matching the OMS rule. An explicit

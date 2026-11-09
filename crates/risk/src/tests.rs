@@ -1,5 +1,5 @@
 use crate::{
-    evaluate, resolve_limits, Exposure, Limits, OrderInput, Reject, RiskInput, Side, TradingState,
+    evaluate, require_prices, resolve_limits, Exposure, Limits, OrderInput, Reject, RiskInput, Side, TradingState,
     Valuation,
 };
 
@@ -179,4 +179,64 @@ fn invalid_limits_rejected() {
         code(resolve_limits(&zero_rate, &Limits::default(), "USDT")),
         "invalid_limits"
     );
+}
+
+fn priceless(limits: Limits, valuation: Valuation, limit_price: Option<f64>) -> RiskInput {
+    RiskInput {
+        order: OrderInput { side: Side::Buy, quantity: 1.0, limit_price, multiplier: 1.0 },
+        exposure: Exposure::default(),
+        limits,
+        state: TradingState::Active,
+        valuation,
+    }
+}
+
+#[test]
+fn an_order_notional_limit_without_any_price_refuses() {
+    let input = priceless(
+        Limits { max_order_notional: Some(1_000.0), ..Default::default() },
+        Valuation { order_price: None, ..active_valuation() },
+        None,
+    );
+    assert_eq!(code(require_prices(&input)), "missing_price");
+}
+
+#[test]
+fn a_position_notional_limit_without_a_position_price_refuses() {
+    let input = priceless(
+        Limits { max_position_notional: Some(1_000.0), ..Default::default() },
+        Valuation { position_price: None, ..active_valuation() },
+        Some(100.0),
+    );
+    assert_eq!(code(require_prices(&input)), "missing_price");
+}
+
+#[test]
+fn a_price_band_without_a_reference_refuses() {
+    let input = priceless(
+        Limits { price_band_pct: Some(5.0), ..Default::default() },
+        Valuation { reference_price: None, ..active_valuation() },
+        Some(100.0),
+    );
+    assert_eq!(code(require_prices(&input)), "missing_price");
+}
+
+#[test]
+fn missing_prices_do_not_matter_without_a_limit_that_needs_them() {
+    let input = priceless(
+        Limits { max_order_qty: Some(10.0), ..Default::default() },
+        Valuation { order_price: None, position_price: None, reference_price: None },
+        None,
+    );
+    assert!(require_prices(&input).is_ok());
+}
+
+#[test]
+fn evaluate_alone_still_skips_a_limit_whose_price_is_missing() {
+    let input = priceless(
+        Limits { max_order_notional: Some(1_000.0), ..Default::default() },
+        Valuation { order_price: None, ..active_valuation() },
+        None,
+    );
+    assert!(evaluate(&input).is_ok(), "the OMS relies on this for market orders without a mark");
 }

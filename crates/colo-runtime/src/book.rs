@@ -544,7 +544,15 @@ impl Book {
         let exposure = self.exposure(&intent.instrument);
         let risk_limits = limits.copied().unwrap_or_default();
         let max_orders_per_sec = risk_limits.max_orders_per_sec;
-        risk::evaluate(&risk::RiskInput {
+        // The venue feed reports order and fill state; while it is stale or
+        // closed the book may not reflect what is resting, so nothing new goes out.
+        if matches!(self.health, BookHealth::Stale | BookHealth::Closed) {
+            return Err(RuntimeError::Rejected(risk::Reject::new(
+                "feed_unhealthy",
+                "the venue feed is stale or closed",
+            )));
+        }
+        let risk_input = risk::RiskInput {
             order: risk::OrderInput {
                 side: risk_side(intent.side),
                 quantity: intent.quantity,
@@ -564,8 +572,10 @@ impl Book {
                 position_price: valuation.position,
                 reference_price: valuation.reference,
             },
-        })
-        .map_err(RuntimeError::Rejected)?;
+        };
+        // Unlike the OMS, a limit whose price is missing refuses the order.
+        risk::require_prices(&risk_input).map_err(RuntimeError::Rejected)?;
+        risk::evaluate(&risk_input).map_err(RuntimeError::Rejected)?;
 
         let (reservation_asset, reservation_amount, reserved_per_unit) =
             self.required_reservation(&intent, &rules, quote_price)?;

@@ -5,7 +5,7 @@ use std::time::Instant;
 use chrono::{TimeZone, Utc};
 use colo_runtime::{
     AccountIdentity, AssetBalance, Book, InstrumentPrices, InstrumentRules, Intent, Operation,
-    OrderType, Prices, RuntimeError, RuntimeOrder, RuntimeOrderState, Side, TimeInForce, Trade,
+    OrderType, Prices, RuntimeError, RuntimeOrder, RuntimeOrderState, Side, StreamState, TimeInForce, Trade,
     TradeKey, TradeProvenance, VenueCapabilities, VenueEvent,
 };
 use uuid::Uuid;
@@ -454,4 +454,38 @@ fn a_checkpoint_drops_finished_orders_but_keeps_their_position() {
     assert_eq!(restored.position("BTCUSDT"), 10.0);
     assert_eq!(restored.leaves(&order.submission.client_order_id), None);
     assert_eq!(restored.committed("USDT"), 0.0);
+}
+
+fn reject_code(result: Result<colo_runtime::PreparedOrder, colo_runtime::RuntimeError>) -> String {
+    match result {
+        Err(colo_runtime::RuntimeError::Rejected(r)) => r.code,
+        other => panic!("expected a risk rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_notional_limit_without_a_position_price_refuses_the_order() {
+    let limits = BTreeMap::from([(
+        "BTCUSDT".to_string(),
+        risk::Limits { max_position_notional: Some(5_000.0), ..Default::default() },
+    )]);
+    let mut book = book(limits, &[("USDT", 10_000.0)]);
+    let mut no_mark = Prices::new();
+    // An order and a reference price, but no position (mark) price.
+    no_mark.set("BTCUSDT", InstrumentPrices::new(Some(100.0), Some(100.0), None, Instant::now()));
+    let result = book.prepare(intent("BTCUSDT", Side::Buy, 1.0, 100.0), &no_mark, Instant::now());
+    assert_eq!(reject_code(result), "missing_price");
+}
+
+#[test]
+fn a_stale_or_closed_feed_refuses_new_orders() {
+    for state in [StreamState::Stale, StreamState::Closed] {
+        let mut book = book(BTreeMap::new(), &[("USDT", 10_000.0)]);
+        book.apply(&VenueEvent::Health { state, observed_at: Utc.timestamp_opt(0, 0).unwrap() }).unwrap();
+        let result = book.prepare(intent("BTCUSDT", Side::Buy, 1.0, 100.0), &prices("BTCUSDT", 100.0), Instant::now());
+        assert_eq!(reject_code(result), "feed_unhealthy");
+        book.apply(&VenueEvent::Health { state: StreamState::Live, observed_at: Utc.timestamp_opt(0, 0).unwrap() }).unwrap();
+        book.prepare(intent("BTCUSDT", Side::Buy, 1.0, 100.0), &prices("BTCUSDT", 100.0), Instant::now())
+            .expect("a live feed admits again");
+    }
 }
