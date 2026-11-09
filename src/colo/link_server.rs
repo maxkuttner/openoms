@@ -497,13 +497,27 @@ mod tests {
             })
         }
         async fn bootstrap_v2(&self, _: &Deployment) -> Result<Bootstrap, String> {
+            // A valid bootstrap: the runtime's link refuses one without
+            // instruments and their limits.
+            let rules = gateway::runtime::InstrumentRules {
+                symbol: "BTCUSDT".into(), venue: "BINANCE".into(), venue_symbol: "BTCUSDT".into(),
+                base_asset: "BTC".into(), quote_asset: "USDT".into(), tick_size: 0.01, step_size: 0.001,
+                multiplier: 1.0, min_quantity: None, max_quantity: None, min_notional: None, max_notional: None,
+                operations: vec![gateway::runtime::Operation::Place, gateway::runtime::Operation::Cancel],
+                capabilities: gateway::runtime::VenueCapabilities {
+                    cancel_on_disconnect: false, atomic_cancel_replace: false, open_orders_snapshot: true,
+                    order_lookup: true, trade_history: true, balance_snapshot: true,
+                },
+            };
             Ok(Bootstrap {
-                instruments: vec![], limits: Default::default(), trading_state: risk::TradingState::Active,
+                instruments: vec![rules],
+                limits: [("BTCUSDT".to_string(), risk::Limits::default())].into_iter().collect(),
+                trading_state: risk::TradingState::Active,
                 instrument_states: Default::default(), timings: Timings { heartbeat_secs: 1, authority_secs: 5, market_data_max_age_secs: 2 },
                 baseline: RuntimeCheckpoint { sequence: 0, positions: Default::default(), open_client_ids: vec![], execution_cursor: ExecutionCursor::default(), complete: true },
                 asset_baseline: Default::default(), killed_epoch: None,
                 allocation: Allocation { quote_asset: "USDT".into(), max_notional: 1_000.0, max_position_qty: None },
-                recovery_universe: vec![],
+                recovery_universe: vec!["BTCUSDT".into()],
             })
         }
         async fn runtime_message(&self, _: &Deployment, message: &FromRuntime) -> Result<(), String> {

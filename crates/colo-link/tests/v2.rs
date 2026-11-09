@@ -387,3 +387,106 @@ fn v1_state_cannot_deserialize_as_a_v2_bootstrap() {
     let v1 = r#"{"type":"state","active":true,"limits":{},"limits_version":1,"positions":[],"dead_man_secs":5}"#;
     assert!(serde_json::from_str::<ToRuntimeEnvelope>(v1).is_err());
 }
+
+mod gate {
+    use super::*;
+    use colo_link::v2::{ControlFrame, ControlGate, EventAck, ProtocolError};
+
+    fn frame(connection: u64, sequence: u64, received_at: Instant, account: &AccountIdentity, message: ToRuntime) -> ControlFrame {
+        ControlFrame { connection, received_at, envelope: envelope(2, account.clone(), "n1", sequence, 3, message) }
+    }
+
+    fn boot(connection: u64, account: &AccountIdentity) -> ControlFrame {
+        frame(connection, 1, Instant::now(), account, ToRuntime::Bootstrap { bootstrap: bootstrap(true) })
+    }
+
+    fn authority(connection: u64, sequence: u64, account: &AccountIdentity) -> ControlFrame {
+        frame(connection, sequence, Instant::now(), account, ToRuntime::Authority { authority: Authority { valid_for_secs: 5 } })
+    }
+
+    fn gate(account: &AccountIdentity) -> ControlGate {
+        ControlGate::new(account.clone(), 7, "n1")
+    }
+
+    #[test]
+    fn a_new_connection_restarts_the_sequence_with_its_bootstrap() {
+        let account = account();
+        let mut gate = gate(&account);
+        gate.admit(boot(1, &account)).unwrap();
+        gate.admit(authority(1, 2, &account)).unwrap();
+        gate.admit(boot(2, &account)).expect("sequence 1 again on the new connection");
+        gate.admit(authority(2, 2, &account)).unwrap();
+    }
+
+    #[test]
+    fn a_message_left_over_from_an_old_connection_is_dropped() {
+        let account = account();
+        let mut gate = gate(&account);
+        gate.admit(boot(1, &account)).unwrap();
+        gate.admit(boot(2, &account)).unwrap();
+        assert!(matches!(gate.admit(authority(1, 2, &account)), Err(ProtocolError::StaleConnection { .. })));
+        assert!(!gate.session().may_trade(Instant::now()));
+    }
+
+    #[test]
+    fn a_new_connection_clears_authority_granted_on_the_old_one() {
+        let account = account();
+        let mut gate = gate(&account);
+        gate.admit(boot(1, &account)).unwrap();
+        gate.admit(authority(1, 2, &account)).unwrap();
+        assert!(gate.session().may_trade(Instant::now()));
+        gate.admit(boot(2, &account)).unwrap();
+        assert!(!gate.session().may_trade(Instant::now()), "authority must be granted again");
+    }
+
+    #[test]
+    fn authority_is_timed_from_when_it_arrived() {
+        let account = account();
+        let mut gate = gate(&account);
+        gate.admit(boot(1, &account)).unwrap();
+        let arrived = Instant::now() - Duration::from_secs(4);
+        let received = gate
+            .admit(frame(1, 2, arrived, &account, ToRuntime::Authority { authority: Authority { valid_for_secs: 5 } }))
+            .unwrap();
+        assert_eq!(received.received_at, arrived);
+        assert!(gate.session().may_trade(Instant::now()));
+        assert!(!gate.session().may_trade(Instant::now() + Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn a_gap_in_the_sequence_is_refused() {
+        let account = account();
+        let mut gate = gate(&account);
+        gate.admit(boot(1, &account)).unwrap();
+        assert!(matches!(gate.admit(authority(1, 3, &account)), Err(ProtocolError::SequenceGap { .. })));
+        gate.admit(authority(1, 2, &account)).expect("the next message still fits");
+    }
+
+    #[test]
+    fn nothing_but_a_bootstrap_opens_a_connection() {
+        let account = account();
+        let mut gate = gate(&account);
+        assert!(gate.admit(authority(1, 1, &account)).is_err());
+    }
+
+    #[test]
+    fn event_acknowledgements_pass_a_control_only_session() {
+        let account = account();
+        let mut gate = gate(&account);
+        gate.admit(boot(1, &account)).unwrap();
+        gate.admit(frame(1, 2, Instant::now(), &account, ToRuntime::EventAck { ack: EventAck { through_sequence: 40 } }))
+            .expect("the reporter, not the link, tracks events");
+    }
+
+    #[test]
+    fn an_enable_is_accepted_after_a_restart_with_a_kill_latched() {
+        let account = account();
+        let mut gate = gate(&account);
+        let mut killed = bootstrap(true);
+        killed.killed_epoch = Some(7);
+        gate.admit(frame(1, 1, Instant::now(), &account, ToRuntime::Bootstrap { bootstrap: killed })).unwrap();
+        assert!(gate.session().killed());
+        gate.admit(frame(1, 2, Instant::now(), &account, ToRuntime::Enable { enable: Enable { stopped_epoch: 7, command_id: "e".into() } }))
+            .expect("the bootstrap carried the kill");
+    }
+}

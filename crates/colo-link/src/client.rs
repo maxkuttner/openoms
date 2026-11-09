@@ -13,7 +13,7 @@ use gateway::runtime::AccountIdentity;
 
 use crate::proto::{FromStrategy, ToStrategy, HEARTBEAT};
 use crate::v2::{
-    FromRuntime, FromRuntimeEnvelope, ProtocolError, Received, RuntimeLink, ToRuntime,
+    ControlFrame, ControlGate, FromRuntime, FromRuntimeEnvelope, ProtocolError, Received, RuntimeLink, ToRuntime,
     ToRuntimeEnvelope, PROTOCOL_VERSION,
 };
 
@@ -237,13 +237,13 @@ impl V2Link {
         cfg: V2LinkConfig,
     ) -> (
         V2Link,
-        mpsc::Receiver<ToRuntimeEnvelope>,
-        mpsc::Receiver<ToRuntimeEnvelope>,
+        mpsc::Receiver<ControlFrame>,
+        mpsc::Receiver<ControlFrame>,
     ) {
         let (control_tx, control_rx) = mpsc::channel::<FromRuntimeEnvelope>(256);
         let (events_tx, events_rx) = mpsc::channel::<FromRuntimeEnvelope>(256);
-        let (control_in_tx, control_in_rx) = mpsc::channel::<ToRuntimeEnvelope>(256);
-        let (events_in_tx, events_in_rx) = mpsc::channel::<ToRuntimeEnvelope>(256);
+        let (control_in_tx, control_in_rx) = mpsc::channel::<ControlFrame>(256);
+        let (events_in_tx, events_in_rx) = mpsc::channel::<ControlFrame>(256);
 
         let control_cfg = cfg.clone();
         tokio::spawn(async move {
@@ -301,10 +301,11 @@ async fn run_v2(
     cfg: &V2LinkConfig,
     url: String,
     mut out_rx: mpsc::Receiver<FromRuntimeEnvelope>,
-    in_tx: mpsc::Sender<ToRuntimeEnvelope>,
+    in_tx: mpsc::Sender<ControlFrame>,
 ) {
+    let mut connection = 0;
     loop {
-        if let Err(e) = run_v2_once(cfg, &url, &mut out_rx, &in_tx).await {
+        if let Err(e) = run_v2_once(cfg, &url, &mut out_rx, &in_tx, &mut connection).await {
             warn!(error = %e, "v2 link: down; reconnecting");
         }
         if in_tx.is_closed() {
@@ -318,7 +319,8 @@ async fn run_v2_once(
     cfg: &V2LinkConfig,
     url: &str,
     out_rx: &mut mpsc::Receiver<FromRuntimeEnvelope>,
-    in_tx: &mpsc::Sender<ToRuntimeEnvelope>,
+    in_tx: &mpsc::Sender<ControlFrame>,
+    connection: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tls = native_tls::TlsConnector::builder();
     if let Some(pem) = &cfg.ca_pem {
@@ -337,14 +339,19 @@ async fn run_v2_once(
     )
     .await
     .map_err(|_| "v2 handshake timed out")??;
-    info!(url, "v2 link: connected");
+    *connection += 1;
+    let connection = *connection;
+    info!(url, connection, "v2 link: connected");
     let (mut sink, mut stream) = ws.split();
     let mut beat = tokio::time::interval(HEARTBEAT);
     loop {
         tokio::select! {
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ToRuntimeEnvelope>(&text) {
-                    Ok(msg) => { if in_tx.send(msg).await.is_err() { return Ok(()); } }
+                    Ok(envelope) => {
+                        let frame = ControlFrame { connection, received_at: Instant::now(), envelope };
+                        if in_tx.send(frame).await.is_err() { return Ok(()); }
+                    }
                     Err(e) => warn!(error = %e, "v2 link: unreadable message"),
                 },
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
@@ -375,43 +382,32 @@ async fn run_v2_once(
 /// Adapter from the two-socket v2 transport to the runtime's transport seam.
 pub struct V2RuntimeLink {
     link: V2Link,
-    control: tokio::sync::Mutex<mpsc::Receiver<ToRuntimeEnvelope>>,
-    account: AccountIdentity,
-    epoch: u64,
-    session_nonce: String,
+    /// The receiver and the gate that validates what comes out of it, held
+    /// together so frames are admitted in arrival order.
+    control: tokio::sync::Mutex<(mpsc::Receiver<ControlFrame>, ControlGate)>,
 }
 
 impl V2RuntimeLink {
     pub fn spawn(cfg: V2LinkConfig) -> Arc<Self> {
-        let account = cfg.account.clone();
-        let epoch = cfg.epoch;
-        let session_nonce = cfg.session_nonce.clone();
+        let gate = ControlGate::new(cfg.account.clone(), cfg.epoch, cfg.session_nonce.clone());
         let (link, control, mut events) = V2Link::spawn(cfg);
         tokio::spawn(async move { while events.recv().await.is_some() {} });
-        Arc::new(Self {
-            link,
-            control: tokio::sync::Mutex::new(control),
-            account,
-            epoch,
-            session_nonce,
-        })
+        Arc::new(Self { link, control: tokio::sync::Mutex::new((control, gate)) })
     }
 }
 
 #[async_trait::async_trait]
 impl RuntimeLink for V2RuntimeLink {
     async fn recv_control(&self) -> Option<Received<ToRuntime>> {
+        let mut guard = self.control.lock().await;
+        let (frames, gate) = &mut *guard;
         loop {
-            let envelope = self.control.lock().await.recv().await?;
-            if envelope.protocol_version != PROTOCOL_VERSION
-                || envelope.account != self.account
-                || envelope.epoch != self.epoch
-                || envelope.session_nonce != self.session_nonce
-            {
-                tracing::warn!("v2 runtime link: dropped mismatched control envelope");
-                continue;
+            let frame = frames.recv().await?;
+            let (connection, sequence) = (frame.connection, frame.envelope.sequence);
+            match gate.admit(frame) {
+                Ok(received) => return Some(received),
+                Err(e) => tracing::warn!(connection, sequence, error = %e, "v2 runtime link: control message dropped"),
             }
-            return Some(Received::new(envelope.message, Instant::now()));
         }
     }
 

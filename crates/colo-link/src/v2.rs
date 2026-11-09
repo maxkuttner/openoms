@@ -240,6 +240,49 @@ impl EventBatch {
     }
 }
 
+/// A control envelope as the socket yielded it: which connection it came on
+/// (numbered from 1 per successful connect) and when it arrived.
+#[derive(Debug, Clone)]
+pub struct ControlFrame {
+    pub connection: u64,
+    pub received_at: Instant,
+    pub envelope: ToRuntimeEnvelope,
+}
+
+/// Validates control frames for the runtime: drops frames from replaced
+/// connections, requires each connection to open with its bootstrap, and runs
+/// every frame through a control-only `V2Session` (version, account, nonce,
+/// epoch, sequence, replay, revision and kill/enable rules). Authority is
+/// timed from arrival, not from when the runtime gets to it.
+pub struct ControlGate {
+    session: V2Session,
+    connection: u64,
+}
+
+impl ControlGate {
+    pub fn new(account: AccountIdentity, epoch: u64, session_nonce: impl Into<String>) -> Self {
+        Self { session: V2Session::control_only(account, epoch, session_nonce), connection: 0 }
+    }
+
+    pub fn admit(&mut self, frame: ControlFrame) -> Result<Received<ToRuntime>, ProtocolError> {
+        if frame.connection < self.connection {
+            return Err(ProtocolError::StaleConnection { current: self.connection, got: frame.connection });
+        }
+        if frame.connection > self.connection {
+            if !matches!(frame.envelope.message, ToRuntime::Bootstrap { .. }) || frame.envelope.sequence != 1 {
+                return Err(ProtocolError::NoBootstrap);
+            }
+            self.connection = frame.connection;
+            self.session.new_connection();
+        }
+        self.session.receive_control(frame.envelope, frame.received_at)
+    }
+
+    pub fn session(&self) -> &V2Session {
+        &self.session
+    }
+}
+
 /// Runtime → OMS reporting messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -281,6 +324,9 @@ pub enum ProtocolError {
     NotKilled,
     AckBeyondSent { ack: u64, sent: u64 },
     AckNotABatchBoundary(u64),
+    /// A message from a connection that has since been replaced.
+    StaleConnection { current: u64, got: u64 },
+
     FrameTooLarge { bytes: usize, max: usize },
     TooManyRecords { count: usize, max: usize },
     NoBootstrap,
@@ -309,6 +355,9 @@ impl std::fmt::Display for ProtocolError {
             Self::NotKilled => write!(f, "enable received while not killed"),
             Self::AckBeyondSent { ack, sent } => write!(f, "ACK {ack} exceeds sent {sent}"),
             Self::AckNotABatchBoundary(seq) => write!(f, "ACK {seq} is not a delivered batch boundary"),
+            Self::StaleConnection { current, got } => {
+                write!(f, "message from connection {got}, which connection {current} replaced")
+            }
             Self::FrameTooLarge { bytes, max } => write!(f, "frame {bytes} exceeds {max}"),
             Self::TooManyRecords { count, max } => write!(f, "batch has {count} records (max {max})"),
             Self::NoBootstrap => write!(f, "bootstrap is required"),
@@ -337,6 +386,9 @@ pub struct V2Session {
     kill_epoch: Option<u64>,
     bootstrap: Option<Bootstrap>,
     resend_from: Option<u64>,
+    /// Whether this session also sends events and so can check their ACKs.
+    /// A control-only session (the runtime's link) leaves that to the reporter.
+    tracks_events: bool,
 }
 
 impl V2Session {
@@ -362,7 +414,22 @@ impl V2Session {
             kill_epoch: None,
             bootstrap: None,
             resend_from: None,
+            tracks_events: true,
         }
+    }
+
+    /// A session that validates control messages only; event ACKs are checked
+    /// for order but their bookkeeping belongs to whoever sends the events.
+    pub fn control_only(account: AccountIdentity, epoch: u64, session_nonce: impl Into<String>) -> Self {
+        Self { tracks_events: false, ..Self::new(account, epoch, session_nonce, 1) }
+    }
+
+    /// A new connection numbers its control messages from 1 again, starting
+    /// with its bootstrap. Authority granted on the old connection is void.
+    pub fn new_connection(&mut self) {
+        self.last_control_sequence = 0;
+        self.last_control = None;
+        self.authority_deadline = None;
     }
 
     /// Rebind to a new connection nonce. Buffered authority from the old
@@ -424,6 +491,13 @@ impl V2Session {
                 }
                 self.bootstrap = Some(bootstrap.clone());
                 self.heartbeat_secs = bootstrap.timings.heartbeat_secs;
+                // The OMS's own record of an active kill, so a runtime that
+                // restarted while killed can still be enabled.
+                if let Some(killed) = bootstrap.killed_epoch {
+                    self.killed = true;
+                    self.kill_epoch = Some(killed);
+                    self.authority_deadline = None;
+                }
                 self.last_policy_revision = envelope.policy_revision;
             }
             ToRuntime::Policy { .. } => {
@@ -470,8 +544,11 @@ impl V2Session {
                 self.kill_epoch = None;
             }
             ToRuntime::EventAck { ack } => {
-                self.ack_events(ack.through_sequence)?;
+                if self.tracks_events {
+                    self.ack_events(ack.through_sequence)?;
+                }
             }
+            ToRuntime::ResyncRequired { .. } if !self.tracks_events => {}
             ToRuntime::ResyncRequired { resync } => {
                 if resync.from_sequence > self.last_sent_event_sequence.saturating_add(1) {
                     return Err(ProtocolError::SequenceGap {
