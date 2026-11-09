@@ -95,6 +95,10 @@ struct FakeVenue {
     lookups: AtomicUsize,
     /// The runtime's venue stream, captured at subscribe.
     stream: std::sync::Mutex<Option<mpsc::Sender<VenueEvent>>>,
+    /// Fills the venue's history serves once, after recovery.
+    history: std::sync::Mutex<Vec<colo_runtime::Trade>>,
+    history_fails: AtomicBool,
+    history_calls: AtomicUsize,
     block: AtomicBool,
     gate: Arc<Notify>,
     started: Arc<Notify>,
@@ -110,6 +114,9 @@ impl FakeVenue {
             lookup_finds: AtomicBool::new(false),
             lookups: AtomicUsize::new(0),
             stream: std::sync::Mutex::new(None),
+            history: std::sync::Mutex::new(Vec::new()),
+            history_fails: AtomicBool::new(false),
+            history_calls: AtomicUsize::new(0),
             block: AtomicBool::new(false),
             gate: Arc::new(Notify::new()),
             started: Arc::new(Notify::new()),
@@ -155,7 +162,12 @@ impl RuntimeVenue for FakeVenue {
     }
     async fn snapshot_orders(&self) -> Result<Vec<colo_runtime::RuntimeOrder>, BrokerError> { Ok(vec![]) }
     async fn executions(&self, cursor: &ExecutionCursor) -> Result<ExecutionPage, BrokerError> {
-        Ok(ExecutionPage { trades: vec![], next: cursor.clone(), complete: true, missing: vec![] })
+        self.history_calls.fetch_add(1, Ordering::SeqCst);
+        if self.history_fails.load(Ordering::SeqCst) {
+            return Err(BrokerError::Network("history down".into()));
+        }
+        let trades = std::mem::take(&mut *self.history.lock().unwrap());
+        Ok(ExecutionPage { trades, next: cursor.clone(), complete: true, missing: vec![] })
     }
     async fn lookup(&self, client_order_id: &str, symbol: &str) -> Result<colo_runtime::RuntimeOrder, BrokerError> {
         self.lookups.fetch_add(1, Ordering::SeqCst);
@@ -894,4 +906,60 @@ async fn a_fresh_journal_never_reuses_order_ids() {
     assert_eq!(a.sequence, b.sequence, "both journals start counting from the same place");
     assert_ne!(a.client_order_id, b.client_order_id);
     second.shutdown().await.unwrap();
+}
+
+fn health(state: colo_runtime::StreamState) -> VenueEvent {
+    VenueEvent::Health { state, observed_at: chrono::Utc::now() }
+}
+
+fn trade_for(client_order_id: &str, trade_id: &str, quantity: f64) -> colo_runtime::Trade {
+    match fill(client_order_id, trade_id, quantity) {
+        VenueEvent::Trade(trade) => trade,
+        _ => unreachable!(),
+    }
+}
+
+async fn submit_allowed(runtime: &Runtime) -> bool {
+    for _ in 0..200 {
+        if runtime.submit(intent(1.0)).await.is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_lost_feed_stops_orders_and_its_return_resyncs_before_trading() {
+    use colo_runtime::StreamState::*;
+    let (runtime, venue, _dir) = start().await;
+    let id = live_order(&runtime, &venue).await;
+    let stream = venue.stream.lock().unwrap().clone().expect("subscribed");
+    stream.send(health(Closed)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(matches!(runtime.submit(intent(0.01)).await, Err(colo_runtime::RuntimeError::NotReady(_))));
+
+    // While the feed was down the order filled; only history knows.
+    venue.history.lock().unwrap().push(trade_for(&id, "77", 0.5));
+    let calls = venue.history_calls.load(Ordering::SeqCst);
+    stream.send(health(Live)).await.unwrap();
+    wait_for("history queried", || venue.history_calls.load(Ordering::SeqCst) > calls).await;
+    assert!(submit_allowed(&runtime).await, "trading resumes after a clean resync");
+    assert_eq!(runtime.position("BTCUSDT").await, 0.5, "the missed fill is counted");
+}
+
+#[tokio::test]
+async fn a_failed_resync_keeps_orders_stopped() {
+    use colo_runtime::StreamState::*;
+    let (runtime, venue, _dir) = start().await;
+    grant(&runtime).await;
+    let stream = venue.stream.lock().unwrap().clone().expect("subscribed");
+    stream.send(health(Stale)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    venue.history_fails.store(true, Ordering::SeqCst);
+    let calls = venue.history_calls.load(Ordering::SeqCst);
+    stream.send(health(Live)).await.unwrap();
+    wait_for("history queried", || venue.history_calls.load(Ordering::SeqCst) > calls).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(runtime.submit(intent(0.01)).await, Err(colo_runtime::RuntimeError::NotReady(_))));
 }

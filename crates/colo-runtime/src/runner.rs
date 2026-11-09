@@ -69,6 +69,8 @@ struct Inner {
     /// Book-changing journal writes not yet applied to the book. A checkpoint
     /// is only taken at zero, so it never claims a record the book lacks.
     writing: AtomicUsize,
+    /// A resync after feed loss is running.
+    resyncing: AtomicBool,
     /// Set once and never cleared, so a task that checks late still stops.
     shutdown: tokio::sync::watch::Sender<bool>,
     report_now: tokio::sync::Notify,
@@ -179,6 +181,7 @@ impl Runtime {
             outbox,
             suspensions: Mutex::new(std::collections::BTreeSet::new()),
             writing: AtomicUsize::new(0),
+            resyncing: AtomicBool::new(false),
             shutdown: tokio::sync::watch::channel(false).0,
             report_now: tokio::sync::Notify::new(),
             recovered: AtomicBool::new(recovered_ok),
@@ -789,38 +792,115 @@ fn spawn_venue_events(
     mut rx: tokio::sync::mpsc::Receiver<VenueEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-            loop {
-                let Some(inner) = weak.upgrade() else { break };
-                let event = tokio::select! {
-                    _ = inner.stopped() => break,
-                    event = rx.recv() => match event {
-                        Some(event) => event,
-                        None => break,
-                    },
-                };
-                drop(inner);
-                let Some(inner) = weak.upgrade() else { break };
-                if let VenueEvent::Health { state, .. } = &event {
-                    if matches!(state, StreamState::Stale | StreamState::Closed) {
-                        let mut core = inner.core.lock().await;
-                        core.control.suspend("venue stream is not healthy");
-                    }
-                }
-                let record = JournalRecord::Venue { event: event.clone() };
-                let _writing = inner.writing();
-                if append(&inner.journal, record).await.is_err() {
-                    inner.suspend(Suspension::Journal);
-                    continue;
-                }
-                inner.report_now.notify_one();
-                let mut core = inner.core.lock().await;
-                let applied = core.book.apply(&event);
-                inner.settle_kill(&mut core);
-                if applied.is_err() {
-                    core.control.suspend("venue event did not match local state");
-                }
+        loop {
+            let Some(inner) = weak.upgrade() else { break };
+            let event = tokio::select! {
+                _ = inner.stopped() => break,
+                event = rx.recv() => match event {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+            drop(inner);
+            let Some(inner) = weak.upgrade() else { break };
+            let health = match &event {
+                VenueEvent::Health { state, .. } => Some(*state),
+                _ => None,
+            };
+            if matches!(health, Some(StreamState::Stale | StreamState::Closed)) {
+                // Fills may now be missed: no new orders until a resync.
+                inner.suspend(Suspension::FeedLost);
             }
-        })
+            ingest(&inner, event).await;
+            if health == Some(StreamState::Live) && inner.is_suspended_for(&Suspension::FeedLost) {
+                spawn_resync(inner.clone());
+            }
+        }
+    })
+}
+
+/// Journals a venue event, then applies it to the book. Returns whether the
+/// book accepted it; a mismatch suspends the runtime.
+async fn ingest(inner: &Arc<Inner>, event: VenueEvent) -> bool {
+    let record = JournalRecord::Venue { event: event.clone() };
+    let _writing = inner.writing();
+    if append(&inner.journal, record).await.is_err() {
+        inner.suspend(Suspension::Journal);
+        return false;
+    }
+    inner.report_now.notify_one();
+    let mut core = inner.core.lock().await;
+    let applied = core.book.apply(&event);
+    inner.settle_kill(&mut core);
+    if applied.is_err() {
+        core.control.suspend("venue event did not match local state");
+        return false;
+    }
+    true
+}
+
+/// History pages read per resync before giving up.
+const RESYNC_MAX_PAGES: usize = 100;
+
+/// After the feed returns, catches up on what it missed: fills since the
+/// execution cursor, the open orders and the balances, each journalled and
+/// applied like a live event. Only a resync that completes lifts the feed
+/// suspension; anything else leaves orders stopped for the next attempt.
+fn spawn_resync(inner: Arc<Inner>) {
+    if inner.resyncing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        let outcome = resync(&inner).await;
+        inner.resyncing.store(false, Ordering::SeqCst);
+        match outcome {
+            Ok(()) => {
+                inner.lift(&Suspension::FeedLost);
+                tracing::info!("runtime: venue feed resynced; admission reopened");
+            }
+            Err(reason) => tracing::warn!(%reason, "runtime: resync after feed loss failed; orders stay stopped"),
+        }
+    });
+}
+
+async fn resync(inner: &Arc<Inner>) -> Result<(), String> {
+    let positions = inner
+        .journal
+        .lock()
+        .map_err(|_| "journal lock poisoned".to_string())?
+        .execution_cursor()
+        .ok_or("no checkpoint to resume history from")?;
+    let mut cursor = gateway::runtime::ExecutionCursor { positions, ..Default::default() };
+    let mut complete = false;
+    for _ in 0..RESYNC_MAX_PAGES {
+        let page = inner.venue.executions(&cursor).await.map_err(|e| format!("history: {e}"))?;
+        if !page.missing.is_empty() {
+            return Err(format!("history missing for {}", page.missing.join(", ")));
+        }
+        for trade in page.trades {
+            if !ingest(inner, VenueEvent::Trade(trade)).await {
+                return Err("a missed fill did not match the book".into());
+            }
+        }
+        cursor = page.next;
+        if page.complete {
+            complete = true;
+            break;
+        }
+    }
+    if !complete {
+        return Err("history did not complete within the page bound".into());
+    }
+    for order in inner.venue.snapshot_orders().await.map_err(|e| format!("open orders: {e}"))? {
+        if !ingest(inner, VenueEvent::Order(order)).await {
+            return Err("an open order did not match the book".into());
+        }
+    }
+    let balances = inner.venue.balances().await.map_err(|e| format!("balances: {e}"))?;
+    if !ingest(inner, VenueEvent::Balances { balances }).await {
+        return Err("balances could not be applied".into());
+    }
+    Ok(())
 }
 
 fn recovered_complete(book: &Book, control: &ControlState, bootstrap_killed: Option<u64>, journal_killed: bool) -> bool {
@@ -856,6 +936,8 @@ enum Suspension {
     UnclearOrder(String),
     /// The strategy stopped draining runtime events.
     EventQueueFull,
+    /// The venue feed went stale or closed; lifted by a completed resync.
+    FeedLost,
 }
 
 impl std::fmt::Display for Suspension {
@@ -865,6 +947,7 @@ impl std::fmt::Display for Suspension {
             Self::CancelFailed(id) => write!(f, "cancel of {id} failed"),
             Self::UnclearOrder(id) => write!(f, "order {id} has no confirmed venue state"),
             Self::EventQueueFull => write!(f, "event queue is full"),
+            Self::FeedLost => write!(f, "venue feed was lost; resyncing"),
         }
     }
 }
@@ -914,6 +997,10 @@ impl Inner {
         if let Ok(mut set) = self.suspensions.lock() {
             set.insert(reason);
         }
+    }
+
+    fn is_suspended_for(&self, reason: &Suspension) -> bool {
+        self.suspensions.lock().map(|set| set.contains(reason)).unwrap_or(true)
     }
 
     fn lift(&self, reason: &Suspension) {
