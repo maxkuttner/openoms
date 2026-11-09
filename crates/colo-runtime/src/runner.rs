@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -57,6 +57,9 @@ struct Inner {
     journal_limit: u64,
     identity: AccountIdentity,
     suspensions: Mutex<std::collections::BTreeSet<Suspension>>,
+    /// Book-changing journal writes not yet applied to the book. A checkpoint
+    /// is only taken at zero, so it never claims a record the book lacks.
+    writing: AtomicUsize,
     shutdown: tokio::sync::Notify,
     report_now: tokio::sync::Notify,
     recovered: AtomicBool,
@@ -140,6 +143,7 @@ impl Runtime {
             journal_limit: config.max_journal_bytes,
             identity: config.identity,
             suspensions: Mutex::new(std::collections::BTreeSet::new()),
+            writing: AtomicUsize::new(0),
             shutdown: tokio::sync::Notify::new(),
             report_now: tokio::sync::Notify::new(),
             recovered: AtomicBool::new(recovered_ok),
@@ -148,12 +152,13 @@ impl Runtime {
             let weak = Arc::downgrade(&inner);
             spawn_venue_events(weak, events)
         };
-        let link_tasks = match (&config.link, reporter) {
+        let mut link_tasks = match (&config.link, reporter) {
             (Some(link), Some(reporter)) => {
                 spawn_link_tasks(Arc::downgrade(&inner), link.clone(), reporter)
             }
             _ => Vec::new(),
         };
+        link_tasks.push(spawn_compaction(Arc::downgrade(&inner)));
         Ok(Self {
             inner,
             events_task: Mutex::new(Some(task)),
@@ -195,8 +200,10 @@ impl Runtime {
             }
             core.control.may_submit(now)?;
             let prices = core.prices.clone();
-            core.book.prepare(intent, &prices, now)?
+            let writing = self.inner.writing();
+            (core.book.prepare(intent, &prices, now)?, writing)
         };
+        let (prepared, writing) = prepared;
         let bytes = self.inner.journal.lock().map_err(|_| RuntimeError::JournalIo("journal lock".into()))?.byte_len();
         if bytes > self.inner.journal_limit {
             self.inner.suspend(Suspension::Journal);
@@ -213,6 +220,7 @@ impl Runtime {
             self.inner.core.lock().await.book.abort_order(&prepared.submission.client_order_id);
             return Err(e);
         }
+        drop(writing);
         self.inner.report_now.notify_one();
 
         let lapsed = self.inner.core.lock().await.control.may_submit(Instant::now()).err();
@@ -275,6 +283,7 @@ impl Runtime {
             };
             let accepted_venue_id = order.venue_order_id.clone();
             let event = VenueEvent::Order(order);
+            let writing = inner.writing();
             if append(&inner.journal, JournalRecord::Venue { event: event.clone() }).await.is_ok() {
                 inner.report_now.notify_one();
                 let mut core = inner.core.lock().await;
@@ -292,6 +301,7 @@ impl Runtime {
             } else {
                 inner.suspend(Suspension::Journal);
             }
+            drop(writing);
             if state == RuntimeOrderState::Unknown {
                 spawn_resolve(
                     Arc::downgrade(&inner),
@@ -443,6 +453,7 @@ async fn abandon(inner: &Arc<Inner>, client_order_id: &str, reason: &str) {
         client_order_id: client_order_id.to_string(),
         reason: reason.to_string(),
     };
+    let _writing = inner.writing();
     if append(&inner.journal, record).await.is_err() {
         inner.suspend(Suspension::Journal);
         return;
@@ -454,6 +465,74 @@ async fn abandon(inner: &Arc<Inner>, client_order_id: &str, reason: &str) {
         client_order_id: client_order_id.to_string(),
         outcome: SubmitOutcome::Rejected { reason: format!("not sent: {reason}") },
     });
+}
+
+/// How often the journal size is checked for compaction.
+const COMPACT_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Checkpoints and compacts the journal once it passes half its limit, and
+/// only after the OMS has acknowledged more events: unacknowledged records
+/// are kept, so compacting without new ACKs would only add checkpoints.
+fn spawn_compaction(weak: std::sync::Weak<Inner>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut compacted_at_ack = 0;
+        let mut tick = tokio::time::interval(COMPACT_EVERY);
+        loop {
+            let Some(inner) = weak.upgrade() else { break };
+            tokio::select! {
+                _ = inner.shutdown.notified() => break,
+                _ = tick.tick() => {}
+            }
+            let (bytes, acked) = match inner.journal.lock() {
+                Ok(journal) => (journal.byte_len(), journal.acked()),
+                Err(_) => break,
+            };
+            if bytes <= inner.journal_limit / 2 || acked <= compacted_at_ack {
+                continue;
+            }
+            match checkpoint_and_compact(&inner).await {
+                Ok(true) => {
+                    compacted_at_ack = acked;
+                    tracing::info!(before = bytes, "runtime: journal compacted");
+                }
+                // Writes in progress; the next tick tries again.
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "runtime: journal compaction failed");
+                    inner.suspend(Suspension::Journal);
+                }
+            }
+        }
+    })
+}
+
+/// Writes a checkpoint of the book and compacts. Holds the book lock
+/// throughout, and checks under the journal lock that no book-changing write
+/// is between its journal record and its book update; returns `false` if one
+/// is, so the checkpoint never claims a record the book has not applied.
+async fn checkpoint_and_compact(inner: &Arc<Inner>) -> Result<bool, RuntimeError> {
+    let core = inner.core.lock().await;
+    let book = core.book.checkpoint();
+    let shared = inner.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let mut journal = shared
+            .journal
+            .lock()
+            .map_err(|_| RuntimeError::JournalIo("journal lock poisoned".into()))?;
+        if shared.writing.load(Ordering::SeqCst) != 0 {
+            return Ok(false);
+        }
+        let cursor = journal.execution_cursor().ok_or_else(|| {
+            RuntimeError::JournalIo("no checkpoint to take the execution cursor from".into())
+        })?;
+        journal.append_durable(&JournalRecord::Checkpoint { book, cursor })?;
+        journal.compact()?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| RuntimeError::JournalIo(format!("compaction task: {e}")))?;
+    drop(core);
+    done
 }
 
 /// First lookup delay for an order whose submit answer was lost.
@@ -474,6 +553,7 @@ fn spawn_resolve(weak: std::sync::Weak<Inner>, client_id: String, symbol: String
                 Ok(order) if order.state != RuntimeOrderState::Unknown => {
                     let venue_order_id = order.venue_order_id.clone();
                     let event = VenueEvent::Order(order);
+                    let _writing = inner.writing();
                     if append(&inner.journal, JournalRecord::Venue { event: event.clone() }).await.is_err() {
                         inner.suspend(Suspension::Journal);
                         return;
@@ -642,6 +722,7 @@ fn spawn_venue_events(
                     }
                 }
                 let record = JournalRecord::Venue { event: event.clone() };
+                let _writing = inner.writing();
                 if append(&inner.journal, record).await.is_err() {
                     inner.suspend(Suspension::Journal);
                     continue;
@@ -701,7 +782,21 @@ impl std::fmt::Display for Suspension {
     }
 }
 
+/// Counts one book-changing journal write until it is applied to the book.
+struct Writing<'a>(&'a AtomicUsize);
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Inner {
+    fn writing(&self) -> Writing<'_> {
+        self.writing.fetch_add(1, Ordering::SeqCst);
+        Writing(&self.writing)
+    }
+
     fn suspend(&self, reason: Suspension) {
         if let Ok(mut set) = self.suspensions.lock() {
             set.insert(reason);

@@ -239,6 +239,35 @@ impl Journal {
         latched
     }
 
+    /// Execution watermarks as of the end of the journal: the latest
+    /// checkpoint's cursor, advanced by later cursor records and fills.
+    /// `None` without a checkpoint.
+    pub fn execution_cursor(&self) -> Option<BTreeMap<String, SymbolCursor>> {
+        let start = self
+            .records
+            .iter()
+            .rposition(|r| matches!(r.record, JournalRecord::Checkpoint { .. }))?;
+        let JournalRecord::Checkpoint { cursor, .. } = &self.records[start].record else {
+            return None;
+        };
+        let mut positions = cursor.clone();
+        for record in &self.records[start + 1..] {
+            match &record.record {
+                JournalRecord::Cursor { positions: saved } => positions = saved.clone(),
+                JournalRecord::Venue { event: VenueEvent::Trade(trade) } => {
+                    if let (Some(position), Ok(id)) =
+                        (positions.get_mut(&trade.key.symbol), trade.key.trade_id.parse::<i64>())
+                    {
+                        position.last_trade_id = Some(position.last_trade_id.map_or(id, |c| c.max(id)));
+                        position.start_time = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(positions)
+    }
+
     /// The sequence of the latest checkpoint, if any.
     pub fn latest_checkpoint(&self) -> Option<u64> {
         self.records

@@ -92,6 +92,8 @@ struct FakeVenue {
     /// Lookups find the order resting; otherwise they fail with a network error.
     lookup_finds: AtomicBool,
     lookups: AtomicUsize,
+    /// The runtime's venue stream, captured at subscribe.
+    stream: std::sync::Mutex<Option<mpsc::Sender<VenueEvent>>>,
     block: AtomicBool,
     gate: Arc<Notify>,
     started: Arc<Notify>,
@@ -106,6 +108,7 @@ impl FakeVenue {
             submit_unclear: AtomicBool::new(false),
             lookup_finds: AtomicBool::new(false),
             lookups: AtomicUsize::new(0),
+            stream: std::sync::Mutex::new(None),
             block: AtomicBool::new(false),
             gate: Arc::new(Notify::new()),
             started: Arc::new(Notify::new()),
@@ -171,7 +174,10 @@ impl RuntimeVenue for FakeVenue {
             original_time: chrono::Utc::now(),
         })
     }
-    async fn subscribe(&self, _: mpsc::Sender<VenueEvent>) -> Result<(), BrokerError> { Ok(()) }
+    async fn subscribe(&self, tx: mpsc::Sender<VenueEvent>) -> Result<(), BrokerError> {
+        *self.stream.lock().unwrap() = Some(tx);
+        Ok(())
+    }
 }
 
 fn intent(qty: f64) -> Intent {
@@ -597,4 +603,111 @@ async fn an_order_cancelled_before_send_is_released_and_survives_restart() {
     let (restarted, _venue) = start_in(&dir).await;
     assert_eq!(restarted.state().await, RuntimeState::Ready, "recovery is not stuck on the unsent order");
     assert_eq!(restarted.leaves(&submission.client_order_id).await, None);
+}
+
+/// A link whose OMS acknowledges every event batch as soon as it arrives.
+struct AckingLink {
+    control: tokio::sync::Mutex<mpsc::Receiver<Received<ToRuntime>>>,
+    acks: mpsc::Sender<Received<ToRuntime>>,
+}
+
+#[async_trait::async_trait]
+impl RuntimeLink for AckingLink {
+    async fn recv_control(&self) -> Option<Received<ToRuntime>> {
+        self.control.lock().await.recv().await
+    }
+    async fn send_events(&self, envelope: FromRuntimeEnvelope) -> Result<(), ProtocolError> {
+        if let FromRuntime::Events { batch } = &envelope.message {
+            let ack = colo_link::v2::EventAck { through_sequence: batch.last_sequence() };
+            let _ = self.acks.send(Received::new(ToRuntime::EventAck { ack }, Instant::now())).await;
+        }
+        Ok(())
+    }
+}
+
+fn fill(client_order_id: &str, trade_id: &str, quantity: f64) -> VenueEvent {
+    let id = identity();
+    VenueEvent::Trade(colo_runtime::Trade {
+        key: colo_runtime::TradeKey {
+            venue: id.venue,
+            account_id: id.account_id,
+            environment: id.environment,
+            symbol: "BTCUSDT".into(),
+            trade_id: trade_id.into(),
+        },
+        venue_order_id: "v-1".into(),
+        client_order_id: client_order_id.into(),
+        side: Side::Buy,
+        quantity,
+        price: 100.0,
+        executed_at: chrono::Utc::now(),
+        fee: None,
+        provenance: colo_runtime::TradeProvenance::Stream,
+    })
+}
+
+#[tokio::test]
+async fn the_journal_is_compacted_and_a_restart_keeps_position_and_open_order() {
+    let dir = TempDir::new().unwrap();
+    let venue = Arc::new(FakeVenue::new());
+    let (acks, control) = mpsc::channel(1024);
+    let link = Arc::new(AckingLink { control: tokio::sync::Mutex::new(control), acks });
+    let limit = 40_000;
+    let runtime = Runtime::start(
+        RuntimeConfig {
+            identity: identity(),
+            epoch: 1,
+            bootstrap: bootstrap(),
+            journal_path: dir.path().join("journal"),
+            max_journal_bytes: limit,
+            event_queue_capacity: 4096,
+            control_url: None,
+            events_url: None,
+            credential_reference: None,
+            link: Some(link),
+            session_nonce: "n1".into(),
+        },
+        venue.clone(),
+    )
+    .await
+    .unwrap();
+    runtime
+        .set_price("BTCUSDT", colo_runtime::InstrumentPrices::new(Some(100.0), Some(100.0), Some(100.0), Instant::now()))
+        .await;
+    let id = live_order(&runtime, &venue).await;
+    let stream = venue.stream.lock().unwrap().clone().expect("subscribed");
+    stream.send(fill(&id, "1", 0.4)).await.unwrap();
+    for _ in 0..200 {
+        if runtime.position("BTCUSDT").await == 0.4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(runtime.position("BTCUSDT").await, 0.4);
+
+    // Grow the journal well past half its limit with balance updates.
+    let balances = vec![AssetBalance { asset: "USDT".into(), free: 1_000.0, locked: 0.0 }];
+    let mut peak = 0;
+    for _ in 0..300 {
+        stream.send(VenueEvent::Balances { balances: balances.clone() }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        peak = peak.max(runtime.journal_bytes().await);
+    }
+    let mut compacted = false;
+    for _ in 0..300 {
+        if runtime.journal_bytes().await < limit / 2 {
+            compacted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(compacted, "journal never compacted (peak {peak} bytes)");
+    assert_eq!(runtime.position("BTCUSDT").await, 0.4);
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (restarted, _venue) = start_in(&dir).await;
+    assert_eq!(restarted.position("BTCUSDT").await, 0.4);
+    assert_eq!(restarted.leaves(&id).await, Some(0.6));
 }
