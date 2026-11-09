@@ -324,3 +324,70 @@ async fn a_retained_kill_latch_blocks_readiness() {
     assert!(!recovered.complete);
     assert!(recovered.evidence.iter().any(|e| e.contains("kill latch")));
 }
+
+fn history_fill(identity: &AccountIdentity, id: &str, qty: f64) -> ExecutionPage {
+    ExecutionPage {
+        trades: vec![trade(identity, "c-1", id, qty)],
+        next: ExecutionCursor::default(),
+        complete: true,
+        missing: vec![],
+    }
+}
+
+fn open_order_venue() -> FakeVenue {
+    FakeVenue::new(vec![order("c-1", 10.0, RuntimeOrderState::New)], balances())
+}
+
+#[tokio::test]
+async fn a_fill_found_in_history_survives_the_next_restart() {
+    let dir = TempDir::new().unwrap();
+    let (mut journal, identity) = journal_with_intent(&dir, "c-1");
+    let boot = bootstrap(&[("USDT", 1_000.0)], None);
+    let venue = open_order_venue().with_page(history_fill(&identity, "7", 4.0));
+    let first = colo_runtime::recover(&venue, &mut journal, &boot).await.unwrap();
+    assert_eq!(first.book.position("BTCUSDT"), 4.0);
+    drop(first);
+
+    // The venue's history has moved on: the fill is not served again.
+    let second = colo_runtime::recover(&open_order_venue(), &mut journal, &boot).await.unwrap();
+    assert_eq!(second.book.position("BTCUSDT"), 4.0, "the fill was only in memory");
+    assert_eq!(second.book.leaves("c-1"), Some(6.0));
+}
+
+#[tokio::test]
+async fn a_restart_after_compaction_keeps_positions_and_open_orders() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("journal");
+    let (mut journal, identity) = journal_with_intent(&dir, "c-1");
+    let boot = bootstrap(&[("USDT", 1_000.0)], None);
+    let venue = open_order_venue().with_page(history_fill(&identity, "7", 4.0));
+    let first = colo_runtime::recover(&venue, &mut journal, &boot).await.unwrap();
+    let committed = first.book.committed("USDT");
+    drop(first);
+    journal.ack_through(journal.last_sequence()).unwrap();
+    journal.compact().unwrap();
+    assert!(!journal.replay().unwrap().iter().any(|r| matches!(r.record, JournalRecord::Intent { .. })));
+    drop(journal);
+
+    let mut journal = Journal::open(&path, &identity).unwrap();
+    let second = colo_runtime::recover(&open_order_venue(), &mut journal, &boot).await.unwrap();
+    assert!(second.complete, "{:?}", second.evidence);
+    assert_eq!(second.book.position("BTCUSDT"), 4.0);
+    assert_eq!(second.book.leaves("c-1"), Some(6.0));
+    assert_eq!(second.book.committed("USDT"), committed);
+}
+
+#[tokio::test]
+async fn records_after_the_checkpoint_are_applied_once() {
+    let dir = TempDir::new().unwrap();
+    let (mut journal, identity) = journal_with_intent(&dir, "c-1");
+    let boot = bootstrap(&[("USDT", 1_000.0)], None);
+    let venue = open_order_venue().with_page(history_fill(&identity, "7", 4.0));
+    drop(colo_runtime::recover(&venue, &mut journal, &boot).await.unwrap());
+    journal
+        .append_durable(&JournalRecord::Venue { event: VenueEvent::Trade(trade(&identity, "c-1", "8", 2.0)) })
+        .unwrap();
+    let second = colo_runtime::recover(&open_order_venue(), &mut journal, &boot).await.unwrap();
+    assert_eq!(second.book.position("BTCUSDT"), 6.0);
+    assert_eq!(second.book.leaves("c-1"), Some(4.0));
+}

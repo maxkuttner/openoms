@@ -37,8 +37,19 @@ pub async fn recover(
         .validate()
         .map_err(|e| RuntimeError::IncompleteRecovery(e.to_string()))?;
 
-    let replay = journal.replay()?;
+    let all = journal.replay()?;
+    // Start from the latest checkpoint: it already holds everything before it.
+    let checkpoint = all.iter().rev().find_map(|r| match &r.record {
+        JournalRecord::Checkpoint { book, cursor } => Some((r.sequence, book.clone(), cursor.clone())),
+        _ => None,
+    });
+    let from = checkpoint.as_ref().map_or(0, |(sequence, ..)| *sequence);
+    let replay: Vec<_> = all.into_iter().filter(|r| r.sequence > from).collect();
+
     let mut cursor = bootstrap.baseline.execution_cursor.clone();
+    if let Some((_, _, positions)) = &checkpoint {
+        cursor.positions = positions.clone();
+    }
     if let Some(JournalRecord::Cursor { positions }) = replay
         .iter()
         .rev()
@@ -61,18 +72,22 @@ pub async fn recover(
 
     let mut book = Book::new(journal.identity().clone(), bootstrap.limits.clone())?;
     book.install_instruments(bootstrap.instruments.clone())?;
-    let opening: Vec<AssetBalance> = bootstrap
-        .asset_baseline
-        .iter()
-        .map(|(asset, quantity)| AssetBalance {
-            asset: asset.clone(),
-            free: *quantity,
-            locked: 0.0,
-        })
-        .collect();
-    book.install_balances(&opening);
-    for (symbol, quantity) in &bootstrap.baseline.positions {
-        book.install_position(symbol.clone(), *quantity)?;
+    if let Some((_, saved, _)) = &checkpoint {
+        book.restore_checkpoint(saved)?;
+    } else {
+        let opening: Vec<AssetBalance> = bootstrap
+            .asset_baseline
+            .iter()
+            .map(|(asset, quantity)| AssetBalance {
+                asset: asset.clone(),
+                free: *quantity,
+                locked: 0.0,
+            })
+            .collect();
+        book.install_balances(&opening);
+        for (symbol, quantity) in &bootstrap.baseline.positions {
+            book.install_position(symbol.clone(), *quantity)?;
+        }
     }
     for record in &replay {
         match &record.record {
@@ -96,9 +111,11 @@ pub async fn recover(
         .map_err(|e| RuntimeError::IncompleteRecovery(format!("stream not established: {e}")))?;
 
     reconcile_history(venue, &mut book, &mut cursor).await?;
-    let has_trades = replay.iter().any(|r| {
-        matches!(&r.record, JournalRecord::Venue { event: VenueEvent::Trade(_) })
-    });
+    // The opening inventory only describes an account nothing has traded on.
+    let has_trades = checkpoint.is_some()
+        || replay.iter().any(|r| {
+            matches!(&r.record, JournalRecord::Venue { event: VenueEvent::Trade(_) })
+        });
 
     let mut stable = false;
     let mut last_orders: Option<Vec<RuntimeOrder>> = None;
@@ -166,7 +183,13 @@ pub async fn recover(
         evidence.push(format!("kill latch retained from epoch {killed}"));
     }
     let complete = evidence.is_empty();
-    journal.append_durable(&JournalRecord::Cursor { positions: cursor.positions.clone() })?;
+    // Fills found in history or on the stream during recovery were applied
+    // to the book but never journalled; the checkpoint makes them durable
+    // before the cursor moves past them.
+    journal.append_durable(&JournalRecord::Checkpoint {
+        book: book.checkpoint(),
+        cursor: cursor.positions.clone(),
+    })?;
     Ok(RecoveredBook { book, events: rx, execution_cursor: cursor, balances, orders, evidence, complete })
 }
 
