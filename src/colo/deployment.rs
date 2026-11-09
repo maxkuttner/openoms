@@ -816,6 +816,42 @@ pub async fn apply_command(
     })
 }
 
+/// The runtime should report a kill's admission stopped this soon, as the
+/// v1 link must acknowledge one.
+pub const KILL_STOPPED_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+/// And confirm nothing rests at the venue this soon. Longer: cancels go
+/// through the venue, which the spec says cannot be guaranteed within 5 s.
+pub const KILL_CLEAR_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a kill sent `age` ago is overdue at its acknowledged `stage`.
+pub fn kill_stalled(stage: Option<&str>, age: std::time::Duration) -> bool {
+    let stopped = matches!(stage, Some("ADMISSION_STOPPED" | "CANCELS_SENT" | "CONFIRMED_CLEAR"));
+    let clear = stage == Some("CONFIRMED_CLEAR");
+    (!stopped && age > KILL_STOPPED_WITHIN) || (!clear && age > KILL_CLEAR_WITHIN)
+}
+
+/// Strategies whose active deployment holds a kill the runtime has not
+/// acknowledged in time (see `kill_stalled`).
+pub async fn stalled_kills(pool: &PgPool) -> Result<std::collections::HashSet<String>, DeploymentError> {
+    let rows = sqlx::query(
+        "SELECT d.strategy_code, c.ack_stage, \
+                EXTRACT(EPOCH FROM (now() - c.created_at))::double precision AS age_secs \
+         FROM colo_deployment d JOIN colo_deployment_command c ON c.command_id = d.kill_command_id \
+         WHERE d.status = 'ACTIVE' AND d.kill_epoch IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            let age = std::time::Duration::from_secs_f64(row.get::<f64, _>("age_secs").max(0.0));
+            kill_stalled(row.get::<Option<String>, _>("ack_stage").as_deref(), age)
+        })
+        .map(|row| row.get::<String, _>("strategy_code"))
+        .collect())
+}
+
 /// Records a kill/enable acknowledgement stage. Matches the command exactly
 /// (deployment, command id and epoch) and only moves the stage forward, so a
 /// late or replayed acknowledgement cannot undo a later one. Returns whether
@@ -1369,6 +1405,19 @@ mod tests {
     }
 
     #[test]
+    fn a_kill_must_stop_admission_fast_and_clear_within_half_a_minute() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert!(!kill_stalled(None, s(4)), "still within its first 5 s");
+        assert!(kill_stalled(None, s(6)));
+        assert!(kill_stalled(Some("RECEIVED"), s(6)), "received is not stopped");
+        assert!(!kill_stalled(Some("ADMISSION_STOPPED"), s(20)));
+        assert!(!kill_stalled(Some("CANCELS_SENT"), s(29)));
+        assert!(kill_stalled(Some("CANCELS_SENT"), s(31)), "orders may still rest");
+        assert!(!kill_stalled(Some("CONFIRMED_CLEAR"), s(3_600)));
+    }
+
+    #[test]
     fn acknowledgement_must_match_command_and_epoch_exactly() {
         let command = command("kill-1", 7);
         let receipt = CommandReceipt {
@@ -1620,14 +1669,23 @@ mod tests {
             get_deployment(&pool, &deployment.strategy_code, deployment.id).await.unwrap().kill_ack_stage
         };
         assert_eq!(stage().await, None);
+        assert!(!stalled_kills(&pool).await.unwrap().contains(&deployment.strategy_code), "just sent");
+        sqlx::query("UPDATE colo_deployment_command SET created_at = now() - interval '60 seconds' WHERE command_id = $1")
+            .bind(&kill_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(stalled_kills(&pool).await.unwrap().contains(&deployment.strategy_code), "unacknowledged for a minute");
         assert!(record_control_ack(&pool, deployment.id, session.epoch, &kill_id, CancelsSent).await.unwrap());
         assert_eq!(stage().await.as_deref(), Some("CANCELS_SENT"));
         assert!(!record_control_ack(&pool, deployment.id, session.epoch, &kill_id, Received).await.unwrap(), "late ACK");
         assert!(!record_control_ack(&pool, deployment.id, session.epoch - 1, &kill_id, ConfirmedClear).await.unwrap(), "stale epoch");
         assert!(!record_control_ack(&pool, deployment.id, session.epoch, "kill-other", ConfirmedClear).await.unwrap());
         assert_eq!(stage().await.as_deref(), Some("CANCELS_SENT"));
+        assert!(stalled_kills(&pool).await.unwrap().contains(&deployment.strategy_code), "not clear after a minute");
         assert!(record_control_ack(&pool, deployment.id, session.epoch, &kill_id, ConfirmedClear).await.unwrap());
         assert_eq!(stage().await.as_deref(), Some("CONFIRMED_CLEAR"));
+        assert!(!stalled_kills(&pool).await.unwrap().contains(&deployment.strategy_code));
 
         let published = deployment.policy_revision as u64;
         record_policy_ack(&pool, deployment.id, published + 5).await.unwrap();

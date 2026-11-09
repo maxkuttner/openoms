@@ -226,6 +226,14 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
         .fetch_all(state.pool())
         .await
         .map_err(map_db_error)?;
+    // v2 deployments report kill stages to the database, not the hub.
+    let stalled = match crate::colo::deployment::stalled_kills(state.pool()).await {
+        Ok(stalled) => stalled,
+        Err(e) => {
+            tracing::warn!(error = %e, "strategies: could not check deployment kill acknowledgements");
+            Default::default()
+        }
+    };
     for row in &mut rows {
         row.session_live = state.fix_sessions().is_live(&row.code);
         if row.mode == "COLOCATED" {
@@ -240,7 +248,8 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
             row.cancelled_per_min = flow.cancelled as i64;
             row.alarm = hub.alarm(&row.code);
             row.fighting = hub.fighting(&row.code);
-            row.kill_ack_late = row.state == "HALTED" && hub.kill_ack_late(&row.code);
+            row.kill_ack_late =
+                (row.state == "HALTED" && hub.kill_ack_late(&row.code)) || stalled.contains(&row.code);
         }
     }
     Ok(Json(rows))
