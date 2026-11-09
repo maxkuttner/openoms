@@ -47,6 +47,10 @@ fn pct_encode(s: &str) -> String {
         .collect()
 }
 
+/// Binance refuses a signed request that arrives later than this after its
+/// `timestamp`, so a lost submit cannot be accepted after it.
+pub const RECV_WINDOW_MS: u64 = 5_000;
+
 /// A Binance Ed25519 API key, plus the FIX session it uses when the transport is FIX
 /// (REST ignores the session fields).
 /// Stored as `{"kind":"BinanceFix", …}` (see [`crate::credentials::BrokerCredentials`]).
@@ -108,7 +112,7 @@ impl BinanceAdapter {
         base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
     }
 
-    /// Send a SIGNED request: append `timestamp`, sign the query, append the
+    /// Send a SIGNED request: append `recvWindow` and `timestamp`, sign the query, append the
     /// signature, attach the API-key header. Params values here (symbols, numeric
     /// quantities, UUID client ids) contain no characters needing URL-encoding.
     pub(crate) async fn signed(
@@ -126,7 +130,7 @@ impl BinanceAdapter {
         if !query.is_empty() {
             query.push('&');
         }
-        query.push_str(&format!("timestamp={ts}"));
+        query.push_str(&format!("recvWindow={RECV_WINDOW_MS}&timestamp={ts}"));
         // The base64 Ed25519 signature can contain +, /, = — percent-encode it so
         // it survives the query string intact.
         let signature = pct_encode(&self.sign(&query));

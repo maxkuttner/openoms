@@ -26,6 +26,9 @@ pub struct RecoveredBook {
     /// acknowledging recovery.
     pub evidence: Vec<String>,
     pub complete: bool,
+    /// Pending orders the venue has no record of yet, as (client id, symbol),
+    /// left for the runtime to settle once the venue's submit window passes.
+    pub unclear: Vec<(String, String)>,
 }
 
 pub async fn recover(
@@ -160,6 +163,10 @@ pub async fn recover(
     book.check_inventory(&balances, true);
 
     let mut evidence = Vec::new();
+    let mut unclear = Vec::new();
+    // Any send happened before this restart, so a venue with a submit window
+    // can settle these by lookup once it has passed.
+    let settles_later = venue.submit_window().is_some();
     for client_id in book.pending_client_ids() {
         if orders.iter().any(|o| o.client_order_id == client_id) {
             continue;
@@ -176,6 +183,7 @@ pub async fn recover(
                 book.apply(&VenueEvent::Order(order))?;
             }
             Err(BrokerError::NoSuchOrder(_)) if history_has_trade => {}
+            Err(_) if settles_later => unclear.push((client_id.clone(), symbol.to_string())),
             Err(BrokerError::NoSuchOrder(_)) => {
                 evidence.push(format!("pending order {client_id} has no venue evidence"));
             }
@@ -196,7 +204,7 @@ pub async fn recover(
         book: book.checkpoint(),
         cursor: cursor.positions.clone(),
     })?;
-    Ok(RecoveredBook { book, events: rx, execution_cursor: cursor, balances, orders, evidence, complete })
+    Ok(RecoveredBook { book, events: rx, execution_cursor: cursor, balances, orders, evidence, complete, unclear })
 }
 
 async fn reconcile_history(

@@ -94,7 +94,7 @@ impl Runtime {
         }
         let journal_killed = journal.kill_latched();
         let recovered = recover(&*venue, &mut journal, &config.bootstrap).await?;
-        let RecoveredBook { mut book, events, complete: recovered_ok, evidence, execution_cursor, .. } = recovered;
+        let RecoveredBook { mut book, events, complete: recovered_ok, evidence, execution_cursor, unclear, .. } = recovered;
         book.restore_sequence(journal.last_sequence());
         book.set_journal_id(journal.id());
         book.install_policy(
@@ -200,6 +200,11 @@ impl Runtime {
             _ => Vec::new(),
         };
         inner.raise_drift(&*inner.core.lock().await);
+        let restarted = Instant::now();
+        for (client_id, symbol) in unclear {
+            inner.suspend(Suspension::UnclearOrder(client_id.clone()));
+            spawn_resolve(Arc::downgrade(&inner), client_id, symbol, restarted);
+        }
         link_tasks.push(spawn_compaction(Arc::downgrade(&inner)));
         link_tasks.push(spawn_balance_poll(Arc::downgrade(&inner)));
         Ok(Self {
@@ -293,6 +298,7 @@ impl Runtime {
                 return;
             }
             let result = inner.venue.submit_order(&request).await;
+            let returned_at = Instant::now();
             let (state, venue_id, outcome) = match result {
                 Ok(response) => {
                     let venue_order_id = response.external_order_id.clone();
@@ -351,6 +357,7 @@ impl Runtime {
                     Arc::downgrade(&inner),
                     task_submission.client_order_id.clone(),
                     intent.instrument.clone(),
+                    returned_at,
                 );
             }
             inner.push_event(RuntimeEvent::SubmitOutcome {
@@ -621,6 +628,8 @@ async fn checkpoint_and_compact(inner: &Arc<Inner>) -> Result<bool, RuntimeError
 }
 
 /// First lookup delay for an order whose submit answer was lost.
+/// Two "no such order" answers this far apart, against read lag at the venue.
+const NO_SUCH_ORDER_SPAN: std::time::Duration = std::time::Duration::from_secs(1);
 const RESOLVE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 /// Lookups never back off further than this.
 const RESOLVE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
@@ -629,12 +638,39 @@ const RESOLVE_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(
 /// records it and lifts that order's suspension. "No such order" is not taken
 /// as proof it was never placed: the venue may not show it yet, so the
 /// runtime keeps looking and stays stopped.
-fn spawn_resolve(weak: std::sync::Weak<Inner>, client_id: String, symbol: String) {
+/// Looks up an order whose submit answer was lost until the venue settles
+/// it. "No such order" is final only once the venue's submit window after
+/// `sent_by` has passed, on two lookups at least `NO_SUCH_ORDER_SPAN` apart,
+/// with the order absent from the open orders: the request can then never be
+/// accepted, so the order is abandoned and its reservation released.
+fn spawn_resolve(weak: std::sync::Weak<Inner>, client_id: String, symbol: String, sent_by: Instant) {
     tokio::spawn(async move {
         let mut delay = RESOLVE_BACKOFF;
+        let mut first_miss: Option<Instant> = None;
         loop {
             let Some(inner) = weak.upgrade() else { return };
-            match inner.venue.lookup(&client_id, &symbol).await {
+            let deadline = inner.venue.submit_window().map(|window| sent_by + window);
+            let lookup = inner.venue.lookup(&client_id, &symbol).await;
+            let past_window = deadline.is_some_and(|d| Instant::now() >= d);
+            if !(past_window && matches!(lookup, Err(BrokerError::NoSuchOrder(_)))) {
+                first_miss = None;
+            }
+            match lookup {
+                Err(BrokerError::NoSuchOrder(_)) if past_window => {
+                    let first = *first_miss.get_or_insert_with(Instant::now);
+                    if first.elapsed() >= NO_SUCH_ORDER_SPAN {
+                        match inner.venue.snapshot_orders().await {
+                            Ok(open) if !open.iter().any(|o| o.client_order_id == client_id) => {
+                                abandon(&inner, &client_id, "the venue never accepted it").await;
+                                inner.lift(&Suspension::UnclearOrder(client_id.clone()));
+                                tracing::info!(client_order_id = %client_id, "runtime: unclear order never reached the venue; abandoned");
+                                return;
+                            }
+                            Ok(_) => first_miss = None,
+                            Err(e) => tracing::warn!(error = %e, "runtime: open orders unavailable to settle an unclear order"),
+                        }
+                    }
+                }
                 Ok(order) if order.state != RuntimeOrderState::Unknown => {
                     let venue_order_id = order.venue_order_id.clone();
                     let event = VenueEvent::Order(order);

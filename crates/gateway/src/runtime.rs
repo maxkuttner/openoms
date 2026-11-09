@@ -318,6 +318,12 @@ pub trait RuntimeVenue: BrokerAdapter {
     /// Establish the push stream. Events, including health after the initial
     /// connection, arrive on `tx`; a closed receiver ends the stream.
     async fn subscribe(&self, tx: mpsc::Sender<VenueEvent>) -> Result<(), BrokerError>;
+    /// How long after a submit call returns the venue could still accept that
+    /// request, clock-skew margin included. Past it, a lookup's "no such order"
+    /// is final. `None`: the venue gives no such bound.
+    fn submit_window(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 #[cfg(test)]

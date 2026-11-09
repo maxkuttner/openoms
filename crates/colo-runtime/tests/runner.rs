@@ -93,6 +93,10 @@ struct FakeVenue {
     /// Lookups find the order resting; otherwise they fail with a network error.
     lookup_finds: AtomicBool,
     lookups: AtomicUsize,
+    /// Lookups answer "no such order" instead of timing out.
+    lookup_missing: AtomicBool,
+    /// Submit window in ms; 0 means the venue gives none.
+    window_ms: std::sync::atomic::AtomicU64,
     /// The runtime's venue stream, captured at subscribe.
     stream: std::sync::Mutex<Option<mpsc::Sender<VenueEvent>>>,
     /// Fills the venue's history serves once, after recovery.
@@ -113,6 +117,8 @@ impl FakeVenue {
             submit_unclear: AtomicBool::new(false),
             lookup_finds: AtomicBool::new(false),
             lookups: AtomicUsize::new(0),
+            lookup_missing: AtomicBool::new(false),
+            window_ms: std::sync::atomic::AtomicU64::new(0),
             stream: std::sync::Mutex::new(None),
             history: std::sync::Mutex::new(Vec::new()),
             history_fails: AtomicBool::new(false),
@@ -172,6 +178,9 @@ impl RuntimeVenue for FakeVenue {
     async fn lookup(&self, client_order_id: &str, symbol: &str) -> Result<colo_runtime::RuntimeOrder, BrokerError> {
         self.lookups.fetch_add(1, Ordering::SeqCst);
         if !self.lookup_finds.load(Ordering::SeqCst) {
+            if self.lookup_missing.load(Ordering::SeqCst) {
+                return Err(BrokerError::NoSuchOrder("fake".into()));
+            }
             return Err(BrokerError::Network("lookup timed out".into()));
         }
         Ok(colo_runtime::RuntimeOrder {
@@ -190,6 +199,12 @@ impl RuntimeVenue for FakeVenue {
     async fn subscribe(&self, tx: mpsc::Sender<VenueEvent>) -> Result<(), BrokerError> {
         *self.stream.lock().unwrap() = Some(tx);
         Ok(())
+    }
+    fn submit_window(&self) -> Option<Duration> {
+        match self.window_ms.load(Ordering::SeqCst) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
     }
 }
 
@@ -1016,4 +1031,45 @@ async fn a_single_short_snapshot_does_not_stop_orders() {
     assert!(inventory_reports(&link).is_empty());
     assert!(submit_allowed(&runtime).await);
     runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_such_order_inside_the_submit_window_keeps_admission_stopped() {
+    let (runtime, venue, _dir) = start().await;
+    venue.window_ms.store(60_000, Ordering::SeqCst);
+    venue.lookup_missing.store(true, Ordering::SeqCst);
+    unclear_submit(&runtime, &venue).await;
+    wait_for("retried lookups", || venue.lookups.load(Ordering::SeqCst) >= 3).await;
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(matches!(runtime.submit(intent(1.0)).await, Err(colo_runtime::RuntimeError::NotReady(_))));
+}
+
+#[tokio::test]
+async fn no_such_order_without_a_venue_window_keeps_admission_stopped() {
+    let (runtime, venue, _dir) = start().await;
+    venue.lookup_missing.store(true, Ordering::SeqCst);
+    unclear_submit(&runtime, &venue).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(matches!(runtime.submit(intent(1.0)).await, Err(colo_runtime::RuntimeError::NotReady(_))));
+}
+
+#[tokio::test]
+async fn no_such_order_after_the_submit_window_abandons_the_order() {
+    let (runtime, venue, _dir) = start().await;
+    venue.window_ms.store(50, Ordering::SeqCst);
+    venue.lookup_missing.store(true, Ordering::SeqCst);
+    grant(&runtime).await;
+    venue.submit_unclear.store(true, Ordering::SeqCst);
+    let lost = runtime.submit(intent(1.0)).await.unwrap();
+    wait_for("venue submit", || venue.submitted.load(Ordering::SeqCst) == 1).await;
+    let mut reopened = false;
+    for _ in 0..300 {
+        if runtime.submit(intent(1.0)).await.is_ok() {
+            reopened = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reopened, "admission reopens once the order provably never existed");
+    assert_eq!(runtime.leaves(&lost.client_order_id).await, None, "the lost order is closed");
 }

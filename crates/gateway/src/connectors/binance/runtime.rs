@@ -88,6 +88,11 @@ impl BrokerAdapter for BinanceRuntimeVenue {
 
 #[async_trait::async_trait]
 impl RuntimeVenue for BinanceRuntimeVenue {
+    /// `recvWindow` plus 5 s for skew between this clock and Binance's.
+    fn submit_window(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(super::adapter::RECV_WINDOW_MS + 5_000))
+    }
+
     async fn metadata(&self, symbols: &[String]) -> Result<Vec<InstrumentRules>, BrokerError> {
         let instruments = self.adapter.list_spot_instruments().await?;
         Ok(instruments
