@@ -13,11 +13,14 @@
 # ~/.config/openoms/binance-testnet): ed25519-private.pem and api-key. Keys
 # stay in those files; they are passed to the OMS and the market maker only.
 #
-# State lives in $COLO_DEMO_DIR (default ./colo-demo); nothing else is changed.
+# State lives in $COLO_DEMO_DIR (default ~/.local/state/openoms/colo-demo);
+# nothing else is changed.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-DIR=${COLO_DEMO_DIR:-$ROOT/colo-demo}
+# Outside the checkout: the OMS loads the nearest .env up the tree, and a
+# checkout's .env points at the developer's own database.
+DIR=${COLO_DEMO_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/openoms/colo-demo}
 KEYS=${COLO_DEMO_KEYS:-$HOME/.config/openoms/binance-testnet}
 PG=oms-colo-demo-pg
 PG_PORT=${COLO_DEMO_PG_PORT:-55441}
@@ -86,6 +89,7 @@ open(conf, "w").write(s)
 PY
 
   echo "starting the OMS (http://$HTTP/cockpit/)…"
+  cd "$DIR"
   OMS_CONFIG="$DIR/oms.toml" nohup "$ROOT/target/debug/oms" </dev/null >"$DIR/oms.log" 2>&1 &
   echo $! > "$DIR/oms.pid"
   i=0; until curl -s "http://$HTTP/health" 2>/dev/null | grep -q OK; do
@@ -121,6 +125,7 @@ mm() {
   acc=$(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['account'])" "$DIR/ids.json")
   tok=$(python3 -I -c "import json,sys;print(json.load(open(sys.argv[1]))['token'])" "$DIR/token.json")
   mkdir -p "$DIR/journal"
+  cd "$DIR"
   BINANCE_API_KEY="$(cat "$KEYS/api-key")" BINANCE_PRIVATE_KEY="$(cat "$KEYS/ed25519-private.pem")" \
     nohup "$ROOT/target/debug/colo-example" --oms-url "wss://localhost:$LINK_PORT" --deployment "$dep" \
       --token "$tok" --account-id "$acc" --account-ref testnet-mm1 --ca "$DIR/link.pem" \
@@ -146,5 +151,5 @@ case "${1:-}" in
   mm) shift; mm "$@" ;;
   stop-mm) stop_mm ;;
   down) down ;;
-  *) sed -n '2,16p' "$0"; exit 2 ;;
+  *) sed -n '2,17p' "$0"; exit 2 ;;
 esac
