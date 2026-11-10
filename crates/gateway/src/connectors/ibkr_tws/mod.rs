@@ -1,5 +1,5 @@
-pub mod gateway;
 pub mod exchanges;
+pub mod gateway;
 
 use futures_util::future::BoxFuture;
 
