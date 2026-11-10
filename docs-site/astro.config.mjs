@@ -15,7 +15,7 @@ export default defineConfig({
       favicon: "/favicon.svg",
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/maxkuttner/openoms" }],
       editLink: { baseUrl: "https://github.com/maxkuttner/openoms/edit/main/docs-site/" },
-      customCss: ["./src/styles/theme.css"],
+      customCss: ["@fontsource-variable/geist", "@fontsource-variable/geist-mono", "./src/styles/theme.css"],
       components: { Header: "./src/components/Header.astro" },
       plugins: [
         // Generated from the committed spec — never hand-written, so it cannot
