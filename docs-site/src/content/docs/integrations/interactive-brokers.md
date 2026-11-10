@@ -30,16 +30,16 @@ restart it picks the running container up again instead of starting a new one. T
 password is handed to the container through a short-lived file and is never put on a
 command line or in a log.
 
-The connection shows its state:
+The connection's status shows `connecting`, `live` or `down`. While it is `down` or
+`connecting`, the message beside it says why:
 
-| State | Meaning |
+| Status message | Meaning |
 |---|---|
-| Starting | The container is up and logging in. |
-| Awaiting 2FA | Live accounts only. Approve the login in the IBKR Mobile app. IBKR asks again about once a week. |
-| Login failed | IBKR rejected the username or password. The OMS stops retrying, so it does not lock your account. Fix the password in the credentials drawer, then restart the connection. |
-| Docker unavailable | The OMS can't reach Docker. It keeps retrying until Docker is back. |
-| Connected | Ready to trade. |
-| Disconnected | The gateway dropped; the OMS reconnects. |
+| IB Gateway is starting | The container is up and logging in. |
+| waiting for two-factor approval on the IBKR mobile app | Approve the login in the IBKR Mobile app. IBKR normally requires this for live logins, and asks again about once a week. |
+| IBKR login failed: ... | IBKR rejected the username or password. The OMS stops retrying, so it does not lock your account. Fix the password in the credentials drawer, then restart the OMS. |
+| Docker is required for IBKR_TWS but is not running | The OMS can't reach Docker. It keeps retrying until Docker is back. |
+| IB Gateway is disconnected, or IB Gateway lost its connection to IBKR | The gateway dropped; the OMS reconnects. |
 
 ### Instruments
 
@@ -120,7 +120,6 @@ Commissions are logged but not yet booked into P&L.
   never queued.
 
 ## FIX session (experimental)
-
 
 The OMS can run a FIX order-entry session to Interactive Brokers, using the QuickFIX
 engine built into the binary. QuickFIX handles logon, heartbeats, sequence numbers,
