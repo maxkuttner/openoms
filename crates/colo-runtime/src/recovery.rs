@@ -117,6 +117,15 @@ pub async fn recover(
         .await
         .map_err(|e| RuntimeError::IncompleteRecovery(format!("stream not established: {e}")))?;
 
+    // A crash between send and answer leaves an order without its venue id,
+    // and history fills carry only that id. Learn it first, so the fill
+    // matches; whatever a lookup cannot settle is handled after the snapshots.
+    for client_id in book.pending_client_ids() {
+        let Some(symbol) = book.order_symbol(&client_id).map(str::to_string) else { continue };
+        if let Ok(order) = venue.lookup(&client_id, &symbol).await {
+            book.apply(&VenueEvent::Order(order))?;
+        }
+    }
     reconcile_history(venue, &mut book, &mut cursor).await?;
     // The opening inventory only describes an account nothing has traded on.
     let has_trades = checkpoint.is_some()

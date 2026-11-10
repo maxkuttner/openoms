@@ -84,6 +84,8 @@ struct FakeVenue {
     pages: Mutex<VecDeque<ExecutionPage>>,
     stream: Mutex<Vec<VenueEvent>>,
     fail_orders: bool,
+    /// What a lookup by client id finds; `None` answers "no such order".
+    found: Mutex<Option<RuntimeOrder>>,
 }
 
 impl FakeVenue {
@@ -94,6 +96,7 @@ impl FakeVenue {
             pages: Mutex::new(VecDeque::new()),
             stream: Mutex::new(Vec::new()),
             fail_orders: false,
+            found: Mutex::new(None),
         }
     }
 
@@ -142,7 +145,7 @@ impl RuntimeVenue for FakeVenue {
         }))
     }
     async fn lookup(&self, _: &str, _: &str) -> Result<RuntimeOrder, BrokerError> {
-        Err(BrokerError::NoSuchOrder("absent".into()))
+        self.found.lock().unwrap().clone().ok_or_else(|| BrokerError::NoSuchOrder("absent".into()))
     }
     async fn subscribe(&self, tx: mpsc::Sender<VenueEvent>) -> Result<(), BrokerError> {
         let events: Vec<VenueEvent> = self.stream.lock().unwrap().drain(..).collect();
@@ -390,4 +393,24 @@ async fn records_after_the_checkpoint_are_applied_once() {
     let second = colo_runtime::recover(&open_order_venue(), &mut journal, &boot).await.unwrap();
     assert_eq!(second.book.position("BTCUSDT"), 6.0);
     assert_eq!(second.book.leaves("c-1"), Some(4.0));
+}
+
+#[tokio::test]
+async fn a_crash_before_the_submit_answer_still_matches_the_history_fill() {
+    // The intent was journalled and sent; the process died before the venue
+    // answered, so the book has no venue id. The order filled at once.
+    let dir = TempDir::new().unwrap();
+    let (mut journal, identity) = journal_with_intent(&dir, "c-1");
+    let mut fill = trade(&identity, "", "7", 10.0);
+    fill.venue_order_id = "v-1".into();
+    let page = ExecutionPage { trades: vec![fill], next: ExecutionCursor::default(), complete: true, missing: vec![] };
+    let venue = FakeVenue::new(vec![], balances()).with_page(page);
+    let mut filled = order("c-1", 0.0, RuntimeOrderState::Filled);
+    filled.executed_quantity = 10.0;
+    *venue.found.lock().unwrap() = Some(filled);
+    let recovered = colo_runtime::recover(&venue, &mut journal, &bootstrap(&[("USDT", 1_000.0)], None))
+        .await
+        .expect("history fill matched through the looked-up venue id");
+    assert_eq!(recovered.book.position("BTCUSDT"), 10.0);
+    assert!(recovered.complete, "{:?}", recovered.evidence);
 }
