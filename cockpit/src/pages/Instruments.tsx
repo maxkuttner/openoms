@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { Anchor, Group, Table, Text, TextInput, Title, Badge, Loader } from "@mantine/core";
+import { Anchor, Button, Group, Table, Text, TextInput, Title, Badge, Loader } from "@mantine/core";
 import { Link as RouterLink } from "react-router-dom";
 import { useDebouncedValue } from "@mantine/hooks";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { InstrumentSummary } from "../api/types";
+import type { BrokerConnection, InstrumentSummary } from "../api/types";
+import { IbkrImport } from "../components/IbkrImport";
 
 // Read-only browser over the seeded master catalog. Instruments are seeded
 // broker-first (a universe load per broker connection); pricing coverage is derived per feed at
@@ -13,6 +14,12 @@ import type { InstrumentSummary } from "../api/types";
 export function InstrumentsPage() {
   const [search, setSearch] = useState("");
   const [debounced] = useDebouncedValue(search, 250);
+  const [importing, setImporting] = useState(false);
+  const { data: connections } = useQuery<BrokerConnection[]>({
+    queryKey: ["/admin/broker-connections"],
+    queryFn: () => api.get<BrokerConnection[]>("/admin/broker-connections"),
+  });
+  const ibkrEnvs = (connections ?? []).filter((c) => c.broker_code === "IBKR_TWS").map((c) => c.environment);
   const { data, isLoading, error } = useQuery<InstrumentSummary[]>({
     queryKey: ["/admin/instruments", debounced],
     queryFn: () =>
@@ -25,7 +32,10 @@ export function InstrumentsPage() {
     <>
       <Group justify="space-between" mb="md">
         <Title order={3}>Instruments</Title>
-        {isLoading && <Loader size="sm" />}
+        <Group>
+          {isLoading && <Loader size="sm" />}
+          {ibkrEnvs.length > 0 && <Button onClick={() => setImporting(true)}>Import from IBKR</Button>}
+        </Group>
       </Group>
       <Text size="sm" c="dimmed" mb="md">
         Loaded from each broker's catalog — see the instrument universe on Broker connections. Which
@@ -78,6 +88,7 @@ export function InstrumentsPage() {
           )}
         </Table.Tbody>
       </Table>
+      {importing && ibkrEnvs.length > 0 && <IbkrImport envs={ibkrEnvs} onClose={() => setImporting(false)} />}
     </>
   );
 }
