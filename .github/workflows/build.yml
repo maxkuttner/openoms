@@ -76,6 +76,7 @@ jobs:
       - name: database-backed tests
         env:
           OMS_RELOAD_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          COLO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ods
         run: cargo test -- --ignored
 
   cockpit:
