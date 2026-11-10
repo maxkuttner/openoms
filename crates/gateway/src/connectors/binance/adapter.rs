@@ -293,7 +293,7 @@ impl BrokerAdapter for BinanceAdapter {
         if resp.status().is_success() {
             Ok(())
         } else {
-            Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()))
+            Err(cancel_error(resp.text().await.unwrap_or_default()))
         }
     }
 
@@ -424,6 +424,16 @@ pub(crate) fn submit_error(status: u16, body: String) -> BrokerError {
         BrokerError::Network(body)
     } else {
         crate::adapter::http_failure(status, body)
+    }
+}
+
+/// A failed cancel: Binance's -2011 ("Unknown order sent") means no open order
+/// has that id any more: it filled, was cancelled, or never existed.
+pub(crate) fn cancel_error(body: String) -> BrokerError {
+    if body.contains("\"code\":-2011") {
+        BrokerError::NoSuchOrder(body)
+    } else {
+        BrokerError::BrokerRejected(body)
     }
 }
 
@@ -590,6 +600,8 @@ mod tests {
     #[test]
     fn an_unknown_order_is_no_such_order() {
         assert!(matches!(lookup_error(r#"{"code":-2013,"msg":"Order does not exist."}"#.into()), BrokerError::NoSuchOrder(_)));
+        assert!(matches!(cancel_error(r#"{"code":-2011,"msg":"Unknown order sent."}"#.into()), BrokerError::NoSuchOrder(_)));
+        assert!(matches!(cancel_error(r#"{"code":-1021,"msg":"Timestamp outside recvWindow."}"#.into()), BrokerError::BrokerRejected(_)));
         assert!(matches!(lookup_error(r#"{"code":-1021,"msg":"Timestamp"}"#.into()), BrokerError::BrokerRejected(_)));
     }
 
