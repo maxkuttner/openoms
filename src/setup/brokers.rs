@@ -148,9 +148,16 @@ pub struct Args {
     /// success is how a seeding gap survives to become a missing price.
     #[arg(long)]
     pub allow_skips: bool,
+    /// IBKR_TWS only: a CSV (`symbol,exchange,currency,conid`) of instruments to
+    /// import through the running OMS, which must be connected to IB Gateway.
+    #[arg(long, value_name = "FILE")]
+    pub symbols: Option<std::path::PathBuf>,
 }
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = &args.symbols {
+        return crate::instruments_import::run_cli(path, args.broker).await;
+    }
     let pool = PgPool::connect(&super::database_url()?).await?;
     let provider = provider_for(&pool, args.broker).await?;
 
@@ -270,7 +277,7 @@ pub struct LoadOptions {
 }
 
 /// What a universe load did, as stored on its job and shown in the cockpit.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct UniverseLoadReport {
     pub fetched: usize,
     pub upserted: usize,

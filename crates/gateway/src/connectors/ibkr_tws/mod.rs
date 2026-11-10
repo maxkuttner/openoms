@@ -2,10 +2,12 @@ pub mod adapter;
 pub mod client;
 pub mod exchanges;
 pub mod gateway;
+pub mod resolve;
 pub mod stream;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::future::BoxFuture;
 
@@ -18,6 +20,30 @@ use crate::verify::TestOutcome;
 use super::{typed, Connected, Connector, Manifest, QuoteScope};
 
 pub struct IbkrTws;
+
+/// Connected clients by connection code (`IBKR_TWS-PAPER`), set by the
+/// supervisor while a session is up. How the admin API (contract search and
+/// import) reaches IB Gateway without owning the connection.
+static LIVE: Mutex<Option<HashMap<String, Arc<dyn client::TwsClient>>>> = Mutex::new(None);
+
+/// The connection code the supervisor registers its client under.
+pub fn connection_code(env: &str) -> String {
+    format!("{}-{env}", MANIFEST.code)
+}
+
+/// The connected client for `connection_code`, if its session is up.
+pub fn live_client(connection_code: &str) -> Option<Arc<dyn client::TwsClient>> {
+    LIVE.lock().unwrap().as_ref()?.get(connection_code).filter(|c| c.connected()).cloned()
+}
+
+pub(crate) fn set_live_client(connection_code: &str, client: Option<Arc<dyn client::TwsClient>>) {
+    let mut live = LIVE.lock().unwrap();
+    let map = live.get_or_insert_with(HashMap::new);
+    match client {
+        Some(c) => map.insert(connection_code.to_string(), c),
+        None => map.remove(connection_code),
+    };
+}
 
 /// An IBKR login for the IB Gateway container.
 /// Stored as `{"kind":"IbkrTws", …}` (see [`crate::credentials::BrokerCredentials`]).
@@ -69,6 +95,10 @@ impl Connector for IbkrTws {
                 Box::pin(stream::supervise(gw, slot.clone(), ctx))
             })),
         })
+    }
+
+    fn universe_provider(&self, _: &str, _: &BrokerCredentials) -> Result<Box<dyn crate::adapter::InstrumentProvider>, String> {
+        Err("IBKR instruments are imported from a CSV or search".into())
     }
 
     fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {

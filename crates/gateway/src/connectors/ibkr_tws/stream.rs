@@ -282,8 +282,10 @@ pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
                 Ok(client) => {
                     let client: Arc<dyn TwsClient> = Arc::new(client);
                     *slot.write().unwrap() = Some(client.clone());
+                    super::set_live_client(&gw.code, Some(client.clone()));
                     let r = run(client, &ctx, &mut booked).await;
                     *slot.write().unwrap() = None;
+                    super::set_live_client(&gw.code, None);
                     Next::Retry(r.err().unwrap_or_else(|| "IBKR session ended".into()))
                 }
             },

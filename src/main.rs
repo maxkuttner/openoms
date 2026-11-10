@@ -7,6 +7,7 @@ mod app_state;
 mod auth;
 mod admin;
 mod instruments_api;
+mod instruments_import;
 mod risk_engine;
 mod positions;
 mod recon_orders;
@@ -153,6 +154,9 @@ mod boundary_tests;
         admin::update_risk_limit,
         admin::delete_risk_limit,
         admin::list_instruments,
+        instruments_import::resolve_csv,
+        instruments_import::save,
+        instruments_import::search,
         admin::list_feeds,
         admin::resolve_symbology,
         admin::backfill_symbology,
@@ -199,6 +203,8 @@ mod boundary_tests;
         CreateBrokerConnection, UpdateBrokerConnection,
         admin::RedactedCredentials, crate::credentials::RedactedField,
         jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
+        instruments_import::Contract, instruments_import::ImportResolveRequest, instruments_import::ResolvedRow,
+        instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
         jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted, jobs::api::JobDetail,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
@@ -1564,6 +1570,7 @@ async fn serve() {
             post(colo::ingest::adjustment),
         )
         .route("/admin/instruments", get(admin::list_instruments))
+        .merge(instruments_import::routes())
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/symbology/resolve", post(admin::resolve_symbology))
         .route("/admin/symbology/backfill", post(admin::backfill_symbology))

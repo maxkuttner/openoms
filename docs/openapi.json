@@ -640,6 +640,167 @@
         ]
       }
     },
+    "/admin/brokers/IBKR_TWS/instruments": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "save",
+        "parameters": [
+          {
+            "name": "env",
+            "in": "path",
+            "description": "Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What was saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UniverseLoadReport"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A conId is unknown or unsupported; nothing was saved"
+          },
+          "503": {
+            "description": "IBKR gateway is not connected"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/brokers/IBKR_TWS/instruments/resolve": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "resolve_csv",
+        "parameters": [
+          {
+            "name": "env",
+            "in": "path",
+            "description": "Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "One entry per CSV row",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ResolvedRow"
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The CSV is malformed"
+          },
+          "503": {
+            "description": "IBKR gateway is not connected"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/brokers/IBKR_TWS/instruments/search": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "search",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "path",
+            "description": "Symbol or company-name fragment.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "env",
+            "in": "path",
+            "description": "Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Matching contracts on supported exchanges",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Contract"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "IBKR gateway is not connected"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/connections/reload": {
       "post": {
         "tags": [
@@ -4488,6 +4649,55 @@
           }
         }
       },
+      "Contract": {
+        "type": "object",
+        "description": "A contract as IBKR describes it.",
+        "required": [
+          "con_id",
+          "symbol",
+          "primary_exchange",
+          "currency",
+          "min_tick",
+          "name"
+        ],
+        "properties": {
+          "con_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "isin": {
+            "type": "string",
+            "nullable": true
+          },
+          "lot_size": {
+            "type": "number",
+            "format": "double",
+            "nullable": true
+          },
+          "mic": {
+            "type": "string",
+            "description": "The OMS venue (ISO 10383 MIC) it maps to.",
+            "nullable": true
+          },
+          "min_tick": {
+            "type": "number",
+            "format": "double"
+          },
+          "name": {
+            "type": "string"
+          },
+          "primary_exchange": {
+            "type": "string",
+            "description": "IBKR primary exchange code, e.g. `IBIS`."
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
       "ControlReport": {
         "type": "object",
         "description": "What a control action did, for the cockpit.",
@@ -5254,6 +5464,18 @@
           }
         }
       },
+      "ImportResolveRequest": {
+        "type": "object",
+        "required": [
+          "csv"
+        ],
+        "properties": {
+          "csv": {
+            "type": "string",
+            "description": "CSV text with a header: `symbol`, `exchange`, `currency`, `conid` (any order)."
+          }
+        }
+      },
       "InstrumentBaseline": {
         "type": "object",
         "required": [
@@ -6015,6 +6237,36 @@
           }
         }
       },
+      "ResolvedRow": {
+        "type": "object",
+        "required": [
+          "line",
+          "status",
+          "candidates",
+          "message"
+        ],
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Contract"
+            },
+            "description": "The one contract for `found`; every candidate for `ambiguous`; empty otherwise."
+          },
+          "line": {
+            "type": "integer",
+            "description": "CSV line, 1-based including the header.",
+            "minimum": 0
+          },
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`found`, `ambiguous` or `not_found`."
+          }
+        }
+      },
       "RetireRequest": {
         "type": "object",
         "required": [
@@ -6096,6 +6348,21 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "SaveRequest": {
+        "type": "object",
+        "required": [
+          "con_ids"
+        ],
+        "properties": {
+          "con_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         }
       },
@@ -6605,6 +6872,43 @@
           "principal_name": {
             "type": "string",
             "nullable": true
+          }
+        }
+      },
+      "UniverseLoadReport": {
+        "type": "object",
+        "description": "What a universe load did, as stored on its job and shown in the cockpit.",
+        "required": [
+          "fetched",
+          "upserted",
+          "mapped",
+          "skipped",
+          "skipped_reasons"
+        ],
+        "properties": {
+          "fetched": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mapped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "integer",
+            "description": "Instruments dropped because their venue or currency is unknown.",
+            "minimum": 0
+          },
+          "skipped_reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Why, as the distinct codes: e.g. \"unknown venue TXSE\"."
+          },
+          "upserted": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
