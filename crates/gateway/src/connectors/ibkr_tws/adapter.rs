@@ -5,7 +5,7 @@
 //! every call made while the slot is empty or the client is disconnected is a
 //! transient `BrokerError::Network`, never queued.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tracing::{debug, info};
@@ -48,8 +48,9 @@ fn broker_error(e: TwsError) -> BrokerError {
         TwsError::NotConnected => BrokerError::Network(RECONNECTING.into()),
         TwsError::Api { code, message } => match map_error(code, &message) {
             ErrorClass::NoSuchOrder => BrokerError::NoSuchOrder(format!("IB error {code}: {message}")),
-            ErrorClass::Transient => BrokerError::Network(format!("IB error {code}: {message}")),
-            _ => BrokerError::BrokerRejected(format!("IB error {code}: {message}")),
+            ErrorClass::Reject => BrokerError::BrokerRejected(format!("IB error {code}: {message}")),
+            // A notice says nothing about the order's fate: unknown, so recon settles it.
+            ErrorClass::Transient | ErrorClass::Info => BrokerError::Network(format!("IB error {code}: {message}")),
         },
         // Timeouts and decode failures say nothing about whether IB took the request.
         TwsError::Other(m) => BrokerError::Network(m),
@@ -74,11 +75,13 @@ pub struct IbkrTwsAdapter {
     symbols: Mutex<HashMap<String, i64>>,
     /// IBKR order id -> OMS order id (the order ref), for events that carry only the id.
     refs: Mutex<HashMap<i32, String>>,
+    /// IBKR ids whose reject `submit_order` already returned: the streamed copy is not booked again.
+    rejected_on_submit: Mutex<HashSet<i32>>,
 }
 
 impl IbkrTwsAdapter {
     pub fn new(client: ClientSlot) -> Self {
-        Self { client, contracts: Mutex::default(), symbols: Mutex::default(), refs: Mutex::default() }
+        Self { client, contracts: Mutex::default(), symbols: Mutex::default(), refs: Mutex::default(), rejected_on_submit: Mutex::default() }
     }
 
     /// The connected client, or the transient error to return.
@@ -93,6 +96,10 @@ impl IbkrTwsAdapter {
     /// The OMS order id for an IBKR order id, when known.
     pub fn order_ref(&self, order_id: i32) -> Option<String> {
         self.refs.lock().unwrap().get(&order_id).cloned()
+    }
+
+    pub(crate) fn rejected_on_submit(&self, order_id: i32) -> bool {
+        self.rejected_on_submit.lock().unwrap().contains(&order_id)
     }
 
     /// Records IBKR id -> OMS id pairs from an order listing.
@@ -197,7 +204,13 @@ impl BrokerAdapter for IbkrTwsAdapter {
         };
         self.refs.lock().unwrap().insert(order_id, req.order_id.clone());
         info!(order_id, con_id, order_ref = %req.order_id, "placing IBKR order");
-        client.place(&order).await.map_err(broker_error)?;
+        client.place(&order).await.map_err(|e| {
+            let e = broker_error(e);
+            if matches!(e, BrokerError::BrokerRejected(_)) {
+                self.rejected_on_submit.lock().unwrap().insert(order_id);
+            }
+            e
+        })?;
         Ok(BrokerOrderResponse { external_order_id: order_id.to_string() })
     }
 
@@ -346,6 +359,15 @@ pub(crate) mod tests {
         // No client yet at all: the same.
         let empty = IbkrTwsAdapter::new(Arc::new(RwLock::new(None)));
         assert!(matches!(empty.cancel_order("100", "AAPL").await, Err(BrokerError::Network(_))));
+    }
+
+    #[test]
+    fn a_notice_on_place_is_an_unknown_outcome_not_a_reject() {
+        let api = |code| broker_error(TwsError::Api { code, message: "x".into() });
+        assert!(matches!(api(2109), BrokerError::Network(_)));
+        assert!(matches!(api(202), BrokerError::Network(_)));
+        assert!(matches!(api(201), BrokerError::BrokerRejected(_)));
+        assert!(matches!(api(135), BrokerError::NoSuchOrder(_)));
     }
 
     #[tokio::test]

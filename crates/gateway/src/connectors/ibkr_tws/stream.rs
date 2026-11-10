@@ -3,23 +3,25 @@
 //! [`supervise`] keeps IB Gateway running and connected (Docker, then the TWS
 //! API), swaps the client into the adapter's slot and runs [`run`] on it. [`run`]
 //! turns the client's events into engine events; after every (re)connect it
-//! checks the account, relearns order refs and replays today's executions and
-//! finished orders, booking each execution once by its exec id.
+//! checks the account, relearns order refs and replays every order's state as
+//! cumulative / terminal totals (replay-safe in the engine, even after an OMS
+//! restart); only executions arriving live in this process go as single fills,
+//! once per exec id.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast::error::RecvError;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::contract::{EngineHandle, ExecEvent, VenueReport};
+use crate::contract::{BrokerOrderState, EngineHandle, ExecEvent, ExecKind, ExecSource, VenueReport};
 use crate::stream_health::StreamHandle;
 
 use super::adapter::{map_error, outcome, ClientSlot, ErrorClass, IbkrTwsAdapter};
-use super::client::{IbapiClient, TwsClient, TwsEvent, TwsOrderState};
+use super::client::{IbapiClient, TwsClient, TwsEvent};
 use super::gateway::{classify_logs, container_name, ensure_running, GatewayDocker, GatewayState};
 use super::IbkrTwsCredentials;
 use crate::contract::BrokerOrderOutcome;
@@ -58,6 +60,18 @@ async fn send(ctx: &Ctx, order: Uuid, report: VenueReport) {
     ctx.engine.exec(ExecEvent::from_report(order, VENUE, ACTOR, report)).await;
 }
 
+async fn send_state(ctx: &Ctx, order: Uuid, kind: ExecKind) {
+    ctx.engine.exec(ExecEvent { order_id: order, venue: VENUE.into(), actor: ACTOR, source: ExecSource::Snapshot, kind }).await;
+}
+
+/// A fill or state for an order the stream can't name: shout, and let recon settle it.
+async fn unknown_order(ctx: &Ctx, what: &str, order_id: i32) {
+    let msg = format!("IBKR {what} for unknown order {order_id}; reconciling");
+    error!(order_id, "{msg}");
+    ctx.health.set_down(msg);
+    ctx.engine.reconcile(VENUE, ctx.env, ACTOR, ctx.adapter.clone()).await;
+}
+
 /// Books one client event, at most once per exec id / order.
 pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
     match ev {
@@ -66,8 +80,7 @@ pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
                 return;
             }
             let Some(order) = order_uuid(&ctx.adapter, order_id, &order_ref) else {
-                warn!(exec_id, order_id, order_ref, "IBKR execution for an order the OMS does not know; skipped");
-                return;
+                return unknown_order(ctx, "execution", order_id).await;
             };
             booked.execs.insert(exec_id.clone());
             send(ctx, order, VenueReport::Fill { execution_id: exec_id, fill_qty: qty, fill_price: price, venue: VENUE.into() }).await;
@@ -76,16 +89,19 @@ pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
         TwsEvent::Commission { exec_id, amount, currency } => {
             info!(exec_id, amount, currency, "IBKR commission");
         }
-        TwsEvent::Status { order_id, order_ref, status, .. } => {
+        TwsEvent::Status { order_id, order_ref, status, filled, .. } => {
             if outcome(&status) == BrokerOrderOutcome::Canceled && booked.canceled.insert(order_id) {
                 match order_uuid(&ctx.adapter, order_id, &order_ref) {
+                    // Part-filled: its last execution may still be in flight, so
+                    // recon closes it from the broker's final totals instead.
+                    Some(_) if filled > 0.0 => ctx.engine.reconcile(VENUE, ctx.env, ACTOR, ctx.adapter.clone()).await,
                     Some(order) => send(ctx, order, VenueReport::Canceled { reason: None, venue: Some(VENUE.into()) }).await,
-                    None => warn!(order_id, "IBKR cancel for an order the OMS does not know"),
+                    None => unknown_order(ctx, "cancel", order_id).await,
                 }
             }
         }
         TwsEvent::Error { order_id: Some(id), code, message } if id > 0 => match map_error(code, &message) {
-            ErrorClass::Reject if booked.rejected.insert(id) => match order_uuid(&ctx.adapter, id, "") {
+            ErrorClass::Reject if !ctx.adapter.rejected_on_submit(id) && booked.rejected.insert(id) => match order_uuid(&ctx.adapter, id, "") {
                 Some(order) => {
                     let reason = format!("IB error {code}: {message}");
                     send(ctx, order, VenueReport::Reject { reason, venue: Some(VENUE.into()) }).await
@@ -99,27 +115,64 @@ pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
     }
 }
 
-/// Replays today's executions and the finished orders' cancels; booking is idempotent.
+/// Replays every order's state from the broker's totals: `Terminal` for
+/// finished orders, `Cumulative` for working ones. The engine books only what
+/// it is missing from these, so a replay after an OMS restart books nothing
+/// twice. Today's exec ids are marked booked so their live echo is skipped.
 pub async fn catch_up(client: &dyn TwsClient, ctx: &Ctx, booked: &mut Booked) -> Result<(), String> {
+    let open = client.open_orders().await.map_err(|e| e.to_string())?;
     let completed = client.completed_orders().await.map_err(|e| e.to_string())?;
+    ctx.adapter.learn(&open);
     ctx.adapter.learn(&completed);
+    // (qty, notional) per order from today's executions: the fallback total for
+    // an order neither listing reports.
+    let mut execs: HashMap<i32, (String, f64, f64)> = HashMap::new();
     for ev in client.executions_today().await.map_err(|e| e.to_string())? {
-        handle(ev, ctx, booked).await;
+        if let TwsEvent::Execution { exec_id, order_id, order_ref, qty, price, .. } = ev {
+            if booked.execs.insert(exec_id) {
+                let e = execs.entry(order_id).or_insert((order_ref, 0.0, 0.0));
+                e.1 += qty;
+                e.2 += qty * price;
+            }
+        }
     }
-    for (id, order_ref, TwsOrderState { status, filled, remaining, .. }) in completed {
-        handle(TwsEvent::Status { order_id: id, order_ref, status, filled, remaining }, ctx, booked).await;
+    let mut unknown = false;
+    for (id, order_ref, st) in &completed {
+        execs.remove(id);
+        let Some(order) = order_uuid(&ctx.adapter, *id, order_ref) else { unknown = true; continue };
+        let o = outcome(&st.status);
+        if o == BrokerOrderOutcome::Canceled {
+            booked.canceled.insert(*id);
+        }
+        if o == BrokerOrderOutcome::Rejected {
+            booked.rejected.insert(*id);
+        }
+        let state = BrokerOrderState { outcome: o, executed_qty: st.filled, avg_px: st.avg_fill_price };
+        send_state(ctx, order, ExecKind::Terminal(state)).await;
+    }
+    for (id, order_ref, st) in &open {
+        execs.remove(id);
+        let Some(order) = order_uuid(&ctx.adapter, *id, order_ref) else { unknown = true; continue };
+        if st.filled > 0.0 {
+            send_state(ctx, order, ExecKind::Cumulative { cum_qty: st.filled, avg_px: st.avg_fill_price }).await;
+        }
+    }
+    for (id, (order_ref, qty, notional)) in execs {
+        let Some(order) = order_uuid(&ctx.adapter, id, &order_ref) else { unknown = true; continue };
+        send_state(ctx, order, ExecKind::Cumulative { cum_qty: qty, avg_px: notional / qty }).await;
+    }
+    if unknown {
+        warn!("IBKR reports orders the OMS can't name; the reconcile settles them");
     }
     Ok(())
 }
 
-/// After a (re)connect: account check, order refs, catch-up, then live and a reconcile.
+/// After a (re)connect: account check, catch-up, then live and a reconcile.
 pub async fn on_connected(client: &dyn TwsClient, ctx: &Ctx, booked: &mut Booked) -> Result<(), String> {
     let accounts = client.managed_accounts().await.map_err(|e| e.to_string())?;
     if accounts.is_empty() {
         return Err("IBKR returned no account".into());
     }
-    let open = client.open_orders().await.map_err(|e| e.to_string())?;
-    ctx.adapter.learn(&open);
     catch_up(client, ctx, booked).await?;
     ctx.health.set_live();
     info!(accounts = ?accounts, "IBKR execution stream live");
@@ -188,6 +241,7 @@ pub fn on_gateway_state(s: &GatewayState) -> Next {
         GatewayState::AwaitingTwoFactor => Next::Retry("waiting for two-factor approval on the IBKR mobile app".into()),
         GatewayState::Starting | GatewayState::Connected => Next::Retry("IB Gateway is starting".into()),
         GatewayState::Disconnected => Next::Retry("IB Gateway is disconnected".into()),
+        GatewayState::Unavailable(m) => Next::Retry(m.clone()),
     }
 }
 
@@ -260,7 +314,7 @@ mod tests {
     use chrono::Utc;
 
     use super::super::adapter::tests::rig;
-    use super::super::client::{OrderKind, Side, Tif, TwsOrder};
+    use super::super::client::{OrderKind, Side, Tif, TwsOrder, TwsOrderState};
     use super::*;
     use crate::contract::{ExecKind, GatewayMsg};
     use crate::stream_health::{StreamHealthRegistry, StreamKind};
@@ -344,6 +398,109 @@ mod tests {
         assert_eq!(n, 1);
     }
 
+    fn order_state(id: i32, order_ref: &str, status: &str, filled: f64, avg: f64) -> (i32, String, TwsOrderState) {
+        let st = TwsOrderState {
+            status: status.into(),
+            filled,
+            remaining: 10.0 - filled,
+            avg_fill_price: avg,
+            symbol: "AAPL".into(),
+            order: TwsOrder {
+                order_id: id,
+                con_id: 265598,
+                exchange: "SMART".into(),
+                primary_exchange: "NASDAQ".into(),
+                currency: "USD".into(),
+                action: Side::Buy,
+                qty: 10.0,
+                order_type: OrderKind::Mkt,
+                tif: Tif::Day,
+                order_ref: order_ref.into(),
+                account: "DU1".into(),
+            },
+        };
+        (id, order_ref.into(), st)
+    }
+
+    fn msgs(rx: &mut tokio::sync::mpsc::Receiver<GatewayMsg>) -> (Vec<ExecEvent>, usize) {
+        let (mut execs, mut recons) = (Vec::new(), 0);
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                GatewayMsg::Exec(e) => execs.push(e),
+                GatewayMsg::Reconcile { .. } => recons += 1,
+            }
+        }
+        (execs, recons)
+    }
+
+    /// After an OMS restart nothing is in `Booked`, and the engine has already
+    /// booked these fills: the replay must be in replay-safe totals, not fills.
+    #[tokio::test]
+    async fn a_restart_replays_totals_not_fills() {
+        let (fake, adapter) = rig();
+        let (working, done) = (Uuid::new_v4(), Uuid::new_v4());
+        fake.accounts.lock().unwrap().push("DU1".into());
+        fake.open.lock().unwrap().push(order_state(42, &working.to_string(), "Submitted", 5.0, 190.2));
+        fake.completed.lock().unwrap().push(order_state(43, &done.to_string(), "Filled", 10.0, 191.0));
+        for (e, id, r) in [("e1", 42, working), ("e2", 42, working), ("e3", 43, done)] {
+            fake.executions.lock().unwrap().push(exec(e, id, &r.to_string()));
+        }
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        let mut booked = Booked::default();
+        on_connected(fake.as_ref(), &ctx, &mut booked).await.unwrap();
+        // TWS echoes the replayed executions onto the live stream too.
+        handle(exec("e1", 42, &working.to_string()), &ctx, &mut booked).await;
+        let (execs, _) = msgs(&mut rx);
+        let kinds: Vec<(Uuid, ExecKind)> = execs.into_iter().map(|e| (e.order_id, e.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (done, ExecKind::Terminal(BrokerOrderState { outcome: BrokerOrderOutcome::Filled, executed_qty: 10.0, avg_px: 191.0 })),
+                (working, ExecKind::Cumulative { cum_qty: 5.0, avg_px: 190.2 }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn executions_for_an_order_neither_list_reports_replay_as_a_total() {
+        let (fake, adapter) = rig();
+        let id = Uuid::new_v4();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        fake.executions.lock().unwrap().push(exec("e1", 42, &id.to_string()));
+        fake.executions.lock().unwrap().push(TwsEvent::Execution {
+            exec_id: "e2".into(), order_id: 42, order_ref: id.to_string(), qty: 1.0, price: 200.0, time: Utc::now(),
+        });
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        on_connected(fake.as_ref(), &ctx, &mut Booked::default()).await.unwrap();
+        let (execs, _) = msgs(&mut rx);
+        let want = ExecKind::Cumulative { cum_qty: 4.0, avg_px: (3.0 * 190.25 + 200.0) / 4.0 };
+        assert_eq!(execs.into_iter().map(|e| e.kind).collect::<Vec<_>>(), vec![want]);
+    }
+
+    #[tokio::test]
+    async fn a_fill_for_an_unknown_order_shows_on_health_and_reconciles() {
+        let (_, adapter) = rig();
+        let (ctx, mut rx, reg) = ctx(adapter);
+        handle(exec("e1", 77, ""), &ctx, &mut Booked::default()).await;
+        let (execs, recons) = msgs(&mut rx);
+        assert!(execs.is_empty());
+        assert_eq!(recons, 1);
+        let err = reg.snapshot()[0].last_error.clone().unwrap();
+        assert!(err.contains("unknown order 77"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_part_filled_cancel_is_left_to_recon() {
+        let (_, adapter) = rig();
+        let id = Uuid::new_v4();
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        let ev = TwsEvent::Status { order_id: 7, order_ref: id.to_string(), status: "Cancelled".into(), filled: 2.0, remaining: 8.0 };
+        handle(ev, &ctx, &mut Booked::default()).await;
+        let (execs, recons) = msgs(&mut rx);
+        assert!(execs.is_empty());
+        assert_eq!(recons, 1);
+    }
+
     #[tokio::test]
     async fn no_account_is_an_error_not_live() {
         let (fake, adapter) = rig();
@@ -392,6 +549,10 @@ mod tests {
         assert!(matches!(on_gateway_state(&GatewayState::LoginFailed("bad password".into())), Next::Stop(_)));
         assert!(matches!(on_gateway_state(&GatewayState::AwaitingTwoFactor), Next::Retry(m) if m.contains("two-factor")));
         assert!(matches!(on_gateway_state(&GatewayState::Starting), Next::Retry(_)));
+        assert_eq!(
+            on_gateway_state(&GatewayState::Unavailable("Docker is required for IBKR_TWS but is not running".into())),
+            Next::Retry("Docker is required for IBKR_TWS but is not running".into())
+        );
     }
 
     #[test]

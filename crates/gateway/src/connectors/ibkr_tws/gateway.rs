@@ -31,6 +31,8 @@ pub enum GatewayState {
     Connected,
     AwaitingTwoFactor,
     LoginFailed(String),
+    /// Docker or the host is not ready: not a credential problem, so retried.
+    Unavailable(String),
     Disconnected,
 }
 
@@ -156,11 +158,11 @@ pub async fn ensure_running(
     creds: &IbkrTwsCredentials,
     state_dir: &Path,
 ) -> Result<u16, GatewayState> {
-    let failed = |m: String| GatewayState::LoginFailed(m);
+    let failed = |m: String| GatewayState::Unavailable(m);
     let blocking = |f: Box<dyn FnOnce() -> Result<Option<u16>, GatewayState> + Send>| async move {
         tokio::task::spawn_blocking(f)
             .await
-            .map_err(|e| GatewayState::LoginFailed(format!("docker task failed: {e}")))?
+            .map_err(|e| GatewayState::Unavailable(format!("docker task failed: {e}")))?
     };
     let live = env.eq_ignore_ascii_case("live");
     let container_port = if live {
@@ -174,7 +176,7 @@ pub async fn ensure_running(
         let (docker, name) = (docker.clone(), name.clone());
         blocking(Box::new(move || {
             if !docker.available() {
-                return Err(GatewayState::LoginFailed(
+                return Err(GatewayState::Unavailable(
                     "Docker is required for IBKR_TWS but is not running".into(),
                 ));
             }
@@ -191,7 +193,7 @@ pub async fn ensure_running(
             ) {
                 return Ok(Some(port));
             }
-            docker.stop_rm(&name).map_err(GatewayState::LoginFailed)?;
+            docker.stop_rm(&name).map_err(GatewayState::Unavailable)?;
             Ok(None)
         }))
         .await?
@@ -581,7 +583,7 @@ mod tests {
             ..Default::default()
         });
         let r = ensure_running(fake.clone(), "IBKR_TWS", "paper", &creds(), &dir("runfail")).await;
-        assert_eq!(r, Err(GatewayState::LoginFailed("boom".into())));
+        assert_eq!(r, Err(GatewayState::Unavailable("boom".into())));
         assert!(!fake.runs.lock().unwrap()[0].env_file.exists());
     }
 
@@ -632,7 +634,7 @@ mod tests {
         .await;
         assert_eq!(
             r,
-            Err(GatewayState::LoginFailed(
+            Err(GatewayState::Unavailable(
                 "Docker is required for IBKR_TWS but is not running".into()
             ))
         );
