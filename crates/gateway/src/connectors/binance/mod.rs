@@ -47,6 +47,7 @@ static MANIFEST: Manifest = Manifest {
     quotes: QuoteScope::OwnVenue,
     exec_stream: true,
     session_bound: true,
+    price_band_exempt: false,
 };
 
 impl Connector for Binance {

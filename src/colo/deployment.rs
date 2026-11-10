@@ -612,7 +612,7 @@ async fn policy_for(
             max_position_notional: row.get("max_position_notional"),
             ..Default::default()
         });
-        let resolved = risk::resolve_limits(&defaults, &override_limits, &currency)
+        let resolved = risk::resolve_limits(&defaults, &override_limits, &currency, false)
             .map_err(|e| DeploymentError::InvalidPolicy(e.to_string()))?;
         let state = overrides
             .as_ref()

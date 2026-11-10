@@ -76,16 +76,17 @@ pub fn check_state(
 
 /// The limits for one instrument: each field of its `risk_limits` row, else
 /// the strategy's default for that field. A default notional limit is only
-/// read in a USD-like quote; any other quote needs its own. Price band and
+/// read in a USD-like quote; any other quote needs its own (the default is
+/// dropped, not refused). A `band_exempt` venue gets no price band. Price band and
 /// order-rate come from the strategy, never the per-instrument row.
-pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, quote_currency: &str) -> Result<RiskLimits, RiskRejection> {
+pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, quote_currency: &str, band_exempt: bool) -> Result<RiskLimits, RiskRejection> {
     let defaults = RiskLimits {
         price_band_pct: strategy.price_band_pct,
         max_orders_per_sec: strategy.max_orders_per_sec,
         ..strategy.limits
     };
     let overrides = override_row.unwrap_or_default();
-    risk::resolve_limits(&defaults, &overrides, quote_currency)
+    risk::resolve_limits(&defaults, &overrides, quote_currency, band_exempt)
         .map_err(|e| RiskRejection { code: e.code, message: e.message })
 }
 
@@ -178,6 +179,7 @@ pub async fn check(
     strategy: &Strategy,
     cmd: &SubmitOrder,
     quote_currency: &str,
+    band_exempt: bool,
     mark: Option<Mark>,
     contract_size: f64,
 ) -> Result<(), crate::risk_engine::RiskCheckError> {
@@ -190,7 +192,7 @@ pub async fn check(
     let state = row
         .as_ref()
         .map_or(strategy.state, |r| strictest(strategy.state, r.trading_state));
-    let limits = effective_limits(strategy, row.map(|r| r.limits), quote_currency)
+    let limits = effective_limits(strategy, row.map(|r| r.limits), quote_currency, band_exempt)
         .map_err(RiskCheckError::Rejected)?;
 
     let mark = admission_mark(mark).map_err(RiskCheckError::Rejected)?;
@@ -283,10 +285,9 @@ mod tests {
     fn defaults_do_not_price_a_non_usd_quote() {
         let mut s = sample("s", "S", "OMS");
         s.limits = limits(Some(10_000.0));
-        let e = effective_limits(&s, None, "BTC").unwrap_err();
-        assert_eq!(e.message, "no notional limit for quote currency BTC");
-        assert_eq!(effective_limits(&s, Some(limits(Some(5.0))), "BTC").unwrap().max_order_notional, Some(5.0));
-        assert_eq!(effective_limits(&s, None, "USDT").unwrap().max_order_notional, Some(10_000.0));
+        assert_eq!(effective_limits(&s, None, "BTC", false).unwrap().max_order_notional, None);
+        assert_eq!(effective_limits(&s, Some(limits(Some(5.0))), "BTC", false).unwrap().max_order_notional, Some(5.0));
+        assert_eq!(effective_limits(&s, None, "USDT", false).unwrap().max_order_notional, Some(10_000.0));
     }
 
     #[test]
@@ -294,14 +295,23 @@ mod tests {
         let mut s = sample("s", "S", "OMS");
         s.limits = RiskLimits { max_order_qty: Some(7.0), ..limits(Some(10_000.0)) };
         let qty_only = RiskLimits { max_order_qty: Some(1.0), ..limits(None) };
-        // A non-USD quote whose notional would fall back to the default is refused.
-        assert!(effective_limits(&s, Some(qty_only), "BTC").is_err());
+        // A non-USD quote drops the inherited notional but keeps the overridden quantity.
+        let merged = effective_limits(&s, Some(qty_only), "BTC", false).unwrap();
+        assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(1.0), None));
         // A USD-like quote keeps the default notional beside the overridden quantity.
-        let merged = effective_limits(&s, Some(qty_only), "USDT").unwrap();
+        let merged = effective_limits(&s, Some(qty_only), "USDT", false).unwrap();
         assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(1.0), Some(10_000.0)));
         // A non-USD quote with its own notional keeps the default quantity.
-        let merged = effective_limits(&s, Some(limits(Some(0.5))), "BTC").unwrap();
+        let merged = effective_limits(&s, Some(limits(Some(0.5))), "BTC", false).unwrap();
         assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(7.0), Some(0.5)));
+    }
+
+    #[test]
+    fn a_band_exempt_venue_gets_no_strategy_band() {
+        let mut s = sample("s", "S", "OMS");
+        s.price_band_pct = Some(5.0);
+        assert_eq!(effective_limits(&s, None, "USD", false).unwrap().price_band_pct, Some(5.0));
+        assert_eq!(effective_limits(&s, None, "USD", true).unwrap().price_band_pct, None);
     }
 
     #[test]

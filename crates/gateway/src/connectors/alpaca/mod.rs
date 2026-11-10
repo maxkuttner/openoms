@@ -28,6 +28,7 @@ static MANIFEST: Manifest = Manifest {
     quotes: QuoteScope::NonCrypto,
     exec_stream: true,
     session_bound: false,
+    price_band_exempt: false,
 };
 
 impl Connector for Alpaca {

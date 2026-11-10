@@ -723,6 +723,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // state may have changed since (Kill), the lock serializes its submits and
     // its session-end cancels, and a portfolio the snapshot missed is still
     // the strategy's.
+    let band_exempt = gateway::connectors::by_code(&broker_code).is_some_and(|c| c.manifest().price_band_exempt);
     let risk = match strategies::by_portfolio(&mut tx, portfolio_id).await {
         Ok(Some(locked)) => {
             let gates = (|| {
@@ -736,7 +737,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
                 guard::session_gate(&origin, state.fix_sessions().is_live(&locked.code))
             })();
             match gates {
-                Ok(()) => guard::check(&mut tx, &locked, &cmd, &quote_currency, mark, contract_size).await,
+                Ok(()) => guard::check(&mut tx, &locked, &cmd, &quote_currency, band_exempt, mark, contract_size).await,
                 Err(rejection) => Err(RiskCheckError::Rejected(rejection)),
             }
         }

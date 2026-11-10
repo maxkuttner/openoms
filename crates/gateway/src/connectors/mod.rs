@@ -67,6 +67,10 @@ pub struct Manifest {
     /// Its session owns a running logon (FIX): a credential change needs a
     /// restart, and on reload the running adapter is carried forward instead.
     pub session_bound: bool,
+    /// Skips the strategy price band: the venue has no reference price for
+    /// the band to compare against (no quotes), while every other venue
+    /// refuses a banded limit order that has none.
+    pub price_band_exempt: bool,
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential

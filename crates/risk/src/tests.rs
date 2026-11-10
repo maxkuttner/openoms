@@ -135,7 +135,7 @@ fn overrides_win_per_field() {
         max_orders_per_sec: Some(1),
     };
 
-    let resolved = resolve_limits(&defaults, &overrides, "USDT").expect("valid");
+    let resolved = resolve_limits(&defaults, &overrides, "USDT", false).expect("valid");
 
     assert_eq!(resolved.max_order_qty, Some(5.0));
     assert_eq!(resolved.max_order_notional, Some(50.0));
@@ -146,14 +146,38 @@ fn overrides_win_per_field() {
 }
 
 #[test]
-fn inherited_notional_needs_a_usd_like_quote() {
-    let defaults = Limits { max_order_notional: Some(100.0), ..Default::default() };
+fn inherited_notional_into_a_non_usd_quote_is_dropped_not_rejected() {
+    let defaults = Limits {
+        max_order_qty: Some(3.0),
+        max_order_notional: Some(1_000.0),
+        max_position_notional: Some(5_000.0),
+        ..Default::default()
+    };
 
-    assert_eq!(
-        code(resolve_limits(&defaults, &Limits::default(), "BTC")),
-        "no_notional_limit"
-    );
-    assert!(resolve_limits(&defaults, &Limits::default(), "USDT").is_ok());
+    let resolved = resolve_limits(&defaults, &Limits::default(), "EUR", false).expect("dropped, not rejected");
+
+    assert_eq!(resolved.max_order_notional, None);
+    assert_eq!(resolved.max_position_notional, None);
+    assert_eq!(resolved.max_order_qty, Some(3.0));
+    assert!(resolve_limits(&defaults, &Limits::default(), "USDT", false).is_ok());
+}
+
+#[test]
+fn an_explicit_eur_override_applies() {
+    let defaults = Limits { max_order_notional: Some(1_000.0), ..Default::default() };
+    let overrides = Limits { max_order_notional: Some(500.0), ..Default::default() };
+
+    let resolved = resolve_limits(&defaults, &overrides, "EUR", false).expect("valid");
+
+    assert_eq!(resolved.max_order_notional, Some(500.0));
+}
+
+#[test]
+fn a_band_exempt_venue_resolves_no_band() {
+    let defaults = Limits { price_band_pct: Some(5.0), ..Default::default() };
+
+    assert_eq!(resolve_limits(&defaults, &Limits::default(), "USD", true).unwrap().price_band_pct, None);
+    assert_eq!(resolve_limits(&defaults, &Limits::default(), "USD", false).unwrap().price_band_pct, Some(5.0));
 }
 
 #[test]
@@ -161,7 +185,7 @@ fn explicit_notional_override_is_allowed_for_any_quote() {
     let defaults = Limits { max_order_notional: Some(100.0), ..Default::default() };
     let overrides = Limits { max_order_notional: Some(50.0), ..Default::default() };
 
-    let resolved = resolve_limits(&defaults, &overrides, "BTC").expect("own notional limit");
+    let resolved = resolve_limits(&defaults, &overrides, "BTC", false).expect("own notional limit");
 
     assert_eq!(resolved.max_order_notional, Some(50.0));
 }
@@ -170,13 +194,13 @@ fn explicit_notional_override_is_allowed_for_any_quote() {
 fn invalid_limits_rejected() {
     let negative = Limits { max_order_qty: Some(-1.0), ..Default::default() };
     assert_eq!(
-        code(resolve_limits(&negative, &Limits::default(), "USDT")),
+        code(resolve_limits(&negative, &Limits::default(), "USDT", false)),
         "invalid_limits"
     );
 
     let zero_rate = Limits { max_orders_per_sec: Some(0), ..Default::default() };
     assert_eq!(
-        code(resolve_limits(&zero_rate, &Limits::default(), "USDT")),
+        code(resolve_limits(&zero_rate, &Limits::default(), "USDT", false)),
         "invalid_limits"
     );
 }

@@ -35,6 +35,7 @@ static MANIFEST: Manifest = Manifest {
     quotes: QuoteScope::None,
     exec_stream: false,
     session_bound: true,
+    price_band_exempt: false,
 };
 
 impl Connector for Ibkr {
