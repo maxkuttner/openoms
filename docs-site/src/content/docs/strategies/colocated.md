@@ -128,6 +128,60 @@ queued; heartbeats do not renew it.
   unmonitored**, the OMS kills instead of only warning.
 - **Order rate:** more orders in a second than its cap.
 
+## Operating the runtime
+
+On **Strategies**, **Runtime** shows what the strategy's runtime last reported:
+- its epoch and the policy revision it has installed;
+- a kill's progress: received, orders stopped, cancels sent, nothing resting;
+- whether its recovery after a start completed, and what was missing if not;
+- any **balance shortfall**.
+
+**Balance checks.** The runtime keeps the balance it expects of every asset:
+the opening balances, moved by each fill and each fee (a BNB fee counts against
+BNB). Every 30 seconds it compares them with the venue. If an asset is short by
+more than 10 bps (or two lot steps) three times in a row, it stops placing
+orders, cancels nothing, and reports the shortfall. A balance higher than
+expected never alarms, so deposits are harmless.
+
+**Approve balances** (`POST /admin/strategies/{code}/rebaseline`) tells the
+runtime to take the venue's current balances as expected, after a withdrawal,
+a deposit or a manual trade. It lifts a balance stop.
+
+**Restarting a runtime.** A new runtime process is a new owner. The OMS refuses
+it until you confirm the old one is stopped: **Record verified stop**
+(`POST /admin/strategies/{code}/deployments/{id}/verified-stop`, with how you
+verified it). The replacement then takes over at the next epoch, which it
+learns from the OMS. A kill stays in force across the takeover.
+
+A submit whose answer was lost (a timeout) stops new orders until a lookup
+settles it. Binance refuses a request that arrives more than 5 seconds after it
+was signed, so once 10 seconds have passed, two "no such order" answers mean the
+order never existed: it is closed and trading resumes.
+
+## Try it on testnet
+
+`scripts/colo-demo.sh` runs the whole setup on Binance Spot testnet with a
+throwaway OMS: its own Postgres container, configuration, TLS certificate,
+strategy, deployment and the reference market maker.
+
+1. Create an Ed25519 key pair and register its public key at
+   [testnet.binance.vision](https://testnet.binance.vision/):
+
+   ```sh
+   mkdir -p ~/.config/openoms/binance-testnet && cd ~/.config/openoms/binance-testnet
+   openssl genpkey -algorithm ed25519 -out ed25519-private.pem
+   openssl pkey -in ed25519-private.pem -pubout
+   ```
+
+   Save the API key Binance shows in `api-key` in the same folder.
+2. From a checkout: `scripts/colo-demo.sh up`, then `scripts/colo-demo.sh mm`.
+   The cockpit runs at `http://127.0.0.1:3021/cockpit/`; the admin password is
+   in `colo-demo/adminpw`.
+3. `scripts/colo-demo.sh down` stops everything and deletes the demo.
+
+The demo uses one testnet account for both the OMS's own Binance connection and
+the strategy; give a real deployment separate accounts.
+
 ## The reference program
 
 `crates/colo-example` is a small market maker on one pair:
