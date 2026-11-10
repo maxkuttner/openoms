@@ -286,6 +286,108 @@ pub async fn save_instruments(
     load_universe(pool, broker, &Chosen(Mutex::new(instruments)), &opts, &Quiet).await
 }
 
+// ── Nightly refresh ──────────────────────────────────────────────────────────
+
+/// IBKR answers a conId it no longer knows with error 200, "No security
+/// definition has been found". That is the one error that means "vanished".
+const NO_SECURITY_DEFINITION: i32 = 200;
+
+/// What a refresh changed.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RefreshReport {
+    /// Instruments re-saved from IBKR's current contract details.
+    pub updated: usize,
+    /// Routing rows newly marked `is_tradeable = false`.
+    pub untradeable: usize,
+}
+
+/// Re-resolves every stored `IBKR_TWS` instrument by conId and re-saves what
+/// IBKR still lists (new tick size, lot size, name). A conId IBKR no longer
+/// has details for gets `broker_instrument.is_tradeable = false` (the flag the
+/// order path reads), never a delete. Requests go one at a time. Any other
+/// failure, such as the client being down, aborts the run before anything is
+/// written: an outage is not a vanished contract.
+pub async fn refresh_ibkr_instruments(pool: &PgPool, client: &dyn TwsClient) -> RefreshReport {
+    match refresh(pool, client).await {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::warn!(error = %e, "IBKR instrument refresh skipped");
+            RefreshReport::default()
+        }
+    }
+}
+
+async fn refresh(pool: &PgPool, client: &dyn TwsClient) -> Result<RefreshReport, Box<dyn std::error::Error>> {
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT native_id FROM broker_instrument WHERE broker_code = 'IBKR_TWS' AND native_id IS NOT NULL ORDER BY native_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut current = Vec::new();
+    let mut vanished = Vec::new();
+    for native_id in stored {
+        let Ok(con_id) = native_id.parse::<i64>() else {
+            tracing::warn!(native_id, "IBKR instrument refresh: native_id is not a conId; left alone");
+            continue;
+        };
+        let q = ContractQuery { con_id: Some(con_id), ..Default::default() };
+        match client.contract_details(&q).await {
+            Ok(found) => match found.first() {
+                Some(c) => match to_broker_instrument(c) {
+                    Ok(bi) => current.push(bi),
+                    Err(e) => tracing::warn!(con_id, error = %e, "IBKR instrument refresh: contract not savable; left alone"),
+                },
+                None => vanished.push(native_id),
+            },
+            Err(TwsError::Api { code: NO_SECURITY_DEFINITION, .. }) => vanished.push(native_id),
+            Err(e) => return Err(format!("conId {con_id}: {e}").into()),
+        }
+    }
+
+    let updated = if current.is_empty() { 0 } else { save_instruments(pool, current, true).await?.mapped as usize };
+    let untradeable = if vanished.is_empty() {
+        0
+    } else {
+        sqlx::query(
+            "UPDATE broker_instrument SET is_tradeable = false, updated_at = now() \
+             WHERE broker_code = 'IBKR_TWS' AND native_id = ANY($1) AND is_tradeable",
+        )
+        .bind(&vanished)
+        .execute(pool)
+        .await?
+        .rows_affected() as usize
+    };
+    Ok(RefreshReport { updated, untradeable })
+}
+
+/// Hour (UTC) the refresh runs each day.
+const REFRESH_HOUR_UTC: u32 = 6;
+
+/// The next 06:00 UTC strictly after `now`.
+fn next_refresh_after(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    let today = now.date_naive().and_hms_opt(REFRESH_HOUR_UTC, 0, 0).expect("valid time").and_utc();
+    if today > now {
+        today
+    } else {
+        today + chrono::Duration::days(1)
+    }
+}
+
+/// Daily 06:00 UTC refresh. Silent when no IBKR_TWS session is live at the time.
+pub async fn run_nightly(pool: PgPool) {
+    let Some(broker) = Broker::of("IBKR_TWS") else { return };
+    let code = connection_code(&broker.environment());
+    loop {
+        let now = chrono::Utc::now();
+        let wait = (next_refresh_after(now) - now).to_std().unwrap_or_default();
+        tokio::time::sleep(wait).await;
+        let Some(client) = live_client(&code) else { continue };
+        let report = refresh_ibkr_instruments(&pool, client.as_ref()).await;
+        tracing::info!(updated = report.updated, untradeable = report.untradeable, "IBKR instrument refresh done");
+    }
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 /// `sync-broker --symbols file.csv`: resolve through the running OMS, save the
@@ -439,6 +541,101 @@ mod tests {
     fn contract_view_carries_the_mic() {
         assert_eq!(Contract::from(&contract(2, "IBIS")).mic.as_deref(), Some("XETR"));
         assert_eq!(Contract::from(&contract(3, "MOON")).mic, None);
+    }
+
+    #[test]
+    fn refresh_runs_at_0600_utc() {
+        use chrono::TimeZone;
+        let at = |d, h, m| chrono::Utc.with_ymd_and_hms(2026, 11, d, h, m, 0).unwrap();
+        assert_eq!(next_refresh_after(at(10, 5, 59)), at(10, 6, 0));
+        assert_eq!(next_refresh_after(at(10, 6, 0)), at(11, 6, 0));
+        assert_eq!(next_refresh_after(at(10, 23, 0)), at(11, 6, 0));
+    }
+
+    /// Answers `contract_details` from a map; a missing conId is "no result",
+    /// and `down` makes every call a transport error.
+    struct Scripted {
+        details: std::collections::HashMap<i64, TwsContract>,
+        down: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl TwsClient for Scripted {
+        async fn contract_details(&self, q: &ContractQuery) -> Result<Vec<TwsContract>, TwsError> {
+            if self.down {
+                return Err(TwsError::NotConnected);
+            }
+            Ok(self.details.get(&q.con_id.unwrap()).cloned().into_iter().collect())
+        }
+        async fn next_order_id(&self) -> Result<i32, TwsError> { unimplemented!() }
+        async fn place(&self, _: &gateway::connectors::ibkr_tws::client::TwsOrder) -> Result<(), TwsError> { unimplemented!() }
+        async fn cancel(&self, _: i32) -> Result<(), TwsError> { unimplemented!() }
+        async fn open_orders(&self) -> Result<Vec<(i32, String, gateway::connectors::ibkr_tws::client::TwsOrderState)>, TwsError> { unimplemented!() }
+        async fn completed_orders(&self) -> Result<Vec<(i32, String, gateway::connectors::ibkr_tws::client::TwsOrderState)>, TwsError> { unimplemented!() }
+        async fn executions_today(&self) -> Result<Vec<gateway::connectors::ibkr_tws::client::TwsEvent>, TwsError> { unimplemented!() }
+        async fn matching_symbols(&self, _: &str) -> Result<Vec<TwsContract>, TwsError> { unimplemented!() }
+        async fn prev_close(&self, _: i64) -> Result<Option<f64>, TwsError> { unimplemented!() }
+        async fn managed_accounts(&self) -> Result<Vec<String>, TwsError> { unimplemented!() }
+        fn events(&self) -> tokio::sync::broadcast::Receiver<gateway::connectors::ibkr_tws::client::TwsEvent> { unimplemented!() }
+        fn connected(&self) -> bool { !self.down }
+    }
+
+    /// A refresh covers every stored IBKR instrument, so the tests that run one
+    /// must not overlap.
+    static REFRESH_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn tradeable(pool: &PgPool, con_id: i64) -> bool {
+        sqlx::query_scalar("SELECT is_tradeable FROM broker_instrument WHERE broker_code = 'IBKR_TWS' AND native_id = $1")
+            .bind(con_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn a_vanished_con_id_becomes_untradeable_not_deleted() {
+        let _serial = REFRESH_TESTS.lock().await;
+        let pool = isolated_pool().await;
+        let (kept, gone) = (990_000_011_i64, 990_000_012_i64);
+        let (mut a, mut b) = (contract(kept, "IBIS"), contract(gone, "IBIS"));
+        a.symbol = "ZKEEP".into();
+        b.symbol = "ZGONE".into();
+        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()], true)
+            .await
+            .unwrap();
+
+        // An outage marks nothing, even though no conId answers.
+        let down = Scripted { details: Default::default(), down: true };
+        assert_eq!(refresh_ibkr_instruments(&pool, &down).await, RefreshReport::default());
+        assert!(tradeable(&pool, gone).await);
+
+        let client = Scripted { details: [(kept, a)].into(), down: false };
+        let report = refresh_ibkr_instruments(&pool, &client).await;
+        assert!(report.untradeable >= 1, "{report:?}");
+        assert!(tradeable(&pool, kept).await);
+        assert!(!tradeable(&pool, gone).await, "the vanished conId stays, untradeable");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn a_changed_min_tick_is_updated() {
+        let _serial = REFRESH_TESTS.lock().await;
+        let pool = isolated_pool().await;
+        let con_id = 990_000_021_i64;
+        let mut c = contract(con_id, "IBIS");
+        c.symbol = "ZTICK".into();
+        save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()], true).await.unwrap();
+
+        c.min_tick = 0.05;
+        let client = Scripted { details: [(con_id, c)].into(), down: false };
+        let report = refresh_ibkr_instruments(&pool, &client).await;
+        assert!(report.updated >= 1, "{report:?}");
+        let tick: f64 = sqlx::query_scalar("SELECT price_increment::float8 FROM instrument WHERE symbol = 'ZTICK' AND venue = 'XETR'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tick, 0.05);
     }
 
     /// A disposable, already-migrated database (never the dev one).

@@ -1263,6 +1263,9 @@ async fn serve() {
     // return as a disconnect to back off from — wrong shape for a periodic job.
     tokio::spawn(expiry::run(state.pool().clone()));
 
+    // Re-resolve imported IBKR instruments daily at 06:00 UTC while a TWS session is live.
+    tokio::spawn(instruments_import::run_nightly(state.pool().clone()));
+
     // Delete browser sessions past their absolute cap. Idle expiry is already
     // enforced on read (`sessions::lookup_session`'s join to `principal`), so
     // this sweep only clears rows that can never resolve again — it exists to
