@@ -5699,6 +5699,7 @@
         "required": [
           "portfolio_id",
           "instrument_id",
+          "currency",
           "net_qty",
           "avg_cost",
           "realized_pnl",
@@ -5708,6 +5709,10 @@
           "avg_cost": {
             "type": "number",
             "format": "double"
+          },
+          "currency": {
+            "type": "string",
+            "description": "The instrument's own currency; every amount on this row is in it (no FX)."
           },
           "instrument_id": {
             "type": "string"

@@ -547,7 +547,8 @@ pub async fn get_portfolio_positions(
                 p.avg_cost::double precision     AS avg_cost, \
                 p.realized_pnl::double precision AS realized_pnl, \
                 p.updated_at, \
-                COALESCE(i.contract_size, 1)::double precision AS contract_size \
+                COALESCE(i.contract_size, 1)::double precision AS contract_size, \
+                COALESCE(i.currency, 'XXX') AS currency \
          FROM position p \
          LEFT JOIN instrument i ON i.id::text = p.instrument_id \
          WHERE p.portfolio_id = $1 ORDER BY p.instrument_id",
@@ -581,6 +582,7 @@ pub async fn get_portfolio_positions(
             Position {
                 portfolio_id: r.get("portfolio_id"),
                 instrument_id,
+                currency: r.get("currency"),
                 net_qty,
                 avg_cost,
                 realized_pnl: r.get("realized_pnl"),

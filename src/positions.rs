@@ -111,6 +111,8 @@ pub struct Valuation {
 pub struct Position {
     pub portfolio_id: Uuid,
     pub instrument_id: String,
+    /// The instrument's own currency; every amount on this row is in it (no FX).
+    pub currency: String,
     pub net_qty: f64,
     pub avg_cost: f64,
     pub realized_pnl: f64,
@@ -269,6 +271,25 @@ mod tests {
 
     fn approx(a: f64, b: f64) {
         assert!((a - b).abs() < 1e-9, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn position_serializes_instrument_currency() {
+        let p = Position {
+            portfolio_id: Uuid::nil(),
+            instrument_id: "42".into(),
+            currency: "EUR".into(),
+            net_qty: 1.0,
+            avg_cost: 2.0,
+            realized_pnl: 0.0,
+            updated_at: Utc::now(),
+            mark: None,
+            market_value: None,
+            unrealized_pnl: None,
+            mark_ts: None,
+        };
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["currency"], "EUR");
     }
 
     #[test]

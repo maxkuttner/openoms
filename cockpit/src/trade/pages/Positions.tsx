@@ -6,24 +6,10 @@ import { useLive } from "../api/liveUpdates";
 import { numeric, columnHeader } from "../table";
 import type { Me } from "../App";
 import type { MarkRow } from "../types";
+import { totalsByCurrency } from "../../positions";
+import type { PositionRow } from "../../positions";
 
-// Mirrors src/positions.rs Position. mark, market_value, unrealized_pnl and
-// mark_ts are None when no live mark exists for the instrument — an
-// unpriceable/expired contract, or a feed that's down — and MUST stay
-// nullable here. Defaulting them (in the type, or with `?? 0`) would turn an
-// honest "we don't know" into a lie that reads as a real, zero-valued P&L.
-export interface PositionRow {
-  portfolio_id: string;
-  instrument_id: string;
-  net_qty: number;
-  avg_cost: number;
-  realized_pnl: number;
-  updated_at: string;
-  mark: number | null;
-  market_value: number | null;
-  unrealized_pnl: number | null;
-  mark_ts: string | null;
-}
+export type { PositionRow };
 
 // mark, market_value, unrealized_pnl and mark_ts are null when no live quote
 // exists — an unpriceable or expired contract, or a feed that is down. Render
@@ -61,18 +47,6 @@ export function PositionsPage({ me }: { me: Me }) {
 
   const rows = positions.data ?? [];
 
-  // realized_pnl is never null; unrealized_pnl and market_value are null for
-  // any position with no live mark (see the PositionRow comment above) — those
-  // rows are excluded from their sums rather than treated as zero, and the
-  // count is surfaced so the total never reads as more complete than it is.
-  const realizedTotal = rows.reduce((sum, p) => sum + p.realized_pnl, 0);
-  const pricedRows = rows.filter((p) => p.unrealized_pnl !== null);
-  const unrealizedTotal = pricedRows.reduce((sum, p) => sum + (p.unrealized_pnl as number), 0);
-  const marketValueTotal = rows
-    .filter((p) => p.market_value !== null)
-    .reduce((sum, p) => sum + (p.market_value as number), 0);
-  const unpriced = rows.length - pricedRows.length;
-
   const heldInstrumentIds = rows.map((p) => p.instrument_id);
   const marks = useQuery<MarkRow[]>({
     queryKey: ["/marks", heldInstrumentIds],
@@ -82,28 +56,16 @@ export function PositionsPage({ me }: { me: Me }) {
   });
   const markByInstrument = new Map((marks.data ?? []).map((m) => [String(m.instrument_id), m]));
 
-  // Day P&L: qty * (mark - prev_close), summed only over positions where
-  // BOTH a live mark and a previous close exist — same "excluded, not
-  // zeroed" rule this file already applies to unrealized P&L above.
-  const dayPnlRows = rows.filter((p) => {
+  // Totals are per currency (no FX). realized_pnl is never null; unrealized_pnl
+  // and market_value are null for a position with no live mark, and Day P&L
+  // needs a mark AND a previous close — those rows are excluded from their sums
+  // rather than treated as zero, and the counts are surfaced below.
+  const totals = totalsByCurrency(rows, markByInstrument);
+  const unpriced = rows.filter((p) => p.unrealized_pnl === null).length;
+  const dayPnlUnpriced = rows.filter((p) => {
     const mark = markByInstrument.get(p.instrument_id);
-    return mark?.mid != null && mark?.prev_close != null;
-  });
-  const dayPnlTotal = dayPnlRows.reduce((sum, p) => {
-    const mark = markByInstrument.get(p.instrument_id)!;
-    return sum + p.net_qty * (mark.mid! - mark.prev_close!);
-  }, 0);
-  const dayPnlUnpriced = rows.length - dayPnlRows.length;
-
-  // Gross exposure: sum of |market value| — pure computation over data this
-  // page already fetched, no new store involved. Only defined over
-  // positions that already have a market_value (same exclusion as the
-  // existing marketValueTotal above). This is gross, not net: a signed sum
-  // would net long and short exposure against each other, which is a
-  // different (and also useful) number this card does not compute.
-  const grossExposure = rows
-    .filter((p) => p.market_value !== null)
-    .reduce((sum, p) => sum + Math.abs(p.market_value as number), 0);
+    return mark?.mid == null || mark?.prev_close == null;
+  }).length;
 
   return (
     <Stack>
@@ -124,13 +86,15 @@ export function PositionsPage({ me }: { me: Me }) {
 
       {rows.length > 0 && (
         <Stack gap={4}>
-          <SimpleGrid cols={{ base: 1, sm: 5 }}>
-            <SummaryCard label="Unrealized P&L" value={unrealizedTotal.toFixed(2)} pnlColor />
-            <SummaryCard label="Realized P&L" value={realizedTotal.toFixed(2)} pnlColor />
-            <SummaryCard label="Market value" value={marketValueTotal.toFixed(2)} />
-            <SummaryCard label="Day P&L" value={dayPnlTotal.toFixed(2)} pnlColor />
-            <SummaryCard label="Gross exposure" value={grossExposure.toFixed(2)} />
-          </SimpleGrid>
+          {[...totals].map(([ccy, t]) => (
+            <SimpleGrid key={ccy} cols={{ base: 1, sm: 5 }}>
+              <SummaryCard label={`Unrealized P&L · ${ccy}`} value={t.unrealized.toFixed(2)} pnlColor />
+              <SummaryCard label={`Realized P&L · ${ccy}`} value={t.realized.toFixed(2)} pnlColor />
+              <SummaryCard label={`Market value · ${ccy}`} value={t.marketValue.toFixed(2)} />
+              <SummaryCard label={`Day P&L · ${ccy}`} value={t.day.toFixed(2)} pnlColor />
+              <SummaryCard label={`Gross exposure · ${ccy}`} value={t.grossExposure.toFixed(2)} />
+            </SimpleGrid>
+          ))}
           {unpriced > 0 && (
             <Text size="xs" c="dimmed">
               {unpriced} of {rows.length} position{rows.length === 1 ? "" : "s"} {unpriced === 1 ? "has" : "have"} no

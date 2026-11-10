@@ -160,6 +160,7 @@ class Position:
     market_value: Optional[float] = None
     unrealized_pnl: Optional[float] = None
     mark_ts: Optional[str] = None
+    currency: str = ""  # the instrument's own currency; amounts are never converted
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Position":
