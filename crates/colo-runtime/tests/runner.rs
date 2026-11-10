@@ -1132,3 +1132,29 @@ async fn an_enable_after_a_kill_resumes_trading() {
     grant(&runtime).await;
     assert!(submit_allowed(&runtime).await, "trading resumes after enable");
 }
+
+#[tokio::test]
+async fn a_bootstrap_resent_on_reconnect_keeps_the_runtime_ready() {
+    let (runtime, _venue, _dir) = start().await;
+    runtime
+        .apply_control(Received::new(ToRuntime::Bootstrap { bootstrap: bootstrap() }, Instant::now()))
+        .await
+        .unwrap();
+    grant(&runtime).await;
+    assert!(submit_allowed(&runtime).await, "a reconnect does not stop trading");
+}
+
+#[tokio::test]
+async fn a_bootstrap_resent_while_killed_does_not_resume() {
+    let (runtime, _venue, _dir) = start().await;
+    grant(&runtime).await;
+    kill(&runtime).await.unwrap();
+    let mut killed = bootstrap();
+    killed.killed_epoch = Some(1);
+    runtime
+        .apply_control(Received::new(ToRuntime::Bootstrap { bootstrap: killed }, Instant::now()))
+        .await
+        .unwrap();
+    grant(&runtime).await;
+    assert!(runtime.submit(intent(1.0)).await.is_err());
+}

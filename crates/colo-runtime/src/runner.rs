@@ -488,6 +488,15 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
         if core.control.kill_latched().is_some() {
             core.book.set_trading_state_halted();
         }
+        // A reconnect re-sends the bootstrap. A runtime that recovered and is
+        // not killed stays ready; suspensions still gate admission.
+        if matches!(incoming, ToRuntime::Bootstrap { .. })
+            && core.control.kill_latched().is_none()
+            && inner.recovered.load(Ordering::SeqCst)
+            && !core.book.is_paused()
+        {
+            core.control.mark_ready();
+        }
         let kill = match &incoming {
             ToRuntime::Kill { kill } => Some(JournalRecord::Kill {
                 epoch: core.control.kill_latched().unwrap_or(0),
