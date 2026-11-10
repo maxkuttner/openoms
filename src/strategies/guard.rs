@@ -76,8 +76,9 @@ pub fn check_state(
 
 /// The limits for one instrument: each field of its `risk_limits` row, else
 /// the strategy's default for that field. A default notional limit is only
-/// read in a USD-like quote; any other quote needs its own (the default is
-/// dropped, not refused). A `band_exempt` venue gets no price band. Price band and
+/// read in a USD-like quote; in any other quote the default is dropped (no
+/// notional check) unless the instrument has its own. A `band_exempt` venue
+/// gets no price band. Price band and
 /// order-rate come from the strategy, never the per-instrument row.
 pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, quote_currency: &str, band_exempt: bool) -> Result<RiskLimits, RiskRejection> {
     let defaults = RiskLimits {
@@ -159,15 +160,24 @@ pub fn covered(inst: &InstrumentRef) -> bool {
 }
 
 /// The mark a strategy order is checked against, looked up before its
-/// transaction: `Ok(None)` when no feed covers the instrument.
-pub async fn reference(state: &crate::app_state::AppState, strategy: &Strategy, inst: &InstrumentRef) -> Result<Option<Mark>, RiskRejection> {
+/// transaction: `Ok(None)` when no feed covers the instrument. A `band_exempt`
+/// venue never holds or refuses an order for lack of a quote: it takes the mark
+/// if there is one (and subscribes for the next order) and otherwise goes on
+/// without.
+pub async fn reference(state: &crate::app_state::AppState, strategy: &Strategy, inst: &InstrumentRef, band_exempt: bool) -> Result<Option<Mark>, RiskRejection> {
     let owner = md_owner(&strategy.code);
-    match reference_mark(state.marks(), &state.market_data().handle(), &owner, inst, covered(inst), HOLD_FOR_MARK).await {
+    reference_or_skip(state.marks(), &state.market_data().handle(), &owner, inst, covered(inst), band_exempt, HOLD_FOR_MARK).await
+}
+
+async fn reference_or_skip(marks: &MarkStore, md: &MdHandle, owner: &str, inst: &InstrumentRef, covered: bool, band_exempt: bool, hold: Duration) -> Result<Option<Mark>, RiskRejection> {
+    let hold = if band_exempt { Duration::ZERO } else { hold };
+    match reference_mark(marks, md, owner, inst, covered, hold).await {
         MarkLookup::Live(m) => Ok(Some(m)),
         MarkLookup::NotCovered => {
-            warn!(strategy = %strategy.code, instrument_id = inst.id, "no feed prices this instrument; price band and market-order notional skipped");
+            warn!(owner, instrument_id = inst.id, "no feed prices this instrument; price band and market-order notional skipped");
             Ok(None)
         }
+        MarkLookup::TimedOut if band_exempt => Ok(None),
         MarkLookup::TimedOut => Err(reject("no_reference_price", format!("no reference price within {}s", HOLD_FOR_MARK.as_secs()))),
     }
 }
@@ -328,6 +338,21 @@ mod tests {
         marks.set_at(7, 99.0, 101.0, chrono::Utc::now() - chrono::Duration::minutes(5));
         let lookup = reference_mark(&marks, &md(), "strategy:s", &held(7), true, Duration::from_millis(50)).await;
         assert!(matches!(lookup, MarkLookup::TimedOut), "{lookup:?}");
+    }
+
+    #[tokio::test]
+    async fn a_band_exempt_order_is_not_held_or_refused_for_a_missing_quote() {
+        let marks = MarkStore::new();
+        let hold = Duration::from_millis(50);
+        let refused = reference_or_skip(&marks, &md(), "strategy:s", &held(7), true, false, hold).await.unwrap_err();
+        assert_eq!(refused.code, "no_reference_price");
+        let started = std::time::Instant::now();
+        let exempt = reference_or_skip(&marks, &md(), "strategy:s", &held(7), true, true, Duration::from_secs(30)).await;
+        assert!(matches!(exempt, Ok(None)), "{exempt:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        marks.set(7, 99.0, 101.0);
+        let live = reference_or_skip(&marks, &md(), "strategy:s", &held(7), true, true, hold).await;
+        assert_eq!(live.unwrap().map(|m| m.mid()), Some(100.0));
     }
 
     #[test]

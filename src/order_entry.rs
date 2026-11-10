@@ -642,6 +642,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
 
     // A strategy order's reference price, looked up before the transaction so
     // waiting for a first quote never holds the strategy's row lock.
+    let band_exempt = gateway::connectors::by_code(&broker_code).is_some_and(|c| c.manifest().price_band_exempt);
     let quote_currency: String = instrument_row.get("currency");
     let mark = match &strategy {
         Some(s) => {
@@ -652,7 +653,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
                 asset_class: instrument_row.get("asset_class"),
                 venue: instrument_row.get("venue"),
             };
-            match guard::reference(state, s, &inst).await {
+            match guard::reference(state, s, &inst, band_exempt).await {
                 Ok(mark) => mark,
                 Err(rejection) => {
                     record_rejection(state, auth, order_id, cmd.clone(), &broker_connection_code, &origin, &fix_cl_ord_id, &rejection).await?;
@@ -723,7 +724,6 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // state may have changed since (Kill), the lock serializes its submits and
     // its session-end cancels, and a portfolio the snapshot missed is still
     // the strategy's.
-    let band_exempt = gateway::connectors::by_code(&broker_code).is_some_and(|c| c.manifest().price_band_exempt);
     let risk = match strategies::by_portfolio(&mut tx, portfolio_id).await {
         Ok(Some(locked)) => {
             let gates = (|| {
