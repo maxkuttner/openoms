@@ -16,7 +16,7 @@
 ## Install
 
 ```sh
-curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+curl -fsSL https://openoms.dev/install.sh | sh
 oms init     # database (it can start PostgreSQL in Docker), admin password, listen address
 oms          # starts the OMS on localhost:3001
 ```
@@ -26,15 +26,7 @@ Silicon) and Linux (x86_64, OpenSSL 3).
 
 ## Documentation
 
-**[maxkuttner.github.io/openoms](https://maxkuttner.github.io/openoms/)**
-
-- [Getting started](https://maxkuttner.github.io/openoms/getting-started/): install, `oms init`, first login
-- [Your first paper trade](https://maxkuttner.github.io/openoms/getting-started/first-paper-trade/) — Alpaca paper, end to end
-- [Your first API call](https://maxkuttner.github.io/openoms/getting-started/first-api-call/) — curl and the Python client
-- [Configuration](https://maxkuttner.github.io/openoms/configuration/reference/) — `oms.toml`, environment variables, [login (OIDC)](https://maxkuttner.github.io/openoms/configuration/login/)
-- [Integrations](https://maxkuttner.github.io/openoms/integrations/alpaca/) — Alpaca, Binance, IBKR, Bybit, Databento
-- [Operations](https://maxkuttner.github.io/openoms/operations/updating/) — updating, running as a service, database, backups, [troubleshooting](https://maxkuttner.github.io/openoms/operations/troubleshooting/)
-- [API reference](https://maxkuttner.github.io/openoms/api/)
+**[openoms.dev](https://openoms.dev)**
 
 ## Develop
 

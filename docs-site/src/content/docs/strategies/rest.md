@@ -4,7 +4,7 @@ description: Trade a strategy through the OMS's REST API, with the same checks a
 ---
 
 A strategy can use the REST API instead of FIX, or alongside it. Set the strategy up as
-described in [Strategies over FIX](/openoms/strategies/fix/); the REST side needs no FIX
+described in [Strategies over FIX](/strategies/fix/); the REST side needs no FIX
 password, port or restart.
 
 ## Token

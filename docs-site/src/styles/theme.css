@@ -1,9 +1,3 @@
-/* The cockpit's green accent (site/style.css --accent: #25b083), in both schemes. */
-:root {
-  --sl-color-accent-low: #0b2e22;
-  --sl-color-accent: #1f9a72;
-  --sl-color-accent-high: #a8ecd2;
-}
 /* The openoms colour scheme. Copies of cockpit/src/palette.ts, the one list of
    openoms colours; a docs test (dist.test.mjs) fails if they drift apart. The
    landing page's glows (GrainBackground.astro) are glow-green and orange. */
@@ -23,45 +17,277 @@
   --oms-paper-border: #dcdfe5;
 }
 
-/* Dark scheme: soft black surfaces instead of Starlight's blue-grey, and
-   visible hairlines, so the sidebar and the top bar have a dividing line. */
+/* ---------------------------------------------------------------------------
+   Type: Geist for prose and UI, Geist Mono for code. One family, two cuts.
+   --------------------------------------------------------------------------- */
+:root {
+  --sl-font: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: "Geist Mono Variable", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sl-text-h1: 1.875rem;
+  --sl-text-h2: 1.375rem;
+  --sl-text-h3: 1.125rem;
+  --sl-text-h4: 1rem;
+  /* The box system shared by cards, code, callouts and inline code. */
+  --docs-radius: 8px;
+  --docs-radius-sm: 6px;
+}
+.sl-markdown-content :is(h1, h2, h3, h4) {
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+h1#_top {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+/* ---------------------------------------------------------------------------
+   Colours. The box fill is a translucent step above the page, so the same
+   rule reads on the plain docs background and on the landing page's glow.
+   --------------------------------------------------------------------------- */
+:root,
 :root[data-theme="dark"] {
+  --sl-color-accent-low: #0b2e22;
+  --sl-color-accent: var(--oms-green);
+  --sl-color-accent-high: #a8ecd2;
   --sl-color-black: var(--oms-black);
   --sl-color-hairline: var(--oms-border);
+  --sl-color-hairline-light: var(--oms-border);
   --sl-color-hairline-shade: var(--oms-border);
   --sl-color-bg-nav: var(--oms-black);
   --sl-color-bg-sidebar: var(--oms-black);
-  --sl-color-bg-inline-code: var(--oms-raised);
-}
-/* Code blocks: a neutral near-black a step above the page, not the theme's blue. */
-:root[data-theme="dark"] .expressive-code {
-  --ec-codeBg: var(--oms-surface) !important;
-  --ec-frm-edBg: var(--oms-surface) !important;
-  --ec-frm-trmBg: var(--oms-surface) !important;
-  --ec-frm-edTabBarBg: var(--oms-raised) !important;
-  --ec-frm-edActTabBg: var(--oms-surface) !important;
-  --ec-frm-trmTtbBg: var(--oms-raised) !important;
-}
-/* Light scheme: a cool off-white instead of plain white. */
-:root[data-theme="light"] {
-  --sl-color-black: var(--oms-paper);
-  --sl-color-bg-nav: var(--oms-paper);
-  --sl-color-bg-sidebar: var(--oms-paper-raised);
-  --sl-color-bg-inline-code: var(--oms-paper-raised);
-  --sl-color-hairline: var(--oms-paper-border);
-  --sl-color-hairline-shade: var(--oms-paper-border);
+  --sl-color-bg-inline-code: var(--oms-surface);
+  --docs-box: rgb(29 35 44 / 0.55);
+  --docs-box-hover: rgb(29 35 44 / 0.9);
+  --docs-box-border: var(--oms-border);
+  --docs-box-border-hover: #3b424e;
+  --docs-tile: var(--oms-surface);
+  --docs-muted: #9aa3b0;
+  --docs-code-bg: var(--oms-surface);
+  --docs-current: rgb(37 176 131 / 0.12);
 }
 :root[data-theme="light"] {
   --sl-color-accent-low: #c8f1e1;
   --sl-color-accent: #14805d;
   --sl-color-accent-high: #0b3d2c;
+  --sl-color-black: var(--oms-paper);
+  --sl-color-bg-nav: var(--oms-paper);
+  --sl-color-bg-sidebar: var(--oms-paper);
+  --sl-color-bg-inline-code: #ffffff;
+  --sl-color-hairline: var(--oms-paper-border);
+  --sl-color-hairline-light: var(--oms-paper-border);
+  --sl-color-hairline-shade: var(--oms-paper-border);
+  --docs-box: rgb(255 255 255 / 0.7);
+  --docs-box-hover: #ffffff;
+  --docs-box-border: var(--oms-paper-border);
+  --docs-box-border-hover: #c3c8d1;
+  --docs-tile: #ffffff;
+  --docs-muted: #5b6472;
+  --docs-code-bg: #ffffff;
+  --docs-current: rgb(20 128 93 / 0.1);
 }
 
-/* Landing page only (Starlight marks it data-has-hero), dark scheme only: the
-   image is near-black, so in light mode the page keeps its plain background. */
+/* ---------------------------------------------------------------------------
+   Cards: flat boxes with a hairline, a small icon tile and a quiet body.
+   Linked cards brighten their border on hover; nothing moves.
+   --------------------------------------------------------------------------- */
+.card,
+.sl-link-card {
+  border: 1px solid var(--docs-box-border);
+  border-radius: var(--docs-radius-sm);
+  background: var(--docs-box);
+  box-shadow: none;
+  padding: 1rem;
+  gap: 0.6rem;
+}
+.sl-link-card:hover {
+  border-color: var(--docs-box-border-hover);
+  background: var(--docs-box-hover);
+}
+.card .title {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.75rem;
+  font-size: var(--sl-text-base);
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+.card .body,
+.sl-link-card .description {
+  font-size: var(--sl-text-sm);
+  line-height: 1.55;
+  color: var(--docs-muted);
+}
+.card .icon {
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0.5rem;
+  border: 1px solid var(--docs-box-border);
+  border-radius: var(--docs-radius);
+  background-color: var(--docs-tile);
+  color: var(--sl-color-accent);
+  box-shadow: none;
+}
+.card-grid {
+  gap: 0.75rem;
+}
+
+/* ---------------------------------------------------------------------------
+   Code. Blocks sit on a bordered panel with no title-bar shading; a terminal
+   frame looks like any other block. Inline code is a tiny box of its own.
+   --------------------------------------------------------------------------- */
+.expressive-code {
+  --ec-brdRad: var(--docs-radius) !important;
+  --ec-brdCol: var(--docs-box-border) !important;
+  --ec-codeBg: var(--docs-code-bg) !important;
+  --ec-frm-edBg: var(--docs-code-bg) !important;
+  --ec-frm-trmBg: var(--docs-code-bg) !important;
+  --ec-frm-edTabBarBg: var(--docs-code-bg) !important;
+  --ec-frm-edActTabBg: var(--docs-code-bg) !important;
+  --ec-frm-edActTabIndTopCol: transparent !important;
+  --ec-frm-edTabBarBrdBtmCol: var(--docs-box-border) !important;
+  --ec-frm-trmTtbBg: var(--docs-code-bg) !important;
+  --ec-frm-trmTtbBrdBtmCol: var(--docs-box-border) !important;
+  --ec-frm-frameBoxShdCssVal: none !important;
+  --ec-codePadBlk: 1rem !important;
+  --ec-codePadInl: 1.25rem !important;
+}
+/* No window chrome on shell blocks: an untitled terminal frame drops its
+   header bar and keeps the border all round. */
+.expressive-code .frame.is-terminal:not(.has-title) .header {
+  display: none;
+}
+.expressive-code .frame.is-terminal:not(.has-title) pre {
+  border-top: var(--ec-brdWd) solid var(--ec-brdCol);
+  border-radius: var(--ec-brdRad);
+}
+.sl-markdown-content :not(pre) > code {
+  padding: 0.1em 0.35em;
+  border: 1px solid var(--docs-box-border);
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+/* ---------------------------------------------------------------------------
+   Callouts: a tint of their own colour, a full hairline and rounded corners,
+   instead of Starlight's left bar.
+   --------------------------------------------------------------------------- */
+.starlight-aside {
+  border: 1px solid color-mix(in srgb, var(--sl-color-asides-border) 45%, transparent);
+  border-radius: var(--docs-radius);
+  background: color-mix(in srgb, var(--sl-color-asides-border) 9%, transparent);
+  padding: 0.85rem 1rem;
+}
+.starlight-aside__title {
+  font-size: var(--sl-text-sm);
+  font-weight: 600;
+}
+.starlight-aside__content {
+  font-size: var(--sl-text-sm);
+}
+
+/* ---------------------------------------------------------------------------
+   Steps: a small numbered badge on a faint rail.
+   --------------------------------------------------------------------------- */
+.sl-steps > li::before {
+  --sl-steps-bullet-size: 1.5rem;
+  border: 1px solid var(--docs-box-border);
+  background: var(--docs-tile);
+  color: var(--docs-muted);
+  font-size: var(--sl-text-xs);
+  font-weight: 500;
+  box-shadow: none;
+}
+.sl-steps > li::after {
+  background-color: var(--docs-box-border);
+  width: 1px;
+}
+
+/* ---------------------------------------------------------------------------
+   Navigation: the current page is a soft accent tint, group headings are the
+   only bold text in the sidebar, and the page outline marks its place with
+   colour alone.
+   --------------------------------------------------------------------------- */
+.sidebar-content a {
+  border-radius: var(--docs-radius-sm);
+  color: var(--docs-muted);
+  font-size: var(--sl-text-sm);
+}
+.sidebar-content a:hover {
+  color: var(--sl-color-white);
+}
+.sidebar-content a[aria-current="page"],
+.sidebar-content a[aria-current="page"]:hover,
+.sidebar-content a[aria-current="page"]:focus {
+  background-color: var(--docs-current);
+  color: var(--sl-color-accent-high);
+  font-weight: 500;
+}
+.sidebar-content .group-label .large {
+  font-size: var(--sl-text-sm);
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+starlight-toc a {
+  color: var(--docs-muted);
+}
+starlight-toc a[aria-current="true"] {
+  color: var(--sl-color-accent-high);
+}
+
+/* Search: a quiet bordered field, like the boxes. */
+site-search button[data-open-modal] {
+  border: 1px solid var(--docs-box-border);
+  border-radius: var(--docs-radius);
+  background: var(--docs-box);
+}
+
+/* ---------------------------------------------------------------------------
+   Buttons: rounded rectangles. The primary is solid accent; the others are
+   boxes.
+   --------------------------------------------------------------------------- */
+.sl-link-button {
+  border-radius: var(--docs-radius);
+  font-weight: 500;
+  font-size: var(--sl-text-sm);
+  padding: 0.6rem 1.1rem;
+}
+.sl-link-button.primary {
+  background: var(--oms-green);
+  border-color: var(--oms-green);
+  color: var(--oms-black);
+}
+.sl-link-button.primary:hover {
+  background: color-mix(in srgb, var(--oms-green) 85%, white);
+  border-color: color-mix(in srgb, var(--oms-green) 85%, white);
+}
+.sl-link-button.minimal,
+.sl-link-button.secondary {
+  border: 1px solid var(--docs-box-border);
+  background: var(--docs-box);
+  color: var(--sl-color-white);
+}
+.sl-link-button.minimal:hover,
+.sl-link-button.secondary:hover {
+  border-color: var(--docs-box-border-hover);
+}
+:root[data-theme="light"] .sl-link-button.primary {
+  background: #14805d;
+  border-color: #14805d;
+  color: #ffffff;
+}
+:root[data-theme="light"] .sl-link-button.primary:hover {
+  background: color-mix(in srgb, #14805d 85%, black);
+  border-color: color-mix(in srgb, #14805d 85%, black);
+}
+
+/* ---------------------------------------------------------------------------
+   Landing page (Starlight marks it data-has-hero).
+   --------------------------------------------------------------------------- */
+/* Dark scheme only: the image is near-black, so in light mode the page keeps
+   its plain background. */
 :root[data-theme="dark"][data-has-hero] {
   background-color: var(--oms-black);
-  background-image: url("/openoms/landing-bg.webp");
+  background-image: url("/landing-bg.webp");
   background-size: cover;
   background-position: center;
   background-attachment: fixed;
@@ -76,7 +302,6 @@
   background-color: rgb(0 0 0 / 0.35);
   backdrop-filter: blur(8px);
 }
-
 /* Light scheme: the grain canvas (GrainBackground.astro) draws a light
    variant, so the page layers go transparent here too. */
 :root[data-theme="light"][data-has-hero] body,
@@ -88,6 +313,16 @@
   background-color: rgb(255 255 255 / 0.5);
   backdrop-filter: blur(8px);
 }
+/* The landing boxes need a firmer fill to hold up over the glow. */
+:root[data-theme="dark"][data-has-hero] {
+  --docs-box: rgb(19 23 29 / 0.72);
+  --docs-box-hover: rgb(19 23 29 / 0.9);
+}
+[data-has-hero] .card,
+[data-has-hero] .sl-link-card,
+[data-has-hero] .expressive-code .frame {
+  backdrop-filter: blur(6px);
+}
 
 /* The 3D logo tile, lifted off the page as in the brand sheet. */
 .hero > img {
@@ -97,39 +332,7 @@
 :root[data-theme="light"] .hero > img {
   box-shadow: 0 10px 22px -8px rgba(13, 16, 20, 0.55), 0 2px 5px rgba(13, 16, 20, 0.18);
 }
+.hero .tagline {
+  color: var(--docs-muted);
+}
 
-/* Landing page feature cards, styled like the 3D logo tile: a dark tile
-   lit from above, a rim highlight along the top edge and a soft drop shadow.
-   Icons sit in small extruded bars, green on the top row and amber below,
-   in the order of the logo's bars. */
-[data-has-hero] .card {
-  border: 1px solid #262b33;
-  border-radius: 14px;
-  background: linear-gradient(180deg, #1d232c, #08090c);
-  box-shadow:
-    inset 0 1px 0 rgb(255 255 255 / 0.1),
-    0 12px 26px -8px rgb(0 0 0 / 0.8);
-}
-[data-has-hero] .card .icon {
-  --bar-top: #4fd6a8;
-  --bar: var(--oms-green);
-  --bar-side: #16785a;
-  color: var(--oms-logo-tile);
-  border: 0;
-  border-radius: 6px;
-  background: linear-gradient(180deg, var(--bar-top), var(--bar));
-  box-shadow: 0 3px 0 var(--bar-side), 0 6px 10px -2px rgb(0 0 0 / 0.6);
-}
-[data-has-hero] .card:nth-child(n + 3) .icon {
-  --bar-top: #ebbe68;
-  --bar: var(--oms-amber);
-  --bar-side: #8c6420;
-}
-/* Light scheme: the same tile on white, as in the brand sheet's light row. */
-:root[data-theme="light"][data-has-hero] .card {
-  border-color: #e2e4e8;
-  background: linear-gradient(180deg, #ffffff, #f4f5f7);
-  box-shadow:
-    0 10px 22px -8px rgb(13 16 20 / 0.35),
-    0 2px 5px rgb(13 16 20 / 0.12);
-}

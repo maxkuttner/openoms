@@ -11,7 +11,7 @@ openoms ships as one `oms` binary. Install it with one command, or build it from
 
 `oms` is a single executable: the server, the web cockpit and the command-line tool in one
 file. It needs no runtime, and the cockpit is embedded. Its only outside dependency is a
-PostgreSQL 16 database, which [`oms init`](/openoms/getting-started/) can start for you in
+PostgreSQL 16 database, which [`oms init`](/getting-started/) can start for you in
 Docker.
 
 ## Installation
@@ -20,7 +20,7 @@ Docker.
 <TabItem label="macOS & Linux">
 
 ```sh
-curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+curl -fsSL https://openoms.dev/install.sh | sh
 ```
 
 <Aside type="note" title="Supported systems">
@@ -68,7 +68,7 @@ Runs openoms and PostgreSQL 16 together with Docker Compose:
 
 ```sh
 mkdir openoms && cd openoms
-curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
+curl -fsSLO https://openoms.dev/compose.yaml
 [ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
 docker compose run --rm oms init
 docker compose up -d
@@ -77,7 +77,7 @@ docker compose up -d
 `oms init` asks one thing, the cockpit admin password (Enter generates one). Then open
 `http://localhost:3001/cockpit/`.
 
-- [compose.yaml](https://maxkuttner.github.io/openoms/compose.yaml) runs the
+- [compose.yaml](https://openoms.dev/compose.yaml) runs the
   `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
 - The cockpit is published on this machine only (`127.0.0.1:3001`). On a remote server,
   reach it through an SSH tunnel or Tailscale.
@@ -146,7 +146,7 @@ manager or container owns refuses to overwrite itself and names the command to u
 | From source | `git pull`, then rebuild |
 
 After upgrading outside Docker, apply new database migrations; see
-[Updating](/openoms/operations/updating/).
+[Updating](/operations/updating/).
 
 ## Installing older versions
 
@@ -154,7 +154,7 @@ After upgrading outside Docker, apply new database migrations; see
 <TabItem label="macOS & Linux">
 
 ```sh
-curl -fsSL https://maxkuttner.github.io/openoms/install.sh | OMS_VERSION=v0.4.0 sh
+curl -fsSL https://openoms.dev/install.sh | OMS_VERSION=v0.4.0 sh
 ```
 
 </TabItem>

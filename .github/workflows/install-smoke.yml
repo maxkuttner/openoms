@@ -21,7 +21,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: install exactly the way the landing page says to
-        run: curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+        run: curl -fsSL https://openoms.dev/install.sh | sh
 
       - name: the installed binary runs and matches the latest release
         env:
@@ -84,7 +84,7 @@ jobs:
       - name: run exactly the way the docs say to
         run: |
           mkdir openoms && cd openoms
-          curl -fsSLO https://maxkuttner.github.io/openoms/compose.yaml
+          curl -fsSLO https://openoms.dev/compose.yaml
           [ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
           docker compose run --rm oms init --non-interactive
           docker compose up -d

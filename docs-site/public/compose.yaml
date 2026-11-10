@@ -1,5 +1,5 @@
 # openoms + PostgreSQL 16. Guide:
-# https://maxkuttner.github.io/openoms/getting-started/installation/
+# https://openoms.dev/getting-started/installation/
 #
 #   [ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
 #   docker compose run --rm oms init
@@ -13,7 +13,7 @@ services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?create .env with POSTGRES_PASSWORD=... next to compose.yaml, see https://maxkuttner.github.io/openoms/getting-started/installation/}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?create .env with POSTGRES_PASSWORD=... next to compose.yaml, see https://openoms.dev/getting-started/installation/}
     volumes:
       - oms-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -27,7 +27,7 @@ services:
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_USERNAME: postgres
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?create .env with POSTGRES_PASSWORD=... next to compose.yaml, see https://maxkuttner.github.io/openoms/getting-started/installation/}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?create .env with POSTGRES_PASSWORD=... next to compose.yaml, see https://openoms.dev/getting-started/installation/}
     volumes:
       - oms-config:/config
     ports:

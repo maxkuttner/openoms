@@ -1,14 +1,14 @@
 // Checks against the built site in dist/ (run `npm run build` first, or
 // `npm run check` for both). These pin what Starlight's own build does not:
 // the install URL people pipe into a shell, and that everything works under
-// the /openoms/ base path GitHub Pages serves the site from.
+// the root path GitHub Pages serves the site from.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const DIST = new URL("../dist/", import.meta.url).pathname;
-const BASE = "/openoms/";
+const BASE = "/";
 
 function htmlFiles(dir) {
   return readdirSync(dir).flatMap((name) => {
@@ -26,7 +26,7 @@ test("install.sh in dist is byte-identical to the repo copy", () => {
 
 test("the home page sends people to Getting started", () => {
   const html = readFileSync(join(DIST, "index.html"), "utf8");
-  assert.ok(html.includes('href="/openoms/getting-started/"'), "no Get started link on the home page");
+  assert.ok(html.includes('href="/getting-started/"'), "no Get started link on the home page");
 });
 
 // Starlight puts the theme switch in the ☰ menu on phones, and pages without a
@@ -68,7 +68,7 @@ test("getting started points to Installation instead of repeating it", () => {
   assert.ok(!html.includes("install.sh"), "getting started repeats the install script");
   assert.ok(!html.includes("brew install"), "getting started repeats the brew install");
   assert.ok(
-    html.includes('href="/openoms/getting-started/installation/"'),
+    html.includes('href="/getting-started/installation/"'),
     "getting started does not link to Installation",
   );
 });
@@ -91,7 +91,7 @@ test("every internal href in dist resolves to a built file", () => {
   assert.deepEqual(broken, []);
 });
 
-// The trading endpoints a reader of "Your first API call" needs. Each must have
+// The trading endpoints API users need most. Each must have
 // its own generated page, so a plugin change or a spec-shape the plugin skips
 // cannot silently drop them from the reference.
 const TRADING_OPERATIONS = [
@@ -135,13 +135,13 @@ test("the architecture page renders all three diagrams", () => {
 });
 
 // The old hand-built site's pages. Every shipped cockpit links to
-// /openoms/architecture.html, so these must keep resolving.
+// /architecture.html, so these must keep resolving.
 for (const [old, target] of [
-  ["architecture.html", "/openoms/concepts/architecture/"],
-  ["api.html", "/openoms/api/"],
-  ["getting-started/first-run/index.html", "/openoms/getting-started/"],
+  ["architecture.html", "/concepts/architecture/"],
+  ["api.html", "/api/"],
+  ["getting-started/first-run/index.html", "/getting-started/"],
 ]) {
-  test(`the old /openoms/${old} redirects to ${target}`, () => {
+  test(`the old /${old} redirects to ${target}`, () => {
     const html = readFileSync(join(DIST, old), "utf8");
     assert.match(html, new RegExp(`<meta http-equiv="refresh" content="0; url=${target}"`));
     assert.ok(existsSync(join(DIST, target.slice(BASE.length), "index.html")), `${target} is not built`);
@@ -211,7 +211,7 @@ test("installation has OS tabs and links the installer source, not the raw scrip
   for (const tab of ["macOS &amp; Linux", "Windows", "Package Managers", "Docker"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
   assert.ok(html.includes('data-sync-key="os"'), "tabs not synced across pages");
   assert.ok(html.includes("https://github.com/maxkuttner/openoms/blob/main/install.sh"));
-  assert.ok(!html.includes('href="/openoms/install.sh"'), "still links the raw script");
+  assert.ok(!html.includes('href="/install.sh"'), "still links the raw script");
 });
 
 test("installation's Package Managers and Docker tabs give real commands", () => {

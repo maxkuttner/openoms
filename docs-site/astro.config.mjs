@@ -4,10 +4,9 @@ import starlight from "@astrojs/starlight";
 import starlightLinksValidator from "starlight-links-validator";
 import starlightOpenAPI, { openAPISidebarGroups } from "starlight-openapi";
 
-// Served as a GitHub Pages project site: https://maxkuttner.github.io/openoms/
+// Served by GitHub Pages at the custom domain, from the root: https://openoms.dev/
 export default defineConfig({
-  site: "https://maxkuttner.github.io",
-  base: "/openoms",
+  site: "https://openoms.dev",
   integrations: [
     starlight({
       title: "openoms",
@@ -16,7 +15,7 @@ export default defineConfig({
       favicon: "/favicon.svg",
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/maxkuttner/openoms" }],
       editLink: { baseUrl: "https://github.com/maxkuttner/openoms/edit/main/docs-site/" },
-      customCss: ["./src/styles/theme.css"],
+      customCss: ["@fontsource-variable/geist", "@fontsource-variable/geist-mono", "./src/styles/theme.css"],
       components: { Header: "./src/components/Header.astro" },
       plugins: [
         // Generated from the committed spec — never hand-written, so it cannot
@@ -27,7 +26,7 @@ export default defineConfig({
         starlightOpenAPI([{ base: "api", schema: "./.generated/openapi.json", sidebar: { label: "API Reference" } }]),
         // Generated API pages are invisible to the validator; test/dist.test.mjs
         // checks links into them against the built files instead.
-        starlightLinksValidator({ exclude: ["/openoms/api", "/openoms/api/**"] }),
+        starlightLinksValidator({ exclude: ["/api", "/api/**"] }),
       ],
       sidebar: [
         {
@@ -35,8 +34,6 @@ export default defineConfig({
           items: [
             "getting-started/installation",
             "getting-started",
-            "getting-started/first-paper-trade",
-            "getting-started/first-api-call",
           ],
         },
         {

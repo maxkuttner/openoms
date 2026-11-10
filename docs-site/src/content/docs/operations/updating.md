@@ -11,7 +11,7 @@ oms update
 
 :::note[On v0.2.0?]
 `oms update` arrived after v0.2.0. On that version, update once by re-running the
-installer (`curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh`); from then
+installer (`curl -fsSL https://openoms.dev/install.sh | sh`); from then
 on, `oms update` works.
 :::
 
@@ -78,5 +78,5 @@ cargo build --release
 The installer works for updates too, and always installs the latest release:
 
 ```sh
-curl -fsSL https://maxkuttner.github.io/openoms/install.sh | sh
+curl -fsSL https://openoms.dev/install.sh | sh
 ```

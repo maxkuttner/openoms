@@ -4,8 +4,7 @@ description: Route US equities and options to Alpaca, paper or live.
 ---
 
 Alpaca is the quickest way to a working setup: free paper trading, US equities and
-options, REST order entry and a streaming execution feed. [Your first paper
-trade](/openoms/getting-started/first-paper-trade/) walks through it end to end.
+options, REST order entry and a streaming execution feed.
 
 ## What it covers
 
@@ -31,7 +30,7 @@ Paper and live accounts have separate keys.
 
 Enter them in the cockpit under **Broker connections → alpaca-paper → Credentials**
 (**Test**, then **Save**). They are stored encrypted with your
-[master key](/openoms/operations/master-key-and-backups/), never in a file. Apply them to a
+[master key](/operations/master-key-and-backups/), never in a file. Apply them to a
 running server without a restart:
 
 ```sh
@@ -89,7 +88,7 @@ any label for the Alpaca account — it must be unique per connection:
 
 - **No live equity prices.** The OMS has no equity price feed, so equity and ETF
   positions are not marked to market. Option positions can be marked through
-  [Databento OPRA](/openoms/integrations/databento/).
+  [Databento OPRA](/integrations/databento/).
 - A handful of Alpaca assets on exchanges the OMS has no venue code for (for example
   `TXSE`) are skipped during sync, with a warning naming them.
 - Market orders outside US market hours wait at Alpaca for the open (`day`) — they show

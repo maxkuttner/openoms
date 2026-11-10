@@ -41,3 +41,6 @@ oms.toml
 
 # scripts/colo-demo.sh state
 /colo-demo/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

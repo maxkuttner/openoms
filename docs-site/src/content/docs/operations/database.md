@@ -21,7 +21,7 @@ directly to upgrade, inspect, or start over.
   what is missing and re-runs the remaining steps, all of which are safe to repeat.
 - `drop` against a database that is not on `localhost` needs `--yes`.
 - The server itself never creates or migrates anything: after an
-  [update](/openoms/operations/updating/), run `oms database migrate`.
+  [update](/operations/updating/), run `oms database migrate`.
 
 ```sh
 oms database status
