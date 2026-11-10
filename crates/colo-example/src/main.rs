@@ -50,8 +50,8 @@ struct Args {
     /// Operator-verified venue account reference.
     #[arg(long)]
     account_ref: String,
-    /// Deployment epoch.
-    #[arg(long, default_value_t = 1)]
+    /// Deployment epoch; 0 (default) takes the one the OMS assigns.
+    #[arg(long, default_value_t = 0)]
     epoch: u64,
     #[arg(long, default_value = "colo-journal")]
     journal_dir: std::path::PathBuf,
@@ -168,11 +168,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_revision: 0,
     });
     let bootstrap = receive_bootstrap(&link).await?;
+    let epoch = link.epoch();
+    info!(epoch, "bootstrapped by the OMS");
     let venue = BinanceRuntimeVenue::new(adapter.clone(), identity.clone())?;
     let runtime = Runtime::start(
         RuntimeConfig {
             identity,
-            epoch: args.epoch,
+            epoch,
             bootstrap,
             journal_path: args.journal_dir.join("journal"),
             max_journal_bytes: MAX_JOURNAL_BYTES,

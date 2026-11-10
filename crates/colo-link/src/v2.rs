@@ -276,11 +276,22 @@ pub struct ControlFrame {
 pub struct ControlGate {
     session: V2Session,
     connection: u64,
+    /// Epoch 0 means "not known yet": the first bootstrap names it.
+    adopt: Option<(AccountIdentity, String)>,
 }
 
 impl ControlGate {
+    /// `epoch` 0 adopts the epoch of the first bootstrap: the OMS assigns it
+    /// when this session takes the deployment over. Once adopted it is fixed.
     pub fn new(account: AccountIdentity, epoch: u64, session_nonce: impl Into<String>) -> Self {
-        Self { session: V2Session::control_only(account, epoch, session_nonce), connection: 0 }
+        let session_nonce = session_nonce.into();
+        let adopt = (epoch == 0).then(|| (account.clone(), session_nonce.clone()));
+        Self { session: V2Session::control_only(account, epoch, session_nonce), connection: 0, adopt }
+    }
+
+    /// The epoch frames are validated against; 0 until a bootstrap named it.
+    pub fn epoch(&self) -> u64 {
+        self.session.epoch()
     }
 
     pub fn admit(&mut self, frame: ControlFrame) -> Result<Received<ToRuntime>, ProtocolError> {
@@ -292,6 +303,9 @@ impl ControlGate {
                 return Err(ProtocolError::NoBootstrap);
             }
             self.connection = frame.connection;
+            if let Some((account, nonce)) = self.adopt.take() {
+                self.session = V2Session::control_only(account, frame.envelope.epoch, nonce);
+            }
             self.session.new_connection();
         }
         self.session.receive_control(frame.envelope, frame.received_at)
@@ -443,6 +457,10 @@ impl V2Session {
     /// for order but their bookkeeping belongs to whoever sends the events.
     pub fn control_only(account: AccountIdentity, epoch: u64, session_nonce: impl Into<String>) -> Self {
         Self { tracks_events: false, ..Self::new(account, epoch, session_nonce, 1) }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// A new connection numbers its control messages from 1 again, starting

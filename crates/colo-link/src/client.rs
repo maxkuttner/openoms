@@ -215,6 +215,7 @@ pub struct V2LinkConfig {
     pub token: String,
     pub ca_pem: Option<Vec<u8>>,
     pub account: AccountIdentity,
+    /// 0 adopts the epoch the OMS names in its first bootstrap.
     pub epoch: u64,
     pub session_nonce: String,
     pub policy_revision: u64,
@@ -227,7 +228,7 @@ pub struct V2Link {
     control: mpsc::Sender<FromRuntimeEnvelope>,
     events: mpsc::Sender<FromRuntimeEnvelope>,
     account: AccountIdentity,
-    epoch: u64,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
     policy_revision: u64,
     session_nonce: String,
 }
@@ -244,14 +245,17 @@ impl V2Link {
         let (events_tx, events_rx) = mpsc::channel::<FromRuntimeEnvelope>(256);
         let (control_in_tx, control_in_rx) = mpsc::channel::<ControlFrame>(256);
         let (events_in_tx, events_in_rx) = mpsc::channel::<ControlFrame>(256);
+        let epoch = Arc::new(std::sync::atomic::AtomicU64::new(cfg.epoch));
 
         let control_cfg = cfg.clone();
+        let control_epoch = epoch.clone();
         tokio::spawn(async move {
-            run_v2(&control_cfg, control_cfg.control_url.clone(), control_rx, control_in_tx).await;
+            run_v2(&control_cfg, control_cfg.control_url.clone(), control_rx, control_in_tx, control_epoch).await;
         });
         let event_cfg = cfg.clone();
+        let event_epoch = epoch.clone();
         tokio::spawn(async move {
-            run_v2(&event_cfg, event_cfg.events_url.clone(), events_rx, events_in_tx).await;
+            run_v2(&event_cfg, event_cfg.events_url.clone(), events_rx, events_in_tx, event_epoch).await;
         });
 
         (
@@ -259,7 +263,7 @@ impl V2Link {
                 control: control_tx,
                 events: events_tx,
                 account: cfg.account,
-                epoch: cfg.epoch,
+                epoch,
                 policy_revision: cfg.policy_revision,
                 session_nonce: cfg.session_nonce,
             },
@@ -284,11 +288,17 @@ impl V2Link {
         self.events.send(envelope).await.map_err(|_| ())
     }
 
+    /// The epoch this link speaks for: configured, or adopted from the
+    /// OMS's first bootstrap.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn envelope(&self, message: FromRuntime) -> FromRuntimeEnvelope {
         FromRuntimeEnvelope {
             protocol_version: PROTOCOL_VERSION,
             account: self.account.clone(),
-            epoch: self.epoch,
+            epoch: self.epoch(),
             policy_revision: self.policy_revision,
             sequence: 0,
             session_nonce: self.session_nonce.clone(),
@@ -302,10 +312,11 @@ async fn run_v2(
     url: String,
     mut out_rx: mpsc::Receiver<FromRuntimeEnvelope>,
     in_tx: mpsc::Sender<ControlFrame>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut connection = 0;
     loop {
-        if let Err(e) = run_v2_once(cfg, &url, &mut out_rx, &in_tx, &mut connection).await {
+        if let Err(e) = run_v2_once(cfg, &url, &mut out_rx, &in_tx, &mut connection, &epoch).await {
             warn!(error = %e, "v2 link: down; reconnecting");
         }
         if in_tx.is_closed() {
@@ -321,6 +332,7 @@ async fn run_v2_once(
     out_rx: &mut mpsc::Receiver<FromRuntimeEnvelope>,
     in_tx: &mpsc::Sender<ControlFrame>,
     connection: &mut u64,
+    epoch: &std::sync::atomic::AtomicU64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tls = native_tls::TlsConnector::builder();
     if let Some(pem) = &cfg.ca_pem {
@@ -349,6 +361,10 @@ async fn run_v2_once(
             frame = stream.next() => match frame {
                 Some(Ok(Message::Text(text))) => match serde_json::from_str::<ToRuntimeEnvelope>(&text) {
                     Ok(envelope) => {
+                        // An unconfigured epoch is the one the OMS bootstraps with.
+                        if matches!(envelope.message, ToRuntime::Bootstrap { .. }) {
+                            let _ = epoch.compare_exchange(0, envelope.epoch, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
+                        }
                         let frame = ControlFrame { connection, received_at: Instant::now(), envelope };
                         if in_tx.send(frame).await.is_err() { return Ok(()); }
                     }
@@ -366,7 +382,7 @@ async fn run_v2_once(
                 let heartbeat = FromRuntimeEnvelope {
                     protocol_version: PROTOCOL_VERSION,
                     account: cfg.account.clone(),
-                    epoch: cfg.epoch,
+                    epoch: epoch.load(std::sync::atomic::Ordering::SeqCst),
                     policy_revision: cfg.policy_revision,
                     sequence: 0,
                     session_nonce: cfg.session_nonce.clone(),
@@ -393,6 +409,11 @@ impl V2RuntimeLink {
         let (link, control, mut events) = V2Link::spawn(cfg);
         tokio::spawn(async move { while events.recv().await.is_some() {} });
         Arc::new(Self { link, control: tokio::sync::Mutex::new((control, gate)) })
+    }
+
+    /// The epoch the OMS assigned this session, once its bootstrap arrived.
+    pub fn epoch(&self) -> u64 {
+        self.link.epoch()
     }
 }
 

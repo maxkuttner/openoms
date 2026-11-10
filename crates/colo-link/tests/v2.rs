@@ -410,6 +410,18 @@ mod gate {
     }
 
     #[test]
+    fn an_unconfigured_gate_adopts_the_bootstrap_epoch_once() {
+        let account = account();
+        let mut gate = ControlGate::new(account.clone(), 0, "n1");
+        gate.admit(boot(1, &account)).expect("bootstrap at the OMS's epoch");
+        assert_eq!(gate.epoch(), 7);
+        // Adoption happens once: a later connection at another epoch is refused.
+        let mut other = boot(2, &account);
+        other.envelope.epoch = 8;
+        assert!(gate.admit(other).is_err());
+    }
+
+    #[test]
     fn a_new_connection_restarts_the_sequence_with_its_bootstrap() {
         let account = account();
         let mut gate = gate(&account);
@@ -491,3 +503,4 @@ mod gate {
             .expect("the bootstrap carried the kill");
     }
 }
+
