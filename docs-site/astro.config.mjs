@@ -64,6 +64,7 @@ export default defineConfig({
             "operations/troubleshooting",
           ],
         },
+        { label: "Changelog", slug: "changelog" },
         ...openAPISidebarGroups,
       ],
     }),

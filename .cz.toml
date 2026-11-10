@@ -1,0 +1,10 @@
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "cargo"
+tag_format = "v$version"
+update_changelog_on_bump = true
+changelog_file = "docs-site/src/content/docs/changelog.md"
+changelog_incremental = true
+changelog_start_rev = "v0.2.0"
+bump_message = "chore(release): v$new_version"
+major_version_zero = true
