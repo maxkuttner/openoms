@@ -26,6 +26,9 @@ hmac = "0.12"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 rand = "0.8"
+# Interactive Brokers TWS API client (the IBKR_TWS connector).
+ibapi = "=5.7.0"
+thiserror = "1"
 # The C++ QuickFIX engine for the FIX sessions (IBKR 4.2, Binance 4.4), with
 # TLS; we implement its ApplicationCallback. Needs cmake + a C++ compiler to build.
 quickfix = { version = "0.2", features = ["build-with-ssl"], optional = true }

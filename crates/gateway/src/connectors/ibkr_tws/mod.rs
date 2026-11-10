@@ -1,3 +1,4 @@
+pub mod client;
 pub mod exchanges;
 pub mod gateway;
 
