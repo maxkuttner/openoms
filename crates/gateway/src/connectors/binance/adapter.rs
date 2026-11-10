@@ -225,6 +225,15 @@ impl BinanceAdapter {
     }
 }
 
+/// A price or quantity as Binance accepts it: at most 8 decimals, no
+/// exponent, trailing zeros dropped. Plain float formatting can print float
+/// noise (`0.30000000000000004`), which Binance refuses as too precise.
+fn decimal(value: f64) -> String {
+    let fixed = format!("{value:.8}");
+    let trimmed = fixed.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" { "0".into() } else { trimmed.into() }
+}
+
 #[async_trait::async_trait]
 impl BrokerAdapter for BinanceAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
@@ -233,7 +242,7 @@ impl BrokerAdapter for BinanceAdapter {
             ("symbol", req.symbol.clone()), // the Binance pair, e.g. BTCUSDT
             ("side", side),
             ("newClientOrderId", req.order_id.clone()), // our UUID, echoed on fills
-            ("quantity", req.quantity.to_string()),
+            ("quantity", decimal(req.quantity)),
         ];
 
         match req.order_type.as_str() {
@@ -250,7 +259,7 @@ impl BrokerAdapter for BinanceAdapter {
                 };
                 params.push(("type", "LIMIT".to_string()));
                 params.push(("timeInForce", tif.to_string()));
-                params.push(("price", price.to_string()));
+                params.push(("price", decimal(price)));
             }
             other => return Err(BrokerError::NotConfigured(format!("unsupported order type: {other}"))),
         }
@@ -518,6 +527,14 @@ pub(crate) fn parse_my_trades(body: &serde_json::Value) -> Vec<crate::contract::
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn decimals_carry_no_float_noise_or_exponent() {
+        assert_eq!(super::decimal(0.1 + 0.2), "0.3");
+        assert_eq!(super::decimal(64000.0), "64000");
+        assert_eq!(super::decimal(0.00001), "0.00001");
+        assert_eq!(super::decimal(1e-9), "0");
+    }
     use super::*;
 
     #[test]

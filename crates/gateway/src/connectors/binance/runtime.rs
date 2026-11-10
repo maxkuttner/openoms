@@ -687,14 +687,17 @@ mod tests {
                 && prices.get(&i.broker_symbol).copied().is_some_and(|p| p > 0.0)
                 && free.get(&i.definition.currency).copied().unwrap_or(0.0) >= 10.0
         }).collect();
-        candidates.sort_by(|a, b| a.broker_symbol.cmp(&b.broker_symbol));
+        // Liquid majors first: their filters are the most predictable.
+        let rank = |symbol: &str| ["BTCUSDT", "ETHUSDT", "BNBUSDT"].iter().position(|s| *s == symbol).unwrap_or(usize::MAX);
+        candidates.sort_by(|a, b| rank(&a.broker_symbol).cmp(&rank(&b.broker_symbol)).then(a.broker_symbol.cmp(&b.broker_symbol)));
         assert!(!candidates.is_empty(), "no testnet pair with a funded quote asset");
 
         let mut placed: Option<(String, String, String)> = None;
         for instrument in candidates.iter().take(8) {
             let symbol = instrument.broker_symbol.clone();
             let mark = prices[&symbol];
-            let limit = mark * 0.9;
+            let tick = instrument.definition.price_increment;
+            let limit = if tick > 0.0 { ((mark * 0.9) / tick).floor() * tick } else { mark * 0.9 };
             let step = instrument.definition.size_increment;
             let min_qty = instrument.min_quantity.unwrap_or(step);
             let min_notional = instrument.min_notional.unwrap_or(5.0);
