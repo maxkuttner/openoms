@@ -1,6 +1,11 @@
+pub mod adapter;
 pub mod client;
 pub mod exchanges;
 pub mod gateway;
+pub mod stream;
+
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use futures_util::future::BoxFuture;
 
@@ -10,7 +15,7 @@ use crate::credentials::Shown::{Clear, Hidden};
 use crate::venue::{environments, field, Venue, DOCS};
 use crate::verify::TestOutcome;
 
-use super::{Connected, Connector, Manifest, QuoteScope};
+use super::{typed, Connected, Connector, Manifest, QuoteScope};
 
 pub struct IbkrTws;
 
@@ -41,13 +46,44 @@ impl Connector for IbkrTws {
         &MANIFEST
     }
 
-    fn connect(&self, _: &'static str, _: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
-        Err("not yet wired".into())
+    /// Builds the adapter now; the execution stream owns the gateway: it starts
+    /// or adopts the container, connects, and hands the client to the adapter.
+    fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
+        let creds: IbkrTwsCredentials = typed(creds, MANIFEST.credential_kind)?;
+        let state_dir = state_dir().ok_or("no HOME or XDG_STATE_HOME to keep the IB Gateway env file under")?;
+        let slot: adapter::ClientSlot = Arc::new(RwLock::new(None));
+        let adapter = Arc::new(adapter::IbkrTwsAdapter::new(slot.clone()));
+        let stream_adapter = adapter.clone();
+        Ok(Connected {
+            daily_stats: Some(adapter.clone()),
+            adapter,
+            exec_stream: Some(Arc::new(move |health, engine| {
+                let gw = stream::Gateway {
+                    docker: Arc::new(gateway::DockerCli),
+                    code: format!("{}-{env}", MANIFEST.code),
+                    env,
+                    creds: creds.clone(),
+                    state_dir: state_dir.clone(),
+                };
+                let ctx = stream::Ctx { adapter: stream_adapter.clone(), health, engine, env };
+                Box::pin(stream::supervise(gw, slot.clone(), ctx))
+            })),
+        })
     }
 
     fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
         Box::pin(async { TestOutcome::NotTestable("checked when the gateway logs in") })
     }
+}
+
+/// `$XDG_STATE_HOME/oms/ibkr`, else `~/.local/state/oms/ibkr`: where the
+/// short-lived gateway env file is written (mode 0600, deleted after `docker run`).
+fn state_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("oms").join("ibkr"))
 }
 
 fn venue() -> Venue {
