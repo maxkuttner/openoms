@@ -118,16 +118,17 @@ impl Runtime {
             now,
         ))?;
         control.begin_recovery();
-        if journal_killed {
-            control.apply(Received::new(
-                ToRuntime::Kill { kill: colo_link::v2::Kill { command_id: "journal-latch".into() } },
-                now,
-            ))?;
+        // The OMS's durable record decides the kill: the runtime journals a
+        // kill only after the OMS sent it, and the bootstrap's killed epoch is
+        // the one its Enable will name. A journalled kill the OMS no longer
+        // holds was enabled while this runtime was down.
+        if journal_killed && config.bootstrap.killed_epoch.is_none() {
+            tracing::info!("runtime: journalled kill was enabled by the OMS while stopped");
         }
         if control.kill_latched().is_some() {
             book.set_trading_state_halted();
         }
-        if recovered_ok && recovered_complete(&book, &control, config.bootstrap.killed_epoch, journal_killed) {
+        if recovered_ok && recovered_complete(&book, &control, config.bootstrap.killed_epoch) {
             control.mark_ready();
         } else {
             control.suspend("recovery is incomplete");
@@ -1028,8 +1029,8 @@ async fn resync(inner: &Arc<Inner>) -> Result<(), String> {
     Ok(())
 }
 
-fn recovered_complete(book: &Book, control: &ControlState, bootstrap_killed: Option<u64>, journal_killed: bool) -> bool {
-    bootstrap_killed.is_none() && !journal_killed && control.kill_latched().is_none() && !book.is_paused()
+fn recovered_complete(book: &Book, control: &ControlState, bootstrap_killed: Option<u64>) -> bool {
+    bootstrap_killed.is_none() && control.kill_latched().is_none() && !book.is_paused()
 }
 
 impl Drop for Runtime {

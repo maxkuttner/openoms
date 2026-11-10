@@ -232,11 +232,15 @@ async fn start_in(dir: &TempDir) -> (Runtime, Arc<FakeVenue>) {
 }
 
 async fn start_with(dir: &TempDir, bootstrap: Bootstrap) -> (Runtime, Arc<FakeVenue>) {
+    start_at(dir, bootstrap, 1).await
+}
+
+async fn start_at(dir: &TempDir, bootstrap: Bootstrap, epoch: u64) -> (Runtime, Arc<FakeVenue>) {
     let venue = Arc::new(FakeVenue::new());
     let runtime = Runtime::start(
         RuntimeConfig {
             identity: identity(),
-            epoch: 1,
+            epoch,
             bootstrap,
             journal_path: dir.path().join("journal"),
             max_journal_bytes: 1_000_000,
@@ -1072,4 +1076,42 @@ async fn no_such_order_after_the_submit_window_abandons_the_order() {
     }
     assert!(reopened, "admission reopens once the order provably never existed");
     assert_eq!(runtime.leaves(&lost.client_order_id).await, None, "the lost order is closed");
+}
+
+#[tokio::test]
+async fn a_takeover_keeps_the_kill_under_the_epoch_the_oms_will_enable() {
+    let dir = TempDir::new().unwrap();
+    let (runtime, _venue) = start_in(&dir).await;
+    grant(&runtime).await;
+    kill(&runtime).await.unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The replacement runs at epoch 2; the OMS still records the kill at 1.
+    let mut killed = bootstrap();
+    killed.killed_epoch = Some(1);
+    let (restarted, _venue) = start_at(&dir, killed, 2).await;
+    restarted
+        .apply_control(Received::new(
+            ToRuntime::Enable { enable: colo_link::v2::Enable { stopped_epoch: 1, command_id: "e".into() } },
+            Instant::now(),
+        ))
+        .await
+        .expect("the OMS's enable clears the retained kill");
+}
+
+#[tokio::test]
+async fn a_kill_the_oms_enabled_while_the_runtime_was_down_does_not_return() {
+    let dir = TempDir::new().unwrap();
+    let (runtime, _venue) = start_in(&dir).await;
+    grant(&runtime).await;
+    kill(&runtime).await.unwrap();
+    runtime.shutdown().await.unwrap();
+    drop(runtime);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The OMS enabled meanwhile: its bootstrap carries no kill.
+    let (restarted, _venue) = start_at(&dir, bootstrap(), 2).await;
+    assert!(restarted.is_ready().await, "the OMS's enable is not undone by the journal");
 }
