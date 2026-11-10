@@ -451,7 +451,14 @@ async fn apply_control_inner(inner: &Arc<Inner>, message: Received<ToRuntime>) -
         for action in &actions {
             match action {
                 ControlAction::KillLatched { .. } => core.book.set_trading_state_halted(),
-                ControlAction::KillCleared { .. } => core.book.set_trading_state_active(),
+                ControlAction::KillCleared { .. } => {
+                    core.book.set_trading_state_active();
+                    // Enable resumes trading only on a book that recovered
+                    // completely; otherwise it stays suspended for review.
+                    if inner.recovered.load(Ordering::SeqCst) && !core.book.is_paused() {
+                        core.control.mark_ready();
+                    }
+                }
                 _ => {}
             }
         }

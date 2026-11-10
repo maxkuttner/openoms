@@ -1115,3 +1115,20 @@ async fn a_kill_the_oms_enabled_while_the_runtime_was_down_does_not_return() {
     let (restarted, _venue) = start_at(&dir, bootstrap(), 2).await;
     assert!(restarted.is_ready().await, "the OMS's enable is not undone by the journal");
 }
+
+#[tokio::test]
+async fn an_enable_after_a_kill_resumes_trading() {
+    let (runtime, _venue, _dir) = start().await;
+    grant(&runtime).await;
+    kill(&runtime).await.unwrap();
+    assert!(runtime.submit(intent(1.0)).await.is_err());
+    runtime
+        .apply_control(Received::new(
+            ToRuntime::Enable { enable: colo_link::v2::Enable { stopped_epoch: 1, command_id: "e".into() } },
+            Instant::now(),
+        ))
+        .await
+        .unwrap();
+    grant(&runtime).await;
+    assert!(submit_allowed(&runtime).await, "trading resumes after enable");
+}
