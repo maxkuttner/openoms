@@ -126,6 +126,17 @@ Commissions are logged but not yet booked into P&L.
 - The OMS sees only the orders it placed through its own API connection. Orders entered
   by hand in TWS or the IBKR apps are invisible to it, including to reconciliation.
 
+## Credentials
+
+For the TWS API connection, in the cockpit's credentials drawer:
+
+| Field | What it is | Default |
+| --- | --- | --- |
+| IBKR username | Your IBKR login (for paper, the paper username from Client Portal) | |
+| Password | Its password. It reaches IB Gateway only through a short-lived file, never a command line or log. | |
+
+The FIX session's fields are listed under [FIX session](#fix-session-experimental).
+
 ## FIX session (experimental)
 
 The OMS can run a FIX order-entry session to Interactive Brokers, using the QuickFIX

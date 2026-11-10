@@ -26,7 +26,7 @@ export function venuesFrom(source) {
     .split(/\n\s*Venue \{/)
     .slice(1)
     .map((block) => ({
-      code: block.match(/code: "([A-Z]+)"/)[1],
+      code: block.match(/code: "([A-Z_]+)"/)[1],
       slug: block.match(/\{DOCS\}\/([a-z-]+)\//)[1],
       labels: [...block.matchAll(/field\("[a-z_]+", "([^"]+)"\)/g)].map((m) => m[1]),
     }));
