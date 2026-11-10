@@ -159,6 +159,8 @@ impl Runtime {
                 },
                 missing: evidence,
             });
+            // The bootstrap carried a policy; acknowledge it like a later one.
+            let _ = tx.send(FromRuntime::PolicyAck { policy_revision: control.policy_revision() });
             (Some(tx), Some(rx))
         } else {
             (None, None)
