@@ -341,6 +341,10 @@ async fn refresh(pool: &PgPool, client: &dyn TwsClient) -> Result<RefreshReport,
                 None => vanished.push(native_id),
             },
             Err(TwsError::Api { code: NO_SECURITY_DEFINITION, .. }) => vanished.push(native_id),
+            // IBKR answered, just not for this conId: one bad contract must not
+            // stall the refresh of every other one.
+            Err(e @ TwsError::Api { .. }) => tracing::warn!(con_id, error = %e, "IBKR instrument refresh: lookup refused; left alone"),
+            // Transport trouble: stop before writing anything.
             Err(e) => return Err(format!("conId {con_id}: {e}").into()),
         }
     }
@@ -553,9 +557,12 @@ mod tests {
     }
 
     /// Answers `contract_details` from a map; a missing conId is "no result",
-    /// and `down` makes every call a transport error.
+    /// a conId in `refused` an IB API error, and `down` makes every call a
+    /// transport error.
+    #[derive(Default)]
     struct Scripted {
         details: std::collections::HashMap<i64, TwsContract>,
+        refused: std::collections::HashSet<i64>,
         down: bool,
     }
 
@@ -564,6 +571,9 @@ mod tests {
         async fn contract_details(&self, q: &ContractQuery) -> Result<Vec<TwsContract>, TwsError> {
             if self.down {
                 return Err(TwsError::NotConnected);
+            }
+            if self.refused.contains(&q.con_id.unwrap()) {
+                return Err(TwsError::Api { code: 321, message: "Error validating request".into() });
             }
             Ok(self.details.get(&q.con_id.unwrap()).cloned().into_iter().collect())
         }
@@ -578,6 +588,7 @@ mod tests {
         async fn managed_accounts(&self) -> Result<Vec<String>, TwsError> { unimplemented!() }
         fn events(&self) -> tokio::sync::broadcast::Receiver<gateway::connectors::ibkr_tws::client::TwsEvent> { unimplemented!() }
         fn connected(&self) -> bool { !self.down }
+        fn shutdown(&self) {}
     }
 
     /// A refresh covers every stored IBKR instrument, so the tests that run one
@@ -606,15 +617,40 @@ mod tests {
             .unwrap();
 
         // An outage marks nothing, even though no conId answers.
-        let down = Scripted { details: Default::default(), down: true };
+        let down = Scripted { down: true, ..Default::default() };
         assert_eq!(refresh_ibkr_instruments(&pool, &down).await, RefreshReport::default());
         assert!(tradeable(&pool, gone).await);
 
-        let client = Scripted { details: [(kept, a)].into(), down: false };
+        let client = Scripted { details: [(kept, a)].into(), ..Default::default() };
         let report = refresh_ibkr_instruments(&pool, &client).await;
         assert!(report.untradeable >= 1, "{report:?}");
         assert!(tradeable(&pool, kept).await);
         assert!(!tradeable(&pool, gone).await, "the vanished conId stays, untradeable");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn a_con_id_ibkr_refuses_is_skipped_and_the_rest_refreshed() {
+        let _serial = REFRESH_TESTS.lock().await;
+        let pool = isolated_pool().await;
+        let (refused, ok) = (990_000_031_i64, 990_000_032_i64);
+        let (mut a, mut b) = (contract(refused, "IBIS"), contract(ok, "IBIS"));
+        a.symbol = "ZREFUSED".into();
+        b.symbol = "ZOKTICK".into();
+        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()], true)
+            .await
+            .unwrap();
+
+        b.min_tick = 0.05;
+        let client = Scripted { details: [(ok, b)].into(), refused: [refused].into(), ..Default::default() };
+        let report = refresh_ibkr_instruments(&pool, &client).await;
+        assert!(report.updated >= 1, "{report:?}");
+        assert!(tradeable(&pool, refused).await, "a refused lookup is not a vanished contract");
+        let tick: f64 = sqlx::query_scalar("SELECT price_increment::float8 FROM instrument WHERE symbol = 'ZOKTICK' AND venue = 'XETR'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tick, 0.05);
     }
 
     #[tokio::test]
@@ -628,7 +664,7 @@ mod tests {
         save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()], true).await.unwrap();
 
         c.min_tick = 0.05;
-        let client = Scripted { details: [(con_id, c)].into(), down: false };
+        let client = Scripted { details: [(con_id, c)].into(), ..Default::default() };
         let report = refresh_ibkr_instruments(&pool, &client).await;
         assert!(report.updated >= 1, "{report:?}");
         let tick: f64 = sqlx::query_scalar("SELECT price_increment::float8 FROM instrument WHERE symbol = 'ZTICK' AND venue = 'XETR'")

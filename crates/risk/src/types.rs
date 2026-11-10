@@ -41,6 +41,17 @@ pub struct Limits {
     pub max_orders_per_sec: Option<u32>,
 }
 
+/// How a venue bends the shared limit rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VenueRules {
+    /// No price band: the venue has no reference price to compare against.
+    pub band_exempt: bool,
+    /// A USD notional default inherited into a non-USD-like quote is dropped
+    /// (no notional check) instead of refusing the order; amounts stay in the
+    /// instrument's own currency.
+    pub per_currency_notional: bool,
+}
+
 /// Signed filled position plus the still-working quantity on each side.
 /// Opposing working orders are never netted: each side reserves its own
 /// capacity.

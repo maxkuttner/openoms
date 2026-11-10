@@ -118,6 +118,8 @@ Commissions are logged but not yet booked into P&L.
   individual fills.
 - A cancel while the gateway is disconnected is refused with a temporary error; it is
   never queued.
+- The OMS sees only the orders it placed through its own API connection. Orders entered
+  by hand in TWS or the IBKR apps are invisible to it, including to reconciliation.
 
 ## FIX session (experimental)
 

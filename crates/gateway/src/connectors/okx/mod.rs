@@ -30,6 +30,7 @@ static MANIFEST: Manifest = Manifest {
     exec_stream: true,
     session_bound: false,
     price_band_exempt: false,
+    per_currency_notional: false,
 };
 
 impl Connector for Okx {

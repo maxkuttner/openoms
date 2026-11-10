@@ -1,5 +1,5 @@
 use crate::{
-    evaluate, require_prices, resolve_limits, Exposure, Limits, OrderInput, Reject, RiskInput, Side, TradingState,
+    evaluate, require_prices, resolve_limits, Exposure, VenueRules, Limits, OrderInput, Reject, RiskInput, Side, TradingState,
     Valuation,
 };
 
@@ -135,7 +135,7 @@ fn overrides_win_per_field() {
         max_orders_per_sec: Some(1),
     };
 
-    let resolved = resolve_limits(&defaults, &overrides, "USDT", false).expect("valid");
+    let resolved = resolve_limits(&defaults, &overrides, "USDT", VenueRules::default()).expect("valid");
 
     assert_eq!(resolved.max_order_qty, Some(5.0));
     assert_eq!(resolved.max_order_notional, Some(50.0));
@@ -145,8 +145,21 @@ fn overrides_win_per_field() {
     assert_eq!(resolved.max_orders_per_sec, Some(1));
 }
 
+const EXEMPT: VenueRules = VenueRules { band_exempt: true, per_currency_notional: false };
+const PER_CURRENCY: VenueRules = VenueRules { band_exempt: false, per_currency_notional: true };
+
 #[test]
-fn inherited_notional_into_a_non_usd_quote_is_dropped_not_rejected() {
+fn inherited_notional_into_a_non_usd_quote_is_rejected() {
+    let defaults = Limits { max_order_notional: Some(1_000.0), ..Default::default() };
+
+    let e = resolve_limits(&defaults, &Limits::default(), "EUR", VenueRules::default()).unwrap_err();
+
+    assert_eq!(e.code, "no_notional_limit");
+    assert_eq!(e.message, "no notional limit for quote currency EUR");
+}
+
+#[test]
+fn inherited_notional_into_a_non_usd_quote_is_dropped_on_a_per_currency_venue() {
     let defaults = Limits {
         max_order_qty: Some(3.0),
         max_order_notional: Some(1_000.0),
@@ -154,12 +167,12 @@ fn inherited_notional_into_a_non_usd_quote_is_dropped_not_rejected() {
         ..Default::default()
     };
 
-    let resolved = resolve_limits(&defaults, &Limits::default(), "EUR", false).expect("dropped, not rejected");
+    let resolved = resolve_limits(&defaults, &Limits::default(), "EUR", PER_CURRENCY).expect("dropped, not rejected");
 
     assert_eq!(resolved.max_order_notional, None);
     assert_eq!(resolved.max_position_notional, None);
     assert_eq!(resolved.max_order_qty, Some(3.0));
-    assert!(resolve_limits(&defaults, &Limits::default(), "USDT", false).is_ok());
+    assert!(resolve_limits(&defaults, &Limits::default(), "USDT", VenueRules::default()).is_ok());
 }
 
 #[test]
@@ -167,7 +180,7 @@ fn an_explicit_eur_override_applies() {
     let defaults = Limits { max_order_notional: Some(1_000.0), ..Default::default() };
     let overrides = Limits { max_order_notional: Some(500.0), ..Default::default() };
 
-    let resolved = resolve_limits(&defaults, &overrides, "EUR", false).expect("valid");
+    let resolved = resolve_limits(&defaults, &overrides, "EUR", VenueRules::default()).expect("valid");
 
     assert_eq!(resolved.max_order_notional, Some(500.0));
 }
@@ -176,8 +189,8 @@ fn an_explicit_eur_override_applies() {
 fn a_band_exempt_venue_resolves_no_band() {
     let defaults = Limits { price_band_pct: Some(5.0), ..Default::default() };
 
-    assert_eq!(resolve_limits(&defaults, &Limits::default(), "USD", true).unwrap().price_band_pct, None);
-    assert_eq!(resolve_limits(&defaults, &Limits::default(), "USD", false).unwrap().price_band_pct, Some(5.0));
+    assert_eq!(resolve_limits(&defaults, &Limits::default(), "USD", EXEMPT).unwrap().price_band_pct, None);
+    assert_eq!(resolve_limits(&defaults, &Limits::default(), "USD", VenueRules::default()).unwrap().price_band_pct, Some(5.0));
 }
 
 #[test]
@@ -185,7 +198,7 @@ fn explicit_notional_override_is_allowed_for_any_quote() {
     let defaults = Limits { max_order_notional: Some(100.0), ..Default::default() };
     let overrides = Limits { max_order_notional: Some(50.0), ..Default::default() };
 
-    let resolved = resolve_limits(&defaults, &overrides, "BTC", false).expect("own notional limit");
+    let resolved = resolve_limits(&defaults, &overrides, "BTC", VenueRules::default()).expect("own notional limit");
 
     assert_eq!(resolved.max_order_notional, Some(50.0));
 }
@@ -194,13 +207,13 @@ fn explicit_notional_override_is_allowed_for_any_quote() {
 fn invalid_limits_rejected() {
     let negative = Limits { max_order_qty: Some(-1.0), ..Default::default() };
     assert_eq!(
-        code(resolve_limits(&negative, &Limits::default(), "USDT", false)),
+        code(resolve_limits(&negative, &Limits::default(), "USDT", VenueRules::default())),
         "invalid_limits"
     );
 
     let zero_rate = Limits { max_orders_per_sec: Some(0), ..Default::default() };
     assert_eq!(
-        code(resolve_limits(&zero_rate, &Limits::default(), "USDT", false)),
+        code(resolve_limits(&zero_rate, &Limits::default(), "USDT", VenueRules::default())),
         "invalid_limits"
     );
 }

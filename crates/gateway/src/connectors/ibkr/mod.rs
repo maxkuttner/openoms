@@ -36,6 +36,7 @@ static MANIFEST: Manifest = Manifest {
     exec_stream: false,
     session_bound: true,
     price_band_exempt: false,
+    per_currency_notional: false,
 };
 
 impl Connector for Ibkr {

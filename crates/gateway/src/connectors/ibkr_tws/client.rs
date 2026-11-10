@@ -125,6 +125,10 @@ pub struct ContractQuery {
     pub con_id: Option<i64>,
 }
 
+/// One IB Gateway API session. Order listings (`open_orders`,
+/// `completed_orders`) and the order-update stream cover only orders placed by
+/// this API client id: orders entered by hand in TWS or the IBKR apps are
+/// invisible, so recon cannot see or settle them.
 #[async_trait]
 pub trait TwsClient: Send + Sync {
     async fn next_order_id(&self) -> Result<i32, TwsError>;
@@ -150,6 +154,9 @@ pub trait TwsClient: Send + Sync {
     async fn managed_accounts(&self) -> Result<Vec<String>, TwsError>;
     fn events(&self) -> broadcast::Receiver<TwsEvent>;
     fn connected(&self) -> bool;
+    /// Closes the API socket so the client id is free for the next session.
+    /// Synchronous so a drop guard can call it.
+    fn shutdown(&self);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +558,14 @@ impl TwsClient for IbapiClient {
     fn connected(&self) -> bool {
         self.client.is_connected()
     }
+
+    fn shutdown(&self) {
+        self.pump.abort();
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            rt.spawn(async move { client.disconnect().await });
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +679,10 @@ impl TwsClient for FakeTws {
 
     fn connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
+    }
+
+    fn shutdown(&self) {
+        self.set_connected(false);
     }
 }
 

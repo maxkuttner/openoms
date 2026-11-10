@@ -90,11 +90,30 @@ pub fn classify_logs(tail: &str) -> Option<GatewayState> {
         if l.contains("second factor authentication") {
             Some(GatewayState::AwaitingTwoFactor)
         } else if l.contains("login failed") || l.contains("invalid username or password") {
-            Some(GatewayState::LoginFailed(line.trim().to_string()))
+            Some(GatewayState::LoginFailed(sanitize_log_line(line)))
         } else {
             None
         }
     })
+}
+
+/// Longest container log line carried into a health or UI message.
+const MAX_LOG_LINE: usize = 200;
+
+/// A container log line made safe to show: cut before any password-like key
+/// (`password`, `TWS_PASSWORD`, …), then capped at [`MAX_LOG_LINE`] chars.
+fn sanitize_log_line(line: &str) -> String {
+    let line = line.trim();
+    // ASCII lowercasing keeps byte offsets, and the key ends on a char boundary.
+    let cut = line.to_ascii_lowercase().find("password").map_or(line.len(), |i| i + "password".len());
+    let kept = &line[..cut];
+    let mut out: String = kept.chars().take(MAX_LOG_LINE).collect();
+    if cut < line.len() {
+        out.push_str(" [redacted]");
+    } else if kept.chars().count() > MAX_LOG_LINE {
+        out.push('…');
+    }
+    out
 }
 
 /// Deletes the env file when dropped, so it goes even if `run` fails.
@@ -140,6 +159,17 @@ fn write_env_file(path: &Path, env: &str, creds: &IbkrTwsCredentials) -> Result<
     )
     .map_err(|e| format!("could not write the gateway env file: {e}"))?;
     Ok(guard)
+}
+
+/// Stops and removes the gateway container for `connection_code`, if any.
+pub async fn remove(docker: Arc<dyn GatewayDocker>, connection_code: String) {
+    let name = container_name(&connection_code);
+    let r = tokio::task::spawn_blocking(move || if docker.available() { docker.stop_rm(&name) } else { Ok(()) }).await;
+    match r {
+        Ok(Ok(())) => tracing::info!(connection_code, "IB Gateway container removed"),
+        Ok(Err(e)) => tracing::warn!(connection_code, error = %e, "could not remove the IB Gateway container"),
+        Err(e) => tracing::warn!(connection_code, error = %e, "could not remove the IB Gateway container"),
+    }
 }
 
 fn port_free(port: u16) -> bool {
@@ -608,6 +638,27 @@ mod tests {
             Some(GatewayState::LoginFailed(_))
         ));
         assert_eq!(classify_logs("all quiet"), None);
+    }
+
+    #[tokio::test]
+    async fn removing_a_connection_stops_and_removes_its_container() {
+        let docker = Arc::new(FakeDocker::default());
+        remove(docker.clone(), "IBKR_TWS-PAPER".into()).await;
+        assert_eq!(*docker.removed.lock().unwrap(), vec![container_name("IBKR_TWS-PAPER")]);
+    }
+
+    #[test]
+    fn a_failed_login_message_is_capped_and_hides_password_values() {
+        let tail = "Login failed: TWS_PASSWORD=hunter2 rejected for user\n";
+        let Some(GatewayState::LoginFailed(m)) = classify_logs(tail) else { panic!("not classified") };
+        assert!(!m.contains("hunter2"), "{m}");
+        assert!(m.starts_with("Login failed: TWS_PASSWORD"), "{m}");
+        let long = format!("Login failed: {}", "x".repeat(500));
+        let Some(GatewayState::LoginFailed(m)) = classify_logs(&long) else { panic!("not classified") };
+        assert!(m.chars().count() <= 201, "{}", m.len());
+        // "Invalid username or password" itself still reads sensibly.
+        let Some(GatewayState::LoginFailed(m)) = classify_logs("Invalid username or password") else { panic!() };
+        assert_eq!(m, "Invalid username or password");
     }
 
     #[test]

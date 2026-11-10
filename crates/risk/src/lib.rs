@@ -7,7 +7,7 @@ mod types;
 
 pub use evaluate::{evaluate, require_prices, resolve_limits};
 pub use types::{
-    Exposure, Limits, OrderInput, Reject, RiskInput, Side, TradingState, Valuation, USD_LIKE,
+    Exposure, Limits, OrderInput, Reject, RiskInput, Side, TradingState, Valuation, VenueRules, USD_LIKE,
 };
 
 #[cfg(test)]

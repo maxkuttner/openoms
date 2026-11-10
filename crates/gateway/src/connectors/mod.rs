@@ -72,6 +72,10 @@ pub struct Manifest {
     /// the band to compare against (no quotes), while every other venue
     /// refuses a banded limit order that has none.
     pub price_band_exempt: bool,
+    /// A USD notional default does not refuse a non-USD-quoted order here: it
+    /// is dropped, and only a limit set in the instrument's own currency
+    /// applies. Every other venue refuses such an order.
+    pub per_currency_notional: bool,
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential
@@ -132,6 +136,13 @@ pub trait Connector: Send + Sync {
     /// Its public quote feed, if the venue has one.
     fn public_feed(&self) -> Option<PublicFeed> {
         None
+    }
+
+    /// Releases what the connection holds outside this process once it is
+    /// disabled or removed (not on a plain reload), after its execution stream
+    /// has been stopped.
+    fn on_removed(&self, _env: &str) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
     }
 }
 

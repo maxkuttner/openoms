@@ -418,6 +418,16 @@ pub fn route_failure(err: &BrokerError) -> RouteFailure {
 }
 
 /// Book a definite reject of a stored order through the order engine.
+/// The connector's limit-rule exceptions. Takes the connector code
+/// (`broker_connection.broker_code`, e.g. `IBKR_TWS`), not the connection code
+/// (`IBKR_TWS-PAPER`), which names no connector.
+fn venue_rules(broker_code: &str) -> risk::VenueRules {
+    gateway::connectors::by_code(broker_code).map_or_else(risk::VenueRules::default, |c| risk::VenueRules {
+        band_exempt: c.manifest().price_band_exempt,
+        per_currency_notional: c.manifest().per_currency_notional,
+    })
+}
+
 async fn book_reject(state: &AppState, order_id: Uuid, broker_code: &str, reason: String) {
     state
         .engine()
@@ -642,7 +652,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
 
     // A strategy order's reference price, looked up before the transaction so
     // waiting for a first quote never holds the strategy's row lock.
-    let band_exempt = gateway::connectors::by_code(&broker_code).is_some_and(|c| c.manifest().price_band_exempt);
+    let rules = venue_rules(&broker_code);
     let quote_currency: String = instrument_row.get("currency");
     let mark = match &strategy {
         Some(s) => {
@@ -653,7 +663,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
                 asset_class: instrument_row.get("asset_class"),
                 venue: instrument_row.get("venue"),
             };
-            match guard::reference(state, s, &inst, band_exempt).await {
+            match guard::reference(state, s, &inst, rules.band_exempt).await {
                 Ok(mark) => mark,
                 Err(rejection) => {
                     record_rejection(state, auth, order_id, cmd.clone(), &broker_connection_code, &origin, &fix_cl_ord_id, &rejection).await?;
@@ -737,7 +747,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
                 guard::session_gate(&origin, state.fix_sessions().is_live(&locked.code))
             })();
             match gates {
-                Ok(()) => guard::check(&mut tx, &locked, &cmd, &quote_currency, band_exempt, mark, contract_size).await,
+                Ok(()) => guard::check(&mut tx, &locked, &cmd, &quote_currency, rules, mark, contract_size).await,
                 Err(rejection) => Err(RiskCheckError::Rejected(rejection)),
             }
         }
@@ -1155,6 +1165,16 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn venue_rules_come_from_the_connector_code_not_the_connection_code() {
+        let tws = venue_rules("IBKR_TWS");
+        assert!(tws.band_exempt && tws.per_currency_notional);
+        // The connection code names no connector: nothing is exempted.
+        assert_eq!(venue_rules("IBKR_TWS-PAPER"), risk::VenueRules::default());
+        assert_eq!(venue_rules("ALPACA"), risk::VenueRules::default());
+        assert_eq!(venue_rules("IBKR"), risk::VenueRules::default());
+    }
 
     #[test]
     fn a_venue_reject_is_a_reject() {

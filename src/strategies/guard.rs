@@ -76,18 +76,18 @@ pub fn check_state(
 
 /// The limits for one instrument: each field of its `risk_limits` row, else
 /// the strategy's default for that field. A default notional limit is only
-/// read in a USD-like quote; in any other quote the default is dropped (no
-/// notional check) unless the instrument has its own. A `band_exempt` venue
-/// gets no price band. Price band and
+/// read in a USD-like quote; any other quote needs its own, except on a
+/// `per_currency_notional` venue, where the default is dropped (no notional
+/// check). A `band_exempt` venue gets no price band. Price band and
 /// order-rate come from the strategy, never the per-instrument row.
-pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, quote_currency: &str, band_exempt: bool) -> Result<RiskLimits, RiskRejection> {
+pub fn effective_limits(strategy: &Strategy, override_row: Option<RiskLimits>, quote_currency: &str, rules: risk::VenueRules) -> Result<RiskLimits, RiskRejection> {
     let defaults = RiskLimits {
         price_band_pct: strategy.price_band_pct,
         max_orders_per_sec: strategy.max_orders_per_sec,
         ..strategy.limits
     };
     let overrides = override_row.unwrap_or_default();
-    risk::resolve_limits(&defaults, &overrides, quote_currency, band_exempt)
+    risk::resolve_limits(&defaults, &overrides, quote_currency, rules)
         .map_err(|e| RiskRejection { code: e.code, message: e.message })
 }
 
@@ -98,8 +98,9 @@ pub fn check_price_band(limit_price: Option<f64>, mid: f64, band_pct: f64) -> Re
 
 /// A mark captured before admission can age while the scope lock is waited
 /// on. Re-check it once admission actually runs; stale supplied data is a
-/// rejection, not a silent skip.
-fn admission_mark(mark: Option<Mark>) -> Result<Option<Mark>, RiskRejection> {
+/// rejection, not a silent skip — except on a `band_exempt` venue, which
+/// trades without a mark anyway: there a stale one counts as none.
+fn admission_mark(mark: Option<Mark>, band_exempt: bool) -> Result<Option<Mark>, RiskRejection> {
     let Some(mark) = mark else { return Ok(None) };
     let fresh = chrono::Utc::now()
         .signed_duration_since(mark.ts)
@@ -107,6 +108,8 @@ fn admission_mark(mark: Option<Mark>) -> Result<Option<Mark>, RiskRejection> {
         .map_or(true, |age| age <= MAX_MARK_AGE);
     if fresh {
         Ok(Some(mark))
+    } else if band_exempt {
+        Ok(None)
     } else {
         Err(reject(
             "no_reference_price",
@@ -189,7 +192,7 @@ pub async fn check(
     strategy: &Strategy,
     cmd: &SubmitOrder,
     quote_currency: &str,
-    band_exempt: bool,
+    rules: risk::VenueRules,
     mark: Option<Mark>,
     contract_size: f64,
 ) -> Result<(), crate::risk_engine::RiskCheckError> {
@@ -202,10 +205,10 @@ pub async fn check(
     let state = row
         .as_ref()
         .map_or(strategy.state, |r| strictest(strategy.state, r.trading_state));
-    let limits = effective_limits(strategy, row.map(|r| r.limits), quote_currency, band_exempt)
+    let limits = effective_limits(strategy, row.map(|r| r.limits), quote_currency, rules)
         .map_err(RiskCheckError::Rejected)?;
 
-    let mark = admission_mark(mark).map_err(RiskCheckError::Rejected)?;
+    let mark = admission_mark(mark, rules.band_exempt).map_err(RiskCheckError::Rejected)?;
     let mid = mark.map(|m| m.mid());
 
     let input = risk::RiskInput {
@@ -275,10 +278,10 @@ mod tests {
         };
         let fresh = Mark { ts: chrono::Utc::now(), ..stale };
 
-        let e = admission_mark(Some(stale)).unwrap_err();
+        let e = admission_mark(Some(stale), false).unwrap_err();
         assert_eq!(e.code, "no_reference_price");
-        assert!(admission_mark(Some(fresh)).unwrap().is_some());
-        assert!(admission_mark(None).unwrap().is_none());
+        assert!(admission_mark(Some(fresh), false).unwrap().is_some());
+        assert!(admission_mark(None, false).unwrap().is_none());
     }
 
     #[test]
@@ -295,9 +298,12 @@ mod tests {
     fn defaults_do_not_price_a_non_usd_quote() {
         let mut s = sample("s", "S", "OMS");
         s.limits = limits(Some(10_000.0));
-        assert_eq!(effective_limits(&s, None, "BTC", false).unwrap().max_order_notional, None);
-        assert_eq!(effective_limits(&s, Some(limits(Some(5.0))), "BTC", false).unwrap().max_order_notional, Some(5.0));
-        assert_eq!(effective_limits(&s, None, "USDT", false).unwrap().max_order_notional, Some(10_000.0));
+        let e = effective_limits(&s, None, "BTC", risk::VenueRules::default()).unwrap_err();
+        assert_eq!(e.message, "no notional limit for quote currency BTC");
+        let per_currency = risk::VenueRules { per_currency_notional: true, ..Default::default() };
+        assert_eq!(effective_limits(&s, None, "EUR", per_currency).unwrap().max_order_notional, None);
+        assert_eq!(effective_limits(&s, Some(limits(Some(5.0))), "BTC", risk::VenueRules::default()).unwrap().max_order_notional, Some(5.0));
+        assert_eq!(effective_limits(&s, None, "USDT", risk::VenueRules::default()).unwrap().max_order_notional, Some(10_000.0));
     }
 
     #[test]
@@ -305,14 +311,13 @@ mod tests {
         let mut s = sample("s", "S", "OMS");
         s.limits = RiskLimits { max_order_qty: Some(7.0), ..limits(Some(10_000.0)) };
         let qty_only = RiskLimits { max_order_qty: Some(1.0), ..limits(None) };
-        // A non-USD quote drops the inherited notional but keeps the overridden quantity.
-        let merged = effective_limits(&s, Some(qty_only), "BTC", false).unwrap();
-        assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(1.0), None));
+        // A non-USD quote whose notional would fall back to the default is refused.
+        assert!(effective_limits(&s, Some(qty_only), "BTC", risk::VenueRules::default()).is_err());
         // A USD-like quote keeps the default notional beside the overridden quantity.
-        let merged = effective_limits(&s, Some(qty_only), "USDT", false).unwrap();
+        let merged = effective_limits(&s, Some(qty_only), "USDT", risk::VenueRules::default()).unwrap();
         assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(1.0), Some(10_000.0)));
         // A non-USD quote with its own notional keeps the default quantity.
-        let merged = effective_limits(&s, Some(limits(Some(0.5))), "BTC", false).unwrap();
+        let merged = effective_limits(&s, Some(limits(Some(0.5))), "BTC", risk::VenueRules::default()).unwrap();
         assert_eq!((merged.max_order_qty, merged.max_order_notional), (Some(7.0), Some(0.5)));
     }
 
@@ -320,8 +325,15 @@ mod tests {
     fn a_band_exempt_venue_gets_no_strategy_band() {
         let mut s = sample("s", "S", "OMS");
         s.price_band_pct = Some(5.0);
-        assert_eq!(effective_limits(&s, None, "USD", false).unwrap().price_band_pct, Some(5.0));
-        assert_eq!(effective_limits(&s, None, "USD", true).unwrap().price_band_pct, None);
+        assert_eq!(effective_limits(&s, None, "USD", risk::VenueRules::default()).unwrap().price_band_pct, Some(5.0));
+        assert_eq!(effective_limits(&s, None, "USD", risk::VenueRules { band_exempt: true, ..Default::default() }).unwrap().price_band_pct, None);
+    }
+
+    #[test]
+    fn a_stale_mark_is_dropped_for_a_band_exempt_venue_and_refused_elsewhere() {
+        let stale = Mark { bid: 99.0, ask: 101.0, ts: chrono::Utc::now() - chrono::Duration::minutes(5) };
+        assert_eq!(admission_mark(Some(stale), false).unwrap_err().code, "no_reference_price");
+        assert!(admission_mark(Some(stale), true).unwrap().is_none());
     }
 
     #[test]

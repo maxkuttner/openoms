@@ -1,4 +1,4 @@
-use crate::{Exposure, Limits, OrderInput, Reject, RiskInput, Side, TradingState, USD_LIKE};
+use crate::{Exposure, Limits, OrderInput, Reject, RiskInput, Side, TradingState, VenueRules, USD_LIKE};
 
 /// Evaluate one order. Pure: no clock, no I/O, no mutation. The caller owns
 /// the rate window and any reservation bookkeeping.
@@ -103,17 +103,26 @@ fn missing_price(limit: &str, needs: &str) -> Reject {
 }
 
 /// Resolve per-field limits: an override wins only where it is configured;
-/// otherwise the default applies. A notional default is denominated in USD, so
-/// inherited into a non-USD-like quote it is dropped (no notional check)
-/// instead of being applied to the wrong currency; an explicit override may
-/// use any quote. A `band_exempt` venue resolves no price band.
+/// otherwise the default applies. A notional default is denominated in USD:
+/// inherited into a non-USD-like quote it is refused, unless the venue is
+/// `per_currency_notional`, where it is dropped (no notional check) instead of
+/// being applied to the wrong currency. An explicit override may use any
+/// quote. A `band_exempt` venue resolves no price band.
 pub fn resolve_limits(
     defaults: &Limits,
     overrides: &Limits,
     quote_currency: &str,
-    band_exempt: bool,
+    rules: VenueRules,
 ) -> Result<Limits, Reject> {
     let usd_like = USD_LIKE.contains(&quote_currency);
+    let inherited_notional = overrides.max_order_notional.is_none() && defaults.max_order_notional.is_some()
+        || overrides.max_position_notional.is_none() && defaults.max_position_notional.is_some();
+    if inherited_notional && !usd_like && !rules.per_currency_notional {
+        return Err(Reject::new(
+            "no_notional_limit",
+            format!("no notional limit for quote currency {quote_currency}"),
+        ));
+    }
     let notional = |own: Option<f64>, default: Option<f64>| own.or(if usd_like { default } else { None });
 
     let resolved = Limits {
@@ -121,7 +130,7 @@ pub fn resolve_limits(
         max_order_notional: notional(overrides.max_order_notional, defaults.max_order_notional),
         max_position_qty: overrides.max_position_qty.or(defaults.max_position_qty),
         max_position_notional: notional(overrides.max_position_notional, defaults.max_position_notional),
-        price_band_pct: if band_exempt { None } else { overrides.price_band_pct.or(defaults.price_band_pct) },
+        price_band_pct: if rules.band_exempt { None } else { overrides.price_band_pct.or(defaults.price_band_pct) },
         max_orders_per_sec: overrides.max_orders_per_sec.or(defaults.max_orders_per_sec),
     };
     validate_limits(&resolved)?;

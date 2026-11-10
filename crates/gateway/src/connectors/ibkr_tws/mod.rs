@@ -65,6 +65,7 @@ static MANIFEST: Manifest = Manifest {
     exec_stream: true,
     session_bound: true,
     price_band_exempt: true,
+    per_currency_notional: true,
 };
 
 impl Connector for IbkrTws {
@@ -103,6 +104,11 @@ impl Connector for IbkrTws {
 
     fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
         Box::pin(async { TestOutcome::NotTestable("checked when the gateway logs in") })
+    }
+
+    /// Stops and removes the connection's IB Gateway container.
+    fn on_removed(&self, env: &str) -> BoxFuture<'static, ()> {
+        Box::pin(gateway::remove(Arc::new(gateway::DockerCli), connection_code(env)))
     }
 }
 

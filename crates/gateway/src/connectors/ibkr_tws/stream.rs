@@ -39,6 +39,9 @@ const STABLE_AFTER: Duration = Duration::from_secs(60);
 #[derive(Default)]
 pub struct Booked {
     execs: HashSet<String>,
+    /// Exec ids without their last `.NN` revision: a new id with a booked
+    /// base is IBKR's correction of a fill, not another fill.
+    exec_bases: HashSet<String>,
     canceled: HashSet<i32>,
     rejected: HashSet<i32>,
 }
@@ -72,6 +75,21 @@ async fn unknown_order(ctx: &Ctx, what: &str, order_id: i32) {
     ctx.engine.reconcile(VENUE, ctx.env, ACTOR, ctx.adapter.clone()).await;
 }
 
+/// `<base>.NN` -> `<base>`; IBKR revises a fill by bumping the last segment.
+fn exec_base(exec_id: &str) -> &str {
+    exec_id.rsplit_once('.').map_or(exec_id, |(base, _)| base)
+}
+
+impl Booked {
+    /// Records `exec_id`; true when it revises a fill already booked.
+    fn note_exec(&mut self, exec_id: &str) -> bool {
+        let correction = !self.execs.contains(exec_id) && self.exec_bases.contains(exec_base(exec_id));
+        self.execs.insert(exec_id.to_string());
+        self.exec_bases.insert(exec_base(exec_id).to_string());
+        correction
+    }
+}
+
 /// Books one client event, at most once per exec id / order.
 pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
     match ev {
@@ -82,7 +100,12 @@ pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
             let Some(order) = order_uuid(&ctx.adapter, order_id, &order_ref) else {
                 return unknown_order(ctx, "execution", order_id).await;
             };
-            booked.execs.insert(exec_id.clone());
+            if booked.note_exec(&exec_id) {
+                // Booking it as a fill would double-count: recon settles the
+                // order from the broker's corrected totals.
+                warn!(exec_id, order_id, "IBKR corrected an execution; reconciling");
+                return ctx.engine.reconcile(VENUE, ctx.env, ACTOR, ctx.adapter.clone()).await;
+            }
             send(ctx, order, VenueReport::Fill { execution_id: exec_id, fill_qty: qty, fill_price: price, venue: VENUE.into() }).await;
         }
         // The engine's fill carries no fee yet: recorded in the log only.
@@ -129,7 +152,12 @@ pub async fn catch_up(client: &dyn TwsClient, ctx: &Ctx, booked: &mut Booked) ->
     let mut execs: HashMap<i32, (String, f64, f64)> = HashMap::new();
     for ev in client.executions_today().await.map_err(|e| e.to_string())? {
         if let TwsEvent::Execution { exec_id, order_id, order_ref, qty, price, .. } = ev {
-            if booked.execs.insert(exec_id) {
+            let fresh = !booked.execs.contains(&exec_id);
+            if booked.note_exec(&exec_id) {
+                // A correction: the reconcile after catch-up settles it.
+                continue;
+            }
+            if fresh {
                 let e = execs.entry(order_id).or_insert((order_ref, 0.0, 0.0));
                 e.1 += qty;
                 e.2 += qty * price;
@@ -259,6 +287,32 @@ pub struct Gateway {
     pub state_dir: PathBuf,
 }
 
+/// Publishes a connected client for one session and withdraws it when the
+/// session ends — also when the supervisor task is aborted mid-session
+/// (connection disabled or reloaded), so no stale client lingers in the
+/// process-wide registry holding client id 1 open.
+struct Published<'a> {
+    code: &'a str,
+    slot: &'a ClientSlot,
+    client: Arc<dyn TwsClient>,
+}
+
+impl Drop for Published<'_> {
+    fn drop(&mut self) {
+        *self.slot.write().unwrap_or_else(|e| e.into_inner()) = None;
+        super::set_live_client(self.code, None);
+        self.client.shutdown();
+    }
+}
+
+/// Runs one connected session with the client published to the adapter and the admin API.
+pub async fn session(code: &str, slot: &ClientSlot, client: Arc<dyn TwsClient>, ctx: &Ctx, booked: &mut Booked) -> Result<(), String> {
+    *slot.write().unwrap() = Some(client.clone());
+    super::set_live_client(code, Some(client.clone()));
+    let _published = Published { code, slot, client: client.clone() };
+    run(client, ctx, booked).await
+}
+
 /// Keeps IB Gateway up and the stream running, backing off 1s -> 60s. A failed
 /// login stops it: retrying a bad password risks locking the account.
 pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
@@ -280,12 +334,7 @@ pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
                     }
                 }
                 Ok(client) => {
-                    let client: Arc<dyn TwsClient> = Arc::new(client);
-                    *slot.write().unwrap() = Some(client.clone());
-                    super::set_live_client(&gw.code, Some(client.clone()));
-                    let r = run(client, &ctx, &mut booked).await;
-                    *slot.write().unwrap() = None;
-                    super::set_live_client(&gw.code, None);
+                    let r = session(&gw.code, &slot, Arc::new(client), &ctx, &mut booked).await;
                     Next::Retry(r.err().unwrap_or_else(|| "IBKR session ended".into()))
                 }
             },
@@ -544,6 +593,50 @@ mod tests {
         handle(reject(), &ctx, &mut booked).await;
         handle(reject(), &ctx, &mut booked).await;
         assert_eq!(fills(&mut rx), vec![(placed, ExecKind::Rejected { reason: "IB error 201: no margin".into() })]);
+    }
+
+    #[tokio::test]
+    async fn a_corrected_execution_reconciles_instead_of_booking_another_fill() {
+        let (_, adapter) = rig();
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        let id = Uuid::new_v4();
+        let mut booked = Booked::default();
+        handle(exec("0000e0d5.6551a1b2.01.01", 42, &id.to_string()), &ctx, &mut booked).await;
+        handle(exec("0000e0d5.6551a1b2.01.02", 42, &id.to_string()), &ctx, &mut booked).await;
+        let (mut fills, mut reconciles) = (0, 0);
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                GatewayMsg::Exec(e) if matches!(e.kind, ExecKind::Fill { .. }) => fills += 1,
+                GatewayMsg::Reconcile { .. } => reconciles += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((fills, reconciles), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn aborting_a_session_withdraws_and_closes_its_client() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        let (ctx, _rx, _reg) = ctx(adapter);
+        let slot: ClientSlot = Arc::new(std::sync::RwLock::new(None));
+        let code = "IBKR_TWS-ABORTTEST";
+        let task = {
+            let (slot, client) = (slot.clone(), fake.clone() as Arc<dyn TwsClient>);
+            tokio::spawn(async move { session(code, &slot, client, &ctx, &mut Booked::default()).await })
+        };
+        for _ in 0..100 {
+            if super::super::live_client(code).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(super::super::live_client(code).is_some());
+        task.abort();
+        let _ = task.await;
+        assert!(super::super::live_client(code).is_none());
+        assert!(slot.read().unwrap().is_none());
+        assert!(!fake.connected());
     }
 
     #[test]
