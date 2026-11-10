@@ -262,10 +262,12 @@ pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adap
     }
     let link = hub.link_status(&strategy.code);
     let changed_at = hub.limits_changed.lock().unwrap().get(&strategy.code).copied().unwrap_or_else(Instant::now);
+    // A v2 runtime acknowledges policy revisions on its deployment instead.
+    let acked = if hub.v2_connected(&strategy.code) { strategy.limits_version } else { link.acked_version };
     let mut alarm = unmonitored(
         hub.link_down_for(&strategy.code),
         no_link_grace(strategy.dead_man_secs),
-        link.acked_version,
+        acked,
         strategy.limits_version,
         changed_at,
         Instant::now(),

@@ -185,6 +185,7 @@ pub struct ColoHub {
 
 struct V2ControlSlot {
     conn: u64,
+    strategy_code: String,
     tx: mpsc::UnboundedSender<ToRuntimeEnvelope>,
     account: gateway::runtime::AccountIdentity,
     epoch: u64,
@@ -227,6 +228,7 @@ impl ColoHub {
     pub(crate) fn register_v2_control(
         &self,
         deployment_id: Uuid,
+        strategy_code: &str,
         account: gateway::runtime::AccountIdentity,
         epoch: u64,
         policy_revision: u64,
@@ -238,6 +240,7 @@ impl ColoHub {
             deployment_id,
             V2ControlSlot {
                 conn,
+                strategy_code: strategy_code.to_string(),
                 tx,
                 account,
                 epoch,
@@ -246,13 +249,16 @@ impl ColoHub {
                 next_sequence: 2,
             },
         );
+        self.down_since.lock().unwrap().remove(strategy_code);
         (conn, rx)
     }
 
     pub(crate) fn disconnect_v2_control(&self, deployment_id: Uuid, conn: u64) {
         let mut links = self.v2_control.lock().unwrap();
         if links.get(&deployment_id).is_some_and(|slot| slot.conn == conn) {
-            links.remove(&deployment_id);
+            if let Some(slot) = links.remove(&deployment_id) {
+                self.down_since.lock().unwrap().insert(slot.strategy_code, Instant::now());
+            }
         }
     }
 
@@ -311,9 +317,15 @@ impl ColoHub {
         }
     }
 
-    /// How long a strategy has had no link; `None` while connected.
+    /// Whether a runtime of this strategy holds a v2 control connection.
+    /// Its policy acknowledgements are tracked on the deployment, not here.
+    pub fn v2_connected(&self, code: &str) -> bool {
+        self.v2_control.lock().unwrap().values().any(|slot| slot.strategy_code == code)
+    }
+
+    /// How long a strategy has had no link (v1 or v2); `None` while connected.
     pub fn link_down_for(&self, code: &str) -> Option<Duration> {
-        if self.links.lock().unwrap().contains_key(code) {
+        if self.links.lock().unwrap().contains_key(code) || self.v2_connected(code) {
             return None;
         }
         let since = self.down_since.lock().unwrap().get(code).copied().unwrap_or(self.started);
@@ -370,6 +382,11 @@ impl ColoHub {
                 last_heard_secs: Some(l.last_heard.elapsed().as_secs()),
                 acked_version: l.acked_version,
                 kill_acked: self.kills.lock().unwrap().get(code).is_some_and(|k| k.1),
+            },
+            None if self.v2_connected(code) => LinkStatus {
+                connected: true,
+                kill_acked: self.kills.lock().unwrap().get(code).is_some_and(|k| k.1),
+                ..LinkStatus::default()
             },
             None => LinkStatus::default(),
         }

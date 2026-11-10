@@ -215,6 +215,7 @@ async fn handle_v2(
         sink.send(Message::Text(serde_json::to_string(&first)?)).await?;
         let (conn, rx) = hub.register_v2_control(
             binding.deployment.id,
+            &binding.deployment.strategy_code,
             binding.account.clone(),
             binding.epoch,
             revision,
@@ -569,6 +570,24 @@ mod tests {
             }
         };
         assert_eq!(next, ToStrategy::Kill);
+    }
+
+    #[test]
+    fn a_v2_control_connection_counts_as_the_strategys_link() {
+        let hub = crate::colo::ColoHub::default();
+        let deployment = uuid::Uuid::new_v4();
+        let account = gateway::runtime::AccountIdentity {
+            account_id: uuid::Uuid::new_v4(),
+            venue: "BINANCE".into(),
+            environment: "PAPER".into(),
+            external_account_ref: "sub".into(),
+        };
+        let (conn, _rx) = hub.register_v2_control(deployment, "mm1", account, 1, 1, "n".into());
+        assert_eq!(hub.link_down_for("mm1"), None);
+        assert!(hub.link_status("mm1").connected);
+        hub.disconnect_v2_control(deployment, conn);
+        assert!(hub.link_down_for("mm1").is_some());
+        assert!(!hub.link_status("mm1").connected);
     }
 
     #[test]
