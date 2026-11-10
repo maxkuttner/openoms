@@ -38,3 +38,6 @@ FIX-*.pdf
 
 # openoms bootstrap config — holds the master key
 oms.toml
+
+# scripts/colo-demo.sh state
+/colo-demo/

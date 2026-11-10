@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Badge, Button, Code, CopyButton, Group, Modal, MultiSelect, PasswordInput, Stack, Text, Textarea } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
+import { DeploymentPanel } from "../components/DeploymentPanel";
 import { api } from "../api/client";
 import { notifyError, notifyOk, useList } from "../api/hooks";
 import { useQueryClient } from "@tanstack/react-query";
@@ -111,6 +112,7 @@ export function StrategiesPage() {
   const [confirm, setConfirm] = useState<{ title: string; body: string; run: () => void } | null>(null);
   const [editing, setEditing] = useState<Strategy | null>(null);
   const [followKey, setFollowKey] = useState<string | null>(null);
+  const [runtime, setRuntime] = useState<string | null>(null);
 
   const refresh = () => qc.invalidateQueries({ queryKey: [PATH] });
   const control = (code: string, action: "kill" | "flatten") =>
@@ -178,6 +180,9 @@ export function StrategiesPage() {
             >
               Flatten
             </Button>
+            {isColocated(row) && (
+              <Button size="xs" variant="default" onClick={() => setRuntime(row.code)}>Runtime</Button>
+            )}
             {isColocated(row) && (
               <Button size="xs" variant="default" onClick={() => setFollowKey(row.code)}>
                 {row.has_follow_credentials ? "Replace follow key" : "Follow key"}
@@ -253,6 +258,7 @@ export function StrategiesPage() {
       {confirm && <Confirm title={confirm.title} body={confirm.body} onConfirm={confirm.run} onClose={() => setConfirm(null)} />}
       {editing && <ConnectionsEditor strategy={editing} onClose={() => setEditing(null)} />}
       {followKey && <FollowKeyForm code={followKey} onClose={() => setFollowKey(null)} />}
+      {runtime && <DeploymentPanel code={runtime} onClose={() => setRuntime(null)} />}
       {password && (
         <Modal opened onClose={() => setPassword(null)} title={`FIX password — ${password.code}`} centered>
           <Stack>
