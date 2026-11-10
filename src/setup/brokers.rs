@@ -72,6 +72,12 @@ impl Broker {
         Broker::all()[0]
     }
 
+    /// Any connector by code, even one with no loadable universe (instruments
+    /// imported on demand still map to their broker).
+    pub fn of(code: &str) -> Option<Broker> {
+        gateway::connectors::all().iter().find(|c| c.manifest().code == code).map(|c| Broker(*c))
+    }
+
     pub fn by_code(code: &str) -> Option<Broker> {
         Broker::all().into_iter().find(|b| b.code() == code)
     }
@@ -148,15 +154,16 @@ pub struct Args {
     /// success is how a seeding gap survives to become a missing price.
     #[arg(long)]
     pub allow_skips: bool,
-    /// IBKR_TWS only: a CSV (`symbol,exchange,currency,conid`) of instruments to
-    /// import through the running OMS, which must be connected to IB Gateway.
+    /// Import instruments for the IBKR TWS connector from a CSV
+    /// (`symbol,exchange,currency,conid`), through the running OMS, which must be
+    /// connected to IB Gateway. Ignores `--broker`.
     #[arg(long, value_name = "FILE")]
     pub symbols: Option<std::path::PathBuf>,
 }
 
 pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &args.symbols {
-        return crate::instruments_import::run_cli(path, args.broker).await;
+        return crate::instruments_import::run_cli(path).await;
     }
     let pool = PgPool::connect(&super::database_url()?).await?;
     let provider = provider_for(&pool, args.broker).await?;

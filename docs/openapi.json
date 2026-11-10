@@ -649,9 +649,9 @@
         "parameters": [
           {
             "name": "env",
-            "in": "path",
+            "in": "query",
             "description": "Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string",
               "nullable": true
@@ -702,9 +702,9 @@
         "parameters": [
           {
             "name": "env",
-            "in": "path",
+            "in": "query",
             "description": "Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string",
               "nullable": true
@@ -758,7 +758,7 @@
         "parameters": [
           {
             "name": "q",
-            "in": "path",
+            "in": "query",
             "description": "Symbol or company-name fragment.",
             "required": true,
             "schema": {
@@ -767,9 +767,9 @@
           },
           {
             "name": "env",
-            "in": "path",
+            "in": "query",
             "description": "Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string",
               "nullable": true

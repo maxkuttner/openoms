@@ -1,6 +1,6 @@
 //! IBKR_TWS instrument import: admin endpoints that resolve a CSV or a search
 //! against the live IB Gateway session and save chosen contracts by conId, and
-//! the CLI client (`oms setup sync-broker --broker ibkr_tws --symbols file.csv`)
+//! the CLI client (`oms setup sync-broker --symbols file.csv`)
 //! that drives them.
 //!
 //! Which gateway: `?env=` picks the connection environment (`PAPER` by
@@ -27,14 +27,20 @@ use crate::setup::brokers::{load_universe, Broker, LoadOptions, LoadProgress, Un
 const NOT_CONNECTED: &str = "IBKR gateway is not connected";
 /// How many search hits are expanded into full contract details.
 const SEARCH_LIMIT: usize = 10;
+/// Most CSV rows or conIds one request may carry.
+pub const MAX_ROWS: usize = 1000;
+/// Largest request body the import routes accept.
+const BODY_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct EnvParam {
     /// Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.
     pub env: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct SearchParams {
     /// Symbol or company-name fragment.
     pub q: String,
@@ -99,10 +105,16 @@ pub struct SaveRequest {
 /// The admin routes; merged into the admin router, so they share its auth.
 pub fn routes() -> axum::Router<AppState> {
     use axum::routing::{get, post};
-    axum::Router::new()
-        .route("/admin/brokers/IBKR_TWS/instruments", post(save))
-        .route("/admin/brokers/IBKR_TWS/instruments/resolve", post(resolve_csv))
-        .route("/admin/brokers/IBKR_TWS/instruments/search", get(search))
+    with_body_limit(
+        axum::Router::new()
+            .route("/admin/brokers/IBKR_TWS/instruments", post(save))
+            .route("/admin/brokers/IBKR_TWS/instruments/resolve", post(resolve_csv))
+            .route("/admin/brokers/IBKR_TWS/instruments/search", get(search)),
+    )
+}
+
+fn with_body_limit<S: Clone + Send + Sync + 'static>(r: axum::Router<S>) -> axum::Router<S> {
+    r.layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
 }
 
 fn live(env: Option<&str>) -> Result<std::sync::Arc<dyn TwsClient>, AdminError> {
@@ -140,7 +152,8 @@ pub async fn resolve_csv(
     Json(body): Json<ImportResolveRequest>,
 ) -> Result<Json<Vec<ResolvedRow>>, AdminError> {
     let client = live(p.env.as_deref())?;
-    let rows = parse_csv(&body.csv).map_err(|e| AdminError::new(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let rows = parse_csv(&body.csv).map_err(unprocessable)?;
+    check_cap(rows.len(), "CSV rows")?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let (status, candidates, message) = match resolve(client.as_ref(), row).await {
@@ -174,8 +187,11 @@ pub async fn search(Query(p): Query<SearchParams>) -> Result<Json<Vec<Contract>>
     for hit in hits.iter().filter(|h| to_mic(&h.primary_exchange).is_some()).take(SEARCH_LIMIT) {
         // The symbol search carries no tick size; the details do.
         let q = ContractQuery { con_id: Some(hit.con_id), ..Default::default() };
-        if let Some(full) = client.contract_details(&q).await.map_err(tws_error)?.first() {
-            out.push(Contract::from(full));
+        // A hit whose details fail is left out; the rest still answer.
+        if let Ok(full) = client.contract_details(&q).await {
+            if let Some(full) = full.first() {
+                out.push(Contract::from(full));
+            }
         }
     }
     dropped(client.as_ref())?;
@@ -198,6 +214,7 @@ pub async fn save(
     Query(p): Query<EnvParam>,
     Json(body): Json<SaveRequest>,
 ) -> Result<Json<UniverseLoadReport>, AdminError> {
+    check_cap(body.con_ids.len(), "conIds")?;
     let client = live(p.env.as_deref())?;
     let mut instruments = Vec::new();
     for &con_id in &body.con_ids {
@@ -214,6 +231,13 @@ pub async fn save(
         .await
         .map_err(|e| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(report))
+}
+
+fn check_cap(n: usize, what: &str) -> Result<(), AdminError> {
+    if n > MAX_ROWS {
+        return Err(unprocessable(format!("{n} {what} is over the limit of {MAX_ROWS} per request")));
+    }
+    Ok(())
 }
 
 fn unprocessable(m: String) -> AdminError {
@@ -257,7 +281,7 @@ pub async fn save_instruments(
     instruments: Vec<BrokerInstrument>,
     no_enrich: bool,
 ) -> Result<UniverseLoadReport, Box<dyn std::error::Error>> {
-    let broker = Broker::by_code("IBKR_TWS").ok_or("IBKR_TWS is not a universe broker")?;
+    let broker = Broker::of("IBKR_TWS").ok_or("IBKR_TWS is not a universe broker")?;
     let opts = LoadOptions { no_enrich, allow_skips: true, underlyings: Vec::new() };
     load_universe(pool, broker, &Chosen(Mutex::new(instruments)), &opts, &Quiet).await
 }
@@ -268,11 +292,8 @@ pub async fn save_instruments(
 /// unambiguous rows, list the rest by line. Errors (exit 1) when any row needs
 /// attention. Talks to the OMS at the configured bind address with the admin
 /// password resolved as the server resolves it; never starts Docker.
-pub async fn run_cli(path: &std::path::Path, broker: Broker) -> Result<(), Box<dyn std::error::Error>> {
-    if broker.code() != "IBKR_TWS" {
-        return Err("--symbols is only for --broker ibkr_tws".into());
-    }
-    let env = broker.environment();
+pub async fn run_cli(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let env = Broker::of("IBKR_TWS").ok_or("IBKR_TWS connector missing")?.environment();
     let env = env.as_str();
     let csv = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file = crate::config::load();
@@ -289,14 +310,11 @@ pub async fn run_cli(path: &std::path::Path, broker: Broker) -> Result<(), Box<d
     )
     .await?;
 
-    let (mut con_ids, mut problems) = (Vec::new(), 0usize);
+    let con_ids = savable_con_ids(&rows);
+    let mut problems = 0usize;
     for row in &rows {
         match (row.status.as_str(), row.candidates.as_slice()) {
-            ("found", [c]) => {
-                if !con_ids.contains(&c.con_id) {
-                    con_ids.push(c.con_id);
-                }
-            }
+            ("found", _) => {}
             ("ambiguous", cands) => {
                 problems += 1;
                 println!("line {}: ambiguous, {}", row.line, row.message);
@@ -327,6 +345,20 @@ pub async fn run_cli(path: &std::path::Path, broker: Broker) -> Result<(), Box<d
     Ok(())
 }
 
+/// The conIds safe to save: unique `found` rows only. Ambiguous and not-found
+/// rows contribute nothing.
+fn savable_con_ids(rows: &[ResolvedRow]) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for row in rows {
+        if let ("found", [c]) = (row.status.as_str(), row.candidates.as_slice()) {
+            if !ids.contains(&c.con_id) {
+                ids.push(c.con_id);
+            }
+        }
+    }
+    ids
+}
+
 async fn admin_call<T: serde::de::DeserializeOwned>(req: reqwest::RequestBuilder) -> Result<T, Box<dyn std::error::Error>> {
     let resp = req.send().await.map_err(|e| format!("could not reach the OMS (is it running?): {e}"))?;
     let status = resp.status();
@@ -353,6 +385,54 @@ mod tests {
             name: "SAP SE".into(),
             isin: None,
         }
+    }
+
+    fn rrow(line: usize, status: &str, ids: &[i64]) -> ResolvedRow {
+        ResolvedRow {
+            line,
+            status: status.into(),
+            candidates: ids.iter().map(|i| Contract::from(&contract(*i, "IBIS"))).collect(),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn only_unique_found_rows_are_saved() {
+        let rows = [
+            rrow(2, "found", &[1]),
+            rrow(3, "ambiguous", &[2, 3]),
+            rrow(4, "not_found", &[]),
+            rrow(5, "found", &[1]),
+            rrow(6, "found", &[4]),
+        ];
+        assert_eq!(savable_con_ids(&rows), vec![1, 4]);
+    }
+
+    #[test]
+    fn requests_over_the_cap_are_refused_naming_the_limit() {
+        assert!(check_cap(MAX_ROWS, "CSV rows").is_ok());
+        let e = check_cap(MAX_ROWS + 1, "conIds").unwrap_err();
+        assert!(format!("{e:?}").contains("1000"));
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_refused() {
+        use axum::body::Body;
+        use tower::Service;
+        let mut app = with_body_limit::<()>(axum::Router::new().route(
+            "/",
+            axum::routing::post(|Json(_): Json<ImportResolveRequest>| async {}),
+        ));
+        let post = |csv: String| {
+            axum::http::Request::post("/")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "csv": csv }).to_string()))
+                .unwrap()
+        };
+        let ok = app.call(post("symbol\nAAPL\n".into())).await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let big = app.call(post("x".repeat(BODY_LIMIT + 1))).await.unwrap();
+        assert_eq!(big.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

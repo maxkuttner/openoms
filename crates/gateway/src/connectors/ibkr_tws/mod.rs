@@ -60,7 +60,7 @@ static MANIFEST: Manifest = Manifest {
     field_types: &[],
     redaction: &[("username", Clear), ("password", Hidden)],
     live_only: false,
-    universe: true,
+    universe: false,
     quotes: QuoteScope::NonCrypto,
     exec_stream: true,
     session_bound: true,
