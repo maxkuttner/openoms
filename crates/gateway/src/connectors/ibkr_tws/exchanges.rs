@@ -16,10 +16,10 @@ const TABLE: &[(&str, &str)] = &[
     ("BVME", "XMIL"),
     ("BM", "XMAD"),
     ("SFB", "XSTO"),
-    ("TSE", "XTKS"),
+    ("TSE", "XTSE"),
     ("SEHK", "XHKG"),
     ("ASX", "XASX"),
-    ("TSX", "XTSE"),
+    ("TSEJ", "XTKS"),
 ];
 
 pub fn to_mic(ibkr: &str) -> Option<&'static str> {
@@ -45,6 +45,17 @@ mod tests {
             let mic = to_mic(ibkr).unwrap();
             assert_eq!(from_mic(mic), Some(*ibkr));
         }
+        let mut mics: Vec<&str> = TABLE.iter().map(|(_, m)| *m).collect();
+        mics.sort_unstable();
+        mics.dedup();
+        assert_eq!(mics.len(), TABLE.len(), "each MIC must appear once");
+    }
+
+    #[test]
+    fn toronto_and_tokyo_map_correctly() {
+        assert_eq!(to_mic("TSE"), Some("XTSE"));
+        assert_eq!(to_mic("TSEJ"), Some("XTKS"));
+        assert_eq!(to_mic("TSX"), None);
     }
 
     #[test]

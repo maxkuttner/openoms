@@ -53,7 +53,7 @@ fn venue() -> Venue {
         code: "IBKR_TWS",
         name: "Interactive Brokers (TWS API)",
         description: "Stocks worldwide via IB Gateway (Docker)",
-        docs_url: format!("{DOCS}/interactive-brokers-tws/"),
+        docs_url: format!("{DOCS}/interactive-brokers/"),
         universe: Some("Imported on demand from a CSV or search"),
         environments: environments(
             "paper trading account",

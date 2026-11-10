@@ -238,7 +238,7 @@
     "code": "IBKR_TWS",
     "name": "Interactive Brokers (TWS API)",
     "description": "Stocks worldwide via IB Gateway (Docker)",
-    "docs_url": "https://openoms.dev/integrations/interactive-brokers-tws/",
+    "docs_url": "https://openoms.dev/integrations/interactive-brokers/",
     "universe": "Imported on demand from a CSV or search",
     "environments": [
       {
