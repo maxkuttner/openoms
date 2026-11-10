@@ -30,6 +30,9 @@ pub enum GatewayState {
     Starting,
     Connected,
     AwaitingTwoFactor,
+    /// The account was logged in elsewhere; the gateway takes the session over
+    /// (`EXISTING_SESSION_DETECTED_ACTION=primary`).
+    ExistingSession,
     LoginFailed(String),
     /// Docker or the host is not ready: not a credential problem, so retried.
     Unavailable(String),
@@ -45,7 +48,13 @@ pub struct ContainerInfo {
     pub container_port: Option<u16>,
     /// Whether the API is published on 127.0.0.1 only.
     pub loopback_only: bool,
+    /// The [`CREDS_LABEL`] it was started with: which login it holds.
+    pub creds_tag: Option<String>,
 }
+
+/// Container label carrying [`creds_tag`], so a container still logged in with
+/// old credentials is replaced instead of adopted.
+pub const CREDS_LABEL: &str = "oms.ibkr.creds";
 
 /// How to start the container. The password is not here: it travels in the
 /// env file only, so this can be logged.
@@ -57,6 +66,8 @@ pub struct RunSpec {
     /// The container-side API port: [`CONTAINER_PORT_PAPER`] or [`CONTAINER_PORT_LIVE`].
     pub container_port: u16,
     pub env_file: PathBuf,
+    /// [`creds_tag`] of the login, set as the [`CREDS_LABEL`] label (not secret).
+    pub creds_tag: String,
 }
 
 impl fmt::Debug for RunSpec {
@@ -67,6 +78,7 @@ impl fmt::Debug for RunSpec {
             .field("api_port", &self.api_port)
             .field("container_port", &self.container_port)
             .field("env_file", &self.env_file)
+            .field("creds_tag", &self.creds_tag)
             .finish()
     }
 }
@@ -89,6 +101,8 @@ pub fn classify_logs(tail: &str) -> Option<GatewayState> {
         let l = line.to_lowercase();
         if l.contains("second factor authentication") {
             Some(GatewayState::AwaitingTwoFactor)
+        } else if l.contains("existing session detected") {
+            Some(GatewayState::ExistingSession)
         } else if l.contains("login failed") || l.contains("invalid username or password") {
             Some(GatewayState::LoginFailed(sanitize_log_line(line)))
         } else {
@@ -154,11 +168,50 @@ fn write_env_file(path: &Path, env: &str, creds: &IbkrTwsCredentials) -> Result<
     let guard = EnvFile(path.to_path_buf());
     write!(
         file,
-        "TWS_USERID={}\nTWS_PASSWORD={}\nTRADING_MODE={mode}\nREAD_ONLY_API=no\n",
+        "TWS_USERID={}\nTWS_PASSWORD={}\nTRADING_MODE={mode}\nREAD_ONLY_API=no\nEXISTING_SESSION_DETECTED_ACTION=primary\n",
         creds.username, creds.password
     )
     .map_err(|e| format!("could not write the gateway env file: {e}"))?;
     Ok(guard)
+}
+
+/// A per-install random key, `creds.salt` in `state_dir` (0600, created once).
+fn salt(state_dir: &Path) -> Result<Vec<u8>, String> {
+    let path = state_dir.join("creds.salt");
+    match std::fs::read(&path) {
+        Ok(s) if s.len() == 32 => return Ok(s),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&path);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    }
+    let mut key = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&path)
+        .and_then(|mut f| f.write_all(&key))
+        .map_err(|e| format!("could not create {}: {e}", path.display()))?;
+    Ok(key.to_vec())
+}
+
+/// HMAC-SHA256 of the login under the install's salt: tells a container started
+/// with these credentials from one started with others, without exposing the
+/// password (an unkeyed hash in `docker inspect` could be brute-forced).
+pub fn creds_tag(state_dir: &Path, creds: &IbkrTwsCredentials) -> Result<String, String> {
+    use hmac::{Hmac, Mac};
+    std::fs::create_dir_all(state_dir).map_err(|e| format!("could not create {}: {e}", state_dir.display()))?;
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&salt(state_dir)?).expect("any key length");
+    mac.update(creds.username.as_bytes());
+    mac.update(b"\0");
+    mac.update(creds.password.as_bytes());
+    Ok(mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Stops and removes the gateway container for `connection_code`, if any.
@@ -203,23 +256,27 @@ pub async fn ensure_running(
     let name = container_name(code);
     let (creds, state_dir, env) = (creds.clone(), state_dir.to_path_buf(), env.to_string());
     let adopted = {
-        let (docker, name) = (docker.clone(), name.clone());
+        let (docker, name, creds, state_dir) = (docker.clone(), name.clone(), creds.clone(), state_dir.clone());
         blocking(Box::new(move || {
             if !docker.available() {
                 return Err(GatewayState::Unavailable(
                     "Docker is required for IBKR_TWS but is not running".into(),
                 ));
             }
+            let tag = creds_tag(&state_dir, &creds).map_err(GatewayState::Unavailable)?;
             let Some(info) = docker.inspect(&name) else {
                 return Ok(None);
             };
             // Only a running container for this very environment, published on
-            // loopback, is ours to reuse: paper and live are not interchangeable.
-            if let (true, Some(port), true, true) = (
+            // loopback and logged in with these credentials, is ours to reuse:
+            // paper and live are not interchangeable, and one holding an old
+            // login (credentials changed since) must be recreated.
+            if let (true, Some(port), true, true, true) = (
                 info.running,
                 info.api_port,
                 info.container_port == Some(container_port),
                 info.loopback_only,
+                info.creds_tag.as_deref() == Some(tag.as_str()),
             ) {
                 return Ok(Some(port));
             }
@@ -242,8 +299,10 @@ pub async fn ensure_running(
         std::fs::create_dir_all(&state_dir)
             .map_err(|e| failed(format!("could not create {}: {e}", state_dir.display())))?;
         let env_path = state_dir.join(format!("{name}.env"));
+        let tag = creds_tag(&state_dir, &creds).map_err(failed)?;
         let _env_file = write_env_file(&env_path, &env, &creds).map_err(failed)?;
         let spec = RunSpec {
+            creds_tag: tag,
             name,
             image: IMAGE,
             api_port,
@@ -326,17 +385,20 @@ impl GatewayDocker for DockerCli {
                 .flatten()
                 .all(|b| b["HostIp"] == "127.0.0.1")
         });
+        let creds_tag = c["Config"]["Labels"][CREDS_LABEL].as_str().map(str::to_string);
         Some(ContainerInfo {
             running,
             api_port,
             container_port,
             loopback_only,
+            creds_tag,
         })
     }
 
     fn run(&self, spec: &RunSpec) -> Result<(), String> {
         let publish = format!("127.0.0.1:{}:{}", spec.api_port, spec.container_port);
         let env_file = spec.env_file.to_string_lossy();
+        let label = format!("{CREDS_LABEL}={}", spec.creds_tag);
         // No restart policy: the supervisor owns restarts, and a bad login must
         // not be retried by Docker (repeated failures can lock the account).
         let out = Self::output(
@@ -347,6 +409,8 @@ impl GatewayDocker for DockerCli {
                 &spec.name,
                 "-p",
                 &publish,
+                "--label",
+                &label,
                 "--env-file",
                 &env_file,
                 spec.image,
@@ -474,21 +538,60 @@ mod tests {
         d
     }
 
+    fn running(tag: Option<String>) -> ContainerInfo {
+        ContainerInfo {
+            running: true,
+            api_port: Some(4123),
+            container_port: Some(CONTAINER_PORT_PAPER),
+            loopback_only: true,
+            creds_tag: tag,
+        }
+    }
+
+    /// A plain OMS restart with the same credentials adopts the running container.
     #[tokio::test]
-    async fn a_running_container_is_adopted_not_recreated() {
+    async fn a_running_container_with_the_same_login_is_adopted_not_recreated() {
+        let d = dir("adopt");
         let fake = Arc::new(FakeDocker {
-            existing: Some(ContainerInfo {
-                running: true,
-                api_port: Some(4123),
-                container_port: Some(CONTAINER_PORT_PAPER),
-                loopback_only: true,
-            }),
+            existing: Some(running(Some(creds_tag(&d, &creds()).unwrap()))),
             ..Default::default()
         });
-        let port = ensure_running(fake.clone(), "IBKR_TWS", "paper", &creds(), &dir("adopt")).await;
+        let port = ensure_running(fake.clone(), "IBKR_TWS", "paper", &creds(), &d).await;
         assert_eq!(port, Ok(4123));
         assert!(fake.runs.lock().unwrap().is_empty());
         assert!(fake.removed.lock().unwrap().is_empty());
+    }
+
+    /// Saving new credentials replaces the container still logged in with the old ones.
+    #[tokio::test]
+    async fn a_container_with_an_old_login_is_replaced() {
+        let d = dir("relogin");
+        let old = IbkrTwsCredentials { username: "trader1".into(), password: "old-pw".into() };
+        let fake = Arc::new(FakeDocker {
+            existing: Some(running(Some(creds_tag(&d, &old).unwrap()))),
+            ..Default::default()
+        });
+        ensure_running(fake.clone(), "IBKR_TWS", "paper", &creds(), &d).await.unwrap();
+        assert_eq!(*fake.removed.lock().unwrap(), vec!["oms-ibgw-ibkr_tws".to_string()]);
+        let runs = fake.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].creds_tag, creds_tag(&d, &creds()).unwrap());
+        // A container without the label (started before it existed) is replaced too.
+        let fake = Arc::new(FakeDocker { existing: Some(running(None)), ..Default::default() });
+        ensure_running(fake.clone(), "IBKR_TWS", "paper", &creds(), &d).await.unwrap();
+        assert_eq!(fake.runs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_creds_tag_is_keyed_stable_and_hides_the_password() {
+        use std::os::unix::fs::PermissionsExt;
+        let (a, b) = (dir("tag-a"), dir("tag-b"));
+        let t = creds_tag(&a, &creds()).unwrap();
+        assert_eq!(t, creds_tag(&a, &creds()).unwrap());
+        assert_ne!(t, creds_tag(&b, &creds()).unwrap(), "another install's salt differs");
+        assert!(!t.contains("s3cret-pw"));
+        let mode = std::fs::metadata(a.join("creds.salt")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[tokio::test]
@@ -499,6 +602,7 @@ mod tests {
                 api_port: Some(4123),
                 container_port: Some(CONTAINER_PORT_PAPER),
                 loopback_only: true,
+                creds_tag: None,
             }),
             ..Default::default()
         });
@@ -520,6 +624,7 @@ mod tests {
                 api_port: Some(4123),
                 container_port: Some(CONTAINER_PORT_PAPER),
                 loopback_only: false,
+                creds_tag: None,
             }),
             ..Default::default()
         });
@@ -560,6 +665,7 @@ mod tests {
                 api_port: Some(4123),
                 container_port: Some(CONTAINER_PORT_PAPER),
                 loopback_only: true,
+                creds_tag: None,
             }),
             ..Default::default()
         });
@@ -600,6 +706,7 @@ mod tests {
             "TWS_PASSWORD=s3cret-pw",
             "TRADING_MODE=paper",
             "READ_ONLY_API=no",
+            "EXISTING_SESSION_DETECTED_ACTION=primary",
         ] {
             assert!(contents.lines().any(|l| l == line), "missing {line}");
         }
@@ -666,6 +773,14 @@ mod tests {
         assert_eq!(
             classify_logs("IBC: Second Factor Authentication window"),
             Some(GatewayState::AwaitingTwoFactor)
+        );
+    }
+
+    #[test]
+    fn an_existing_session_is_classified() {
+        assert_eq!(
+            classify_logs("IBC: Existing session detected - User must choose whether to continue with this session"),
+            Some(GatewayState::ExistingSession)
         );
     }
 

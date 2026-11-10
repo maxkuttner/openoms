@@ -146,6 +146,17 @@ impl StreamHandle {
         });
     }
 
+    /// Connecting, with why it is not live yet (starting, awaiting approval…),
+    /// shown in `last_error` until the stream goes live.
+    pub fn set_connecting_because(&self, message: impl Into<String>) {
+        let message = message.into();
+        self.mutate(|h| {
+            h.state = StreamState::Connecting;
+            h.connected_since = None;
+            h.last_error = Some(message);
+        });
+    }
+
     /// Authenticated + subscribed; the socket is live.
     pub fn set_live(&self) {
         let now = Utc::now();
@@ -182,5 +193,22 @@ impl dataprovider::FeedHealth for StreamHandle {
 
     fn on_event(&self) {
         self.record_event();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connecting_can_say_why_and_going_live_clears_it() {
+        let reg = StreamHealthRegistry::new();
+        let h = reg.handle("IBKR_TWS", "PAPER", StreamKind::Execution);
+        h.set_connecting_because("IB Gateway is starting");
+        let s = &reg.snapshot()[0];
+        assert!(s.state == StreamState::Connecting);
+        assert_eq!(s.last_error.as_deref(), Some("IB Gateway is starting"));
+        h.set_live();
+        assert_eq!(reg.snapshot()[0].last_error, None);
     }
 }

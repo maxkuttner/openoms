@@ -26,20 +26,25 @@ and password.
 
 The OMS starts one container per connection and environment, named
 `oms-ibgw-<connection>`. The API port is published on `127.0.0.1` only. After an OMS
-restart it picks the running container up again instead of starting a new one. The
+restart it picks the running container up again instead of starting a new one, as
+long as your credentials are unchanged. Saving new credentials replaces the container
+and logs in again; no OMS restart is needed. If the account is logged in somewhere
+else, the gateway takes the session over. The
 password is handed to the container through a short-lived file and is never put on a
 command line or in a log.
 
 The connection's status shows `connecting`, `live` or `down`. While it is `down` or
-`connecting`, the message beside it says why:
+`connecting`, the message beside it (hover the status) says why:
 
-| Status message | Meaning |
-|---|---|
-| IB Gateway is starting | The container is up and logging in. |
-| waiting for two-factor approval on the IBKR mobile app | Approve the login in the IBKR Mobile app. IBKR normally requires this for live logins, and asks again about once a week. |
-| IBKR login failed: ... | IBKR rejected the username or password. The OMS stops retrying, so it does not lock your account. Fix the password in the credentials drawer, then restart the OMS. |
-| Docker is required for IBKR_TWS but is not running | The OMS can't reach Docker. It keeps retrying until Docker is back. |
-| IB Gateway is disconnected, or IB Gateway lost its connection to IBKR | The gateway dropped; the OMS reconnects. |
+| Status | Message | Meaning |
+|---|---|---|
+| connecting | IB Gateway is starting | The container is up and logging in. |
+| connecting | IB Gateway not reachable yet: ... | The container is still starting its API. |
+| connecting | waiting for two-factor approval on the IBKR mobile app | Approve the login in the IBKR Mobile app. IBKR normally requires this for live logins, and asks again about once a week. |
+| connecting | IBKR account is logged in elsewhere; the gateway is taking over the session | Another TWS, IB Gateway or IBKR web session holds the login. The gateway takes over, which logs the other session out. |
+| down | IBKR login failed: ... | IBKR rejected the username or password. The OMS stops retrying, so it does not lock your account. Fix the password in the credentials drawer and save; the OMS logs in again with the new one. |
+| down | Docker is required for IBKR_TWS but is not running | The OMS can't reach Docker. It keeps retrying until Docker is back. |
+| down | IB Gateway is disconnected, or IB Gateway lost its connection to IBKR | The gateway dropped; the OMS reconnects. |
 
 ### Instruments
 

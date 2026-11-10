@@ -63,7 +63,7 @@ static MANIFEST: Manifest = Manifest {
     universe: false,
     quotes: QuoteScope::NonCrypto,
     exec_stream: true,
-    session_bound: true,
+    session_bound: false,
     price_band_exempt: true,
     per_currency_notional: true,
 };

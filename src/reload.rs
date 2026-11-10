@@ -408,6 +408,24 @@ mod tests {
         assert_eq!(codes, ["ALPACA", "BYBIT", "COINBASE", "OKX"]);
     }
 
+    /// IBKR_TWS is not session-bound: saving its credentials (or creating it)
+    /// on a running OMS builds a fresh adapter and hands back its execution
+    /// stream, whose restart replaces the old supervisor — no OMS restart.
+    #[tokio::test]
+    async fn an_ibkr_tws_credential_change_is_applied_on_reload() {
+        let creds = BrokerCredentials::from_typed(
+            "IbkrTws",
+            &gateway::connectors::ibkr_tws::IbkrTwsCredentials { username: "u".into(), password: "p".into() },
+        );
+        let mut c = conn("ibkr-tws-paper", "ACTIVE", CredentialState::Configured(creds));
+        c.kind = "IBKR_TWS".into();
+        assert!(matches!(classify(&c, false), ConnectionOutcome::Registered));
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &stub_deps()).await;
+        assert!(matches!(out.report.connections[0].1, ConnectionOutcome::Registered), "{:?}", out.report.connections);
+        let codes: Vec<&str> = out.exec_streams.iter().map(|s| s.code).collect();
+        assert_eq!(codes, ["IBKR_TWS"]);
+    }
+
     /// Every REST connector's previous-close source comes back beside its
     /// adapter, for the market-data side; FIX connectors have none.
     #[tokio::test]

@@ -259,6 +259,9 @@ pub async fn run(client: Arc<dyn TwsClient>, ctx: &Ctx, booked: &mut Booked) -> 
 /// What the supervisor does with a gateway state it can't connect past.
 #[derive(Debug, PartialEq)]
 pub enum Next {
+    /// Not up yet but nothing is wrong (starting, awaiting approval): connecting.
+    Wait(String),
+    /// Down: Docker missing or the session lost.
     Retry(String),
     Stop(String),
 }
@@ -266,8 +269,11 @@ pub enum Next {
 pub fn on_gateway_state(s: &GatewayState) -> Next {
     match s {
         GatewayState::LoginFailed(m) => Next::Stop(format!("IBKR login failed: {m}")),
-        GatewayState::AwaitingTwoFactor => Next::Retry("waiting for two-factor approval on the IBKR mobile app".into()),
-        GatewayState::Starting | GatewayState::Connected => Next::Retry("IB Gateway is starting".into()),
+        GatewayState::AwaitingTwoFactor => Next::Wait("waiting for two-factor approval on the IBKR mobile app".into()),
+        GatewayState::ExistingSession => {
+            Next::Wait("IBKR account is logged in elsewhere; the gateway is taking over the session".into())
+        }
+        GatewayState::Starting | GatewayState::Connected => Next::Wait("IB Gateway is starting".into()),
         GatewayState::Disconnected => Next::Retry("IB Gateway is disconnected".into()),
         GatewayState::Unavailable(m) => Next::Retry(m.clone()),
     }
@@ -330,7 +336,7 @@ pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
                     let tail = tokio::task::spawn_blocking(move || docker.logs_tail(&name, 200)).await.unwrap_or_default();
                     match classify_logs(&tail) {
                         Some(state) => on_gateway_state(&state),
-                        None => Next::Retry(format!("IB Gateway not reachable yet: {e}")),
+                        None => Next::Wait(format!("IB Gateway not reachable yet: {e}")),
                     }
                 }
                 Ok(client) => {
@@ -345,12 +351,20 @@ pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
                 ctx.health.set_down(m);
                 return;
             }
-            Next::Retry(m) => {
+            next => {
                 if started.elapsed() >= STABLE_AFTER {
                     backoff = FIRST_BACKOFF;
                 }
-                warn!(error = %m, "IBKR_TWS: retrying in {}s", backoff.as_secs());
-                ctx.health.set_down(m);
+                match next {
+                    Next::Wait(m) => {
+                        info!(status = %m, "IBKR_TWS: checking again in {}s", backoff.as_secs());
+                        ctx.health.set_connecting_because(m);
+                    }
+                    Next::Retry(m) | Next::Stop(m) => {
+                        warn!(error = %m, "IBKR_TWS: retrying in {}s", backoff.as_secs());
+                        ctx.health.set_down(m);
+                    }
+                }
                 tokio::time::sleep(backoff).await;
                 backoff = next_backoff(backoff);
             }
@@ -642,8 +656,14 @@ mod tests {
     #[test]
     fn gateway_states_retry_except_a_failed_login() {
         assert!(matches!(on_gateway_state(&GatewayState::LoginFailed("bad password".into())), Next::Stop(_)));
-        assert!(matches!(on_gateway_state(&GatewayState::AwaitingTwoFactor), Next::Retry(m) if m.contains("two-factor")));
-        assert!(matches!(on_gateway_state(&GatewayState::Starting), Next::Retry(_)));
+        // Not up yet but nothing wrong: connecting, not down.
+        assert!(matches!(on_gateway_state(&GatewayState::AwaitingTwoFactor), Next::Wait(m) if m.contains("two-factor")));
+        assert!(matches!(on_gateway_state(&GatewayState::Starting), Next::Wait(_)));
+        assert_eq!(
+            on_gateway_state(&GatewayState::ExistingSession),
+            Next::Wait("IBKR account is logged in elsewhere; the gateway is taking over the session".into())
+        );
+        assert!(matches!(on_gateway_state(&GatewayState::Disconnected), Next::Retry(_)));
         assert_eq!(
             on_gateway_state(&GatewayState::Unavailable("Docker is required for IBKR_TWS but is not running".into())),
             Next::Retry("Docker is required for IBKR_TWS but is not running".into())
