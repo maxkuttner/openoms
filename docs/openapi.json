@@ -2674,6 +2674,70 @@
         ]
       }
     },
+    "/admin/strategies/{code}/deployments/{id}/verified-stop": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Record that the deployment's runtime is verifiably stopped, so a",
+        "description": "replacement runtime may take over at the next epoch. The deployment stays\nactive; pass the new epoch to the replacement.",
+        "operationId": "verified_stop",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Deployment id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetireRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stop recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Deployment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Shutdown not verified"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/strategies/{code}/enable": {
       "post": {
         "tags": [

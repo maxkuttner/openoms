@@ -1033,6 +1033,34 @@ pub async fn record_enable_for_strategy(
     .map(Some)
 }
 
+/// Records that the deployment's current runtime is verifiably stopped, while
+/// keeping the deployment active: the next runtime to connect takes over at
+/// the next epoch. Same evidence rule as retirement.
+pub async fn verify_stop(
+    pool: &PgPool,
+    strategy_code: &str,
+    id: Uuid,
+    request: &RetireRequest,
+) -> Result<Deployment, DeploymentError> {
+    if !request.verified_shutdown || request.shutdown_evidence.trim().is_empty() {
+        return Err(DeploymentError::InvalidInput(
+            "a takeover requires verified shutdown/fencing evidence".into(),
+        ));
+    }
+    sqlx::query_as::<_, Deployment>(&format!(
+        "UPDATE colo_deployment SET verified_stop_at = now(), verified_stop_epoch = epoch, \
+            shutdown_evidence = $3, updated_at = now() \
+         WHERE id = $1 AND strategy_code = $2 AND status = 'ACTIVE' RETURNING {DEPLOYMENT_SELECT}"
+    ))
+    .bind(id)
+    .bind(strategy_code)
+    .bind(&request.shutdown_evidence)
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?
+    .ok_or(DeploymentError::NotFound)
+}
+
 pub async fn retire_deployment(
     pool: &PgPool,
     strategy_code: &str,
@@ -1430,6 +1458,25 @@ pub async fn get(
     Path((code, id)): Path<(String, Uuid)>,
 ) -> Result<Json<Deployment>, AdminError> {
     get_deployment(state.pool(), &code, id).await.map(Json).map_err(Into::into)
+}
+
+/// Record that the deployment's runtime is verifiably stopped, so a
+/// replacement runtime may take over at the next epoch. The deployment stays
+/// active; pass the new epoch to the replacement.
+#[utoipa::path(
+    post, path = "/admin/strategies/{code}/deployments/{id}/verified-stop", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code"), ("id" = Uuid, Path, description = "Deployment id")),
+    request_body = RetireRequest,
+    responses((status = 200, description = "Stop recorded", body = Deployment), (status = 400, description = "Shutdown not verified"), (status = 404, description = "Not found")),
+    security(("bearer_token" = []))
+)]
+pub async fn verified_stop(
+    State(state): State<AppState>,
+    Path((code, id)): Path<(String, Uuid)>,
+    Json(request): Json<RetireRequest>,
+) -> Result<Json<Deployment>, AdminError> {
+    info!(strategy = %code, deployment = %id, "admin recorded a verified runtime stop");
+    verify_stop(state.pool(), &code, id, &request).await.map(Json).map_err(Into::into)
 }
 
 #[utoipa::path(

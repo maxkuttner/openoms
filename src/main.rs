@@ -177,6 +177,7 @@ mod boundary_tests;
         colo::deployment::list,
         colo::deployment::get,
         colo::deployment::retire,
+        colo::deployment::verified_stop,
         colo::ingest::adjustment,
         auth_api::login,
         auth_api::callback,
@@ -1553,6 +1554,10 @@ async fn serve() {
         .route(
             "/admin/strategies/:code/deployments/:id/retire",
             post(colo::deployment::retire),
+        )
+        .route(
+            "/admin/strategies/:code/deployments/:id/verified-stop",
+            post(colo::deployment::verified_stop),
         )
         .route(
             "/admin/strategies/:code/deployments/:id/adjustments",
