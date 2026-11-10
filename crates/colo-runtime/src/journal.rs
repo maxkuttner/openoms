@@ -56,8 +56,12 @@ pub enum JournalRecord {
         amounts: BTreeMap<String, f64>,
     },
     /// Durable acknowledgement that OMS events through `through` were applied.
+    /// `events` is the protocol event sequence that ACK covered, so the next
+    /// run continues from it; absent in journals written before it existed.
     Ack {
         through: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        events: Option<u64>,
     },
     /// The book and execution watermarks at this sequence. Recovery starts
     /// here and applies only later records; compaction may drop earlier ones.
@@ -206,6 +210,16 @@ impl Journal {
     }
 
     pub fn ack_through(&mut self, sequence: u64) -> Result<(), RuntimeError> {
+        self.ack(sequence, None)
+    }
+
+    /// Records the OMS's ACK of protocol events through `events`, which
+    /// covered journal records through `sequence`.
+    pub fn ack_events(&mut self, sequence: u64, events: u64) -> Result<(), RuntimeError> {
+        self.ack(sequence, Some(events))
+    }
+
+    fn ack(&mut self, sequence: u64, events: Option<u64>) -> Result<(), RuntimeError> {
         if sequence > self.last_sequence {
             return Err(RuntimeError::CorruptState(format!(
                 "ACK {sequence} exceeds the last stored event {}",
@@ -215,9 +229,21 @@ impl Journal {
         if sequence <= self.acked {
             return Ok(());
         }
-        self.append_durable(&JournalRecord::Ack { through: sequence })?;
+        self.append_durable(&JournalRecord::Ack { through: sequence, events })?;
         self.acked = sequence;
         Ok(())
+    }
+
+    /// The protocol event sequence of the latest ACK, when it was recorded.
+    pub fn acked_events(&self) -> Option<u64> {
+        self.records
+            .iter()
+            .filter_map(|r| match r.record {
+                JournalRecord::Ack { through, events } => Some((through, events)),
+                _ => None,
+            })
+            .max_by_key(|(through, _)| *through)
+            .and_then(|(_, events)| events)
     }
 
     pub fn unacked(&self, from: u64, limit: usize) -> Result<Vec<SequencedRecord>, RuntimeError> {
@@ -472,7 +498,7 @@ fn parse_file(
     let acked = records
         .iter()
         .filter_map(|r| match r.record {
-            JournalRecord::Ack { through } => Some(through),
+            JournalRecord::Ack { through, .. } => Some(through),
             _ => None,
         })
         .max()

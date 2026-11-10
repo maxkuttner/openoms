@@ -62,3 +62,39 @@ fn a_batch_is_bounded_to_the_protocol_record_limit() {
     let batch = reporter.next_batch(&journal, 10_000).unwrap().unwrap();
     assert!(batch.records.len() <= 128);
 }
+
+#[test]
+fn a_restart_continues_the_event_sequence_past_unreported_records_and_compaction() {
+    let dir = TempDir::new().unwrap();
+    let id = identity();
+    let mut journal = Journal::open(&dir.path().join("journal"), &id).unwrap();
+    journal.append_durable(&record("a", 1)).unwrap();
+    // Not reported as an event: must not advance the protocol sequence.
+    journal
+        .append_durable(&JournalRecord::Baseline { command_id: "r".into(), amounts: Default::default() })
+        .unwrap();
+    journal.append_durable(&record("b", 2)).unwrap();
+    let mut reporter = Reporter::new(id.clone(), 1, "n1", 1, &journal).unwrap();
+    let batch = reporter.next_batch(&journal, 128).unwrap().unwrap();
+    assert_eq!(batch.last_sequence(), 2);
+    reporter.ack(&mut journal, 2).unwrap();
+    journal.append_durable(&record("c", 3)).unwrap();
+    journal
+        .append_durable(&JournalRecord::Checkpoint { book: empty_checkpoint(), cursor: Default::default() })
+        .unwrap();
+    journal.compact().unwrap();
+    drop(journal);
+
+    let journal = Journal::open(&dir.path().join("journal"), &id).unwrap();
+    let mut restarted = Reporter::new(id, 1, "n2", 1, &journal).unwrap();
+    let next = restarted.next_batch(&journal, 128).unwrap().unwrap();
+    assert_eq!(next.records.len(), 1);
+    assert_eq!(next.last_sequence(), 3, "the OMS expects event 3 next");
+}
+
+fn empty_checkpoint() -> colo_runtime::BookCheckpoint {
+    serde_json::from_value(serde_json::json!({
+        "positions": {}, "asset_totals": {}, "sequence": 0, "orders": []
+    }))
+    .unwrap()
+}

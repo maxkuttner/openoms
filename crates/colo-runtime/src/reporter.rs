@@ -28,16 +28,14 @@ impl Reporter {
     ) -> Result<Self, RuntimeError> {
         let records = journal.replay()?;
         let acked = journal.acked();
-        let sent = records
-            .iter()
-            .filter(|r| {
-                r.sequence <= acked
-                    && !matches!(
-                        r.record,
-                        JournalRecord::Ack { .. } | JournalRecord::Cursor { .. } | JournalRecord::Checkpoint { .. }
-                    )
-            })
-            .count() as u64;
+        // Older journals did not record the event sequence with the ACK;
+        // count the acknowledged records that were reported as events.
+        let sent = journal.acked_events().unwrap_or_else(|| {
+            records
+                .iter()
+                .filter(|r| r.sequence <= acked && runtime_event(&r.record, &identity).is_some())
+                .count() as u64
+        });
         let mut session = V2Session::new(identity.clone(), epoch, session_nonce, 1);
         session.seed_event_sequence(sent);
         Ok(Self {
@@ -113,7 +111,7 @@ impl Reporter {
             .get(&through)
             .copied()
             .ok_or_else(|| RuntimeError::InvalidControl("ACK has no journal boundary".into()))?;
-        journal.ack_through(journal_through)?;
+        journal.ack_events(journal_through, through)?;
         self.journal_boundaries.retain(|protocol, _| *protocol > through);
         self.last_acked = through;
         self.journal_acked = journal_through;
