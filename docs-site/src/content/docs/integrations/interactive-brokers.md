@@ -52,9 +52,9 @@ Each instrument is an IBKR contract, identified by its IBKR contract id (conId) 
 listed under its listing exchange's MIC, for example `XETR` for SAP. Orders always go
 out by conId.
 
-In the cockpit, open **Instruments** and use **Import from IBKR**: choose a CSV file,
-check the preview, pick a contract for any ambiguous row, then save. The same page has
-a search for single instruments.
+In the cockpit, open **Broker connections** and press **Import instruments** on the IBKR_TWS
+connection: choose a CSV file, check the preview, pick a contract for any ambiguous row,
+then save. The same dialog has a search for single instruments.
 
 The CSV needs a header with a `symbol` or `conid` column; `exchange` and `currency`
 narrow the search, and a `conid` pins an exact contract. Leave `exchange` empty to let

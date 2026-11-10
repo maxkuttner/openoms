@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Alert, Badge, Button, FileInput, Group, Modal, SegmentedControl, Select, Stack, Table, Tabs, Text, TextInput } from "@mantine/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { ApiError } from "../api/client";
@@ -26,7 +26,7 @@ function ReportView({ report }: { report: LoadReport }) {
 
 // Dialog for adding IBKR contracts: a CSV is resolved to conIds and previewed
 // before saving; the search tab adds single contracts.
-export function IbkrImport({ envs, onClose }: { envs: string[]; onClose: () => void }) {
+export function IbkrImport({ envs, onClose, intro }: { envs: string[]; onClose: () => void; intro?: ReactNode }) {
   const qc = useQueryClient();
   const [env, setEnv] = useState(envs.includes("PAPER") ? "PAPER" : envs[0]);
   const [rows, setRows] = useState<ResolveRow[]>([]);
@@ -52,6 +52,7 @@ export function IbkrImport({ envs, onClose }: { envs: string[]; onClose: () => v
   return (
     <Modal opened onClose={onClose} title="Import from IBKR" size="xl" centered>
       <Stack>
+        {intro}
         {envs.length > 1 && (
           <SegmentedControl value={env} onChange={setEnv} data={envs} w="fit-content" />
         )}

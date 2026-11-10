@@ -4,8 +4,7 @@ import { Link as RouterLink } from "react-router-dom";
 import { useDebouncedValue } from "@mantine/hooks";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
-import type { BrokerConnection, InstrumentSummary } from "../api/types";
-import { IbkrImport } from "../components/IbkrImport";
+import type { InstrumentSummary } from "../api/types";
 
 // Read-only browser over the seeded master catalog. Instruments are seeded
 // broker-first (a universe load per broker connection); pricing coverage is derived per feed at
@@ -14,12 +13,6 @@ import { IbkrImport } from "../components/IbkrImport";
 export function InstrumentsPage() {
   const [search, setSearch] = useState("");
   const [debounced] = useDebouncedValue(search, 250);
-  const [importing, setImporting] = useState(false);
-  const { data: connections } = useQuery<BrokerConnection[]>({
-    queryKey: ["/admin/broker-connections"],
-    queryFn: () => api.get<BrokerConnection[]>("/admin/broker-connections"),
-  });
-  const ibkrEnvs = (connections ?? []).filter((c) => c.broker_code === "IBKR_TWS").map((c) => c.environment);
   const { data, isLoading, error } = useQuery<InstrumentSummary[]>({
     queryKey: ["/admin/instruments", debounced],
     queryFn: () =>
@@ -34,7 +27,6 @@ export function InstrumentsPage() {
         <Title order={3}>Instruments</Title>
         <Group>
           {isLoading && <Loader size="sm" />}
-          {ibkrEnvs.length > 0 && <Button onClick={() => setImporting(true)}>Import from IBKR</Button>}
         </Group>
       </Group>
       <Text size="sm" c="dimmed" mb="md">
@@ -88,7 +80,6 @@ export function InstrumentsPage() {
           )}
         </Table.Tbody>
       </Table>
-      {importing && ibkrEnvs.length > 0 && <IbkrImport envs={ibkrEnvs} onClose={() => setImporting(false)} />}
     </>
   );
 }

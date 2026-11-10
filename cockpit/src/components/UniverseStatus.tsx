@@ -1,7 +1,9 @@
+import { useState } from "react";
 import { Anchor, Button, Group, Progress, Stack, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
+import { IbkrImport } from "./IbkrImport";
 import { openTaskCenter, type UniverseStatus as Status } from "../api/jobs";
 
 const SYMBOL: Record<Status["state"], { sym: string; color: string; label: string }> = {
@@ -47,8 +49,11 @@ export async function loadUniverse(code: string): Promise<boolean> {
 }
 
 /** The "Instrument universe" cell for one broker connection. */
-export function UniverseStatus({ code }: { code: string }) {
+export function UniverseStatus({ code, broker, environment }: { code: string; broker?: string; environment?: string }) {
   const qc = useQueryClient();
+  const [importing, setImporting] = useState(false);
+  // IBKR has no list-everything call, so its "load" is the CSV import.
+  const isIbkr = broker === "IBKR_TWS" && !!environment;
   const { data } = useQuery<Status>({
     queryKey: ["/admin/broker-connections", code, "universe"],
     queryFn: () => api.get<Status>(`/admin/broker-connections/${code}/universe`),
@@ -94,12 +99,34 @@ export function UniverseStatus({ code }: { code: string }) {
           </Text>
         )}
       </Stack>
-      {action && (
+      {(isIbkr || action) && (
         <Tooltip label="Add credentials first" disabled={configured}>
-          <Button size="compact-xs" variant="light" onClick={run} disabled={!configured}>
-            {action}
+          <Button
+            size="compact-xs"
+            variant="light"
+            onClick={isIbkr ? () => setImporting(true) : run}
+            disabled={!configured}
+          >
+            {isIbkr ? "Import instruments" : action}
           </Button>
         </Tooltip>
+      )}
+      {importing && isIbkr && (
+        <IbkrImport
+          envs={[environment!]}
+          onClose={() => setImporting(false)}
+          intro={
+            <Text size="sm">
+              IBKR has no way to list every instrument, so the OMS adds the ones you trade. Upload a CSV
+              with the columns symbol, exchange and currency, or conid (exchange as an IBKR code or a
+              MIC, up to 1000 rows). Each row is looked up at IBKR and pinned by its conId; if a row
+              matches several contracts you pick one. You can also search for single instruments.{" "}
+              <Anchor href="https://openoms.dev/integrations/interactive-brokers/#instruments" target="_blank" rel="noreferrer">
+                Read the docs
+              </Anchor>
+            </Text>
+          }
+        />
       )}
     </Group>
   );

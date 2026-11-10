@@ -46,7 +46,7 @@ export function BrokerConnectionsPage() {
         {
           key: "universe",
           label: "Instrument universe",
-          render: (row: BrokerConnection) => <UniverseStatus code={row.code} />,
+          render: (row: BrokerConnection) => <UniverseStatus code={row.code} broker={row.broker_code} environment={row.environment} />,
         },
       ]}
       fields={[
