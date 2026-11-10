@@ -235,6 +235,45 @@
     ]
   },
   {
+    "code": "IBKR_TWS",
+    "name": "Interactive Brokers (TWS API)",
+    "description": "Stocks worldwide via IB Gateway (Docker)",
+    "docs_url": "https://openoms.dev/integrations/interactive-brokers-tws/",
+    "universe": "Imported on demand from a CSV or search",
+    "environments": [
+      {
+        "code": "PAPER",
+        "label": "paper trading account",
+        "keys_url": "https://www.interactivebrokers.com/portal/"
+      },
+      {
+        "code": "LIVE",
+        "label": "live account",
+        "keys_url": "https://www.interactivebrokers.com/portal/"
+      }
+    ],
+    "fields": [
+      {
+        "name": "username",
+        "label": "IBKR username",
+        "secret": false,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      },
+      {
+        "name": "password",
+        "label": "Password",
+        "secret": true,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null
+      }
+    ]
+  },
+  {
     "code": "IBKR",
     "name": "Interactive Brokers",
     "description": "Multi-asset over FIX; experimental, no instrument loading",

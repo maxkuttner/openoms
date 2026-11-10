@@ -25,6 +25,7 @@ pub mod bybit;
 pub mod coinbase;
 #[cfg(feature = "fix")]
 pub mod ibkr;
+pub mod ibkr_tws;
 pub mod okx;
 
 /// How a non-text credential field is typed in the stored JSON.
@@ -172,9 +173,9 @@ pub fn exec_stream_code(code: &str, env: &str) -> String {
 /// Every connector, in the order the cockpit lists them.
 pub fn all() -> &'static [&'static dyn Connector] {
     #[cfg(feature = "fix")]
-    return &[&alpaca::Alpaca, &binance::Binance, &bybit::Bybit, &coinbase::Coinbase, &okx::Okx, &ibkr::Ibkr];
+    return &[&alpaca::Alpaca, &binance::Binance, &bybit::Bybit, &coinbase::Coinbase, &okx::Okx, &ibkr_tws::IbkrTws, &ibkr::Ibkr];
     #[cfg(not(feature = "fix"))]
-    return &[&alpaca::Alpaca, &binance::Binance, &bybit::Bybit, &coinbase::Coinbase, &okx::Okx];
+    return &[&alpaca::Alpaca, &binance::Binance, &bybit::Bybit, &coinbase::Coinbase, &okx::Okx, &ibkr_tws::IbkrTws];
 }
 
 pub fn by_code(code: &str) -> Option<&'static dyn Connector> {
