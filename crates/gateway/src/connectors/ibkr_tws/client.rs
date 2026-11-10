@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use futures_util::StreamExt;
 use ibapi::contracts::{Contract, Currency, Exchange, Symbol};
-use ibapi::market_data::historical::{BarSize, WhatToShow};
+use ibapi::market_data::historical::{BarSize, BarTimestamp, WhatToShow};
 use ibapi::market_data::realtime::{Quote, TickTypes};
 use ibapi::market_data::MarketDataType;
 use ibapi::orders::{order_builder, Action, ExecutionFilter, Executions, OrderData, OrderUpdate, Orders, TimeInForce};
@@ -131,12 +131,19 @@ pub trait TwsClient: Send + Sync {
     async fn place(&self, o: &TwsOrder) -> Result<(), TwsError>;
     async fn cancel(&self, order_id: i32) -> Result<(), TwsError>;
     /// Orders working at the broker: `(order_id, order_ref, state)`.
+    ///
+    /// Also teaches the client each order's ref: `Status` events carry the
+    /// `order_ref` only for ids it has seen, so callers run this on every
+    /// (re)connect before relying on `Status.order_ref`.
     async fn open_orders(&self) -> Result<Vec<(i32, String, TwsOrderState)>, TwsError>;
-    /// Orders that finished (API orders only).
+    /// Orders that finished (API orders only); also records their refs, like `open_orders`.
     async fn completed_orders(&self) -> Result<Vec<(i32, String, TwsOrderState)>, TwsError>;
-    /// Today's `Execution` and `Commission` events.
+    /// Today's `Execution` and `Commission` events. TWS also replays these onto
+    /// [`TwsClient::events`] (the order-update stream), so consumers must dedupe by `exec_id`.
     async fn executions_today(&self) -> Result<Vec<TwsEvent>, TwsError>;
     async fn contract_details(&self, q: &ContractQuery) -> Result<Vec<TwsContract>, TwsError>;
+    /// Symbol search. Results carry `min_tick: 0.0`, no lot size and no ISIN:
+    /// follow up with `contract_details` for the tradable facts.
     async fn matching_symbols(&self, pattern: &str) -> Result<Vec<TwsContract>, TwsError>;
     /// Delayed snapshot close, else the last daily bar's close, else `None`.
     async fn prev_close(&self, con_id: i64) -> Result<Option<f64>, TwsError>;
@@ -173,6 +180,22 @@ impl IbapiClient {
         Ok(Self { client, events, order_refs, pump })
     }
 
+    /// Today's date on the instrument's exchange (from its contract details'
+    /// timezone id); UTC's date, with a warning, if that can't be determined.
+    async fn exchange_today(&self, contract: &Contract) -> NaiveDate {
+        let zone = match self.client.contract_details(contract).await {
+            Ok(d) => d.first().and_then(|d| d.time_zone_id.parse::<chrono_tz::Tz>().ok()),
+            Err(_) => None,
+        };
+        match zone {
+            Some(tz) => Utc::now().with_timezone(&tz).date_naive(),
+            None => {
+                tracing::warn!(con_id = contract.contract_id, "exchange timezone unknown; using the UTC date for prev_close");
+                Utc::now().date_naive()
+            }
+        }
+    }
+
     fn ensure_connected(&self) -> Result<(), TwsError> {
         self.connected().then_some(()).ok_or(TwsError::NotConnected)
     }
@@ -200,12 +223,21 @@ async fn pump_order_updates(client: Arc<Client>, tx: broadcast::Sender<TwsEvent>
                         Ok(SubscriptionItem::Notice(n)) => {
                             let _ = tx.send(TwsEvent::Error { order_id: n.request_id, code: n.code, message: n.message });
                         }
+                        Err(ibapi::Error::Notice(n)) => {
+                            let _ = tx.send(TwsEvent::Error { order_id: n.request_id, code: n.code, message: n.message });
+                        }
                         Err(e) => {
                             tracing::warn!(error = %e, "TWS order-update stream error");
                             break;
                         }
                     }
                 }
+            }
+            // Still connected but the subscription is taken: back off, don't announce a disconnect.
+            Err(ibapi::Error::AlreadySubscribed) if client.is_connected() => {
+                tracing::warn!("TWS order-update stream is already subscribed; retrying");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
             Err(e) => tracing::warn!(error = %e, "TWS order-update subscribe failed"),
         }
@@ -244,7 +276,7 @@ fn update_events(update: OrderUpdate, refs: &OrderRefs) -> Vec<TwsEvent> {
                 order_ref,
                 qty: e.shares,
                 price: e.price,
-                time: parse_exec_time(&e.time),
+                time: exec_time_or_now(&e.time),
             }]
         }
         OrderUpdate::CommissionReport(c) => {
@@ -254,22 +286,57 @@ fn update_events(update: OrderUpdate, refs: &OrderRefs) -> Vec<TwsEvent> {
     }
 }
 
-/// IB sends execution times as `yyyymmdd hh:mm:ss` (UTC on current gateways; older
-/// ones append a zone name or use `yyyymmdd-hh:mm:ss`). Unparseable -> now.
-fn parse_exec_time(s: &str) -> DateTime<Utc> {
+/// TWS sends execution times as `yyyymmdd  hh:mm:ss <IANA zone>` in the login
+/// timezone (`ibapi` passes the string through raw); a zone-less `yyyymmdd hh:mm:ss`
+/// or `yyyymmdd-hh:mm:ss` is taken as UTC. `None` when unparseable or the zone is unknown.
+fn parse_exec_time(s: &str) -> Option<DateTime<Utc>> {
     let mut parts = s.split([' ', '-']).filter(|p| !p.is_empty());
-    let (Some(d), Some(t)) = (parts.next(), parts.next()) else { return Utc::now() };
-    NaiveDateTime::parse_from_str(&format!("{d} {t}"), "%Y%m%d %H:%M:%S").map_or_else(|_| Utc::now(), |n| n.and_utc())
+    let (d, t) = (parts.next()?, parts.next()?);
+    let naive = NaiveDateTime::parse_from_str(&format!("{d} {t}"), "%Y%m%d %H:%M:%S").ok()?;
+    match parts.next() {
+        None => Some(naive.and_utc()),
+        Some(zone) => {
+            let tz: chrono_tz::Tz = zone.parse().ok()?;
+            Some(tz.from_local_datetime(&naive).earliest()?.with_timezone(&Utc))
+        }
+    }
 }
 
-fn stock_contract(con_id: i64, exchange: &str, primary: &str, currency: &str) -> Contract {
-    Contract {
-        contract_id: con_id as i32,
+/// [`parse_exec_time`], falling back to now (with a warning) so a bad timestamp
+/// never drops a fill. The fill's identity is its exec id, not its time.
+fn exec_time_or_now(s: &str) -> DateTime<Utc> {
+    parse_exec_time(s).unwrap_or_else(|| {
+        tracing::warn!(time = s, "unparseable TWS execution time; using receive time");
+        Utc::now()
+    })
+}
+
+/// The last daily bar strictly before `today` (the exchange's date): the bar
+/// for today, if present, is a partial session and not a previous close.
+fn pick_prev_close(bars: &[(NaiveDate, f64)], today: NaiveDate) -> Option<f64> {
+    bars.iter().filter(|(d, _)| *d < today).max_by_key(|(d, _)| *d).map(|(_, c)| *c)
+}
+
+fn bar_date(ts: &BarTimestamp) -> NaiveDate {
+    let d = match ts {
+        BarTimestamp::Date(d) => *d,
+        BarTimestamp::DateTime(t) => t.date(),
+    };
+    NaiveDate::from_ymd_opt(d.year(), d.month() as u32, d.day() as u32).unwrap_or_default()
+}
+
+fn con_id_i32(con_id: i64) -> Result<i32, TwsError> {
+    i32::try_from(con_id).map_err(|_| TwsError::Other(format!("conId {con_id} does not fit the TWS API's 32-bit contract id")))
+}
+
+fn stock_contract(con_id: i64, exchange: &str, primary: &str, currency: &str) -> Result<Contract, TwsError> {
+    Ok(Contract {
+        contract_id: con_id_i32(con_id)?,
         exchange: Exchange::new(exchange),
         primary_exchange: Exchange::new(primary),
         currency: Currency::new(currency),
         ..Contract::default()
-    }
+    })
 }
 
 fn to_tws_contract(c: &Contract, min_tick: f64, lot_size: Option<f64>, name: String, isin: Option<String>) -> TwsContract {
@@ -286,9 +353,25 @@ fn to_tws_contract(c: &Contract, min_tick: f64, lot_size: Option<f64>, name: Str
     }
 }
 
-fn to_tws_order_state(d: &OrderData, status: Option<(f64, f64, Option<f64>)>) -> (i32, String, TwsOrderState) {
+/// `(ordered qty, filled, remaining, avg fill price)` of one order report.
+/// Open-order reports carry the full size in `total_quantity`; completed-order
+/// reports carry the unfilled remainder there (ordered = total + filled).
+/// An `OrderStatus` row, when present, is authoritative for fills.
+fn order_quantities(completed: bool, total: f64, filled_qty: f64, status: Option<(f64, f64, Option<f64>)>) -> (f64, f64, f64, f64) {
+    let (qty, filled, remaining) = if completed {
+        (total + filled_qty, filled_qty, total)
+    } else {
+        (total, filled_qty, (total - filled_qty).max(0.0))
+    };
+    match status {
+        Some((f, r, avg)) => (qty, f, r, avg.unwrap_or(0.0)),
+        None => (qty, filled, remaining, 0.0),
+    }
+}
+
+fn to_tws_order_state(d: &OrderData, completed: bool, status: Option<(f64, f64, Option<f64>)>) -> (i32, String, TwsOrderState) {
     let o = &d.order;
-    let (filled, remaining, avg) = status.unwrap_or((o.filled_quantity, o.total_quantity, None));
+    let (qty, filled, remaining, avg_fill_price) = order_quantities(completed, o.total_quantity, o.filled_quantity, status);
     let order = TwsOrder {
         order_id: d.order_id,
         con_id: d.contract.contract_id as i64,
@@ -296,7 +379,7 @@ fn to_tws_order_state(d: &OrderData, status: Option<(f64, f64, Option<f64>)>) ->
         primary_exchange: d.contract.primary_exchange.to_string(),
         currency: d.contract.currency.to_string(),
         action: if matches!(o.action, Action::Buy) { Side::Buy } else { Side::Sell },
-        qty: o.total_quantity + o.filled_quantity,
+        qty,
         order_type: match (o.order_type.as_str(), o.limit_price) {
             ("LMT", Some(p)) => OrderKind::Lmt(p),
             _ => OrderKind::Mkt,
@@ -309,7 +392,7 @@ fn to_tws_order_state(d: &OrderData, status: Option<(f64, f64, Option<f64>)>) ->
         status: d.order_state.status.as_str().to_string(),
         filled,
         remaining,
-        avg_fill_price: avg.unwrap_or(0.0),
+        avg_fill_price,
         symbol: d.contract.symbol.to_string(),
         order,
     };
@@ -317,7 +400,7 @@ fn to_tws_order_state(d: &OrderData, status: Option<(f64, f64, Option<f64>)>) ->
 }
 
 /// Joins an orders stream's `OrderData` rows with their `OrderStatus` rows.
-fn join_orders(rows: Vec<Orders>) -> Vec<(i32, String, TwsOrderState)> {
+fn join_orders(rows: Vec<Orders>, completed: bool, refs: &OrderRefs) -> Vec<(i32, String, TwsOrderState)> {
     let mut statuses = HashMap::new();
     for r in &rows {
         if let Orders::OrderStatus(s) = r {
@@ -326,8 +409,13 @@ fn join_orders(rows: Vec<Orders>) -> Vec<(i32, String, TwsOrderState)> {
     }
     rows.iter()
         .filter_map(|r| match r {
-            Orders::OrderData(d) => Some(to_tws_order_state(d, statuses.get(&d.order_id).copied())),
+            Orders::OrderData(d) => Some(to_tws_order_state(d, completed, statuses.get(&d.order_id).copied())),
             _ => None,
+        })
+        .inspect(|(id, order_ref, _)| {
+            if !order_ref.is_empty() {
+                refs.lock().unwrap().insert(*id, order_ref.clone());
+            }
         })
         .collect()
 }
@@ -355,7 +443,7 @@ impl TwsClient for IbapiClient {
         };
         order.order_ref = o.order_ref.clone();
         order.account = o.account.clone();
-        let contract = stock_contract(o.con_id, &o.exchange, &o.primary_exchange, &o.currency);
+        let contract = stock_contract(o.con_id, &o.exchange, &o.primary_exchange, &o.currency)?;
         self.order_refs.lock().unwrap().insert(o.order_id, o.order_ref.clone());
         self.client.submit_order(o.order_id, &contract, &order).await?;
         Ok(())
@@ -371,13 +459,13 @@ impl TwsClient for IbapiClient {
     async fn open_orders(&self) -> Result<Vec<(i32, String, TwsOrderState)>, TwsError> {
         self.ensure_connected()?;
         let mut sub = self.client.open_orders().await?;
-        Ok(join_orders(sub.collect_to_end_within(REQUEST_TIMEOUT).await?))
+        Ok(join_orders(sub.collect_to_end_within(REQUEST_TIMEOUT).await?, false, &self.order_refs))
     }
 
     async fn completed_orders(&self) -> Result<Vec<(i32, String, TwsOrderState)>, TwsError> {
         self.ensure_connected()?;
         let mut sub = self.client.completed_orders(true).await?;
-        Ok(join_orders(sub.collect_to_end_within(REQUEST_TIMEOUT).await?))
+        Ok(join_orders(sub.collect_to_end_within(REQUEST_TIMEOUT).await?, true, &self.order_refs))
     }
 
     async fn executions_today(&self) -> Result<Vec<TwsEvent>, TwsError> {
@@ -393,7 +481,7 @@ impl TwsClient for IbapiClient {
                     order_ref: d.execution.order_reference,
                     qty: d.execution.shares,
                     price: d.execution.price,
-                    time: parse_exec_time(&d.execution.time),
+                    time: exec_time_or_now(&d.execution.time),
                 },
                 Executions::CommissionReport(c) => {
                     TwsEvent::Commission { exec_id: c.execution_id, amount: c.commission, currency: c.currency }
@@ -405,7 +493,7 @@ impl TwsClient for IbapiClient {
     async fn contract_details(&self, q: &ContractQuery) -> Result<Vec<TwsContract>, TwsError> {
         self.ensure_connected()?;
         let contract = Contract {
-            contract_id: q.con_id.unwrap_or(0) as i32,
+            contract_id: con_id_i32(q.con_id.unwrap_or(0))?,
             symbol: Symbol::new(q.symbol.clone().unwrap_or_default()),
             exchange: Exchange::new(q.exchange.as_deref().unwrap_or("SMART")),
             currency: Currency::new(q.currency.clone().unwrap_or_default()),
@@ -433,20 +521,22 @@ impl TwsClient for IbapiClient {
 
     async fn prev_close(&self, con_id: i64) -> Result<Option<f64>, TwsError> {
         self.ensure_connected()?;
-        let contract = stock_contract(con_id, "SMART", "", "");
+        let contract = stock_contract(con_id, "SMART", "", "")?;
         if let Ok(ticks) = self.client.market_data(&contract).snapshot_once(REQUEST_TIMEOUT).await {
             if let Some(close) = Quote::from_ticks(ticks.iter().filter(|t| matches!(t, TickTypes::Price(_)))).close {
                 return Ok(Some(close));
             }
         }
+        // Two daily bars: the newest may be today's partial session.
         let data = self
             .client
             .historical_data(&contract, BarSize::Day)
-            .duration(ibapi::market_data::historical::Duration::DAY)
+            .duration(ibapi::market_data::historical::Duration::days(2))
             .what_to_show(WhatToShow::Trades)
             .fetch()
             .await?;
-        Ok(data.bars.last().map(|b| b.close))
+        let bars: Vec<(NaiveDate, f64)> = data.bars.iter().map(|b| (bar_date(&b.date), b.close)).collect();
+        Ok(pick_prev_close(&bars, self.exchange_today(&contract).await))
     }
 
     async fn managed_accounts(&self) -> Result<Vec<String>, TwsError> {
@@ -599,10 +689,45 @@ mod tests {
     }
 
     #[test]
-    fn execution_times_parse_both_ib_formats() {
-        let want = "2026-11-10T14:30:05Z".parse::<DateTime<Utc>>().unwrap();
-        assert_eq!(parse_exec_time("20261110 14:30:05"), want);
-        assert_eq!(parse_exec_time("20261110-14:30:05"), want);
-        assert_eq!(parse_exec_time("20261110  14:30:05 America/New_York"), want);
+    fn execution_times_convert_their_zone_to_utc() {
+        let utc = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        // November: New York is on EST (UTC-5).
+        assert_eq!(parse_exec_time("20261110  14:30:05 America/New_York"), Some(utc("2026-11-10T19:30:05Z")));
+        // July: EDT (UTC-4).
+        assert_eq!(parse_exec_time("20260710  14:30:05 America/New_York"), Some(utc("2026-07-10T18:30:05Z")));
+        // Zone-less forms are UTC.
+        assert_eq!(parse_exec_time("20261110 14:30:05"), Some(utc("2026-11-10T14:30:05Z")));
+        assert_eq!(parse_exec_time("20261110-14:30:05"), Some(utc("2026-11-10T14:30:05Z")));
+        // Garbage and unknown zones are None (the caller warns and falls back).
+        assert_eq!(parse_exec_time("soon"), None);
+        assert_eq!(parse_exec_time("20261110  14:30:05 Mars/Olympus"), None);
+    }
+
+    #[test]
+    fn prev_close_skips_todays_partial_bar() {
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        let bars = [(d(11, 9), 100.0), (d(11, 10), 101.5)];
+        assert_eq!(pick_prev_close(&bars, d(11, 10)), Some(100.0));
+        // Market not yet open today: the newest bar is yesterday's.
+        assert_eq!(pick_prev_close(&bars, d(11, 11)), Some(101.5));
+        assert_eq!(pick_prev_close(&bars[1..], d(11, 10)), None);
+        assert_eq!(pick_prev_close(&[], d(11, 10)), None);
+    }
+
+    #[test]
+    fn open_and_completed_reports_read_quantities_differently() {
+        // Open: total_quantity is the full size; 4 of 10 filled.
+        assert_eq!(order_quantities(false, 10.0, 4.0, None), (10.0, 4.0, 6.0, 0.0));
+        // Completed: total_quantity is what was left unfilled; ordered = total + filled.
+        assert_eq!(order_quantities(true, 0.0, 10.0, None), (10.0, 10.0, 0.0, 0.0));
+        assert_eq!(order_quantities(true, 6.0, 4.0, None), (10.0, 4.0, 6.0, 0.0));
+        // An OrderStatus row wins for fills and price.
+        assert_eq!(order_quantities(false, 10.0, 0.0, Some((4.0, 6.0, Some(9.5)))), (10.0, 4.0, 6.0, 9.5));
+    }
+
+    #[test]
+    fn con_ids_beyond_i32_are_refused() {
+        assert_eq!(con_id_i32(265598), Ok(265598));
+        assert!(matches!(con_id_i32(i64::from(i32::MAX) + 1), Err(TwsError::Other(_))));
     }
 }
