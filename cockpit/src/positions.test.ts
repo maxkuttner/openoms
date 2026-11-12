@@ -16,6 +16,7 @@ const row = (over: Partial<PositionRow>): PositionRow => ({
   market_value: null,
   unrealized_pnl: null,
   mark_ts: null,
+  other_fees: [],
   ...over,
 });
 

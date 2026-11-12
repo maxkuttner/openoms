@@ -71,3 +71,4 @@ is down.
 - Spot only: no perpetuals, futures, options or margin.
 - No FIX; Bybit offers FIX to institutional clients only.
 - Orders cannot be amended; cancel and place a new one.
+- Fees: booked from the fee Bybit reports on each execution; see [Fees](/concepts/fees/).

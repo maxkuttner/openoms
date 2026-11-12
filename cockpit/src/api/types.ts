@@ -1,3 +1,4 @@
+import type { FeeAmount } from "../fees";
 // Hand-written mirror of the admin API resource shapes (src/admin.rs, src/handlers.rs).
 // Could be generated from the OpenAPI doc later (openapi-typescript) to avoid drift.
 
@@ -199,6 +200,7 @@ export interface BlotterRow {
   leaves_qty: number;
   cum_qty: number;
   avg_px: number | null;
+  fees: FeeAmount[];
   created_at: string;
   updated_at: string;
 }

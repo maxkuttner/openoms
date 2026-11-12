@@ -72,3 +72,4 @@ OKX positions. Demo Trading positions are marked at live OKX prices.
   OMS does not support yet.
 - Orders cannot be amended; cancel and place a new one.
 - Limit prices are sent as entered; OKX rejects a price off the pair's tick size.
+- Fees: booked from the running fee total OKX reports per order; see [Fees](/concepts/fees/).

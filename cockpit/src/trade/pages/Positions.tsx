@@ -4,6 +4,7 @@ import { Loader, Paper, Select, SimpleGrid, Stack, Table, Text, Title, Group } f
 import { tradeApi } from "../api/client";
 import { useLive } from "../api/liveUpdates";
 import { numeric, columnHeader } from "../table";
+import { formatFees } from "../../fees";
 import type { Me } from "../App";
 import type { MarkRow } from "../types";
 import { totalsByCurrency } from "../../positions";
@@ -125,6 +126,7 @@ export function PositionsPage({ me }: { me: Me }) {
               <Table.Th style={{ ...columnHeader, ...numeric }}>Market value</Table.Th>
               <Table.Th style={{ ...columnHeader, ...numeric }}>Unrealized P&L</Table.Th>
               <Table.Th style={{ ...columnHeader, ...numeric }}>Realized P&L</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Other fees</Table.Th>
               <Table.Th style={columnHeader}>Mark time</Table.Th>
             </Table.Tr>
           </Table.Thead>
@@ -138,12 +140,13 @@ export function PositionsPage({ me }: { me: Me }) {
                 <Table.Td style={numeric}>{num(p.market_value)}</Table.Td>
                 <Table.Td style={numeric}>{num(p.unrealized_pnl)}</Table.Td>
                 <Table.Td style={numeric}>{p.realized_pnl}</Table.Td>
+                <Table.Td style={numeric}>{formatFees(p.other_fees)}</Table.Td>
                 <Table.Td>{p.mark_ts ? new Date(p.mark_ts).toLocaleString() : "—"}</Table.Td>
               </Table.Tr>
             ))}
             {rows.length === 0 && (
               <Table.Tr>
-                <Table.Td colSpan={8}>
+                <Table.Td colSpan={9}>
                   <Text c="dimmed" ta="center" py="md">
                     No positions.
                   </Text>
