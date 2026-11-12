@@ -246,14 +246,22 @@ pub async fn persist_transfer(
 /// Recovery / backfill: rebuild every position by replaying the fill and fee events
 /// from the order_event log in order (fees use the effect stored on the event). Idempotent (derived data).
 pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
+    rebuild_positions_scoped(pool, None).await
+}
+
+/// [`rebuild_positions`] limited to one portfolio (`Some`), leaving every other
+/// portfolio's positions untouched; `None` rebuilds everything.
+pub async fn rebuild_positions_scoped(pool: &PgPool, portfolio: Option<Uuid>) -> Result<usize, sqlx::Error> {
     // Each fill event carries qty/price; portfolio/instrument/side live on order_state.
     let rows = sqlx::query(
         "SELECT e.payload_json, os.portfolio_id, os.instrument_id, os.side \
          FROM order_event e \
          JOIN order_state os ON os.order_id = e.order_id \
          WHERE e.event_type IN ('order_partially_filled', 'order_filled', 'order_fee_charged') \
+           AND ($1::uuid IS NULL OR os.portfolio_id = $1) \
          ORDER BY e.global_position",
     )
+    .bind(portfolio)
     .fetch_all(pool)
     .await?;
 
@@ -284,7 +292,10 @@ pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
     }
 
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM position").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM position WHERE ($1::uuid IS NULL OR portfolio_id = $1)")
+        .bind(portfolio)
+        .execute(&mut *tx)
+        .await?;
     for ((portfolio_id, instrument_id), p) in &acc {
         sqlx::query(
             "INSERT INTO position \

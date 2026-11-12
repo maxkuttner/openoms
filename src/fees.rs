@@ -443,7 +443,9 @@ mod tests {
             process_execution_report(&pool, order_id, fill(), "test", None).await.unwrap();
             book_fee(&pool, None, order_id, charge("b1", 0.01, &base), "test").await.unwrap();
             let incremental = position(&pool, portfolio_id, &instrument_id).await;
-            let rebuilt = positions::rebuild_positions(&pool).await;
+            // scoped: the global rebuild deletes and re-inserts every portfolio's positions, racing
+            // other DB tests' seeds and cleanups (FK violation on position_portfolio_id_fkey).
+            let rebuilt = positions::rebuild_positions_scoped(&pool, Some(portfolio_id)).await;
             let after = position(&pool, portfolio_id, &instrument_id).await;
             remove_seeded(&pool, order_id).await;
             rebuilt.unwrap();
