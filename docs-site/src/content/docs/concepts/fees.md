@@ -21,7 +21,10 @@ these fees.
 
 **Base asset.** The fee reduces the position's quantity at average cost. Buy 1 BTC
 on BTCUSDT and pay a 0.001 BTC fee, and the position is 0.999 BTC, which is what the
-venue holds. The order's filled quantity is not changed: the fill is what traded.
+venue holds. The fee always lowers the held quantity, even on a short or a flat
+position, where it can leave a small residual or cross zero. Average cost and
+realized P&L are unchanged. The order's filled quantity is not changed: the fill is
+what traded.
 
 **Any other currency.** The fee is recorded and shown as a per-currency total in
 **Other fees** on the position row. It does not touch quantity or P&L. A 0.01 BNB fee
