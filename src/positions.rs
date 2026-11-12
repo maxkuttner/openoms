@@ -213,6 +213,22 @@ pub async fn persist_fill(
     upsert(conn, portfolio_id, instrument_id, next).await
 }
 
+/// Load → apply one venue fee → upsert, inside the caller's transaction. An
+/// `Other` fee has no position effect and writes nothing.
+pub async fn persist_fee(
+    conn: &mut PgConnection,
+    portfolio_id: Uuid,
+    instrument_id: &str,
+    amount: f64,
+    effect: FeeEffect,
+) -> Result<(), sqlx::Error> {
+    if effect == FeeEffect::Other {
+        return Ok(());
+    }
+    let next = load(conn, portfolio_id, instrument_id).await?.apply_fee(amount, effect);
+    upsert(conn, portfolio_id, instrument_id, next).await
+}
+
 /// Cost-preserving allocation transfer of `qty` (> 0) of `instrument_id` from one
 /// portfolio to another at `price`, inside the caller's tx. The source reduces at
 /// cost (no P&L — a conduit); the destination books at `price` via the normal fill
@@ -232,15 +248,15 @@ pub async fn persist_transfer(
     upsert(conn, to_portfolio, instrument_id, to).await
 }
 
-/// Recovery / backfill: rebuild every position by replaying the fill events from the
-/// order_event log in order. Idempotent (derived data).
+/// Recovery / backfill: rebuild every position by replaying the fill and fee events
+/// from the order_event log in order (fees use the effect stored on the event). Idempotent (derived data).
 pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
     // Each fill event carries qty/price; portfolio/instrument/side live on order_state.
     let rows = sqlx::query(
         "SELECT e.payload_json, os.portfolio_id, os.instrument_id, os.side \
          FROM order_event e \
          JOIN order_state os ON os.order_id = e.order_id \
-         WHERE e.event_type IN ('order_partially_filled', 'order_filled') \
+         WHERE e.event_type IN ('order_partially_filled', 'order_filled', 'order_fee_charged') \
          ORDER BY e.global_position",
     )
     .fetch_all(pool)
@@ -252,19 +268,24 @@ pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
         let Ok(event) = serde_json::from_value::<OrderDomainEvent>(payload) else {
             continue;
         };
-        let (fill_qty, fill_price) = match event.payload {
-            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (fill_qty, fill_price),
-            _ => continue,
-        };
         let portfolio_id: Uuid = r.get("portfolio_id");
         let instrument_id: String = r.get("instrument_id");
         let side = match r.get::<String, _>("side").as_str() {
             "buy" => OrderSide::Buy,
             _ => OrderSide::Sell,
         };
-        let entry = acc.entry((portfolio_id, instrument_id)).or_insert(PositionMath::FLAT);
-        *entry = entry.apply_fill(side, fill_qty, fill_price);
+        match event.payload {
+            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
+            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => {
+                let entry = acc.entry((portfolio_id, instrument_id)).or_insert(PositionMath::FLAT);
+                *entry = entry.apply_fill(side, fill_qty, fill_price);
+            }
+            OrderEventPayload::OrderFeeCharged { amount, effect, .. } if effect != FeeEffect::Other => {
+                let entry = acc.entry((portfolio_id, instrument_id)).or_insert(PositionMath::FLAT);
+                *entry = entry.apply_fee(amount, effect);
+            }
+            _ => continue,
+        }
     }
 
     let mut tx = pool.begin().await?;

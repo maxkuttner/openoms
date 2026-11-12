@@ -24,9 +24,9 @@ use crate::positions;
 
 /// Signals an optimistic-concurrency version conflict — the caller retries.
 #[derive(Debug)]
-struct ConcurrencyRetry {
-    expected: i64,
-    actual: i64,
+pub(crate) struct ConcurrencyRetry {
+    pub(crate) expected: i64,
+    pub(crate) actual: i64,
 }
 impl std::fmt::Display for ConcurrencyRetry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,15 +45,29 @@ pub async fn process_execution_report(
     actor: &str,
     bus: Option<&EventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    retry_on_conflict(order_id, "execution", || apply_once(pool, order_id, report.clone(), actor, bus)).await
+}
+
+/// Run `attempt` up to five times while it fails with [`ConcurrencyRetry`],
+/// backing off a little more each time.
+pub(crate) async fn retry_on_conflict<T, F, Fut>(
+    order_id: Uuid,
+    what: &str,
+    mut attempt_once: F,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, Box<dyn std::error::Error + Send + Sync>>>,
+{
     const MAX_ATTEMPTS: u32 = 5;
     for attempt in 1..=MAX_ATTEMPTS {
-        match apply_once(pool, order_id, report.clone(), actor, bus).await {
-            Ok(()) => return Ok(()),
+        match attempt_once().await {
+            Ok(v) => return Ok(v),
             Err(e) if e.downcast_ref::<ConcurrencyRetry>().is_some() => {
                 if attempt == MAX_ATTEMPTS {
                     return Err(e);
                 }
-                warn!(order_id = %order_id, attempt, "execution: {e}, retrying");
+                warn!(order_id = %order_id, attempt, "{what}: {e}, retrying");
                 tokio::time::sleep(std::time::Duration::from_millis(50 * attempt as u64)).await;
             }
             Err(e) => return Err(e),
@@ -298,6 +312,11 @@ pub(crate) mod tests {
     /// DB. The order's events stay: `order_event` is append-only and refuses deletes.
     pub(crate) async fn remove_seeded(pool: &PgPool, order_id: Uuid) {
         let mut tx = pool.begin().await.expect("begin cleanup");
+        sqlx::query("DELETE FROM order_fee WHERE order_id = $1")
+            .bind(order_id)
+            .execute(&mut *tx)
+            .await
+            .expect("delete order_fee rows");
         sqlx::query(
             "DELETE FROM kafka_outbox WHERE global_position IN \
              (SELECT global_position FROM order_event WHERE order_id = $1)",
