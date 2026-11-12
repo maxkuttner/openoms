@@ -131,6 +131,9 @@ pub fn summarize(event: &OrderDomainEvent) -> String {
                 format!("amended {}", changes.join(", "))
             }
         }
+        OrderEventPayload::OrderFeeCharged { amount, currency, .. } => {
+            format!("fee {amount} {currency}")
+        }
         OrderEventPayload::OrderCanceled { reason } => with_reason("canceled", reason.as_deref()),
         OrderEventPayload::CancelRejected { reason } => format!("cancel rejected: {reason}"),
         OrderEventPayload::OrderExpired { reason } => with_reason("expired", reason.as_deref()),

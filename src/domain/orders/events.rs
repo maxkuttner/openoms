@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::fees::FeeEffect;
 use super::state::{OrderSide, OrderStatus, OrderType, TimeInForce};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub enum OrderEventType {
     OrderExpired,
     OrderSuspended,
     OrderReleased,
+    OrderFeeCharged,
 }
 
 impl OrderEventType {
@@ -33,6 +35,7 @@ impl OrderEventType {
             Self::OrderExpired => "order_expired",
             Self::OrderSuspended => "order_suspended",
             Self::OrderReleased => "order_released",
+            Self::OrderFeeCharged => "order_fee_charged",
         }
     }
 }
@@ -97,6 +100,13 @@ pub enum OrderEventPayload {
     },
     OrderReleased {
         resumed_to_status: OrderStatus,
+    },
+    OrderFeeCharged {
+        fee_id: String,
+        execution_id: Option<String>,
+        amount: f64,
+        currency: String,
+        effect: FeeEffect,
     },
 }
 

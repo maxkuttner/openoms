@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload};
 use crate::domain::orders::state::OrderSide;
+use crate::fees::FeeEffect;
 
 /// The signed holding + average cost + realized P&L. `avg_cost` is the average price
 /// of the *open* position (>= 0; 0 when flat). Pure value type — no DB.
@@ -65,6 +66,27 @@ impl PositionMath {
                 avg_cost: price,
                 realized_pnl,
             }
+        }
+    }
+
+    /// Apply a venue fee (charge > 0, rebate < 0). Quote: realized P&L. Base: shrink
+    /// the holding at unchanged cost, never past zero. Other: no position effect.
+    pub fn apply_fee(self, amount: f64, effect: FeeEffect) -> PositionMath {
+        match effect {
+            FeeEffect::Quote => PositionMath { realized_pnl: self.realized_pnl - amount, ..self },
+            FeeEffect::Base => {
+                if self.net_qty == 0.0 {
+                    return self;
+                }
+                let sign = self.net_qty.signum();
+                let remaining = (self.net_qty.abs() - amount).max(0.0);
+                if remaining == 0.0 {
+                    PositionMath { net_qty: 0.0, avg_cost: 0.0, ..self }
+                } else {
+                    PositionMath { net_qty: sign * remaining, ..self }
+                }
+            }
+            FeeEffect::Other => self,
         }
     }
 
@@ -291,6 +313,13 @@ mod tests {
         let json = serde_json::to_value(&p).unwrap();
         assert_eq!(json["currency"], "EUR");
     }
+
+    #[test] fn quote_fee_reduces_realized() { let p = PositionMath { net_qty: 1.0, avg_cost: 100.0, realized_pnl: 5.0 }.apply_fee(1.5, FeeEffect::Quote); approx(p.realized_pnl, 3.5); approx(p.net_qty, 1.0); }
+    #[test] fn rebate_increases_realized() { approx(PositionMath::FLAT.apply_fee(-0.2, FeeEffect::Quote).realized_pnl, 0.2); }
+    #[test] fn base_fee_shrinks_long_at_cost() { let p = PositionMath { net_qty: 1.0, avg_cost: 64000.0, realized_pnl: 0.0 }.apply_fee(0.001, FeeEffect::Base); approx(p.net_qty, 0.999); approx(p.avg_cost, 64000.0); approx(p.realized_pnl, 0.0); }
+    #[test] fn base_fee_on_short_moves_toward_flat() { approx(PositionMath { net_qty: -2.0, avg_cost: 10.0, realized_pnl: 0.0 }.apply_fee(0.5, FeeEffect::Base).net_qty, -1.5); }
+    #[test] fn base_fee_never_crosses_zero() { let p = PositionMath { net_qty: 0.0005, avg_cost: 10.0, realized_pnl: 0.0 }.apply_fee(0.001, FeeEffect::Base); approx(p.net_qty, 0.0); approx(p.avg_cost, 0.0); }
+    #[test] fn other_fee_changes_nothing() { let p = PositionMath { net_qty: 1.0, avg_cost: 1.0, realized_pnl: 1.0 }; assert_eq!(p.apply_fee(3.0, FeeEffect::Other), p); }
 
     #[test]
     fn open_long() {

@@ -419,6 +419,16 @@ impl OrderAggregate {
                 state.resume_to_status = None;
                 state.version = event.version;
             }
+            OrderEventPayload::OrderFeeCharged { .. } => {
+                let state = self.state.as_mut().ok_or_else(|| {
+                    CommandRejection::new(
+                        RejectionCode::OrderNotFound,
+                        "cannot apply fee event before submit",
+                    )
+                })?;
+
+                state.version = event.version;
+            }
             OrderEventPayload::OrderRejected { .. }
             | OrderEventPayload::OrderCanceled { .. }
             | OrderEventPayload::OrderExpired { .. }
@@ -531,6 +541,44 @@ mod tests {
             .decide(OrderCommand::SubmitOrder(cmd), metadata("e-2"))
             .expect_err("double submit should fail");
         assert_eq!(err.code, RejectionCode::OrderAlreadyExists);
+    }
+
+    #[test]
+    fn fee_event_bumps_version_only() {
+        use crate::fees::FeeEffect;
+        let mut aggregate = submitted_aggregate();
+        let fill = aggregate
+            .decide(
+                OrderCommand::ReceiveExecutionReport(t().exec_fill("x-1", 10.0, 101.0, "XNYS")),
+                metadata("e-2"),
+            )
+            .expect("fill should succeed");
+        aggregate.apply(&fill[0]).expect("apply should succeed");
+        let before = aggregate.state.clone().expect("state");
+        assert_eq!(before.status, OrderStatus::Filled);
+
+        let fee = OrderDomainEvent {
+            event_id: "e-3".into(),
+            event_type: OrderEventType::OrderFeeCharged,
+            order_id: before.order_id.clone(),
+            timestamp: Utc::now(),
+            actor: "test".into(),
+            payload: OrderEventPayload::OrderFeeCharged {
+                fee_id: "f-1".into(),
+                execution_id: Some("x-1".into()),
+                amount: 0.5,
+                currency: "USD".into(),
+                effect: FeeEffect::Quote,
+            },
+            version: before.version + 1,
+            status_after: before.status,
+        };
+        aggregate.apply(&fee).expect("apply should succeed");
+        let after = aggregate.state.expect("state");
+        assert_eq!(after.version, before.version + 1);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.cum_qty, before.cum_qty);
+        assert_eq!(after.avg_px, before.avg_px);
     }
 
     #[test]

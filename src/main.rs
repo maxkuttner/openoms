@@ -10,6 +10,7 @@ mod instruments_api;
 mod instruments_import;
 mod risk_engine;
 mod positions;
+mod fees;
 mod recon_orders;
 mod symbology_resolver;
 mod setup;
