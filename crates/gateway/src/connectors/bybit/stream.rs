@@ -86,6 +86,36 @@ pub(crate) enum Update {
     /// A terminal order update for an order with fills: apply through reconcile
     /// so fills it may have overtaken are booked before the close.
     Terminal(BrokerOrderState),
+    /// The fee of one execution, sent after its fill.
+    Fee(ExecKind),
+}
+
+/// Quote coins Bybit spot lists; the base is what precedes the quote in the
+/// symbol (the stream has no instrument lookup).
+const QUOTES: &[&str] = &["USDT", "USDC", "USDE", "FDUSD", "DAI", "EUR", "BRL", "TRY", "BTC", "ETH", "MNT"];
+
+fn base_quote(symbol: &str) -> Option<(&str, &str)> {
+    QUOTES.iter().filter_map(|q| symbol.strip_suffix(q).filter(|b| !b.is_empty()).map(|b| (b, *q))).next()
+}
+
+/// The fee of one `execution.spot` Trade entry. `execFee` is positive when
+/// charged and negative for a maker rebate, the OMS sign. Its currency, per the
+/// v5 private `execution` topic: `feeCurrency` when the message carries it;
+/// otherwise Bybit spot's rule, a buy pays in the base coin and a sell in the
+/// quote coin. A zero fee sends nothing.
+fn fee(d: &serde_json::Value, exec_id: &str) -> Option<ExecKind> {
+    let amount: f64 = d["execFee"].as_str()?.parse().ok()?;
+    if amount == 0.0 {
+        return None;
+    }
+    let currency = match d["feeCurrency"].as_str().filter(|c| !c.is_empty()) {
+        Some(c) => c.to_string(),
+        None => {
+            let (base, quote) = base_quote(d["symbol"].as_str()?)?;
+            if d["side"].as_str()? == "Buy" { base } else { quote }.to_string()
+        }
+    };
+    Some(ExecKind::Fee { fee_id: format!("{VENUE}-{exec_id}"), execution_id: Some(exec_id.to_string()), amount, currency })
 }
 
 /// The updates one pushed message carries, by OMS order id. Entries for orders
@@ -95,8 +125,20 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
     let execution = topic_is(msg, "execution");
     let order = topic_is(msg, "order");
     data.iter()
-        .filter_map(|d| {
-            let id = Uuid::parse_str(d["orderLinkId"].as_str()?).ok()?;
+        .flat_map(|d| {
+            let Some(id) = d["orderLinkId"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else { return Vec::new() };
+            let mut out: Vec<(Uuid, Update)> = report(d, id, execution, order).into_iter().collect();
+            if execution && out.len() == 1 && matches!(out[0].1, Update::Report(VenueReport::Fill { .. })) {
+                if let Some(f) = d["execId"].as_str().and_then(|e| fee(d, e)) {
+                    out.push((id, Update::Fee(f)));
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+fn report(d: &serde_json::Value, id: Uuid, execution: bool, order: bool) -> Option<(Uuid, Update)> {
             let num = |k: &str| d[k].as_str().and_then(|s| s.parse::<f64>().ok());
             let report = if execution {
                 if d["execType"].as_str() != Some("Trade") {
@@ -131,8 +173,6 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
                 return None;
             };
             Some((id, report))
-        })
-        .collect()
 }
 
 /// What one parsed update tells the order engine. Fills and order updates
@@ -141,6 +181,7 @@ pub(crate) fn reports(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
 fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
     match update {
         Update::Report(report) => ExecEvent::from_report(order_id, VENUE, "bybit", report),
+        Update::Fee(kind) => ExecEvent { order_id, venue: VENUE.to_string(), actor: "bybit", source: ExecSource::Session, kind },
         Update::Terminal(st) => ExecEvent {
             order_id,
             venue: VENUE.to_string(),
@@ -265,6 +306,33 @@ mod tests {
     }
 
     #[test]
+    fn bybit_execution_sends_fee_in_base_on_buy() {
+        let r = reports(&sample("ws_execution"));
+        assert_eq!(r.len(), 2);
+        assert!(matches!(r[0].1, Update::Report(VenueReport::Fill { .. })), "fill first");
+        let kind = exec_event(r[1].0, r.into_iter().nth(1).unwrap().1).kind;
+        assert_eq!(
+            kind,
+            crate::contract::ExecKind::Fee {
+                fee_id: "BYBIT-2100000000007764263".into(),
+                execution_id: Some("2100000000007764263".into()),
+                amount: 0.000001,
+                currency: "BTC".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn bybit_fee_currency_is_quote_on_sell_and_fee_currency_wins() {
+        let sell = serde_json::json!({"symbol": "BTCUSDT", "side": "Sell", "execFee": "0.065"});
+        assert!(matches!(fee(&sell, "x"), Some(crate::contract::ExecKind::Fee { currency, .. }) if currency == "USDT"));
+        let tagged = serde_json::json!({"symbol": "BTCUSDT", "side": "Buy", "execFee": "0.5", "feeCurrency": "MNT"});
+        assert!(matches!(fee(&tagged, "x"), Some(crate::contract::ExecKind::Fee { currency, .. }) if currency == "MNT"));
+        let zero = serde_json::json!({"symbol": "BTCUSDT", "side": "Buy", "execFee": "0"});
+        assert!(fee(&zero, "x").is_none());
+    }
+
+    #[test]
     fn auth_signs_get_realtime_with_the_expiry() {
         let a = BybitAdapter::new("key".into(), "secret".into(), "PAPER");
         let m = auth_message(&a, 1700000005000);
@@ -277,7 +345,7 @@ mod tests {
     #[test]
     fn fill_uses_exec_id_qty_and_price() {
         let r = reports(&sample("ws_execution"));
-        assert_eq!(r.len(), 1);
+        assert_eq!(r.len(), 2, "the fill and its fee");
         assert_eq!(r[0].0.to_string(), ORDER_ID);
         match &r[0].1 {
             Update::Report(VenueReport::Fill { execution_id, fill_qty, fill_price, venue }) => {

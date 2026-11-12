@@ -25,7 +25,7 @@ use crate::connectors::binance::runtime::{
     health_event, parse_raw_order, parse_raw_trade, runtime_events,
 };
 use crate::contract::VenueReport;
-use crate::contract::{EngineHandle, ExecEvent, ExternalFill, FollowEvent, FollowHandle};
+use crate::contract::{EngineHandle, ExecEvent, ExecKind, ExternalFill, FollowEvent, FollowHandle};
 use crate::runtime::{
     AccountIdentity, RuntimeOrderState, StreamState, TradeProvenance, VenueEvent,
 };
@@ -436,8 +436,31 @@ async fn handle_execution_report(
         }
     };
 
+    let fee = match &report {
+        VenueReport::Fill { execution_id, .. } => trade_fee(event, execution_id),
+        _ => None,
+    };
     engine.exec(ExecEvent::from_report(order_id, VENUE, "binance", report)).await;
+    if let Some(kind) = fee {
+        engine.exec(ExecEvent { order_id, venue: VENUE.into(), actor: "binance", source: crate::contract::ExecSource::Session, kind }).await;
+    }
     Ok(())
+}
+
+/// A TRADE report's commission (`n` in asset `N`), keyed by trade id like the
+/// `myTrades` path, so both book it once. A zero commission sends nothing.
+fn trade_fee(event: &serde_json::Value, trade_id: &str) -> Option<ExecKind> {
+    fee_kind(trade_id, event["n"].as_str()?.parse().ok()?, event["N"].as_str()?)
+}
+
+/// `ExecKind::Fee` for one Binance trade; `None` for a zero commission.
+pub fn fee_kind(trade_id: &str, amount: f64, currency: &str) -> Option<ExecKind> {
+    (amount != 0.0 && !currency.is_empty()).then(|| ExecKind::Fee {
+        fee_id: format!("{VENUE}-{trade_id}"),
+        execution_id: Some(trade_id.to_string()),
+        amount,
+        currency: currency.to_string(),
+    })
 }
 
 
@@ -504,5 +527,36 @@ mod tests {
         assert_eq!(ev.order_id, order_id);
         assert_eq!(ev.venue, "BINANCE");
         assert_eq!(ev.kind, ExecKind::Fill { execution_id: "77".into(), qty: 0.5, price: 64000.1 });
+    }
+
+    #[tokio::test]
+    async fn binance_trade_report_sends_fill_then_fee() {
+        let order_id = Uuid::new_v4();
+        let event = serde_json::json!({
+            "e": "executionReport", "x": "TRADE", "c": order_id.to_string(),
+            "l": "0.5", "L": "64000.1", "t": 77, "n": "0.01", "N": "BNB",
+        });
+        let (engine, mut rx) = EngineHandle::new();
+        handle_execution_report(&event, &engine).await.unwrap();
+        let Some(GatewayMsg::Exec(fill)) = rx.try_recv().ok() else { panic!("a fill") };
+        assert!(matches!(fill.kind, ExecKind::Fill { .. }));
+        let Some(GatewayMsg::Exec(fee)) = rx.try_recv().ok() else { panic!("a fee") };
+        assert_eq!(fee.order_id, order_id);
+        assert_eq!(
+            fee.kind,
+            ExecKind::Fee { fee_id: "BINANCE-77".into(), execution_id: Some("77".into()), amount: 0.01, currency: "BNB".into() }
+        );
+    }
+
+    #[tokio::test]
+    async fn binance_zero_commission_sends_no_fee() {
+        let event = serde_json::json!({
+            "e": "executionReport", "x": "TRADE", "c": Uuid::new_v4().to_string(),
+            "l": "0.5", "L": "64000.1", "t": 77, "n": "0", "N": "BNB",
+        });
+        let (engine, mut rx) = EngineHandle::new();
+        handle_execution_report(&event, &engine).await.unwrap();
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
     }
 }
