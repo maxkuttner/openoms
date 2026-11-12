@@ -47,6 +47,59 @@ pub enum FeeEffect {
     Other,
 }
 
+/// A fee total in one currency. Fees stay per currency, never FX-converted.
+#[derive(Debug, Clone, PartialEq, Serialize, utoipa::ToSchema)]
+pub struct FeeAmount {
+    pub currency: String,
+    pub amount: f64,
+}
+
+/// Fee totals per currency for each of `order_ids`, currencies in the order
+/// their first fee was booked. Orders without fees are absent.
+pub async fn fees_by_order(
+    pool: &PgPool,
+    order_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, Vec<FeeAmount>>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT order_id, currency, SUM(amount)::float8 AS amount \
+         FROM order_fee WHERE order_id = ANY($1) \
+         GROUP BY order_id, currency ORDER BY order_id, MIN(booked_at), currency",
+    )
+    .bind(order_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut out: std::collections::HashMap<Uuid, Vec<FeeAmount>> = std::collections::HashMap::new();
+    for r in rows {
+        out.entry(r.get("order_id"))
+            .or_default()
+            .push(FeeAmount { currency: r.get("currency"), amount: r.get("amount") });
+    }
+    Ok(out)
+}
+
+/// Fees with no position effect (`effect = 'other'`) per instrument of one
+/// portfolio, summed per currency. Instruments without such fees are absent.
+pub async fn other_fees_by_instrument(
+    pool: &PgPool,
+    portfolio_id: Uuid,
+) -> Result<std::collections::HashMap<String, Vec<FeeAmount>>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT instrument_id, currency, SUM(amount)::float8 AS amount \
+         FROM order_fee WHERE portfolio_id = $1 AND effect = 'other' \
+         GROUP BY instrument_id, currency ORDER BY instrument_id, MIN(booked_at), currency",
+    )
+    .bind(portfolio_id)
+    .fetch_all(pool)
+    .await?;
+    let mut out: std::collections::HashMap<String, Vec<FeeAmount>> = std::collections::HashMap::new();
+    for r in rows {
+        out.entry(r.get("instrument_id"))
+            .or_default()
+            .push(FeeAmount { currency: r.get("currency"), amount: r.get("amount") });
+    }
+    Ok(out)
+}
+
 /// Classify a fee by its currency relative to the instrument (case-insensitive).
 pub fn fee_effect(
     fee_currency: &str,
@@ -397,6 +450,42 @@ mod tests {
             let (q, c, p) = incremental.expect("incremental position");
             assert!((q - 0.99).abs() < 1e-9 && (c - 100.0).abs() < 1e-9 && (p + 0.3).abs() < 1e-9, "{q} {c} {p}");
             assert_eq!(after, incremental);
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live Postgres; run with --ignored"]
+        async fn orders_list_carries_fees_per_currency() {
+            let pool = test_pool().await;
+            let (order_id, _, _) = seeded_order(&pool, 0).await;
+            for f in [charge("a1", 1.0, "USD"), charge("a2", 0.5, "USD"), charge("a3", 0.01, "BNB")] {
+                book_fee(&pool, None, order_id, f, "test").await.unwrap();
+            }
+            let fees = fees_by_order(&pool, &[order_id]).await;
+            remove_seeded(&pool, order_id).await;
+            let fees = fees.unwrap();
+            assert_eq!(
+                fees[&order_id],
+                vec![
+                    FeeAmount { currency: "USD".into(), amount: 1.5 },
+                    FeeAmount { currency: "BNB".into(), amount: 0.01 },
+                ]
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live Postgres; run with --ignored"]
+        async fn position_carries_other_currency_fees() {
+            let pool = test_pool().await;
+            let (order_id, portfolio_id, instrument_id) = seeded_order(&pool, 0).await;
+            let quote = quote_ccy(&pool, &instrument_id).await;
+            book_fee(&pool, None, order_id, charge("o1", 0.2, "BNB"), "test").await.unwrap();
+            book_fee(&pool, None, order_id, charge("o2", 0.3, "BNB"), "test").await.unwrap();
+            book_fee(&pool, None, order_id, charge("q1", 1.0, &quote), "test").await.unwrap();
+            let other = other_fees_by_instrument(&pool, portfolio_id).await;
+            remove_seeded(&pool, order_id).await;
+            let other = other.unwrap();
+            // The quote-currency fee hits realized P&L, so only BNB is "other".
+            assert_eq!(other[&instrument_id], vec![FeeAmount { currency: "BNB".into(), amount: 0.5 }]);
         }
 
         #[tokio::test]

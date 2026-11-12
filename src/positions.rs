@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+use crate::fees::FeeAmount;
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
@@ -147,6 +149,9 @@ pub struct Position {
     pub unrealized_pnl: Option<f64>,
     /// When the mark was received; lets a caller judge staleness.
     pub mark_ts: Option<DateTime<Utc>>,
+    /// Fees in currencies that don't touch the position (e.g. BNB on a USDT pair),
+    /// summed per currency. Empty when none.
+    pub other_fees: Vec<FeeAmount>,
 }
 
 /// Read the current position (FOR UPDATE), or FLAT if none.
@@ -330,6 +335,7 @@ mod tests {
             market_value: None,
             unrealized_pnl: None,
             mark_ts: None,
+            other_fees: vec![],
         };
         let json = serde_json::to_value(&p).unwrap();
         assert_eq!(json["currency"], "EUR");

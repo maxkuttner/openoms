@@ -311,6 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn order_fee_event_has_a_summary() {
+        let e = event(
+            OrderEventPayload::OrderFeeCharged {
+                fee_id: "f1".to_string(),
+                execution_id: Some("x1".to_string()),
+                amount: 1.5,
+                currency: "USD".to_string(),
+                effect: crate::fees::FeeEffect::Quote,
+            },
+            OrderEventType::OrderFeeCharged,
+            OrderStatus::Routed,
+        );
+        assert_eq!(view(&record_of(&e)).summary, "fee 1.5 USD");
+    }
+
+    #[test]
     fn a_stored_event_becomes_a_timeline_entry() {
         let e = event(
             OrderEventPayload::OrderRouted {

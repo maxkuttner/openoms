@@ -194,7 +194,7 @@ mod boundary_tests;
         crate::domain::orders::state::OrderStatus,
         crate::positions::Position,
         handlers::VenueOption,
-        Allocation, CreateAllocations, AllocationSplit, BlotterRow,
+        Allocation, CreateAllocations, AllocationSplit, BlotterRow, crate::fees::FeeAmount,
         order_events::OrderEventView,
         handlers::GrantedPortfolio,
         Principal, Portfolio, Account, BrokerConnection,
