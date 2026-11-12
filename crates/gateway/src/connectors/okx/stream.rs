@@ -109,6 +109,34 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
         .collect()
 }
 
+/// The running fee total each entry reports, by OMS order id, in the fee
+/// currency. OKX reports a charge as a negative `fee`, so the total flips its
+/// sign (a rebate becomes a negative total). No fee yet (zero, empty) sends nothing.
+pub(crate) fn fee_totals(msg: &serde_json::Value) -> Vec<(Uuid, f64, String)> {
+    if msg["arg"]["channel"].as_str() != Some("orders") {
+        return Vec::new();
+    }
+    let data = msg["data"].as_array().cloned().unwrap_or_default();
+    data.iter()
+        .filter_map(|d| {
+            let id = oms_order_id(d["clOrdId"].as_str()?)?;
+            let fee: f64 = d["fee"].as_str()?.parse().ok()?;
+            let ccy = d["feeCcy"].as_str().filter(|c| !c.is_empty())?;
+            (fee != 0.0).then(|| (id, -fee, ccy.to_string()))
+        })
+        .collect()
+}
+
+fn fee_event(order_id: Uuid, total: f64, currency: String) -> ExecEvent {
+    ExecEvent {
+        order_id,
+        venue: VENUE.to_string(),
+        actor: "okx",
+        source: ExecSource::Session,
+        kind: ExecKind::FeeTotal { total, currency },
+    }
+}
+
 /// What one parsed update tells the order engine: cumulative progress books
 /// only what the OMS is missing, so a repeated update books nothing.
 fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
@@ -166,6 +194,9 @@ async fn connect_and_run(
         if v.get("data").is_some() {
             for (order_id, update) in updates(&v) {
                 engine.exec(exec_event(order_id, update)).await;
+            }
+            for (order_id, total, currency) in fee_totals(&v) {
+                engine.exec(fee_event(order_id, total, currency)).await;
             }
             continue;
         }
@@ -293,5 +324,34 @@ mod tests {
     fn other_channels_are_ignored() {
         let v = serde_json::from_str(include_str!("testdata/ws_tickers.json")).unwrap();
         assert!(updates(&v).is_empty());
+    }
+
+    fn with_fee(fee: &str) -> serde_json::Value {
+        let mut m = sample("ws_orders_fill");
+        m["data"][1]["fee"] = fee.into();
+        m["data"][1]["feeCcy"] = "USDT".into();
+        m
+    }
+
+    #[test]
+    fn okx_order_update_sends_fee_total_with_charged_positive() {
+        let t = fee_totals(&with_fee("-0.06"));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0.to_string(), ORDER_ID);
+        let ev = fee_event(t[0].0, t[0].1, t[0].2.clone());
+        assert!(matches!(&ev.kind, ExecKind::FeeTotal { total, currency } if *total == 0.06 && currency == "USDT"), "{:?}", ev.kind);
+    }
+
+    #[test]
+    fn okx_rebate_is_a_negative_total() {
+        let t = fee_totals(&with_fee("0.01"));
+        assert_eq!((t[0].1, t[0].2.as_str()), (-0.01, "USDT"));
+    }
+
+    #[test]
+    fn okx_zero_or_missing_fee_sends_nothing() {
+        assert!(fee_totals(&with_fee("0")).is_empty());
+        assert!(fee_totals(&with_fee("")).is_empty());
+        assert!(fee_totals(&sample("ws_orders_fill")).is_empty());
     }
 }

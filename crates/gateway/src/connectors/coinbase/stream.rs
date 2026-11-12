@@ -104,6 +104,35 @@ pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
         .collect()
 }
 
+/// The running `total_fees` each order entry reports, by OMS order id, in the
+/// product's quote currency (`BTC-USD` -> `USD`). Zero sends nothing.
+pub(crate) fn fee_totals(msg: &serde_json::Value) -> Vec<(Uuid, f64, String)> {
+    if msg["channel"].as_str() != Some("user") {
+        return Vec::new();
+    }
+    let events = msg["events"].as_array().cloned().unwrap_or_default();
+    events
+        .iter()
+        .flat_map(|e| e["orders"].as_array().cloned().unwrap_or_default())
+        .filter_map(|o| {
+            let id = Uuid::parse_str(o["client_order_id"].as_str()?).ok()?;
+            let total: f64 = o["total_fees"].as_str()?.parse().ok()?;
+            let quote = o["product_id"].as_str()?.rsplit_once('-')?.1;
+            (total != 0.0 && !quote.is_empty()).then(|| (id, total, quote.to_string()))
+        })
+        .collect()
+}
+
+fn fee_event(order_id: Uuid, total: f64, currency: String) -> ExecEvent {
+    ExecEvent {
+        order_id,
+        venue: VENUE.to_string(),
+        actor: "coinbase",
+        source: ExecSource::Session,
+        kind: ExecKind::FeeTotal { total, currency },
+    }
+}
+
 /// What one parsed update tells the order engine: cumulative progress books
 /// only what the OMS is missing, so a repeated update books nothing.
 fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
@@ -172,6 +201,9 @@ async fn connect_and_run(
         }
         for (order_id, update) in updates(&v) {
             engine.exec(exec_event(order_id, update)).await;
+        }
+        for (order_id, total, currency) in fee_totals(&v) {
+            engine.exec(fee_event(order_id, total, currency)).await;
         }
     }
     Ok(())
@@ -271,5 +303,21 @@ mod tests {
         let mut msg = sample("partial");
         msg["events"][0]["orders"][0]["client_order_id"] = "placed-in-the-coinbase-app".into();
         assert!(updates(&msg).is_empty());
+    }
+
+    #[test]
+    fn coinbase_update_sends_fee_total_in_quote() {
+        let mut msg = sample("partial");
+        msg["events"][0]["orders"][0]["total_fees"] = "0.13".into();
+        let t = fee_totals(&msg);
+        assert_eq!(t.len(), 1);
+        let ev = fee_event(t[0].0, t[0].1, t[0].2.clone());
+        assert_eq!(t[0].0.to_string(), ORDER_ID);
+        assert!(matches!(&ev.kind, ExecKind::FeeTotal { total, currency } if *total == 0.13 && currency == "USD"), "{:?}", ev.kind);
+    }
+
+    #[test]
+    fn coinbase_zero_total_fees_sends_nothing() {
+        assert!(fee_totals(&sample("partial")).is_empty());
     }
 }

@@ -224,14 +224,15 @@ pub async fn booked_fee_total(pool: &PgPool, order_id: Uuid, currency: &str) -> 
 }
 
 /// The fee to book to bring `booked` up to a venue-reported running `total`, or
-/// `None` when they already agree. The id names the total reached, so a repeated
-/// total dedupes and a corrected one books its own difference.
+/// `None` when they already agree. The id names the step (booked -> total), so a repeated
+/// step dedupes, a corrected total books its own difference, and a total that
+/// returns to an earlier value after a correction is not deduped against it.
 pub fn fee_delta(order_id: Uuid, venue: &str, booked: f64, total: f64, currency: &str) -> Option<FeeCharge> {
     if (total - booked).abs() < 1e-12 {
         return None;
     }
     Some(FeeCharge {
-        fee_id: format!("{venue}-{order_id}-{currency}-{total}"),
+        fee_id: format!("{venue}-{order_id}-{currency}-{booked}->{total}"),
         execution_id: None,
         amount: total - booked,
         currency: currency.to_string(),
@@ -254,7 +255,13 @@ mod tests {
     }
     #[test] fn the_fee_id_names_the_total_reached() {
         let id = Uuid::nil();
-        assert_eq!(fee_delta(id, "OKX", 0.0, 0.6, "USDT").unwrap().fee_id, format!("OKX-{id}-USDT-0.6"));
+        assert_eq!(fee_delta(id, "OKX", 0.0, 0.6, "USDT").unwrap().fee_id, format!("OKX-{id}-USDT-0->0.6"));
+    }
+    #[test] fn a_total_returning_after_a_correction_books_again() {
+        let id = Uuid::nil();
+        let a = fee_delta(id, "OKX", 0.0, 0.6, "USDT").unwrap().fee_id;
+        let b = fee_delta(id, "OKX", 0.4, 0.6, "USDT").unwrap().fee_id;
+        assert_ne!(a, b);
     }
 
     #[test] fn usdt_fee_on_btcusdt_is_quote() { assert_eq!(fee_effect("USDT", "BTCUSDT", "CRYPTO", "USDT"), FeeEffect::Quote); }
