@@ -39,6 +39,11 @@ pub enum ExecKind {
     Rejected { reason: String },
     /// The venue holds the order under this id: routes a `submitted` order.
     Ack { venue_order_id: String },
+    /// One fee the venue charged (positive) or rebated (negative); never touches fills.
+    Fee { fee_id: String, execution_id: Option<String>, amount: f64, currency: String },
+    /// Running total of the fees charged so far on this order, in one currency;
+    /// the engine books the difference from what it already has.
+    FeeTotal { total: f64, currency: String },
 }
 
 /// What a venue did to one order.

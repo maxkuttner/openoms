@@ -12,13 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use sqlx::PgPool;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::domain::orders::commands::ExecutionReport;
 use crate::event_bus::EventBus;
 use gateway::contract::{EngineHandle, ExecEvent, ExecKind, GatewayMsg};
 use crate::execution::process_execution_report;
+use crate::fees::{booked_fee_total, fee_delta, FeeBooked, FeeCharge};
 use gateway::contract::BrokerOrderOutcome;
 use crate::recon_orders::{increment_price, missing_qty, oms_fill_state, run_order_reconcile};
 
@@ -77,6 +78,8 @@ pub fn reports_for(ev: &ExecEvent, booked_cum: f64, booked_avg: Option<f64>) -> 
         ExecKind::Rejected { reason } => vec![ExecutionReport::Reject { reason: reason.clone(), venue: Some(venue) }],
         // Routes the order (`apply_exec`); not an execution report.
         ExecKind::Ack { .. } => Vec::new(),
+        // Booked by `apply_exec` as fees; they never touch fill state.
+        ExecKind::Fee { .. } | ExecKind::FeeTotal { .. } => Vec::new(),
     }
 }
 
@@ -161,6 +164,27 @@ impl Drop for Reconciling {
     }
 }
 
+/// The fee an event asks to book, if any. A running total books only its
+/// difference from what is already booked in that currency.
+async fn fee_charge(pool: &PgPool, ev: &ExecEvent) -> Option<FeeCharge> {
+    match &ev.kind {
+        ExecKind::Fee { fee_id, execution_id, amount, currency } => Some(FeeCharge {
+            fee_id: fee_id.clone(),
+            execution_id: execution_id.clone(),
+            amount: *amount,
+            currency: currency.clone(),
+        }),
+        ExecKind::FeeTotal { total, currency } => match booked_fee_total(pool, ev.order_id, currency).await {
+            Ok(booked) => fee_delta(ev.order_id, &ev.venue, booked, *total, currency),
+            Err(e) => {
+                error!(order_id = %ev.order_id, error = %e, "order engine: could not read booked fees");
+                None
+            }
+        },
+        _ => None,
+    }
+}
+
 /// Book one event: read what the OMS has booked when the event is cumulative or
 /// terminal, then apply each report the plan yields.
 pub async fn apply_exec(pool: &PgPool, bus: &EventBus, ev: &ExecEvent) {
@@ -169,6 +193,17 @@ pub async fn apply_exec(pool: &PgPool, bus: &EventBus, ev: &ExecEvent) {
             Ok(result) => info!(order_id = %ev.order_id, ?result, "order engine: venue acknowledged a stuck order"),
             Err(e) => error!(order_id = %ev.order_id, error = %e.message, "order engine: could not route a stuck order"),
         }
+        return;
+    }
+    if let Some(charge) = fee_charge(pool, ev).await {
+        match crate::fees::book_fee(pool, Some(bus), ev.order_id, charge, ev.actor).await {
+            Ok(FeeBooked::Booked) => {}
+            Ok(FeeBooked::Duplicate) => debug!(order_id = %ev.order_id, "order engine: fee already booked"),
+            Ok(FeeBooked::UnknownOrder) => warn!(order_id = %ev.order_id, "order engine: fee for an unknown order"),
+            Err(e) => error!(order_id = %ev.order_id, error = %e, "order engine: could not book fee"),
+        }
+    }
+    if matches!(ev.kind, ExecKind::Fee { .. } | ExecKind::FeeTotal { .. }) {
         return;
     }
     let (booked_cum, booked_avg) = if needs_booked_state(&ev.kind) {
@@ -438,5 +473,41 @@ mod tests {
 
         assert!((cum - 0.5).abs() < 1e-9);
         assert_eq!(partials, 1);
+    }
+
+    #[test]
+    fn fees_yield_no_execution_report() {
+        let fee = ExecKind::Fee { fee_id: "f1".into(), execution_id: None, amount: 0.1, currency: "USD".into() };
+        assert!(reports_for(&ev(fee), 0.0, None).is_empty());
+        assert!(reports_for(&ev(ExecKind::FeeTotal { total: 0.3, currency: "USD".into() }), 0.0, None).is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn a_fee_total_sent_twice_books_once() {
+        use crate::execution::tests::{remove_seeded, seeded_order};
+        let pool = crate::handlers::tests::test_pool().await;
+        let (order_id, _, _) = seeded_order(&pool, 0).await;
+        let bus = crate::event_bus::EventBus::new();
+        let ev = ExecEvent {
+            order_id,
+            venue: "TEST".into(),
+            actor: "engine-test",
+            source: ExecSource::Session,
+            kind: ExecKind::FeeTotal { total: 0.4, currency: "USD".into() },
+        };
+
+        apply_exec(&pool, &bus, &ev).await;
+        apply_exec(&pool, &bus, &ev).await;
+        let total = booked_fee_total(&pool, order_id, "USD").await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM order_fee WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        remove_seeded(&pool, order_id).await;
+
+        assert!((total - 0.4).abs() < 1e-9);
+        assert_eq!(rows, 1);
     }
 }

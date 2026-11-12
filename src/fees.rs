@@ -223,9 +223,39 @@ pub async fn booked_fee_total(pool: &PgPool, order_id: Uuid, currency: &str) -> 
     .await
 }
 
+/// The fee to book to bring `booked` up to a venue-reported running `total`, or
+/// `None` when they already agree. The id names the total reached, so a repeated
+/// total dedupes and a corrected one books its own difference.
+pub fn fee_delta(order_id: Uuid, venue: &str, booked: f64, total: f64, currency: &str) -> Option<FeeCharge> {
+    if (total - booked).abs() < 1e-12 {
+        return None;
+    }
+    Some(FeeCharge {
+        fee_id: format!("{venue}-{order_id}-{currency}-{total}"),
+        execution_id: None,
+        amount: total - booked,
+        currency: currency.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approx(a: f64, b: f64) { assert!((a - b).abs() < 1e-9, "{a} != {b}"); }
+    #[test] fn fee_delta_books_the_increase() {
+        let f = fee_delta(Uuid::nil(), "COINBASE", 0.5, 0.8, "USD").unwrap();
+        approx(f.amount, 0.3);
+        assert_eq!(f.currency, "USD");
+    }
+    #[test] fn a_repeated_total_books_nothing() { assert!(fee_delta(Uuid::nil(), "COINBASE", 0.8, 0.8, "USD").is_none()); }
+    #[test] fn a_lower_total_books_a_negative_correction() {
+        approx(fee_delta(Uuid::nil(), "OKX", 0.8, 0.6, "USDT").unwrap().amount, -0.2);
+    }
+    #[test] fn the_fee_id_names_the_total_reached() {
+        let id = Uuid::nil();
+        assert_eq!(fee_delta(id, "OKX", 0.0, 0.6, "USDT").unwrap().fee_id, format!("OKX-{id}-USDT-0.6"));
+    }
 
     #[test] fn usdt_fee_on_btcusdt_is_quote() { assert_eq!(fee_effect("USDT", "BTCUSDT", "CRYPTO", "USDT"), FeeEffect::Quote); }
     #[test] fn btc_fee_on_btcusdt_is_base() { assert_eq!(fee_effect("btc", "BTCUSDT", "CRYPTO", "USDT"), FeeEffect::Base); }
