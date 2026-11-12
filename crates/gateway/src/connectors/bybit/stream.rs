@@ -111,8 +111,16 @@ fn fee(d: &serde_json::Value, exec_id: &str) -> Option<ExecKind> {
     let currency = match d["feeCurrency"].as_str().filter(|c| !c.is_empty()) {
         Some(c) => c.to_string(),
         None => {
-            let (base, quote) = base_quote(d["symbol"].as_str()?)?;
-            if d["side"].as_str()? == "Buy" { base } else { quote }.to_string()
+            let symbol = d["symbol"].as_str().unwrap_or("");
+            let side = d["side"].as_str().unwrap_or("");
+            let resolved = base_quote(symbol).map(|(base, quote)| if side == "Buy" { base } else { quote }.to_string());
+            match resolved {
+                Some(c) => c,
+                None => {
+                    warn!(%symbol, %exec_id, fee = amount, "Bybit WS: fee currency unresolved, fee not booked");
+                    return None;
+                }
+            }
         }
     };
     Some(ExecKind::Fee { fee_id: format!("{VENUE}-{exec_id}"), execution_id: Some(exec_id.to_string()), amount, currency })
@@ -330,6 +338,8 @@ mod tests {
         assert!(matches!(fee(&tagged, "x"), Some(crate::contract::ExecKind::Fee { currency, .. }) if currency == "MNT"));
         let zero = serde_json::json!({"symbol": "BTCUSDT", "side": "Buy", "execFee": "0"});
         assert!(fee(&zero, "x").is_none());
+        let unknown = serde_json::json!({"symbol": "FOOBAR", "side": "Buy", "execFee": "0.5"});
+        assert!(fee(&unknown, "x").is_none());
     }
 
     #[test]
