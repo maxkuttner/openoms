@@ -380,6 +380,8 @@ mod tests {
         let token = crate::sessions::create_session(
             &pool,
             principal_id,
+            crate::sessions::AuthMethod::Oidc,
+            false,
             &SessionTtl::default(),
             None,
         )
@@ -407,6 +409,8 @@ mod tests {
         let token = crate::sessions::create_session(
             &pool,
             principal_id,
+            crate::sessions::AuthMethod::Oidc,
+            false,
             &SessionTtl::default(),
             None,
         )

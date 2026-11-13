@@ -626,7 +626,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let session = crate::sessions::create_session(pool, id, &Default::default(), None).await.unwrap();
+        let session = crate::sessions::create_session(pool, id, crate::sessions::AuthMethod::Oidc, false, &Default::default(), None).await.unwrap();
         (id, key.key_id, key.secret.unwrap(), session.hash)
     }
 

@@ -241,32 +241,119 @@ pub fn derive_public_base_url(bind_addr: &str) -> Result<String, String> {
     }
 }
 
+/// How a session was established — `user_session.auth_method`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    Oidc,
+    Local,
+    LegacyAdmin,
+}
+
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMethod::Oidc => "oidc",
+            AuthMethod::Local => "local",
+            AuthMethod::LegacyAdmin => "legacy_admin",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "local" => AuthMethod::Local,
+            "legacy_admin" => AuthMethod::LegacyAdmin,
+            _ => AuthMethod::Oidc,
+        }
+    }
+}
+
 pub struct SessionRecord {
     pub id: Uuid,
     pub principal_id: Uuid,
     pub principal_code: String,
     pub last_seen_at: DateTime<Utc>,
     pub absolute_expires_at: DateTime<Utc>,
+    pub auth_method: AuthMethod,
+    pub mfa_verified_at: Option<DateTime<Utc>>,
 }
 
+const INSERT_SESSION: &str = "INSERT INTO user_session \
+     (principal_id, token_hash, absolute_expires_at, user_agent, auth_method, mfa_verified_at) \
+     VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN now() END) RETURNING id";
+
+/// Mint a session. `mfa_verified` stamps `mfa_verified_at = now()`; a local
+/// login starts without it and earns it at the TOTP step.
 pub async fn create_session(
     pool: &PgPool,
     principal_id: Uuid,
+    auth_method: AuthMethod,
+    mfa_verified: bool,
     ttl: &SessionTtl,
     user_agent: Option<&str>,
 ) -> Result<SessionToken, sqlx::Error> {
     let token = generate_session_token();
-    sqlx::query(
-        "INSERT INTO user_session (principal_id, token_hash, absolute_expires_at, user_agent) \
-         VALUES ($1, $2, $3, $4)",
+    sqlx::query(INSERT_SESSION)
+        .bind(principal_id)
+        .bind(&token.hash)
+        .bind(absolute_expiry(Utc::now(), ttl))
+        .bind(user_agent)
+        .bind(auth_method.as_str())
+        .bind(mfa_verified)
+        .execute(pool)
+        .await?;
+    Ok(token)
+}
+
+/// Replace session `old_id` with a fresh one in one transaction: the new row
+/// is inserted and the old one revoked together, so the old token stops
+/// working the moment the new one exists (session-fixation defence on a
+/// privilege change such as passing MFA). `None` if `old_id` was already
+/// revoked — a concurrent rotation won, and this one mints nothing.
+pub async fn rotate_session(
+    pool: &PgPool,
+    old_id: Uuid,
+    principal_id: Uuid,
+    auth_method: AuthMethod,
+    mfa_verified: bool,
+    ttl: &SessionTtl,
+    user_agent: Option<&str>,
+) -> Result<Option<SessionToken>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let revoked = sqlx::query(
+        "UPDATE user_session SET revoked_at = now() \
+          WHERE id = $1 AND principal_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(old_id)
+    .bind(principal_id)
+    .execute(&mut *tx)
+    .await?;
+    if revoked.rows_affected() != 1 {
+        return Ok(None);
+    }
+    let token = generate_session_token();
+    sqlx::query(INSERT_SESSION)
+        .bind(principal_id)
+        .bind(&token.hash)
+        .bind(absolute_expiry(Utc::now(), ttl))
+        .bind(user_agent)
+        .bind(auth_method.as_str())
+        .bind(mfa_verified)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(token))
+}
+
+/// Revoke every live session of `principal_id` (logout-all, credential
+/// change). Returns how many were revoked.
+pub async fn revoke_all_for_principal(pool: &PgPool, principal_id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE user_session SET revoked_at = now() WHERE principal_id = $1 AND revoked_at IS NULL",
     )
     .bind(principal_id)
-    .bind(&token.hash)
-    .bind(absolute_expiry(Utc::now(), ttl))
-    .bind(user_agent)
     .execute(pool)
     .await?;
-    Ok(token)
+    Ok(result.rows_affected())
 }
 
 /// Resolve a cookie value to its session, joining `principal` so a disabled
@@ -280,7 +367,7 @@ pub async fn lookup_session(
 ) -> Result<Option<SessionRecord>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT s.id, s.principal_id, p.code AS principal_code, \
-                s.last_seen_at, s.absolute_expires_at \
+                s.last_seen_at, s.absolute_expires_at, s.auth_method, s.mfa_verified_at \
          FROM user_session s \
          JOIN principal p ON p.id = s.principal_id \
          WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status = 'ACTIVE' \
@@ -296,6 +383,8 @@ pub async fn lookup_session(
         principal_code: r.get("principal_code"),
         last_seen_at: r.get("last_seen_at"),
         absolute_expires_at: r.get("absolute_expires_at"),
+        auth_method: AuthMethod::parse(r.get::<&str, _>("auth_method")),
+        mfa_verified_at: r.get("mfa_verified_at"),
     }))
 }
 
@@ -628,7 +717,7 @@ mod tests {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "session-store-test").await;
 
-        let token = create_session(&pool, principal_id, &SessionTtl::default(), Some("test-agent"))
+        let token = create_session(&pool, principal_id, AuthMethod::Oidc, false, &SessionTtl::default(), Some("test-agent"))
             .await
             .expect("create");
 
@@ -650,7 +739,7 @@ mod tests {
     async fn a_disabled_principal_loses_its_sessions() {
         let pool = test_pool().await;
         let (principal_id, _principal_code) = seed_principal(&pool, "session-disable-test").await;
-        let token = create_session(&pool, principal_id, &SessionTtl::default(), None)
+        let token = create_session(&pool, principal_id, AuthMethod::Oidc, false, &SessionTtl::default(), None)
             .await
             .expect("create");
 

@@ -2878,6 +2878,228 @@
         }
       }
     },
+    "/auth/invite/{token}/preview": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "What a valid, pending invite offers: masked email, role, portfolios and",
+        "description": "the enabled sign-in methods. Any other token gets `{valid:false}` with the\nsame fields, after the same single query.",
+        "operationId": "preview",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "description": "The invite link token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitePreview"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/local/enroll": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Claim an invite with a new local password: in one transaction the",
+        "description": "credential is written, the local identity linked, the user activated, the\ninvite accepted and the claim audited. Then a session (MFA pending) is\nminted. Only for a pending `any`/`local` invite of a not-yet-active user\nwith no local credential; any refusal leaves the invite pending.",
+        "operationId": "enroll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Enrolled; session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NextStep"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid invite or weak password"
+          },
+          "403": {
+            "description": "Cross-origin request"
+          }
+        }
+      }
+    },
+    "/auth/local/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Email + password. Success mints a session with MFA pending and says which",
+        "description": "TOTP step comes next. Every failure is the same generic 401; over the\nrate limit it is a generic 429.",
+        "operationId": "local_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Password accepted; session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NextStep"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "invalid_credentials"
+          },
+          "403": {
+            "description": "Cross-origin request"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/totp": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Second factor on the current local session: a TOTP code or an unused",
+        "description": "recovery code. Success sets `mfa_verified_at` by rotating the session —\nthe old token is revoked in the same transaction.",
+        "operationId": "totp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Verified; rotated session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaVerified"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Wrong code or no session"
+          },
+          "409": {
+            "description": "TOTP not enrolled yet"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/totp/confirm": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Activate the pending TOTP secret with a valid code. Issues the recovery",
+        "description": "codes (returned once) and rotates the session to an MFA-verified one.",
+        "operationId": "totp_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "TOTP active; rotated session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCodes"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Wrong code or no session"
+          },
+          "409": {
+            "description": "No pending enrolment"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/totp/enroll": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Start TOTP enrolment on the current local session: a fresh secret is",
+        "description": "stored (sealed) as pending and its `otpauth://` URI returned. Calling it\nagain before confirming replaces the pending secret.",
+        "operationId": "totp_enroll",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TotpEnrollResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No session"
+          },
+          "409": {
+            "description": "TOTP already enrolled"
+          }
+        }
+      }
+    },
     "/auth/logout": {
       "post": {
         "tags": [
@@ -2889,6 +3111,27 @@
         "responses": {
           "204": {
             "description": "Session revoked and cookie cleared (idempotent)"
+          }
+        }
+      }
+    },
+    "/auth/logout-all": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Revoke every session of the signed-in user, this one included, and clear",
+        "description": "the cookie.",
+        "operationId": "logout_all",
+        "responses": {
+          "204": {
+            "description": "All sessions revoked; cookie cleared"
+          },
+          "401": {
+            "description": "No session"
+          },
+          "403": {
+            "description": "Cross-origin request"
           }
         }
       }
@@ -4206,6 +4449,18 @@
           }
         }
       },
+      "CodeBody": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "A 6-digit TOTP code, or a recovery code."
+          }
+        }
+      },
       "ConnectionEntry": {
         "type": "object",
         "required": [
@@ -4801,6 +5056,21 @@
           }
         }
       },
+      "EnrollBody": {
+        "type": "object",
+        "required": [
+          "token",
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        }
+      },
       "ExpirySweepResult": {
         "type": "object",
         "required": [
@@ -5048,6 +5318,44 @@
           }
         }
       },
+      "InvitePreview": {
+        "type": "object",
+        "required": [
+          "valid",
+          "portfolios",
+          "methods"
+        ],
+        "properties": {
+          "email_hint": {
+            "type": "string",
+            "nullable": true
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "portfolios": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "role": {
+            "type": "string",
+            "nullable": true
+          },
+          "valid": {
+            "type": "boolean"
+          }
+        }
+      },
       "JobDetail": {
         "type": "object",
         "required": [
@@ -5174,6 +5482,21 @@
           "interrupted"
         ]
       },
+      "LoginBody": {
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
       "MeResponse": {
         "type": "object",
         "description": "The signed-in principal plus its granted portfolios — the shape a\nfront end needs to render itself without a second round trip.",
@@ -5201,6 +5524,17 @@
           }
         }
       },
+      "MfaVerified": {
+        "type": "object",
+        "required": [
+          "mfa_verified"
+        ],
+        "properties": {
+          "mfa_verified": {
+            "type": "boolean"
+          }
+        }
+      },
       "NewPassword": {
         "type": "object",
         "required": [
@@ -5210,6 +5544,18 @@
           "password": {
             "type": "string",
             "description": "Shown once; only its hash is stored."
+          }
+        }
+      },
+      "NextStep": {
+        "type": "object",
+        "required": [
+          "next"
+        ],
+        "properties": {
+          "next": {
+            "type": "string",
+            "description": "`totp` or `totp_enroll`."
           }
         }
       },
@@ -5545,6 +5891,21 @@
           "command_id": {
             "type": "string",
             "description": "The command the runtime acknowledges: RECEIVED, then CONFIRMED_CLEAR\nonce it has taken the venue's balances as its expected inventory."
+          }
+        }
+      },
+      "RecoveryCodes": {
+        "type": "object",
+        "required": [
+          "recovery_codes"
+        ],
+        "properties": {
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Shown exactly once; only hashes are stored."
           }
         }
       },
@@ -6275,6 +6636,17 @@
           "ioc",
           "fok"
         ]
+      },
+      "TotpEnrollResponse": {
+        "type": "object",
+        "required": [
+          "otpauth_uri"
+        ],
+        "properties": {
+          "otpauth_uri": {
+            "type": "string"
+          }
+        }
       },
       "TradeableInstrument": {
         "type": "object",

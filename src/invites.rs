@@ -447,7 +447,7 @@ async fn insert_invite(
     Ok(NewInvite { invite_id, principal_id, token, expires_at })
 }
 
-async fn audit(
+pub(crate) async fn audit(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     action: &str,

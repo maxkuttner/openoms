@@ -16,8 +16,8 @@ mod symbology_resolver;
 mod setup;
 mod sessions;
 mod oidc;
-#[allow(dead_code)] // wired into routes by the local-login task
 mod local_auth;
+mod local_auth_api;
 mod auth_api;
 mod invites;
 mod users_api;
@@ -185,6 +185,13 @@ mod authz_route_tests;
         auth_api::callback,
         auth_api::logout,
         auth_api::me,
+        local_auth_api::preview,
+        local_auth_api::enroll,
+        local_auth_api::login,
+        local_auth_api::totp,
+        local_auth_api::totp_enroll,
+        local_auth_api::totp_confirm,
+        local_auth_api::logout_all,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -214,6 +221,14 @@ mod authz_route_tests;
         users_api::SetupStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         auth_api::MeResponse,
+        local_auth_api::InvitePreview,
+        local_auth_api::EnrollBody,
+        local_auth_api::NextStep,
+        local_auth_api::LoginBody,
+        local_auth_api::CodeBody,
+        local_auth_api::MfaVerified,
+        local_auth_api::TotpEnrollResponse,
+        local_auth_api::RecoveryCodes,
         strategies::admin::StrategyRow, strategies::admin::Responsible, strategies::admin::Handover, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
         strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted, strategies::admin::RebaselineIssued,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
@@ -1031,7 +1046,7 @@ fn build_app(
     // through to `handler_404` below exactly as it does with no OIDC config
     // at all: the off-by-default behaviour holds whether the block is
     // absent or merely not yet working.
-    if let Some(auth_state) = auth_api_state {
+    if let Some(auth_state) = auth_api_state.clone() {
         let auth_router = Router::new()
             .route("/auth/oidc/login", get(auth_api::login))
             .route("/auth/invite/:token", get(auth_api::invite))
@@ -1053,7 +1068,14 @@ fn build_app(
     //
     // `/auth/me` requires authentication, so it carries `auth_middleware`;
     // `/auth/logout` reads the session cookie itself and is idempotent.
+    let oidc_discovered = auth_api_state.is_some();
     if local_enabled || oidc_configured {
+        let local_auth = local_auth_api::LocalAuth::new(
+            admin::resolve_master_key().ok().flatten(),
+            local_enabled,
+            oidc_discovered,
+        );
+        app = app.merge(local_auth_api::routes(local_auth));
         let me_router = Router::new()
             .route("/auth/me", get(auth_api::me))
             .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
@@ -1682,7 +1704,8 @@ async fn serve() {
     }
     info!("Scalar UI: {}/scalar", host_url);
     info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);
-    axum::serve(listener, app).await.unwrap();
+    // Peer address for the login rate limiter (never X-Forwarded-For).
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }
 
 #[cfg(test)]

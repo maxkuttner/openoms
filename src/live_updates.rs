@@ -500,6 +500,8 @@ mod tests {
             principal_code: "trader".into(),
             last_seen_at: now - chrono::Duration::minutes(last_seen_mins_ago),
             absolute_expires_at: now + chrono::Duration::minutes(expires_in_mins),
+            auth_method: crate::sessions::AuthMethod::Oidc,
+            mfa_verified_at: None,
         }
     }
 

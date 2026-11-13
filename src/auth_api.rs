@@ -416,7 +416,7 @@ pub async fn callback(
     };
 
     let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-    let token = sessions::create_session(state.pool(), principal_id, &state.session_config.ttl, user_agent)
+    let token = sessions::create_session(state.pool(), principal_id, sessions::AuthMethod::Oidc, false, &state.session_config.ttl, user_agent)
         .await
         .map_err(|err| db_error("create_session", err))?;
 
