@@ -216,8 +216,12 @@ pub async fn invite(
     Extension(auth_state): Extension<AuthApiState>,
     Path(token): Path<String>,
 ) -> Response {
-    start_flow(&state, &auth_state, sanitize_return_to(None), Some(token))
+    start_flow(&state, &auth_state, INVITE_LANDING.to_string(), Some(token))
 }
+
+/// Where an accepted invite lands: the trader app, never the admin console at
+/// `/`. Invitees are traders, PMs and viewers; the cockpit is admin-only.
+const INVITE_LANDING: &str = "/trade/";
 
 fn start_flow(
     state: &AppState,
@@ -580,6 +584,13 @@ fn percent_encode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_invite_lands_in_the_trader_app() {
+        assert_eq!(super::INVITE_LANDING, "/trade/");
+        assert_eq!(super::sanitize_return_to(Some(super::INVITE_LANDING)), "/trade/");
+    }
+
     use super::*;
 
     #[test]
