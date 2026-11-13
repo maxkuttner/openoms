@@ -156,7 +156,7 @@ mod authz_route_tests;
         admin::resolve_symbology,
         admin::backfill_symbology,
         admin::expiry_sweep,
-        admin::setup_status,
+        users_api::setup_status,
         strategies::admin::list_strategies,
         strategies::admin::create_strategy,
         strategies::admin::update_strategy,
@@ -209,7 +209,7 @@ mod authz_route_tests;
         instruments_api::ChainLeg, instruments_api::ChainRow,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
         admin::ExpirySweepResult,
-        admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
+        users_api::SetupStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         auth_api::MeResponse,
         strategies::admin::StrategyRow, strategies::admin::Responsible, strategies::admin::Handover, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
@@ -828,6 +828,244 @@ async fn main() {
     }
 }
 
+/// Assembles the full application router exactly as `serve` mounts it.
+/// Extracted so a test can build it: axum panics at build time on an
+/// overlapping (method, path) registration, which only boots would catch.
+fn build_app(state: AppState, auth_api_state: Option<auth_api::AuthApiState>, oidc_configured: bool) -> Router {
+    // Register routes
+
+    // 1) Register order routes
+    let orders_router = Router::new()
+        .route("/orders/submit", post(handlers::orders_submit))
+        .route("/orders/cancel", post(handlers::orders_cancel))
+        .route("/orders/:id", get(handlers::get_order))
+        .route("/orders/:id/events", get(order_events::get_order_events))
+        .route("/orders", get(handlers::list_orders))
+        .route("/strategies/securities", get(strategies::admin::strategy_securities))
+        .route("/strategies", get(strategies::trader_api::list).post(strategies::trader_api::create))
+        .route("/strategies/:code/handover", post(strategies::trader_api::handover))
+        .route("/portfolios", get(handlers::list_portfolios))
+        .route(
+            "/watchlist",
+            get(handlers::list_watchlist).post(handlers::add_watchlist_item),
+        )
+        .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
+        .route("/marks", get(handlers::get_marks))
+        .route("/updates", get(live_updates::ws_updates))
+        .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
+        .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
+        .route("/portfolios/:id/limits", get(limits_api::list_limits))
+        .route(
+            "/portfolios/:id/limits/:instrument_id",
+            axum::routing::put(limits_api::put_limit),
+        )
+        .route(
+            "/orders/:id/allocations",
+            post(handlers::create_allocations).get(handlers::list_allocations),
+        )
+        .route("/instruments", get(instruments_api::list_instruments_for_trader))
+        .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
+        .route("/instruments/options/chain", get(instruments_api::get_option_chain))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+    
+    // 2) Register admin routes (protected by static bearer token only)
+    let admin_router = Router::new()
+        .route("/admin/orders", get(handlers::get_orders_blotter))
+        .route(
+            "/admin/orders/:id/events",
+            get(order_events::get_order_events_admin),
+        )
+        .route("/admin/users", get(users_api::list_users).post(users_api::create_key_only_user))
+        .route("/admin/setup-status", get(users_api::setup_status))
+        .route("/admin/auth/status", get(users_api::auth_status))
+        .route("/admin/users/invite", post(users_api::invite_user))
+        .route("/admin/users/invites/:id/revoke", post(users_api::revoke_invite))
+        .route("/admin/users/invites/:id/reissue", post(users_api::reissue_invite))
+        .route("/admin/users/:id/link-invite", post(users_api::link_invite))
+        .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
+        .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
+        .route("/admin/users/:id/disable", post(users_api::disable_user))
+        .route("/admin/users/:id/enable", post(users_api::enable_user))
+        .route("/admin/users/:id/keys", get(users_api::list_keys).post(users_api::create_key))
+        .route("/admin/users/:id/keys/:key_id", axum::routing::delete(users_api::revoke_key))
+        .route(
+            "/admin/trading-tokens",
+            post(admin::create_trading_token).get(admin::list_trading_tokens),
+        )
+        .route(
+            "/admin/trading-tokens/:key_id",
+            axum::routing::delete(admin::revoke_trading_token),
+        )
+        .route(
+            "/admin/portfolios",
+            post(admin::create_portfolio).get(admin::list_portfolios),
+        )
+        .route(
+            "/admin/portfolios/:id",
+            axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
+        )
+        .route(
+            "/admin/accounts",
+            post(admin::create_account).get(admin::list_accounts),
+        )
+        .route(
+            "/admin/accounts/:id",
+            axum::routing::patch(admin::update_account).get(admin::get_account),
+        )
+        .route("/admin/stream-health", get(admin::list_stream_health))
+        .route("/admin/venues", get(admin::list_venues))
+        .route(
+            "/admin/broker-connections",
+            post(admin::create_broker_connection).get(admin::list_broker_connections),
+        )
+        .route(
+            "/admin/broker-connections/:code",
+            axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
+        )
+        .route(
+            "/admin/broker-connections/:code/credentials",
+            get(admin::get_broker_connection_credentials)
+                .put(admin::put_broker_connection_credentials)
+                .delete(admin::delete_broker_connection_credentials),
+        )
+        .route(
+            "/admin/broker-connections/:code/credentials/test",
+            post(admin::test_broker_connection_credentials),
+        )
+        .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
+        .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
+        .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
+        .route("/admin/jobs", get(jobs::api::list_jobs))
+        .route("/admin/jobs/:id", get(jobs::api::get_job))
+        .route("/admin/feed-connections", get(admin::list_feed_connections))
+        .route(
+            "/admin/feed-connections/:code/credentials",
+            get(admin::get_feed_connection_credentials)
+                .put(admin::put_feed_connection_credentials)
+                .delete(admin::delete_feed_connection_credentials),
+        )
+        .route(
+            "/admin/feed-connections/:code/credentials/test",
+            post(admin::test_feed_connection_credentials),
+        )
+        .route("/admin/connections/reload", post(admin::reload_connections))
+        .route(
+            "/admin/risk-limits",
+            post(admin::create_risk_limit).get(admin::list_risk_limits),
+        )
+        .route(
+            "/admin/risk-limits/:id",
+            get(admin::get_risk_limit)
+                .patch(admin::update_risk_limit)
+                .delete(admin::delete_risk_limit),
+        )
+        .route(
+            "/admin/strategies",
+            post(strategies::admin::create_strategy).get(strategies::admin::list_strategies),
+        )
+        .route(
+            "/admin/strategies/:code",
+            axum::routing::patch(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
+        )
+        .route(
+            "/admin/strategies/:code/connections",
+            axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
+        )
+        .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
+        .route("/admin/strategies/:code/follow-credentials", axum::routing::put(strategies::admin::put_follow_credentials))
+        .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
+        .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
+        .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
+        .route("/admin/strategies/:code/handover", post(strategies::admin::handover))
+        .route("/admin/strategies/:code/rebaseline", post(strategies::admin::rebaseline_strategy))
+        .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
+        .route(
+            "/admin/strategies/:code/deployments",
+            post(colo::deployment::register).get(colo::deployment::list),
+        )
+        .route("/admin/strategies/:code/deployments/:id", get(colo::deployment::get))
+        .route(
+            "/admin/strategies/:code/deployments/:id/retire",
+            post(colo::deployment::retire),
+        )
+        .route(
+            "/admin/strategies/:code/deployments/:id/verified-stop",
+            post(colo::deployment::verified_stop),
+        )
+        .route(
+            "/admin/strategies/:code/deployments/:id/adjustments",
+            post(colo::ingest::adjustment),
+        )
+        .route("/admin/instruments", get(admin::list_instruments))
+        .merge(instruments_import::routes())
+        .route("/admin/feeds", get(admin::list_feeds))
+        .route("/admin/symbology/resolve", post(admin::resolve_symbology))
+        .route("/admin/symbology/backfill", post(admin::backfill_symbology))
+        .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
+
+    let scalar_html = {
+        let config = json!({ "url": "/api-docs/openapi.json" });
+        scalar_api_reference::scalar_html_default(&config)
+    };
+
+    let mut app = Router::new()
+        .route("/scalar", get(move || async move { Html(scalar_html) }))
+        .route("/api-docs/openapi.json", get(|| async { axum::Json(ApiDoc::openapi()) }))
+        // add health check route
+        .route("/health", get(handlers::health))
+        .merge(orders_router)
+        .merge(admin_router)
+        .merge(cockpit::router());
+
+    // 3) Register the unauthenticated OIDC routes — merged only when
+    // `auth_api_state` resolved above, i.e. only when `[auth.oidc]` is
+    // configured and discovery succeeded. Left unmerged, `/auth/*` falls
+    // through to `handler_404` below exactly as it does with no OIDC config
+    // at all: the off-by-default behaviour holds whether the block is
+    // absent or merely not yet working.
+    if let Some(auth_state) = auth_api_state {
+        let auth_router = Router::new()
+            .route("/auth/login", get(auth_api::login))
+            .route("/auth/invite/:token", get(auth_api::invite))
+            .route("/auth/callback", get(auth_api::callback))
+            .route("/auth/logout", post(auth_api::logout))
+            .layer(Extension(auth_state));
+        app = app.merge(auth_router);
+    }
+
+    // `/auth/me` is the one `/auth/*` route that requires authentication, so
+    // it carries `auth_middleware` rather than riding on the unauthenticated
+    // router above — but it is still an `/auth/*` route, and the spec's
+    // off-by-default promise is that with no `[auth.oidc]` block the whole
+    // prefix 404s and nothing else changes. Mounted unconditionally it broke
+    // that promise for every install that never enabled login.
+    //
+    // Gated on the config block, not on `auth_api_state`: discovery failing
+    // (IdP down, secret unset) must not take `/auth/me` away from sessions
+    // that already exist. The IdP is a dependency of login, not of every
+    // request — see the spec's "Token handling".
+    //
+    // `/trade/*` rides the same gate, for the same reason: the trade app
+    // authenticates by session cookie and nothing else, and a session can
+    // only ever be minted by the OIDC callback. With no `[auth.oidc]` block
+    // configured, `/trade/` would be a screen nobody could ever log into, so
+    // it stays off unless OIDC is at least configured — and, like `/auth/me`,
+    // it must not disappear out from under an already-signed-in trader just
+    // because discovery is transiently failing on this restart.
+    if oidc_configured {
+        let me_router = Router::new()
+            .route("/auth/me", get(auth_api::me))
+            .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+        app = app.merge(me_router).merge(cockpit::trade_router());
+    }
+
+    app
+        // add 404 route as fallback
+        .fallback(handlers::handler_404)
+        .with_state(state)
+}
+
 // Server entry point (default when no subcommand is given).
 async fn serve() {
 
@@ -1406,239 +1644,7 @@ async fn serve() {
         };
     state.set_oidc_status(oidc_status);
 
-    // Register routes
-
-    // 1) Register order routes
-    let orders_router = Router::new()
-        .route("/orders/submit", post(handlers::orders_submit))
-        .route("/orders/cancel", post(handlers::orders_cancel))
-        .route("/orders/:id", get(handlers::get_order))
-        .route("/orders/:id/events", get(order_events::get_order_events))
-        .route("/orders", get(handlers::list_orders))
-        .route("/strategies/securities", get(strategies::admin::strategy_securities))
-        .route("/strategies", get(strategies::trader_api::list).post(strategies::trader_api::create))
-        .route("/strategies/:code/handover", post(strategies::trader_api::handover))
-        .route("/portfolios", get(handlers::list_portfolios))
-        .route(
-            "/watchlist",
-            get(handlers::list_watchlist).post(handlers::add_watchlist_item),
-        )
-        .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
-        .route("/marks", get(handlers::get_marks))
-        .route("/updates", get(live_updates::ws_updates))
-        .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
-        .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
-        .route("/portfolios/:id/limits", get(limits_api::list_limits))
-        .route(
-            "/portfolios/:id/limits/:instrument_id",
-            axum::routing::put(limits_api::put_limit),
-        )
-        .route(
-            "/orders/:id/allocations",
-            post(handlers::create_allocations).get(handlers::list_allocations),
-        )
-        .route("/instruments", get(instruments_api::list_instruments_for_trader))
-        .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
-        .route("/instruments/options/chain", get(instruments_api::get_option_chain))
-        .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
-    
-    // 2) Register admin routes (protected by static bearer token only)
-    let admin_router = Router::new()
-        .route("/admin/orders", get(handlers::get_orders_blotter))
-        .route(
-            "/admin/orders/:id/events",
-            get(order_events::get_order_events_admin),
-        )
-        .route("/admin/users", get(users_api::list_users).post(users_api::create_key_only_user))
-        .route("/admin/setup-status", get(users_api::setup_status))
-        .route("/admin/auth/status", get(users_api::auth_status))
-        .route("/admin/users/invite", post(users_api::invite_user))
-        .route("/admin/users/invites/:id/revoke", post(users_api::revoke_invite))
-        .route("/admin/users/invites/:id/reissue", post(users_api::reissue_invite))
-        .route("/admin/users/:id/link-invite", post(users_api::link_invite))
-        .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
-        .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
-        .route("/admin/users/:id/disable", post(users_api::disable_user))
-        .route("/admin/users/:id/enable", post(users_api::enable_user))
-        .route("/admin/users/:id/keys", get(users_api::list_keys).post(users_api::create_key))
-        .route("/admin/users/:id/keys/:key_id", axum::routing::delete(users_api::revoke_key))
-        .route(
-            "/admin/trading-tokens",
-            post(admin::create_trading_token).get(admin::list_trading_tokens),
-        )
-        .route(
-            "/admin/trading-tokens/:key_id",
-            axum::routing::delete(admin::revoke_trading_token),
-        )
-        .route(
-            "/admin/portfolios",
-            post(admin::create_portfolio).get(admin::list_portfolios),
-        )
-        .route(
-            "/admin/portfolios/:id",
-            axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
-        )
-        .route(
-            "/admin/accounts",
-            post(admin::create_account).get(admin::list_accounts),
-        )
-        .route(
-            "/admin/accounts/:id",
-            axum::routing::patch(admin::update_account).get(admin::get_account),
-        )
-        .route("/admin/stream-health", get(admin::list_stream_health))
-        .route("/admin/venues", get(admin::list_venues))
-        .route(
-            "/admin/broker-connections",
-            post(admin::create_broker_connection).get(admin::list_broker_connections),
-        )
-        .route(
-            "/admin/broker-connections/:code",
-            axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
-        )
-        .route(
-            "/admin/broker-connections/:code/credentials",
-            get(admin::get_broker_connection_credentials)
-                .put(admin::put_broker_connection_credentials)
-                .delete(admin::delete_broker_connection_credentials),
-        )
-        .route(
-            "/admin/broker-connections/:code/credentials/test",
-            post(admin::test_broker_connection_credentials),
-        )
-        .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
-        .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
-        .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
-        .route("/admin/jobs", get(jobs::api::list_jobs))
-        .route("/admin/jobs/:id", get(jobs::api::get_job))
-        .route("/admin/feed-connections", get(admin::list_feed_connections))
-        .route(
-            "/admin/feed-connections/:code/credentials",
-            get(admin::get_feed_connection_credentials)
-                .put(admin::put_feed_connection_credentials)
-                .delete(admin::delete_feed_connection_credentials),
-        )
-        .route(
-            "/admin/feed-connections/:code/credentials/test",
-            post(admin::test_feed_connection_credentials),
-        )
-        .route("/admin/connections/reload", post(admin::reload_connections))
-        .route(
-            "/admin/risk-limits",
-            post(admin::create_risk_limit).get(admin::list_risk_limits),
-        )
-        .route(
-            "/admin/risk-limits/:id",
-            get(admin::get_risk_limit)
-                .patch(admin::update_risk_limit)
-                .delete(admin::delete_risk_limit),
-        )
-        .route(
-            "/admin/strategies",
-            post(strategies::admin::create_strategy).get(strategies::admin::list_strategies),
-        )
-        .route(
-            "/admin/strategies/:code",
-            axum::routing::patch(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
-        )
-        .route(
-            "/admin/strategies/:code/connections",
-            axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
-        )
-        .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
-        .route("/admin/strategies/:code/follow-credentials", axum::routing::put(strategies::admin::put_follow_credentials))
-        .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
-        .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
-        .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
-        .route("/admin/strategies/:code/handover", post(strategies::admin::handover))
-        .route("/admin/strategies/:code/rebaseline", post(strategies::admin::rebaseline_strategy))
-        .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
-        .route(
-            "/admin/strategies/:code/deployments",
-            post(colo::deployment::register).get(colo::deployment::list),
-        )
-        .route("/admin/strategies/:code/deployments/:id", get(colo::deployment::get))
-        .route(
-            "/admin/strategies/:code/deployments/:id/retire",
-            post(colo::deployment::retire),
-        )
-        .route(
-            "/admin/strategies/:code/deployments/:id/verified-stop",
-            post(colo::deployment::verified_stop),
-        )
-        .route(
-            "/admin/strategies/:code/deployments/:id/adjustments",
-            post(colo::ingest::adjustment),
-        )
-        .route("/admin/instruments", get(admin::list_instruments))
-        .merge(instruments_import::routes())
-        .route("/admin/feeds", get(admin::list_feeds))
-        .route("/admin/symbology/resolve", post(admin::resolve_symbology))
-        .route("/admin/symbology/backfill", post(admin::backfill_symbology))
-        .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
-        .route("/admin/setup-status", get(admin::setup_status))
-        .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
-
-    let scalar_html = {
-        let config = json!({ "url": "/api-docs/openapi.json" });
-        scalar_api_reference::scalar_html_default(&config)
-    };
-
-    let mut app = Router::new()
-        .route("/scalar", get(move || async move { Html(scalar_html) }))
-        .route("/api-docs/openapi.json", get(|| async { axum::Json(ApiDoc::openapi()) }))
-        // add health check route
-        .route("/health", get(handlers::health))
-        .merge(orders_router)
-        .merge(admin_router)
-        .merge(cockpit::router());
-
-    // 3) Register the unauthenticated OIDC routes — merged only when
-    // `auth_api_state` resolved above, i.e. only when `[auth.oidc]` is
-    // configured and discovery succeeded. Left unmerged, `/auth/*` falls
-    // through to `handler_404` below exactly as it does with no OIDC config
-    // at all: the off-by-default behaviour holds whether the block is
-    // absent or merely not yet working.
-    if let Some(auth_state) = auth_api_state {
-        let auth_router = Router::new()
-            .route("/auth/login", get(auth_api::login))
-            .route("/auth/invite/:token", get(auth_api::invite))
-            .route("/auth/callback", get(auth_api::callback))
-            .route("/auth/logout", post(auth_api::logout))
-            .layer(Extension(auth_state));
-        app = app.merge(auth_router);
-    }
-
-    // `/auth/me` is the one `/auth/*` route that requires authentication, so
-    // it carries `auth_middleware` rather than riding on the unauthenticated
-    // router above — but it is still an `/auth/*` route, and the spec's
-    // off-by-default promise is that with no `[auth.oidc]` block the whole
-    // prefix 404s and nothing else changes. Mounted unconditionally it broke
-    // that promise for every install that never enabled login.
-    //
-    // Gated on the config block, not on `auth_api_state`: discovery failing
-    // (IdP down, secret unset) must not take `/auth/me` away from sessions
-    // that already exist. The IdP is a dependency of login, not of every
-    // request — see the spec's "Token handling".
-    //
-    // `/trade/*` rides the same gate, for the same reason: the trade app
-    // authenticates by session cookie and nothing else, and a session can
-    // only ever be minted by the OIDC callback. With no `[auth.oidc]` block
-    // configured, `/trade/` would be a screen nobody could ever log into, so
-    // it stays off unless OIDC is at least configured — and, like `/auth/me`,
-    // it must not disappear out from under an already-signed-in trader just
-    // because discovery is transiently failing on this restart.
-    if oidc_settings.is_some() {
-        let me_router = Router::new()
-            .route("/auth/me", get(auth_api::me))
-            .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
-        app = app.merge(me_router).merge(cockpit::trade_router());
-    }
-
-    let app = app
-        // add 404 route as fallback
-        .fallback(handlers::handler_404)
-        .with_state(state);
+    let app = build_app(state, auth_api_state, oidc_settings.is_some());
 
     // Start TCP listener
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
@@ -1654,6 +1660,17 @@ async fn serve() {
 
 #[cfg(test)]
 mod tests {
+    /// axum panics while *building* a router that registers one (method, path)
+    /// twice, so this fails at startup in production and here alike. Both OIDC
+    /// branches are built so the conditionally-merged routers are covered too.
+    #[tokio::test]
+    async fn the_full_router_builds() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let state = crate::handlers::tests::test_app_state(pool);
+        let _ = crate::build_app(state.clone(), None, false);
+        let _ = crate::build_app(state, None, true);
+    }
+
 
     #[test]
     fn init_takes_the_guided_setup_flags() {

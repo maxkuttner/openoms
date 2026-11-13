@@ -1806,8 +1806,7 @@
         "tags": [
           "admin"
         ],
-        "summary": "What is left to configure. Reuses `credentials::load_brokers`/`load_feeds`",
-        "description": "— the exact decode path `reload_connections` uses — so this checklist\ncannot report a connection \"configured\" that the reload path would\nactually refuse to register, or the reverse.",
+        "summary": "`GET /admin/setup-status`: which first-run steps are done.",
         "operationId": "setup_status",
         "responses": {
           "200": {
@@ -5918,80 +5917,30 @@
           }
         }
       },
-      "SetupCatalogStatus": {
-        "type": "object",
-        "required": [
-          "instruments",
-          "state"
-        ],
-        "properties": {
-          "instruments": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "state": {
-            "type": "string"
-          }
-        }
-      },
-      "SetupConnectionStatus": {
-        "type": "object",
-        "description": "One connection's classification, for the checklist below. Deliberately\nthe same three strings `RedactedCredentials` uses\n(`configured`/`unconfigured`/`error`) rather than a boolean — \"stored but\nthe master key can't open it\" is a different operator problem from\n\"never configured\", and collapsing them here would hide exactly the\nmisconfiguration this checklist exists to surface.",
-        "required": [
-          "code",
-          "state"
-        ],
-        "properties": {
-          "code": {
-            "type": "string"
-          },
-          "state": {
-            "type": "string"
-          }
-        }
-      },
       "SetupStatus": {
         "type": "object",
-        "description": "The checklist an operator (or the cockpit's own onboarding banner) reads to\nanswer \"what is left to configure\" — nothing else in this system can\nanswer that question in one call today.",
         "required": [
-          "database",
-          "admin_password",
-          "master_key",
-          "brokers",
-          "feeds",
-          "catalog",
-          "portfolios"
+          "venue_connected",
+          "portfolio_exists",
+          "sign_in_ok",
+          "user_invited",
+          "first_order"
         ],
         "properties": {
-          "admin_password": {
-            "type": "string",
-            "description": "`\"default\"` iff the admin console is still guarded by the built-in\ndev password rather than an operator-chosen one — see\n`admin_password_state`."
+          "first_order": {
+            "type": "boolean"
           },
-          "brokers": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SetupConnectionStatus"
-            }
+          "portfolio_exists": {
+            "type": "boolean"
           },
-          "catalog": {
-            "$ref": "#/components/schemas/SetupCatalogStatus"
+          "sign_in_ok": {
+            "type": "boolean"
           },
-          "database": {
-            "type": "string"
+          "user_invited": {
+            "type": "boolean"
           },
-          "feeds": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SetupConnectionStatus"
-            }
-          },
-          "master_key": {
-            "type": "string",
-            "description": "Whether a master key is configured. Never the key itself, nor even\nwhether it is *valid* — an invalid key surfaces the same way every\nother credential-reading endpoint surfaces it, as a 500 from\n`resolve_master_key`, not folded into this field."
-          },
-          "portfolios": {
-            "type": "integer",
-            "format": "int64"
+          "venue_connected": {
+            "type": "boolean"
           }
         }
       },

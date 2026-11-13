@@ -527,7 +527,7 @@ pub async fn revoke_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct SetupStatus {
     pub venue_connected: bool,
     pub portfolio_exists: bool,
@@ -537,6 +537,11 @@ pub struct SetupStatus {
 }
 
 /// `GET /admin/setup-status`: which first-run steps are done.
+#[utoipa::path(
+    get, path = "/admin/setup-status", tag = "admin",
+    responses((status = 200, description = "OK", body = SetupStatus)),
+    security(("bearer_token" = []))
+)]
 pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
     let (venue_connected, portfolio_exists, user_invited, first_order): (bool, bool, bool, bool) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM broker_connection WHERE status = 'ACTIVE'), \
