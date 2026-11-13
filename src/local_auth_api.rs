@@ -62,39 +62,56 @@ impl LoginLimiter {
         Self { account_limit, ip_limit, window, buckets: Mutex::new(HashMap::new()) }
     }
 
-    fn count(&self, map: &HashMap<String, (Instant, u32)>, key: &str, now: Instant) -> u32 {
-        match map.get(key) {
+    fn live(&self, entry: Option<&(Instant, u32)>, now: Instant) -> u32 {
+        match entry {
             Some((start, n)) if now.duration_since(*start) < self.window => *n,
             _ => 0,
         }
     }
 
-    /// Whether either key has reached its limit in the current window.
-    pub fn blocked(&self, account: &str, ip: &str) -> bool {
+    /// Check and charge one attempt against both keys under a single lock,
+    /// so concurrent attempts cannot all slip past the check before any of
+    /// them is counted. `false` means over the limit (nothing is charged).
+    /// The caller refunds the charge on success (`refund`) and keeps it on
+    /// failure.
+    pub fn try_acquire(&self, account: &str, ip: &str) -> bool {
         let now = Instant::now();
-        let map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        self.count(&map, &format!("a:{account}"), now) >= self.account_limit
-            || self.count(&map, &format!("i:{ip}"), now) >= self.ip_limit
-            || (map.len() >= LIMITER_MAX_KEYS && !map.contains_key(&format!("a:{account}")))
-    }
-
-    pub fn record_failure(&self, account: &str, ip: &str) {
-        let now = Instant::now();
+        let keys = [format!("a:{account}"), format!("i:{ip}")];
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        for key in [format!("a:{account}"), format!("i:{ip}")] {
-            if !map.contains_key(&key) && map.len() >= LIMITER_MAX_KEYS {
-                let window = self.window;
-                map.retain(|_, (start, _)| now.duration_since(*start) < window);
-                if map.len() >= LIMITER_MAX_KEYS {
-                    continue;
-                }
+        if self.live(map.get(&keys[0]), now) >= self.account_limit || self.live(map.get(&keys[1]), now) >= self.ip_limit {
+            return false;
+        }
+        let new_keys = keys.iter().filter(|k| !map.contains_key(*k)).count();
+        if map.len() + new_keys > LIMITER_MAX_KEYS {
+            let window = self.window;
+            map.retain(|_, (start, _)| now.duration_since(*start) < window);
+            if map.len() + new_keys > LIMITER_MAX_KEYS {
+                return false; // fail closed rather than grow without bound
             }
+        }
+        for key in keys {
             let entry = map.entry(key).or_insert((now, 0));
             if now.duration_since(entry.0) >= self.window {
                 *entry = (now, 0);
             }
             entry.1 += 1;
         }
+        true
+    }
+
+    /// Return the charge of an attempt that succeeded.
+    pub fn refund(&self, account: &str, ip: &str) {
+        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        for key in [format!("a:{account}"), format!("i:{ip}")] {
+            if let Some(entry) = map.get_mut(&key) {
+                entry.1 = entry.1.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Forget an account's failures (a successful login).
+    pub fn clear_account(&self, account: &str) {
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner()).remove(&format!("a:{account}"));
     }
 }
 
@@ -214,6 +231,24 @@ async fn drop_prior_session(state: &AppState, headers: &HeaderMap) {
     if let Ok(prior) = current_session(state, headers).await {
         let _ = sessions::revoke_session(state.pool(), prior.id).await;
     }
+}
+
+/// Count one failed password or TOTP attempt in the database; the 10th
+/// consecutive one locks the credential for 15 minutes. One atomic UPDATE,
+/// so the lockout holds across processes and concurrent requests.
+async fn record_db_failure(pool: &PgPool, principal_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "UPDATE local_credential SET \
+            failed_attempts = CASE WHEN failed_attempts + 1 >= $2 THEN 0 ELSE failed_attempts + 1 END, \
+            locked_until = CASE WHEN failed_attempts + 1 >= $2 THEN now() + interval '15 minutes' \
+                                ELSE locked_until END \
+          WHERE principal_id = $1 \
+         RETURNING COALESCE(locked_until > now(), false)",
+    )
+    .bind(principal_id)
+    .bind(LOCKOUT_AFTER)
+    .fetch_one(pool)
+    .await
 }
 
 // ── invite preview ─────────────────────────────────────────────────────────
@@ -432,9 +467,14 @@ pub async fn login(
     }
     let account = body.email.trim().to_lowercase();
     let ip = client_ip(&conn);
-    if la.limiter.blocked(&account, &ip) {
-        burn_verify(&body.password).await;
+    if !la.limiter.try_acquire(&account, &ip) {
+        burn_verify("x").await;
         return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
+    }
+    // Over-long input never reaches a real hash; the charge is kept.
+    if body.password.chars().count() > local_auth::MAX_PASSWORD_CHARS {
+        burn_verify("x").await;
+        return invalid_credentials();
     }
 
     let row = sqlx::query(
@@ -453,34 +493,22 @@ pub async fn login(
     };
     let Some(row) = row else {
         burn_verify(&body.password).await;
-        la.limiter.record_failure(&account, &ip);
         return invalid_credentials();
     };
     let principal_id: Uuid = row.get("id");
     let hash: String = row.get("password_hash");
     let ok = local_auth::verify_password(&hash, &body.password).await;
     if row.get::<bool, _>("locked") {
-        la.limiter.record_failure(&account, &ip);
         return invalid_credentials();
     }
     if !ok {
-        la.limiter.record_failure(&account, &ip);
-        let counted = sqlx::query(
-            "UPDATE local_credential SET \
-                failed_attempts = CASE WHEN failed_attempts + 1 >= $2 THEN 0 ELSE failed_attempts + 1 END, \
-                locked_until = CASE WHEN failed_attempts + 1 >= $2 THEN now() + interval '15 minutes' \
-                                    ELSE locked_until END \
-              WHERE principal_id = $1",
-        )
-        .bind(principal_id)
-        .bind(LOCKOUT_AFTER)
-        .execute(state.pool())
-        .await;
-        if let Err(e) = counted {
+        if let Err(e) = record_db_failure(state.pool(), principal_id).await {
             return internal("record failed login", e);
         }
         return invalid_credentials();
     }
+    la.limiter.refund(&account, &ip);
+    la.limiter.clear_account(&account);
 
     if let Err(e) = sqlx::query("UPDATE local_credential SET failed_attempts = 0, locked_until = NULL WHERE principal_id = $1")
         .bind(principal_id)
@@ -566,18 +594,22 @@ pub async fn totp(
         Ok(s) => s,
         Err(r) => return r,
     };
+    if session.mfa_verified_at.is_some() {
+        // Already verified: nothing to earn, and no needless rotation.
+        return Json(MfaVerified { mfa_verified: true }).into_response();
+    }
     let account = format!("p:{}", session.principal_id);
     let ip = client_ip(&conn);
-    if la.limiter.blocked(&account, &ip) {
-        return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
-    }
     let master = match master(&la) {
         Ok(m) => m,
         Err(r) => return r,
     };
+    if !la.limiter.try_acquire(&account, &ip) {
+        return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
+    }
     let row = sqlx::query(
-        "SELECT totp_secret_enc, totp_last_step FROM local_credential \
-          WHERE principal_id = $1 AND totp_enrolled_at IS NOT NULL",
+        "SELECT totp_secret_enc, totp_last_step, COALESCE(locked_until > now(), false) AS locked \
+           FROM local_credential WHERE principal_id = $1 AND totp_enrolled_at IS NOT NULL",
     )
     .bind(session.principal_id)
     .fetch_optional(state.pool())
@@ -588,7 +620,9 @@ pub async fn totp(
         Err(e) => return internal("load credential", e),
     };
 
-    let accepted = if looks_like_totp(&body.code) {
+    let accepted = if row.get::<bool, _>("locked") {
+        Ok(false)
+    } else if looks_like_totp(&body.code) {
         let secret: Vec<u8> = row.get("totp_secret_enc");
         match local_auth::verify_totp(&secret, master, &body.code, row.get("totp_last_step"), Utc::now().timestamp()) {
             // Conditional on the stored step, so two concurrent requests with
@@ -608,11 +642,14 @@ pub async fn totp(
         use_recovery_code(state.pool(), session.principal_id, &body.code).await
     };
     match accepted {
-        Ok(true) => rotate_verified(&state, &session, &headers, Json(MfaVerified { mfa_verified: true }).into_response()).await,
-        Ok(false) => {
-            la.limiter.record_failure(&account, &ip);
-            fail(StatusCode::UNAUTHORIZED, "invalid_code")
+        Ok(true) => {
+            la.limiter.refund(&account, &ip);
+            rotate_verified(&state, &session, &headers, Json(MfaVerified { mfa_verified: true }).into_response()).await
         }
+        Ok(false) => match record_db_failure(state.pool(), session.principal_id).await {
+            Ok(_) => fail(StatusCode::UNAUTHORIZED, "invalid_code"),
+            Err(e) => internal("record failed totp", e),
+        },
         Err(e) => internal("verify second factor", e),
     }
 }
@@ -731,13 +768,13 @@ pub async fn totp_confirm(
     };
     let account = format!("p:{}", session.principal_id);
     let ip = client_ip(&conn);
-    if la.limiter.blocked(&account, &ip) {
-        return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
-    }
     let master = match master(&la) {
         Ok(m) => m,
         Err(r) => return r,
     };
+    if !la.limiter.try_acquire(&account, &ip) {
+        return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
+    }
     let secret: Option<Vec<u8>> = match sqlx::query_scalar(
         "SELECT totp_secret_enc FROM local_credential \
           WHERE principal_id = $1 AND totp_enrolled_at IS NULL AND totp_secret_enc IS NOT NULL",
@@ -753,11 +790,14 @@ pub async fn totp_confirm(
         return fail(StatusCode::CONFLICT, "no_pending_totp");
     };
     let Ok(step) = local_auth::verify_totp(&secret, master, &body.code, None, Utc::now().timestamp()) else {
-        la.limiter.record_failure(&account, &ip);
+        if let Err(e) = record_db_failure(state.pool(), session.principal_id).await {
+            return internal("record failed totp", e);
+        }
         return fail(StatusCode::UNAUTHORIZED, "invalid_code");
     };
+    la.limiter.refund(&account, &ip);
     let (shown, hashes) = local_auth::new_recovery_codes();
-    match activate_totp(state.pool(), session.principal_id, &session.principal_code, step, &hashes).await {
+    match activate_totp(state.pool(), session.principal_id, &session.principal_code, step, &hashes, &secret).await {
         Ok(true) => {}
         Ok(false) => return fail(StatusCode::CONFLICT, "no_pending_totp"),
         Err(e) => return internal("activate totp", e),
@@ -765,14 +805,25 @@ pub async fn totp_confirm(
     rotate_verified(&state, &session, &headers, Json(RecoveryCodes { recovery_codes: shown }).into_response()).await
 }
 
-async fn activate_totp(pool: &PgPool, principal_id: Uuid, code: &str, step: i64, hashes: &[String]) -> Result<bool, sqlx::Error> {
+/// Activates only `verified_secret` — the secret the code was checked
+/// against — so a concurrent re-enrol that swapped in a new pending secret
+/// cannot get an unproven secret activated.
+async fn activate_totp(
+    pool: &PgPool,
+    principal_id: Uuid,
+    code: &str,
+    step: i64,
+    hashes: &[String],
+    verified_secret: &[u8],
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let activated = sqlx::query(
         "UPDATE local_credential SET totp_enrolled_at = now(), totp_last_step = $2 \
-          WHERE principal_id = $1 AND totp_enrolled_at IS NULL",
+          WHERE principal_id = $1 AND totp_enrolled_at IS NULL AND totp_secret_enc = $3",
     )
     .bind(principal_id)
     .bind(step)
+    .bind(verified_secret)
     .execute(&mut *tx)
     .await?;
     if activated.rows_affected() != 1 {
@@ -995,18 +1046,21 @@ mod tests {
     }
 
     #[test]
-    fn limiter_counts_per_key_and_bounds_its_map() {
+    fn limiter_reserves_atomically_and_refunds() {
         let l = LoginLimiter::new(2, 3, std::time::Duration::from_secs(900));
-        assert!(!l.blocked("a", "1"));
-        l.record_failure("a", "1");
-        l.record_failure("a", "1");
-        assert!(l.blocked("a", "1"), "account limit");
-        assert!(!l.blocked("b", "2"));
-        l.record_failure("c", "1");
-        assert!(l.blocked("d", "1"), "ip limit is shared across accounts");
+        assert!(l.try_acquire("a", "1"));
+        assert!(l.try_acquire("a", "1"));
+        assert!(!l.try_acquire("a", "1"), "account limit");
+        l.refund("a", "1");
+        assert!(l.try_acquire("a", "1"), "a refunded success frees its slot");
+        assert!(l.try_acquire("c", "1"));
+        assert!(!l.try_acquire("d", "1"), "ip limit is shared across accounts");
+        assert!(l.try_acquire("b", "2"));
+        l.clear_account("a");
+        assert!(l.try_acquire("a", "2"), "clearing an account resets its count");
         let short = LoginLimiter::new(1, 1, std::time::Duration::from_millis(0));
-        short.record_failure("a", "1");
-        assert!(!short.blocked("a", "1"), "an expired window no longer counts");
+        assert!(short.try_acquire("a", "1"));
+        assert!(short.try_acquire("a", "1"), "an expired window no longer counts");
     }
 
     #[tokio::test]
@@ -1255,6 +1309,93 @@ mod tests {
 
         let no_origin = logout_all(State(st), HeaderMap::new()).await;
         assert_eq!(no_origin.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn parallel_totp_attempts_cannot_exceed_limit() {
+        use futures_util::future::join_all;
+        let pool = migrated_db().await;
+        let st = app(pool.clone());
+        let l = la();
+        enrolled(&st, &l, "par@fund.test").await;
+        let cookie = cookie_of(&login_req(&st, &l, 1, "par@fund.test", PASSWORD).await).unwrap();
+        let attempts = (0..20).map(|_| totp_req(&st, &l, &cookie, "000000"));
+        let through = join_all(attempts).await.iter().filter(|r| r.status() != StatusCode::TOO_MANY_REQUESTS).count();
+        assert!(through <= 5, "{through} TOTP attempts got past the limiter");
+
+        let logins = (0..20).map(|n| login_req(&st, &l, 50 + n, "par@fund.test", "nope nope nope nope"));
+        let through = join_all(logins).await.iter().filter(|r| r.status() != StatusCode::TOO_MANY_REQUESTS).count();
+        assert!(through <= 5, "{through} logins got past the limiter");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn activation_requires_the_verified_secret() {
+        let pool = migrated_db().await;
+        let st = app(pool.clone());
+        let l = la();
+        let token = invite(&pool, "swap@fund.test", "any").await;
+        let cookie = cookie_of(&enroll_req(&st, &l, &token, PASSWORD).await).unwrap();
+        totp_enroll(State(st.clone()), Extension(l.clone()), hdrs(Some(&cookie))).await;
+        let pid = session_of(&pool, &cookie).await.unwrap().principal_id;
+        // The code was checked against some other secret than the one now pending.
+        let activated = activate_totp(&pool, pid, "swap", 1, &[], b"not-the-stored-secret").await.unwrap();
+        assert!(!activated);
+        let enrolled: bool = sqlx::query_scalar("SELECT totp_enrolled_at IS NOT NULL FROM local_credential WHERE principal_id = $1")
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!enrolled);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn totp_failures_lock_account() {
+        let pool = migrated_db().await;
+        let st = app(pool.clone());
+        let l = la_with(1000, 1000);
+        let (uri, _, _) = enrolled(&st, &l, "tl@fund.test").await;
+        let cookie = cookie_of(&login_req(&st, &l, 1, "tl@fund.test", PASSWORD).await).unwrap();
+        for _ in 0..10 {
+            assert_eq!(totp_req(&st, &l, &cookie, "000000").await.status(), StatusCode::UNAUTHORIZED);
+        }
+        let locked: bool = sqlx::query_scalar(
+            "SELECT locked_until > now() FROM local_credential c JOIN principal p ON p.id = c.principal_id \
+              WHERE p.email = 'tl@fund.test'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(locked);
+        assert_eq!(totp_req(&st, &l, &cookie, &code_at(&uri, 30)).await.status(), StatusCode::UNAUTHORIZED, "locked refuses a right code");
+        assert_eq!(login_req(&st, &l, 1, "tl@fund.test", PASSWORD).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn overlong_password_is_generic_failure() {
+        let pool = migrated_db().await;
+        let st = app(pool.clone());
+        let l = la();
+        enrolled(&st, &l, "long@fund.test").await;
+        let r = login_req(&st, &l, 1, "long@fund.test", &"a".repeat(local_auth::MAX_PASSWORD_CHARS + 1)).await;
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body(r).await, serde_json::json!({ "error": "invalid_credentials" }));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn totp_on_verified_session_does_not_rotate() {
+        let pool = migrated_db().await;
+        let st = app(pool.clone());
+        let l = la();
+        let (_, _, cookie) = enrolled(&st, &l, "vv@fund.test").await;
+        let r = totp_req(&st, &l, &cookie, "000000").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(cookie_of(&r).is_none(), "no new cookie");
+        assert!(session_of(&pool, &cookie).await.is_some(), "the session is untouched");
     }
 
     /// Captures every tracing event emitted on this thread while `f` runs.
