@@ -8,8 +8,8 @@ description: What to back up, why the master key matters, and how to rotate it.
 | What | Why |
 |---|---|
 | `oms.toml` | Holds the **master key**, the `oms` role password and the cockpit password. |
-| The `.env` beside it, if you have one | Secrets that are not in `oms.toml`, such as `OMS_OIDC_CLIENT_SECRET`. |
-| The database | Orders, executions, positions, portfolios, principals, and the encrypted broker and feed credentials. |
+| The `.env` beside it, if you have one | Secrets that are not in `oms.toml`, such as `OMS_OIDC_CLIENT_SECRET`, and on the test server the Authentik values (`OMS_AUTHENTIK_SECRET_KEY`, `OMS_AUTHENTIK_PG_PASSWORD`, `OMS_AUTHENTIK_BOOTSTRAP_PASSWORD`). |
+| The database | Orders, executions, positions, portfolios, users and their roles, invites, sign-in identities, the audit log, and the encrypted broker and feed credentials. |
 
 Back up the database with standard Postgres tools, for example:
 
@@ -58,3 +58,12 @@ anything else, and keep the old key until that edit is saved.
 
 Then restart the server so it uses the new key. If rotation fails partway, the
 transaction rolls back and everything stays readable under the old key.
+
+## Authentik is backed up separately
+
+Sign-in accounts (passwords, Microsoft, Google and GitHub sources, the `email_verified`
+attributes) live in Authentik's own Postgres, not in the OMS database. Back up its volume
+or run `pg_dump` against it too, and keep `OMS_AUTHENTIK_SECRET_KEY`: Authentik cannot
+read its stored secrets without it. The OMS database holds only the
+`(issuer, subject)` of each sign-in, so a restored OMS pointed at a new, empty Authentik
+needs fresh invites.

@@ -26,8 +26,9 @@ The trader requests a co-located strategy; an admin sets it up:
    - its limits;
    - optionally **Kill when unmonitored**.
 4. **Follow key:** enter the OMS's key. **Connections:** pick the strategy's Binance
-   account in its portfolio. Create a trading token for the strategy's principal on the
-   **API** page; the program uses it for the control link.
+   account in its portfolio. Create a trading token for the strategy on the
+   **API** page (it belongs to the strategy, not to its responsible user); the program
+   uses it for the control link.
 
 The OMS needs a `[control_link]` block in its configuration:
 
