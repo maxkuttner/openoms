@@ -1,4 +1,4 @@
-//! DB tests for the users/roles/SSO schema (migrations 0047–0052): the
+//! DB tests for the users/roles/SSO schema (migrations 0047–0059): the
 //! backfill of existing principals into identities and roles.
 
 use sqlx::postgres::{PgConnectOptions, PgPool};
@@ -170,4 +170,157 @@ async fn strategy_owner_cannot_be_a_strategy_principal() {
     .await
     .expect_err("a STRATEGY owner must be refused");
     assert!(err.to_string().contains("STRATEGY"), "{err}");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn auth_redesign_schema() {
+    let pool = migrated_db().await;
+
+    for (table, column) in [
+        ("user_session", "auth_method"),
+        ("user_session", "mfa_verified_at"),
+        ("principal_admin", "principal_id"),
+        ("principal_admin", "granted_by"),
+        ("principal_admin", "granted_at"),
+        ("local_credential", "password_hash"),
+        ("local_credential", "password_changed_at"),
+        ("local_credential", "totp_secret_enc"),
+        ("local_credential", "totp_enrolled_at"),
+        ("local_credential", "totp_last_step"),
+        ("local_credential", "failed_attempts"),
+        ("local_credential", "locked_until"),
+        ("recovery_code", "code_hash"),
+        ("recovery_code", "used_at"),
+        ("pending_identity_binding", "invite_id"),
+        ("pending_identity_binding", "issuer"),
+        ("pending_identity_binding", "subject"),
+        ("pending_identity_binding", "untrusted_email"),
+        ("pending_identity_binding", "display_name"),
+        ("pending_identity_binding", "metadata"),
+        ("pending_identity_binding", "expires_at"),
+        ("pending_identity_binding", "decided_at"),
+        ("pending_identity_binding", "decided_by"),
+        ("pending_identity_binding", "decision"),
+        ("invite", "method"),
+        ("system_setting", "key"),
+        ("system_setting", "value"),
+        ("system_setting", "updated_at"),
+    ] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'oms' AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "missing column {table}.{column}");
+    }
+
+    let legacy: serde_json::Value = sqlx::query_scalar(
+        "SELECT value FROM oms.system_setting WHERE key = 'legacy_admin_enabled'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(legacy, serde_json::json!(true));
+
+    // A STRATEGY principal cannot be a named admin; a HUMAN can.
+    let mut ids = Vec::new();
+    for (code, kind) in [("auth_strat", "STRATEGY"), ("auth_human", "HUMAN")] {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO oms.principal (id, code, principal_type, status) \
+             VALUES ($1, $2, $3, 'ACTIVE')",
+        )
+        .bind(id)
+        .bind(code)
+        .bind(kind)
+        .execute(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let (strategy, human) = (ids[0], ids[1]);
+    let err = sqlx::query(
+        "INSERT INTO oms.principal_admin (principal_id, granted_by) VALUES ($1, 'test')",
+    )
+    .bind(strategy)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("STRATEGY"), "{err}");
+    sqlx::query("INSERT INTO oms.principal_admin (principal_id, granted_by) VALUES ($1, 'test')")
+        .bind(human)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // One open binding per (issuer, subject); a decided one frees the slot.
+    let invite = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO oms.invite (id, token_hash, email, principal_id, created_by, expires_at) \
+         VALUES ($1, 'auth_tok', 'a@example.com', $2, 'test', now() + interval '1 day')",
+    )
+    .bind(invite)
+    .bind(human)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let method: String = sqlx::query_scalar("SELECT method FROM oms.invite WHERE id = $1")
+        .bind(invite)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(method, "any");
+    let open = "INSERT INTO oms.pending_identity_binding \
+                (id, invite_id, issuer, subject, expires_at) \
+                VALUES ($1, $2, 'https://idp', 'sub-1', now() + interval '1 day')";
+    sqlx::query(open)
+        .bind(Uuid::new_v4())
+        .bind(invite)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let dup = sqlx::query(open)
+        .bind(Uuid::new_v4())
+        .bind(invite)
+        .execute(&pool)
+        .await;
+    assert!(
+        dup.is_err(),
+        "second open binding for the same identity must fail"
+    );
+    sqlx::query(
+        "UPDATE oms.pending_identity_binding SET decision = 'rejected', \
+         decided_at = now(), decided_by = 'test'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(open)
+        .bind(Uuid::new_v4())
+        .bind(invite)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Sessions default to the OIDC method.
+    let session: Uuid = sqlx::query_scalar(
+        "INSERT INTO oms.user_session (principal_id, token_hash, absolute_expires_at) \
+         VALUES ($1, 'auth_sess', now() + interval '1 day') RETURNING id",
+    )
+    .bind(human)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let auth_method: String =
+        sqlx::query_scalar("SELECT auth_method FROM oms.user_session WHERE id = $1")
+            .bind(session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(auth_method, "oidc");
 }
