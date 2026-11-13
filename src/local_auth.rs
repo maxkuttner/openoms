@@ -13,12 +13,13 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, Params, PasswordHasher, PasswordVerifier, Version};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use totp_rs::{Algorithm, Secret, Totp};
+use zeroize::Zeroizing;
 
 use crate::secrets::{self, MasterKey};
 
@@ -75,6 +76,8 @@ pub enum TotpError {
     Invalid,
     /// The code's step was already accepted (or is older than one that was).
     Replayed,
+    /// Issuer or account name is not a valid otpauth label (e.g. contains `:`).
+    InvalidLabel,
 }
 
 impl std::fmt::Display for TotpError {
@@ -83,39 +86,60 @@ impl std::fmt::Display for TotpError {
             TotpError::BadSecret => f.write_str("stored TOTP secret is unusable"),
             TotpError::Invalid => f.write_str("invalid TOTP code"),
             TotpError::Replayed => f.write_str("TOTP code already used"),
+            TotpError::InvalidLabel => f.write_str("issuer or account name cannot be used in a TOTP label"),
         }
     }
 }
 
 impl std::error::Error for TotpError {}
 
-/// Argon2id with the crate defaults: m = 19456 KiB, t = 2, p = 1 (OWASP floor).
-fn argon2() -> Argon2<'static> {
-    Argon2::default()
+/// Argon2id v0x13, m = 19456 KiB, t = 2, p = 1 (OWASP floor), stated explicitly
+/// rather than inherited from crate defaults.
+fn argon2() -> Result<Argon2<'static>, LocalAuthError> {
+    let params = Params::new(19_456, 2, 1, None).map_err(|e| LocalAuthError::Hash(e.to_string()))?;
+    Ok(Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params))
+}
+
+/// Run `job` on the blocking pool under a permit of `permits`. The permit moves
+/// into the blocking closure, so it is held until the job itself finishes —
+/// dropping the returned future (client disconnect) does not free a slot while
+/// the Argon2 work is still running. `None` if the job panicked.
+async fn run_bounded<T, F>(permits: &'static Semaphore, job: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = permits.acquire().await.ok()?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        job()
+    })
+    .await
+    .ok()
 }
 
 /// Hash a password into an Argon2id PHC string with a fresh random salt.
 pub async fn hash_password(pw: &str) -> Result<String, LocalAuthError> {
-    let _permit = HASH_PERMITS.acquire().await.expect("semaphore is never closed");
-    let pw = pw.to_owned();
-    tokio::task::spawn_blocking(move || {
-        argon2()
+    let pw = Zeroizing::new(pw.to_owned());
+    run_bounded(&HASH_PERMITS, move || {
+        argon2()?
             .hash_password(pw.as_bytes())
             .map(|h| h.to_string())
             .map_err(|e| LocalAuthError::Hash(e.to_string()))
     })
     .await
-    .map_err(|_| LocalAuthError::Join)?
+    .ok_or(LocalAuthError::Join)?
 }
 
 /// Check a password against a stored PHC string. The library compares in
 /// constant time; any malformed hash is simply a mismatch.
 pub async fn verify_password(hash: &str, pw: &str) -> bool {
-    let _permit = HASH_PERMITS.acquire().await.expect("semaphore is never closed");
-    let (hash, pw) = (hash.to_owned(), pw.to_owned());
-    tokio::task::spawn_blocking(move || argon2().verify_password(pw.as_bytes(), hash.as_str()).is_ok())
-        .await
-        .unwrap_or(false)
+    let (hash, pw) = (hash.to_owned(), Zeroizing::new(pw.to_owned()));
+    run_bounded(&HASH_PERMITS, move || {
+        argon2().is_ok_and(|a| a.verify_password(pw.as_bytes(), hash.as_str()).is_ok())
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// NIST-style passphrase policy: length bounds and a common-password
@@ -148,7 +172,7 @@ impl std::fmt::Debug for TotpEnrollment {
     }
 }
 
-fn totp_from_secret(secret: Vec<u8>, issuer: Option<&str>, account: &str) -> Totp {
+fn totp_from_secret(secret: &[u8], issuer: Option<&str>, account: &str) -> Totp {
     // build_noncompliant: the issuer/account checks only matter for the URI,
     // which `new_totp` builds through the checked path.
     totp_rs::Builder::new()
@@ -164,9 +188,9 @@ fn totp_from_secret(secret: Vec<u8>, issuer: Option<&str>, account: &str) -> Tot
 
 /// Generate a fresh 160-bit TOTP secret (RFC 6238, SHA-1, 6 digits, 30 s).
 ///
-/// Panics only if `issuer` or `account` contains a `:` (otpauth forbids it) —
-/// callers pass the configured product name and a user's email/login.
-pub fn new_totp(issuer: &str, account: &str, master: &MasterKey) -> TotpEnrollment {
+/// `InvalidLabel` if `issuer` or `account` is not a valid otpauth label (a `:`
+/// is forbidden, and is legal in a quoted email local part).
+pub fn new_totp(issuer: &str, account: &str, master: &MasterKey) -> Result<TotpEnrollment, TotpError> {
     let secret = Secret::generate();
     let totp = totp_rs::Builder::new()
         .with_algorithm(Algorithm::SHA1)
@@ -177,9 +201,9 @@ pub fn new_totp(issuer: &str, account: &str, master: &MasterKey) -> TotpEnrollme
         .with_issuer(Some(issuer))
         .with_account_name(account)
         .build()
-        .expect("valid TOTP parameters, issuer and account");
-    let otpauth_uri = totp.to_url().expect("issuer and account are set");
-    TotpEnrollment { secret_enc: secrets::seal(master, TOTP_AAD, secret.as_ref()), otpauth_uri }
+        .map_err(|_| TotpError::InvalidLabel)?;
+    let otpauth_uri = totp.to_url().map_err(|_| TotpError::InvalidLabel)?;
+    Ok(TotpEnrollment { secret_enc: secrets::seal(master, TOTP_AAD, secret.as_ref()), otpauth_uri })
 }
 
 /// Verify a TOTP code. Accepts the current step ±1; rejects any step at or
@@ -192,9 +216,9 @@ pub fn verify_totp(
     last_step: Option<i64>,
     now: i64,
 ) -> Result<i64, TotpError> {
-    let secret = secrets::open(master, TOTP_AAD, secret_enc).map_err(|_| TotpError::BadSecret)?;
+    let secret = Zeroizing::new(secrets::open(master, TOTP_AAD, secret_enc).map_err(|_| TotpError::BadSecret)?);
     let now = u64::try_from(now).map_err(|_| TotpError::Invalid)?;
-    let totp = totp_from_secret(secret, None, "");
+    let totp = totp_from_secret(&secret, None, "");
     let step = totp.check(code.trim(), now).ok_or(TotpError::Invalid)?;
     let step = i64::try_from(step).map_err(|_| TotpError::Invalid)?;
     if last_step.is_some_and(|last| step <= last) {
@@ -250,7 +274,7 @@ mod tests {
     /// compute expected codes.
     fn clear_totp(e: &TotpEnrollment) -> Totp {
         let secret = secrets::open(&key(), TOTP_AAD, &e.secret_enc).expect("opens");
-        totp_from_secret(secret, None, "")
+        totp_from_secret(&secret, None, "")
     }
 
     #[tokio::test]
@@ -263,6 +287,38 @@ mod tests {
         assert!(!verify_password("not a phc string", pw).await);
         // Unique salt per credential.
         assert_ne!(h, hash_password(pw).await.expect("hash"));
+    }
+
+    #[tokio::test]
+    async fn bounded_job_keeps_permit_after_caller_is_dropped() {
+        static PERMITS: Semaphore = Semaphore::const_new(4);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(run_bounded(&PERMITS, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            done_tx.send(()).unwrap();
+        }));
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap()).await.unwrap();
+        caller.abort(); // client disconnect: the outer future is dropped mid-flight
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(PERMITS.available_permits(), 3, "permit must stay held while the job runs");
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || done_rx.recv().unwrap()).await.unwrap();
+        for _ in 0..100 {
+            if PERMITS.available_permits() == 4 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("permit not released after the job finished");
+    }
+
+    #[test]
+    fn new_totp_rejects_colon_label_without_panic() {
+        assert_eq!(new_totp("OpenOMS", "\"a:b\"@example.com", &key()).unwrap_err(), TotpError::InvalidLabel);
+        assert_eq!(new_totp("Open:OMS", "alice", &key()).unwrap_err(), TotpError::InvalidLabel);
     }
 
     #[test]
@@ -282,7 +338,7 @@ mod tests {
 
     #[test]
     fn totp_accepts_current_and_adjacent_step() {
-        let e = new_totp("OpenOMS", "alice@example.com", &key());
+        let e = new_totp("OpenOMS", "alice@example.com", &key()).expect("enroll");
         assert!(e.otpauth_uri.starts_with("otpauth://totp/OpenOMS:alice%40example.com?"), "{}", e.otpauth_uri);
         let t = clear_totp(&e);
         let now: i64 = 1_800_000_015; // mid-step
@@ -301,7 +357,7 @@ mod tests {
 
     #[test]
     fn totp_rejects_replayed_step() {
-        let e = new_totp("OpenOMS", "bob", &key());
+        let e = new_totp("OpenOMS", "bob", &key()).expect("enroll");
         let t = clear_totp(&e);
         let now: i64 = 1_800_000_015;
         let code = t.generate(now as u64).to_string();
@@ -317,7 +373,7 @@ mod tests {
 
     #[test]
     fn totp_secret_is_encrypted_at_rest() {
-        let e = new_totp("OpenOMS", "carol", &key());
+        let e = new_totp("OpenOMS", "carol", &key()).expect("enroll");
         let t = clear_totp(&e);
         let b32 = t.secret().to_base32();
         assert!(e.otpauth_uri.contains(&b32));
