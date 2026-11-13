@@ -857,6 +857,47 @@ async fn activate_totp(
     Ok(true)
 }
 
+// ── sign-in methods ───────────────────────────────────────────────────────
+
+/// The sign-in methods the login page may offer. Unauthenticated.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct AuthMethods {
+    /// Email + password (then TOTP).
+    pub local: bool,
+    /// The configured OIDC provider, reachable at boot.
+    pub sso: bool,
+    pub sso_label: &'static str,
+    /// The deprecated shared admin password still works (until the first
+    /// named admin signs in); it can only bootstrap that admin.
+    pub legacy_admin: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EnabledMethods {
+    local: bool,
+    sso: bool,
+}
+
+/// Which sign-in buttons to show. Only enabled methods are reported; a
+/// database error reports the shared admin password as off.
+#[utoipa::path(
+    get, path = "/auth/methods", tag = "auth",
+    responses((status = 200, body = AuthMethods)),
+)]
+pub async fn methods(State(state): State<AppState>, Extension(m): Extension<EnabledMethods>) -> Json<AuthMethods> {
+    let legacy_admin = crate::admin_bootstrap::legacy_admin_enabled(state.pool()).await.unwrap_or(false);
+    Json(AuthMethods { local: m.local, sso: m.sso, sso_label: "Sign in with SSO", legacy_admin })
+}
+
+/// `GET /auth/methods`, mounted whatever is configured: with nothing on it
+/// says so, and the login page shows that instead of a dead button.
+pub fn methods_routes(local: bool, sso: bool) -> axum::Router<AppState> {
+    axum::Router::new()
+        .route("/auth/methods", axum::routing::get(methods))
+        .layer(Extension(EnabledMethods { local, sso }))
+        .layer(axum::middleware::map_response(no_store))
+}
+
 // ── router ─────────────────────────────────────────────────────────────────
 
 /// The routes of this module. Preview and logout-all serve any sign-in
@@ -1056,6 +1097,37 @@ mod tests {
             assert_eq!(resp.headers()["cache-control"], "no-store", "{uri}");
             assert_eq!(resp.headers()["referrer-policy"], "no-referrer", "{uri}");
         }
+    }
+
+    async fn methods_body(pool: PgPool, local: bool, sso: bool) -> (StatusCode, serde_json::Value) {
+        use tower::Service;
+        let mut svc = methods_routes(local, sso).with_state(app(pool));
+        let req = axum::http::Request::builder().uri("/auth/methods").body(axum::body::Body::empty()).unwrap();
+        let resp = svc.call(req).await.unwrap();
+        let status = resp.status();
+        (status, body(resp).await)
+    }
+
+    /// Unauthenticated; reports the configured methods. With the database
+    /// unreachable the shared admin password is reported off (fail closed).
+    #[tokio::test]
+    async fn methods_reports_configured_methods() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let (status, b) = methods_body(pool, true, false).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(b, serde_json::json!({ "local": true, "sso": false, "sso_label": "Sign in with SSO", "legacy_admin": false }));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn methods_reports_legacy_admin_setting() {
+        let pool = migrated_db().await;
+        sqlx::query("UPDATE system_setting SET value = 'true'::jsonb WHERE key = 'legacy_admin_enabled'").execute(&pool).await.unwrap();
+        let (_, b) = methods_body(pool.clone(), false, true).await;
+        assert_eq!(b, serde_json::json!({ "local": false, "sso": true, "sso_label": "Sign in with SSO", "legacy_admin": true }));
+        sqlx::query("UPDATE system_setting SET value = 'false'::jsonb WHERE key = 'legacy_admin_enabled'").execute(&pool).await.unwrap();
+        let (_, b) = methods_body(pool, false, true).await;
+        assert_eq!(b["legacy_admin"], false);
     }
 
     #[test]

@@ -22,24 +22,3 @@ export function inviteNotice(email: string, expiresAt: string): string {
 }
 
 export const SIGN_IN_WARNING = "Invitees can't sign in until sign-in is turned on.";
-
-export type AccessReason = "no_invite" | "expired" | "revoked" | "email_mismatch" | "email_unverified" | "pending_approval";
-
-/** Text for the trader app's access page; unknown reasons read as no invite. */
-export function accessMessage(reason: string | null, hint: string | null): string {
-  switch (reason) {
-    case "expired":
-      return "This invite expired. Ask for a new one.";
-    case "revoked":
-      return "This invite was revoked.";
-    case "email_mismatch":
-      return `This invite is for ${hint ?? "another address"}. Sign in with that address, or ask for a new invite.`;
-    // No longer sent by the server; kept for old bookmarked access URLs.
-    case "email_unverified":
-      return "Your sign-in provider didn't confirm your email address. Use another sign-in method or ask for a new invite.";
-    case "pending_approval":
-      return "Your sign-in is waiting for an admin to approve it. Try again once they have.";
-    default:
-      return "Access not granted. Ask the OMS admin for an invite.";
-  }
-}

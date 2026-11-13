@@ -193,6 +193,7 @@ mod authz_route_tests;
         local_auth_api::totp_enroll,
         local_auth_api::totp_confirm,
         local_auth_api::logout_all,
+        local_auth_api::methods,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -223,6 +224,7 @@ mod authz_route_tests;
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         auth_api::MeResponse,
         local_auth_api::InvitePreview,
+        local_auth_api::AuthMethods,
         local_auth_api::EnrollBody,
         local_auth_api::NextStep,
         local_auth_api::LoginBody,
@@ -1115,9 +1117,7 @@ fn build_app(
             .route("/auth/oidc/login", get(auth_api::login))
             .route("/auth/invite/:token", get(auth_api::invite))
             .route("/auth/oidc/callback", get(auth_api::callback))
-            // Aliases: the registered IdP redirect URIs and the trade app
-            // still use the pre-rename paths.
-            .route("/auth/login", get(auth_api::login))
+            // Alias: the registered IdP redirect URIs still use the pre-rename path.
             .route("/auth/callback", get(auth_api::callback))
             .layer(Extension(auth_state));
         app = app.merge(auth_router);
@@ -1128,11 +1128,12 @@ fn build_app(
     // it is merely *configured*: discovery failing (IdP down, secret unset)
     // must not take `/auth/me`, `/auth/logout` or `/trade/` away from
     // sessions that already exist. With neither enabled, the whole `/auth/*`
-    // and `/trade/*` surface 404s.
+    // and `/trade/*` surface 404s, except `/auth/methods`, which says so.
     //
     // `/auth/me` requires authentication, so it carries `auth_middleware`;
     // `/auth/logout` reads the session cookie itself and is idempotent.
     let oidc_discovered = auth_api_state.is_some();
+    app = app.merge(local_auth_api::methods_routes(local_enabled, oidc_discovered));
     if local_enabled || oidc_configured {
         let local_auth = local_auth_api::LocalAuth::new(
             admin::resolve_master_key().ok().flatten(),

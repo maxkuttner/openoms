@@ -1,6 +1,6 @@
 # OMS Cockpit
 
-A React/TypeScript admin webapp for the OMS — set up principals, API keys, portfolio grants,
+A React/TypeScript admin webapp for the OMS — set up users, API keys, portfolio grants,
 accounts, broker connections, and risk limits, and watch the order **blotter** ("who is trading
 what"). It talks to the OMS admin REST API.
 
@@ -16,8 +16,10 @@ React Router. No backend code here — just the admin API.
    npm run dev
    ```
 3. Open http://localhost:5173. Vite proxies `/api/*` → the OMS (no CORS).
-   - Dev with `OMS_ADMIN_AUTH_ENABLED=false`: no token needed.
-   - If admin auth is on, click **Set token** (top-right) and paste `OMS_ADMIN_TOKEN`.
+   - Sign in as a named admin (email, password, authenticator code, or SSO). The session
+     is a cookie; nothing is kept in `localStorage`.
+   - On a fresh install with no named admin yet, the sign-in page also offers the shared
+     admin password, only to create that first admin.
    - Point at a different OMS with `OMS_URL=http://host:port npm run dev`.
 
 ## Build
@@ -33,7 +35,7 @@ by the OMS itself: `/cockpit/` serves the cockpit shell, `/trade/` the trade she
 only when OIDC is configured), and `/ui/*` the assets both of them load.
 
 ## Layout
-- `src/api/` — `client.ts` (typed fetch + bearer token), `types.ts` (resource shapes),
+- `src/api/` — `client.ts` (typed fetch, session cookie), `types.ts` (resource shapes),
   `hooks.ts` (TanStack Query helpers).
 - `src/components/CrudResource.tsx` — generic list + create/edit/delete used by the simple pages.
 - `src/trade/` — the trader app (`/trade/`): its own cookie-only API client, order ticket,

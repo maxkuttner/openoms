@@ -3172,6 +3172,28 @@
         ]
       }
     },
+    "/auth/methods": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Which sign-in buttons to show. Only enabled methods are reported; a",
+        "description": "database error reports the shared admin password as off.",
+        "operationId": "methods",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMethods"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/auth/oidc/callback": {
       "get": {
         "tags": [
@@ -4216,6 +4238,33 @@
           "quantity": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "AuthMethods": {
+        "type": "object",
+        "description": "The sign-in methods the login page may offer. Unauthenticated.",
+        "required": [
+          "local",
+          "sso",
+          "sso_label",
+          "legacy_admin"
+        ],
+        "properties": {
+          "legacy_admin": {
+            "type": "boolean",
+            "description": "The deprecated shared admin password still works (until the first\nnamed admin signs in); it can only bootstrap that admin."
+          },
+          "local": {
+            "type": "boolean",
+            "description": "Email + password (then TOTP)."
+          },
+          "sso": {
+            "type": "boolean",
+            "description": "The configured OIDC provider, reachable at boot."
+          },
+          "sso_label": {
+            "type": "string"
           }
         }
       },

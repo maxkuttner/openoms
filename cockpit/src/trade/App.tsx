@@ -3,7 +3,10 @@ import { useQuery } from "@tanstack/react-query";
 import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
 import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { AccessPage } from "./pages/Access";
-import { tradeApi, onLoginUnavailable, API_BASE } from "./api/client";
+import { tradeApi, API_BASE } from "./api/client";
+import { LoginPage } from "../login/LoginPage";
+import { InvitePreview } from "../login/InvitePreview";
+import { TRADE_HOME } from "../login/api";
 import { TradePage } from "./pages/Trade";
 import { LiveUpdatesProvider, useLive } from "./api/liveUpdates";
 
@@ -62,47 +65,19 @@ export type Me = {
 };
 
 export function TradeApp() {
-  // The access page is where a refused sign-in lands, so it has no session to
-  // load: render it before the identity query, which would bounce to sign-in.
+  // Sign-in, invite and access pages have no session to load: render them
+  // before the identity query, which would bounce to sign-in.
   const { pathname } = useLocation();
   if (pathname === "/access") return <AccessPage />;
+  if (pathname === "/login") return <LoginPage home={TRADE_HOME} />;
+  if (pathname === "/invite") return <InvitePreview />;
   return <SignedInTradeApp />;
 }
 
 function SignedInTradeApp() {
-  // Set when the client finds /auth/login missing: /trade/ and /auth/* are
-  // mounted under the same condition, but a provider-discovery failure can
-  // leave this app served with no auth routes behind it. Without this the
-  // trader goes /trade/ -> 401 -> /auth/login -> bare 404, with nothing said
-  // and no way back.
-  const [loginUnavailable, setLoginUnavailable] = useState(false);
-  useEffect(() => onLoginUnavailable(() => setLoginUnavailable(true)), []);
-
-  // A 401 here redirects to the identity provider from inside the client, so
-  // this query either resolves with an identity or the page navigates away —
-  // unless sign-in itself is unavailable, handled above.
+  // A 401 here sends the browser to the sign-in page from inside the client,
+  // so this query either resolves with an identity or the page navigates away.
   const me = useQuery<Me>({ queryKey: ["/auth/me"], queryFn: () => tradeApi.get<Me>("/auth/me") });
-
-  if (loginUnavailable) {
-    return (
-      <Container size="sm" py="xl">
-        <Alert color="amber" title="Sign-in is unavailable">
-          <Stack gap="sm" align="flex-start">
-            <Text size="sm">
-              This screen needs a signed-in session, but the OMS is not serving its sign-in
-              routes: <code>/auth/login</code> answered 404. That usually means the server
-              started without an identity provider configured, or its discovery call is
-              failing. Nothing you can do here will sign you in — an operator has to fix the
-              server. Your orders and positions are unaffected.
-            </Text>
-            <Button variant="default" onClick={() => window.location.reload()}>
-              Try again
-            </Button>
-          </Stack>
-        </Alert>
-      </Container>
-    );
-  }
 
   if (me.isLoading) return <Loader />;
   if (me.error) return <Text c="red">Could not load your session.</Text>;

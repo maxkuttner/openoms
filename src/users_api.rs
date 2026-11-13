@@ -48,6 +48,8 @@ pub struct UserRow {
     pub sign_in: Option<String>,
     pub status: String,
     pub invite: Option<PendingInvite>,
+    /// Holds the admin capability (opens the cockpit).
+    pub admin: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,7 +118,7 @@ fn public_base_url(state: &AppState) -> Result<&str, ApiError> {
 
 fn invite_response(base: &str, invite: NewInvite) -> InviteResponse {
     InviteResponse {
-        link: format!("{base}/auth/invite/{}", invite.token),
+        link: crate::admin_bootstrap::invite_link(base, &invite.token),
         invite_id: invite.invite_id,
         user_id: invite.principal_id,
         expires_at: invite.expires_at,
@@ -172,7 +174,8 @@ async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, 
                 (SELECT i.issuer FROM principal_identity i \
                   WHERE i.principal_id = p.id AND i.last_login_at IS NOT NULL \
                   ORDER BY i.last_login_at DESC LIMIT 1) AS issuer, \
-                v.id AS invite_id, v.expires_at \
+                v.id AS invite_id, v.expires_at, \
+                EXISTS (SELECT 1 FROM principal_admin a WHERE a.principal_id = p.id) AS admin \
            FROM principal p \
            LEFT JOIN principal_role r ON r.principal_id = p.id \
            LEFT JOIN LATERAL ( \
@@ -220,6 +223,7 @@ async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, 
                 sign_in: r.get::<Option<String>, _>("issuer").map(|i| issuer_host(&i)),
                 status: r.get("status"),
                 invite: invite_id.map(|invite_id| PendingInvite { invite_id, expires_at: r.get("expires_at") }),
+                admin: r.get("admin"),
             }
         })
         .collect())
@@ -940,7 +944,7 @@ mod tests {
         .await
         .unwrap()
         .0;
-        let token = out.link.strip_prefix("https://oms.example.com/auth/invite/").expect("link shape");
+        let token = out.link.strip_prefix("https://oms.example.com/trade/invite#").expect("link shape");
         let stored: String = sqlx::query_scalar("SELECT token_hash FROM invite WHERE id = $1")
             .bind(out.invite_id)
             .fetch_one(&pool)
@@ -1005,7 +1009,7 @@ mod tests {
         let st = state(&pool, Some(BASE)).await;
         let (id, ..) = active_user(&pool, &st).await;
         let out = link_invite(State(st.clone()), Extension(actor()), Path(id)).await.unwrap().0;
-        assert!(out.link.starts_with("https://oms.example.com/auth/invite/"));
+        assert!(out.link.starts_with("https://oms.example.com/trade/invite#"));
         let missing = link_invite(State(st), Extension(actor()), Path(Uuid::new_v4())).await.unwrap_err();
         assert_eq!(missing.status, StatusCode::CONFLICT);
     }

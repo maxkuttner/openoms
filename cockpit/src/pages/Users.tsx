@@ -1,10 +1,10 @@
 import { useState } from "react";
 import {
   Stack, Group, Title, Button, Table, Modal, Drawer, TextInput, Select, Checkbox, Text, Badge, Loader,
-  ActionIcon, Alert, Code, CopyButton, Divider, Anchor,
+  ActionIcon, Alert, Code, CopyButton, Divider, Anchor, Switch,
 } from "@mantine/core";
 import { Link } from "react-router-dom";
-import { api } from "../api/client";
+import { api, isLegacySession } from "../api/client";
 import { useList, useApiMutation } from "../api/hooks";
 import type { ApiKeyRecord, Portfolio } from "../api/types";
 import { useSetupStatus } from "../components/SetupChecklist";
@@ -22,9 +22,21 @@ type UserRow = {
   sign_in: string | null;
   status: string;
   invite: { invite_id: string; expires_at: string } | null;
+  admin: boolean;
 };
 
-type InviteResult = { invite_id: string; link: string; expires_at: string };
+type PendingBinding = {
+  binding_id: string;
+  user_code: string;
+  invited_email: string;
+  issuer: string;
+  subject: string;
+  untrusted_email: string | null;
+  display_name: string | null;
+  created_at: string;
+};
+
+type InviteResult = { link: string; expires_at: string | null };
 
 function who(u: UserRow) {
   return u.display_name ?? u.email ?? u.code;
@@ -69,7 +81,7 @@ function PortfolioPicker({ value, onChange }: { value: Record<string, Access>; o
 function LinkBox({ email, result }: { email: string; result: InviteResult }) {
   return (
     <Stack gap="xs">
-      <Text size="sm">{inviteNotice(email, result.expires_at)}</Text>
+      <Text size="sm">{result.expires_at ? inviteNotice(email, result.expires_at) : `Send this link to ${email}.`}</Text>
       <Group gap="xs" wrap="nowrap">
         <Code style={{ overflowWrap: "anywhere" }}>{result.link}</Code>
         <CopyButton value={result.link}>
@@ -88,6 +100,8 @@ export function UsersPage() {
   const [editing, setEditing] = useState<UserRow | null>(null);
   const [keysFor, setKeysFor] = useState<UserRow | null>(null);
   const [shown, setShown] = useState<{ email: string; result: InviteResult } | null>(null);
+  const [bootstrapping, setBootstrapping] = useState(false);
+  const legacy = isLegacySession();
 
   const reload = [PATH, "/admin/setup-status"];
   const linkAction = (path: (u: UserRow) => string) => (u: UserRow) =>
@@ -102,11 +116,24 @@ export function UsersPage() {
     <Stack>
       <Group justify="space-between">
         <Title order={3}>Users</Title>
-        <Group>
-          <Button variant="default" onClick={() => setKeyOnly(true)}>New API-key user</Button>
-          <Button onClick={() => setInviting(true)}>Invite user</Button>
-        </Group>
+        {legacy ? (
+          <Button onClick={() => setBootstrapping(true)}>Bootstrap named admin</Button>
+        ) : (
+          <Group>
+            <Button variant="default" onClick={() => setKeyOnly(true)}>New API-key user</Button>
+            <Button onClick={() => setInviting(true)}>Invite user</Button>
+          </Group>
+        )}
       </Group>
+
+      {legacy && (
+        <Alert color="yellow">
+          You're using the shared admin password. It can only create a named admin: do that, open the link,
+          set a password and authenticator, then sign in as that admin.
+        </Alert>
+      )}
+
+      {!legacy && <PendingBindings />}
 
       {setup.data && !setup.data.sign_in_ok && (
         <Alert color="yellow">
@@ -126,6 +153,7 @@ export function UsersPage() {
               <Table.Th>Portfolios</Table.Th>
               <Table.Th>Sign-in</Table.Th>
               <Table.Th>Status</Table.Th>
+              <Table.Th>Admin</Table.Th>
               <Table.Th />
             </Table.Tr>
           </Table.Thead>
@@ -148,6 +176,17 @@ export function UsersPage() {
                     : u.sign_in ?? <Text c="dimmed">—</Text>}
                 </Table.Td>
                 <Table.Td><Badge variant="light">{u.status}</Badge></Table.Td>
+                <Table.Td>
+                  <Switch
+                    aria-label="Admin"
+                    checked={u.admin}
+                    disabled={legacy || u.status === "DISABLED"}
+                    onChange={(e) => {
+                      const admin = e.currentTarget.checked;
+                      run(u, (x) => api.put(`${PATH}/${x.principal_id}/admin`, { admin }));
+                    }}
+                  />
+                </Table.Td>
                 <Table.Td>
                   <Group gap="xs" justify="flex-end">
                     {u.invite && (
@@ -175,13 +214,14 @@ export function UsersPage() {
               </Table.Tr>
             ))}
             {(list.data ?? []).length === 0 && (
-              <Table.Tr><Table.Td colSpan={6}><Text c="dimmed" ta="center">No users yet.</Text></Table.Td></Table.Tr>
+              <Table.Tr><Table.Td colSpan={7}><Text c="dimmed" ta="center">No users yet.</Text></Table.Td></Table.Tr>
             )}
           </Table.Tbody>
         </Table>
       )}
 
       <InviteModal opened={inviting} onClose={() => setInviting(false)} onDone={(email, result) => { setInviting(false); setShown({ email, result }); }} />
+      <BootstrapAdminModal opened={bootstrapping} onClose={() => setBootstrapping(false)} onDone={(email, result) => { setBootstrapping(false); setShown({ email, result }); }} />
       <KeyOnlyModal opened={keyOnly} onClose={() => setKeyOnly(false)} />
       {editing && <EditAccessModal user={editing} onClose={() => setEditing(null)} />}
 
@@ -218,6 +258,80 @@ function InviteModal({ opened, onClose, onDone }: { opened: boolean; onClose: ()
           <Group justify="flex-end">
             <Button variant="default" onClick={onClose}>Cancel</Button>
             <Button type="submit" loading={send.isPending}>Create invite</Button>
+          </Group>
+        </Stack>
+      </form>
+    </Modal>
+  );
+}
+
+/** Sign-in identities waiting for an admin to compare and approve them. */
+function PendingBindings() {
+  const path = `${PATH}/bindings`;
+  const list = useList<PendingBinding>(path);
+  const decide = useApiMutation(
+    ({ id, verdict }: { id: string; verdict: "approve" | "reject" }) => api.post(`${path}/${id}/${verdict}`, {}),
+    { invalidate: [path, PATH], success: "Done" },
+  );
+  if (!list.data?.length) return null;
+  return (
+    <Stack gap="xs">
+      <Title order={5}>Waiting for approval</Title>
+      <Text size="sm" c="dimmed">
+        Someone opened an invite and signed in with SSO. Check with the invited person, by a channel you trust,
+        that this sign-in is theirs before approving. The provider's email is not verified.
+      </Text>
+      <Table withTableBorder>
+        <Table.Thead>
+          <Table.Tr><Table.Th>Invite</Table.Th><Table.Th>Signed in as</Table.Th><Table.Th>Provider</Table.Th><Table.Th /></Table.Tr>
+        </Table.Thead>
+        <Table.Tbody>
+          {list.data.map((b) => (
+            <Table.Tr key={b.binding_id}>
+              <Table.Td>{b.invited_email}</Table.Td>
+              <Table.Td>
+                {b.display_name ?? "—"}
+                {b.untrusted_email && <Text size="xs" c="dimmed">{b.untrusted_email} (unverified)</Text>}
+              </Table.Td>
+              <Table.Td>
+                <Text size="xs">{b.issuer}</Text>
+                <Text size="xs" c="dimmed">{b.subject}</Text>
+              </Table.Td>
+              <Table.Td>
+                <Group gap="xs" justify="flex-end">
+                  <Button size="xs" variant="light" onClick={() => decide.mutate({ id: b.binding_id, verdict: "approve" })}>Approve</Button>
+                  <Button size="xs" variant="light" color="red" onClick={() => decide.mutate({ id: b.binding_id, verdict: "reject" })}>Reject</Button>
+                </Group>
+              </Table.Td>
+            </Table.Tr>
+          ))}
+        </Table.Tbody>
+      </Table>
+    </Stack>
+  );
+}
+
+/** Create the first named admin with the shared admin password. */
+function BootstrapAdminModal({ opened, onClose, onDone }: { opened: boolean; onClose: () => void; onDone: (email: string, r: InviteResult) => void }) {
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const create = useApiMutation(
+    () => api.post<{ user_id: string; link: string }>(`${PATH}/bootstrap-admin`, { email: email.trim(), display_name: name.trim() || null }),
+    {
+      invalidate: [PATH],
+      success: "Admin created",
+      onDone: (r) => onDone(email.trim(), { link: (r as { link: string }).link, expires_at: null }),
+    },
+  );
+  return (
+    <Modal opened={opened} onClose={onClose} title="Bootstrap named admin" centered>
+      <form onSubmit={(e) => { e.preventDefault(); create.mutate(undefined); }}>
+        <Stack>
+          <TextInput label="Email" type="email" required value={email} onChange={(e) => setEmail(e.currentTarget.value)} />
+          <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
+          <Group justify="flex-end">
+            <Button variant="default" onClick={onClose}>Cancel</Button>
+            <Button type="submit" loading={create.isPending}>Create</Button>
           </Group>
         </Stack>
       </form>

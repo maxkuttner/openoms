@@ -22,7 +22,7 @@ OMS_PID=$!
 trap 'kill $OMS_PID $VITE_PID 2>/dev/null' EXIT
 
 echo "waiting for the OMS..."
-until curl -sf http://localhost:3001/auth/login -o /dev/null; do
+until curl -sf http://localhost:3001/auth/methods -o /dev/null; do
   sleep 1
   if ! kill -0 $OMS_PID 2>/dev/null; then
     echo "OMS process died — see /tmp/oms-server.log"; exit 1

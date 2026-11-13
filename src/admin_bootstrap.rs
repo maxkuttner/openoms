@@ -375,7 +375,15 @@ pub fn host_token_ok(hash: Option<&str>, token: &str, peer: Option<std::net::Soc
 
 /// The enrolment link for `invite`, the same shape the invite API returns.
 pub fn enrolment_link(base: &str, invite: &NewInvite) -> String {
-    format!("{}/auth/invite/{}", base.trim_end_matches('/'), invite.token)
+    invite_link(base, &invite.token)
+}
+
+/// Every invite link: the invite page, which shows the invite's role and
+/// portfolios and offers the enabled sign-in methods before any redirect.
+/// The token rides in the fragment, so it never reaches a server log or a
+/// `Referer` header.
+pub fn invite_link(base: &str, token: &str) -> String {
+    format!("{}/trade/invite#{token}", base.trim_end_matches('/'))
 }
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
@@ -604,7 +612,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let body: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(body["link"].as_str().unwrap().starts_with(&format!("{ORIGIN}/auth/invite/")), "{body}");
+        assert!(body["link"].as_str().unwrap().starts_with(&format!("{ORIGIN}/trade/invite#")), "{body}");
         let id: Uuid = body["user_id"].as_str().unwrap().parse().unwrap();
 
         let (status, kind, name): (String, String, Option<String>) =

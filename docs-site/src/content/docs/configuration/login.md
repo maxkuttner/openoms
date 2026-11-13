@@ -135,9 +135,9 @@ On the cockpit's **Users** page choose **Invite user**, then fill in the email, 
 portfolios (view, and optionally trade, for each). The dialog shows the invite link and
 its expiry (7 days). The OMS sends no email: copy the link and send it yourself.
 
-The link is `{public_base_url}/auth/invite/{token}`. It starts the sign-in with the
-invite attached; the person picks a method on the Authentik page and lands in the trade
-app.
+The link is `{public_base_url}/trade/invite#{token}`. It opens the invite page, which
+shows the role and portfolios and offers the enabled sign-in methods ("Set a password"
+and/or "Sign in with SSO"); the person then lands in the trade app.
 
 The new user appears as **Invited** and cannot sign in or use API keys until they accept.
 From the list you can also:

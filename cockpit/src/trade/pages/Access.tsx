@@ -1,6 +1,6 @@
 import { Alert, Container, Text } from "@mantine/core";
 import { useSearchParams } from "react-router-dom";
-import { accessMessage } from "../../users";
+import { accessMessage } from "../../login";
 
 /** Where a refused sign-in lands. Needs no session: it must render signed out. */
 export function AccessPage() {

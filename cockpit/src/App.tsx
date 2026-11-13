@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
-import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor } from "@mantine/core";
-import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
+import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor, Modal, Stack } from "@mantine/core";
+import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { api, setToken, API_BASE } from "./api/client";
+import { API_BASE, consoleAccess, goToLogin, isLegacySession, onMfaRequired, setLegacyPassword } from "./api/client";
+import { authApi, TRADE_HOME } from "./login/api";
+import { Totp } from "./login/Totp";
+import { Frame } from "./login/Frame";
 import { Logo } from "./components/Logo";
 import { JobsIndicator } from "./components/JobsIndicator";
 import { LoginPage } from "./pages/Login";
@@ -117,36 +120,58 @@ function Console({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-type Status = "checking" | "authed" | "login";
+type Status = "checking" | "admin" | "forbidden";
+
+/** Signed in, but without the admin capability. */
+function NoAccess() {
+  return (
+    <Frame title="Admin console">
+      <Stack gap={12}>
+        <Text fz={13}>You don't have access to the admin console.</Text>
+        <Anchor href={TRADE_HOME}>Open the trader app</Anchor>
+      </Stack>
+    </Frame>
+  );
+}
 
 /**
- * Auth gate. Probes an authed endpoint rather than just checking for a token, so
- * dev with OMS_ADMIN_AUTH_ENABLED=false still enters straight through (no token
- * needed), while a real deployment shows the login screen on 401/403.
+ * The authenticator prompt behind every 403 mfa_required: the request that
+ * hit it waits, and is retried once the code is accepted.
  */
+function MfaPrompt() {
+  const [pending, setPending] = useState<((ok: boolean) => void) | null>(null);
+  useEffect(
+    () => onMfaRequired(() => new Promise<boolean>((resolve) => setPending(() => resolve))),
+    [],
+  );
+  const finish = (ok: boolean) => {
+    pending?.(ok);
+    setPending(null);
+  };
+  return (
+    <Modal opened={!!pending} onClose={() => finish(false)} title="Confirm" centered>
+      {pending && <Totp prompt="Confirm with your authenticator code to continue." onDone={() => finish(true)} />}
+    </Modal>
+  );
+}
+
+/** Auth gate: the console needs a session holding the admin capability. */
 export function App() {
+  const { pathname } = useLocation();
+  const navigate = useNavigate();
   const [status, setStatus] = useState<Status>("checking");
-  const [checking, setChecking] = useState(false);
-  const [error, setError] = useState<string | undefined>();
+  const onLoginPage = pathname === "/login";
 
-  async function probe(): Promise<boolean> {
-    try {
-      await api.get("/admin/users");
-      return true;
-    } catch {
-      return false;
-    }
+  useEffect(() => {
+    if (onLoginPage) return;
+    consoleAccess()
+      .catch(() => "signed_out" as const)
+      .then((a) => (a === "signed_out" ? goToLogin() : setStatus(a)));
+  }, [onLoginPage]);
+
+  if (onLoginPage) {
+    return <LoginPage onLegacySignedIn={() => { setStatus("admin"); navigate("/users", { replace: true }); }} />;
   }
-
-  useEffect(() => {
-    probe().then((ok) => setStatus(ok ? "authed" : "login"));
-  }, []);
-
-  useEffect(() => {
-    const onUnauthorized = () => setStatus("login");
-    window.addEventListener("oms:unauthorized", onUnauthorized);
-    return () => window.removeEventListener("oms:unauthorized", onUnauthorized);
-  }, []);
 
   if (status === "checking") {
     return (
@@ -155,24 +180,18 @@ export function App() {
       </Center>
     );
   }
+  if (status === "forbidden") return <NoAccess />;
 
-  if (status === "login") {
-    return (
-      <LoginPage
-        checking={checking}
-        error={error}
-        onSubmit={async (token) => {
-          setToken(token);
-          setError(undefined);
-          setChecking(true);
-          const ok = await probe();
-          setChecking(false);
-          if (ok) setStatus("authed");
-          else setError("Invalid token");
+  return (
+    <>
+      <MfaPrompt />
+      <Console
+        onLogout={async () => {
+          if (!isLegacySession()) await authApi.logout().catch(() => undefined);
+          setLegacyPassword(null);
+          goToLogin();
         }}
       />
-    );
-  }
-
-  return <Console onLogout={() => { setToken(""); setStatus("login"); }} />;
+    </>
+  );
 }
