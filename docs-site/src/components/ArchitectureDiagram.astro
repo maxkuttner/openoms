@@ -69,8 +69,8 @@ const { target = false } = Astro.props;
     >
       <title id="arch-title">OpenOMS architecture</title>
       <desc id="arch-desc">
-        From top to bottom: users, strategies and the Authentik sign-in service; the OMS core with the order
-        engine, event store, event bus and the users and access tables (invites, roles, identities) that sign-in checks against; the order and market data gateways;
+        From top to bottom: users, strategies and an optional external identity provider for single sign-on; the OMS core with the order
+        engine, event store, event bus and the users and access records (local accounts, invites, roles, identities) that the OMS itself owns; the order and market data gateways;
         the brokers, crypto venues and data vendors they connect to. At the
         bottom, a co-located strategy trades a crypto venue directly while the
         OMS follows its account and controls it over the control link.
@@ -107,7 +107,7 @@ const { target = false } = Astro.props;
       <path class="arch-edge arch-edge-event" d="M740,292 L782,292 L782,20 L551,20 L551,34" />
       <text class="arch-edge-label arch-label-event" transform="translate(776 180) rotate(-90)" text-anchor="middle">Kafka</text>
       <path class="arch-edge arch-edge-auth" d="M693,96 L693,106 L760,106 L760,538 L740,538" />
-      <text class="arch-edge-label arch-label-auth" transform="translate(754 330) rotate(-90)" text-anchor="middle">OIDC sign-in · invite claim</text>
+      <text class="arch-edge-label arch-label-auth" transform="translate(754 330) rotate(-90)" text-anchor="middle">optional SSO · OIDC</text>
       <path class="arch-edge arch-edge-event" d="M400,240 L400,344" />
       <path class="arch-edge arch-edge-event" d="M400,404 L400,426" />
       <path class="arch-edge arch-edge-event" d="M200,626 L200,568" />
@@ -131,7 +131,7 @@ const { target = false } = Astro.props;
       <g class="arch-box arch-user"><rect x="202" y="34" width="130" height="62" rx="8" /><text x="267" y="60" text-anchor="middle" class="arch-name">Trader UI</text><text x="267" y="78" text-anchor="middle" class="arch-sub">invited users</text></g>
       <g class="arch-box arch-strategy"><rect x="344" y="34" width="130" height="62" rx="8" /><text x="409" y="60" text-anchor="middle" class="arch-name">Strategies ①</text><text x="409" y="78" text-anchor="middle" class="arch-sub">FIX or REST</text></g>
       <g class="arch-box arch-ext"><rect x="486" y="34" width="130" height="62" rx="8" /><text x="551" y="60" text-anchor="middle" class="arch-name">Other systems</text><text x="551" y="78" text-anchor="middle" class="arch-sub">risk, accounting…</text></g>
-      <g class="arch-box arch-ext"><rect x="628" y="34" width="130" height="62" rx="8" /><text x="693" y="60" text-anchor="middle" class="arch-name">Authentik</text><text x="693" y="78" text-anchor="middle" class="arch-sub">sign-in · SSO</text></g>
+      <g class="arch-box arch-ext"><rect x="628" y="34" width="130" height="62" rx="8" /><text x="693" y="60" text-anchor="middle" class="arch-name">Identity provider</text><text x="693" y="78" text-anchor="middle" class="arch-sub">optional SSO</text></g>
 
       <!-- Core: three columns, four rows; the bus spans the right two -->
       <g class="arch-box"><rect x="60" y="180" width="180" height="60" rx="8" /><text x="150" y="205" text-anchor="middle" class="arch-name">Order API + Risk</text><text x="150" y="223" text-anchor="middle" class="arch-sub">role checks, risk, store</text></g>
@@ -155,7 +155,7 @@ const { target = false } = Astro.props;
       <g class="arch-box arch-strategy"><rect x="60" y="508" width="180" height="60" rx="8" /><text x="150" y="533" text-anchor="middle" class="arch-name">Co-located hub</text><text x="150" y="551" text-anchor="middle" class="arch-sub">books fills · link · alarms</text></g>
       <g class="arch-box"><rect x="310" y="508" width="180" height="60" rx="8" /><text x="400" y="533" text-anchor="middle" class="arch-name">UI updates</text><text x="400" y="551" text-anchor="middle" class="arch-sub">bus → open screens, live</text></g>
 
-      <g class="arch-box"><rect x="560" y="508" width="180" height="60" rx="8" /><text x="650" y="533" text-anchor="middle" class="arch-name">Users &amp; access</text><text x="650" y="551" text-anchor="middle" class="arch-sub">roles · invites · identities</text></g>
+      <g class="arch-box"><rect x="560" y="508" width="180" height="60" rx="8" /><text x="650" y="533" text-anchor="middle" class="arch-name">Users &amp; access</text><text x="650" y="551" text-anchor="middle" class="arch-sub">local accounts · MFA · roles</text></g>
 
       <!-- Gateways -->
       <g class="arch-gw"><rect x="60" y="626" width="330" height="150" rx="10" /><text x="225" y="650" text-anchor="middle" class="arch-name">Order gateway</text><text x="225" y="667" text-anchor="middle" class="arch-sub">orders and fills only · sessions, reconnect, health</text></g>

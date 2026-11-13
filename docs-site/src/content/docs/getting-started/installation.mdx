@@ -74,8 +74,9 @@ docker compose run --rm oms init
 docker compose up -d
 ```
 
-`oms init` asks one thing, the cockpit admin password (Enter generates one). Then open
-`http://localhost:3001/cockpit/`.
+`oms init` asks for the first admin's email and prints a one-time link to set a password
+and authenticator. Then open `http://localhost:3001/cockpit/`. See
+[Sign-in and users](/configuration/login/).
 
 - [compose.yaml](https://openoms.dev/compose.yaml) runs the
   `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.

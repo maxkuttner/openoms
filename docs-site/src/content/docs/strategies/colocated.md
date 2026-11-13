@@ -176,8 +176,8 @@ strategy, deployment and the reference market maker.
 
    Save the API key Binance shows in `api-key` in the same folder.
 2. From a checkout: `scripts/colo-demo.sh up`, then `scripts/colo-demo.sh mm`.
-   The cockpit runs at `http://127.0.0.1:3021/cockpit/`; the admin password is
-   in `~/.local/state/openoms/colo-demo/adminpw`.
+   The cockpit runs at `http://127.0.0.1:3021/cockpit/`; sign in as the admin
+   described in [Sign-in and users](/configuration/login/).
 3. `scripts/colo-demo.sh down` stops everything and deletes the demo.
 
 The demo uses one testnet account for both the OMS's own Binance connection and

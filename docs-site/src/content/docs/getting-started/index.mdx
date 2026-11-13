@@ -24,7 +24,7 @@ oms init
 The program will prompt you to answer some basic questions on
 
 - whether to use your own PostgresSQL (16.0) database or whether you would like to use the pre-configured docker image
-- which administrator password you would like to set for the `admin cockpit` ui
+- the email and name of the first admin, who gets a one-time link to choose a password and set up an authenticator app (see [Sign-in and users](/configuration/login/))
 - which port the oms should listen on for requests
 
 Then it writes `~/.config/oms/oms.toml` (mode `0600`), creates the database, applies every
@@ -54,14 +54,16 @@ the instrument catalog is empty — the cockpit fills it in the next guide.
 
 ## 4. Open the cockpit
 
-Open `http://localhost:3001/cockpit/` and log in with your
-admin password. On a remote server, tunnel the port first:
+Open `http://localhost:3001/cockpit/` and sign in as the admin you created, with the
+password and authenticator code from the one-time link `oms init` printed. On a remote
+server, tunnel the port first:
 
 ```sh
 ssh -L 3001:localhost:3001 your-server
 ```
 
-Forgot a generated password? It is `admin_password` in `~/.config/oms/oms.toml`.
+Lost the link or the authenticator? Run `oms auth recover-admin --email <you>` on the
+server; see [Sign-in and users](/configuration/login/#recover-an-admin-from-the-host).
 
 ## Updating
 

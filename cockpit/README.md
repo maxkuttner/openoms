@@ -41,6 +41,6 @@ only when OIDC is configured), and `/ui/*` the assets both of them load.
 - `src/trade/` — the trader app (`/trade/`): its own cookie-only API client, order ticket,
   blotter and positions. It shares `src/components/` and the Mantine theme with the cockpit,
   but never its admin API client.
-- `src/pages/` — Principals (+ keys + grants), Portfolios, Accounts, BrokerConnections,
+- `src/pages/` — Users (+ keys + grants), Portfolios, Accounts, BrokerConnections,
   RiskLimits, Blotter, ApiDocs (embedded [Scalar](https://scalar.com) reference, lazy-loaded,
   fed from the OMS OpenAPI doc).
