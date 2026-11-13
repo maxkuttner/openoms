@@ -239,7 +239,7 @@ mod authz_route_tests;
         colo::deployment::InstrumentBaseline, colo::deployment::AssetHolding,
         colo::deployment::RetireRequest, colo::ingest::AdjustmentRequest,
     )),
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &MfaAddon),
     tags(
         (name = "orders", description = "Order submission and cancellation"),
         (name = "admin", description = "Admin management of principals, portfolios, accounts, broker connections, and keys"),
@@ -273,6 +273,37 @@ impl utoipa::Modify for SecurityAddon {
                     .build(),
             ),
         );
+    }
+}
+
+/// Documents the 403 `mfa_required` on every MFA-gated route: order actions
+/// (`authz::require_mfa` in the handler) and every `/admin` mutation
+/// (`auth::admin_mfa_gate`). Done here rather than per handler so a new admin
+/// mutation cannot forget it.
+struct MfaAddon;
+impl utoipa::Modify for MfaAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::{PathItemType, RefOr, ResponseBuilder};
+        const TRADING: [&str; 3] = ["/orders/submit", "/orders/cancel", "/orders/{id}/allocations"];
+        const NOTE: &str = "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)";
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            for (method, op) in item.operations.iter_mut() {
+                let gated = match method {
+                    PathItemType::Get | PathItemType::Head | PathItemType::Options => false,
+                    PathItemType::Post => path.starts_with("/admin/") || TRADING.contains(&path.as_str()),
+                    _ => path.starts_with("/admin/"),
+                };
+                if !gated {
+                    continue;
+                }
+                match op.responses.responses.get_mut("403") {
+                    Some(RefOr::T(r)) => r.description = format!("{}; or {NOTE}", r.description),
+                    _ => {
+                        op.responses.responses.insert("403".into(), RefOr::T(ResponseBuilder::new().description(NOTE).build()));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2058,6 +2089,32 @@ mod tests {
             .filter(|name| !defined.contains(name))
             .collect();
         assert!(dangling.is_empty(), "dangling schema refs: {dangling:?}");
+    }
+
+    /// Every route behind the MFA gate (order actions and every `/admin`
+    /// mutation) documents its 403 `mfa_required`; reads do not.
+    #[test]
+    fn every_mfa_gated_route_documents_mfa_required() {
+        let spec: serde_json::Value = serde_json::from_str(&super::openapi_json()).unwrap();
+        let trading = [("post", "/orders/submit"), ("post", "/orders/cancel"), ("post", "/orders/{id}/allocations")];
+        let mut missing = Vec::new();
+        let mut gated = 0;
+        for (path, ops) in spec["paths"].as_object().unwrap() {
+            for (method, op) in ops.as_object().unwrap() {
+                let is_gated = (path.starts_with("/admin/") && method != "get") || trading.contains(&(method.as_str(), path.as_str()));
+                let documented = op["responses"]["403"]["description"].as_str().is_some_and(|d| d.contains("mfa_required"));
+                if is_gated {
+                    gated += 1;
+                    if !documented {
+                        missing.push(format!("{method} {path}"));
+                    }
+                } else {
+                    assert!(!documented, "{method} {path} is not MFA-gated");
+                }
+            }
+        }
+        assert!(gated > 40, "{gated}");
+        assert!(missing.is_empty(), "no 403 mfa_required on: {missing:?}");
     }
 
     /// The trading endpoints are what the public API reference leads with, and

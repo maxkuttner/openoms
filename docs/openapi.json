@@ -62,6 +62,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Already exists"
           }
@@ -150,6 +153,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -216,6 +222,9 @@
           },
           "400": {
             "description": "Invalid environment (must be PAPER or LIVE)"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "409": {
             "description": "Already exists"
@@ -305,6 +314,9 @@
           },
           "400": {
             "description": "Invalid environment"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -402,6 +414,9 @@
           "400": {
             "description": "The request body was malformed, or could not be parsed into a credential (unknown field, bad port, ...)"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
@@ -446,6 +461,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -493,6 +511,9 @@
           },
           "400": {
             "description": "No credential is stored for this connection"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -577,6 +598,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
@@ -622,6 +646,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -679,6 +706,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "422": {
             "description": "A conId is unknown or unsupported; nothing was saved"
           },
@@ -734,6 +764,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "422": {
             "description": "The CSV is malformed"
@@ -812,6 +845,9 @@
         "responses": {
           "200": {
             "description": "Per-connection reload report (codes and outcomes only — no credential material)"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "500": {
             "description": "The credential store could not be read, the master key is invalid, or nothing at all decrypted; nothing was changed"
@@ -939,6 +975,9 @@
           "400": {
             "description": "The request body was malformed, or could not be parsed into a credential (unknown field, ...)"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
@@ -983,6 +1022,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -1030,6 +1072,9 @@
           },
           "400": {
             "description": "No credential is stored for this connection"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -1092,6 +1137,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "500": {
             "description": "The acceptor did not start again"
@@ -1171,6 +1219,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           }
         },
         "security": [
@@ -1501,6 +1552,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Already exists"
           }
@@ -1589,6 +1643,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -1668,6 +1725,9 @@
           "400": {
             "description": "Invalid trading_state"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Limit already exists for this portfolio/instrument"
           }
@@ -1739,6 +1799,9 @@
           "204": {
             "description": "Deleted"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -1789,6 +1852,9 @@
           },
           "400": {
             "description": "Invalid trading_state"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -1883,6 +1949,9 @@
           "400": {
             "description": "Missing CompIDs"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Code, portfolio, principal or CompIDs already used"
           },
@@ -1917,6 +1986,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -1964,6 +2036,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2053,6 +2128,9 @@
           "400": {
             "description": "A broker twice, or an account of another portfolio or broker"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2141,6 +2219,9 @@
           },
           "400": {
             "description": "Invalid deployment"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "409": {
             "description": "Account already registered"
@@ -2246,6 +2327,9 @@
           "400": {
             "description": "Deployment not stopped or invalid"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2307,6 +2391,9 @@
           },
           "400": {
             "description": "Shutdown not verified"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2372,6 +2459,9 @@
           "400": {
             "description": "Shutdown not verified"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2404,6 +2494,9 @@
         "responses": {
           "204": {
             "description": "Enabled"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2449,6 +2542,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2492,6 +2588,9 @@
         "responses": {
           "204": {
             "description": "Stored"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2545,6 +2644,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
@@ -2589,6 +2691,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2628,6 +2733,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2673,6 +2781,9 @@
           "400": {
             "description": "Not co-located, or no active deployment"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2712,6 +2823,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           }
         },
         "security": [
@@ -2747,6 +2861,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           }
         },
         "security": [
@@ -2809,6 +2926,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "422": {
             "description": "Auto-provision needs an active broker connection"
           }
@@ -2840,6 +2960,9 @@
         "responses": {
           "204": {
             "description": "Revoked"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -3613,6 +3736,9 @@
           "400": {
             "description": "Invalid UUID"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Order not found"
           },
@@ -3655,7 +3781,7 @@
             "description": "Validation error"
           },
           "403": {
-            "description": "No trade grant for principal/portfolio/account"
+            "description": "No trade grant for principal/portfolio/account; or mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "409": {
             "description": "Order already exists"
@@ -3813,7 +3939,7 @@
             }
           },
           "403": {
-            "description": "No allocate grant on the block portfolio"
+            "description": "No allocate grant on the block portfolio; or mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Order not found"
