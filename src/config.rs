@@ -243,7 +243,6 @@ pub struct OidcSettings {
     pub required_claim: Option<(String, String)>,
     #[allow(dead_code)] // superseded by auth_settings().ttl
     pub ttl: crate::sessions::SessionTtl,
-    #[allow(dead_code)] // used by the OIDC identity task
     pub trust_email_verified: bool,
     pub require_amr: Vec<String>,
 }

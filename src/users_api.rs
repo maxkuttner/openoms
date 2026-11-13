@@ -94,7 +94,7 @@ fn is_violation(err: &sqlx::Error, check: impl Fn(&dyn sqlx::error::DatabaseErro
 
 fn invite_error(err: InviteError) -> ApiError {
     match err {
-        InviteError::AlreadyInvited | InviteError::AlreadyUser | InviteError::NotLinkable => {
+        InviteError::AlreadyInvited | InviteError::AlreadyUser | InviteError::NotLinkable | InviteError::IdentityTaken => {
             api_error(StatusCode::CONFLICT, err.to_string())
         }
         InviteError::BadRole => api_error(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
@@ -307,7 +307,9 @@ pub async fn reissue_invite(
     Ok(Json(invite_response(base, invite)))
 }
 
-/// A link for an active user to add a second sign-in provider.
+/// A link for an active user to add a second sign-in provider. Claiming it
+/// needs that user's own live session on the same browser; otherwise the
+/// login waits as a pending binding for admin approval.
 pub async fn link_invite(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
@@ -316,6 +318,66 @@ pub async fn link_invite(
     let base = public_base_url(&state)?;
     let invite = invites::create_link(state.pool(), id, &ctx.principal_code).await.map_err(invite_error)?;
     Ok(Json(invite_response(base, invite)))
+}
+
+/// An explicit pre-binding of a sign-in identity.
+#[derive(Debug, Deserialize)]
+pub struct PrebindIdentity {
+    pub issuer: String,
+    pub subject: String,
+}
+
+/// Sign-in identities waiting for an admin to approve their binding.
+pub async fn list_bindings(State(state): State<AppState>) -> Result<Json<Vec<invites::PendingBinding>>, ApiError> {
+    Ok(Json(invites::list_bindings(state.pool()).await.map_err(db)?))
+}
+
+/// Approve a pending binding: links the identity, activates the user and
+/// consumes the invite in one step.
+pub async fn approve_binding(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let principal_id = invites::approve_binding(state.pool(), id, &ctx.principal_code).await.map_err(binding_error)?;
+    state.event_bus().publish_auth_changed(principal_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Reject a pending binding; the invite stays pending.
+pub async fn reject_binding(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    invites::reject_binding(state.pool(), id, &ctx.principal_code).await.map_err(binding_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Bind an independently verified `(issuer, subject)` to a user directly.
+pub async fn prebind_identity(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(p): Json<PrebindIdentity>,
+) -> Result<StatusCode, ApiError> {
+    let (issuer, subject) = (p.issuer.trim(), p.subject.trim());
+    if issuer.is_empty() || subject.is_empty() {
+        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "issuer and subject are required"));
+    }
+    invites::prebind_identity(state.pool(), id, issuer, subject, &ctx.principal_code).await.map_err(|err| match err {
+        InviteError::NotFound => api_error(StatusCode::NOT_FOUND, "user not found, or not active or invited"),
+        other => invite_error(other),
+    })?;
+    state.event_bus().publish_auth_changed(id);
+    Ok(StatusCode::CREATED)
+}
+
+fn binding_error(err: InviteError) -> ApiError {
+    match err {
+        InviteError::NotFound => api_error(StatusCode::NOT_FOUND, "binding not found, already decided, or its invite is no longer pending"),
+        other => invite_error(other),
+    }
 }
 
 pub async fn set_role(

@@ -25,6 +25,10 @@ test("access page text by reason", () => {
     "This invite is for j…@fundco.com. Sign in with that address, or ask for a new invite.",
   );
   assert.equal(
+    accessMessage("pending_approval", null),
+    "Your sign-in is waiting for an admin to approve it. Try again once they have.",
+  );
+  assert.equal(
     accessMessage("email_unverified", null),
     "Your sign-in provider didn't confirm your email address. Use another sign-in method or ask for a new invite.",
   );

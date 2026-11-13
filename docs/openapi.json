@@ -2857,8 +2857,8 @@
         "tags": [
           "auth"
         ],
-        "summary": "The invite link: starts a login with the invite token bound to the flow,",
-        "description": "and does nothing else. Whether the token is any good is decided only after\nthe provider has verified who is signing in.",
+        "summary": "The invite link: starts a login with the invite token's hash bound to the",
+        "description": "server-side flow, and does nothing else. The token never reaches a cookie\nor the provider. Whether the token is any good is decided only after\nthe provider has verified who is signing in.",
         "operationId": "invite",
         "parameters": [
           {
@@ -2872,8 +2872,11 @@
           }
         ],
         "responses": {
-          "302": {
+          "303": {
             "description": "Redirects to the identity provider's authorization endpoint"
+          },
+          "503": {
+            "description": "Too many sign-ins in progress; try again shortly"
           }
         }
       }
@@ -3207,8 +3210,8 @@
           }
         ],
         "responses": {
-          "302": {
-            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=...)"
+          "303": {
+            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused or awaiting admin approval (redirects to /trade/access?reason=..., e.g. pending_approval)"
           },
           "400": {
             "description": "Malformed callback, or a missing/expired/mismatched login flow"
@@ -3230,8 +3233,8 @@
         "tags": [
           "auth"
         ],
-        "summary": "Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in",
-        "description": "the flow cookie, and sends the browser to the provider. Cannot fail —\nthere is no user input yet and no network call, only local randomness —\nso this returns a bare `Response`, not a `Result`.",
+        "summary": "Starts a login: mints `state`/`nonce`/a PKCE verifier, keeps them in the",
+        "description": "flow store under a random id set as the flow cookie, and sends the browser\nto the provider. Refused with a generic 503 only when too many logins are\npending at once.",
         "operationId": "login",
         "parameters": [
           {
@@ -3245,8 +3248,11 @@
           }
         ],
         "responses": {
-          "302": {
+          "303": {
             "description": "Redirects to the identity provider's authorization endpoint"
+          },
+          "503": {
+            "description": "Too many sign-ins in progress; try again shortly"
           }
         }
       }

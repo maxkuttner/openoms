@@ -334,6 +334,14 @@ fn refuses_plain_http_oidc(bind_addr: &str, public_base_url: &str) -> bool {
     !(https || purely_local)
 }
 
+/// The client secret the bundled dev identity-provider fixture registers.
+/// Anyone can read it, so it is refused anywhere but a loopback bind.
+const DEV_OIDC_CLIENT_SECRET: &str = "oms-dev-secret";
+
+fn refuses_dev_client_secret(bind_addr: &str, client_secret: Option<&str>) -> bool {
+    client_secret == Some(DEV_OIDC_CLIENT_SECRET) && !bind_is_loopback(bind_addr)
+}
+
 /// Bind address on the usual tiers. No CLI flag exists for this today, so the
 /// chain is env → file → default. Both sources are emptiness-filtered: a blank
 /// `bind_addr` in `oms.toml` must fall through to the default the same way a
@@ -954,6 +962,10 @@ fn build_app(
         .route("/admin/users/invites/:id/revoke", post(users_api::revoke_invite))
         .route("/admin/users/invites/:id/reissue", post(users_api::reissue_invite))
         .route("/admin/users/:id/link-invite", post(users_api::link_invite))
+        .route("/admin/users/bindings", get(users_api::list_bindings))
+        .route("/admin/users/bindings/:id/approve", post(users_api::approve_binding))
+        .route("/admin/users/bindings/:id/reject", post(users_api::reject_binding))
+        .route("/admin/users/:id/identities", post(users_api::prebind_identity))
         .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
         .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
         .route("/admin/users/bootstrap-admin", post(users_api::bootstrap_admin))
@@ -1354,6 +1366,14 @@ async fn serve() {
             );
             std::process::exit(1);
         }
+        if refuses_dev_client_secret(&bind_addr, env::var("OMS_OIDC_CLIENT_SECRET").ok().as_deref()) {
+            error!(
+                "refusing to start: OMS_OIDC_CLIENT_SECRET is the public development secret and \
+                 OMS_BIND_ADDR ({bind_addr}) is not loopback. Register a real client secret at \
+                 your identity provider and set OMS_OIDC_CLIENT_SECRET to it."
+            );
+            std::process::exit(1);
+        }
     }
 
     // Stream health + the event bus are created here (before the broker
@@ -1709,11 +1729,18 @@ async fn serve() {
                 Some(client_secret) => {
                     let required_claim = oidc_settings.required_claim.clone();
                     let require_amr = oidc_settings.require_amr.clone();
+                    let trust_email_verified = oidc_settings.trust_email_verified;
                     match oidc::Provider::discover(oidc_settings, client_secret).await {
                         Ok(provider) => {
                             info!("OIDC discovery succeeded — login enabled");
                             oidc_status.discovery_ok = true;
-                            Some(auth_api::AuthApiState { provider: Arc::new(provider), required_claim, require_amr })
+                            Some(auth_api::AuthApiState {
+                                provider: Arc::new(provider),
+                                required_claim,
+                                require_amr,
+                                trust_email_verified,
+                                flows: Arc::new(auth_api::FlowStore::default()),
+                            })
                         }
                         Err(e) => {
                             error!(error = ?e, "OIDC discovery failed — login is disabled for this run");
@@ -1763,6 +1790,8 @@ mod tests {
             )),
             required_claim: None,
             require_amr: Vec::new(),
+            trust_email_verified: true,
+            flows: std::sync::Arc::new(crate::auth_api::FlowStore::default()),
         };
         // (local only), (OIDC configured, discovery failed), (neither),
         // then the discovered router: (OIDC only) and (both).
@@ -1879,6 +1908,20 @@ mod tests {
     /// The OIDC start-up gate. Plain http is only ever acceptable when the
     /// whole deployment is loopback; `https://` is fine on any bind, which is
     /// the reverse-proxy topology C2 was about.
+    #[test]
+    fn boot_refuses_dev_secret_off_loopback() {
+        use super::refuses_dev_client_secret as refuses;
+
+        assert!(refuses("0.0.0.0:3001", Some("oms-dev-secret")));
+        assert!(refuses("oms.internal:3001", Some("oms-dev-secret")));
+        // Local development may keep the fixture's secret.
+        assert!(!refuses("127.0.0.1:3001", Some("oms-dev-secret")));
+        assert!(!refuses("localhost:3001", Some("oms-dev-secret")));
+        // A real secret, or none, is not this rule's business.
+        assert!(!refuses("0.0.0.0:3001", Some("a-real-registered-secret")));
+        assert!(!refuses("0.0.0.0:3001", None));
+    }
+
     #[test]
     fn plain_http_oidc_is_only_tolerated_when_everything_is_local() {
         use super::refuses_plain_http_oidc as refuses;

@@ -3,7 +3,9 @@
 //! `invites::resolve_login`, logout and `/auth/me`. Sign-in is invite-only:
 //! nothing here creates a user.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -22,7 +24,7 @@ use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::handlers::GrantedPortfolio;
 use crate::handlers::{self, ApiError};
-use crate::invites::{self, ClaimOutcome};
+use crate::invites::{self, ClaimOutcome, ClaimPolicy};
 use crate::oidc::{OidcError, Provider};
 use crate::sessions::{self, CookiePolicy};
 
@@ -47,22 +49,79 @@ pub struct AuthApiState {
     /// `[auth.oidc].require_amr`: a login whose `amr` lacks any of these gets
     /// a session without MFA (reads only; see `authz::require_mfa`).
     pub require_amr: Vec<String>,
+    /// `[auth.oidc].trust_email_verified`; off, every invite claim waits for
+    /// an admin to approve the binding.
+    pub trust_email_verified: bool,
+    /// Pending logins, keyed server-side; the browser holds only the id.
+    pub flows: Arc<FlowStore>,
 }
 
 /// `state`, `nonce`, and the PKCE verifier for one pending login. Minted by
-/// `login`, carried to the browser in a short-lived cookie (see
-/// `flow_cookie`), and read back by `callback` — never persisted to a table,
-/// since they are per-browser and worthless the moment the callback returns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `login`, kept in the `FlowStore` and found again by `callback` through the
+/// random flow id in the flow cookie — never persisted to a table, since they
+/// are per-browser and worthless the moment the callback returns.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlowState {
     pub state: String,
     pub nonce: String,
     pub pkce_verifier: String,
     pub return_to: String,
-    /// The invite link token this login arrived with, if any. It is the
-    /// only way an unknown identity can get in.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invite_token: Option<String>,
+    /// SHA-256 of the invite link token this login arrived with, if any. It
+    /// is the only way an unknown identity can get in; the token itself is
+    /// never kept or sent anywhere.
+    pub invite_token_hash: Option<String>,
+}
+
+/// How long a pending login stays usable, and how many may be pending at once.
+const FLOW_TTL: Duration = Duration::from_secs(300);
+const FLOW_CAP: usize = 10_000;
+
+/// Pending logins in memory, keyed by the SHA-256 of their flow id. Bounded
+/// so unauthenticated `/auth/login` hits cannot grow it without limit: expired
+/// flows are evicted, and past the cap a new login is refused. A restart drops
+/// every pending login, which costs a user one more click.
+pub struct FlowStore {
+    flows: Mutex<HashMap<String, (FlowState, Instant)>>,
+    ttl: Duration,
+    cap: usize,
+}
+
+impl Default for FlowStore {
+    fn default() -> Self {
+        FlowStore::new(FLOW_TTL, FLOW_CAP)
+    }
+}
+
+impl FlowStore {
+    pub fn new(ttl: Duration, cap: usize) -> Self {
+        FlowStore { flows: Mutex::new(HashMap::new()), ttl, cap }
+    }
+
+    /// Keeps `flow` and returns its fresh random id, or `None` when full.
+    pub fn insert(&self, flow: FlowState) -> Option<String> {
+        let mut flows = self.flows.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if flows.len() >= self.cap {
+            flows.retain(|_, (_, expires)| *expires > now);
+        }
+        if flows.len() >= self.cap {
+            return None;
+        }
+        let id = random_token();
+        flows.insert(flow_key(&id), (flow, now + self.ttl));
+        Some(id)
+    }
+
+    /// Removes and returns the flow behind `id`, if it is still live.
+    pub fn take(&self, id: &str) -> Option<FlowState> {
+        let mut flows = self.flows.lock().unwrap_or_else(|e| e.into_inner());
+        let (flow, expires) = flows.remove(&flow_key(id))?;
+        (expires > Instant::now()).then_some(flow)
+    }
+}
+
+fn flow_key(id: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(id.as_bytes()))
 }
 
 /// Validate a caller-supplied post-login destination.
@@ -110,14 +169,12 @@ fn flow_cookie_name(policy: &CookiePolicy) -> &'static str {
     }
 }
 
-/// Builds the `Set-Cookie` header that carries `flow` to the browser.
-/// `HttpOnly` so no script on the page can read the PKCE verifier;
-/// `SameSite=Lax` and `Max-Age=300` so it cannot outlive the login it was
-/// minted for.
-pub fn flow_cookie(policy: &CookiePolicy, flow: &FlowState) -> String {
-    let encoded = encode_flow(flow);
+/// Builds the `Set-Cookie` header that carries the flow id to the browser.
+/// `HttpOnly` so no script on the page can read it; `SameSite=Lax` and
+/// `Max-Age=300` so it cannot outlive the login it was minted for.
+pub fn flow_cookie(policy: &CookiePolicy, flow_id: &str) -> String {
     let mut header = format!(
-        "{}={encoded}; Path=/; HttpOnly; SameSite=Lax; Max-Age={FLOW_COOKIE_MAX_AGE_SECONDS}",
+        "{}={flow_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={FLOW_COOKIE_MAX_AGE_SECONDS}",
         flow_cookie_name(policy)
     );
     if policy.secure {
@@ -139,26 +196,14 @@ fn clear_flow_cookie(policy: &CookiePolicy) -> String {
     header
 }
 
-/// Reads `flow_cookie`'s value back out, or `None` if it is absent, expired,
-/// or corrupt. A callback with no flow cookie cannot be trusted — there is
-/// nothing to compare its `state` against — so this is the gate `callback`
-/// checks before anything else touches the network.
-pub fn flow_from_cookie(headers: &HeaderMap, policy: &CookiePolicy) -> Option<FlowState> {
-    let value = sessions::cookie_from_headers(headers, flow_cookie_name(policy))?;
-    decode_flow(&value)
-}
-
-/// JSON, then base64url (no padding) — the same alphabet already used for
-/// `state`/`nonce`/`pkce_verifier` (see `random_token`), so the cookie value
-/// never needs percent-encoding.
-fn encode_flow(flow: &FlowState) -> String {
-    let json = serde_json::to_vec(flow).expect("FlowState is plain strings; serialization cannot fail");
-    URL_SAFE_NO_PAD.encode(json)
-}
-
-fn decode_flow(value: &str) -> Option<FlowState> {
-    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Takes the flow named by the request's flow cookie out of `store`, or
+/// `None` if the cookie is absent or its flow expired, was used, or never
+/// existed. A callback with no flow cannot be trusted — there is nothing to
+/// compare its `state` against — so this is the gate `callback` checks before
+/// anything else touches the network.
+pub fn take_flow(store: &FlowStore, headers: &HeaderMap, policy: &CookiePolicy) -> Option<FlowState> {
+    let id = sessions::cookie_from_headers(headers, flow_cookie_name(policy))?;
+    store.take(&id)
 }
 
 /// A cryptographically random, URL-safe token — used for `state`, `nonce`,
@@ -185,15 +230,16 @@ pub struct LoginParams {
     pub return_to: Option<String>,
 }
 
-/// Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in
-/// the flow cookie, and sends the browser to the provider. Cannot fail —
-/// there is no user input yet and no network call, only local randomness —
-/// so this returns a bare `Response`, not a `Result`.
+/// Starts a login: mints `state`/`nonce`/a PKCE verifier, keeps them in the
+/// flow store under a random id set as the flow cookie, and sends the browser
+/// to the provider. Refused with a generic 503 only when too many logins are
+/// pending at once.
 #[utoipa::path(
     get, path = "/auth/oidc/login", tag = "auth",
     params(LoginParams),
     responses(
-        (status = 302, description = "Redirects to the identity provider's authorization endpoint"),
+        (status = 303, description = "Redirects to the identity provider's authorization endpoint"),
+        (status = 503, description = "Too many sign-ins in progress; try again shortly"),
     ),
 )]
 pub async fn login(
@@ -204,14 +250,16 @@ pub async fn login(
     start_flow(&state, &auth_state, sanitize_return_to(params.return_to.as_deref()), None)
 }
 
-/// The invite link: starts a login with the invite token bound to the flow,
-/// and does nothing else. Whether the token is any good is decided only after
+/// The invite link: starts a login with the invite token's hash bound to the
+/// server-side flow, and does nothing else. The token never reaches a cookie
+/// or the provider. Whether the token is any good is decided only after
 /// the provider has verified who is signing in.
 #[utoipa::path(
     get, path = "/auth/invite/{token}", tag = "auth",
     params(("token" = String, Path, description = "The invite link token")),
     responses(
-        (status = 302, description = "Redirects to the identity provider's authorization endpoint"),
+        (status = 303, description = "Redirects to the identity provider's authorization endpoint"),
+        (status = 503, description = "Too many sign-ins in progress; try again shortly"),
     ),
 )]
 pub async fn invite(
@@ -219,7 +267,7 @@ pub async fn invite(
     Extension(auth_state): Extension<AuthApiState>,
     Path(token): Path<String>,
 ) -> Response {
-    start_flow(&state, &auth_state, INVITE_LANDING.to_string(), Some(token))
+    start_flow(&state, &auth_state, INVITE_LANDING.to_string(), Some(sessions::hash_session_token(&token)))
 }
 
 /// Where an accepted invite lands: the trader app, never the admin console at
@@ -230,20 +278,25 @@ fn start_flow(
     state: &AppState,
     auth_state: &AuthApiState,
     return_to: String,
-    invite_token: Option<String>,
+    invite_token_hash: Option<String>,
 ) -> Response {
     let flow = FlowState {
         state: random_token(),
         nonce: random_token(),
         pkce_verifier: random_token(),
         return_to,
-        invite_token,
+        invite_token_hash,
     };
     let challenge = pkce_challenge(&flow.pkce_verifier);
     let authorize_url = auth_state.provider.authorize_url(&flow.state, &flow.nonce, &challenge);
+    let Some(flow_id) = auth_state.flows.insert(flow) else {
+        tracing::warn!("login refused: too many sign-ins in progress");
+        return ApiError { status: StatusCode::SERVICE_UNAVAILABLE, message: "sign-in unavailable, try again shortly".to_string() }
+            .into_response();
+    };
 
     let mut response = Redirect::to(&authorize_url).into_response();
-    let cookie = flow_cookie(&state.session_config.cookie_policy, &flow);
+    let cookie = flow_cookie(&state.session_config.cookie_policy, &flow_id);
     response.headers_mut().insert(
         header::SET_COOKIE,
         cookie.parse().expect("flow cookie header value is plain ASCII"),
@@ -346,7 +399,7 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
     get, path = "/auth/oidc/callback", tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 302, description = "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=...)"),
+        (status = 303, description = "Login completed (session cookie set, redirects to the validated return_to), or refused or awaiting admin approval (redirects to /trade/access?reason=..., e.g. pending_approval)"),
         (status = 400, description = "Malformed callback, or a missing/expired/mismatched login flow"),
         (status = 401, description = "The provider rejected the login, or the exchanged token failed verification"),
         (status = 403, description = "The claim gate rejected the identity"),
@@ -374,7 +427,7 @@ pub async fn callback(
     };
 
     let policy = &state.session_config.cookie_policy;
-    let flow = flow_from_cookie(&headers, policy).ok_or_else(|| ApiError {
+    let flow = take_flow(&auth_state.flows, &headers, policy).ok_or_else(|| ApiError {
         status: StatusCode::BAD_REQUEST,
         message: "missing or expired login flow".to_string(),
     })?;
@@ -402,7 +455,13 @@ pub async fn callback(
         }
     }
 
-    let outcome = invites::resolve_login(state.pool(), &identity, flow.invite_token.as_deref())
+    // A live session on this browser is the owner proof a link invite needs.
+    let owner_session = match crate::auth::authenticate_session(state.pool(), &headers, &state.session_config).await {
+        Ok(record) => record.map(|r| r.principal_id),
+        Err(unavailable) => return Ok(unavailable),
+    };
+    let policy_for_claim = ClaimPolicy { trust_email_verified: auth_state.trust_email_verified, owner_session };
+    let outcome = invites::resolve_login(state.pool(), &identity, flow.invite_token_hash.as_deref(), &policy_for_claim)
         .await
         .map_err(|err| db_error("resolve_login", err))?;
 
@@ -599,34 +658,59 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn the_flow_cookie_survives_a_round_trip() {
-        let policy = crate::sessions::cookie_policy("localhost:3001", None);
-        let flow = FlowState {
-            state: "st-1".into(),
+    fn flow(state: &str) -> FlowState {
+        FlowState {
+            state: state.into(),
             nonce: "n-1".into(),
             pkce_verifier: "v-1".into(),
             return_to: "/".into(),
-            invite_token: None,
-        };
+            invite_token_hash: None,
+        }
+    }
 
-        let header = flow_cookie(&policy, &flow);
+    fn cookie_request(set_cookie: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        let value = header.split(';').next().unwrap().to_string();
-        headers.insert("cookie", value.parse().unwrap());
+        headers.insert("cookie", set_cookie.split(';').next().unwrap().parse().unwrap());
+        headers
+    }
 
-        let read = flow_from_cookie(&headers, &policy).expect("flow");
+    #[test]
+    fn the_flow_is_kept_server_side_and_taken_once() {
+        let policy = crate::sessions::cookie_policy("localhost:3001", None);
+        let store = FlowStore::default();
+        let id = store.insert(flow("st-1")).expect("room");
+
+        let headers = cookie_request(&flow_cookie(&policy, &id));
+        let read = take_flow(&store, &headers, &policy).expect("flow");
         assert_eq!(read.state, "st-1");
-        assert_eq!(read.nonce, "n-1");
         assert_eq!(read.pkce_verifier, "v-1");
+        assert!(take_flow(&store, &headers, &policy).is_none(), "a flow is single use");
+    }
+
+    #[test]
+    fn an_expired_flow_is_gone() {
+        let store = FlowStore::new(Duration::ZERO, 10);
+        let id = store.insert(flow("st-1")).expect("room");
+        assert!(store.take(&id).is_none());
+    }
+
+    #[test]
+    fn the_flow_store_is_bounded() {
+        let store = FlowStore::new(Duration::from_secs(300), 2);
+        assert!(store.insert(flow("a")).is_some());
+        assert!(store.insert(flow("b")).is_some());
+        assert!(store.insert(flow("c")).is_none(), "past the cap a new flow is refused");
+
+        // Expired flows are evicted to make room.
+        let store = FlowStore::new(Duration::ZERO, 1);
+        assert!(store.insert(flow("a")).is_some());
+        assert!(store.insert(flow("b")).is_some());
     }
 
     #[test]
     fn the_flow_cookie_is_short_lived_and_unreadable_to_script() {
         let policy = crate::sessions::cookie_policy("localhost:3001", None);
-        let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(), invite_token: None,
-        });
+        let header = flow_cookie(&policy, "flow-id");
 
         assert!(header.contains("HttpOnly"));
         assert!(header.contains("Max-Age=300"));
@@ -634,12 +718,13 @@ mod tests {
 
     #[test]
     fn a_callback_with_no_flow_cookie_cannot_be_trusted() {
-        assert!(flow_from_cookie(&HeaderMap::new(), &crate::sessions::cookie_policy("localhost:3001", None)).is_none());
+        let store = FlowStore::default();
+        assert!(take_flow(&store, &HeaderMap::new(), &crate::sessions::cookie_policy("localhost:3001", None)).is_none());
     }
 
     #[test]
     fn a_state_mismatch_is_rejected_before_anything_is_exchanged() {
-        let flow = FlowState { state: "expected".into(), nonce: "n".into(), pkce_verifier: "v".into(), return_to: "/".into(), invite_token: None };
+        let flow = flow("expected");
 
         assert!(!callback_state_matches(&flow, "attacker-supplied"));
         assert!(callback_state_matches(&flow, "expected"));
@@ -666,12 +751,56 @@ mod tests {
     #[test]
     fn a_flow_cookie_on_a_public_bind_is_host_prefixed_and_secure() {
         let policy = crate::sessions::cookie_policy("0.0.0.0:3001", None);
-        let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(), invite_token: None,
-        });
+        let header = flow_cookie(&policy, "flow-id");
 
         assert!(header.starts_with("__Host-oms_login_flow="));
         assert!(header.contains("Secure"));
+    }
+
+    fn test_auth_state(store: Arc<FlowStore>) -> AuthApiState {
+        AuthApiState {
+            provider: Arc::new(crate::oidc::Provider::for_test("https://id.example.com", "oms", "https://oms.example.com")),
+            required_claim: None,
+            require_amr: Vec::new(),
+            trust_email_verified: true,
+            flows: store,
+        }
+    }
+
+    #[tokio::test]
+    async fn flow_cookie_has_no_invite_token() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let state = crate::handlers::tests::test_app_state(pool);
+        let store = Arc::new(FlowStore::default());
+        let token = "invite-token-plaintext-1234567890";
+
+        let response = invite(State(state.clone()), Extension(test_auth_state(store.clone())), Path(token.to_string())).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
+        let location = response.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+        let token_hash = crate::sessions::hash_session_token(token);
+        for leaked in [token, token_hash.as_str()] {
+            assert!(!set_cookie.contains(leaked), "the cookie carries only the flow id");
+            assert!(!location.contains(leaked), "the IdP never sees the invite token");
+        }
+
+        // The flow id resolves server-side to the invite's hash, never the token.
+        let policy = &state.session_config.cookie_policy;
+        let flow = take_flow(&store, &cookie_request(&set_cookie), policy).expect("flow");
+        assert_eq!(flow.invite_token_hash.as_deref(), Some(token_hash.as_str()));
+        assert_eq!(flow.return_to, "/trade/");
+        assert!(location.contains(&format!("state={}", flow.state)));
+    }
+
+    #[tokio::test]
+    async fn a_full_flow_store_refuses_login_generically() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let state = crate::handlers::tests::test_app_state(pool);
+        let store = Arc::new(FlowStore::new(Duration::from_secs(300), 0));
+
+        let response = login(State(state), Extension(test_auth_state(store)), Query(LoginParams { return_to: None })).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
     }
 
     #[test]
@@ -746,50 +875,11 @@ mod tests {
     }
 
     #[test]
-    fn the_flow_cookie_carries_the_return_to() {
-        let policy = crate::sessions::cookie_policy("localhost:3001", None);
-        let flow = FlowState {
-            state: "st-1".into(),
-            nonce: "n-1".into(),
-            pkce_verifier: "v-1".into(),
-            return_to: "/trade/".into(),
-            invite_token: None,
-        };
-
-        let header = flow_cookie(&policy, &flow);
-        let mut headers = HeaderMap::new();
-        headers.insert("cookie", header.split(';').next().unwrap().parse().unwrap());
-
-        assert_eq!(flow_from_cookie(&headers, &policy).expect("flow").return_to, "/trade/");
-    }
-
-    #[test]
-    fn the_flow_cookie_carries_the_invite_token() {
-        let policy = crate::sessions::cookie_policy("localhost:3001", None);
-        let flow = FlowState {
-            state: "st-1".into(),
-            nonce: "n-1".into(),
-            pkce_verifier: "v-1".into(),
-            return_to: "/".into(),
-            invite_token: Some("tok-1".into()),
-        };
-
-        let header = flow_cookie(&policy, &flow);
-        let mut headers = HeaderMap::new();
-        headers.insert("cookie", header.split(';').next().unwrap().parse().unwrap());
-
-        assert_eq!(flow_from_cookie(&headers, &policy).expect("flow").invite_token.as_deref(), Some("tok-1"));
-    }
-
-    #[test]
     fn a_refused_login_lands_on_the_access_page_with_its_reason() {
         assert_eq!(access_refused_url(&ClaimOutcome::NoInvite), "/trade/access?reason=no_invite");
         assert_eq!(access_refused_url(&ClaimOutcome::Expired), "/trade/access?reason=expired");
         assert_eq!(access_refused_url(&ClaimOutcome::Revoked), "/trade/access?reason=revoked");
-        assert_eq!(
-            access_refused_url(&ClaimOutcome::EmailUnverified),
-            "/trade/access?reason=email_unverified"
-        );
+        assert_eq!(access_refused_url(&ClaimOutcome::PendingApproval), "/trade/access?reason=pending_approval");
         assert_eq!(
             access_refused_url(&ClaimOutcome::EmailMismatch { invited_hint: "j…@fundco.com".into() }),
             "/trade/access?reason=email_mismatch&hint=j%E2%80%A6%40fundco.com"
