@@ -343,6 +343,7 @@ pub async fn set_role(
     .map_err(db)?;
     audit(&mut tx, &ctx, "user.role_changed", id, serde_json::json!({ "from": from, "to": p.role })).await?;
     tx.commit().await.map_err(db)?;
+    state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -388,6 +389,7 @@ pub async fn set_portfolios(
     }
     audit(&mut tx, &ctx, "user.portfolios_changed", id, serde_json::json!({ "portfolios": grants })).await?;
     tx.commit().await.map_err(db)?;
+    state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -420,6 +422,7 @@ pub async fn disable_user(State(state): State<AppState>, Extension(ctx): Extensi
     .map_err(db)?;
     audit(&mut tx, &ctx, "user.disabled", id, serde_json::json!({ "sessions_revoked": sessions })).await?;
     tx.commit().await.map_err(db)?;
+    state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -486,6 +489,7 @@ pub async fn set_admin(
         audit(&mut tx, &ctx, "admin.revoked", id, serde_json::json!({})).await?;
     }
     tx.commit().await.map_err(db)?;
+    state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -618,6 +622,7 @@ pub async fn revoke_key(
     }
     audit(&mut tx, &ctx, "key.revoked", id, serde_json::json!({ "key_id": key_id })).await?;
     tx.commit().await.map_err(db)?;
+    state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
 }
 

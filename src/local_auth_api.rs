@@ -896,6 +896,7 @@ pub async fn logout_all(State(state): State<AppState>, headers: HeaderMap) -> Re
     if let Err(e) = sessions::revoke_all_for_principal(state.pool(), session.principal_id).await {
         return internal("revoke_all_for_principal", e);
     }
+    state.event_bus().publish_auth_changed(session.principal_id);
     with_cookie(StatusCode::NO_CONTENT.into_response(), sessions::clear_cookie_header(&state.session_config.cookie_policy))
 }
 

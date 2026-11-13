@@ -305,6 +305,12 @@ pub fn admin_mfa_gate(method: &axum::http::Method, ctx: &AuthContext) -> Result<
     crate::authz::require_mfa(ctx)
 }
 
+/// The `key_id` of the API key on this request, if it carries one in either
+/// form. Does not verify the secret — callers rely on the middleware for that.
+pub fn trading_key_id(headers: &header::HeaderMap) -> Option<String> {
+    extract_trading_credentials(headers).ok().map(|(key_id, _)| key_id)
+}
+
 /// Extract `(key_id, secret)` from either credential form:
 /// - `Authorization: Basic base64(key_id:secret)`
 /// - `Authorization: Bearer key_id.secret` (single trading token)

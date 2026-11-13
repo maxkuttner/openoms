@@ -20,6 +20,15 @@ use crate::event_store::{AppendResult, NewOrderEvent};
 
 pub const ORDER_LANE_CAPACITY: usize = 1024;
 pub const PRICE_LANE_CAPACITY: usize = 4096;
+pub const AUTH_LANE_CAPACITY: usize = 256;
+
+/// A principal's access changed (disabled, role, portfolios, admin, logout-all,
+/// key revoked). Open live-update sockets of that principal re-check their
+/// credential and reload their scope at once instead of at the next tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AuthChanged {
+    pub principal_id: Uuid,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderLaneEvent {
@@ -46,13 +55,15 @@ impl From<&dataprovider::Quote> for MarkUpdate {
 pub struct EventBus {
     order: broadcast::Sender<OrderLaneEvent>,
     price: broadcast::Sender<MarkUpdate>,
+    auth: broadcast::Sender<AuthChanged>,
 }
 
 impl EventBus {
     pub fn new() -> Self {
         let (order, _) = broadcast::channel(ORDER_LANE_CAPACITY);
         let (price, _) = broadcast::channel(PRICE_LANE_CAPACITY);
-        Self { order, price }
+        let (auth, _) = broadcast::channel(AUTH_LANE_CAPACITY);
+        Self { order, price, auth }
     }
 
     // send only errs when nobody is subscribed, which is not a failure
@@ -62,6 +73,15 @@ impl EventBus {
 
     pub fn publish_mark(&self, m: MarkUpdate) {
         let _ = self.price.send(m);
+    }
+
+    /// Call after the change has committed.
+    pub fn publish_auth_changed(&self, principal_id: Uuid) {
+        let _ = self.auth.send(AuthChanged { principal_id });
+    }
+
+    pub fn subscribe_auth(&self) -> broadcast::Receiver<AuthChanged> {
+        self.auth.subscribe()
     }
 
     pub fn subscribe_order(&self) -> broadcast::Receiver<OrderLaneEvent> {

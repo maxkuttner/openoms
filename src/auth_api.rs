@@ -469,6 +469,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result
             sessions::revoke_session(state.pool(), record.id)
                 .await
                 .map_err(|err| db_error("revoke_session", err))?;
+            state.event_bus().publish_auth_changed(record.principal_id);
         }
     }
 
