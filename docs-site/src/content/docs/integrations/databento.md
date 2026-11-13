@@ -21,7 +21,8 @@ One API key. Enter it in the cockpit under **Data feeds → databento-opra →
 Credentials** (**Test**, then **Save**), then reload:
 
 ```sh
-# the host token sits next to oms.toml; the server accepts it from this machine only
+# the host token is the file host-token next to your oms.toml (default ~/.config/oms/host-token);
+# the server accepts it from this machine only
 curl -s -X POST localhost:3001/admin/connections/reload \
   -H "Authorization: Bearer $(cat ~/.config/oms/host-token)"
 ```

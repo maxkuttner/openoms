@@ -58,7 +58,8 @@ read, and nothing else. These need a session that passed MFA:
 - creating or handing over strategies, and changing limits;
 - every change in the admin console (users, roles, connections, keys).
 
-Reads never need it. API keys, strategy tokens and the host token are exempt: they are
+Reads never need it, and neither does adding or removing instruments on your own
+watchlist: that is a personal view setting, not an order or admin action. API keys, strategy tokens and the host token are exempt: they are
 machine credentials with their own scope. For SSO sessions see
 [`require_amr`](#require-mfa-from-the-identity-provider).
 
@@ -74,10 +75,19 @@ and portfolios first, then offers the enabled sign-in methods: set a password an
 authenticator, or sign in with SSO. The new user appears as **Invited** and cannot sign in
 or use API keys until they accept.
 
+**Sign-in method** in the dialog restricts how the invite can be claimed: **Any sign-in method** (the
+default), **Email + password only**, or **SSO only**. The API takes the same choice as
+`"method": "any" | "local" | "oidc"` on `POST /admin/users/invite` and on reissue; any
+other value is refused with 422.
+
 From the list you can also **copy**, **revoke** or **reissue** a pending invite (a revoked
 or expired link shows its own message), change the **role** or **portfolios** (effective on
 the next request), **disable** a user (sessions end at once and API keys stop), and create
 or revoke their **API keys**.
+
+Revoking access ends the user's open live-update connections immediately. Revocations the
+running server is not told about, a session reaching its absolute lifetime or a host-CLI
+`oms auth recover-admin`, close those connections at the next check, within 15 seconds.
 
 The home page has a **setup checklist** until you are done: connect a venue, create a
 portfolio, confirm sign-in works, invite a user and see a first order. Invites,
@@ -199,14 +209,19 @@ settings. Use the values your provider emits (for example `mfa`, `otp`, `hwk`).
 ## SSO only
 
 ```toml
-[auth.local]
-enabled = false
+[auth]
+policy = "sso_only"
 ```
 
-Local sign-in is hidden and refused; everyone uses the provider. Set this only after SSO
-works and an admin has signed in through it. Because the provider is then the only way in,
-note that recovery (below) mints a local enrolment link: set `enabled = true` again while
-you use it.
+Local sign-in and enrolment are refused and the login page shows only SSO, whatever
+`[auth.local].enabled` says (`[auth.local] enabled = false` has the same effect). Set this
+only after SSO works and an admin has signed in through it.
+
+The host CLI still works, but the links `oms auth bootstrap-admin` and
+`oms auth recover-admin` print enrol a **local** password and authenticator, which this
+policy refuses; the command prints a note saying so. To use such a link, set
+`policy = "local_and_sso"` and restart, enrol with the link, then set `sso_only` back and
+restart.
 
 ## Recover an admin from the host
 
