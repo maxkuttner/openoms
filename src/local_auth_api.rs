@@ -1316,7 +1316,8 @@ mod tests {
         let bad = totp_req(&st, &l, &old, "000000").await;
         assert_eq!(bad.status(), StatusCode::UNAUTHORIZED);
 
-        let resp = totp_req(&st, &l, &old, &code_at(&uri, 30)).await;
+        let code = code_at(&uri, 30);
+        let resp = totp_req(&st, &l, &old, &code).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let new = cookie_of(&resp).unwrap();
         assert_ne!(new, old);
@@ -1327,7 +1328,8 @@ mod tests {
 
         // The same code cannot be replayed on a fresh login.
         let again = cookie_of(&login_req(&st, &l, 1, "eve@fund.test", PASSWORD).await).unwrap();
-        let replay = totp_req(&st, &l, &again, &code_at(&uri, 30)).await;
+        // The very same code string: recomputing it could cross a 30 s step.
+        let replay = totp_req(&st, &l, &again, &code).await;
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
     }
 
