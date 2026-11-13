@@ -16,6 +16,8 @@ mod symbology_resolver;
 mod setup;
 mod sessions;
 mod oidc;
+#[allow(dead_code)] // wired into routes by the local-login task
+mod local_auth;
 mod auth_api;
 mod invites;
 mod users_api;

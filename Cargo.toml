@@ -100,6 +100,10 @@ mime_guess = "2"
 # OIDC relying-party protocol: discovery, the code exchange, and ID-token
 # verification. Not a session framework — sessions are ours (src/sessions.rs).
 openidconnect = "4"
+argon2 = "0.6.0"
+totp-rs = { version = "6.0.0", features = ["otpauth", "gen_secret"] }
+base32 = "0.5"
+subtle = "2.6"
 
 [dev-dependencies]
 # Test-only: scratch install dirs for src/setup/update.rs.
