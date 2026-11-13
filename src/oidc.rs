@@ -39,6 +39,9 @@ pub struct Expectations {
 /// group/role gate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedIdentity {
+    /// The issuer the token was verified against; with `subject`, the
+    /// identity's key.
+    pub issuer: String,
     pub subject: String,
     pub display_name: Option<String>,
     pub email: Option<String>,
@@ -160,6 +163,7 @@ pub fn verify_id_token(
         .map(String::from);
 
     Ok(VerifiedIdentity {
+        issuer: expected.issuer.clone(),
         subject,
         display_name,
         email,

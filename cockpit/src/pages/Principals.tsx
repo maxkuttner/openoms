@@ -10,7 +10,7 @@ import type { Principal, ApiKeyRecord, Grant, Portfolio } from "../api/types";
 import { useLifecycle } from "../components/Lifecycle";
 import { statusOptions } from "../lifecycle";
 
-const PRINCIPAL_TYPES = ["HUMAN", "SERVICE", "STRATEGY", "DESK"].map((v) => ({ value: v, label: v }));
+const PRINCIPAL_TYPES = ["HUMAN", "STRATEGY"].map((v) => ({ value: v, label: v }));
 const STATUS = statusOptions("principal");
 
 export function PrincipalsPage() {
@@ -26,7 +26,7 @@ export function PrincipalsPage() {
   const isCreate = editing != null && !("id" in editing);
 
   const form = useForm({
-    initialValues: { code: "", principal_type: "HUMAN", display_name: "", external_subject: "", status: "ACTIVE" },
+    initialValues: { code: "", principal_type: "HUMAN", display_name: "", status: "ACTIVE" },
   });
 
   const openForm = (p: Principal | null) => {
@@ -34,7 +34,6 @@ export function PrincipalsPage() {
       code: p?.code ?? "",
       principal_type: p?.principal_type ?? "HUMAN",
       display_name: p?.display_name ?? "",
-      external_subject: p?.external_subject ?? "",
       status: p?.status ?? "ACTIVE",
     });
     setEditing(p ?? {});
@@ -44,7 +43,6 @@ export function PrincipalsPage() {
     (v: any) => {
       const body: any = { ...v };
       if (!body.display_name) delete body.display_name;
-      if (!body.external_subject) delete body.external_subject;
       return isCreate ? api.post("/admin/principals", body) : api.patch(`/admin/principals/${(editing as Principal).id}`, body);
     },
     { invalidate: ["/admin/principals"], success: isCreate ? "Principal created" : "Principal updated", onDone: () => setEditing(null) },
@@ -107,7 +105,6 @@ export function PrincipalsPage() {
             <TextInput label="Code" required disabled={!isCreate} {...form.getInputProps("code")} />
             <Select label="Type" data={PRINCIPAL_TYPES} {...form.getInputProps("principal_type")} />
             <TextInput label="Display name" {...form.getInputProps("display_name")} />
-            <TextInput label="External subject (OIDC sub, optional)" {...form.getInputProps("external_subject")} />
             <Select label="Status" data={STATUS} {...form.getInputProps("status")} />
             <Group justify="flex-end">
               <Button variant="default" onClick={() => setEditing(null)}>Cancel</Button>

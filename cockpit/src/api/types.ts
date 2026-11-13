@@ -6,7 +6,6 @@ export interface Principal {
   id: string;
   code: string;
   principal_type: string;
-  external_subject: string | null;
   display_name: string | null;
   status: string;
   created_at: string;

@@ -96,16 +96,40 @@ pub async fn applied_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
         .await
 }
 
+/// Env override for the OIDC issuer used to backfill `principal_identity`
+/// (migration 0047). Wins over `[auth.oidc].issuer`.
+pub const BACKFILL_ISSUER_ENV: &str = "OMS_OIDC_ISSUER_FOR_BACKFILL";
+
+/// The issuer migration 0047 links existing `external_subject`s under:
+/// `OMS_OIDC_ISSUER_FOR_BACKFILL`, else `[auth.oidc].issuer`, else none (the
+/// subjects are then left unlinked and their owners re-link via invite).
+fn backfill_issuer() -> Option<String> {
+    std::env::var(BACKFILL_ISSUER_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| crate::config::load().and_then(|c| c.auth.oidc.issuer.clone()))
+}
+
 /// Apply every pending migration. Returns how many ran.
 pub async fn apply_all(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    apply_matching(pool, |_, _| true).await
+}
+
+/// Apply the pending migrations `include(schema, filename)` accepts, in apply
+/// order. Tests use this to stop short of a migration and seed pre-migration data.
+pub(crate) async fn apply_matching(
+    pool: &PgPool,
+    include: impl Fn(&str, &str) -> bool,
+) -> Result<u64, sqlx::Error> {
+    let issuer = backfill_issuer();
     let mut applied = 0;
     for t in &TARGETS {
         let already = applied_set(pool, t.schema).await?;
         for (filename, sql) in assets::migrations(t) {
-            if already.contains(&filename) {
+            if already.contains(&filename) || !include(t.schema, &filename) {
                 continue;
             }
-            apply_one(pool, t, &filename, sql).await?;
+            apply_one(pool, t, &filename, sql, issuer.as_deref()).await?;
             applied += 1;
         }
     }
@@ -120,6 +144,7 @@ async fn apply_one(
     target: &MigrationTarget,
     filename: &str,
     sql: &str,
+    backfill_issuer: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     tracing::info!("[{}] applying {}", target.schema, filename);
     let mut tx = pool.begin().await?;
@@ -131,6 +156,13 @@ async fn apply_one(
     ))
     .execute(&mut *tx)
     .await?;
+
+    // Transaction-local, so it is visible to this file only and never leaks
+    // back into the pool's connection.
+    sqlx::query("SELECT set_config('oms.backfill_issuer', $1, true)")
+        .bind(backfill_issuer.unwrap_or(""))
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::raw_sql(sql).execute(&mut *tx).await?;
 

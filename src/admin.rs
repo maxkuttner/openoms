@@ -27,7 +27,6 @@ use symbology::InstrumentQuery;
 pub struct CreatePrincipal {
     pub code: String,
     pub principal_type: String,
-    pub external_subject: Option<String>,
     pub display_name: Option<String>,
     pub status: String,
 }
@@ -36,7 +35,6 @@ pub struct CreatePrincipal {
 pub struct UpdatePrincipal {
     pub code: Option<String>,
     pub principal_type: Option<String>,
-    pub external_subject: Option<String>,
     pub display_name: Option<String>,
     pub status: Option<String>,
 }
@@ -140,17 +138,15 @@ pub async fn create_principal(
             id,
             code,
             principal_type,
-            external_subject,
             display_name,
             status
-        ) VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id, code, principal_type, external_subject, display_name, status, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, code, principal_type, display_name, status, created_at, updated_at
         "#,
     )
     .bind(id)
     .bind(payload.code)
     .bind(payload.principal_type)
-    .bind(payload.external_subject)
     .bind(payload.display_name)
     .bind(payload.status)
     .fetch_one(state.pool())
@@ -160,14 +156,8 @@ pub async fn create_principal(
     Ok(Json(record))
 }
 
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-pub struct PrincipalFilter {
-    pub external_subject: Option<String>,
-}
-
 #[utoipa::path(
     get, path = "/admin/principals", tag = "admin",
-    params(PrincipalFilter),
     responses(
         (status = 200, description = "OK", body = [Principal]),
     ),
@@ -175,33 +165,18 @@ pub struct PrincipalFilter {
 )]
 pub async fn list_principals(
     State(state): State<AppState>,
-    Query(filter): Query<PrincipalFilter>,
 ) -> Result<Json<Vec<Principal>>, AdminError> {
     info!("admin list principals");
-    let records = if let Some(sub) = filter.external_subject {
-        sqlx::query_as::<_, Principal>(
-            r#"
-            SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
-            FROM principal
-            WHERE external_subject = $1
-            "#,
-        )
-        .bind(sub)
-        .fetch_all(state.pool())
-        .await
-        .map_err(map_db_error)?
-    } else {
-        sqlx::query_as::<_, Principal>(
-            r#"
-            SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
-            FROM principal
-            ORDER BY created_at DESC
-            "#,
-        )
-        .fetch_all(state.pool())
-        .await
-        .map_err(map_db_error)?
-    };
+    let records = sqlx::query_as::<_, Principal>(
+        r#"
+        SELECT id, code, principal_type, display_name, status, created_at, updated_at
+        FROM principal
+        ORDER BY created_at DESC
+        "#,
+    )
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
 
     Ok(Json(records))
 }
@@ -222,7 +197,7 @@ pub async fn get_principal(
     info!(principal_id = %id, "admin get principal");
     let record = sqlx::query_as::<_, Principal>(
         r#"
-        SELECT id, code, principal_type, external_subject, display_name, status, created_at, updated_at
+        SELECT id, code, principal_type, display_name, status, created_at, updated_at
         FROM principal
         WHERE id = $1
         "#,
@@ -258,17 +233,15 @@ pub async fn update_principal(
         SET
             code = COALESCE($1, code),
             principal_type = COALESCE($2, principal_type),
-            external_subject = COALESCE($3, external_subject),
-            display_name = COALESCE($4, display_name),
-            status = COALESCE($5, status),
+            display_name = COALESCE($3, display_name),
+            status = COALESCE($4, status),
             updated_at = now()
-        WHERE id = $6
-        RETURNING id, code, principal_type, external_subject, display_name, status, created_at, updated_at
+        WHERE id = $5
+        RETURNING id, code, principal_type, display_name, status, created_at, updated_at
         "#,
     )
     .bind(payload.code)
     .bind(payload.principal_type)
-    .bind(payload.external_subject)
     .bind(payload.display_name)
     .bind(payload.status)
     .bind(id)

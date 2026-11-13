@@ -87,6 +87,8 @@ mod cockpit;
 mod reload_tests;
 #[cfg(test)]
 mod boundary_tests;
+#[cfg(test)]
+mod authz_schema_tests;
 
 #[derive(OpenApi)]
 #[openapi(

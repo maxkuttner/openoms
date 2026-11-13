@@ -1606,17 +1606,6 @@
           "admin"
         ],
         "operationId": "list_principals",
-        "parameters": [
-          {
-            "name": "external_subject",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          }
-        ],
         "responses": {
           "200": {
             "description": "OK",
@@ -4879,10 +4868,6 @@
             "type": "string",
             "nullable": true
           },
-          "external_subject": {
-            "type": "string",
-            "nullable": true
-          },
           "principal_type": {
             "type": "string"
           },
@@ -6036,10 +6021,6 @@
             "type": "string",
             "nullable": true
           },
-          "external_subject": {
-            "type": "string",
-            "nullable": true
-          },
           "id": {
             "type": "string",
             "format": "uuid"
@@ -7080,10 +7061,6 @@
             "nullable": true
           },
           "display_name": {
-            "type": "string",
-            "nullable": true
-          },
-          "external_subject": {
             "type": "string",
             "nullable": true
           },

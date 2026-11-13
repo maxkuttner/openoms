@@ -8,7 +8,6 @@ pub struct Principal {
     pub id: Uuid,
     pub code: String,
     pub principal_type: String,
-    pub external_subject: Option<String>,
     pub display_name: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,

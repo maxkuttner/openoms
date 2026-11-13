@@ -37,11 +37,10 @@ pub enum ResolveOutcome {
     /// `required_claim` is configured and the identity's claims don't satisfy
     /// it. No principal was read, created, or touched.
     ClaimRejected,
-    /// `external_subject` already belongs to a row this subject must never
-    /// resolve onto or touch — a non-HUMAN principal (SERVICE, STRATEGY,
-    /// DESK) or a DISABLED one. Nothing was created or modified: this is a
-    /// refusal, not a provisioning opportunity, since `external_subject` is
-    /// UNIQUE and this subject can never claim a different row.
+    /// The `(issuer, subject)` identity is already linked to a row this
+    /// login must never resolve onto or touch — a non-HUMAN principal or a
+    /// DISABLED one. Nothing was created or modified: this is a refusal, not
+    /// a provisioning opportunity, since an identity links to one row only.
     SubjectNotAvailable,
 }
 
@@ -58,22 +57,11 @@ pub async fn resolve_or_provision(
     identity: &VerifiedIdentity,
     required_claim: Option<&(String, String)>,
 ) -> Result<ResolveOutcome, sqlx::Error> {
-    // A SERVICE or STRATEGY principal must never hold a browser session, and a
-    // DISABLED one must never resolve at all — both are enforced right here in
-    // the match, not left to a caller to remember.
-    let existing = sqlx::query(
-        "SELECT id, code FROM principal \
-         WHERE external_subject = $1 AND status = 'ACTIVE' AND principal_type = 'HUMAN'",
-    )
-    .bind(&identity.subject)
-    .fetch_optional(pool)
-    .await?;
-
-    if let Some(row) = existing {
-        return Ok(ResolveOutcome::Resolved {
-            principal_id: row.get("id"),
-            principal_code: row.get("code"),
-        });
+    // A STRATEGY principal must never hold a browser session, and a DISABLED
+    // one must never resolve at all — both are enforced right here in the
+    // match, not left to a caller to remember.
+    if let Some(outcome) = lookup_identity(pool, identity).await? {
+        return Ok(outcome);
     }
 
     // Checked before any insert: a rejected subject must leave no row behind.
@@ -92,43 +80,68 @@ pub async fn resolve_or_provision(
         .unwrap_or(&identity.subject);
     let code = generate_unique_code(pool, code_seed).await?;
 
-    // ON CONFLICT (external_subject) is what makes two concurrent first
-    // logins for the same subject idempotent rather than a unique-violation
-    // error: whichever insert loses the race just updates the winner's row
-    // (display_name only — code, id, and grants are untouched) and returns
-    // it, same as if it had matched on the lookup above.
-    //
-    // The DO UPDATE's WHERE guard is load-bearing: without it, a conflict
-    // against a SERVICE/STRATEGY/DESK or DISABLED principal would still fire
-    // the update and hand this subject that row's id, code, and every grant
-    // it holds — a privilege escalation. With the guard, a conflict against
-    // such a row satisfies no WHERE clause, so DO UPDATE affects zero rows
-    // and RETURNING yields nothing: `fetch_optional` sees `None`, and that is
-    // treated as a refusal below, not as "nothing happened, fall through to
-    // provisioning" (this row already exists — provisioning would collide on
-    // the UNIQUE external_subject too).
-    let row = sqlx::query(
-        "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-         VALUES ($1, $2, 'HUMAN', $3, $4, 'ACTIVE') \
-         ON CONFLICT (external_subject) DO UPDATE SET display_name = EXCLUDED.display_name \
-         WHERE principal.principal_type = 'HUMAN' AND principal.status = 'ACTIVE' \
-         RETURNING id, code",
+    // Principal and identity are created together. If a concurrent first
+    // login for the same identity won the race, the identity insert conflicts
+    // on (issuer, subject): roll back our principal and resolve onto the
+    // winner's row exactly as the lookup above would have.
+    let mut tx = pool.begin().await?;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO principal (id, code, principal_type, display_name, status) \
+         VALUES ($1, $2, 'HUMAN', $3, 'ACTIVE')",
     )
-    .bind(Uuid::new_v4())
+    .bind(id)
     .bind(&code)
-    .bind(&identity.subject)
     .bind(&identity.display_name)
+    .execute(&mut *tx)
+    .await?;
+    let linked = sqlx::query(
+        "INSERT INTO principal_identity (issuer, subject, principal_id) VALUES ($1, $2, $3) \
+         ON CONFLICT (issuer, subject) DO NOTHING",
+    )
+    .bind(&identity.issuer)
+    .bind(&identity.subject)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if linked == 0 {
+        tx.rollback().await?;
+        return Ok(lookup_identity(pool, identity)
+            .await?
+            .unwrap_or(ResolveOutcome::SubjectNotAvailable));
+    }
+    tx.commit().await?;
+
+    Ok(ResolveOutcome::Resolved { principal_id: id, principal_code: code })
+}
+
+/// The outcome for an already-linked identity, or `None` if it is unlinked.
+async fn lookup_identity(
+    pool: &PgPool,
+    identity: &VerifiedIdentity,
+) -> Result<Option<ResolveOutcome>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT p.id, p.code, p.principal_type, p.status \
+           FROM principal_identity i JOIN principal p ON p.id = i.principal_id \
+          WHERE i.issuer = $1 AND i.subject = $2",
+    )
+    .bind(&identity.issuer)
+    .bind(&identity.subject)
     .fetch_optional(pool)
     .await?;
-
-    let Some(row) = row else {
-        return Ok(ResolveOutcome::SubjectNotAvailable);
-    };
-
-    Ok(ResolveOutcome::Resolved {
-        principal_id: row.get("id"),
-        principal_code: row.get("code"),
-    })
+    Ok(row.map(|row| {
+        let kind: String = row.get("principal_type");
+        let status: String = row.get("status");
+        if kind == "HUMAN" && status == "ACTIVE" {
+            ResolveOutcome::Resolved {
+                principal_id: row.get("id"),
+                principal_code: row.get("code"),
+            }
+        } else {
+            ResolveOutcome::SubjectNotAvailable
+        }
+    }))
 }
 
 // ── HTTP layer: /auth/login, /auth/callback, /auth/logout, /auth/me ────────
@@ -861,7 +874,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn an_existing_principal_is_matched_on_its_external_subject() {
+    async fn an_existing_principal_is_matched_on_its_identity() {
         let pool = test_pool().await;
         let subject = format!("sub-{}", Uuid::new_v4());
         let expected = seed_principal_with_subject(&pool, &subject).await;
@@ -901,14 +914,13 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn a_subject_already_held_by_a_service_principal_is_refused_not_hijacked() {
+    async fn a_subject_already_held_by_a_strategy_principal_is_refused_not_hijacked() {
         let pool = test_pool().await;
         let subject = format!("sub-{}", Uuid::new_v4());
-        let (service_id, original_name) = seed_service_principal_with_subject(&pool, &subject).await;
+        let (service_id, original_name) = seed_strategy_principal_with_subject(&pool, &subject).await;
 
-        // An attacker-controlled display_name must not leak into the service
-        // principal even though the ON CONFLICT arbiter (external_subject)
-        // does match this row.
+        // An attacker-controlled display_name must not leak into the strategy
+        // principal even though its identity matches this login.
         let mut identity = identity_for(&subject);
         identity.display_name = Some("Attacker-Controlled Name".to_string());
 
@@ -917,7 +929,8 @@ mod tests {
         assert!(matches!(outcome, ResolveOutcome::SubjectNotAvailable));
 
         let principal_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM principal WHERE external_subject = $1")
+            sqlx::query_scalar("SELECT count(*) FROM principal_identity WHERE issuer = $1 AND subject = $2")
+                .bind(TEST_ISSUER)
                 .bind(&subject)
                 .fetch_one(&pool)
                 .await
@@ -929,7 +942,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("read display_name");
-        assert_eq!(name, original_name, "the service principal must not be touched");
+        assert_eq!(name, original_name, "the strategy principal must not be touched");
     }
 
     #[tokio::test]
@@ -967,11 +980,25 @@ mod tests {
     /// unique without leaning on the collision-suffix path.
     fn identity_for(subject: &str) -> VerifiedIdentity {
         VerifiedIdentity {
+            issuer: TEST_ISSUER.to_string(),
             subject: subject.to_string(),
             display_name: Some("Test User".to_string()),
             email: Some(format!("{subject}@example.com")),
             claims: serde_json::json!({}),
         }
+    }
+
+    const TEST_ISSUER: &str = "https://idp.test";
+
+    /// Links `subject` under `TEST_ISSUER` to principal `id`.
+    async fn link(pool: &sqlx::PgPool, id: Uuid, subject: &str) {
+        sqlx::query("INSERT INTO principal_identity (issuer, subject, principal_id) VALUES ($1, $2, $3)")
+            .bind(TEST_ISSUER)
+            .bind(subject)
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("link identity");
     }
 
     /// `main` loads .env before resolving config; a test binary does not, so
@@ -1001,59 +1028,59 @@ mod tests {
         let id = Uuid::new_v4();
         let code = format!("seeded-{id}");
         sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-             VALUES ($1, $2, 'HUMAN', $3, $2, 'ACTIVE')",
+            "INSERT INTO principal (id, code, principal_type, display_name, status) \
+             VALUES ($1, $2, 'HUMAN', $2, 'ACTIVE')",
         )
         .bind(id)
         .bind(&code)
-        .bind(subject)
         .execute(pool)
         .await
         .expect("seed principal");
+        link(pool, id, subject).await;
         id
     }
 
-    /// Seeds an ACTIVE SERVICE principal already bound to `subject` — the
-    /// scenario where a human's `sub` collides with a machine credential's.
+    /// Seeds an ACTIVE STRATEGY principal already bound to `subject` — the
+    /// scenario where a human's `sub` collides with a non-human principal's.
     /// Returns its id and the `display_name` it was seeded with, so callers
     /// can assert that name survives untouched.
-    async fn seed_service_principal_with_subject(
+    async fn seed_strategy_principal_with_subject(
         pool: &sqlx::PgPool,
         subject: &str,
     ) -> (Uuid, String) {
         let id = Uuid::new_v4();
-        let code = format!("service-{id}");
-        let display_name = format!("Service {id}");
+        let code = format!("strategy-{id}");
+        let display_name = format!("Strategy {id}");
         sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-             VALUES ($1, $2, 'SERVICE', $3, $4, 'ACTIVE')",
+            "INSERT INTO principal (id, code, principal_type, display_name, status) \
+             VALUES ($1, $2, 'STRATEGY', $3, 'ACTIVE')",
         )
         .bind(id)
         .bind(&code)
-        .bind(subject)
         .bind(&display_name)
         .execute(pool)
         .await
-        .expect("seed service principal");
+        .expect("seed strategy principal");
+        link(pool, id, subject).await;
         (id, display_name)
     }
 
     /// Seeds a DISABLED HUMAN principal already bound to `subject` — e.g. an
-    /// offboarded user whose `external_subject` an admin never cleared.
+    /// offboarded user whose identity an admin never unlinked.
     /// Returns its id.
     async fn seed_disabled_human_with_subject(pool: &sqlx::PgPool, subject: &str) -> Uuid {
         let id = Uuid::new_v4();
         let code = format!("disabled-{id}");
         sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-             VALUES ($1, $2, 'HUMAN', $3, $2, 'DISABLED')",
+            "INSERT INTO principal (id, code, principal_type, display_name, status) \
+             VALUES ($1, $2, 'HUMAN', $2, 'DISABLED')",
         )
         .bind(id)
         .bind(&code)
-        .bind(subject)
         .execute(pool)
         .await
         .expect("seed disabled principal");
+        link(pool, id, subject).await;
         id
     }
 }
