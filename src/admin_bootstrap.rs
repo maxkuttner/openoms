@@ -671,6 +671,25 @@ mod tests {
         assert_eq!(audit_rows(&pool, "admin.bootstrap").await, vec![(LEGACY_ACTOR.to_string(), Some(id))]);
     }
 
+    /// The legacy password may only create the first admin: once any ACTIVE
+    /// named admin exists it gets 409, like the CLI without --force-recovery.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn legacy_bootstrap_refused_once_an_admin_exists() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone(), Some(LEGACY_PW));
+        let first = bootstrap(&pool, &email(), None, HOST_CLI_ACTOR, true).await.unwrap().principal_id;
+        let (status, body) =
+            send(&st, "POST", BOOTSTRAP_PATH, Cred::Bearer(LEGACY_PW), Some(serde_json::json!({ "email": email() }))).await;
+        assert_eq!(status, StatusCode::OK, "an INVITED admin does not count yet: {body}");
+
+        sqlx::query("UPDATE principal SET status = 'ACTIVE' WHERE id = $1").bind(first).execute(&pool).await.unwrap();
+        let (status, body) =
+            send(&st, "POST", BOOTSTRAP_PATH, Cred::Bearer(LEGACY_PW), Some(serde_json::json!({ "email": email() }))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(audit_rows(&pool, "admin.bootstrap").await.len(), 2, "the refused call creates nothing");
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
     async fn legacy_admin_cannot_mutate_otherwise() {

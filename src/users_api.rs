@@ -561,15 +561,17 @@ pub async fn set_admin(
 
 /// `POST /admin/users/bootstrap-admin`: create a named admin (no role, no
 /// portfolios) and return their one-time local enrolment link. The one
-/// mutation the legacy shared password may make.
+/// mutation the legacy shared password may make, and only while no ACTIVE
+/// named admin exists (409 after, the CLI's rule without --force-recovery).
 pub async fn bootstrap_admin(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
     Json(p): Json<crate::admin_bootstrap::BootstrapRequest>,
 ) -> Result<Json<crate::admin_bootstrap::BootstrapResponse>, ApiError> {
-    use crate::admin_bootstrap::{bootstrap, enrolment_link, BootstrapError, BootstrapResponse};
+    use crate::admin_bootstrap::{bootstrap, enrolment_link, BootstrapError, BootstrapResponse, LEGACY_ACTOR};
     let base = public_base_url(&state)?;
-    let invite = bootstrap(state.pool(), &p.email, p.display_name.as_deref(), &ctx.principal_code, false)
+    let only_if_no_admin = ctx.principal_code == LEGACY_ACTOR;
+    let invite = bootstrap(state.pool(), &p.email, p.display_name.as_deref(), &ctx.principal_code, only_if_no_admin)
         .await
         .map_err(|e| match e {
             BootstrapError::Db(e) => db(e),
