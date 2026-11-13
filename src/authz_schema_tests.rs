@@ -112,7 +112,7 @@ async fn migrations_backfill_identities_and_roles() {
     .unwrap();
     assert_eq!(column, 0, "external_subject must be dropped");
 
-    assert_eq!(role_of(&pool, human).await.as_deref(), Some("trader"));
+    assert_eq!(role_of(&pool, human).await.as_deref(), Some("pm"));
     assert_eq!(role_of(&pool, strategy).await.as_deref(), Some("strategy"));
 
     let service_type: String =

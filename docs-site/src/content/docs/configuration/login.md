@@ -232,6 +232,6 @@ change the blueprint's `oms-dev-secret` as warned above.
 Existing OIDC users keep their login, bound to the issuer in your `[auth.oidc]` block.
 Switching to a different identity provider (for example from the old local test provider to Authentik) changes the issuer, so those users no longer match:
 send each a fresh invite (**Sign-in link** on the Users page re-links an existing user
-through a new invite). People who existed as logins before get the Trader role; strategy
+through a new invite). People who existed as logins before get the PM role; strategy
 users keep the strategy role. Unused service and desk entries are removed; used ones
 become key-only users that you can disable from Users.

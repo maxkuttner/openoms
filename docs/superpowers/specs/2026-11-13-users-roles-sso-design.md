@@ -201,8 +201,8 @@ checklist.
   `allowed(principal, permission, portfolio)`. The existing grant flags become: `can_view` =
   in scope at all; `can_trade` = may use `orders.create` / `cancel_*` there (so a trader can be
   "trade A, view B"). `can_allocate` keeps its meaning.
-- The built-in role rows are seeded by migration. Existing HUMAN principals get the Trader role,
-  so today's behaviour is unchanged.
+- The built-in role rows are seeded by migration. Existing HUMAN principals get the PM role,
+  so someone can still manage everything after the upgrade.
 - Strategy principals, and API keys of existing SERVICE principals (migrated to a user or
   strategy owner; see Migration), keep working through their existing grants. Strategies get a
   `strategy` role with exactly today's powers: `orders.view_all`, `orders.create`,

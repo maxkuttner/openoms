@@ -41,9 +41,9 @@ UNION ALL
 SELECT 'strategy', unnest(ARRAY['orders.view_all', 'orders.create', 'orders.cancel_any',
                                 'positions.view', 'limits.view']);
 
--- Existing people trade; existing strategies keep trading. SERVICE/DESK rows
--- are handled by 0051.
+-- Existing people become PMs, so someone can still manage everything after the
+-- upgrade; existing strategies keep trading. SERVICE/DESK rows are handled by 0051.
 INSERT INTO principal_role (principal_id, role_code)
-SELECT id, CASE principal_type WHEN 'STRATEGY' THEN 'strategy' ELSE 'trader' END
+SELECT id, CASE principal_type WHEN 'STRATEGY' THEN 'strategy' ELSE 'pm' END
   FROM principal
  WHERE principal_type IN ('HUMAN', 'STRATEGY');
