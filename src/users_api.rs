@@ -544,7 +544,7 @@ pub struct SetupStatus {
 )]
 pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
     let (venue_connected, portfolio_exists, user_invited, first_order): (bool, bool, bool, bool) = sqlx::query_as(
-        "SELECT EXISTS (SELECT 1 FROM broker_connection WHERE status = 'ACTIVE'), \
+        "SELECT EXISTS (SELECT 1 FROM broker_connection WHERE status = 'ACTIVE' AND credentials IS NOT NULL), \
                 EXISTS (SELECT 1 FROM portfolio), \
                 EXISTS (SELECT 1 FROM invite), \
                 EXISTS (SELECT 1 FROM order_state)",
@@ -644,6 +644,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // A seeded connection without credentials is not a connected venue.
+        assert!(!get().await.venue_connected, "a connection without credentials must not count");
+        sqlx::query("UPDATE broker_connection SET credentials = '\\x00'::bytea WHERE code = 'alpaca-paper'")
+            .execute(&pool).await.unwrap();
         let s = get().await;
         assert!(s.venue_connected && !s.portfolio_exists);
 

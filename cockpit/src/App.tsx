@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AppShell, Group, NavLink, Button, Center, Text, Loader, Anchor } from "@mantine/core";
+import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor } from "@mantine/core";
 import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { api, setToken, API_BASE } from "./api/client";
@@ -8,8 +8,7 @@ import { JobsIndicator } from "./components/JobsIndicator";
 import { LoginPage } from "./pages/Login";
 import { UsersPage } from "./pages/Users";
 import { SignInPage } from "./pages/SignIn";
-import { SetupChecklist, useSetupStatus } from "./components/SetupChecklist";
-import { checklistVisible } from "./checklist";
+import { SetupChecklist } from "./components/SetupChecklist";
 import { PortfoliosPage } from "./pages/Portfolios";
 import { AccountsPage } from "./pages/Accounts";
 import { BrokerConnectionsPage } from "./pages/BrokerConnections";
@@ -49,12 +48,10 @@ function ConnectionDot() {
   );
 }
 
-/** Home: the setup checklist while anything is left, otherwise straight to Users. */
+/** Home: straight to Users. The setup checklist is a banner above every page
+ *  (see Console) until all its steps are done, so it never vanishes on navigation. */
 function Home() {
-  const { data, isLoading } = useSetupStatus();
-  if (isLoading) return <Loader />;
-  if (!data || !checklistVisible(data)) return <Navigate to="/users" replace />;
-  return <SetupChecklist />;
+  return <Navigate to="/users" replace />;
 }
 
 /** The authenticated console. */
@@ -98,6 +95,9 @@ function Console({ onLogout }: { onLogout: () => void }) {
         </Group>
       </AppShell.Navbar>
       <AppShell.Main>
+        <Box mb="md">
+          <SetupChecklist />
+        </Box>
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/users" element={<UsersPage />} />
