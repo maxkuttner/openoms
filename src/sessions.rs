@@ -210,7 +210,35 @@ pub fn origin_is_allowed(headers: &HeaderMap, method: &Method, public_base_url: 
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    origin.trim_end_matches('/') == public_base_url.trim_end_matches('/')
+    let (origin, expected) = (origin.trim_end_matches('/'), public_base_url.trim_end_matches('/'));
+    origin == expected || same_loopback_origin(origin, expected)
+}
+
+/// Two `http://` origins on the same port whose hosts are both loopback names
+/// (`localhost`, `127.0.0.1`, `[::1]`). A browser sends whichever spelling the
+/// user typed, and all of them reach this machine only.
+fn same_loopback_origin(a: &str, b: &str) -> bool {
+    use openidconnect::url::Url;
+    let (Ok(a), Ok(b)) = (Url::parse(a), Url::parse(b)) else {
+        return false;
+    };
+    is_plain_http_loopback(a.as_str())
+        && is_plain_http_loopback(b.as_str())
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The CSRF expected origin when `[auth].public_base_url` is not configured:
+/// on a loopback bind, `http://<bind_addr>`; anywhere else `Err` with the
+/// operator-facing refusal (the origin cannot be guessed safely, and local
+/// login needs one).
+pub fn derive_public_base_url(bind_addr: &str) -> Result<String, String> {
+    if crate::bind_is_loopback(bind_addr) {
+        Ok(format!("http://{bind_addr}"))
+    } else {
+        Err(format!(
+            "refusing to start: local login is enabled, OMS_BIND_ADDR ({bind_addr}) is reachable              beyond this machine, and no public URL is configured. Set [auth].public_base_url in              oms.toml to the URL browsers use to reach this server (e.g. https://oms.example.com)."
+        ))
+    }
 }
 
 pub struct SessionRecord {
@@ -307,6 +335,45 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("origin", origin.parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn loopback_local_only_derives_expected_origin() {
+        assert_eq!(derive_public_base_url("127.0.0.1:3001").unwrap(), "http://127.0.0.1:3001");
+        assert_eq!(derive_public_base_url("localhost:3001").unwrap(), "http://localhost:3001");
+        // Both spellings of the same loopback port are accepted.
+        let derived = derive_public_base_url("127.0.0.1:3001").unwrap();
+        for ok in ["http://localhost:3001", "http://127.0.0.1:3001"] {
+            let mut h = HeaderMap::new();
+            h.insert("origin", ok.parse().unwrap());
+            assert!(origin_is_allowed(&h, &Method::POST, &derived), "{ok}");
+        }
+        for bad in ["http://localhost:3002", "https://localhost:3001", "http://evil.example.com:3001"] {
+            let mut h = HeaderMap::new();
+            h.insert("origin", bad.parse().unwrap());
+            assert!(!origin_is_allowed(&h, &Method::POST, &derived), "{bad}");
+        }
+    }
+
+    #[test]
+    fn non_loopback_local_without_base_url_refuses_to_start() {
+        let err = derive_public_base_url("0.0.0.0:3001").unwrap_err();
+        assert!(err.contains("[auth].public_base_url"), "{err}");
+    }
+
+    #[test]
+    fn derived_origin_gates_session_posts() {
+        let cfg = SessionConfig {
+            cookie_policy: cookie_policy("127.0.0.1:3001", Some("http://127.0.0.1:3001")),
+            ttl: SessionTtl::default(),
+            public_base_url: Some(derive_public_base_url("127.0.0.1:3001").unwrap()),
+        };
+        let base = cfg.public_base_url.as_deref().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("origin", "http://localhost:3001".parse().unwrap());
+        assert!(origin_is_allowed(&h, &Method::POST, base));
+        h.insert("origin", "http://attacker.example".parse().unwrap());
+        assert!(!origin_is_allowed(&h, &Method::POST, base));
     }
 
     #[test]

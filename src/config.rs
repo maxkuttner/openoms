@@ -196,6 +196,7 @@ pub struct SessionSection {
 #[derive(Debug)]
 pub struct AuthSettings {
     pub public_base_url: Option<String>,
+    #[allow(dead_code)] // used by Task 4 (local login policy)
     pub policy: AuthPolicy,
     pub local_enabled: bool,
     pub ttl: crate::sessions::SessionTtl,
@@ -237,8 +238,11 @@ pub struct OidcSettings {
     pub public_base_url: String,
     pub scopes: Vec<String>,
     pub required_claim: Option<(String, String)>,
+    #[allow(dead_code)] // superseded by auth_settings().ttl
     pub ttl: crate::sessions::SessionTtl,
+    #[allow(dead_code)] // used by the OIDC identity task
     pub trust_email_verified: bool,
+    #[allow(dead_code)] // used by the OIDC identity task
     pub require_amr: Vec<String>,
 }
 

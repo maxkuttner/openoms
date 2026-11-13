@@ -1393,10 +1393,24 @@ async fn serve() {
         }
         None => (config::FileConfig::default().auth_settings(), true),
     };
+    // The CSRF expected origin must be configured, never taken from a request.
+    // Unset on a loopback bind it is derived from the bind address; unset
+    // anywhere else, local login has no safe origin to check, so refuse.
+    let public_base_url = match auth_settings.public_base_url {
+        Some(url) => Some(url),
+        None if local_enabled => match sessions::derive_public_base_url(&bind_addr) {
+            Ok(url) => Some(url),
+            Err(msg) => {
+                error!("{msg}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
     let session_config = sessions::SessionConfig {
-        cookie_policy: sessions::cookie_policy(&bind_addr, auth_settings.public_base_url.as_deref()),
+        cookie_policy: sessions::cookie_policy(&bind_addr, public_base_url.as_deref()),
         ttl: auth_settings.ttl,
-        public_base_url: auth_settings.public_base_url,
+        public_base_url,
     };
 
     let state = AppState::new(
@@ -1678,13 +1692,22 @@ mod tests {
     async fn the_full_router_builds() {
         let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
         let state = crate::handlers::tests::test_app_state(pool);
-        // (local only), (OIDC configured, discovery failed), (both, discovered).
+        let discovered = || crate::auth_api::AuthApiState {
+            provider: std::sync::Arc::new(crate::oidc::Provider::for_test(
+                "https://id.example.com",
+                "oms",
+                "https://oms.example.com",
+            )),
+            required_claim: None,
+        };
+        // (local only), (OIDC configured, discovery failed), (neither),
+        // then the discovered router: (OIDC only) and (both).
         let _ = crate::build_app(state.clone(), None, true, false);
         let _ = crate::build_app(state.clone(), None, false, true);
-        let _ = crate::build_app(state.clone(), None, true, true);
-        let _ = crate::build_app(state, None, false, false);
+        let _ = crate::build_app(state.clone(), None, false, false);
+        let _ = crate::build_app(state.clone(), Some(discovered()), false, true);
+        let _ = crate::build_app(state, Some(discovered()), true, true);
     }
-
 
     #[test]
     fn init_takes_the_guided_setup_flags() {
