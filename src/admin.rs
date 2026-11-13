@@ -1847,14 +1847,14 @@ pub struct RiskLimitFilter {
 }
 
 // NUMERIC columns are cast to double precision so FromRow decodes them into f64.
-const RISK_LIMIT_SELECT: &str = "id, portfolio_id, instrument_id, trading_state, \
+pub(crate) const RISK_LIMIT_SELECT: &str = "id, portfolio_id, instrument_id, trading_state, \
     max_order_quantity::double precision    AS max_order_quantity, \
     max_order_notional::double precision    AS max_order_notional, \
     max_position_quantity::double precision AS max_position_quantity, \
     max_position_notional::double precision AS max_position_notional, \
     created_at, updated_at";
 
-fn validate_trading_state(s: &str) -> Result<(), AdminError> {
+pub(crate) fn validate_trading_state(s: &str) -> Result<(), AdminError> {
     match s {
         "ACTIVE" | "REDUCING" | "HALTED" => Ok(()),
         _ => Err(AdminError {
@@ -1864,7 +1864,7 @@ fn validate_trading_state(s: &str) -> Result<(), AdminError> {
     }
 }
 
-async fn republish_colo_policy(state: &AppState, portfolio_id: Uuid) {
+pub(crate) async fn republish_colo_policy(state: &AppState, portfolio_id: Uuid) {
     let code: Option<String> = sqlx::query_scalar(
         "SELECT code FROM strategy WHERE portfolio_id = $1 AND mode = 'COLOCATED'",
     )

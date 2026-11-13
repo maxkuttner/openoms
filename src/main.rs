@@ -20,6 +20,7 @@ mod auth_api;
 mod invites;
 mod users_api;
 mod authz;
+mod limits_api;
 
 use gateway::adapter::BrokerRegistry;
 use gateway::md::daily_stats::DailyStatsRegistry;
@@ -1415,6 +1416,11 @@ async fn serve() {
         .route("/updates", get(live_updates::ws_updates))
         .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
         .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
+        .route("/portfolios/:id/limits", get(limits_api::list_limits))
+        .route(
+            "/portfolios/:id/limits/:instrument_id",
+            axum::routing::put(limits_api::put_limit),
+        )
         .route(
             "/orders/:id/allocations",
             post(handlers::create_allocations).get(handlers::list_allocations),
