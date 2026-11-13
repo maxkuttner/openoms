@@ -163,6 +163,29 @@ pub async fn create(
     grants: &[(Uuid, bool)],
     created_by: &str,
 ) -> Result<NewInvite, InviteError> {
+    create_with_method(pool, email, role, grants, created_by, "any").await
+}
+
+/// The sign-in methods an invite may be redeemed with (`invite.method`).
+pub const INVITE_METHODS: [&str; 3] = ["any", "local", "oidc"];
+
+/// Restrict a just-inserted invite to `method` (one of `INVITE_METHODS`).
+async fn set_method(tx: &mut Transaction<'_, Postgres>, invite_id: Uuid, method: &str) -> Result<(), sqlx::Error> {
+    if method != "any" {
+        sqlx::query("UPDATE invite SET method = $2 WHERE id = $1").bind(invite_id).bind(method).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+/// `create`, redeemable only with `method` (validated by the caller).
+pub async fn create_with_method(
+    pool: &PgPool,
+    email: &str,
+    role: &str,
+    grants: &[(Uuid, bool)],
+    created_by: &str,
+    method: &str,
+) -> Result<NewInvite, InviteError> {
     if !INVITABLE_ROLES.contains(&role) {
         return Err(InviteError::BadRole);
     }
@@ -228,6 +251,7 @@ pub async fn create(
     }
 
     let invite = insert_invite(&mut tx, principal_id, &email, created_by).await?;
+    set_method(&mut tx, invite.invite_id, method).await?;
     let grant_detail: Vec<serde_json::Value> = grants
         .iter()
         .map(|(p, t)| serde_json::json!({ "portfolio_id": p, "can_trade": t }))
@@ -237,7 +261,7 @@ pub async fn create(
         created_by,
         "invite.created",
         principal_id,
-        serde_json::json!({ "invite_id": invite.invite_id, "email": email, "role": role, "grants": grant_detail }),
+        serde_json::json!({ "invite_id": invite.invite_id, "email": email, "role": role, "grants": grant_detail, "method": method }),
     )
     .await?;
     tx.commit().await?;
@@ -273,6 +297,11 @@ pub async fn revoke(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<(), I
 /// working, and only the user's newest unclaimed invite can be reissued;
 /// a user disabled by revoking an unclaimed invite is invited again.
 pub async fn reissue(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<NewInvite, InviteError> {
+    reissue_with_method(pool, invite_id, actor, "any").await
+}
+
+/// `reissue`, the new invite redeemable only with `method`.
+pub async fn reissue_with_method(pool: &PgPool, invite_id: Uuid, actor: &str, method: &str) -> Result<NewInvite, InviteError> {
     let mut tx = pool.begin().await?;
     // Only an unclaimed invite, and only the user's newest one: an invite that
     // a later reissue already replaced must not mint a rival to the live one.
@@ -315,12 +344,13 @@ pub async fn reissue(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<NewI
     }
 
     let invite = insert_invite(&mut tx, principal_id, &email, actor).await?;
+    set_method(&mut tx, invite.invite_id, method).await?;
     audit(
         &mut tx,
         actor,
         "invite.reissued",
         principal_id,
-        serde_json::json!({ "invite_id": invite.invite_id, "replaces": invite_id }),
+        serde_json::json!({ "invite_id": invite.invite_id, "replaces": invite_id, "method": method }),
     )
     .await?;
     tx.commit().await?;

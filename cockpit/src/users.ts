@@ -2,6 +2,13 @@
 
 export type Access = "trade" | "view";
 
+/** Which sign-in method may redeem an invite (`invite.method`). */
+export const INVITE_METHOD_OPTIONS = [
+  { value: "any", label: "Any sign-in method" },
+  { value: "local", label: "Email + password only" },
+  { value: "oidc", label: "SSO only" },
+];
+
 export const ROLE_OPTIONS = [
   { value: "pm", label: "PM" },
   { value: "trader", label: "Trader" },

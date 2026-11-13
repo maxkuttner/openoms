@@ -58,6 +58,28 @@ pub struct InviteRequest {
     pub role: String,
     #[serde(default)]
     pub portfolios: Vec<PortfolioAccess>,
+    /// Which sign-in method may redeem the invite: "any" (default), "local"
+    /// or "oidc".
+    #[serde(default)]
+    pub method: Option<String>,
+}
+
+/// Optional body of a reissue.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReissueRequest {
+    #[serde(default)]
+    pub method: Option<String>,
+}
+
+/// An invite's sign-in method: absent means "any"; anything else is 422.
+fn invite_method(method: Option<&str>) -> Result<&'static str, ApiError> {
+    let m = method.unwrap_or("any");
+    invites::INVITE_METHODS
+        .iter()
+        .copied()
+        .find(|&known| known == m)
+        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "method must be one of any, local, oidc"))
 }
 
 #[derive(Debug, Serialize)]
@@ -280,6 +302,7 @@ pub async fn invite_user(
 ) -> Result<Json<InviteResponse>, ApiError> {
     let base = public_base_url(&state)?;
     require_role(&p.role)?;
+    let method = invite_method(p.method.as_deref())?;
     let mut ids: Vec<Uuid> = p.portfolios.iter().map(|g| g.portfolio_id).collect();
     ids.sort();
     ids.dedup();
@@ -292,7 +315,7 @@ pub async fn invite_user(
         return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown or repeated portfolio"));
     }
     let grants: Vec<(Uuid, bool)> = p.portfolios.iter().map(|g| (g.portfolio_id, g.can_trade)).collect();
-    let invite = invites::create(state.pool(), &p.email, &p.role, &grants, &ctx.principal_code).await.map_err(invite_error)?;
+    let invite = invites::create_with_method(state.pool(), &p.email, &p.role, &grants, &ctx.principal_code, method).await.map_err(invite_error)?;
     Ok(Json(invite_response(base, invite)))
 }
 
@@ -305,9 +328,17 @@ pub async fn reissue_invite(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
+    body: axum::body::Bytes,
 ) -> Result<Json<InviteResponse>, ApiError> {
     let base = public_base_url(&state)?;
-    let invite = invites::reissue(state.pool(), id, &ctx.principal_code).await.map_err(invite_error)?;
+    // The body is optional: none (or empty) reissues for any method.
+    let req: ReissueRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        ReissueRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| api_error(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid body: {e}")))?
+    };
+    let method = invite_method(req.method.as_deref())?;
+    let invite = invites::reissue_with_method(state.pool(), id, &ctx.principal_code, method).await.map_err(invite_error)?;
     Ok(Json(invite_response(base, invite)))
 }
 
@@ -941,6 +972,7 @@ mod tests {
                 email: email.clone(),
                 role: "trader".into(),
                 portfolios: vec![PortfolioAccess { portfolio_id: p, can_trade: true }],
+                method: None,
             }),
         )
         .await
@@ -958,13 +990,13 @@ mod tests {
 
         // Duplicate email -> 409; bad role -> 422.
         let dup = invite_user(State(st.clone()), Extension(actor()),
-            Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![] }),
+            Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![], method: None }),
         )
         .await
         .unwrap_err();
         assert_eq!(dup.status, StatusCode::CONFLICT);
         let bad = invite_user(State(st.clone()), Extension(actor()),
-            Json(InviteRequest { email: "x@fundco.com".into(), role: "strategy".into(), portfolios: vec![] }),
+            Json(InviteRequest { email: "x@fundco.com".into(), role: "strategy".into(), portfolios: vec![], method: None }),
         )
         .await
         .unwrap_err();
@@ -975,12 +1007,54 @@ mod tests {
         let row = users.iter().find(|u| u.email.as_deref() == Some(email.as_str())).unwrap();
         assert_eq!(row.status, "INVITED");
         assert_eq!(row.invite.as_ref().unwrap().invite_id, out.invite_id);
-        let again = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id)).await.unwrap().0;
+        let again = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id), Default::default()).await.unwrap().0;
         assert_ne!(again.link, out.link);
         revoke_invite(State(st.clone()), Extension(actor()), Path(again.invite_id)).await.unwrap();
         assert_eq!(status_of(&pool, row.principal_id).await, "DISABLED");
         let gone = revoke_invite(State(st.clone()), Extension(actor()), Path(again.invite_id)).await.unwrap_err();
         assert_eq!(gone.status, StatusCode::NOT_FOUND);
+    }
+
+    async fn method_of(pool: &PgPool, invite_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT method FROM invite WHERE id = $1").bind(invite_id).fetch_one(pool).await.unwrap()
+    }
+
+    /// `method` on invite and reissue: stored when valid, "any" when absent,
+    /// 422 (creating nothing) otherwise.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn invite_method_is_validated_and_stored() {
+        let pool = migrated_db().await;
+        let st = state(&pool, Some("https://oms.example.com")).await;
+        let req = |email: &str, method: Option<&str>| {
+            Json(InviteRequest { email: email.into(), role: "viewer".into(), portfolios: vec![], method: method.map(str::to_string) })
+        };
+        let email = format!("m-{}@fundco.com", Uuid::new_v4().simple());
+
+        let bad = invite_user(State(st.clone()), Extension(actor()), req(&email, Some("password"))).await.unwrap_err();
+        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM principal WHERE email = $1").bind(&email).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+
+        let out = invite_user(State(st.clone()), Extension(actor()), req(&email, Some("oidc"))).await.unwrap().0;
+        assert_eq!(method_of(&pool, out.invite_id).await, "oidc");
+
+        let bytes = |s: &str| axum::body::Bytes::from(s.to_string());
+        let bad = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id), bytes(r#"{"method":"sms"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let local = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id), bytes(r#"{"method":"local"}"#))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(method_of(&pool, local.invite_id).await, "local");
+        let any = reissue_invite(State(st.clone()), Extension(actor()), Path(local.invite_id), bytes("")).await.unwrap().0;
+        assert_eq!(method_of(&pool, any.invite_id).await, "any");
+
+        let other = format!("d-{}@fundco.com", Uuid::new_v4().simple());
+        let out = invite_user(State(st.clone()), Extension(actor()), req(&other, None)).await.unwrap().0;
+        assert_eq!(method_of(&pool, out.invite_id).await, "any");
     }
 
     #[tokio::test]
@@ -990,7 +1064,7 @@ mod tests {
         let st = state(&pool, None).await;
         let email = format!("nobase-{}@fundco.com", Uuid::new_v4().simple());
         let err = invite_user(State(st), Extension(actor()),
-            Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![] }),
+            Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![], method: None }),
         )
         .await
         .unwrap_err();
@@ -1272,7 +1346,7 @@ mod tests {
         let out = invite_user(
             State(st.clone()),
             Extension(ada.clone()),
-            Json(InviteRequest { email: format!("{}@fundco.com", Uuid::new_v4().simple()), role: "viewer".into(), portfolios: vec![] }),
+            Json(InviteRequest { email: format!("{}@fundco.com", Uuid::new_v4().simple()), role: "viewer".into(), portfolios: vec![], method: None }),
         )
         .await
         .unwrap()

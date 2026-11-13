@@ -8,7 +8,7 @@ import { api, isLegacySession } from "../api/client";
 import { useList, useApiMutation } from "../api/hooks";
 import type { ApiKeyRecord, Portfolio } from "../api/types";
 import { useSetupStatus } from "../components/SetupChecklist";
-import { ROLE_OPTIONS, SIGN_IN_WARNING, accessBody, inviteNotice, roleLabel, type Access } from "../users";
+import { INVITE_METHOD_OPTIONS, ROLE_OPTIONS, SIGN_IN_WARNING, accessBody, inviteNotice, roleLabel, type Access } from "../users";
 
 const PATH = "/admin/users";
 
@@ -239,9 +239,10 @@ export function UsersPage() {
 function InviteModal({ opened, onClose, onDone }: { opened: boolean; onClose: () => void; onDone: (email: string, r: InviteResult) => void }) {
   const [email, setEmail] = useState("");
   const [role, setRole] = useState<string>("trader");
+  const [method, setMethod] = useState<string>("any");
   const [picked, setPicked] = useState<Record<string, Access>>({});
   const send = useApiMutation(
-    () => api.post<InviteResult>(`${PATH}/invite`, { email: email.trim(), role, portfolios: accessBody(picked) }),
+    () => api.post<InviteResult>(`${PATH}/invite`, { email: email.trim(), role, method, portfolios: accessBody(picked) }),
     {
       invalidate: [PATH, "/admin/setup-status"],
       success: "Invite created",
@@ -254,6 +255,7 @@ function InviteModal({ opened, onClose, onDone }: { opened: boolean; onClose: ()
         <Stack>
           <TextInput label="Email" type="email" required value={email} onChange={(e) => setEmail(e.currentTarget.value)} />
           <Select label="Role" data={ROLE_OPTIONS} allowDeselect={false} value={role} onChange={(v) => v && setRole(v)} />
+          <Select label="Sign-in method" data={INVITE_METHOD_OPTIONS} allowDeselect={false} value={method} onChange={(v) => v && setMethod(v)} />
           <PortfolioPicker value={picked} onChange={setPicked} />
           <Group justify="flex-end">
             <Button variant="default" onClick={onClose}>Cancel</Button>
