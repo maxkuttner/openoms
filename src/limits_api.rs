@@ -156,7 +156,7 @@ mod tests {
         let p = portfolio(&pool).await;
         grant(&pool, &pm, p).await;
         grant(&pool, &trader, p).await;
-        put(&pool, &pm, p, "BTC", body(5.0)).await.unwrap();
+        let _ = put(&pool, &pm, p, "BTC", body(5.0)).await.unwrap();
         let rows = list(&pool, &trader, p).await.unwrap().0;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].instrument_id, "BTC");
@@ -185,7 +185,7 @@ mod tests {
         let pm = user(&pool, "pm").await;
         let p = portfolio(&pool).await;
         grant(&pool, &pm, p).await;
-        put(&pool, &pm, p, "ETH", body(5.0)).await.unwrap();
+        let _ = put(&pool, &pm, p, "ETH", body(5.0)).await.unwrap();
         let after = put(&pool, &pm, p, "ETH", body(9.0)).await.unwrap().0;
         assert_eq!(after.max_order_quantity, Some(9.0));
         let details: Vec<serde_json::Value> = sqlx::query_scalar(

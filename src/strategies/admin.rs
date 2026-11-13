@@ -323,7 +323,7 @@ async fn fill_responsible(pool: &sqlx::PgPool, rows: &mut [StrategyRow]) -> Resu
     .map_err(map_db_error)?;
     for row in rows {
         row.responsible = people.iter().find(|p| p.principal_id == row.owner_principal_id).cloned();
-        row.needs_responsible = row.responsible.as_ref().map_or(true, |p| p.status != "ACTIVE");
+        row.needs_responsible = row.responsible.as_ref().is_none_or(|p| p.status != "ACTIVE");
     }
     Ok(())
 }
