@@ -172,10 +172,10 @@ fn session_cookie(state: &AppState, token: &str) -> String {
 
 /// CSRF: a POST must carry our own `Origin`. Fails closed with no configured
 /// base URL.
-fn check_origin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+fn check_origin(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     match state.session_config.public_base_url.as_deref() {
         Some(url) if sessions::origin_is_allowed(headers, &Method::POST, url) => Ok(()),
-        _ => Err(fail(StatusCode::FORBIDDEN, "forbidden")),
+        _ => Err(Box::new(fail(StatusCode::FORBIDDEN, "forbidden"))),
     }
 }
 
@@ -203,8 +203,8 @@ async fn local_session(state: &AppState, headers: &HeaderMap) -> Result<SessionR
     Ok(s)
 }
 
-fn master(la: &LocalAuth) -> Result<&MasterKey, Response> {
-    la.master_key.as_deref().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "mfa_unavailable"))
+fn master(la: &LocalAuth) -> Result<&MasterKey, Box<Response>> {
+    la.master_key.as_deref().ok_or_else(|| Box::new(fail(StatusCode::SERVICE_UNAVAILABLE, "mfa_unavailable")))
 }
 
 fn client_ip(conn: &Option<ConnectInfo<SocketAddr>>) -> String {
@@ -351,7 +351,7 @@ pub async fn enroll(
     Json(body): Json<EnrollBody>,
 ) -> Response {
     if let Err(r) = check_origin(&state, &headers) {
-        return r;
+        return *r;
     }
     if let Err(reason) = local_auth::check_password_policy(&body.password) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "weak_password", "reason": reason })))
@@ -465,7 +465,7 @@ pub async fn login(
     Json(body): Json<LoginBody>,
 ) -> Response {
     if let Err(r) = check_origin(&state, &headers) {
-        return r;
+        return *r;
     }
     let account = body.email.trim().to_lowercase();
     let ip = client_ip(&conn);
@@ -600,7 +600,7 @@ pub async fn totp(
     Json(body): Json<CodeBody>,
 ) -> Response {
     if let Err(r) = check_origin(&state, &headers) {
-        return r;
+        return *r;
     }
     let session = match local_session(&state, &headers).await {
         Ok(s) => s,
@@ -614,7 +614,7 @@ pub async fn totp(
     let ip = client_ip(&conn);
     let master = match master(&la) {
         Ok(m) => m,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !la.limiter.try_acquire(&account, &ip) {
         return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
@@ -717,7 +717,7 @@ pub struct TotpEnrollResponse {
 )]
 pub async fn totp_enroll(State(state): State<AppState>, Extension(la): Extension<LocalAuth>, headers: HeaderMap) -> Response {
     if let Err(r) = check_origin(&state, &headers) {
-        return r;
+        return *r;
     }
     let session = match local_session(&state, &headers).await {
         Ok(s) => s,
@@ -725,7 +725,7 @@ pub async fn totp_enroll(State(state): State<AppState>, Extension(la): Extension
     };
     let master = match master(&la) {
         Ok(m) => m,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let email: Option<String> = match sqlx::query_scalar("SELECT email FROM principal WHERE id = $1")
         .bind(session.principal_id)
@@ -784,7 +784,7 @@ pub async fn totp_confirm(
     Json(body): Json<CodeBody>,
 ) -> Response {
     if let Err(r) = check_origin(&state, &headers) {
-        return r;
+        return *r;
     }
     let session = match local_session(&state, &headers).await {
         Ok(s) => s,
@@ -794,7 +794,7 @@ pub async fn totp_confirm(
     let ip = client_ip(&conn);
     let master = match master(&la) {
         Ok(m) => m,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if !la.limiter.try_acquire(&account, &ip) {
         return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
@@ -889,7 +889,7 @@ pub struct AuthMethods {
 }
 
 #[derive(Clone, Copy)]
-struct EnabledMethods {
+pub struct EnabledMethods {
     local: bool,
     sso: bool,
 }
@@ -948,7 +948,7 @@ pub fn routes(la: LocalAuth) -> axum::Router<AppState> {
 )]
 pub async fn logout_all(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = check_origin(&state, &headers) {
-        return r;
+        return *r;
     }
     let session = match current_session(&state, &headers).await {
         Ok(s) => s,
