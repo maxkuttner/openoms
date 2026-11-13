@@ -656,6 +656,9 @@ pub async fn totp(
     match accepted {
         Ok(true) => {
             la.limiter.refund(&account, &ip);
+            if let Err(e) = clear_failures(state.pool(), session.principal_id).await {
+                return internal("clear failures", e);
+            }
             rotate_verified(&state, &session, &headers, Json(MfaVerified { mfa_verified: true }).into_response()).await
         }
         Ok(false) => match record_db_failure(state.pool(), session.principal_id).await {
@@ -664,6 +667,15 @@ pub async fn totp(
         },
         Err(e) => internal("verify second factor", e),
     }
+}
+
+/// A passed second factor resets the failure count and any expired lock.
+async fn clear_failures(pool: &PgPool, principal_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE local_credential SET failed_attempts = 0, locked_until = NULL WHERE principal_id = $1")
+        .bind(principal_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
 }
 
 /// Spend one unused recovery code, atomically: only the request whose update
@@ -787,8 +799,8 @@ pub async fn totp_confirm(
     if !la.limiter.try_acquire(&account, &ip) {
         return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
     }
-    let secret: Option<Vec<u8>> = match sqlx::query_scalar(
-        "SELECT totp_secret_enc FROM local_credential \
+    let pending: Option<(Vec<u8>, bool)> = match sqlx::query_as(
+        "SELECT totp_secret_enc, COALESCE(locked_until > now(), false) FROM local_credential \
           WHERE principal_id = $1 AND totp_enrolled_at IS NULL AND totp_secret_enc IS NOT NULL",
     )
     .bind(session.principal_id)
@@ -798,10 +810,12 @@ pub async fn totp_confirm(
         Ok(s) => s,
         Err(e) => return internal("load pending totp", e),
     };
-    let Some(secret) = secret else {
+    let Some((secret, locked)) = pending else {
         return fail(StatusCode::CONFLICT, "no_pending_totp");
     };
-    let Ok(step) = local_auth::verify_totp(&secret, master, &body.code, None, Utc::now().timestamp()) else {
+    // A locked account fails like a wrong code, as on `totp` and `login`.
+    let verified = if locked { None } else { local_auth::verify_totp(&secret, master, &body.code, None, Utc::now().timestamp()).ok() };
+    let Some(step) = verified else {
         if let Err(e) = record_db_failure(state.pool(), session.principal_id).await {
             return internal("record failed totp", e);
         }
@@ -830,8 +844,10 @@ async fn activate_totp(
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let activated = sqlx::query(
-        "UPDATE local_credential SET totp_enrolled_at = now(), totp_last_step = $2 \
-          WHERE principal_id = $1 AND totp_enrolled_at IS NULL AND totp_secret_enc = $3",
+        "UPDATE local_credential SET totp_enrolled_at = now(), totp_last_step = $2, \
+                failed_attempts = 0, locked_until = NULL \
+          WHERE principal_id = $1 AND totp_enrolled_at IS NULL AND totp_secret_enc = $3 \
+            AND (locked_until IS NULL OR locked_until <= now())",
     )
     .bind(principal_id)
     .bind(step)
@@ -1492,6 +1508,84 @@ mod tests {
         assert!(locked);
         assert_eq!(totp_req(&st, &l, &cookie, &code_at(&uri, 30)).await.status(), StatusCode::UNAUTHORIZED, "locked refuses a right code");
         assert_eq!(login_req(&st, &l, 1, "tl@fund.test", PASSWORD).await.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn lock_state(pool: &PgPool, email: &str) -> (i32, Option<DateTime<Utc>>) {
+        sqlx::query_as(
+            "SELECT c.failed_attempts, c.locked_until FROM local_credential c JOIN principal p ON p.id = c.principal_id \
+              WHERE p.email = $1",
+        )
+        .bind(email)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn set_lock(pool: &PgPool, email: &str, failed: i32, locked_until: &str) {
+        sqlx::query(&format!(
+            "UPDATE local_credential SET failed_attempts = $2, locked_until = {locked_until} \
+              WHERE principal_id = (SELECT id FROM principal WHERE email = $1)"
+        ))
+        .bind(email)
+        .bind(failed)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A locked account cannot activate TOTP either, even with a right code.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn totp_confirm_refused_while_locked() {
+        let pool = migrated_db().await;
+        let st = app(pool.clone());
+        let l = la_with(1000, 1000);
+        let token = invite(&pool, "cl@fund.test", "any").await;
+        let cookie = cookie_of(&enroll_req(&st, &l, &token, PASSWORD).await).unwrap();
+        let uri = body(totp_enroll(State(st.clone()), Extension(l.clone()), hdrs(Some(&cookie))).await).await["otpauth_uri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        set_lock(&pool, "cl@fund.test", 0, "now() + interval '15 minutes'").await;
+        let resp =
+            totp_confirm(State(st.clone()), Extension(l.clone()), ip(1), hdrs(Some(&cookie)), Json(CodeBody { code: code_at(&uri, 0) }))
+                .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let enrolled: bool = sqlx::query_scalar(
+            "SELECT totp_enrolled_at IS NOT NULL FROM local_credential c JOIN principal p ON p.id = c.principal_id \
+              WHERE p.email = 'cl@fund.test'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!enrolled);
+    }
+
+    /// A successful TOTP confirm or sign-in clears the failure count and any
+    /// (expired) lock.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn successful_totp_resets_failures() {
+        let pool = migrated_db().await;
+        let st = app(pool.clone());
+        let l = la_with(1000, 1000);
+        let token = invite(&pool, "rs@fund.test", "any").await;
+        let cookie = cookie_of(&enroll_req(&st, &l, &token, PASSWORD).await).unwrap();
+        let uri = body(totp_enroll(State(st.clone()), Extension(l.clone()), hdrs(Some(&cookie))).await).await["otpauth_uri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        set_lock(&pool, "rs@fund.test", 4, "now() - interval '1 minute'").await;
+        let resp =
+            totp_confirm(State(st.clone()), Extension(l.clone()), ip(1), hdrs(Some(&cookie)), Json(CodeBody { code: code_at(&uri, 0) }))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(lock_state(&pool, "rs@fund.test").await, (0, None), "confirm resets");
+
+        let cookie = cookie_of(&login_req(&st, &l, 1, "rs@fund.test", PASSWORD).await).unwrap();
+        set_lock(&pool, "rs@fund.test", 4, "now() - interval '1 minute'").await;
+        assert_eq!(totp_req(&st, &l, &cookie, &code_at(&uri, 30)).await.status(), StatusCode::OK);
+        assert_eq!(lock_state(&pool, "rs@fund.test").await, (0, None), "totp resets");
     }
 
     #[tokio::test]
