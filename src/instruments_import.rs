@@ -468,7 +468,7 @@ async fn admin_call<T: serde::de::DeserializeOwned>(req: reqwest::RequestBuilder
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("the OMS answered {status}: {body}").into());
+        return Err(crate::admin_bootstrap::host_call_error(status.as_u16(), &body).into());
     }
     Ok(resp.json().await?)
 }

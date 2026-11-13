@@ -50,6 +50,10 @@ key, or every encrypted row in it fails to decrypt.
 Rebuilds the image on the box and restarts the container. `oms.toml`/`.env`
 are untouched by this — they live outside the shipped tree.
 
+Host CLI admin commands (`oms status`, `oms setup sync-broker`, `oms auth …`) use a
+per-boot token the server writes inside the container and accept only loopback
+callers, so run them in the container: `docker exec <container> oms …`.
+
 ## Teardown
 
 ```

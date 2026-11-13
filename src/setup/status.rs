@@ -204,10 +204,7 @@ async fn streams(base: &str) -> Streams {
         Err(e) => return Streams::Unknown(e.to_string()),
     };
     if !resp.status().is_success() {
-        return Streams::Unknown(format!(
-            "the OMS answered {} (is this the OMS host, and is the server's host token current?)",
-            resp.status()
-        ));
+        return Streams::Unknown(crate::admin_bootstrap::host_call_error(resp.status().as_u16(), ""));
     }
     match resp.json().await {
         Ok(list) => Streams::List(list),

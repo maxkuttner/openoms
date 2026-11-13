@@ -285,6 +285,8 @@ pub const HOST_TOKEN_FILE: &str = "host-token";
 
 /// Where the host token lives: beside the `oms.toml` in effect, else beside
 /// the one `oms init` would create. Server and CLI resolve it identically.
+/// Under Docker it is inside the container and the host's calls arrive from
+/// the bridge, not loopback: run host CLI commands with `docker exec`.
 pub fn host_token_path() -> std::path::PathBuf {
     let cfg = crate::config::path();
     let cfg = if cfg.exists() { cfg } else { crate::config::init_target() };
@@ -318,11 +320,26 @@ pub fn read_host_token() -> Result<String, String> {
     let path = host_token_path();
     std::fs::read_to_string(&path).map(|t| t.trim().to_string()).map_err(|e| {
         format!(
-            "cannot read the host token at {} ({e}): run this on the OMS host as the OMS user, \
-             with the server running",
-            path.display()
+            "cannot read the host token at {} ({e}). {}",
+            path.display(),
+            HOST_CLI_HINT
         )
     })
+}
+
+/// Where a host CLI call has to run from, for every refusal or missing token.
+pub const HOST_CLI_HINT: &str = "Run this on the OMS host as the OMS user, with the server running \
+     (under Docker: inside the container, `docker exec <container> oms ...`).";
+
+/// The error for a host-token call the server answered `status` to: 401/403
+/// means the token was refused (wrong host, stale token, or a Docker bridge
+/// peer), so say where to run it.
+pub fn host_call_error(status: u16, body: &str) -> String {
+    if status == 401 || status == 403 {
+        format!("the OMS refused the host token ({status}). {HOST_CLI_HINT}")
+    } else {
+        format!("the OMS answered {status}: {body}")
+    }
 }
 
 /// The synthetic context of the host token: actor `host-cli`, the nil UUID
@@ -815,6 +832,16 @@ mod tests {
         let token = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         token
+    }
+
+    #[test]
+    fn a_refused_host_token_call_says_docker_exec() {
+        for status in [401, 403] {
+            let m = host_call_error(status, "unauthorized");
+            assert!(m.contains("docker exec") && m.contains("OMS host"), "{m}");
+        }
+        assert!(host_call_error(500, "boom").contains("boom"));
+        assert!(HOST_CLI_HINT.contains("docker exec"));
     }
 
     #[test]
