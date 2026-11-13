@@ -17,6 +17,7 @@ mod setup;
 mod sessions;
 mod oidc;
 mod auth_api;
+mod invites;
 mod authz;
 
 use gateway::adapter::BrokerRegistry;
@@ -190,6 +191,7 @@ mod authz_route_tests;
         colo::deployment::verified_stop,
         colo::ingest::adjustment,
         auth_api::login,
+        auth_api::invite,
         auth_api::callback,
         auth_api::logout,
         auth_api::me,
@@ -1610,6 +1612,7 @@ async fn serve() {
     if let Some(auth_state) = auth_api_state {
         let auth_router = Router::new()
             .route("/auth/login", get(auth_api::login))
+            .route("/auth/invite/:token", get(auth_api::invite))
             .route("/auth/callback", get(auth_api::callback))
             .route("/auth/logout", post(auth_api::logout))
             .layer(Extension(auth_state));

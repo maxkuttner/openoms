@@ -1,17 +1,12 @@
-//! Maps an authenticated OIDC subject onto a `principal` row.
-//!
-//! The OMS's existing identity for anything that can trade is `principal`; a
-//! human who successfully completes OIDC login needs one too. This module
-//! owns that mapping and, on first login, the provisioning of a new row.
-//!
-//! `resolve_or_provision` takes an already-`VerifiedIdentity` and a database
-//! pool, and makes no assumption about how either arrived — that's the job of
-//! the `/auth/*` HTTP handlers below, which route an OIDC login through it.
+//! The `/auth/*` HTTP handlers: OIDC login, the invite link that starts one,
+//! the callback that resolves the verified identity through
+//! `invites::resolve_login`, logout and `/auth/me`. Sign-in is invite-only:
+//! nothing here creates a user.
 
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
@@ -20,129 +15,16 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::handlers::GrantedPortfolio;
 use crate::handlers::{self, ApiError};
-use crate::oidc::{OidcError, Provider, VerifiedIdentity};
+use crate::invites::{self, ClaimOutcome};
+use crate::oidc::{OidcError, Provider};
 use crate::sessions::{self, CookiePolicy};
-
-/// The result of matching a verified identity to a principal.
-pub enum ResolveOutcome {
-    /// Matched an existing principal, or provisioned a new one.
-    Resolved { principal_id: Uuid, principal_code: String },
-    /// `required_claim` is configured and the identity's claims don't satisfy
-    /// it. No principal was read, created, or touched.
-    ClaimRejected,
-    /// The `(issuer, subject)` identity is already linked to a row this
-    /// login must never resolve onto or touch — a non-HUMAN principal or a
-    /// DISABLED one. Nothing was created or modified: this is a refusal, not
-    /// a provisioning opportunity, since an identity links to one row only.
-    SubjectNotAvailable,
-}
-
-/// Match an authenticated subject to its principal, creating one on first sight.
-///
-/// A provisioned principal has no grants, and a principal without grants can do
-/// nothing: `require_order_grant` gates every order path and `/portfolios`
-/// returns only granted rows. So first login yields an identity that can see
-/// nothing until an admin grants it a portfolio — which is why this is safe to
-/// do automatically, and why it beats making an admin hand-copy opaque subject
-/// strings before anyone can log in.
-pub async fn resolve_or_provision(
-    pool: &PgPool,
-    identity: &VerifiedIdentity,
-    required_claim: Option<&(String, String)>,
-) -> Result<ResolveOutcome, sqlx::Error> {
-    // A STRATEGY principal must never hold a browser session, and a DISABLED
-    // one must never resolve at all — both are enforced right here in the
-    // match, not left to a caller to remember.
-    if let Some(outcome) = lookup_identity(pool, identity).await? {
-        return Ok(outcome);
-    }
-
-    // Checked before any insert: a rejected subject must leave no row behind.
-    if let Some((claim_name, required_value)) = required_claim {
-        if !claim_satisfies(&identity.claims, claim_name, required_value) {
-            return Ok(ResolveOutcome::ClaimRejected);
-        }
-    }
-
-    let code_seed = identity
-        .email
-        .as_deref()
-        .and_then(|email| email.split('@').next())
-        .filter(|local| !local.is_empty())
-        .or(identity.display_name.as_deref())
-        .unwrap_or(&identity.subject);
-    let code = generate_unique_code(pool, code_seed).await?;
-
-    // Principal and identity are created together. If a concurrent first
-    // login for the same identity won the race, the identity insert conflicts
-    // on (issuer, subject): roll back our principal and resolve onto the
-    // winner's row exactly as the lookup above would have.
-    let mut tx = pool.begin().await?;
-    let id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO principal (id, code, principal_type, display_name, status) \
-         VALUES ($1, $2, 'HUMAN', $3, 'ACTIVE')",
-    )
-    .bind(id)
-    .bind(&code)
-    .bind(&identity.display_name)
-    .execute(&mut *tx)
-    .await?;
-    let linked = sqlx::query(
-        "INSERT INTO principal_identity (issuer, subject, principal_id) VALUES ($1, $2, $3) \
-         ON CONFLICT (issuer, subject) DO NOTHING",
-    )
-    .bind(&identity.issuer)
-    .bind(&identity.subject)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if linked == 0 {
-        tx.rollback().await?;
-        return Ok(lookup_identity(pool, identity)
-            .await?
-            .unwrap_or(ResolveOutcome::SubjectNotAvailable));
-    }
-    tx.commit().await?;
-
-    Ok(ResolveOutcome::Resolved { principal_id: id, principal_code: code })
-}
-
-/// The outcome for an already-linked identity, or `None` if it is unlinked.
-async fn lookup_identity(
-    pool: &PgPool,
-    identity: &VerifiedIdentity,
-) -> Result<Option<ResolveOutcome>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT p.id, p.code, p.principal_type, p.status \
-           FROM principal_identity i JOIN principal p ON p.id = i.principal_id \
-          WHERE i.issuer = $1 AND i.subject = $2",
-    )
-    .bind(&identity.issuer)
-    .bind(&identity.subject)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|row| {
-        let kind: String = row.get("principal_type");
-        let status: String = row.get("status");
-        if kind == "HUMAN" && status == "ACTIVE" {
-            ResolveOutcome::Resolved {
-                principal_id: row.get("id"),
-                principal_code: row.get("code"),
-            }
-        } else {
-            ResolveOutcome::SubjectNotAvailable
-        }
-    }))
-}
 
 // ── HTTP layer: /auth/login, /auth/callback, /auth/logout, /auth/me ────────
 //
@@ -153,8 +35,8 @@ async fn lookup_identity(
 // `[auth.oidc]` config plus `oidc::Provider::discover`.
 
 /// What `login` and `callback` need beyond `AppState`: the configured
-/// provider connection and the optional claim gate `resolve_or_provision`
-/// checks. Kept out of `AppState` because OIDC is optional and off by
+/// provider connection and the optional claim gate the callback checks
+/// before resolving the login. Kept out of `AppState` because OIDC is optional and off by
 /// default (see `FileConfig::oidc`); Task 13 constructs this once at boot,
 /// only when `[auth.oidc]` is configured, and hands it to the router as an
 /// `Extension`.
@@ -174,6 +56,10 @@ pub struct FlowState {
     pub nonce: String,
     pub pkce_verifier: String,
     pub return_to: String,
+    /// The invite link token this login arrived with, if any. It is the
+    /// only way an unknown identity can get in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_token: Option<String>,
 }
 
 /// Validate a caller-supplied post-login destination.
@@ -312,11 +198,39 @@ pub async fn login(
     Extension(auth_state): Extension<AuthApiState>,
     Query(params): Query<LoginParams>,
 ) -> Response {
+    start_flow(&state, &auth_state, sanitize_return_to(params.return_to.as_deref()), None)
+}
+
+/// The invite link: starts a login with the invite token bound to the flow,
+/// and does nothing else. Whether the token is any good is decided only after
+/// the provider has verified who is signing in.
+#[utoipa::path(
+    get, path = "/auth/invite/{token}", tag = "auth",
+    params(("token" = String, Path, description = "The invite link token")),
+    responses(
+        (status = 302, description = "Redirects to the identity provider's authorization endpoint"),
+    ),
+)]
+pub async fn invite(
+    State(state): State<AppState>,
+    Extension(auth_state): Extension<AuthApiState>,
+    Path(token): Path<String>,
+) -> Response {
+    start_flow(&state, &auth_state, sanitize_return_to(None), Some(token))
+}
+
+fn start_flow(
+    state: &AppState,
+    auth_state: &AuthApiState,
+    return_to: String,
+    invite_token: Option<String>,
+) -> Response {
     let flow = FlowState {
         state: random_token(),
         nonce: random_token(),
         pkce_verifier: random_token(),
-        return_to: sanitize_return_to(params.return_to.as_deref()),
+        return_to,
+        invite_token,
     };
     let challenge = pkce_challenge(&flow.pkce_verifier);
     let authorize_url = auth_state.provider.authorize_url(&flow.state, &flow.nonce, &challenge);
@@ -413,21 +327,22 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
 }
 
 /// Completes a login: validates the callback, exchanges the code, resolves
-/// (or provisions) the principal, and mints a session.
+/// the identity (claiming the flow's invite if it is unknown), and mints a
+/// session. A login that resolves to no user is redirected to the access
+/// page with the reason; nothing is created for it.
 ///
-/// Every failure path here ends in a clean `ApiError` and no session:
-/// a provider error, a missing/expired flow cookie, a `state` mismatch, an
-/// exchange/token failure, `ClaimRejected`, and `SubjectNotAvailable` (the
-/// latter two both map to 403 — see `ResolveOutcome`) all return before
-/// `create_session` is ever called.
+/// Every failure path returns before `create_session` is ever called: a
+/// provider error, a missing/expired flow cookie, a `state` mismatch, an
+/// exchange/token failure or the claim gate end in an `ApiError`; a
+/// `ClaimOutcome` refusal ends in the access-page redirect.
 #[utoipa::path(
     get, path = "/auth/callback", tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 302, description = "Login completed; session cookie set, redirects to the validated return_to (default /)"),
+        (status = 302, description = "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=...)"),
         (status = 400, description = "Malformed callback, or a missing/expired/mismatched login flow"),
         (status = 401, description = "The provider rejected the login, or the exchanged token failed verification"),
-        (status = 403, description = "The claim gate rejected the identity, or the subject belongs to a non-human or disabled principal"),
+        (status = 403, description = "The claim gate rejected the identity"),
         (status = 502, description = "The identity provider was unreachable"),
     ),
 )]
@@ -472,19 +387,27 @@ pub async fn callback(
         .await
         .map_err(map_oidc_error)?;
 
-    let outcome = resolve_or_provision(state.pool(), &identity, auth_state.required_claim.as_ref())
-        .await
-        .map_err(|err| db_error("resolve_or_provision", err))?;
-
-    // Exhaustive on purpose: `SubjectNotAvailable` is a refusal, not a
-    // variant a catch-all should ever be allowed to treat as success.
-    let principal_id = match outcome {
-        ResolveOutcome::Resolved { principal_id, .. } => principal_id,
-        ResolveOutcome::ClaimRejected => {
+    // Checked before any lookup: a login outside the configured slice of the
+    // tenant is refused outright.
+    if let Some((claim_name, required_value)) = auth_state.required_claim.as_ref() {
+        if !claim_satisfies(&identity.claims, claim_name, required_value) {
             return Err(ApiError { status: StatusCode::FORBIDDEN, message: "not authorized".to_string() });
         }
-        ResolveOutcome::SubjectNotAvailable => {
-            return Err(ApiError { status: StatusCode::FORBIDDEN, message: "not authorized".to_string() });
+    }
+
+    let outcome = invites::resolve_login(state.pool(), &identity, flow.invite_token.as_deref())
+        .await
+        .map_err(|err| db_error("resolve_login", err))?;
+
+    let principal_id = match outcome {
+        ClaimOutcome::Linked { principal_id, .. } | ClaimOutcome::Known { principal_id, .. } => principal_id,
+        refused => {
+            let mut response = Redirect::to(&access_refused_url(&refused)).into_response();
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                clear_flow_cookie(policy).parse().expect("flow cookie header value is plain ASCII"),
+            );
+            return Ok(response);
         }
     };
 
@@ -633,44 +556,26 @@ fn claim_satisfies(claims: &serde_json::Value, claim_name: &str, required_value:
     }
 }
 
-/// Slugifies `seed` and, if that code is already taken, appends the lowest
-/// free numeric suffix (`-2`, `-3`, ...). An admin granting portfolios should
-/// see a human-readable name, not a UUID.
-async fn generate_unique_code(pool: &PgPool, seed: &str) -> Result<String, sqlx::Error> {
-    let base = slugify(seed);
-    let base = if base.is_empty() { "principal".to_string() } else { base };
-
-    let mut candidate = base.clone();
-    let mut suffix = 1u32;
-    loop {
-        let taken: bool =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM principal WHERE code = $1)")
-                .bind(&candidate)
-                .fetch_one(pool)
-                .await?;
-        if !taken {
-            return Ok(candidate);
+/// Where a refused login lands: the access page with the reason, plus the
+/// masked invited address for an email mismatch.
+pub fn access_refused_url(outcome: &ClaimOutcome) -> String {
+    let reason = outcome.refusal_reason().unwrap_or("no_invite");
+    match outcome {
+        ClaimOutcome::EmailMismatch { invited_hint } => {
+            format!("/trade/access?reason={reason}&hint={}", percent_encode(invited_hint))
         }
-        suffix += 1;
-        candidate = format!("{base}-{suffix}");
+        _ => format!("/trade/access?reason={reason}"),
     }
 }
 
-/// Lowercase alphanumerics joined by single hyphens; no leading, trailing, or
-/// doubled hyphens.
-fn slugify(input: &str) -> String {
-    let mut out = String::new();
-    for c in input.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -685,6 +590,7 @@ mod tests {
             nonce: "n-1".into(),
             pkce_verifier: "v-1".into(),
             return_to: "/".into(),
+            invite_token: None,
         };
 
         let header = flow_cookie(&policy, &flow);
@@ -702,7 +608,7 @@ mod tests {
     fn the_flow_cookie_is_short_lived_and_unreadable_to_script() {
         let policy = crate::sessions::cookie_policy("localhost:3001", None);
         let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(),
+            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(), invite_token: None,
         });
 
         assert!(header.contains("HttpOnly"));
@@ -716,7 +622,7 @@ mod tests {
 
     #[test]
     fn a_state_mismatch_is_rejected_before_anything_is_exchanged() {
-        let flow = FlowState { state: "expected".into(), nonce: "n".into(), pkce_verifier: "v".into(), return_to: "/".into() };
+        let flow = FlowState { state: "expected".into(), nonce: "n".into(), pkce_verifier: "v".into(), return_to: "/".into(), invite_token: None };
 
         assert!(!callback_state_matches(&flow, "attacker-supplied"));
         assert!(callback_state_matches(&flow, "expected"));
@@ -744,7 +650,7 @@ mod tests {
     fn a_flow_cookie_on_a_public_bind_is_host_prefixed_and_secure() {
         let policy = crate::sessions::cookie_policy("0.0.0.0:3001", None);
         let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(),
+            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(), invite_token: None,
         });
 
         assert!(header.starts_with("__Host-oms_login_flow="));
@@ -830,6 +736,7 @@ mod tests {
             nonce: "n-1".into(),
             pkce_verifier: "v-1".into(),
             return_to: "/trade/".into(),
+            invite_token: None,
         };
 
         let header = flow_cookie(&policy, &flow);
@@ -839,248 +746,36 @@ mod tests {
         assert_eq!(flow_from_cookie(&headers, &policy).expect("flow").return_to, "/trade/");
     }
 
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn a_first_login_provisions_a_human_with_no_grants() {
-        let pool = test_pool().await;
-        let identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-
-        let outcome = resolve_or_provision(&pool, &identity, None).await.expect("resolve");
-
-        let ResolveOutcome::Resolved { principal_id, .. } = outcome else {
-            panic!("expected a principal");
+    #[test]
+    fn the_flow_cookie_carries_the_invite_token() {
+        let policy = crate::sessions::cookie_policy("localhost:3001", None);
+        let flow = FlowState {
+            state: "st-1".into(),
+            nonce: "n-1".into(),
+            pkce_verifier: "v-1".into(),
+            return_to: "/".into(),
+            invite_token: Some("tok-1".into()),
         };
-        let grants: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM principal_portfolio_grant WHERE principal_id = $1",
-        )
-        .bind(principal_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count grants");
-        assert_eq!(grants, 0, "a new human must be able to do nothing until granted");
+
+        let header = flow_cookie(&policy, &flow);
+        let mut headers = HeaderMap::new();
+        headers.insert("cookie", header.split(';').next().unwrap().parse().unwrap());
+
+        assert_eq!(flow_from_cookie(&headers, &policy).expect("flow").invite_token.as_deref(), Some("tok-1"));
     }
 
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn logging_in_twice_does_not_create_a_second_principal() {
-        let pool = test_pool().await;
-        let identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-
-        let first = resolve_or_provision(&pool, &identity, None).await.expect("first");
-        let second = resolve_or_provision(&pool, &identity, None).await.expect("second");
-
-        assert_eq!(principal_id_of(&first), principal_id_of(&second));
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn an_existing_principal_is_matched_on_its_identity() {
-        let pool = test_pool().await;
-        let subject = format!("sub-{}", Uuid::new_v4());
-        let expected = seed_principal_with_subject(&pool, &subject).await;
-
-        let outcome = resolve_or_provision(&pool, &identity_for(&subject), None)
-            .await
-            .expect("resolve");
-
-        assert_eq!(principal_id_of(&outcome), expected);
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn the_claim_gate_keeps_the_rest_of_the_tenant_out() {
-        let pool = test_pool().await;
-        let mut identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-        identity.claims = serde_json::json!({ "groups": "everyone-else" });
-
-        let gate = ("groups".to_string(), "traders".to_string());
-        let outcome = resolve_or_provision(&pool, &identity, Some(&gate)).await.expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::ClaimRejected));
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn the_claim_gate_lets_the_intended_slice_through() {
-        let pool = test_pool().await;
-        let mut identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-        identity.claims = serde_json::json!({ "groups": ["traders", "staff"] });
-
-        let gate = ("groups".to_string(), "traders".to_string());
-        let outcome = resolve_or_provision(&pool, &identity, Some(&gate)).await.expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn a_subject_already_held_by_a_strategy_principal_is_refused_not_hijacked() {
-        let pool = test_pool().await;
-        let subject = format!("sub-{}", Uuid::new_v4());
-        let (service_id, original_name) = seed_strategy_principal_with_subject(&pool, &subject).await;
-
-        // An attacker-controlled display_name must not leak into the strategy
-        // principal even though its identity matches this login.
-        let mut identity = identity_for(&subject);
-        identity.display_name = Some("Attacker-Controlled Name".to_string());
-
-        let outcome = resolve_or_provision(&pool, &identity, None).await.expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::SubjectNotAvailable));
-
-        let principal_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM principal_identity WHERE issuer = $1 AND subject = $2")
-                .bind(TEST_ISSUER)
-                .bind(&subject)
-                .fetch_one(&pool)
-                .await
-                .expect("count principals for subject");
-        assert_eq!(principal_count, 1, "no second principal must be created for a taken subject");
-
-        let name: String = sqlx::query_scalar("SELECT display_name FROM principal WHERE id = $1")
-            .bind(service_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read display_name");
-        assert_eq!(name, original_name, "the strategy principal must not be touched");
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn a_subject_held_by_a_disabled_human_is_refused_not_reactivated() {
-        let pool = test_pool().await;
-        let subject = format!("sub-{}", Uuid::new_v4());
-        let disabled_id = seed_disabled_human_with_subject(&pool, &subject).await;
-
-        let outcome = resolve_or_provision(&pool, &identity_for(&subject), None)
-            .await
-            .expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::SubjectNotAvailable));
-
-        let status: String = sqlx::query_scalar("SELECT status FROM principal WHERE id = $1")
-            .bind(disabled_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read status");
-        assert_eq!(status, "DISABLED", "a disabled principal must not be reactivated by a login attempt");
-    }
-
-    // ── test plumbing ────────────────────────────────────────────────────────
-
-    fn principal_id_of(outcome: &ResolveOutcome) -> Uuid {
-        match outcome {
-            ResolveOutcome::Resolved { principal_id, .. } => *principal_id,
-            _ => panic!("expected a resolved principal"),
-        }
-    }
-
-    /// A `VerifiedIdentity` carrying `subject` unchanged, with an email whose
-    /// local part embeds `subject` so the code this test run provisions is
-    /// unique without leaning on the collision-suffix path.
-    fn identity_for(subject: &str) -> VerifiedIdentity {
-        VerifiedIdentity {
-            issuer: TEST_ISSUER.to_string(),
-            subject: subject.to_string(),
-            display_name: Some("Test User".to_string()),
-            email: Some(format!("{subject}@example.com")),
-            claims: serde_json::json!({}),
-        }
-    }
-
-    const TEST_ISSUER: &str = "https://idp.test";
-
-    /// Links `subject` under `TEST_ISSUER` to principal `id`.
-    async fn link(pool: &sqlx::PgPool, id: Uuid, subject: &str) {
-        sqlx::query("INSERT INTO principal_identity (issuer, subject, principal_id) VALUES ($1, $2, $3)")
-            .bind(TEST_ISSUER)
-            .bind(subject)
-            .bind(id)
-            .execute(pool)
-            .await
-            .expect("link identity");
-    }
-
-    /// `main` loads .env before resolving config; a test binary does not, so
-    /// without this the test resolves a different database than the server
-    /// runs against. The `oms` role carries `search_path = oms, public`
-    /// (db/access/roles.sql); these are the admin credentials, so set it here.
-    async fn test_pool() -> sqlx::PgPool {
-        use crate::setup::database::config;
-        dotenvy::dotenv().ok();
-        let cfg = config::resolve(config::PostgresOverrides::default());
-        sqlx::postgres::PgPoolOptions::new()
-            .after_connect(|conn, _| {
-                Box::pin(async move {
-                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
-                    Ok(())
-                })
-            })
-            .connect(&cfg.url())
-            .await
-            .expect("connect")
-    }
-
-    /// Seeds an ACTIVE HUMAN principal already bound to `subject`, as if it
-    /// had been provisioned by an earlier login (or created by an admin).
-    /// Returns its id.
-    async fn seed_principal_with_subject(pool: &sqlx::PgPool, subject: &str) -> Uuid {
-        let id = Uuid::new_v4();
-        let code = format!("seeded-{id}");
-        sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, display_name, status) \
-             VALUES ($1, $2, 'HUMAN', $2, 'ACTIVE')",
-        )
-        .bind(id)
-        .bind(&code)
-        .execute(pool)
-        .await
-        .expect("seed principal");
-        link(pool, id, subject).await;
-        id
-    }
-
-    /// Seeds an ACTIVE STRATEGY principal already bound to `subject` — the
-    /// scenario where a human's `sub` collides with a non-human principal's.
-    /// Returns its id and the `display_name` it was seeded with, so callers
-    /// can assert that name survives untouched.
-    async fn seed_strategy_principal_with_subject(
-        pool: &sqlx::PgPool,
-        subject: &str,
-    ) -> (Uuid, String) {
-        let id = Uuid::new_v4();
-        let code = format!("strategy-{id}");
-        let display_name = format!("Strategy {id}");
-        sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, display_name, status) \
-             VALUES ($1, $2, 'STRATEGY', $3, 'ACTIVE')",
-        )
-        .bind(id)
-        .bind(&code)
-        .bind(&display_name)
-        .execute(pool)
-        .await
-        .expect("seed strategy principal");
-        link(pool, id, subject).await;
-        (id, display_name)
-    }
-
-    /// Seeds a DISABLED HUMAN principal already bound to `subject` — e.g. an
-    /// offboarded user whose identity an admin never unlinked.
-    /// Returns its id.
-    async fn seed_disabled_human_with_subject(pool: &sqlx::PgPool, subject: &str) -> Uuid {
-        let id = Uuid::new_v4();
-        let code = format!("disabled-{id}");
-        sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, display_name, status) \
-             VALUES ($1, $2, 'HUMAN', $2, 'DISABLED')",
-        )
-        .bind(id)
-        .bind(&code)
-        .execute(pool)
-        .await
-        .expect("seed disabled principal");
-        link(pool, id, subject).await;
-        id
+    #[test]
+    fn a_refused_login_lands_on_the_access_page_with_its_reason() {
+        assert_eq!(access_refused_url(&ClaimOutcome::NoInvite), "/trade/access?reason=no_invite");
+        assert_eq!(access_refused_url(&ClaimOutcome::Expired), "/trade/access?reason=expired");
+        assert_eq!(access_refused_url(&ClaimOutcome::Revoked), "/trade/access?reason=revoked");
+        assert_eq!(
+            access_refused_url(&ClaimOutcome::EmailUnverified),
+            "/trade/access?reason=email_unverified"
+        );
+        assert_eq!(
+            access_refused_url(&ClaimOutcome::EmailMismatch { invited_hint: "j…@fundco.com".into() }),
+            "/trade/access?reason=email_mismatch&hint=j%E2%80%A6%40fundco.com"
+        );
     }
 }

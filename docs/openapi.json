@@ -3308,7 +3308,7 @@
           "auth"
         ],
         "summary": "Completes a login: validates the callback, exchanges the code, resolves",
-        "description": "(or provisions) the principal, and mints a session.\n\nEvery failure path here ends in a clean `ApiError` and no session:\na provider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure, `ClaimRejected`, and `SubjectNotAvailable` (the\nlatter two both map to 403 — see `ResolveOutcome`) all return before\n`create_session` is ever called.",
+        "description": "the identity (claiming the flow's invite if it is unknown), and mints a\nsession. A login that resolves to no user is redirected to the access\npage with the reason; nothing is created for it.\n\nEvery failure path returns before `create_session` is ever called: a\nprovider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure or the claim gate end in an `ApiError`; a\n`ClaimOutcome` refusal ends in the access-page redirect.",
         "operationId": "callback",
         "parameters": [
           {
@@ -3341,7 +3341,7 @@
         ],
         "responses": {
           "302": {
-            "description": "Login completed; session cookie set, redirects to the validated return_to (default /)"
+            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=...)"
           },
           "400": {
             "description": "Malformed callback, or a missing/expired/mismatched login flow"
@@ -3350,10 +3350,36 @@
             "description": "The provider rejected the login, or the exchanged token failed verification"
           },
           "403": {
-            "description": "The claim gate rejected the identity, or the subject belongs to a non-human or disabled principal"
+            "description": "The claim gate rejected the identity"
           },
           "502": {
             "description": "The identity provider was unreachable"
+          }
+        }
+      }
+    },
+    "/auth/invite/{token}": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "The invite link: starts a login with the invite token bound to the flow,",
+        "description": "and does nothing else. Whether the token is any good is decided only after\nthe provider has verified who is signing in.",
+        "operationId": "invite",
+        "parameters": [
+          {
+            "name": "token",
+            "in": "path",
+            "description": "The invite link token",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirects to the identity provider's authorization endpoint"
           }
         }
       }

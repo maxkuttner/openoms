@@ -23,6 +23,26 @@ pub(crate) async fn fresh_db() -> PgPool {
     PgPool::connect_with(options.database(&name)).await.unwrap()
 }
 
+/// A fully migrated disposable database whose connections resolve
+/// unqualified table names in `oms`, as the runtime role does.
+pub(crate) async fn migrated_db() -> PgPool {
+    let admin = fresh_db().await;
+    migrate::ensure_tracking(&admin).await.unwrap();
+    migrate::apply_all(&admin).await.unwrap();
+    let name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("ALTER DATABASE {name} SET search_path = oms, public"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+    let url = std::env::var("OMS_RELOAD_TEST_DATABASE_URL").unwrap();
+    let options: PgConnectOptions = url.parse().unwrap();
+    PgPool::connect_with(options.database(&name)).await.unwrap()
+}
+
 async fn principal(pool: &PgPool, code: &str, kind: &str, subject: Option<&str>) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(

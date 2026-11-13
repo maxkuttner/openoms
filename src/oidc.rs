@@ -45,6 +45,8 @@ pub struct VerifiedIdentity {
     pub subject: String,
     pub display_name: Option<String>,
     pub email: Option<String>,
+    /// The `email_verified` claim; absent or anything but `true` is false.
+    pub email_verified: bool,
     pub claims: serde_json::Value,
 }
 
@@ -162,11 +164,14 @@ pub fn verify_id_token(
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let email_verified = matches!(raw_claims.get("email_verified"), Some(serde_json::Value::Bool(true)));
+
     Ok(VerifiedIdentity {
         issuer: expected.issuer.clone(),
         subject,
         display_name,
         email,
+        email_verified,
         claims: raw_claims,
     })
 }
@@ -582,6 +587,19 @@ mod tests {
     }
 
     #[test]
+    fn email_verified_is_true_only_when_the_token_says_so() {
+        let s = signer();
+        for (claim, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let token = s.token_with(|mut c| {
+                c.email_verified = claim;
+                c
+            });
+            let identity = verify_id_token(&token, &s.keys(), &expectations(), Utc::now()).expect("verify");
+            assert_eq!(identity.email_verified, expected, "claim {claim:?}");
+        }
+    }
+
+    #[test]
     fn a_token_without_name_or_email_still_verifies_with_none() {
         let s = signer();
         let token = s.token_with(|mut c| {
@@ -845,6 +863,7 @@ mod tests {
         nonce: String,
         name: Option<String>,
         email: Option<String>,
+        email_verified: Option<bool>,
     }
 
     impl Default for Claims {
@@ -859,6 +878,7 @@ mod tests {
                 nonce: "n-123".into(),
                 name: Some("Ada Lovelace".into()),
                 email: Some("ada@example.com".into()),
+                email_verified: None,
             }
         }
     }
@@ -912,6 +932,7 @@ mod tests {
             if let Some(email) = c.email {
                 claims = claims.set_email(Some(EndUserEmail::new(email)));
             }
+            claims = claims.set_email_verified(c.email_verified);
 
             CoreIdToken::new(
                 claims,
