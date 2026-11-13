@@ -297,10 +297,14 @@ pub async fn reissue(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<NewI
     .bind(principal_id)
     .execute(&mut *tx)
     .await?;
+    // Only a user who never signed in is invited again. Admin pre-bindings
+    // that were never used for a login (no last_login_at) do not count and
+    // are kept; a user who did sign in is re-enabled instead.
     let reinvited = sqlx::query(
         "UPDATE principal SET status = 'INVITED', updated_at = now() \
           WHERE id = $1 AND status = 'DISABLED' \
-            AND NOT EXISTS (SELECT 1 FROM principal_identity WHERE principal_id = $1)",
+            AND NOT EXISTS (SELECT 1 FROM principal_identity \
+                             WHERE principal_id = $1 AND last_login_at IS NOT NULL)",
     )
     .bind(principal_id)
     .execute(&mut *tx)
@@ -1488,6 +1492,36 @@ mod tests {
             claim(&pool, &identity, Some(&new.token)).await.unwrap(),
             ClaimOutcome::Linked { .. }
         ));
+    }
+
+    /// A pre-bound identity that never signed in does not block reissue after
+    /// the invite was revoked; the pre-binding is kept and still resolves.
+    /// An identity that has signed in does block it (re-enable instead).
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn reissue_after_revoke_keeps_unused_prebinding() {
+        let pool = migrated_db().await;
+        let old = invite_jane(&pool).await;
+        prebind_identity(&pool, old.principal_id, ISSUER, "entra-oid-7", "ada").await.unwrap();
+        revoke(&pool, old.invite_id, "admin").await.unwrap();
+        assert_eq!(status(&pool, old.principal_id).await, "DISABLED");
+
+        let new = reissue(&pool, old.invite_id, "admin").await.unwrap();
+        assert_eq!(status(&pool, old.principal_id).await, "INVITED");
+        assert_eq!(count(&pool, "principal_identity").await, 1, "the pre-binding is kept");
+        assert!(matches!(
+            claim(&pool, &login(ISSUER, "entra-oid-7", "x@else.com", false), Some(&new.token)).await.unwrap(),
+            ClaimOutcome::Linked { .. }
+        ));
+
+        // Once that identity has signed in, a revoked-then-reissued invite
+        // does not flip the user back to INVITED.
+        let used = create(&pool, "used@fundco.com", "trader", &[], "admin").await.unwrap();
+        prebind_identity(&pool, used.principal_id, ISSUER, "entra-oid-8", "ada").await.unwrap();
+        sqlx::query("UPDATE principal_identity SET last_login_at = now() WHERE subject = 'entra-oid-8'").execute(&pool).await.unwrap();
+        revoke(&pool, used.invite_id, "admin").await.unwrap();
+        reissue(&pool, used.invite_id, "admin").await.unwrap();
+        assert_eq!(status(&pool, used.principal_id).await, "DISABLED");
     }
 
     #[tokio::test]
