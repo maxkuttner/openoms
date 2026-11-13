@@ -21,6 +21,7 @@ use crate::domain::orders::commands::SubmitOrder;
 use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
+use crate::authz::{self, Permission};
 use crate::positions::{value as value_position, Position};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::NewOrderEvent;
@@ -143,29 +144,39 @@ impl SubmitOrderRequest {
     }
 }
 
-/// Which entitlement a route demands on the portfolio an order books against.
-#[derive(Clone, Copy)]
-pub(crate) enum OrderPermission {
+/// What a route wants to do with an order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrderAccess {
     View,
-    Trade,
+    Cancel,
 }
 
-impl OrderPermission {
-    /// The grant column. A fixed `&'static str` per variant — never caller input —
-    /// so interpolating it into SQL cannot carry anything injectable.
-    fn column(self) -> &'static str {
+impl OrderAccess {
+    /// (permission on any order in the portfolio, permission on the caller's own).
+    fn permissions(self) -> (Permission, Permission) {
         match self {
-            Self::View => "can_view",
-            Self::Trade => "can_trade",
+            Self::View => (Permission::OrdersViewAll, Permission::OrdersViewOwn),
+            Self::Cancel => (Permission::OrdersCancelAny, Permission::OrdersCancelOwn),
         }
     }
 }
 
-/// Assert this principal may act on the given order, by way of its portfolio.
+pub(crate) fn forbidden() -> ApiError {
+    ApiError { status: StatusCode::FORBIDDEN, message: "unauthorized".to_string() }
+}
+
+/// A 500 whose detail stays in the server log, not the response.
+pub(crate) fn internal(context: &str, err: impl std::fmt::Debug) -> ApiError {
+    tracing::error!(?err, "{context}");
+    ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: context.to_string() }
+}
+
+/// Assert this principal may act on the given order, by way of its portfolio and role.
 ///
 /// Orders are reachable by UUID alone, so without this any valid trading token could
-/// read or cancel any order in the system, including another principal's. The grant
-/// lives on the portfolio, matching `get_portfolio_positions`.
+/// read or cancel any order in the system. `View` passes with `orders.view_all` in
+/// the order's portfolio, or `orders.view_own` when the caller placed it; `Cancel`
+/// likewise with `orders.cancel_any` / `orders.cancel_own`.
 ///
 /// A missing order is 404 and an unentitled one is 403 — deliberately distinguished.
 /// Collapsing both to 404 would hide typos behind "not found"; order ids are UUIDs, so
@@ -174,35 +185,23 @@ pub(crate) async fn require_order_grant(
     pool: &PgPool,
     principal_id: Uuid,
     order_id: Uuid,
-    permission: OrderPermission,
+    access: OrderAccess,
 ) -> Result<(), ApiError> {
-    let granted: Option<bool> = query_scalar(&format!(
-        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant g \
-          WHERE g.portfolio_id = os.portfolio_id AND g.principal_id = $2 \
-            AND g.{} = true) \
-         FROM order_state os WHERE os.order_id = $1",
-        permission.column()
-    ))
-    .bind(order_id)
-    .bind(principal_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to check grant: {:?}", err),
-    })?;
-
-    match granted {
-        Some(true) => Ok(()),
-        Some(false) => Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            message: "unauthorized".to_string(),
-        }),
-        None => Err(ApiError {
-            status: StatusCode::NOT_FOUND,
-            message: "order not found".to_string(),
-        }),
-    }
+    let row: Option<(Uuid, Uuid)> =
+        sqlx::query_as("SELECT portfolio_id, principal_id FROM order_state WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|err| internal("failed to check grant", err))?;
+    let Some((portfolio_id, owner)) = row else {
+        return Err(ApiError { status: StatusCode::NOT_FOUND, message: "order not found".to_string() });
+    };
+    let (any, own) = access.permissions();
+    let check = |perm| authz::allowed(pool, principal_id, perm, portfolio_id);
+    let ok = check(any).await.map_err(|err| internal("failed to check grant", err))?
+        || (owner == principal_id
+            && check(own).await.map_err(|err| internal("failed to check grant", err))?);
+    if ok { Ok(()) } else { Err(forbidden()) }
 }
 
 /// Split the `Symbol@Venue` shorthand into its parts. `None` when there is no `@`.
@@ -388,7 +387,7 @@ pub async fn get_order(
         message: "id must be a UUID".to_string(),
     })?;
 
-    require_order_grant(state.pool(), auth.principal_id, order_id, OrderPermission::View).await?;
+    require_order_grant(state.pool(), auth.principal_id, order_id, OrderAccess::View).await?;
 
     let row = sqlx::query(
         r#"
@@ -473,15 +472,25 @@ pub async fn list_portfolios(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<GrantedPortfolio>>, ApiError> {
+    // Only portfolios the role can see anything in; `can_trade` reports whether the
+    // role may actually place orders there, so a viewer's ticket stays greyed out.
+    let visible = |perm| authz::visible_portfolios(state.pool(), auth.principal_id, perm);
+    let fail = |e| internal("failed to list portfolios", e);
+    let mut in_scope = visible(Permission::PositionsView).await.map_err(fail)?;
+    in_scope.extend(visible(Permission::OrdersViewAll).await.map_err(fail)?);
+    in_scope.extend(visible(Permission::OrdersViewOwn).await.map_err(fail)?);
+    let can_create = visible(Permission::OrdersCreate).await.map_err(fail)?;
     let rows = sqlx::query(
         "SELECT p.id, p.code, p.name, p.status, p.base_currency, \
-                g.can_trade, g.can_view, g.can_allocate \
+                g.portfolio_id = ANY($3) AS can_trade, g.can_view, g.can_allocate \
          FROM principal_portfolio_grant g \
          JOIN portfolio p ON p.id = g.portfolio_id \
-         WHERE g.principal_id = $1 \
+         WHERE g.principal_id = $1 AND g.portfolio_id = ANY($2) \
          ORDER BY p.code",
     )
     .bind(auth.principal_id)
+    .bind(&in_scope)
+    .bind(&can_create)
     .fetch_all(state.pool())
     .await
     .map_err(|err| ApiError {
@@ -520,24 +529,7 @@ pub async fn get_portfolio_positions(
     Extension(auth): Extension<AuthContext>,
     Path(portfolio_id): Path<Uuid>,
 ) -> Result<Json<Vec<Position>>, ApiError> {
-    let can_view: bool = query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant \
-         WHERE principal_id = $1 AND portfolio_id = $2 AND can_view = true)",
-    )
-    .bind(auth.principal_id)
-    .bind(portfolio_id)
-    .fetch_one(state.pool())
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to check grant: {:?}", err),
-    })?;
-    if !can_view {
-        return Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            message: "unauthorized".to_string(),
-        });
-    }
+    authz::require(state.pool(), auth.principal_id, Permission::PositionsView, portfolio_id).await?;
 
     // contract_size scales the mark into money (x100 for options, 1 for spot).
     // LEFT JOIN: a position whose master row is missing still returns, valued at 1x.
@@ -663,21 +655,8 @@ pub async fn get_portfolio_venues(
     Path(portfolio_id): Path<Uuid>,
     Query(query): Query<VenuesQuery>,
 ) -> Result<Json<Vec<VenueOption>>, ApiError> {
-    let can_view: bool = query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant \
-         WHERE principal_id = $1 AND portfolio_id = $2 AND can_view = true)",
-    )
-    .bind(auth.principal_id)
-    .bind(portfolio_id)
-    .fetch_one(state.pool())
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to check grant: {:?}", err),
-    })?;
-    if !can_view {
-        return Err(ApiError { status: StatusCode::FORBIDDEN, message: "unauthorized".to_string() });
-    }
+    // Same scope as the portfolio's positions: any role in the portfolio at all.
+    authz::require(state.pool(), auth.principal_id, Permission::PositionsView, portfolio_id).await?;
 
     // An unparseable instrument_id has no venues, same as a real but
     // never-synced one — excluded, not an error.
@@ -809,6 +788,8 @@ pub async fn create_allocations(
     if !can_allocate {
         return Err(ApiError { status: StatusCode::FORBIDDEN, message: "unauthorized".to_string() });
     }
+    // ...and the block order must be one the caller may see.
+    require_order_grant(pool, auth.principal_id, order_id, OrderAccess::View).await?;
 
     // 3. validate splits + cap at the filled (and not-yet-allocated) quantity.
     if req.splits.is_empty() {
@@ -898,8 +879,10 @@ pub async fn create_allocations(
 )]
 pub async fn list_allocations(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
     Path(order_id): Path<Uuid>,
 ) -> Result<Json<Vec<Allocation>>, ApiError> {
+    require_order_grant(state.pool(), auth.principal_id, order_id, OrderAccess::View).await?;
     let rows = sqlx::query(
         "SELECT id, order_id, from_portfolio_id, to_portfolio_id, instrument_id, \
                 qty::double precision AS qty, price::double precision AS price, created_at \
@@ -984,8 +967,9 @@ pub struct BlotterRow {
 enum BlotterScope {
     /// Oversight: every order, `principal_id` usable as a filter.
     All,
-    /// This principal's entitled portfolios only. Not a filter — a ceiling.
-    GrantedTo(Uuid),
+    /// A caller's view: every order in `view_all` portfolios, and their own
+    /// orders in `view_own` ones. Not a filter — a ceiling.
+    Visible { principal_id: Uuid, view_all: Vec<Uuid>, view_own: Vec<Uuid> },
 }
 
 async fn load_blotter(
@@ -1015,17 +999,14 @@ async fn load_blotter(
         BlotterScope::All => {
             if let Some(v) = f.principal_id { qb.push(" AND os.principal_id = ").push_bind(v); }
         }
-        // EXISTS rather than a join: an order must sit in a portfolio this principal
-        // may view, and a join would duplicate rows if the grant model ever allows
-        // more than one matching grant per portfolio.
-        BlotterScope::GrantedTo(principal_id) => {
-            qb.push(
-                " AND EXISTS (SELECT 1 FROM principal_portfolio_grant g \
-                   WHERE g.portfolio_id = os.portfolio_id AND g.can_view = true \
-                     AND g.principal_id = ",
-            )
-            .push_bind(principal_id)
-            .push(")");
+        BlotterScope::Visible { principal_id, view_all, view_own } => {
+            qb.push(" AND (os.portfolio_id = ANY(")
+                .push_bind(view_all)
+                .push(") OR (os.portfolio_id = ANY(")
+                .push_bind(view_own)
+                .push(") AND os.principal_id = ")
+                .push_bind(principal_id)
+                .push("))");
         }
     }
     if let Some(v) = &f.status { qb.push(" AND os.status = ").push_bind(v.clone()); }
@@ -1113,7 +1094,11 @@ pub async fn list_orders(
     Extension(auth): Extension<AuthContext>,
     Query(f): Query<BlotterFilter>,
 ) -> Result<Json<Vec<BlotterRow>>, ApiError> {
-    load_blotter(&state, &f, BlotterScope::GrantedTo(auth.principal_id)).await.map(Json)
+    let visible = |perm| authz::visible_portfolios(state.pool(), auth.principal_id, perm);
+    let view_all = visible(Permission::OrdersViewAll).await.map_err(|e| internal("failed to load blotter", e))?;
+    let view_own = visible(Permission::OrdersViewOwn).await.map_err(|e| internal("failed to load blotter", e))?;
+    let scope = BlotterScope::Visible { principal_id: auth.principal_id, view_all, view_own };
+    load_blotter(&state, &f, scope).await.map(Json)
 }
 
 // Function to issue an api error
@@ -1438,12 +1423,17 @@ pub(crate) mod tests {
         assert_eq!(split_symbol_at_venue("@"), None);
     }
 
-    /// The grant column is chosen by the route, never by the caller — these two fixed
-    /// strings are the only things ever interpolated into the grant query.
+    /// Each access pairs a whole-portfolio permission with an own-orders one.
     #[test]
-    fn order_permission_maps_to_grant_column() {
-        assert_eq!(OrderPermission::View.column(), "can_view");
-        assert_eq!(OrderPermission::Trade.column(), "can_trade");
+    fn order_access_maps_to_any_and_own_permissions() {
+        assert_eq!(
+            OrderAccess::View.permissions(),
+            (Permission::OrdersViewAll, Permission::OrdersViewOwn)
+        );
+        assert_eq!(
+            OrderAccess::Cancel.permissions(),
+            (Permission::OrdersCancelAny, Permission::OrdersCancelOwn)
+        );
     }
 
     /// An authenticated command is attributed to whoever sent it — the whole
@@ -2180,6 +2170,12 @@ pub(crate) mod tests {
         .execute(pool)
         .await
         .expect("seed principal");
+        // as migration 0051 did for every existing person
+        sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, 'trader')")
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("seed role");
         (id, code)
     }
 

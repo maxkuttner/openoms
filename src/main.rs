@@ -90,6 +90,8 @@ mod reload_tests;
 mod boundary_tests;
 #[cfg(test)]
 mod authz_schema_tests;
+#[cfg(test)]
+mod authz_route_tests;
 
 #[derive(OpenApi)]
 #[openapi(

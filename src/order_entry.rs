@@ -20,7 +20,7 @@ use crate::event_bus::publish_appended;
 use crate::event_store::OrderEventStore;
 use crate::handlers::{
     actor_for, domain_event_to_new_event, map_rejection_to_api_error, parse_order_side, parse_order_status,
-    parse_order_type, parse_time_in_force, require_order_grant, resolve_instrument_ref, ApiError, OrderPermission,
+    parse_order_type, parse_time_in_force, require_order_grant, resolve_instrument_ref, ApiError, OrderAccess,
     SubmitOrderRequest,
 };
 use crate::domain::orders::risk::RiskRejection;
@@ -116,9 +116,12 @@ pub(crate) async fn insert_order_state(
             version,
             broker_connection_code,
             origin,
-            fix_cl_ord_id
+            fix_cl_ord_id,
+            responsible_principal_id
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+            -- a strategy's order answers to its responsible user; anyone else's to themselves
+            COALESCE((SELECT owner_principal_id FROM strategy WHERE principal_id = $3 LIMIT 1), $3)
         )
         "#
     )
@@ -701,22 +704,10 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     let principal_id = auth.principal_id;
     info!(principal_id = %principal_id, "resolved principal");
 
-    let has_grant: bool = query_scalar(
-        "SELECT EXISTS (
-            SELECT 1 FROM principal_portfolio_grant
-            WHERE principal_id = $1
-              AND portfolio_id = $2
-              AND can_trade = true
-        )"
-    )
-    .bind(principal_id)
-    .bind(portfolio_id)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to check grant: {:?}", err),
-    })?;
+    // orders.create on the target portfolio: the role allows it and the grant has can_trade.
+    let has_grant = crate::authz::allowed(&pool, principal_id, crate::authz::Permission::OrdersCreate, portfolio_id)
+        .await
+        .map_err(|err| crate::handlers::internal("failed to check grant", err))?;
 
     info!(has_grant, portfolio_id = %portfolio_id, account_id = %account_id, "checked trade grant");
 
@@ -918,7 +909,8 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     Ok(order_id)
 }
 
-/// Cancel one order, on the caller's `can_trade` grant.
+/// Cancel one order: `orders.cancel_any` in its portfolio, or `orders.cancel_own`
+/// for the caller's own (both need the portfolio grant's `can_trade`).
 pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, reason: Option<String>) -> Result<CancelOutcome, ApiError> {
     info!(%order_id, principal_id = %auth.principal_id, "cancel order received");
 
@@ -926,8 +918,7 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
     let event_store = OrderEventStore::new(pool.clone());
 
 
-    // Cancelling is acting on the position, so it takes can_trade rather than can_view.
-    require_order_grant(&pool, auth.principal_id, order_id, OrderPermission::Trade).await?;
+    require_order_grant(&pool, auth.principal_id, order_id, OrderAccess::Cancel).await?;
 
     // start transaction
     let mut tx = pool.begin().await.map_err(|err| ApiError {

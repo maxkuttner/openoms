@@ -20,7 +20,7 @@ use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload};
 use crate::event_store::{OrderEventRecord, OrderEventStore};
-use crate::handlers::{require_order_grant, ApiError, OrderPermission};
+use crate::handlers::{require_order_grant, ApiError, OrderAccess};
 
 /// One entry in an order's audit trail.
 ///
@@ -229,7 +229,7 @@ pub async fn get_order_events(
     let order_id = parse_order_id(&order_id)?;
     // Also answers "does this order exist" — 404 for an unknown id, 403 for one
     // this principal may not see.
-    require_order_grant(state.pool(), auth.principal_id, order_id, OrderPermission::View).await?;
+    require_order_grant(state.pool(), auth.principal_id, order_id, OrderAccess::View).await?;
 
     load_timeline(state.pool(), order_id).await.map(Json)
 }

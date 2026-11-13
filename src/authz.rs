@@ -99,10 +99,7 @@ pub async fn require(
             status: StatusCode::FORBIDDEN,
             message: "not authorized".to_string(),
         }),
-        Err(e) => Err(ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("permission check failed: {e}"),
-        }),
+        Err(err) => Err(crate::handlers::internal("permission check failed", err)),
     }
 }
 
@@ -111,8 +108,7 @@ mod tests {
     use super::*;
     use crate::authz_schema_tests::fresh_db;
     use crate::setup::database::migrate;
-    use sqlx::postgres::{PgConnectOptions, PgPool};
-    use uuid::Uuid;
+    use sqlx::postgres::PgConnectOptions;
 
     /// Migrated disposable database whose connections resolve unqualified
     /// table names in `oms`, as the runtime role does.
@@ -124,10 +120,12 @@ mod tests {
             .fetch_one(&admin)
             .await
             .unwrap();
-        sqlx::query(&format!("ALTER DATABASE {name} SET search_path = oms, public"))
-            .execute(&admin)
-            .await
-            .unwrap();
+        sqlx::query(&format!(
+            "ALTER DATABASE {name} SET search_path = oms, public"
+        ))
+        .execute(&admin)
+        .await
+        .unwrap();
         let url = std::env::var("OMS_RELOAD_TEST_DATABASE_URL").unwrap();
         let options: PgConnectOptions = url.parse().unwrap();
         PgPool::connect_with(options.database(&name)).await.unwrap()
@@ -155,16 +153,24 @@ mod tests {
 
     async fn portfolio(pool: &PgPool) -> Uuid {
         let id = Uuid::new_v4();
-        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'p', 'ACTIVE')")
-            .bind(id)
-            .bind(format!("p-{}", id.simple()))
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'p', 'ACTIVE')",
+        )
+        .bind(id)
+        .bind(format!("p-{}", id.simple()))
+        .execute(pool)
+        .await
+        .unwrap();
         id
     }
 
-    async fn grant(pool: &PgPool, principal: Uuid, portfolio: Uuid, can_trade: bool, can_view: bool) {
+    async fn grant(
+        pool: &PgPool,
+        principal: Uuid,
+        portfolio: Uuid,
+        can_trade: bool,
+        can_view: bool,
+    ) {
         sqlx::query(
             "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view) \
              VALUES ($1, $2, $3, $4, $5)",
@@ -196,12 +202,27 @@ mod tests {
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
     async fn viewer_cannot_create() {
         let pool = db().await;
-        let (u, p) = (user(&pool, "viewer", "ACTIVE").await, portfolio(&pool).await);
+        let (u, p) = (
+            user(&pool, "viewer", "ACTIVE").await,
+            portfolio(&pool).await,
+        );
         grant(&pool, u, p, true, true).await;
-        assert!(!allowed(&pool, u, Permission::OrdersCreate, p).await.unwrap());
-        assert!(allowed(&pool, u, Permission::PositionsView, p).await.unwrap());
-        assert_eq!(require(&pool, u, Permission::OrdersCreate, p).await.unwrap_err().status, axum::http::StatusCode::FORBIDDEN);
-        require(&pool, u, Permission::PositionsView, p).await.unwrap();
+        assert!(!allowed(&pool, u, Permission::OrdersCreate, p)
+            .await
+            .unwrap());
+        assert!(allowed(&pool, u, Permission::PositionsView, p)
+            .await
+            .unwrap());
+        assert_eq!(
+            require(&pool, u, Permission::OrdersCreate, p)
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::FORBIDDEN
+        );
+        require(&pool, u, Permission::PositionsView, p)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -212,13 +233,25 @@ mod tests {
         let (traded, view_only) = (portfolio(&pool).await, portfolio(&pool).await);
         grant(&pool, u, traded, true, true).await;
         grant(&pool, u, view_only, false, true).await;
-        assert!(allowed(&pool, u, Permission::OrdersCreate, traded).await.unwrap());
-        assert!(allowed(&pool, u, Permission::OrdersCancelOwn, traded).await.unwrap());
-        assert!(!allowed(&pool, u, Permission::OrdersCreate, view_only).await.unwrap());
-        assert!(!allowed(&pool, u, Permission::OrdersCancelOwn, view_only).await.unwrap());
-        assert!(allowed(&pool, u, Permission::OrdersViewOwn, view_only).await.unwrap());
+        assert!(allowed(&pool, u, Permission::OrdersCreate, traded)
+            .await
+            .unwrap());
+        assert!(allowed(&pool, u, Permission::OrdersCancelOwn, traded)
+            .await
+            .unwrap());
+        assert!(!allowed(&pool, u, Permission::OrdersCreate, view_only)
+            .await
+            .unwrap());
+        assert!(!allowed(&pool, u, Permission::OrdersCancelOwn, view_only)
+            .await
+            .unwrap());
+        assert!(allowed(&pool, u, Permission::OrdersViewOwn, view_only)
+            .await
+            .unwrap());
         // A trader's role has no limits.manage whatever the grant says.
-        assert!(!allowed(&pool, u, Permission::LimitsManage, traded).await.unwrap());
+        assert!(!allowed(&pool, u, Permission::LimitsManage, traded)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -227,9 +260,13 @@ mod tests {
         let pool = db().await;
         let (u, p) = (user(&pool, "pm", "ACTIVE").await, portfolio(&pool).await);
         grant(&pool, u, p, false, true).await;
-        assert!(allowed(&pool, u, Permission::LimitsManage, p).await.unwrap());
+        assert!(allowed(&pool, u, Permission::LimitsManage, p)
+            .await
+            .unwrap());
         // Needs can_trade for order actions even as PM.
-        assert!(!allowed(&pool, u, Permission::OrdersCancelAny, p).await.unwrap());
+        assert!(!allowed(&pool, u, Permission::OrdersCancelAny, p)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -238,8 +275,13 @@ mod tests {
         let pool = db().await;
         let (u, p) = (user(&pool, "pm", "DISABLED").await, portfolio(&pool).await);
         grant(&pool, u, p, true, true).await;
-        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p).await.unwrap());
-        assert!(visible_portfolios(&pool, u, Permission::OrdersViewOwn).await.unwrap().is_empty());
+        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p)
+            .await
+            .unwrap());
+        assert!(visible_portfolios(&pool, u, Permission::OrdersViewOwn)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -248,7 +290,9 @@ mod tests {
         let pool = db().await;
         let (u, p) = (user(&pool, "pm", "INVITED").await, portfolio(&pool).await);
         grant(&pool, u, p, true, true).await;
-        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p).await.unwrap());
+        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -256,11 +300,18 @@ mod tests {
     async fn no_grant_means_no_access() {
         let pool = db().await;
         let (u, p) = (user(&pool, "pm", "ACTIVE").await, portfolio(&pool).await);
-        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p).await.unwrap());
-        assert!(visible_portfolios(&pool, u, Permission::OrdersViewOwn).await.unwrap().is_empty());
+        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p)
+            .await
+            .unwrap());
+        assert!(visible_portfolios(&pool, u, Permission::OrdersViewOwn)
+            .await
+            .unwrap()
+            .is_empty());
         // A grant with can_view = false does not count either.
         grant(&pool, u, p, true, false).await;
-        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p).await.unwrap());
+        assert!(!allowed(&pool, u, Permission::OrdersViewOwn, p)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -268,17 +319,31 @@ mod tests {
     async fn visible_portfolios_lists_granted_portfolios_with_permission() {
         let pool = db().await;
         let u = user(&pool, "trader", "ACTIVE").await;
-        let (a, b, c) = (portfolio(&pool).await, portfolio(&pool).await, portfolio(&pool).await);
+        let (a, b, c) = (
+            portfolio(&pool).await,
+            portfolio(&pool).await,
+            portfolio(&pool).await,
+        );
         grant(&pool, u, a, true, true).await;
         grant(&pool, u, b, false, true).await;
         grant(&pool, u, c, true, false).await;
-        let mut seen = visible_portfolios(&pool, u, Permission::OrdersViewOwn).await.unwrap();
+        let mut seen = visible_portfolios(&pool, u, Permission::OrdersViewOwn)
+            .await
+            .unwrap();
         seen.sort();
         let mut want = vec![a, b];
         want.sort();
         assert_eq!(seen, want);
         // Trade permissions narrow it to can_trade grants.
-        assert_eq!(visible_portfolios(&pool, u, Permission::OrdersCreate).await.unwrap(), vec![a]);
-        assert!(visible_portfolios(&pool, u, Permission::LimitsManage).await.unwrap().is_empty());
+        assert_eq!(
+            visible_portfolios(&pool, u, Permission::OrdersCreate)
+                .await
+                .unwrap(),
+            vec![a]
+        );
+        assert!(visible_portfolios(&pool, u, Permission::LimitsManage)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

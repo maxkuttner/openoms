@@ -58,6 +58,12 @@ async fn principal(pool: &PgPool, kind: &str, suffix: &str) -> Uuid {
     .execute(pool)
     .await
     .expect("seed principal");
+    sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2)")
+        .bind(id)
+        .bind(if kind == "owner" { "trader" } else { "strategy" })
+        .execute(pool)
+        .await
+        .expect("seed role");
     id
 }
 
