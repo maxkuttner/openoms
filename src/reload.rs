@@ -63,7 +63,7 @@ pub fn classify(conn: &Connection<BrokerCredentials>, is_boot: bool) -> Connecti
         // itself; at boot nothing is running yet, so it simply starts. A kind no
         // connector owns is left to registration, which reports why.
         CredentialState::Configured(c) => match connectors::by_credential_kind(&c.kind) {
-            Some(connector) if connector.manifest().session_bound && !is_boot => ConnectionOutcome::RestartRequired,
+            Some(connector) if !is_boot && connector.session_bound(conn.environment.as_deref().unwrap_or("")) => ConnectionOutcome::RestartRequired,
             _ => ConnectionOutcome::Registered,
         },
     }
@@ -217,6 +217,7 @@ pub async fn build_registry(
                                 // your change": the operator needs to know there is no
                                 // fallback adapter serving this connection right now.
                                 None => {
+                                    error!(code = %conn.code, "credential change needs an OMS restart, and no adapter is running for this connection meanwhile");
                                     outcome = ConnectionOutcome::Failed(
                                         "connection needs a restart to apply this change and has no running adapter to fall back on".into(),
                                     );
@@ -460,22 +461,21 @@ mod tests {
         assert!(output.daily_stats.get("ALPACA", "PAPER").is_some());
     }
 
-    /// Binance is session-bound on either transport, so a reload carries a
-    /// running REST connection forward; its previous-close source must come
-    /// with it, or Day P&L baselines stop refreshing until a restart.
+    /// A reload carries a running session-bound connection forward; its
+    /// previous-close source must come with it, or Day P&L baselines stop
+    /// refreshing until a restart.
     #[tokio::test]
-    async fn a_carried_forward_binance_connection_keeps_its_daily_stats() {
+    async fn a_carried_forward_fix_connection_keeps_its_daily_stats() {
         let mut current = BrokerRegistry::new();
-        current.register("BINANCE", "PAPER", stub_adapter());
+        current.register("IBKR", "PAPER", stub_adapter());
         let mut current_stats = DailyStatsRegistry::new();
-        current_stats.register("BINANCE", "PAPER", Arc::new(NoStats));
+        current_stats.register("IBKR", "PAPER", Arc::new(NoStats));
 
-        let mut c = conn("binance-paper", "ACTIVE", CredentialState::Configured(binance()));
-        c.kind = "BINANCE".into();
+        let c = ibkr_conn("ibkr-paper", "ACTIVE", CredentialState::Configured(ibkr()));
         let output = build_registry(&[c], false, &current, &current_stats, &stub_deps()).await;
 
         assert_eq!(output.report.connections[0].1, ConnectionOutcome::RestartRequired);
-        assert!(output.daily_stats.get("BINANCE", "PAPER").is_some());
+        assert!(output.daily_stats.get("IBKR", "PAPER").is_some());
     }
 
     struct NoStats;
@@ -544,12 +544,35 @@ mod tests {
         assert!(matches!(classify(&ibkr_fix, true), ConnectionOutcome::Registered));
         assert!(matches!(classify(&binance_fix, true), ConnectionOutcome::Registered));
 
-        // On reload the FIX ones must report a restart rather than starting a
-        // second session to the same venue — including `BinanceFix` when the
-        // actual transport would have been REST (see `classify`'s doc comment).
+        // On reload a FIX session must report a restart rather than starting a
+        // second session to the same venue.
         assert!(matches!(classify(&rest, false), ConnectionOutcome::Registered));
         assert!(matches!(classify(&ibkr_fix, false), ConnectionOutcome::RestartRequired));
-        assert!(matches!(classify(&binance_fix, false), ConnectionOutcome::RestartRequired));
+    }
+
+    /// Binance's default transport is REST (`BINANCE_{ENV}_TRANSPORT` unset), so
+    /// saving its credentials on a running OMS builds the adapter there and then,
+    /// like Bybit. Before, the connector-wide `session_bound` flag made a first
+    /// save report "restart required" with nothing running, and the connection
+    /// stayed unarmed until the OMS was restarted.
+    #[tokio::test]
+    async fn a_rest_binance_credential_applies_on_reload_without_a_restart() {
+        // A parseable Ed25519 key (the same test-only key `binance/fix.rs` uses):
+        // the REST adapter parses it at build time and nothing here dials out.
+        let creds = BrokerCredentials::from_typed("BinanceFix", &gateway::connectors::binance::adapter::BinanceCredentials {
+            host: "h".into(), port: 9000,
+            sender_comp_id: "OMS".into(), target_comp_id: "SPOT".into(),
+            api_key: "k".into(),
+            private_key: "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAGvAMHEDQzczRRSN2T3AYeEUyaWSwA6GXlSZ2hjM8TC\n-----END PRIVATE KEY-----\n".into(),
+        });
+        let mut c = conn("binance-paper", "ACTIVE", CredentialState::Configured(creds));
+        c.kind = "BINANCE".into();
+        assert!(matches!(classify(&c, false), ConnectionOutcome::Registered));
+        let out = build_registry(&[c], false, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &stub_deps()).await;
+        assert!(matches!(out.report.connections[0].1, ConnectionOutcome::Registered), "{:?}", out.report.connections);
+        assert!(out.registry.get("BINANCE", "PAPER").is_some());
+        let codes: Vec<&str> = out.exec_streams.iter().map(|s| s.code).collect();
+        assert_eq!(codes, ["BINANCE"]);
     }
 
     /// The most consequential rule in this plan, pinned end-to-end through
