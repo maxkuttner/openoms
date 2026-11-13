@@ -460,3 +460,105 @@ async fn submit_stamps_responsible_principal() {
     let (by_strategy, _) = submit(&pool, &strategy, portfolio, instrument).await;
     assert_eq!(responsible(by_strategy).await, Some(owner.principal_id));
 }
+
+async fn grant_allocate(pool: &PgPool, principal_id: Uuid, portfolio_id: Uuid, can_trade: bool) {
+    sqlx::query(
+        "INSERT INTO principal_portfolio_grant \
+            (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
+         VALUES ($1, $2, $3, $4, true, true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(principal_id)
+    .bind(portfolio_id)
+    .bind(can_trade)
+    .execute(pool)
+    .await
+    .expect("seed allocate grant");
+}
+
+/// A filled order by `owner` in a fresh portfolio; returns (order, portfolio).
+async fn filled_order(pool: &PgPool, owner: Uuid) -> (Uuid, Uuid) {
+    let (order_id, portfolio) = order(pool, owner).await;
+    sqlx::query("UPDATE order_state SET cum_qty = 10, avg_px = 100 WHERE order_id = $1")
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .expect("fill order");
+    (order_id, portfolio)
+}
+
+async fn new_portfolio(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, $2, 'ACTIVE')")
+        .bind(id)
+        .bind(format!("authz-alloc-{id}"))
+        .execute(pool)
+        .await
+        .expect("seed portfolio");
+    id
+}
+
+async fn allocate(
+    pool: &PgPool,
+    auth: &AuthContext,
+    order_id: Uuid,
+    targets: &[Uuid],
+) -> Result<usize, StatusCode> {
+    let splits = targets
+        .iter()
+        .map(|p| handlers::AllocationSplit { portfolio_id: *p, qty: 1.0 })
+        .collect();
+    handlers::create_allocations(
+        State(test_app_state(pool.clone())),
+        Extension(auth.clone()),
+        Path(order_id),
+        Json(handlers::CreateAllocations { splits }),
+    )
+    .await
+    .map(|Json(v)| v.len())
+    .map_err(|e| e.status)
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; run with --ignored"]
+async fn viewer_cannot_allocate() {
+    let pool = test_pool().await;
+    let owner = user(&pool, "trader", "HUMAN").await;
+    let (order_id, source) = filled_order(&pool, owner.principal_id).await;
+    let target = new_portfolio(&pool).await;
+    // A stale can_allocate flag must not outrank the role.
+    let viewer = user(&pool, "viewer", "HUMAN").await;
+    grant_allocate(&pool, viewer.principal_id, source, true).await;
+    grant(&pool, viewer.principal_id, target, false).await;
+    assert_eq!(allocate(&pool, &viewer, order_id, &[target]).await, Err(StatusCode::FORBIDDEN));
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; run with --ignored"]
+async fn allocate_to_unseen_target_portfolio_is_403() {
+    let pool = test_pool().await;
+    let trader = user(&pool, "trader", "HUMAN").await;
+    let (order_id, source) = filled_order(&pool, trader.principal_id).await;
+    grant_allocate(&pool, trader.principal_id, source, true).await;
+    let seen = new_portfolio(&pool).await;
+    grant(&pool, trader.principal_id, seen, false).await;
+    let unseen = new_portfolio(&pool).await;
+    assert_eq!(
+        allocate(&pool, &trader, order_id, &[seen, unseen]).await,
+        Err(StatusCode::FORBIDDEN)
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; run with --ignored"]
+async fn trader_with_trade_grant_can_allocate_to_visible_targets() {
+    let pool = test_pool().await;
+    let trader = user(&pool, "trader", "HUMAN").await;
+    let (order_id, source) = filled_order(&pool, trader.principal_id).await;
+    grant_allocate(&pool, trader.principal_id, source, true).await;
+    let a = new_portfolio(&pool).await;
+    let b = new_portfolio(&pool).await;
+    grant(&pool, trader.principal_id, a, false).await;
+    grant(&pool, trader.principal_id, b, true).await;
+    assert_eq!(allocate(&pool, &trader, order_id, &[a, b]).await, Ok(2));
+}

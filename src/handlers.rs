@@ -493,10 +493,7 @@ pub async fn list_portfolios(
     .bind(&can_create)
     .fetch_all(state.pool())
     .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to list portfolios: {:?}", err),
-    })?;
+    .map_err(fail)?;
 
     Ok(Json(
         rows.into_iter()
@@ -749,7 +746,6 @@ pub async fn create_allocations(
     Json(req): Json<CreateAllocations>,
 ) -> Result<Json<Vec<Allocation>>, ApiError> {
     let pool = state.pool();
-    let err500 = |m: String| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: m };
     let err422 = |m: &str| ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message: m.to_string() };
 
     // 1. the block order: source portfolio, instrument, side, filled qty + avg price.
@@ -762,7 +758,7 @@ pub async fn create_allocations(
     .bind(order_id)
     .fetch_optional(pool)
     .await
-    .map_err(|e| err500(format!("failed to load order: {e:?}")))?
+    .map_err(|e| internal("failed to load order", e))?
     .ok_or_else(|| ApiError { status: StatusCode::NOT_FOUND, message: "order not found".to_string() })?;
 
     let from_portfolio: Uuid = order.get("portfolio_id");
@@ -775,7 +771,9 @@ pub async fn create_allocations(
     }
     let price = avg_px.ok_or_else(|| err422("order has no fill price"))?;
 
-    // 2. entitlement: can_allocate on the block (source) portfolio.
+    // 2. entitlement: the role may trade the block (source) portfolio, the grant
+    // carries can_allocate there, and the block order is one the caller may see.
+    let fail = |e| internal("failed to check allocation access", e);
     let can_allocate: bool = query_scalar(
         "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant \
          WHERE principal_id = $1 AND portfolio_id = $2 AND can_allocate = true)",
@@ -784,12 +782,26 @@ pub async fn create_allocations(
     .bind(from_portfolio)
     .fetch_one(pool)
     .await
-    .map_err(|e| err500(format!("failed to check grant: {e:?}")))?;
-    if !can_allocate {
-        return Err(ApiError { status: StatusCode::FORBIDDEN, message: "unauthorized".to_string() });
+    .map_err(fail)?;
+    let may_trade = authz::allowed(pool, auth.principal_id, Permission::OrdersCreate, from_portfolio)
+        .await
+        .map_err(fail)?;
+    if !can_allocate || !may_trade {
+        return Err(forbidden());
     }
-    // ...and the block order must be one the caller may see.
     require_order_grant(pool, auth.principal_id, order_id, OrderAccess::View).await?;
+    // ...and every target portfolio must be one the caller can see.
+    let mut target_ids: Vec<Uuid> = req.splits.iter().map(|s| s.portfolio_id).collect();
+    target_ids.sort();
+    target_ids.dedup();
+    for target in &target_ids {
+        if !authz::allowed(pool, auth.principal_id, Permission::PositionsView, *target)
+            .await
+            .map_err(fail)?
+        {
+            return Err(forbidden());
+        }
+    }
 
     // 3. validate splits + cap at the filled (and not-yet-allocated) quantity.
     if req.splits.is_empty() {
@@ -805,25 +817,22 @@ pub async fn create_allocations(
     .bind(order_id)
     .fetch_one(pool)
     .await
-    .map_err(|e| err500(format!("failed to sum allocations: {e:?}")))?;
+    .map_err(|e| internal("failed to sum allocations", e))?;
     if already + total_new > cum_qty + 1e-9 {
         return Err(err422("over-allocation: would exceed the filled quantity"));
     }
     // every target portfolio must exist.
-    let mut target_ids: Vec<Uuid> = req.splits.iter().map(|s| s.portfolio_id).collect();
-    target_ids.sort();
-    target_ids.dedup();
     let existing: i64 = query_scalar("SELECT count(*) FROM portfolio WHERE id = ANY($1)")
         .bind(&target_ids)
         .fetch_one(pool)
         .await
-        .map_err(|e| err500(format!("failed to check portfolios: {e:?}")))?;
+        .map_err(|e| internal("failed to check portfolios", e))?;
     if existing != target_ids.len() as i64 {
         return Err(err422("a target portfolio does not exist"));
     }
 
     // 4. apply atomically: record each allocation + transfer the position at cost.
-    let mut tx = pool.begin().await.map_err(|e| err500(format!("tx begin: {e:?}")))?;
+    let mut tx = pool.begin().await.map_err(|e| internal("tx begin", e))?;
     let mut created = Vec::with_capacity(req.splits.len());
     for s in &req.splits {
         let row = sqlx::query(
@@ -839,7 +848,7 @@ pub async fn create_allocations(
         .bind(price)
         .fetch_one(&mut *tx)
         .await
-        .map_err(|e| err500(format!("failed to insert allocation: {e:?}")))?;
+        .map_err(|e| internal("failed to insert allocation", e))?;
 
         crate::positions::persist_transfer(
             &mut *tx,
@@ -851,7 +860,7 @@ pub async fn create_allocations(
             price,
         )
         .await
-        .map_err(|e| err500(format!("failed to transfer position: {e:?}")))?;
+        .map_err(|e| internal("failed to transfer position", e))?;
 
         created.push(Allocation {
             id: row.get("id"),
@@ -864,7 +873,7 @@ pub async fn create_allocations(
             created_at: row.get("created_at"),
         });
     }
-    tx.commit().await.map_err(|e| err500(format!("commit: {e:?}")))?;
+    tx.commit().await.map_err(|e| internal("commit", e))?;
     let to_portfolios: Vec<Uuid> = created.iter().map(|a| a.to_portfolio_id).collect();
     crate::event_bus::publish_transfer(state.event_bus(), from_portfolio, &to_portfolios, &instrument_id);
     Ok(Json(created))

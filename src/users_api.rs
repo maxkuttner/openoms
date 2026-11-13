@@ -59,6 +59,8 @@ pub struct InviteRequest {
 #[derive(Debug, Serialize)]
 pub struct InviteResponse {
     pub invite_id: Uuid,
+    /// The invited user, so the caller can open them straight away.
+    pub user_id: Uuid,
     pub link: String,
     pub expires_at: DateTime<Utc>,
 }
@@ -118,6 +120,7 @@ fn invite_response(base: &str, invite: NewInvite) -> InviteResponse {
     InviteResponse {
         link: format!("{base}/auth/invite/{}", invite.token),
         invite_id: invite.invite_id,
+        user_id: invite.principal_id,
         expires_at: invite.expires_at,
     }
 }
@@ -356,10 +359,13 @@ pub async fn set_portfolios(
         .map_err(db)?;
     for g in &grants {
         sqlx::query(
-            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view) \
-             VALUES ($1, $2, $3, $4, true) \
+            // The trade toggle also controls allocation out of the portfolio.
+            "INSERT INTO principal_portfolio_grant \
+                (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
+             VALUES ($1, $2, $3, $4, true, $4) \
              ON CONFLICT (principal_id, portfolio_id) \
-             DO UPDATE SET can_trade = EXCLUDED.can_trade, can_view = true, updated_at = now()",
+             DO UPDATE SET can_trade = EXCLUDED.can_trade, can_allocate = EXCLUDED.can_allocate, \
+                           can_view = true, updated_at = now()",
         )
         .bind(Uuid::new_v4())
         .bind(id)
@@ -766,6 +772,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored, crate::sessions::hash_session_token(token));
+        // The trade toggle also controls allocation.
+        assert_eq!(grant_flags(&pool, out.user_id, p).await, (true, true));
 
         // Duplicate email -> 409; bad role -> 422.
         let dup = invite_user(
@@ -828,6 +836,34 @@ mod tests {
         assert!(out.link.starts_with("https://oms.example.com/auth/invite/"));
         let missing = link_invite(State(st), Path(Uuid::new_v4())).await.unwrap_err();
         assert_eq!(missing.status, StatusCode::CONFLICT);
+    }
+
+    async fn grant_flags(pool: &PgPool, principal_id: Uuid, portfolio_id: Uuid) -> (bool, bool) {
+        let row = sqlx::query(
+            "SELECT can_trade, can_allocate FROM principal_portfolio_grant \
+              WHERE principal_id = $1 AND portfolio_id = $2",
+        )
+        .bind(principal_id)
+        .bind(portfolio_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (row.get("can_trade"), row.get("can_allocate"))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn set_portfolios_sets_can_allocate_with_can_trade() {
+        let pool = migrated_db().await;
+        let st = state(&pool, Some(BASE)).await;
+        let (id, ..) = active_user(&pool, &st).await;
+        let p = portfolio(&pool).await;
+        for trade in [true, false, true] {
+            set_portfolios(State(st.clone()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: trade }]))
+                .await
+                .unwrap();
+            assert_eq!(grant_flags(&pool, id, p).await, (trade, trade));
+        }
     }
 
     #[tokio::test]

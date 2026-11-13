@@ -166,8 +166,10 @@ pub async fn create(
         .await?;
     for (portfolio_id, can_trade) in grants {
         sqlx::query(
-            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view) \
-             VALUES ($1, $2, $3, $4, true)",
+            // can_allocate follows can_trade: one toggle for the admin.
+            "INSERT INTO principal_portfolio_grant \
+                (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
+             VALUES ($1, $2, $3, $4, true, $4)",
         )
         .bind(Uuid::new_v4())
         .bind(principal_id)
