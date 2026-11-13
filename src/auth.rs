@@ -37,6 +37,18 @@ pub enum AuthMethod {
     HostCli,
 }
 
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMethod::Oidc => "oidc",
+            AuthMethod::Local => "local",
+            AuthMethod::LegacyAdmin => "legacy_admin",
+            AuthMethod::ApiKey => "api_key",
+            AuthMethod::HostCli => "host_cli",
+        }
+    }
+}
+
 impl AuthContext {
     /// A machine identity (API key, strategy): exempt from the MFA gate.
     pub fn machine(principal_id: Uuid, principal_code: String) -> Self {
@@ -393,6 +405,17 @@ fn service_unavailable() -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// `/auth/me` reports it, so the UI knows which MFA step to offer.
+    #[test]
+    fn auth_method_names() {
+        assert_eq!(AuthMethod::Local.as_str(), "local");
+        assert_eq!(AuthMethod::Oidc.as_str(), "oidc");
+        assert_eq!(AuthMethod::LegacyAdmin.as_str(), "legacy_admin");
+        assert_eq!(AuthMethod::ApiKey.as_str(), "api_key");
+        assert_eq!(AuthMethod::HostCli.as_str(), "host_cli");
+    }
+
     use super::*;
     use crate::sessions::{cookie_policy, SessionTtl};
 

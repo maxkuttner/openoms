@@ -3,7 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
 import { Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { AccessPage } from "./pages/Access";
-import { tradeApi, API_BASE } from "./api/client";
+import { tradeApi, API_BASE, onMfaRequired } from "./api/client";
+import { MfaPrompt } from "../login/MfaPrompt";
 import { LoginPage } from "../login/LoginPage";
 import { InvitePreview } from "../login/InvitePreview";
 import { TRADE_HOME } from "../login/api";
@@ -84,6 +85,7 @@ function SignedInTradeApp() {
 
   return (
     <LiveUpdatesProvider>
+      <MfaPrompt register={onMfaRequired} />
       <AppShell header={{ height: 48 }} padding="md">
         <AppShell.Header>
           <Group h="100%" px="md" justify="space-between" wrap="nowrap">

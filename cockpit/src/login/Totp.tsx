@@ -19,7 +19,7 @@ function CopyField({ label, value }: { label: string; value: string }) {
 }
 
 /** Check a TOTP code (or a recovery code) on the current session. */
-export function Totp({ prompt, onDone }: { prompt?: string; onDone: () => void }) {
+export function Totp({ prompt, onDone, onError }: { prompt?: string; onDone: () => void; onError?: (e: unknown) => void }) {
   const [code, setCode] = useState("");
   const [recovery, setRecovery] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -33,6 +33,7 @@ export function Totp({ prompt, onDone }: { prompt?: string; onDone: () => void }
       onDone();
     } catch (e) {
       setError(authErrorText(e));
+      onError?.(e);
     } finally {
       setBusy(false);
     }

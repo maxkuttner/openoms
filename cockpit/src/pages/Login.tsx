@@ -19,12 +19,12 @@ function LegacyAdminForm({ onSignedIn }: { onSignedIn: () => void }) {
     setBusy(true);
     setError(null);
     setLegacyPassword(password);
-    const access = await consoleAccess().catch(() => "signed_out" as const);
+    const access = await consoleAccess().catch(() => "unavailable" as const);
     setBusy(false);
     if (access === "admin") onSignedIn();
     else {
       setLegacyPassword(null);
-      setError("Wrong password.");
+      setError(access === "unavailable" ? "The OMS isn't responding. Try again." : "Wrong password.");
     }
   }
 

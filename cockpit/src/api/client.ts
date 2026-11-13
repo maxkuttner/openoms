@@ -95,12 +95,13 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 /**
  * Who may open the console: "admin", "forbidden" (signed in, but no admin
- * capability) or "signed_out". Does not redirect.
+ * capability), "signed_out", or "unavailable" (server error). Does not redirect.
  */
-export async function consoleAccess(): Promise<"admin" | "forbidden" | "signed_out"> {
+export async function consoleAccess(): Promise<"admin" | "forbidden" | "signed_out" | "unavailable"> {
   const res = await send("GET", "/admin/users");
   if (res.ok) return "admin";
-  return res.status === 403 ? "forbidden" : "signed_out";
+  if (res.status === 403) return "forbidden";
+  return res.status === 401 ? "signed_out" : "unavailable";
 }
 
 export const api = {

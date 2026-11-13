@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  accessMessage, inviteSummary, inviteTokenFromHash, loginHref, nextStepFromLoginResponse, safeReturnTo,
+  accessMessage, authErrorMessage, inviteSummary, mfaPromptText, mfaStepFor, inviteTokenFromHash, loginHref, nextStepFromLoginResponse, safeReturnTo,
   secretFromOtpauth, visibleMethods,
 } from "./login.ts";
 
@@ -59,4 +59,23 @@ test("the invite token comes from the URL fragment", () => {
   assert.equal(inviteTokenFromHash("#abc_DEF-123"), "abc_DEF-123");
   assert.equal(inviteTokenFromHash(""), null);
   assert.equal(inviteTokenFromHash("#"), null);
+});
+
+test("the MFA step follows how the session signed in", () => {
+  assert.equal(mfaStepFor("local"), "totp");
+  assert.equal(mfaStepFor("oidc"), "sso");
+  assert.equal(mfaStepFor(null), "sso");
+  assert.equal(mfaStepFor("local", "totp_not_enrolled"), "sso");
+  assert.equal(mfaStepFor("local", "not_a_local_session"), "sso");
+  assert.equal(mfaPromptText("totp"), "Confirm with your authenticator code to continue.");
+  assert.equal(mfaPromptText("sso"), "Sign in again with SSO to continue.");
+});
+
+test("auth errors read by their code", () => {
+  assert.equal(authErrorMessage(401, "unauthenticated", null), "Your sign-in expired. Sign in again.");
+  assert.equal(authErrorMessage(401, "invalid_code", null), "That code didn't work. Try again.");
+  assert.equal(authErrorMessage(401, "invalid_credentials", null), "Wrong email or password.");
+  assert.equal(authErrorMessage(429, "too_many_attempts", null), "Too many attempts. Wait a few minutes and try again.");
+  assert.equal(authErrorMessage(400, "weak_password", "too common"), "too common");
+  assert.equal(authErrorMessage(500, null, null), "Something went wrong. Try again.");
 });

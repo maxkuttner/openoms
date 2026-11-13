@@ -78,3 +78,37 @@ export function inviteTokenFromHash(hash: string): string | null {
   const t = hash.replace(/^#/, "");
   return t || null;
 }
+
+export type MfaStep = "totp" | "sso";
+
+/**
+ * What a 403 mfa_required asks for: a local session confirms with its
+ * authenticator; any other (OIDC) signs in again with SSO. A TOTP call
+ * answering totp_not_enrolled / not_a_local_session also means SSO.
+ */
+export function mfaStepFor(authMethod: string | null, errorCode?: string | null): MfaStep {
+  if (errorCode === "totp_not_enrolled" || errorCode === "not_a_local_session") return "sso";
+  return authMethod === "local" ? "totp" : "sso";
+}
+
+export function mfaPromptText(step: MfaStep): string {
+  return step === "totp" ? "Confirm with your authenticator code to continue." : "Sign in again with SSO to continue.";
+}
+
+/** User-facing text for a failed sign-in call, by the server's error code. */
+export function authErrorMessage(status: number, code: string | null, reason: string | null): string {
+  switch (code) {
+    case "invalid_credentials":
+      return "Wrong email or password.";
+    case "too_many_attempts":
+      return "Too many attempts. Wait a few minutes and try again.";
+    case "weak_password":
+      return reason ?? "Choose a stronger password.";
+    case "unauthenticated":
+      return "Your sign-in expired. Sign in again.";
+    case "invalid_code":
+      return "That code didn't work. Try again.";
+  }
+  if (status === 429) return "Too many attempts. Wait a few minutes and try again.";
+  return "Something went wrong. Try again.";
+}

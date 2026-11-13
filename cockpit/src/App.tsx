@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor, Modal, Stack } from "@mantine/core";
+import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor, Stack } from "@mantine/core";
 import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { API_BASE, consoleAccess, goToLogin, isLegacySession, onMfaRequired, setLegacyPassword } from "./api/client";
 import { authApi, TRADE_HOME } from "./login/api";
-import { Totp } from "./login/Totp";
+import { MfaPrompt } from "./login/MfaPrompt";
 import { Frame } from "./login/Frame";
 import { Logo } from "./components/Logo";
 import { JobsIndicator } from "./components/JobsIndicator";
@@ -120,7 +120,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-type Status = "checking" | "admin" | "forbidden";
+type Status = "checking" | "admin" | "forbidden" | "unavailable";
 
 /** Signed in, but without the admin capability. */
 function NoAccess() {
@@ -134,27 +134,6 @@ function NoAccess() {
   );
 }
 
-/**
- * The authenticator prompt behind every 403 mfa_required: the request that
- * hit it waits, and is retried once the code is accepted.
- */
-function MfaPrompt() {
-  const [pending, setPending] = useState<((ok: boolean) => void) | null>(null);
-  useEffect(
-    () => onMfaRequired(() => new Promise<boolean>((resolve) => setPending(() => resolve))),
-    [],
-  );
-  const finish = (ok: boolean) => {
-    pending?.(ok);
-    setPending(null);
-  };
-  return (
-    <Modal opened={!!pending} onClose={() => finish(false)} title="Confirm" centered>
-      {pending && <Totp prompt="Confirm with your authenticator code to continue." onDone={() => finish(true)} />}
-    </Modal>
-  );
-}
-
 /** Auth gate: the console needs a session holding the admin capability. */
 export function App() {
   const { pathname } = useLocation();
@@ -165,7 +144,7 @@ export function App() {
   useEffect(() => {
     if (onLoginPage) return;
     consoleAccess()
-      .catch(() => "signed_out" as const)
+      .catch(() => "unavailable" as const)
       .then((a) => (a === "signed_out" ? goToLogin() : setStatus(a)));
   }, [onLoginPage]);
 
@@ -181,10 +160,13 @@ export function App() {
     );
   }
   if (status === "forbidden") return <NoAccess />;
+  if (status === "unavailable") {
+    return <Frame title="Admin console"><Text fz={13}>The OMS isn't responding. Try again.</Text></Frame>;
+  }
 
   return (
     <>
-      <MfaPrompt />
+      <MfaPrompt register={onMfaRequired} />
       <Console
         onLogout={async () => {
           if (!isLegacySession()) await authApi.logout().catch(() => undefined);

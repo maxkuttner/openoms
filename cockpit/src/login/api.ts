@@ -1,7 +1,7 @@
 // The sign-in screens' own fetch: session cookie only, never an admin bearer,
 // so the same module is safe in both the cockpit and the trader app.
 
-import type { AuthMethods } from "../login";
+import { authErrorMessage, type AuthMethods } from "../login";
 
 export const API_BASE = import.meta.env.DEV ? "/api" : "";
 
@@ -60,18 +60,12 @@ export type InvitePreview = {
 /** User-facing text for a failed sign-in call. */
 export function authErrorText(err: unknown): string {
   if (!(err instanceof AuthError)) return "Can't reach the OMS. Try again.";
-  switch (err.code) {
-    case "invalid_credentials":
-      return "Wrong email or password.";
-    case "too_many_attempts":
-      return "Too many attempts. Wait a few minutes and try again.";
-    case "weak_password":
-      return err.reason ?? "Choose a stronger password.";
-    default:
-      if (err.status === 401) return "That code didn't work. Try again.";
-      if (err.status === 429) return "Too many attempts. Wait a few minutes and try again.";
-      return "Something went wrong. Try again.";
-  }
+  return authErrorMessage(err.status, err.code, err.reason);
+}
+
+/** The signed-in session's sign-in method ("local", "oidc", …), or null. */
+export async function sessionAuthMethod(): Promise<string | null> {
+  return call<{ auth_method?: string }>("GET", "/auth/me").then((m) => m?.auth_method ?? null, () => null);
 }
 
 /** Full-page navigation to the OIDC flow (a 303 to the provider, which fetch can't follow). */

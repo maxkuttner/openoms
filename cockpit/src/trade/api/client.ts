@@ -24,13 +24,41 @@ function goToLogin(): void {
   window.location.href = loginHref(TRADE_HOME, window.location.pathname + window.location.search);
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
+// Opens the MFA step for a 403 mfa_required; resolves true once the session
+// has passed it. Installed by the app shell (login/MfaPrompt).
+type MfaPrompt = () => Promise<boolean>;
+let mfaPrompt: MfaPrompt | null = null;
+
+export function onMfaRequired(prompt: MfaPrompt): () => void {
+  mfaPrompt = prompt;
+  return () => {
+    if (mfaPrompt === prompt) mfaPrompt = null;
+  };
+}
+
+async function isMfaRequired(res: Response): Promise<boolean> {
+  if (res.status !== 403) return false;
+  try {
+    return JSON.parse(await res.clone().text())?.error === "mfa_required";
+  } catch {
+    return false;
+  }
+}
+
+function send(method: string, path: string, body?: unknown): Promise<Response> {
+  return fetch(`${API_BASE}${path}`, {
     method,
     credentials: "same-origin",
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+}
+
+async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  let res = await send(method, path, body);
+  if (mfaPrompt && (await isMfaRequired(res)) && (await mfaPrompt())) {
+    res = await send(method, path, body);
+  }
 
   if (!res.ok) {
     // 401 means the session is gone.

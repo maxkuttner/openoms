@@ -6,23 +6,28 @@ import { Enroll } from "./Enroll";
 import { Totp, TotpEnroll } from "./Totp";
 import { inviteSummary, inviteTokenFromHash, type Step } from "../login";
 
-// Read once and drop from the address bar, so the token is not left in
-// history or on screen.
-function takeToken(): string | null {
-  const token = inviteTokenFromHash(window.location.hash);
-  if (token) window.history.replaceState(null, "", window.location.pathname + window.location.search);
-  return token;
+// The token is kept in state and dropped from the address bar once the
+// preview has answered, so it is not left in history or on screen (a failed
+// call leaves it there for a reload).
+function readToken(): string | null {
+  return inviteTokenFromHash(window.location.hash);
+}
+
+function clearToken() {
+  window.history.replaceState(null, "", window.location.pathname + window.location.search);
 }
 
 /** Where an invite link lands: what the invite grants, then the enabled ways to accept it. */
 export function InvitePreview() {
-  const [token] = useState(takeToken);
+  const [token] = useState(readToken);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [failed, setFailed] = useState(false);
   const [step, setStep] = useState<"choose" | "password" | Exclude<Step, "done">>("choose");
 
   useEffect(() => {
-    if (token) authApi.preview(token).then(setPreview, () => setFailed(true));
+    if (token) {
+      authApi.preview(token).then((p) => { clearToken(); setPreview(p); }, () => setFailed(true));
+    }
   }, [token]);
 
   // A named admin's invite (no role) opens the cockpit; everyone else the trader app.

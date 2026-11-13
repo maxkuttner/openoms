@@ -5558,9 +5558,14 @@
         "required": [
           "principal_id",
           "code",
-          "portfolios"
+          "portfolios",
+          "auth_method"
         ],
         "properties": {
+          "auth_method": {
+            "type": "string",
+            "description": "How this session signed in (`local`, `oidc`, …): decides which step\na 403 `mfa_required` asks for."
+          },
           "code": {
             "type": "string"
           },

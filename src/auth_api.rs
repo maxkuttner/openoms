@@ -28,9 +28,9 @@ use crate::invites::{self, ClaimOutcome, ClaimPolicy};
 use crate::oidc::{OidcError, Provider};
 use crate::sessions::{self, CookiePolicy};
 
-// ── HTTP layer: /auth/login, /auth/callback, /auth/logout, /auth/me ────────
+// ── HTTP layer: /auth/oidc/login, /auth/oidc/callback, /auth/logout, /auth/me ──
 //
-// Mounted in `main.rs`'s `serve()`: `/auth/login`, `/auth/callback` and
+// Mounted in `main.rs`'s `serve()`: `/auth/oidc/login`, `/auth/oidc/callback` and
 // `/auth/logout` on their own unauthenticated router (merged only when
 // `config.oidc()` is `Some`), `/auth/me` on `orders_router` behind
 // `auth_middleware`. `AuthApiState` is constructed there too, from
@@ -77,7 +77,7 @@ const FLOW_TTL: Duration = Duration::from_secs(300);
 const FLOW_CAP: usize = 10_000;
 
 /// Pending logins in memory, keyed by the SHA-256 of their flow id. Bounded
-/// so unauthenticated `/auth/login` hits cannot grow it without limit: expired
+/// so unauthenticated `/auth/oidc/login` hits cannot grow it without limit: expired
 /// flows are evicted, and past the cap a new login is refused. A restart drops
 /// every pending login, which costs a user one more click.
 pub struct FlowStore {
@@ -128,7 +128,7 @@ fn flow_key(id: &str) -> String {
 ///
 /// Only a same-site relative path is allowed. Everything else falls back to
 /// `/`. This is the whole security value of the feature: without it,
-/// `/auth/login` is an open redirect on the endpoint that mints the session,
+/// `/auth/oidc/login` is an open redirect on the endpoint that mints the session,
 /// which is worth more to an attacker than most bugs in this system.
 pub fn sanitize_return_to(raw: Option<&str>) -> String {
     const DEFAULT: &str = "/";
@@ -550,6 +550,9 @@ pub struct MeResponse {
     pub code: String,
     pub display_name: Option<String>,
     pub portfolios: Vec<GrantedPortfolio>,
+    /// How this session signed in (`local`, `oidc`, …): decides which step
+    /// a 403 `mfa_required` asks for.
+    pub auth_method: &'static str,
 }
 
 /// Who the caller is signed in as, and what they can act on.
@@ -608,6 +611,7 @@ pub async fn me(
         code: auth.principal_code,
         display_name,
         portfolios,
+        auth_method: auth.auth_method.as_str(),
     }))
 }
 
