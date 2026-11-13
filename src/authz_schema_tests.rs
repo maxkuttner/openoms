@@ -10,7 +10,7 @@ const FIRST_AUTHZ_MIGRATION: &str = "0047_";
 
 /// A fresh, empty database on the disposable server, so a migration can be
 /// stopped short of 0047 regardless of what the shared `ods` database holds.
-async fn fresh_db() -> PgPool {
+pub(crate) async fn fresh_db() -> PgPool {
     let url = std::env::var("OMS_RELOAD_TEST_DATABASE_URL")
         .expect("set OMS_RELOAD_TEST_DATABASE_URL to an explicit disposable Postgres server");
     let options: PgConnectOptions = url.parse().unwrap();

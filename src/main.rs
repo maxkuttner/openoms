@@ -17,6 +17,7 @@ mod setup;
 mod sessions;
 mod oidc;
 mod auth_api;
+mod authz;
 
 use gateway::adapter::BrokerRegistry;
 use gateway::md::daily_stats::DailyStatsRegistry;
