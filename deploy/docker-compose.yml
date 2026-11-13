@@ -10,7 +10,10 @@
 #                                    target database's encrypted columns
 #   /opt/oms/config/.env           — POSTGRES_PASSWORD=..., OMS_PASSWORD=...,
 #                                    and (with [auth.oidc] configured)
-#                                    OMS_OIDC_CLIENT_SECRET=oms-dev-secret
+#                                    OMS_OIDC_CLIENT_SECRET=oms-dev-secret,
+#                                    plus OMS_AUTHENTIK_SECRET_KEY,
+#                                    OMS_AUTHENTIK_PG_PASSWORD and
+#                                    OMS_AUTHENTIK_BOOTSTRAP_PASSWORD (required)
 services:
   oms:
     build:
@@ -30,15 +33,18 @@ services:
   # Authentik sits behind Tailscale Serve, so the OMS issuer must be its https
   # front door (src/oidc.rs refuses non-https, non-loopback endpoints).
   #
-  # Set OMS_AUTHENTIK_SECRET_KEY and OMS_AUTHENTIK_PG_PASSWORD in /opt/oms/config/.env
-  # (the dev defaults are public). Authentik 2026.8 needs no Redis.
+  # OMS_AUTHENTIK_SECRET_KEY, OMS_AUTHENTIK_PG_PASSWORD and
+  # OMS_AUTHENTIK_BOOTSTRAP_PASSWORD are REQUIRED (no defaults: this stack is
+  # exposed on the tailnet). Compose interpolation does not read the oms
+  # service's env_file, so deploy.sh passes `--env-file` for the same .env;
+  # do the same when running compose by hand. Authentik 2026.8 needs no Redis.
   authentik-postgres:
     container_name: oms-test-authentik-postgres
     image: docker.io/library/postgres:16-alpine
     environment:
       POSTGRES_DB: authentik
       POSTGRES_USER: authentik
-      POSTGRES_PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:-authentik-dev-only}
+      POSTGRES_PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:?set in /opt/oms/config/.env}
     volumes:
       - oms-test-authentik-pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -53,12 +59,12 @@ services:
     image: ghcr.io/goauthentik/server:2026.8.5
     command: server
     environment: &authentik-env
-      AUTHENTIK_SECRET_KEY: ${OMS_AUTHENTIK_SECRET_KEY:-dev-only-insecure-secret-key-change-me-0123456789}
+      AUTHENTIK_SECRET_KEY: ${OMS_AUTHENTIK_SECRET_KEY:?set in /opt/oms/config/.env}
       AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
       AUTHENTIK_POSTGRESQL__NAME: authentik
       AUTHENTIK_POSTGRESQL__USER: authentik
-      AUTHENTIK_POSTGRESQL__PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:-authentik-dev-only}
-      AUTHENTIK_BOOTSTRAP_PASSWORD: ${OMS_AUTHENTIK_BOOTSTRAP_PASSWORD:-admin}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:?set in /opt/oms/config/.env}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${OMS_AUTHENTIK_BOOTSTRAP_PASSWORD:?set in /opt/oms/config/.env}
       AUTHENTIK_BOOTSTRAP_EMAIL: akadmin@example.com
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
     depends_on:
@@ -88,6 +94,12 @@ services:
     volumes:
       - oms-test-authentik-data:/data
       - ../docker/authentik/blueprints:/blueprints/custom:ro
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
     restart: unless-stopped
 
 volumes:
