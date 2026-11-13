@@ -118,7 +118,7 @@ export function App() {
 
   async function probe(): Promise<boolean> {
     try {
-      await api.get("/admin/principals");
+      await api.get("/admin/users");
       return true;
     } catch {
       return false;

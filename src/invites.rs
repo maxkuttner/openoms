@@ -9,10 +9,6 @@
 //! never matched or merged on email, and a login with no valid invite creates
 //! nothing.
 
-// create / revoke / reissue / create_link are called by the admin routes,
-// which land with the users console; until then only tests reach them.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use chrono::{DateTime, Utc};
 use rand::RngCore;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -27,6 +23,11 @@ const INVITE_TTL_DAYS: i64 = 7;
 
 /// Roles a person can be invited with. `strategy` belongs to algorithms only.
 const INVITABLE_ROLES: [&str; 3] = ["pm", "trader", "viewer"];
+
+/// Whether `role` is one a person (invited or key-only) can hold.
+pub fn is_assignable_role(role: &str) -> bool {
+    INVITABLE_ROLES.contains(&role)
+}
 
 /// A freshly minted invite. `token` is the plaintext link token: it is
 /// returned exactly once and never stored.
@@ -218,12 +219,18 @@ pub async fn revoke(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<(), I
     Ok(())
 }
 
-/// A new token and expiry for the same user. The old invite stops working;
+/// A new token and expiry for the same user. Every older pending invite stops
+/// working, and only the user's newest unclaimed invite can be reissued;
 /// a user disabled by revoking an unclaimed invite is invited again.
 pub async fn reissue(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<NewInvite, InviteError> {
     let mut tx = pool.begin().await?;
+    // Only an unclaimed invite, and only the user's newest one: an invite that
+    // a later reissue already replaced must not mint a rival to the live one.
     let row = sqlx::query(
-        "SELECT principal_id, email FROM invite WHERE id = $1 AND accepted_at IS NULL FOR UPDATE",
+        "SELECT principal_id, email FROM invite i \
+          WHERE id = $1 AND accepted_at IS NULL \
+            AND created_at = (SELECT max(created_at) FROM invite WHERE principal_id = i.principal_id) \
+            FOR UPDATE",
     )
     .bind(invite_id)
     .fetch_optional(&mut *tx)
@@ -232,10 +239,14 @@ pub async fn reissue(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<NewI
     let principal_id: Uuid = row.get("principal_id");
     let email: String = row.get("email");
 
-    sqlx::query("UPDATE invite SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL")
-        .bind(invite_id)
-        .execute(&mut *tx)
-        .await?;
+    // The user never has two live invites: retire whatever is still pending.
+    sqlx::query(
+        "UPDATE invite SET revoked_at = now() \
+          WHERE principal_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(principal_id)
+    .execute(&mut *tx)
+    .await?;
     let reinvited = sqlx::query(
         "UPDATE principal SET status = 'INVITED', updated_at = now() \
           WHERE id = $1 AND status = 'DISABLED' \
@@ -776,6 +787,31 @@ mod tests {
             resolve_login(&pool, &identity, Some(&new.token)).await.unwrap(),
             ClaimOutcome::Linked { .. }
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn reissue_never_leaves_two_live_invites() {
+        let pool = migrated_db().await;
+        let first = invite_jane(&pool).await;
+        let second = reissue(&pool, first.invite_id, "admin").await.unwrap();
+        // The first invite was superseded; reissuing it again must not mint a rival.
+        assert!(matches!(reissue(&pool, first.invite_id, "admin").await, Err(InviteError::NotFound)));
+        let third = reissue(&pool, second.invite_id, "admin").await.unwrap();
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM invite WHERE principal_id = $1 \
+               AND accepted_at IS NULL AND revoked_at IS NULL",
+        )
+        .bind(first.principal_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 1);
+
+        // An accepted invite cannot be reissued.
+        let identity = login(ISSUER, "s9", "jane@fundco.com", true);
+        resolve_login(&pool, &identity, Some(&third.token)).await.unwrap();
+        assert!(matches!(reissue(&pool, third.invite_id, "admin").await, Err(InviteError::NotFound)));
     }
 
     #[tokio::test]

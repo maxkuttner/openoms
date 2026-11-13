@@ -18,6 +18,7 @@ mod sessions;
 mod oidc;
 mod auth_api;
 mod invites;
+mod users_api;
 mod authz;
 
 use gateway::adapter::BrokerRegistry;
@@ -31,14 +32,11 @@ use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, Allocat
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
-    CreatePrincipal, UpdatePrincipal,
     CreatePortfolio, UpdatePortfolio,
     CreateAccount, UpdateAccount,
     CreateBrokerConnection, UpdateBrokerConnection,
     CreateKey, ApiKeyRecord,
-    CreateGrant, UpdateGrant,
 };
-use crate::domain::identity::Grant;
 
 use axum::{
     response::Html,
@@ -114,20 +112,9 @@ mod authz_route_tests;
         instruments_api::list_instruments_for_trader,
         instruments_api::list_option_expiries,
         instruments_api::get_option_chain,
-        admin::create_principal,
-        admin::list_principals,
-        admin::get_principal,
-        admin::update_principal,
-        admin::register_principal_key,
-        admin::list_principal_keys,
-        admin::revoke_principal_key,
         admin::create_trading_token,
         admin::list_trading_tokens,
         admin::revoke_trading_token,
-        admin::create_grant,
-        admin::list_grants,
-        admin::update_grant,
-        admin::delete_grant,
         admin::create_portfolio,
         admin::list_portfolios,
         admin::get_portfolio,
@@ -169,7 +156,6 @@ mod authz_route_tests;
         admin::backfill_symbology,
         admin::expiry_sweep,
         admin::setup_status,
-        admin::revoke_principal_sessions,
         strategies::admin::list_strategies,
         strategies::admin::create_strategy,
         strategies::admin::update_strategy,
@@ -205,7 +191,6 @@ mod authz_route_tests;
         order_events::OrderEventView,
         handlers::GrantedPortfolio,
         Principal, Portfolio, Account, BrokerConnection,
-        CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
@@ -217,7 +202,6 @@ mod authz_route_tests;
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
-        Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary, admin::FeedSummary, admin::FeedConnectionSummary,
         instruments_api::ChainLeg, instruments_api::ChainRow,
@@ -225,7 +209,6 @@ mod authz_route_tests;
         admin::ExpirySweepResult,
         admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
-        admin::RevokedSessions,
         auth_api::MeResponse,
         strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
         strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted, strategies::admin::RebaselineIssued,
@@ -1445,26 +1428,17 @@ async fn serve() {
             "/admin/orders/:id/events",
             get(order_events::get_order_events_admin),
         )
-        .route(
-            "/admin/principals",
-            post(admin::create_principal).get(admin::list_principals),
-        )
-        .route(
-            "/admin/principals/:id",
-            axum::routing::patch(admin::update_principal).get(admin::get_principal),
-        )
-        .route(
-            "/admin/principals/:id/keys",
-            post(admin::register_principal_key).get(admin::list_principal_keys),
-        )
-        .route(
-            "/admin/principals/:id/keys/:key_id",
-            axum::routing::delete(admin::revoke_principal_key),
-        )
-        .route(
-            "/admin/principals/:id/sessions",
-            axum::routing::delete(admin::revoke_principal_sessions),
-        )
+        .route("/admin/users", get(users_api::list_users).post(users_api::create_key_only_user))
+        .route("/admin/users/invite", post(users_api::invite_user))
+        .route("/admin/users/invites/:id/revoke", post(users_api::revoke_invite))
+        .route("/admin/users/invites/:id/reissue", post(users_api::reissue_invite))
+        .route("/admin/users/:id/link-invite", post(users_api::link_invite))
+        .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
+        .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
+        .route("/admin/users/:id/disable", post(users_api::disable_user))
+        .route("/admin/users/:id/enable", post(users_api::enable_user))
+        .route("/admin/users/:id/keys", get(users_api::list_keys).post(users_api::create_key))
+        .route("/admin/users/:id/keys/:key_id", axum::routing::delete(users_api::revoke_key))
         .route(
             "/admin/trading-tokens",
             post(admin::create_trading_token).get(admin::list_trading_tokens),
@@ -1526,14 +1500,6 @@ async fn serve() {
             post(admin::test_feed_connection_credentials),
         )
         .route("/admin/connections/reload", post(admin::reload_connections))
-        .route(
-            "/admin/principals/:id/grants",
-            post(admin::create_grant).get(admin::list_grants),
-        )
-        .route(
-            "/admin/principals/:id/grants/:grant_id",
-            axum::routing::patch(admin::update_grant).delete(admin::delete_grant),
-        )
         .route(
             "/admin/risk-limits",
             post(admin::create_risk_limit).get(admin::list_risk_limits),

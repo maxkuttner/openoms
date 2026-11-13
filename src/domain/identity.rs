@@ -47,15 +47,3 @@ pub struct Account {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
-
-#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
-pub struct Grant {
-    pub id: Uuid,
-    pub principal_id: Uuid,
-    pub portfolio_id: Uuid,
-    pub can_trade: bool,
-    pub can_view: bool,
-    pub can_allocate: bool,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}

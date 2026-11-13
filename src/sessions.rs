@@ -287,22 +287,6 @@ pub async fn revoke_session(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
     Ok(())
 }
 
-pub async fn revoke_all_for_principal(
-    pool: &PgPool,
-    principal_id: Uuid,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE user_session SET revoked_at = now() \
-         WHERE principal_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(principal_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-/// Delete sessions past their absolute cap. Idle expiry is enforced on read, so
-/// this only clears what can never resolve again.
 pub async fn sweep_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query("DELETE FROM user_session WHERE absolute_expires_at < now()")
         .execute(pool)
@@ -615,21 +599,6 @@ mod tests {
             .expect("disable");
 
         assert!(lookup_session(&pool, &token.hash).await.expect("lookup").is_none());
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn revoking_a_principal_kills_every_one_of_its_sessions() {
-        let pool = test_pool().await;
-        let (principal_id, _principal_code) = seed_principal(&pool, "session-revoke-all-test").await;
-        let a = create_session(&pool, principal_id, &SessionTtl::default(), None).await.expect("a");
-        let b = create_session(&pool, principal_id, &SessionTtl::default(), None).await.expect("b");
-
-        let killed = revoke_all_for_principal(&pool, principal_id).await.expect("revoke all");
-
-        assert_eq!(killed, 2);
-        assert!(lookup_session(&pool, &a.hash).await.expect("a").is_none());
-        assert!(lookup_session(&pool, &b.hash).await.expect("b").is_none());
     }
 
     // ── test plumbing ────────────────────────────────────────────────────────

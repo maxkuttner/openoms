@@ -19,25 +19,9 @@ use gateway::verify::TestOutcome;
 use crate::credentials_api::{self, CredentialSubmission};
 use crate::reload;
 use gateway::stream_health::StreamHealth;
-use crate::domain::identity::{Account, BrokerConnection, Portfolio, Grant, Principal};
+use crate::domain::identity::{Account, BrokerConnection, Portfolio};
 use crate::symbology_resolver::{self, ResolveError, ResolveOutcome};
 use symbology::InstrumentQuery;
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct CreatePrincipal {
-    pub code: String,
-    pub principal_type: String,
-    pub display_name: Option<String>,
-    pub status: String,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct UpdatePrincipal {
-    pub code: Option<String>,
-    pub principal_type: Option<String>,
-    pub display_name: Option<String>,
-    pub status: Option<String>,
-}
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePortfolio {
@@ -115,142 +99,6 @@ pub struct RedactedCredentials {
     /// `state == "error"`, and always a description, never the payload.
     pub message: Option<String>,
     pub updated_at: Option<DateTime<Utc>>,
-}
-
-#[utoipa::path(
-    post, path = "/admin/principals", tag = "admin",
-    request_body = CreatePrincipal,
-    responses(
-        (status = 200, description = "Created", body = Principal),
-        (status = 409, description = "Already exists"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn create_principal(
-    State(state): State<AppState>,
-    Json(payload): Json<CreatePrincipal>,
-) -> Result<Json<Principal>, AdminError> {
-    info!(code = %payload.code, principal_type = %payload.principal_type, "admin create principal");
-    let id = Uuid::new_v4();
-    let record = sqlx::query_as::<_, Principal>(
-        r#"
-        INSERT INTO principal (
-            id,
-            code,
-            principal_type,
-            display_name,
-            status
-        ) VALUES ($1, $2, $3, $4, $5)
-        RETURNING id, code, principal_type, display_name, status, created_at, updated_at
-        "#,
-    )
-    .bind(id)
-    .bind(payload.code)
-    .bind(payload.principal_type)
-    .bind(payload.display_name)
-    .bind(payload.status)
-    .fetch_one(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    Ok(Json(record))
-}
-
-#[utoipa::path(
-    get, path = "/admin/principals", tag = "admin",
-    responses(
-        (status = 200, description = "OK", body = [Principal]),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn list_principals(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<Principal>>, AdminError> {
-    info!("admin list principals");
-    let records = sqlx::query_as::<_, Principal>(
-        r#"
-        SELECT id, code, principal_type, display_name, status, created_at, updated_at
-        FROM principal
-        ORDER BY created_at DESC
-        "#,
-    )
-    .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    Ok(Json(records))
-}
-
-#[utoipa::path(
-    get, path = "/admin/principals/{id}", tag = "admin",
-    params(("id" = Uuid, Path, description = "Principal ID")),
-    responses(
-        (status = 200, description = "OK", body = Principal),
-        (status = 404, description = "Not found"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn get_principal(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Principal>, AdminError> {
-    info!(principal_id = %id, "admin get principal");
-    let record = sqlx::query_as::<_, Principal>(
-        r#"
-        SELECT id, code, principal_type, display_name, status, created_at, updated_at
-        FROM principal
-        WHERE id = $1
-        "#,
-    )
-    .bind(id)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("principal"))?;
-
-    Ok(Json(record))
-}
-
-#[utoipa::path(
-    patch, path = "/admin/principals/{id}", tag = "admin",
-    params(("id" = Uuid, Path, description = "Principal ID")),
-    request_body = UpdatePrincipal,
-    responses(
-        (status = 200, description = "Updated", body = Principal),
-        (status = 404, description = "Not found"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn update_principal(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<UpdatePrincipal>,
-) -> Result<Json<Principal>, AdminError> {
-    info!(principal_id = %id, "admin update principal");
-    let record = sqlx::query_as::<_, Principal>(
-        r#"
-        UPDATE principal
-        SET
-            code = COALESCE($1, code),
-            principal_type = COALESCE($2, principal_type),
-            display_name = COALESCE($3, display_name),
-            status = COALESCE($4, status),
-            updated_at = now()
-        WHERE id = $5
-        RETURNING id, code, principal_type, display_name, status, created_at, updated_at
-        "#,
-    )
-    .bind(payload.code)
-    .bind(payload.principal_type)
-    .bind(payload.display_name)
-    .bind(payload.status)
-    .bind(id)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("principal"))?;
-
-    Ok(Json(record))
 }
 
 #[utoipa::path(
@@ -1790,108 +1638,6 @@ pub struct ApiKeyRecord {
     pub secret: Option<String>,
 }
 
-#[utoipa::path(
-    get, path = "/admin/principals/{id}/keys", tag = "admin",
-    params(("id" = Uuid, Path, description = "Principal ID")),
-    responses(
-        (status = 200, description = "OK", body = [ApiKeyRecord]),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn list_principal_keys(
-    State(state): State<AppState>,
-    Path(principal_id): Path<Uuid>,
-) -> Result<Json<Vec<ApiKeyRecord>>, AdminError> {
-    info!(principal_id = %principal_id, "admin list keys");
-    let records = sqlx::query_as::<_, ApiKeyRecord>(
-        r#"
-        SELECT id, principal_id, key_id, name, created_at
-        FROM api_key
-        WHERE principal_id = $1 AND revoked_at IS NULL
-        ORDER BY created_at DESC
-        "#,
-    )
-    .bind(principal_id)
-    .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    Ok(Json(records))
-}
-
-#[utoipa::path(
-    post, path = "/admin/principals/{id}/keys", tag = "admin",
-    params(("id" = Uuid, Path, description = "Principal ID")),
-    request_body = CreateKey,
-    responses(
-        (status = 200, description = "Created — plaintext secret included once", body = ApiKeyRecord),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn register_principal_key(
-    State(state): State<AppState>,
-    Path(principal_id): Path<Uuid>,
-    Json(payload): Json<CreateKey>,
-) -> Result<Json<ApiKeyRecord>, AdminError> {
-    info!(principal_id = %principal_id, "admin register key");
-    let KeyMaterial { key_id, plaintext_secret, secret_hash } = generate_key_material().await?;
-
-    let mut record = sqlx::query_as::<_, ApiKeyRecord>(
-        r#"
-        INSERT INTO api_key (principal_id, key_id, secret_hash, name)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, principal_id, key_id, name, created_at
-        "#,
-    )
-    .bind(principal_id)
-    .bind(&key_id)
-    .bind(secret_hash)
-    .bind(payload.name)
-    .fetch_one(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    record.secret = Some(plaintext_secret);
-    Ok(Json(record))
-}
-
-#[utoipa::path(
-    delete, path = "/admin/principals/{id}/keys/{key_id}", tag = "admin",
-    params(
-        ("id" = Uuid, Path, description = "Principal ID"),
-        ("key_id" = String, Path, description = "Key ID"),
-    ),
-    responses(
-        (status = 204, description = "Revoked"),
-        (status = 404, description = "Not found"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn revoke_principal_key(
-    State(state): State<AppState>,
-    Path((principal_id, key_id)): Path<(Uuid, String)>,
-) -> Result<StatusCode, AdminError> {
-    info!(principal_id = %principal_id, key_id = %key_id, "admin revoke key");
-
-    let result = sqlx::query(
-        r#"
-        UPDATE api_key SET revoked_at = now()
-        WHERE key_id = $1 AND principal_id = $2 AND revoked_at IS NULL
-        "#,
-    )
-    .bind(&key_id)
-    .bind(principal_id)
-    .execute(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    if result.rows_affected() == 0 {
-        return Err(AdminError::not_found("key"));
-    }
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
 // ── Trading tokens ────────────────────────────────────────────────────────────
 //
 // A "trading token" is an ordinary `api_key` presented to the trading routes as a
@@ -1900,15 +1646,15 @@ pub async fn revoke_principal_key(
 // can auto-provision the principal + portfolio + `can_trade` grant it needs.
 
 /// Freshly generated key material, before it's persisted.
-struct KeyMaterial {
-    key_id: String,
-    plaintext_secret: String,
-    secret_hash: String,
+pub(crate) struct KeyMaterial {
+    pub(crate) key_id: String,
+    pub(crate) plaintext_secret: String,
+    pub(crate) secret_hash: String,
 }
 
 /// Generate a new `(key_id, secret)` and its bcrypt hash. `key_id` = `ak_<uuid>`,
 /// secret = `sk_<base64url(32 bytes)>`. Hashing runs off the async pool.
-async fn generate_key_material() -> Result<KeyMaterial, AdminError> {
+pub(crate) async fn generate_key_material() -> Result<KeyMaterial, AdminError> {
     let key_id = format!("ak_{}", Uuid::new_v4().simple());
     let mut raw = [0u8; 32];
     raw[..16].copy_from_slice(Uuid::new_v4().as_bytes());
@@ -1927,7 +1673,7 @@ async fn generate_key_material() -> Result<KeyMaterial, AdminError> {
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateTradingToken {
     /// Mint the token under this existing principal (the trader/strategy/service it
-    /// belongs to). Create principals on the Principals admin surface first.
+    /// belongs to). Create users on the Users admin surface first.
     pub principal_id: Uuid,
     /// Optionally entitle the principal to trade this portfolio (adds a `can_trade`
     /// grant). Omit if the principal is already granted, or to grant separately.
@@ -2056,203 +1802,6 @@ pub async fn revoke_trading_token(
     if result.rows_affected() == 0 {
         return Err(AdminError::not_found("token"));
     }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-// ── Session revocation ────────────────────────────────────────────────────────
-
-/// How many of a principal's sessions were just revoked.
-///
-/// Not itself proof the principal has no *other* way in — a revoked session
-/// only stops resolving on its next `lookup_session` (see
-/// `sessions::lookup_session`'s `revoked_at IS NULL` filter); this endpoint
-/// does not touch API keys.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct RevokedSessions {
-    pub revoked: u64,
-}
-
-/// Cut a principal off immediately: revoke every one of its live sessions.
-///
-/// Effective on the very next request from any of them — `lookup_session`
-/// only resolves a session while `revoked_at IS NULL`, so there is nothing
-/// to invalidate beyond the row itself (no cache sits in front of it).
-#[utoipa::path(
-    delete, path = "/admin/principals/{id}/sessions", tag = "admin",
-    params(("id" = Uuid, Path, description = "Principal ID")),
-    responses(
-        (status = 200, description = "OK", body = RevokedSessions),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn revoke_principal_sessions(
-    State(state): State<AppState>,
-    Path(principal_id): Path<Uuid>,
-) -> Result<Json<RevokedSessions>, AdminError> {
-    info!(principal_id = %principal_id, "admin revoke principal sessions");
-    let revoked = crate::sessions::revoke_all_for_principal(state.pool(), principal_id)
-        .await
-        .map_err(map_db_error)?;
-    Ok(Json(RevokedSessions { revoked }))
-}
-
-// ── Grant management ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct CreateGrant {
-    pub portfolio_id: Uuid,
-    pub can_trade: bool,
-    pub can_view: bool,
-    pub can_allocate: bool,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct UpdateGrant {
-    pub can_trade: Option<bool>,
-    pub can_view: Option<bool>,
-    pub can_allocate: Option<bool>,
-}
-
-#[utoipa::path(
-    post, path = "/admin/principals/{id}/grants", tag = "admin",
-    params(("id" = Uuid, Path, description = "Principal ID")),
-    request_body = CreateGrant,
-    responses(
-        (status = 200, description = "Created", body = Grant),
-        (status = 409, description = "Grant already exists for this principal/portfolio"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn create_grant(
-    State(state): State<AppState>,
-    Path(principal_id): Path<Uuid>,
-    Json(payload): Json<CreateGrant>,
-) -> Result<Json<Grant>, AdminError> {
-    info!(principal_id = %principal_id, portfolio_id = %payload.portfolio_id, "admin create grant");
-    let id = Uuid::new_v4();
-    let record = sqlx::query_as::<_, Grant>(
-        r#"
-        INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view, can_allocate)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
-        "#,
-    )
-    .bind(id)
-    .bind(principal_id)
-    .bind(payload.portfolio_id)
-    .bind(payload.can_trade)
-    .bind(payload.can_view)
-    .bind(payload.can_allocate)
-    .fetch_one(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    Ok(Json(record))
-}
-
-#[utoipa::path(
-    get, path = "/admin/principals/{id}/grants", tag = "admin",
-    params(("id" = Uuid, Path, description = "Principal ID")),
-    responses(
-        (status = 200, description = "OK", body = [Grant]),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn list_grants(
-    State(state): State<AppState>,
-    Path(principal_id): Path<Uuid>,
-) -> Result<Json<Vec<Grant>>, AdminError> {
-    info!(principal_id = %principal_id, "admin list grants");
-    let records = sqlx::query_as::<_, Grant>(
-        r#"
-        SELECT id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
-        FROM principal_portfolio_grant
-        WHERE principal_id = $1
-        ORDER BY created_at DESC
-        "#,
-    )
-    .bind(principal_id)
-    .fetch_all(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    Ok(Json(records))
-}
-
-#[utoipa::path(
-    patch, path = "/admin/principals/{id}/grants/{grant_id}", tag = "admin",
-    params(
-        ("id" = Uuid, Path, description = "Principal ID"),
-        ("grant_id" = Uuid, Path, description = "Grant ID"),
-    ),
-    request_body = UpdateGrant,
-    responses(
-        (status = 200, description = "Updated", body = Grant),
-        (status = 404, description = "Not found"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn update_grant(
-    State(state): State<AppState>,
-    Path((principal_id, grant_id)): Path<(Uuid, Uuid)>,
-    Json(payload): Json<UpdateGrant>,
-) -> Result<Json<Grant>, AdminError> {
-    info!(principal_id = %principal_id, grant_id = %grant_id, "admin update grant");
-    let record = sqlx::query_as::<_, Grant>(
-        r#"
-        UPDATE principal_portfolio_grant
-        SET
-            can_trade    = COALESCE($1, can_trade),
-            can_view     = COALESCE($2, can_view),
-            can_allocate = COALESCE($3, can_allocate),
-            updated_at   = now()
-        WHERE id = $4 AND principal_id = $5
-        RETURNING id, principal_id, portfolio_id, can_trade, can_view, can_allocate, created_at, updated_at
-        "#,
-    )
-    .bind(payload.can_trade)
-    .bind(payload.can_view)
-    .bind(payload.can_allocate)
-    .bind(grant_id)
-    .bind(principal_id)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(map_db_error)?
-    .ok_or_else(|| AdminError::not_found("grant"))?;
-
-    Ok(Json(record))
-}
-
-#[utoipa::path(
-    delete, path = "/admin/principals/{id}/grants/{grant_id}", tag = "admin",
-    params(
-        ("id" = Uuid, Path, description = "Principal ID"),
-        ("grant_id" = Uuid, Path, description = "Grant ID"),
-    ),
-    responses(
-        (status = 204, description = "Deleted"),
-        (status = 404, description = "Not found"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn delete_grant(
-    State(state): State<AppState>,
-    Path((principal_id, grant_id)): Path<(Uuid, Uuid)>,
-) -> Result<StatusCode, AdminError> {
-    info!(principal_id = %principal_id, grant_id = %grant_id, "admin delete grant");
-    let result = sqlx::query(
-        "DELETE FROM principal_portfolio_grant WHERE id = $1 AND principal_id = $2",
-    )
-    .bind(grant_id)
-    .bind(principal_id)
-    .execute(state.pool())
-    .await
-    .map_err(map_db_error)?;
-
-    if result.rows_affected() == 0 {
-        return Err(AdminError::not_found("grant"));
-    }
-
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2859,6 +2408,12 @@ impl AdminError {
     }
 }
 
+impl From<AdminError> for crate::handlers::ApiError {
+    fn from(err: AdminError) -> Self {
+        Self { status: err.status, message: err.message }
+    }
+}
+
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
         (self.status, self.message).into_response()
@@ -3344,22 +2899,6 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn revoking_sessions_reports_how_many_it_killed() {
-        let pool = test_pool().await;
-        let (principal_id, _code) = seed_principal(&pool, "admin-revoke-sessions-test").await;
-        crate::sessions::create_session(&pool, principal_id, &Default::default(), None)
-            .await
-            .expect("session");
-
-        let revoked = crate::sessions::revoke_all_for_principal(&pool, principal_id)
-            .await
-            .expect("revoke");
-
-        assert_eq!(revoked, 1);
-    }
-
     // ── test plumbing ────────────────────────────────────────────────────
 
     /// `main` loads .env before resolving config; a test binary does not, so
@@ -3380,23 +2919,5 @@ mod tests {
             .connect(&cfg.url())
             .await
             .expect("connect")
-    }
-
-    /// `principal.code` is `UNIQUE` and these tests leave their rows behind,
-    /// so the code is suffixed with the row's own id. Returns the id and the
-    /// code actually inserted, since callers assert against it.
-    async fn seed_principal(pool: &sqlx::PgPool, code: &str) -> (Uuid, String) {
-        let id = Uuid::new_v4();
-        let code = format!("{code}-{id}");
-        sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, display_name, status) \
-             VALUES ($1, $2, 'HUMAN', $2, 'ACTIVE')",
-        )
-        .bind(id)
-        .bind(&code)
-        .execute(pool)
-        .await
-        .expect("seed principal");
-        (id, code)
     }
 }
