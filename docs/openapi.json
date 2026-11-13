@@ -1886,6 +1886,9 @@
           },
           "409": {
             "description": "Code, portfolio, principal or CompIDs already used"
+          },
+          "422": {
+            "description": "Not an active user as responsible"
           }
         },
         "security": [
@@ -2405,6 +2408,9 @@
           },
           "404": {
             "description": "Not found"
+          },
+          "409": {
+            "description": "No active responsible user"
           }
         },
         "security": [
@@ -2493,6 +2499,58 @@
           },
           "503": {
             "description": "No master key"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/handover": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "handover",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Handover"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Handed over",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyRow"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "422": {
+            "description": "Not an active user"
           }
         },
         "security": [
@@ -4395,7 +4453,6 @@
           "name",
           "portfolio_id",
           "owner_principal_id",
-          "principal_id",
           "sender_comp_id",
           "target_comp_id"
         ],
@@ -4456,7 +4513,8 @@
           },
           "owner_principal_id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "description": "The responsible user: an ACTIVE person."
           },
           "portfolio_id": {
             "type": "string",
@@ -4469,7 +4527,9 @@
           },
           "principal_id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "description": "The principal it trades as. Omitted (the usual case): a new strategy\nprincipal is created, named after the strategy.",
+            "nullable": true
           },
           "sender_comp_id": {
             "type": "string"
@@ -4899,6 +4959,18 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "Handover": {
+        "type": "object",
+        "required": [
+          "principal_id"
+        ],
+        "properties": {
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -5709,6 +5781,30 @@
           }
         }
       },
+      "Responsible": {
+        "type": "object",
+        "required": [
+          "principal_id",
+          "code",
+          "status"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
       "RetireRequest": {
         "type": "object",
         "required": [
@@ -5925,7 +6021,8 @@
           "placed_per_min",
           "cancelled_per_min",
           "fighting",
-          "kill_ack_late"
+          "kill_ack_late",
+          "needs_responsible"
         ],
         "properties": {
           "acked_limits_version": {
@@ -6019,6 +6116,10 @@
           "name": {
             "type": "string"
           },
+          "needs_responsible": {
+            "type": "boolean",
+            "description": "The responsible user is not ACTIVE: the strategy cannot be (re)started\nuntil it is handed over."
+          },
           "open_orders": {
             "type": "integer",
             "format": "int64"
@@ -6043,6 +6144,14 @@
           "principal_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "responsible": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Responsible"
+              }
+            ],
+            "nullable": true
           },
           "rest_enabled": {
             "type": "boolean"

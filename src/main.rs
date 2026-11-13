@@ -168,6 +168,7 @@ mod authz_route_tests;
         strategies::admin::strategy_securities,
         strategies::admin::kill_strategy,
         strategies::admin::enable_strategy,
+        strategies::admin::handover,
         strategies::admin::rebaseline_strategy,
         strategies::admin::flatten_strategy,
         colo::deployment::register,
@@ -210,7 +211,7 @@ mod authz_route_tests;
         admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         auth_api::MeResponse,
-        strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
+        strategies::admin::StrategyRow, strategies::admin::Responsible, strategies::admin::Handover, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
         strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted, strategies::admin::RebaselineIssued,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
         colo::deployment::Deployment, colo::deployment::DeploymentRegistration,
@@ -1402,6 +1403,8 @@ async fn serve() {
         .route("/orders/:id/events", get(order_events::get_order_events))
         .route("/orders", get(handlers::list_orders))
         .route("/strategies/securities", get(strategies::admin::strategy_securities))
+        .route("/strategies", get(strategies::trader_api::list).post(strategies::trader_api::create))
+        .route("/strategies/:code/handover", post(strategies::trader_api::handover))
         .route("/portfolios", get(handlers::list_portfolios))
         .route(
             "/watchlist",
@@ -1527,6 +1530,7 @@ async fn serve() {
         .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
         .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
         .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
+        .route("/admin/strategies/:code/handover", post(strategies::admin::handover))
         .route("/admin/strategies/:code/rebaseline", post(strategies::admin::rebaseline_strategy))
         .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
         .route(

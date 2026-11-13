@@ -65,7 +65,30 @@ pub struct StrategyRow {
     /// Killed, and the strategy has not acknowledged it within 5 s.
     #[sqlx(default)]
     pub kill_ack_late: bool,
+    /// The responsible user, shown on the strategy.
+    #[sqlx(skip)]
+    pub responsible: Option<Responsible>,
+    /// The responsible user is not ACTIVE: the strategy cannot be (re)started
+    /// until it is handed over.
+    #[sqlx(default)]
+    pub needs_responsible: bool,
 }
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct Responsible {
+    pub principal_id: Uuid,
+    pub code: String,
+    pub display_name: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+pub struct Handover {
+    pub principal_id: Uuid,
+}
+
+pub(crate) const PICK_RESPONSIBLE: &str = "Pick an active user as responsible";
+pub(crate) const NO_RESPONSIBLE: &str = "Strategy has no active responsible user";
 
 const ROW_SELECT: &str = "code, name, portfolio_id, owner_principal_id, principal_id, sender_comp_id, \
     target_comp_id, fix_password_hash IS NOT NULL AS has_fix_password, \
@@ -78,13 +101,17 @@ const ROW_SELECT: &str = "code, name, portfolio_id, owner_principal_id, principa
     follow_credentials IS NOT NULL AS has_follow_credentials, dead_man_secs, max_orders_per_sec, \
     kill_when_unmonitored, limits_version";
 
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct CreateStrategy {
     pub code: String,
     pub name: String,
     pub portfolio_id: Uuid,
+    /// The responsible user: an ACTIVE person.
     pub owner_principal_id: Uuid,
-    pub principal_id: Uuid,
+    /// The principal it trades as. Omitted (the usual case): a new strategy
+    /// principal is created, named after the strategy.
+    #[serde(default)]
+    pub principal_id: Option<Uuid>,
     pub sender_comp_id: String,
     pub target_comp_id: String,
     /// Comma-separated IP addresses; empty means any.
@@ -134,7 +161,7 @@ pub struct NewPassword {
     pub password: String,
 }
 
-async fn reload(state: &AppState) {
+pub(crate) async fn reload(state: &AppState) {
     if let Err(e) = state.strategies().reload(state.pool()).await {
         warn!(error = %e, "strategies: registry reload failed; the snapshot keeps its last state");
     }
@@ -222,7 +249,15 @@ fn validate_comp_ids(sender: &str, target: &str) -> Result<(), AdminError> {
     security(("bearer_token" = []))
 )]
 pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<StrategyRow>>, AdminError> {
-    let mut rows = sqlx::query_as::<_, StrategyRow>(&format!("SELECT {ROW_SELECT} FROM strategy ORDER BY code"))
+    list_rows(&state, None).await.map(Json)
+}
+
+/// Strategies with their live status; `portfolios` narrows to those books.
+pub(crate) async fn list_rows(state: &AppState, portfolios: Option<&[Uuid]>) -> Result<Vec<StrategyRow>, AdminError> {
+    let mut rows = sqlx::query_as::<_, StrategyRow>(&format!(
+        "SELECT {ROW_SELECT} FROM strategy WHERE $1::uuid[] IS NULL OR portfolio_id = ANY($1) ORDER BY code"
+    ))
+        .bind(portfolios)
         .fetch_all(state.pool())
         .await
         .map_err(map_db_error)?;
@@ -234,6 +269,7 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
             Default::default()
         }
     };
+    fill_responsible(state.pool(), &mut rows).await?;
     for row in &mut rows {
         row.session_live = state.fix_sessions().is_live(&row.code);
         if row.mode == "COLOCATED" {
@@ -252,7 +288,7 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
                 (row.state == "HALTED" && hub.kill_ack_late(&row.code)) || stalled.contains(&row.code);
         }
     }
-    Ok(Json(rows))
+    Ok(rows)
 }
 
 #[utoipa::path(
@@ -262,6 +298,7 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
         (status = 200, description = "Created", body = StrategyRow),
         (status = 400, description = "Missing CompIDs"),
         (status = 409, description = "Code, portfolio, principal or CompIDs already used"),
+        (status = 422, description = "Not an active user as responsible"),
     ),
     security(("bearer_token" = []))
 )]
@@ -269,10 +306,111 @@ pub async fn create_strategy(
     State(state): State<AppState>,
     Json(p): Json<CreateStrategy>,
 ) -> Result<Json<StrategyRow>, AdminError> {
+    let row = create_strategy_inner(state.pool(), p, "admin").await?;
+    reload(&state).await;
+    Ok(Json(row))
+}
+
+/// The responsible user's row and whether it is ACTIVE, onto each strategy.
+async fn fill_responsible(pool: &sqlx::PgPool, rows: &mut [StrategyRow]) -> Result<(), AdminError> {
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.owner_principal_id).collect();
+    let people = sqlx::query_as::<_, Responsible>(
+        "SELECT id AS principal_id, code, display_name, status FROM principal WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    .map_err(map_db_error)?;
+    for row in rows {
+        row.responsible = people.iter().find(|p| p.principal_id == row.owner_principal_id).cloned();
+        row.needs_responsible = row.responsible.as_ref().map_or(true, |p| p.status != "ACTIVE");
+    }
+    Ok(())
+}
+
+/// The responsible user must be an ACTIVE person (HUMAN), never a strategy.
+pub(crate) async fn require_active_person(
+    conn: &mut sqlx::PgConnection,
+    principal_id: Uuid,
+) -> Result<(), AdminError> {
+    let ok: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM principal WHERE id = $1 AND principal_type = 'HUMAN' AND status = 'ACTIVE')",
+    )
+    .bind(principal_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(map_db_error)?;
+    if ok { Ok(()) } else { Err(AdminError::new(StatusCode::UNPROCESSABLE_ENTITY, PICK_RESPONSIBLE)) }
+}
+
+/// Refuse to (re)start a strategy whose responsible user is not ACTIVE. An
+/// unknown code passes, so the caller's own lookup answers 404.
+pub(crate) async fn require_responsible(pool: &sqlx::PgPool, code: &str) -> Result<(), crate::handlers::ApiError> {
+    let needs: Option<bool> = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM principal p WHERE p.id = s.owner_principal_id AND p.status = 'ACTIVE') \
+           FROM strategy s WHERE s.code = $1",
+    )
+    .bind(code)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| crate::handlers::internal("database error", e))?;
+    if needs == Some(true) {
+        return Err(crate::handlers::ApiError { status: StatusCode::CONFLICT, message: NO_RESPONSIBLE.into() });
+    }
+    Ok(())
+}
+
+pub(crate) async fn fetch_row(pool: &sqlx::PgPool, code: &str) -> Result<StrategyRow, AdminError> {
+    let mut row = sqlx::query_as::<_, StrategyRow>(&format!("SELECT {ROW_SELECT} FROM strategy WHERE code = $1"))
+        .bind(code)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_db_error)?
+        .ok_or_else(|| AdminError::not_found("strategy"))?;
+    fill_responsible(pool, std::slice::from_mut(&mut row)).await?;
+    Ok(row)
+}
+
+/// Create a strategy; shared by the admin console and the PM route. The
+/// caller has already decided who may pick which responsible user.
+pub(crate) async fn create_strategy_inner(
+    pool: &sqlx::PgPool,
+    p: CreateStrategy,
+    actor: &str,
+) -> Result<StrategyRow, AdminError> {
     validate_comp_ids(&p.sender_comp_id, &p.target_comp_id)?;
-    info!(code = %p.code, "admin create strategy");
-    let mut tx = state.pool().begin().await.map_err(map_db_error)?;
-    let row = sqlx::query_as::<_, StrategyRow>(&format!(
+    info!(code = %p.code, %actor, "create strategy");
+    let mut tx = pool.begin().await.map_err(map_db_error)?;
+    require_active_person(&mut tx, p.owner_principal_id).await?;
+    let principal_id = match p.principal_id {
+        Some(id) => id,
+        None => {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO principal (id, code, principal_type, display_name, status) \
+                 VALUES ($1, $2, 'STRATEGY', $3, 'ACTIVE')",
+            )
+            .bind(id)
+            .bind(format!("strategy-{}", p.code))
+            .bind(&p.name)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+            id
+        }
+    };
+    // Without a role a principal is denied everything: a strategy principal
+    // gets the strategy role (today's powers).
+    sqlx::query(
+        "INSERT INTO principal_role (principal_id, role_code) \
+         SELECT id, 'strategy' FROM principal WHERE id = $1 AND principal_type = 'STRATEGY' \
+         ON CONFLICT (principal_id) DO NOTHING",
+    )
+    .bind(principal_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_error)?;
+    let mut row = sqlx::query_as::<_, StrategyRow>(&format!(
         "INSERT INTO strategy (code, name, portfolio_id, owner_principal_id, principal_id, sender_comp_id, \
             target_comp_id, allowed_addresses, max_order_quantity, max_order_notional, max_position_quantity, \
             max_position_notional, price_band_pct, mode, follow_environment, dead_man_secs, max_orders_per_sec, \
@@ -284,7 +422,7 @@ pub async fn create_strategy(
     .bind(&p.name)
     .bind(p.portfolio_id)
     .bind(p.owner_principal_id)
-    .bind(p.principal_id)
+    .bind(principal_id)
     .bind(&p.sender_comp_id)
     .bind(&p.target_comp_id)
     .bind(addresses(p.allowed_addresses.as_deref().unwrap_or_default()))
@@ -309,14 +447,62 @@ pub async fn create_strategy(
          ON CONFLICT (principal_id, portfolio_id) DO UPDATE SET can_trade = true, can_view = true",
     )
     .bind(Uuid::new_v4())
-    .bind(p.principal_id)
+    .bind(principal_id)
     .bind(p.portfolio_id)
     .execute(&mut *tx)
     .await
     .map_err(map_db_error)?;
     tx.commit().await.map_err(map_db_error)?;
-    reload(&state).await;
-    Ok(Json(row))
+    fill_responsible(pool, std::slice::from_mut(&mut row)).await?;
+    Ok(row)
+}
+
+/// Hand the strategy to another responsible user; audited. The caller has
+/// already checked that it may pick `to`.
+pub(crate) async fn handover_inner(pool: &sqlx::PgPool, code: &str, to: Uuid, actor: &str) -> Result<StrategyRow, AdminError> {
+    info!(%code, %to, %actor, "strategy handover");
+    let mut tx = pool.begin().await.map_err(map_db_error)?;
+    require_active_person(&mut tx, to).await?;
+    let from: Uuid = sqlx::query_scalar("SELECT owner_principal_id FROM strategy WHERE code = $1 FOR UPDATE")
+        .bind(code)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_error)?
+        .ok_or_else(|| AdminError::not_found("strategy"))?;
+    sqlx::query("UPDATE strategy SET owner_principal_id = $2, updated_at = now() WHERE code = $1")
+        .bind(code)
+        .bind(to)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+    sqlx::query("INSERT INTO audit_event (actor, action, target_principal_id, detail) VALUES ($1, 'strategy.handover', $2, $3)")
+        .bind(actor)
+        .bind(to)
+        .bind(serde_json::json!({ "strategy": code, "from": from, "to": to }))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+    tx.commit().await.map_err(map_db_error)?;
+    fetch_row(pool, code).await
+}
+
+#[utoipa::path(
+    post, path = "/admin/strategies/{code}/handover", tag = "admin",
+    params(("code" = String, Path, description = "Strategy code")),
+    request_body = Handover,
+    responses(
+        (status = 200, description = "Handed over", body = StrategyRow),
+        (status = 404, description = "Not found"),
+        (status = 422, description = "Not an active user"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn handover(
+    State(state): State<AppState>,
+    Path(code): Path<String>,
+    Json(p): Json<Handover>,
+) -> Result<Json<StrategyRow>, AdminError> {
+    handover_inner(state.pool(), &code, p.principal_id, "admin").await.map(Json)
 }
 
 #[utoipa::path(
@@ -374,6 +560,8 @@ pub async fn update_strategy(
     .map_err(map_db_error)?
     .ok_or_else(|| AdminError::not_found("strategy"))?;
     validate_comp_ids(&row.sender_comp_id, &row.target_comp_id)?;
+    let mut row = row;
+    fill_responsible(state.pool(), std::slice::from_mut(&mut row)).await?;
     reload(&state).await;
     if row.mode == "COLOCATED" {
         if bump {
@@ -551,7 +739,7 @@ pub async fn kill_strategy(State(state): State<AppState>, Path(code): Path<Strin
 #[utoipa::path(
     post, path = "/admin/strategies/{code}/enable", tag = "admin",
     params(("code" = String, Path, description = "Strategy code")),
-    responses((status = 204, description = "Enabled"), (status = 404, description = "Not found")),
+    responses((status = 204, description = "Enabled"), (status = 404, description = "Not found"), (status = 409, description = "No active responsible user")),
     security(("bearer_token" = []))
 )]
 pub async fn enable_strategy(State(state): State<AppState>, Path(code): Path<String>) -> Result<StatusCode, AdminError> {
@@ -692,6 +880,80 @@ mod tests {
         assert!(check_connection(p, &entry("BINANCE"), (Some(Uuid::new_v4()), "BINANCE".into())).is_err());
         assert!(check_connection(p, &entry("BINANCE"), (None, "BINANCE".into())).is_err());
         assert!(check_connection(p, &entry("BINANCE"), (Some(p), "BYBIT".into())).is_err());
+    }
+
+    fn api(e: AdminError) -> crate::handlers::ApiError {
+        e.into()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn create_refuses_inactive_or_strategy_responsible() {
+        use crate::strategies::test_support as ts;
+        let pool = ts::dev_pool().await;
+        let portfolio = ts::portfolio(&pool).await;
+        let disabled = ts::user(&pool, "trader", "DISABLED").await;
+        let algo = ts::strategy_principal(&pool).await;
+        for owner in [disabled, algo, Uuid::new_v4()] {
+            let err = api(create_strategy_inner(&pool, ts::create_request(portfolio, owner), "admin").await.unwrap_err());
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.message, "Pick an active user as responsible");
+        }
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM strategy WHERE portfolio_id = $1")
+            .bind(portfolio).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn created_strategy_principal_can_trade() {
+        use crate::strategies::test_support as ts;
+        let pool = ts::dev_pool().await;
+        let portfolio = ts::portfolio(&pool).await;
+        let owner = ts::user(&pool, "trader", "ACTIVE").await;
+        let row = create_strategy_inner(&pool, ts::create_request(portfolio, owner), "admin").await.unwrap();
+        assert_ne!(row.principal_id, owner);
+        assert!(crate::authz::allowed(&pool, row.principal_id, crate::authz::Permission::OrdersCreate, portfolio).await.unwrap());
+        let responsible = row.responsible.expect("responsible shown");
+        assert_eq!(responsible.principal_id, owner);
+        assert!(!row.needs_responsible);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn handover_is_audited() {
+        use crate::strategies::test_support as ts;
+        let pool = ts::dev_pool().await;
+        let code = ts::seed_strategy(&pool).await;
+        let state = ts::state(pool.clone());
+        let next = ts::user(&pool, "pm", "ACTIVE").await;
+        let disabled = ts::user(&pool, "pm", "DISABLED").await;
+        let err = api(handover(State(state.clone()), Path(code.clone()), Json(Handover { principal_id: disabled })).await.unwrap_err());
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let Json(row) = handover(State(state), Path(code.clone()), Json(Handover { principal_id: next })).await.unwrap();
+        assert_eq!(row.owner_principal_id, next);
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_event WHERE action = 'strategy.handover' AND target_principal_id = $1 AND detail->>'strategy' = $2",
+        )
+        .bind(next).bind(&code).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn enable_refused_without_active_responsible_user() {
+        use crate::strategies::test_support as ts;
+        let pool = ts::dev_pool().await;
+        let code = ts::seed_strategy(&pool).await;
+        sqlx::query("UPDATE principal SET status = 'DISABLED' WHERE id = (SELECT owner_principal_id FROM strategy WHERE code = $1)")
+            .bind(&code).execute(&pool).await.unwrap();
+        let state = ts::state(pool.clone());
+        state.strategies().reload(&pool).await.unwrap();
+        let Json(rows) = list_strategies(State(state.clone())).await.unwrap();
+        assert!(rows.iter().find(|r| r.code == code).unwrap().needs_responsible);
+        let err = api(enable_strategy(State(state), Path(code)).await.unwrap_err());
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.message, "Strategy has no active responsible user");
     }
 
     /// Against the shared dev DB: a reset returns the plaintext once and stores

@@ -1434,6 +1434,7 @@ pub async fn register(
 ) -> Result<Json<Deployment>, AdminError> {
     input.strategy_code = code;
     info!(strategy = %input.strategy_code, "admin register co-located deployment");
+    crate::strategies::admin::require_responsible(state.pool(), &input.strategy_code).await.map_err(|e| AdminError::new(e.status, e.message))?;
     register_deployment(state.pool(), &input).await.map(Json).map_err(Into::into)
 }
 

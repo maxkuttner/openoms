@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Badge, Button, Code, CopyButton, Group, Modal, MultiSelect, PasswordInput, Stack, Text, Textarea } from "@mantine/core";
+import { Badge, Button, Code, CopyButton, Group, Modal, MultiSelect, PasswordInput, Select, Stack, Text, Textarea } from "@mantine/core";
 import { CrudResource } from "../components/CrudResource";
 import { DeploymentPanel } from "../components/DeploymentPanel";
 import { api } from "../api/client";
@@ -28,7 +28,40 @@ type Strategy = {
   session_live: boolean;
   has_fix_password: boolean;
   last_logon_error: string | null;
+  responsible: { principal_id: string; code: string; display_name: string | null; status: string } | null;
+  needs_responsible: boolean;
 };
+
+type User = { principal_id: string; code: string; display_name: string | null; status: string };
+
+const userLabel = (u: { code: string; display_name: string | null }) => u.display_name || u.code;
+
+/// Who can be responsible for a strategy: active users only.
+function activeUserOptions(users: User[]) {
+  return users.filter((u) => u.status === "ACTIVE").map((u) => ({ value: u.principal_id, label: userLabel(u) }));
+}
+
+function HandoverForm({ strategy, users, onClose }: { strategy: Strategy; users: User[]; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [to, setTo] = useState<string | null>(null);
+  const save = () =>
+    api
+      .post(`${PATH}/${strategy.code}/handover`, { principal_id: to })
+      .then(() => { notifyOk(`${strategy.code} handed over`); onClose(); })
+      .catch(notifyError)
+      .finally(() => qc.invalidateQueries({ queryKey: [PATH] }));
+  return (
+    <Modal opened onClose={onClose} title={`Hand over — ${strategy.code}`} centered>
+      <Stack>
+        <Text fz="sm">Responsible now: {strategy.responsible ? userLabel(strategy.responsible) : "nobody"}</Text>
+        <Select label="New responsible user" data={activeUserOptions(users)} value={to} onChange={setTo} searchable />
+        <Group justify="flex-end">
+          <Button onClick={save} disabled={!to}>Hand over</Button>
+        </Group>
+      </Stack>
+    </Modal>
+  );
+}
 
 const MODES = [
   { value: "VIA_OMS", label: "Through the OMS" },
@@ -113,6 +146,8 @@ export function StrategiesPage() {
   const [editing, setEditing] = useState<Strategy | null>(null);
   const [followKey, setFollowKey] = useState<string | null>(null);
   const [runtime, setRuntime] = useState<string | null>(null);
+  const [handover, setHandover] = useState<Strategy | null>(null);
+  const users = useList<User>("/admin/users").data ?? [];
 
   const refresh = () => qc.invalidateQueries({ queryKey: [PATH] });
   const control = (code: string, action: "kill" | "flatten") =>
@@ -190,6 +225,7 @@ export function StrategiesPage() {
             )}
             <Button size="xs" variant="default" onClick={() => resetPassword(row.code)}>Reset password</Button>
             <Button size="xs" variant="default" onClick={() => setEditing(row)}>Connections</Button>
+            <Button size="xs" variant="default" onClick={() => setHandover(row)}>Hand over</Button>
           </Group>
         )}
         columns={[
@@ -197,6 +233,16 @@ export function StrategiesPage() {
           { key: "name", label: "Name" },
           { key: "mode", label: "Mode", render: (r: Strategy) => (isColocated(r) ? "co-located" : "through OMS") },
           { key: "state", label: "State" },
+          {
+            key: "responsible",
+            label: "Responsible",
+            render: (r: Strategy) => (
+              <Group gap={4}>
+                <Text fz="sm">{r.responsible ? userLabel(r.responsible) : "—"}</Text>
+                {r.needs_responsible ? <Badge color="orange">needs a new responsible user</Badge> : null}
+              </Group>
+            ),
+          },
           { key: "rest_enabled", label: "REST", render: (r: Strategy) => (r.rest_enabled ? "on" : "off") },
           {
             key: "link_connected",
@@ -237,8 +283,15 @@ export function StrategiesPage() {
           { name: "code", label: "Code", required: true, inEdit: false },
           { name: "name", label: "Name", required: true },
           { name: "portfolio_id", label: "Portfolio", type: "select", required: true, inEdit: false, optionsPath: "/admin/portfolios", optionValue: "id", optionLabel: "code" },
-          { name: "owner_principal_id", label: "Owner", type: "select", required: true, inEdit: false, optionsPath: "/admin/principals", optionValue: "id", optionLabel: "code" },
-          { name: "principal_id", label: "Trades as", type: "select", required: true, inEdit: false, optionsPath: "/admin/principals", optionValue: "id", optionLabel: "code" },
+          { name: "owner_principal_id", label: "Responsible user", type: "select", required: true, inEdit: false, options: activeUserOptions(users) },
+          {
+            name: "principal_id",
+            label: "Trades as",
+            type: "select",
+            inEdit: false,
+            options: users.map((u) => ({ value: u.principal_id, label: userLabel(u) })),
+            description: () => "Leave empty: the strategy trades under its own new login.",
+          },
           { name: "sender_comp_id", label: "SenderCompID", required: true },
           { name: "target_comp_id", label: "TargetCompID", required: true, default: "OMS" },
           { name: "allowed_addresses", label: "Allowed IP addresses" },
@@ -258,6 +311,7 @@ export function StrategiesPage() {
       {confirm && <Confirm title={confirm.title} body={confirm.body} onConfirm={confirm.run} onClose={() => setConfirm(null)} />}
       {editing && <ConnectionsEditor strategy={editing} onClose={() => setEditing(null)} />}
       {followKey && <FollowKeyForm code={followKey} onClose={() => setFollowKey(null)} />}
+      {handover && <HandoverForm strategy={handover} users={users} onClose={() => setHandover(null)} />}
       {runtime && <DeploymentPanel code={runtime} onClose={() => setRuntime(null)} />}
       {password && (
         <Modal opened onClose={() => setPassword(null)} title={`FIX password — ${password.code}`} centered>

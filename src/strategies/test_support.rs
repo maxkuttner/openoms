@@ -225,3 +225,66 @@ pub async fn drop_strategy(pool: &PgPool, code: &str) {
     sqlx::query("DELETE FROM portfolio WHERE id = $1").bind(portfolio).execute(pool).await.expect("drop portfolio");
     sqlx::query("DELETE FROM principal WHERE id = ANY($1)").bind(vec![owner, service]).execute(pool).await.expect("drop principals");
 }
+
+/// A HUMAN principal with `role` in `status`.
+pub async fn user(pool: &PgPool, role: &str, status: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO principal (id, code, principal_type, display_name, status) VALUES ($1, $2, 'HUMAN', $2, $3)")
+        .bind(id)
+        .bind(format!("strategy-test-user-{}", id.simple()))
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed user");
+    sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2)")
+        .bind(id)
+        .bind(role)
+        .execute(pool)
+        .await
+        .expect("seed role");
+    id
+}
+
+/// A STRATEGY principal with the strategy role.
+pub async fn strategy_principal(pool: &PgPool) -> Uuid {
+    principal(pool, "service", &Uuid::new_v4().simple().to_string()).await
+}
+
+pub async fn portfolio(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, $2, 'ACTIVE')")
+        .bind(id)
+        .bind(format!("strategy-test-{}", id.simple()))
+        .execute(pool)
+        .await
+        .expect("seed portfolio");
+    id
+}
+
+pub async fn grant(pool: &PgPool, principal: Uuid, portfolio: Uuid, can_trade: bool) {
+    sqlx::query(
+        "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
+         VALUES ($1, $2, $3, $4, true, false)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(principal)
+    .bind(portfolio)
+    .bind(can_trade)
+    .execute(pool)
+    .await
+    .expect("seed grant");
+}
+
+/// A create request for `portfolio` with fresh, unique code and CompIDs.
+pub fn create_request(portfolio: Uuid, owner: Uuid) -> crate::strategies::admin::CreateStrategy {
+    let code = format!("st-{}", &Uuid::new_v4().simple().to_string()[..16]);
+    crate::strategies::admin::CreateStrategy {
+        name: code.clone(),
+        sender_comp_id: code.clone(),
+        target_comp_id: "OMS".into(),
+        code,
+        portfolio_id: portfolio,
+        owner_principal_id: owner,
+        ..Default::default()
+    }
+}
