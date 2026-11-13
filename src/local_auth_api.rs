@@ -1118,6 +1118,42 @@ mod tests {
         assert_eq!(b, serde_json::json!({ "local": true, "sso": false, "sso_label": "Sign in with SSO", "legacy_admin": false }));
     }
 
+    fn sso_only_settings() -> crate::config::AuthSettings {
+        let cfg: crate::config::FileConfig =
+            toml::from_str("[auth]\npolicy = \"sso_only\"\n[auth.local]\nenabled = true\n").unwrap();
+        cfg.auth_settings()
+    }
+
+    /// `policy = "sso_only"` wins over `[auth.local].enabled = true`: the
+    /// local login and enrol routes are not mounted.
+    #[tokio::test]
+    async fn sso_only_refuses_local_login_and_enrol() {
+        use tower::Service;
+        let s = sso_only_settings();
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let mut svc = routes(LocalAuth::new(Some(key()), s.local_enabled, true)).with_state(app(pool));
+        for uri in ["/auth/local/login", "/auth/local/enroll"] {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("origin", ORIGIN)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"email":"a@b.c","password":"x","token":"t"}"#))
+                .unwrap();
+            let resp = svc.call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn methods_reports_no_local_under_sso_only() {
+        let s = sso_only_settings();
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let (_, b) = methods_body(pool, s.local_enabled, true).await;
+        assert_eq!(b["local"], false);
+        assert_eq!(b["sso"], true);
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
     async fn methods_reports_legacy_admin_setting() {

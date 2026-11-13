@@ -885,7 +885,12 @@ async fn main() {
                 AuthCmd::RecoverAdmin { email, db } => admin_bootstrap::cli_recover(db.into(), &email).await,
             };
             match result {
-                Ok(link) => println!("One-time enrolment link (valid 7 days):\n\n    {link}\n"),
+                Ok(link) => {
+                    println!("One-time enrolment link (valid 7 days):\n\n    {link}\n");
+                    if let Some(note) = admin_bootstrap::cli_link_note_for_config() {
+                        println!("{note}\n");
+                    }
+                }
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);

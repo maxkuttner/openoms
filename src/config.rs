@@ -196,8 +196,8 @@ pub struct SessionSection {
 #[derive(Debug)]
 pub struct AuthSettings {
     pub public_base_url: Option<String>,
-    #[allow(dead_code)] // used by Task 4 (local login policy)
     pub policy: AuthPolicy,
+    /// Effective: `[auth.local].enabled` and not `policy = "sso_only"`.
     pub local_enabled: bool,
     pub ttl: crate::sessions::SessionTtl,
 }
@@ -476,7 +476,7 @@ impl FileConfig {
         AuthSettings {
             public_base_url: a.public_base_url.clone().or_else(|| a.oidc.public_base_url.clone()),
             policy: a.policy,
-            local_enabled: a.local.enabled,
+            local_enabled: a.local.enabled && a.policy != AuthPolicy::SsoOnly,
             ttl: crate::sessions::SessionTtl {
                 idle: chrono::Duration::minutes(
                     a.session.idle_ttl_minutes.or(a.oidc.idle_ttl_minutes).unwrap_or(30),

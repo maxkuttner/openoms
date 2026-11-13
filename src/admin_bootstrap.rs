@@ -439,6 +439,24 @@ fn cli_link_base() -> Result<String, String> {
     link_base(file.and_then(|f| f.auth_settings().public_base_url), &bind)
 }
 
+/// What the operator must know before using a host-CLI enrolment link. The
+/// link is local-only (password + TOTP); under `policy = "sso_only"` local
+/// sign-in is switched off, so it cannot be redeemed until the policy is
+/// relaxed for the duration of the enrolment.
+pub fn cli_link_note(policy: crate::config::AuthPolicy) -> Option<&'static str> {
+    (policy == crate::config::AuthPolicy::SsoOnly).then_some(
+        "note: [auth].policy is \"sso_only\", so local sign-in is off and this link cannot be\n\
+         redeemed as is. Set policy = \"local_and_sso\" in oms.toml and restart, enrol with the\n\
+         link (password + TOTP), then set\n\
+         policy = \"sso_only\" back and restart.",
+    )
+}
+
+/// The note for the `oms.toml` in effect, if any.
+pub fn cli_link_note_for_config() -> Option<&'static str> {
+    crate::config::load().and_then(|f| cli_link_note(f.auth_settings().policy))
+}
+
 /// `oms auth bootstrap-admin`. Returns the enrolment link.
 pub async fn cli_bootstrap(
     o: crate::setup::database::config::PostgresOverrides,
@@ -515,6 +533,13 @@ mod tests {
         let text = resp.text().await.unwrap();
         server.abort();
         (status, text)
+    }
+
+    #[test]
+    fn cli_link_note_only_under_sso_only() {
+        use crate::config::AuthPolicy;
+        assert!(cli_link_note(AuthPolicy::LocalAndSso).is_none());
+        assert!(cli_link_note(AuthPolicy::SsoOnly).unwrap().contains("local_and_sso"));
     }
 
     fn hdrs(cookie: Option<&str>) -> HeaderMap {
