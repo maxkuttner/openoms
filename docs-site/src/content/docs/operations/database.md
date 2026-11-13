@@ -31,7 +31,7 @@ oms database status
 server:   localhost:5432
 database: ods (present)
 role:     oms
-migrations: 53 applied, 0 pending
+migrations: 54 applied, 0 pending
 ```
 
 ## What's in it
