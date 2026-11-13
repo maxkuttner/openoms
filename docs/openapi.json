@@ -2852,62 +2852,6 @@
         ]
       }
     },
-    "/auth/callback": {
-      "get": {
-        "tags": [
-          "auth"
-        ],
-        "summary": "Completes a login: validates the callback, exchanges the code, resolves",
-        "description": "the identity (claiming the flow's invite if it is unknown), and mints a\nsession. A login that resolves to no user is redirected to the access\npage with the reason; nothing is created for it.\n\nEvery failure path returns before `create_session` is ever called: a\nprovider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure or the claim gate end in an `ApiError`; a\n`ClaimOutcome` refusal ends in the access-page redirect.",
-        "operationId": "callback",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          },
-          {
-            "name": "state",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          },
-          {
-            "name": "error",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          }
-        ],
-        "responses": {
-          "302": {
-            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=...)"
-          },
-          "400": {
-            "description": "Malformed callback, or a missing/expired/mismatched login flow"
-          },
-          "401": {
-            "description": "The provider rejected the login, or the exchanged token failed verification"
-          },
-          "403": {
-            "description": "The claim gate rejected the identity"
-          },
-          "502": {
-            "description": "The identity provider was unreachable"
-          }
-        }
-      }
-    },
     "/auth/invite/{token}": {
       "get": {
         "tags": [
@@ -2924,32 +2868,6 @@
             "required": true,
             "schema": {
               "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "302": {
-            "description": "Redirects to the identity provider's authorization endpoint"
-          }
-        }
-      }
-    },
-    "/auth/login": {
-      "get": {
-        "tags": [
-          "auth"
-        ],
-        "summary": "Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in",
-        "description": "the flow cookie, and sends the browser to the provider. Cannot fail —\nthere is no user input yet and no network call, only local randomness —\nso this returns a bare `Response`, not a `Result`.",
-        "operationId": "login",
-        "parameters": [
-          {
-            "name": "return_to",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
             }
           }
         ],
@@ -3006,6 +2924,88 @@
             "bearer_token": []
           }
         ]
+      }
+    },
+    "/auth/oidc/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Completes a login: validates the callback, exchanges the code, resolves",
+        "description": "the identity (claiming the flow's invite if it is unknown), and mints a\nsession. A login that resolves to no user is redirected to the access\npage with the reason; nothing is created for it.\n\nEvery failure path returns before `create_session` is ever called: a\nprovider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure or the claim gate end in an `ApiError`; a\n`ClaimOutcome` refusal ends in the access-page redirect.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "state",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "error",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=...)"
+          },
+          "400": {
+            "description": "Malformed callback, or a missing/expired/mismatched login flow"
+          },
+          "401": {
+            "description": "The provider rejected the login, or the exchanged token failed verification"
+          },
+          "403": {
+            "description": "The claim gate rejected the identity"
+          },
+          "502": {
+            "description": "The identity provider was unreachable"
+          }
+        }
+      }
+    },
+    "/auth/oidc/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in",
+        "description": "the flow cookie, and sends the browser to the provider. Cannot fail —\nthere is no user input yet and no network call, only local randomness —\nso this returns a bare `Response`, not a `Result`.",
+        "operationId": "login",
+        "parameters": [
+          {
+            "name": "return_to",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirects to the identity provider's authorization endpoint"
+          }
+        }
       }
     },
     "/health": {

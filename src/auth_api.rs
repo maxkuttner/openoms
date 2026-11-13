@@ -187,7 +187,7 @@ pub struct LoginParams {
 /// there is no user input yet and no network call, only local randomness —
 /// so this returns a bare `Response`, not a `Result`.
 #[utoipa::path(
-    get, path = "/auth/login", tag = "auth",
+    get, path = "/auth/oidc/login", tag = "auth",
     params(LoginParams),
     responses(
         (status = 302, description = "Redirects to the identity provider's authorization endpoint"),
@@ -340,7 +340,7 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
 /// exchange/token failure or the claim gate end in an `ApiError`; a
 /// `ClaimOutcome` refusal ends in the access-page redirect.
 #[utoipa::path(
-    get, path = "/auth/callback", tag = "auth",
+    get, path = "/auth/oidc/callback", tag = "auth",
     params(CallbackParams),
     responses(
         (status = 302, description = "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=...)"),

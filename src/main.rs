@@ -831,7 +831,12 @@ async fn main() {
 /// Assembles the full application router exactly as `serve` mounts it.
 /// Extracted so a test can build it: axum panics at build time on an
 /// overlapping (method, path) registration, which only boots would catch.
-fn build_app(state: AppState, auth_api_state: Option<auth_api::AuthApiState>, oidc_configured: bool) -> Router {
+fn build_app(
+    state: AppState,
+    auth_api_state: Option<auth_api::AuthApiState>,
+    local_enabled: bool,
+    oidc_configured: bool,
+) -> Router {
     // Register routes
 
     // 1) Register order routes
@@ -1026,38 +1031,32 @@ fn build_app(state: AppState, auth_api_state: Option<auth_api::AuthApiState>, oi
     // absent or merely not yet working.
     if let Some(auth_state) = auth_api_state {
         let auth_router = Router::new()
-            .route("/auth/login", get(auth_api::login))
+            .route("/auth/oidc/login", get(auth_api::login))
             .route("/auth/invite/:token", get(auth_api::invite))
+            .route("/auth/oidc/callback", get(auth_api::callback))
+            // Aliases: the registered IdP redirect URIs and the trade app
+            // still use the pre-rename paths.
+            .route("/auth/login", get(auth_api::login))
             .route("/auth/callback", get(auth_api::callback))
-            .route("/auth/logout", post(auth_api::logout))
             .layer(Extension(auth_state));
         app = app.merge(auth_router);
     }
 
-    // `/auth/me` is the one `/auth/*` route that requires authentication, so
-    // it carries `auth_middleware` rather than riding on the unauthenticated
-    // router above — but it is still an `/auth/*` route, and the spec's
-    // off-by-default promise is that with no `[auth.oidc]` block the whole
-    // prefix 404s and nothing else changes. Mounted unconditionally it broke
-    // that promise for every install that never enabled login.
+    // Session routes. A session can be minted by local login or by OIDC, so
+    // these are mounted whenever either is enabled — and, for OIDC, whenever
+    // it is merely *configured*: discovery failing (IdP down, secret unset)
+    // must not take `/auth/me`, `/auth/logout` or `/trade/` away from
+    // sessions that already exist. With neither enabled, the whole `/auth/*`
+    // and `/trade/*` surface 404s.
     //
-    // Gated on the config block, not on `auth_api_state`: discovery failing
-    // (IdP down, secret unset) must not take `/auth/me` away from sessions
-    // that already exist. The IdP is a dependency of login, not of every
-    // request — see the spec's "Token handling".
-    //
-    // `/trade/*` rides the same gate, for the same reason: the trade app
-    // authenticates by session cookie and nothing else, and a session can
-    // only ever be minted by the OIDC callback. With no `[auth.oidc]` block
-    // configured, `/trade/` would be a screen nobody could ever log into, so
-    // it stays off unless OIDC is at least configured — and, like `/auth/me`,
-    // it must not disappear out from under an already-signed-in trader just
-    // because discovery is transiently failing on this restart.
-    if oidc_configured {
+    // `/auth/me` requires authentication, so it carries `auth_middleware`;
+    // `/auth/logout` reads the session cookie itself and is idempotent.
+    if local_enabled || oidc_configured {
         let me_router = Router::new()
             .route("/auth/me", get(auth_api::me))
             .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
-        app = app.merge(me_router).merge(cockpit::trade_router());
+        let logout_router = Router::new().route("/auth/logout", post(auth_api::logout));
+        app = app.merge(me_router).merge(logout_router).merge(cockpit::trade_router());
     }
 
     app
@@ -1381,11 +1380,23 @@ async fn serve() {
     // function's doc comment for why a missing base URL still fails closed
     // there rather than assuming this.
     let oidc_settings = file_cfg.and_then(|f| f.oidc());
-    let public_base_url = oidc_settings.as_ref().map(|o| o.public_base_url.clone());
+    if let Some(f) = file_cfg {
+        f.warn_deprecated_auth();
+    }
+    // Built from `[auth]`/`[auth.session]` whether or not OIDC is configured:
+    // local login mints sessions too.
+    let (auth_settings, local_enabled) = match file_cfg {
+        Some(f) => {
+            let a = f.auth_settings();
+            let local = a.local_enabled;
+            (a, local)
+        }
+        None => (config::FileConfig::default().auth_settings(), true),
+    };
     let session_config = sessions::SessionConfig {
-        cookie_policy: sessions::cookie_policy(&bind_addr, public_base_url.as_deref()),
-        ttl: oidc_settings.as_ref().map(|o| o.ttl.clone()).unwrap_or_default(),
-        public_base_url,
+        cookie_policy: sessions::cookie_policy(&bind_addr, auth_settings.public_base_url.as_deref()),
+        ttl: auth_settings.ttl,
+        public_base_url: auth_settings.public_base_url,
     };
 
     let state = AppState::new(
@@ -1644,7 +1655,7 @@ async fn serve() {
         };
     state.set_oidc_status(oidc_status);
 
-    let app = build_app(state, auth_api_state, oidc_settings.is_some());
+    let app = build_app(state, auth_api_state, local_enabled, oidc_settings.is_some());
 
     // Start TCP listener
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
@@ -1667,8 +1678,11 @@ mod tests {
     async fn the_full_router_builds() {
         let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
         let state = crate::handlers::tests::test_app_state(pool);
-        let _ = crate::build_app(state.clone(), None, false);
-        let _ = crate::build_app(state, None, true);
+        // (local only), (OIDC configured, discovery failed), (both, discovered).
+        let _ = crate::build_app(state.clone(), None, true, false);
+        let _ = crate::build_app(state.clone(), None, false, true);
+        let _ = crate::build_app(state.clone(), None, true, true);
+        let _ = crate::build_app(state, None, false, false);
     }
 
 

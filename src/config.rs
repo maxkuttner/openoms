@@ -141,8 +141,64 @@ pub struct ServerSection {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthSection {
+    /// The browser-facing origin of this server (CSRF origin check, cookie
+    /// scheme, OIDC redirect URI). `[auth.oidc].public_base_url` is the
+    /// deprecated fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub policy: AuthPolicy,
+    #[serde(default)]
+    pub local: LocalSection,
+    #[serde(default)]
+    pub session: SessionSection,
     #[serde(default)]
     pub oidc: OidcSection,
+}
+
+/// Which sign-in methods are allowed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPolicy {
+    #[default]
+    LocalAndSso,
+    SsoOnly,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for LocalSection {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_minutes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absolute_ttl_hours: Option<i64>,
+}
+
+/// Resolved `[auth]` / `[auth.session]` settings, independent of whether OIDC
+/// is configured. Local login and the session routes depend on these alone.
+#[derive(Debug)]
+pub struct AuthSettings {
+    pub public_base_url: Option<String>,
+    pub policy: AuthPolicy,
+    pub local_enabled: bool,
+    pub ttl: crate::sessions::SessionTtl,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -160,10 +216,18 @@ pub struct OidcSection {
     pub required_claim: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_claim_value: Option<String>,
+    /// Deprecated: use `[auth.session].idle_ttl_minutes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_ttl_minutes: Option<i64>,
+    /// Deprecated: use `[auth.session].absolute_ttl_hours`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub absolute_ttl_hours: Option<i64>,
+    /// Accept an `email_verified` claim as proof of the email (default true).
+    #[serde(default = "default_true")]
+    pub trust_email_verified: bool,
+    /// Authentication methods references (`amr`) the ID token must carry.
+    #[serde(default)]
+    pub require_amr: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -174,6 +238,8 @@ pub struct OidcSettings {
     pub scopes: Vec<String>,
     pub required_claim: Option<(String, String)>,
     pub ttl: crate::sessions::SessionTtl,
+    pub trust_email_verified: bool,
+    pub require_amr: Vec<String>,
 }
 
 // Hand-written so a stray `{:?}` — in a log line, a panic message, an
@@ -377,8 +443,8 @@ impl FileConfig {
     /// clearer signal than a redirect into a broken exchange.
     pub fn oidc(&self) -> Option<OidcSettings> {
         let s = &self.auth.oidc;
-        let (issuer, client_id, public_base_url) =
-            (s.issuer.clone()?, s.client_id.clone()?, s.public_base_url.clone()?);
+        let (issuer, client_id) = (s.issuer.clone()?, s.client_id.clone()?);
+        let public_base_url = self.auth_settings().public_base_url?;
 
         Some(OidcSettings {
             issuer,
@@ -391,11 +457,41 @@ impl FileConfig {
                 .required_claim
                 .clone()
                 .zip(s.required_claim_value.clone()),
-            ttl: crate::sessions::SessionTtl {
-                idle: chrono::Duration::minutes(s.idle_ttl_minutes.unwrap_or(30)),
-                absolute: chrono::Duration::hours(s.absolute_ttl_hours.unwrap_or(12)),
-            },
+            ttl: self.auth_settings().ttl,
+            trust_email_verified: s.trust_email_verified,
+            require_amr: s.require_amr.clone(),
         })
+    }
+
+    /// The `[auth]` settings every sign-in method shares. Deprecated
+    /// `[auth.oidc]` spellings (`public_base_url`, the TTLs) are still read as
+    /// fallbacks; `warn_deprecated_auth` reports them once at boot.
+    pub fn auth_settings(&self) -> AuthSettings {
+        let a = &self.auth;
+        AuthSettings {
+            public_base_url: a.public_base_url.clone().or_else(|| a.oidc.public_base_url.clone()),
+            policy: a.policy,
+            local_enabled: a.local.enabled,
+            ttl: crate::sessions::SessionTtl {
+                idle: chrono::Duration::minutes(
+                    a.session.idle_ttl_minutes.or(a.oidc.idle_ttl_minutes).unwrap_or(30),
+                ),
+                absolute: chrono::Duration::hours(
+                    a.session.absolute_ttl_hours.or(a.oidc.absolute_ttl_hours).unwrap_or(12),
+                ),
+            },
+        }
+    }
+
+    /// Logs a warning for each deprecated `[auth.oidc]` key still in use.
+    pub fn warn_deprecated_auth(&self) {
+        let o = &self.auth.oidc;
+        if o.public_base_url.is_some() {
+            tracing::warn!("[auth.oidc].public_base_url is deprecated; move it to [auth].public_base_url");
+        }
+        if o.idle_ttl_minutes.is_some() || o.absolute_ttl_hours.is_some() {
+            tracing::warn!("[auth.oidc] idle_ttl_minutes/absolute_ttl_hours are deprecated; use [auth.session]");
+        }
     }
 }
 
@@ -760,6 +856,95 @@ admin_password = "admin-pw"
         let cfg: FileConfig = toml::from_str("[server]\nbind_addr = \"localhost:3001\"\n").unwrap();
 
         assert!(cfg.oidc().is_none(), "absent configuration must not half-enable login");
+    }
+
+    #[test]
+    fn auth_section_parses_with_defaults() {
+        let cfg: FileConfig = toml::from_str("[server]\nbind_addr = \"localhost:3001\"\n").unwrap();
+        let a = cfg.auth_settings();
+        assert_eq!(a.policy, AuthPolicy::LocalAndSso);
+        assert!(a.local_enabled);
+        assert!(a.public_base_url.is_none());
+        assert_eq!(a.ttl.idle, chrono::Duration::minutes(30));
+        assert_eq!(a.ttl.absolute, chrono::Duration::hours(12));
+
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth]
+            public_base_url = "https://oms.example.com"
+            policy = "sso_only"
+            [auth.local]
+            enabled = false
+            [auth.session]
+            idle_ttl_minutes = 5
+            absolute_ttl_hours = 2
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            trust_email_verified = false
+            require_amr = ["mfa"]
+            "#,
+        )
+        .unwrap();
+        let a = cfg.auth_settings();
+        assert_eq!(a.policy, AuthPolicy::SsoOnly);
+        assert!(!a.local_enabled);
+        assert_eq!(a.public_base_url.as_deref(), Some("https://oms.example.com"));
+        assert_eq!(a.ttl.idle, chrono::Duration::minutes(5));
+        assert_eq!(a.ttl.absolute, chrono::Duration::hours(2));
+        let o = cfg.oidc().expect("[auth].public_base_url completes the block");
+        assert_eq!(o.public_base_url, "https://oms.example.com");
+        assert!(!o.trust_email_verified);
+        assert_eq!(o.require_amr, vec!["mfa"]);
+
+        let d: FileConfig = toml::from_str(
+            "[auth.oidc]\nissuer = \"https://i\"\nclient_id = \"oms\"\npublic_base_url = \"https://x\"\n",
+        )
+        .unwrap();
+        let o = d.oidc().unwrap();
+        assert!(o.trust_email_verified);
+        assert!(o.require_amr.is_empty());
+    }
+
+    #[test]
+    fn legacy_oidc_public_base_url_still_used() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://legacy.example.com"
+            idle_ttl_minutes = 7
+            "#,
+        )
+        .unwrap();
+        let a = cfg.auth_settings();
+        assert_eq!(a.public_base_url.as_deref(), Some("https://legacy.example.com"));
+        assert_eq!(a.ttl.idle, chrono::Duration::minutes(7));
+        assert_eq!(cfg.oidc().unwrap().public_base_url, "https://legacy.example.com");
+
+        // The new location wins when both are present.
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth]
+            public_base_url = "https://new.example.com"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://legacy.example.com"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.auth_settings().public_base_url.as_deref(), Some("https://new.example.com"));
+    }
+
+    #[test]
+    fn old_oms_toml_with_server_admin_password_still_parses() {
+        let cfg: FileConfig = toml::from_str(
+            "[server]\nbind_addr = \"localhost:3001\"\nadmin_password = \"x\"\n",
+        )
+        .unwrap();
+        assert!(cfg.auth_settings().local_enabled);
     }
 
     #[test]

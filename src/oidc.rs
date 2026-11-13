@@ -346,6 +346,8 @@ impl Provider {
                 scopes: vec!["openid".to_string()],
                 required_claim: None,
                 ttl: crate::sessions::SessionTtl::default(),
+                trust_email_verified: true,
+                require_amr: Vec::new(),
             },
             client_secret: "test-secret".to_string(),
             authorization_endpoint: format!("{issuer}/authorize"),
