@@ -45,37 +45,11 @@ pub async fn authenticate(
     headers: &axum::http::HeaderMap,
     session_config: &SessionConfig,
 ) -> Result<Option<(AuthContext, CredentialKind)>, Response> {
-    let policy = &session_config.cookie_policy;
-    if let Some(value) =
-        crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy))
-    {
-        let hash = crate::sessions::hash_session_token(&value);
-        if let Some(record) = crate::sessions::lookup_session(pool, &hash)
-            .await
-            .map_err(|_| service_unavailable())?
-        {
-            let now = chrono::Utc::now();
-            if crate::sessions::is_expired(
-                now,
-                record.last_seen_at,
-                record.absolute_expires_at,
-                &session_config.ttl,
-            ) {
-                return Ok(None);
-            }
-            if crate::sessions::needs_touch(now, record.last_seen_at) {
-                crate::sessions::touch_session(pool, record.id)
-                    .await
-                    .map_err(|_| service_unavailable())?;
-            }
-            return Ok(Some((
-                AuthContext {
-                    principal_id: record.principal_id,
-                    principal_code: record.principal_code,
-                },
-                CredentialKind::Session,
-            )));
-        }
+    if let Some(record) = authenticate_session(pool, headers, session_config).await? {
+        return Ok(Some((
+            AuthContext { principal_id: record.principal_id, principal_code: record.principal_code },
+            CredentialKind::Session,
+        )));
     }
 
     let Ok((key_id, secret)) = extract_trading_credentials(headers) else {
@@ -84,6 +58,33 @@ pub async fn authenticate(
     Ok(verify_key(pool, &key_id, &secret).await?.map(|(principal_id, principal_code)| {
         (AuthContext { principal_id, principal_code }, CredentialKind::ApiKey)
     }))
+}
+
+/// The session half of `authenticate`: the live session record behind the
+/// request's cookie (ACTIVE HUMAN principal, not revoked, within its TTLs), or
+/// `None`. Exposed whole so `admin_middleware` can see how the session was
+/// established and whether it passed MFA.
+pub async fn authenticate_session(
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    session_config: &SessionConfig,
+) -> Result<Option<crate::sessions::SessionRecord>, Response> {
+    let policy = &session_config.cookie_policy;
+    let Some(value) = crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy)) else {
+        return Ok(None);
+    };
+    let hash = crate::sessions::hash_session_token(&value);
+    let Some(record) = crate::sessions::lookup_session(pool, &hash).await.map_err(|_| service_unavailable())? else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now();
+    if crate::sessions::is_expired(now, record.last_seen_at, record.absolute_expires_at, &session_config.ttl) {
+        return Ok(None);
+    }
+    if crate::sessions::needs_touch(now, record.last_seen_at) {
+        crate::sessions::touch_session(pool, record.id).await.map_err(|_| service_unavailable())?;
+    }
+    Ok(Some(record))
 }
 
 /// Authenticate a trading request and inject `AuthContext`.
@@ -193,21 +194,60 @@ pub async fn verify_key(
     Ok(valid.then_some((principal_id, principal_code)))
 }
 
+/// Guard for `/admin/*`.
+///
+/// The normal door is a session (cookie) of an ACTIVE principal holding a
+/// `principal_admin` row. A state-changing request on it must pass the CSRF
+/// origin check, and a local-password session must also have passed TOTP.
+/// API keys never open `/admin/*`.
+///
+/// The legacy door: while `system_setting.legacy_admin_enabled` is true, the
+/// deprecated shared password is also accepted as `Bearer <password>`. It
+/// acts as the synthetic `legacy-admin`, which may read any admin route and
+/// create a named admin (`POST /admin/users/bootstrap-admin`), nothing else.
+/// Its `principal_id` is the nil UUID, which never exists in `principal`, so
+/// it can never satisfy a trading or authz check.
 pub async fn admin_middleware(
     State(state): State<AppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    if !state.admin_auth_enabled {
+    let pool = state.pool();
+    if let Some(session) = authenticate_session(pool, req.headers(), &state.session_config).await? {
+        enforce_origin_for_session(CredentialKind::Session, req.headers(), req.method(), &state.session_config)?;
+        let is_admin = crate::admin_bootstrap::is_active_admin(pool, session.principal_id)
+            .await
+            .map_err(|_| service_unavailable())?;
+        if !is_admin {
+            return Err(forbidden_because("admin access required"));
+        }
+        let mutation = !crate::sessions::is_read_method(req.method());
+        if mutation
+            && session.auth_method == crate::sessions::AuthMethod::Local
+            && session.mfa_verified_at.is_none()
+        {
+            return Err(forbidden_because("mfa_required"));
+        }
+        req.extensions_mut()
+            .insert(AuthContext { principal_id: session.principal_id, principal_code: session.principal_code });
         return Ok(next.run(req).await);
     }
 
-    let token = extract_bearer_token(req.headers()).map_err(|_| forbidden())?;
-
-    if !constant_time_eq(token.as_bytes(), state.admin_token.as_bytes()) {
-        return Err(forbidden());
+    let token = extract_bearer_token(req.headers()).map_err(|_| unauthorized())?;
+    let Some(password) = state.legacy_admin_password.as_deref() else {
+        return Err(unauthorized());
+    };
+    if !constant_time_eq(token.as_bytes(), password.as_bytes()) {
+        return Err(unauthorized());
     }
-
+    let enabled = crate::admin_bootstrap::legacy_admin_enabled(pool).await.map_err(|_| service_unavailable())?;
+    if !enabled {
+        return Err(forbidden_because("the shared admin password is disabled; sign in as a named admin"));
+    }
+    if !crate::admin_bootstrap::legacy_may(req.method(), req.uri().path()) {
+        return Err(forbidden_because("create a named admin first"));
+    }
+    req.extensions_mut().insert(crate::admin_bootstrap::legacy_context());
     Ok(next.run(req).await)
 }
 
@@ -274,6 +314,13 @@ fn forbidden() -> Response {
     Response::builder()
         .status(StatusCode::FORBIDDEN)
         .body("forbidden".into())
+        .unwrap()
+}
+
+fn forbidden_because(reason: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(reason.into())
         .unwrap()
 }
 

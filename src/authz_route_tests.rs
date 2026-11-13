@@ -83,7 +83,7 @@ async fn portfolio_of(pool: &PgPool, order_id: Uuid) -> Uuid {
 /// A portfolio whose default account routes to a broker no adapter serves, and
 /// an instrument tradeable there: a permitted submit stores the order and then
 /// fails routing with 503.
-async fn tradeable_portfolio(pool: &PgPool) -> (Uuid, i64) {
+pub(crate) async fn tradeable_portfolio(pool: &PgPool) -> (Uuid, i64) {
     let s = Uuid::new_v4().simple().to_string();
     let instrument = seed_instrument(pool, "AUTHZSUB").await;
     let broker = format!("AUTHZ{s}");
@@ -339,7 +339,7 @@ async fn idor_positions_outside_scope_is_403() {
     assert_eq!(r.err().map(|e| e.status), Some(StatusCode::FORBIDDEN));
 }
 
-async fn submit(
+pub(crate) async fn submit(
     pool: &PgPool,
     auth: &AuthContext,
     portfolio: Uuid,

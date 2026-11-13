@@ -3,6 +3,7 @@
 //! keep their own admin surface. Every mutation writes an `audit_event`.
 
 use axum::extract::{Path, State};
+use axum::Extension;
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -12,6 +13,7 @@ use uuid::Uuid;
 
 use crate::admin::{ApiKeyRecord, CreateKey};
 use crate::app_state::AppState;
+use crate::auth::AuthContext;
 use crate::handlers::ApiError;
 use crate::invites::{self, InviteError, NewInvite};
 
@@ -78,10 +80,6 @@ pub struct SetRole {
     pub role: String,
 }
 
-/// Actor recorded on audit rows: these routes sit behind the admin token, which
-/// identifies no individual.
-const ACTOR: &str = "admin";
-
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
     ApiError { status, message: message.into() }
 }
@@ -141,12 +139,13 @@ fn issuer_host(issuer: &str) -> String {
 
 async fn audit(
     tx: &mut Transaction<'_, Postgres>,
+    actor: &AuthContext,
     action: &str,
     target: Uuid,
     detail: serde_json::Value,
 ) -> Result<(), ApiError> {
     sqlx::query("INSERT INTO audit_event (actor, action, target_principal_id, detail) VALUES ($1, $2, $3, $4)")
-        .bind(ACTOR)
+        .bind(&actor.principal_code)
         .bind(action)
         .bind(target)
         .bind(detail)
@@ -232,6 +231,7 @@ pub async fn list_users(State(state): State<AppState>) -> Result<Json<Vec<UserRo
 
 pub async fn create_key_only_user(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Json(p): Json<CreateKeyOnlyUser>,
 ) -> Result<Json<UserRow>, ApiError> {
     require_role(&p.role)?;
@@ -263,7 +263,7 @@ pub async fn create_key_only_user(
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-    audit(&mut tx, "user.created", id, serde_json::json!({ "code": code, "role": p.role, "key_only": true })).await?;
+    audit(&mut tx, &ctx, "user.created", id, serde_json::json!({ "code": code, "role": p.role, "key_only": true })).await?;
     tx.commit().await.map_err(db)?;
     let user = fetch_users(state.pool(), Some(id)).await?.pop();
     user.map(Json).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "user not found"))
@@ -271,6 +271,7 @@ pub async fn create_key_only_user(
 
 pub async fn invite_user(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Json(p): Json<InviteRequest>,
 ) -> Result<Json<InviteResponse>, ApiError> {
     let base = public_base_url(&state)?;
@@ -287,36 +288,39 @@ pub async fn invite_user(
         return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown or repeated portfolio"));
     }
     let grants: Vec<(Uuid, bool)> = p.portfolios.iter().map(|g| (g.portfolio_id, g.can_trade)).collect();
-    let invite = invites::create(state.pool(), &p.email, &p.role, &grants, ACTOR).await.map_err(invite_error)?;
+    let invite = invites::create(state.pool(), &p.email, &p.role, &grants, &ctx.principal_code).await.map_err(invite_error)?;
     Ok(Json(invite_response(base, invite)))
 }
 
-pub async fn revoke_invite(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
-    invites::revoke(state.pool(), id, ACTOR).await.map_err(invite_error)?;
+pub async fn revoke_invite(State(state): State<AppState>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+    invites::revoke(state.pool(), id, &ctx.principal_code).await.map_err(invite_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn reissue_invite(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<InviteResponse>, ApiError> {
     let base = public_base_url(&state)?;
-    let invite = invites::reissue(state.pool(), id, ACTOR).await.map_err(invite_error)?;
+    let invite = invites::reissue(state.pool(), id, &ctx.principal_code).await.map_err(invite_error)?;
     Ok(Json(invite_response(base, invite)))
 }
 
 /// A link for an active user to add a second sign-in provider.
 pub async fn link_invite(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<InviteResponse>, ApiError> {
     let base = public_base_url(&state)?;
-    let invite = invites::create_link(state.pool(), id, ACTOR).await.map_err(invite_error)?;
+    let invite = invites::create_link(state.pool(), id, &ctx.principal_code).await.map_err(invite_error)?;
     Ok(Json(invite_response(base, invite)))
 }
 
 pub async fn set_role(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
     Json(p): Json<SetRole>,
 ) -> Result<StatusCode, ApiError> {
@@ -337,7 +341,7 @@ pub async fn set_role(
     .execute(&mut *tx)
     .await
     .map_err(db)?;
-    audit(&mut tx, "user.role_changed", id, serde_json::json!({ "from": from, "to": p.role })).await?;
+    audit(&mut tx, &ctx, "user.role_changed", id, serde_json::json!({ "from": from, "to": p.role })).await?;
     tx.commit().await.map_err(db)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -345,6 +349,7 @@ pub async fn set_role(
 /// Replace the user's portfolio access with exactly `grants`.
 pub async fn set_portfolios(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
     Json(grants): Json<Vec<PortfolioAccess>>,
 ) -> Result<StatusCode, ApiError> {
@@ -381,18 +386,19 @@ pub async fn set_portfolios(
             }
         })?;
     }
-    audit(&mut tx, "user.portfolios_changed", id, serde_json::json!({ "portfolios": grants })).await?;
+    audit(&mut tx, &ctx, "user.portfolios_changed", id, serde_json::json!({ "portfolios": grants })).await?;
     tx.commit().await.map_err(db)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Cut a user off now: no sign-in, no session, no API key, no pending invite.
 /// Keys are kept but stop verifying while the user is not ACTIVE.
-pub async fn disable_user(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+pub async fn disable_user(State(state): State<AppState>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool().begin().await.map_err(db)?;
     if lock_human(&mut tx, id).await? == "DISABLED" {
         return Ok(StatusCode::NO_CONTENT);
     }
+    refuse_removing_last_admin(&mut tx, id).await?;
     sqlx::query("UPDATE principal SET status = 'DISABLED', updated_at = now() WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -412,14 +418,100 @@ pub async fn disable_user(State(state): State<AppState>, Path(id): Path<Uuid>) -
     .execute(&mut *tx)
     .await
     .map_err(db)?;
-    audit(&mut tx, "user.disabled", id, serde_json::json!({ "sessions_revoked": sessions })).await?;
+    audit(&mut tx, &ctx, "user.disabled", id, serde_json::json!({ "sessions_revoked": sessions })).await?;
     tx.commit().await.map_err(db)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 409 when `id` is an admin and no other ACTIVE admin would remain. Takes
+/// the admin lock, so it holds until the caller's transaction ends.
+async fn refuse_removing_last_admin(tx: &mut Transaction<'_, Postgres>, id: Uuid) -> Result<(), ApiError> {
+    crate::admin_bootstrap::lock_admins(tx).await.map_err(db)?;
+    let is_admin: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_admin WHERE principal_id = $1)")
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db)?;
+    if is_admin && crate::admin_bootstrap::other_active_admins(tx, id).await.map_err(db)? == 0 {
+        return Err(api_error(StatusCode::CONFLICT, "this is the last active admin"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetAdmin {
+    pub admin: bool,
+}
+
+/// `PUT /admin/users/:id/admin`: grant or remove the admin capability. It is
+/// separate from the role: it neither needs one nor gives trading powers.
+/// Removing the last ACTIVE admin is refused (409).
+pub async fn set_admin(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(p): Json<SetAdmin>,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = state.pool().begin().await.map_err(db)?;
+    let status = lock_human(&mut tx, id).await?;
+    if p.admin {
+        if status == "DISABLED" {
+            return Err(api_error(StatusCode::CONFLICT, "a disabled user cannot be made admin"));
+        }
+        crate::admin_bootstrap::lock_admins(&mut tx).await.map_err(db)?;
+        let granted = sqlx::query(
+            "INSERT INTO principal_admin (principal_id, granted_by) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(&ctx.principal_code)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if granted == 0 {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        audit(&mut tx, &ctx, "admin.granted", id, serde_json::json!({})).await?;
+    } else {
+        refuse_removing_last_admin(&mut tx, id).await?;
+        let removed = sqlx::query("DELETE FROM principal_admin WHERE principal_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        if removed == 0 {
+            return Ok(StatusCode::NO_CONTENT);
+        }
+        audit(&mut tx, &ctx, "admin.revoked", id, serde_json::json!({})).await?;
+    }
+    tx.commit().await.map_err(db)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /admin/users/bootstrap-admin`: create a named admin (no role, no
+/// portfolios) and return their one-time local enrolment link. The one
+/// mutation the legacy shared password may make.
+pub async fn bootstrap_admin(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(p): Json<crate::admin_bootstrap::BootstrapRequest>,
+) -> Result<Json<crate::admin_bootstrap::BootstrapResponse>, ApiError> {
+    use crate::admin_bootstrap::{bootstrap, enrolment_link, BootstrapError, BootstrapResponse};
+    let base = public_base_url(&state)?;
+    let invite = bootstrap(state.pool(), &p.email, p.display_name.as_deref(), &ctx.principal_code, false)
+        .await
+        .map_err(|e| match e {
+            BootstrapError::Db(e) => db(e),
+            BootstrapError::BadEmail => api_error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
+            other => api_error(StatusCode::CONFLICT, other.to_string()),
+        })?;
+    Ok(Json(BootstrapResponse { user_id: invite.principal_id, link: enrolment_link(base, &invite) }))
+}
+
 /// Re-activate a disabled user who has signed in before or holds an API key.
 /// One who never got in has to be invited again.
-pub async fn enable_user(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+pub async fn enable_user(State(state): State<AppState>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool().begin().await.map_err(db)?;
     match lock_human(&mut tx, id).await?.as_str() {
         "ACTIVE" => return Ok(StatusCode::NO_CONTENT),
@@ -448,7 +540,7 @@ pub async fn enable_user(State(state): State<AppState>, Path(id): Path<Uuid>) ->
                 db(e)
             }
         })?;
-    audit(&mut tx, "user.enabled", id, serde_json::json!({})).await?;
+    audit(&mut tx, &ctx, "user.enabled", id, serde_json::json!({})).await?;
     tx.commit().await.map_err(db)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -479,6 +571,7 @@ pub async fn list_keys(
 /// Mint a key for an ACTIVE user; the secret is in this response only.
 pub async fn create_key(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
     Json(p): Json<CreateKey>,
 ) -> Result<Json<ApiKeyRecord>, ApiError> {
@@ -498,7 +591,7 @@ pub async fn create_key(
     .fetch_one(&mut *tx)
     .await
     .map_err(db)?;
-    audit(&mut tx, "key.created", id, serde_json::json!({ "key_id": material.key_id, "name": p.name })).await?;
+    audit(&mut tx, &ctx, "key.created", id, serde_json::json!({ "key_id": material.key_id, "name": p.name })).await?;
     tx.commit().await.map_err(db)?;
     record.secret = Some(material.plaintext_secret);
     Ok(Json(record))
@@ -506,6 +599,7 @@ pub async fn create_key(
 
 pub async fn revoke_key(
     State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
     Path((id, key_id)): Path<(Uuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool().begin().await.map_err(db)?;
@@ -522,7 +616,7 @@ pub async fn revoke_key(
     if revoked == 0 {
         return Err(api_error(StatusCode::NOT_FOUND, "key not found"));
     }
-    audit(&mut tx, "key.revoked", id, serde_json::json!({ "key_id": key_id })).await?;
+    audit(&mut tx, &ctx, "key.revoked", id, serde_json::json!({ "key_id": key_id })).await?;
     tx.commit().await.map_err(db)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -574,6 +668,12 @@ mod tests {
     use crate::handlers::tests::test_app_state;
     const BASE: &str = "https://oms.example.com";
 
+    /// A named admin acting through these handlers, as `admin_middleware`
+    /// would inject it.
+    fn actor() -> AuthContext {
+        AuthContext { principal_id: Uuid::nil(), principal_code: "ada".to_string() }
+    }
+
     async fn state(pool: &PgPool, base: Option<&str>) -> AppState {
         let mut s = test_app_state(pool.clone());
         s.session_config.public_base_url = base.map(str::to_string);
@@ -622,7 +722,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        let key = create_key(State(st.clone()), Path(id), Json(CreateKey { name: Some("k".into()) }))
+        let key = create_key(State(st.clone()), Extension(actor()), Path(id), Json(CreateKey { name: Some("k".into()) }))
             .await
             .unwrap()
             .0;
@@ -712,7 +812,7 @@ mod tests {
         assert!(crate::sessions::lookup_session(&pool, &hash).await.unwrap().is_some());
         assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_some());
 
-        disable_user(State(st.clone()), Path(id)).await.unwrap();
+        disable_user(State(st.clone()), Extension(actor()), Path(id)).await.unwrap();
 
         assert_eq!(status_of(&pool, id).await, "DISABLED");
         assert!(crate::sessions::lookup_session(&pool, &hash).await.unwrap().is_none());
@@ -727,7 +827,7 @@ mod tests {
         .unwrap();
         assert_eq!(live, 0);
 
-        enable_user(State(st.clone()), Path(id)).await.unwrap();
+        enable_user(State(st.clone()), Extension(actor()), Path(id)).await.unwrap();
         assert_eq!(status_of(&pool, id).await, "ACTIVE");
         assert_eq!(audit_count(&pool, "user.enabled", id).await, 1);
         // Enabling does not resurrect the killed session.
@@ -743,7 +843,7 @@ mod tests {
         let email = format!("inv-{}@fundco.com", Uuid::new_v4().simple());
         let invite = crate::invites::create(&pool, &email, "viewer", &[], "admin").await.unwrap();
 
-        let err = create_key(State(st), Path(invite.principal_id), Json(CreateKey { name: None }))
+        let err = create_key(State(st), Extension(actor()), Path(invite.principal_id), Json(CreateKey { name: None }))
             .await
             .unwrap_err();
         assert_eq!(err.status, StatusCode::CONFLICT);
@@ -763,8 +863,7 @@ mod tests {
         let st = state(&pool, Some("https://oms.example.com/")).await;
         let email = format!("new-{}@fundco.com", Uuid::new_v4().simple());
 
-        let out = invite_user(
-            State(st.clone()),
+        let out = invite_user(State(st.clone()), Extension(actor()),
             Json(InviteRequest {
                 email: email.clone(),
                 role: "trader".into(),
@@ -785,15 +884,13 @@ mod tests {
         assert_eq!(grant_flags(&pool, out.user_id, p).await, (true, true));
 
         // Duplicate email -> 409; bad role -> 422.
-        let dup = invite_user(
-            State(st.clone()),
+        let dup = invite_user(State(st.clone()), Extension(actor()),
             Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![] }),
         )
         .await
         .unwrap_err();
         assert_eq!(dup.status, StatusCode::CONFLICT);
-        let bad = invite_user(
-            State(st.clone()),
+        let bad = invite_user(State(st.clone()), Extension(actor()),
             Json(InviteRequest { email: "x@fundco.com".into(), role: "strategy".into(), portfolios: vec![] }),
         )
         .await
@@ -805,11 +902,11 @@ mod tests {
         let row = users.iter().find(|u| u.email.as_deref() == Some(email.as_str())).unwrap();
         assert_eq!(row.status, "INVITED");
         assert_eq!(row.invite.as_ref().unwrap().invite_id, out.invite_id);
-        let again = reissue_invite(State(st.clone()), Path(out.invite_id)).await.unwrap().0;
+        let again = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id)).await.unwrap().0;
         assert_ne!(again.link, out.link);
-        revoke_invite(State(st.clone()), Path(again.invite_id)).await.unwrap();
+        revoke_invite(State(st.clone()), Extension(actor()), Path(again.invite_id)).await.unwrap();
         assert_eq!(status_of(&pool, row.principal_id).await, "DISABLED");
-        let gone = revoke_invite(State(st.clone()), Path(again.invite_id)).await.unwrap_err();
+        let gone = revoke_invite(State(st.clone()), Extension(actor()), Path(again.invite_id)).await.unwrap_err();
         assert_eq!(gone.status, StatusCode::NOT_FOUND);
     }
 
@@ -819,8 +916,7 @@ mod tests {
         let pool = migrated_db().await;
         let st = state(&pool, None).await;
         let email = format!("nobase-{}@fundco.com", Uuid::new_v4().simple());
-        let err = invite_user(
-            State(st),
+        let err = invite_user(State(st), Extension(actor()),
             Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![] }),
         )
         .await
@@ -841,9 +937,9 @@ mod tests {
         let pool = migrated_db().await;
         let st = state(&pool, Some(BASE)).await;
         let (id, ..) = active_user(&pool, &st).await;
-        let out = link_invite(State(st.clone()), Path(id)).await.unwrap().0;
+        let out = link_invite(State(st.clone()), Extension(actor()), Path(id)).await.unwrap().0;
         assert!(out.link.starts_with("https://oms.example.com/auth/invite/"));
-        let missing = link_invite(State(st), Path(Uuid::new_v4())).await.unwrap_err();
+        let missing = link_invite(State(st), Extension(actor()), Path(Uuid::new_v4())).await.unwrap_err();
         assert_eq!(missing.status, StatusCode::CONFLICT);
     }
 
@@ -868,7 +964,7 @@ mod tests {
         let (id, ..) = active_user(&pool, &st).await;
         let p = portfolio(&pool).await;
         for trade in [true, false, true] {
-            set_portfolios(State(st.clone()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: trade }]))
+            set_portfolios(State(st.clone()), Extension(actor()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: trade }]))
                 .await
                 .unwrap();
             assert_eq!(grant_flags(&pool, id, p).await, (trade, trade));
@@ -883,7 +979,7 @@ mod tests {
         let (id, ..) = active_user(&pool, &st).await;
         let p = portfolio(&pool).await;
 
-        set_role(State(st.clone()), Path(id), Json(SetRole { role: "viewer".into() })).await.unwrap();
+        set_role(State(st.clone()), Extension(actor()), Path(id), Json(SetRole { role: "viewer".into() })).await.unwrap();
         let role: String = sqlx::query_scalar("SELECT role_code FROM principal_role WHERE principal_id = $1")
             .bind(id)
             .fetch_one(&pool)
@@ -900,20 +996,20 @@ mod tests {
         assert_eq!(detail["from"], "trader");
         assert_eq!(detail["to"], "viewer");
 
-        let bad = set_role(State(st.clone()), Path(id), Json(SetRole { role: "strategy".into() }))
+        let bad = set_role(State(st.clone()), Extension(actor()), Path(id), Json(SetRole { role: "strategy".into() }))
             .await
             .unwrap_err();
         assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
-        let none = set_role(State(st.clone()), Path(Uuid::new_v4()), Json(SetRole { role: "pm".into() }))
+        let none = set_role(State(st.clone()), Extension(actor()), Path(Uuid::new_v4()), Json(SetRole { role: "pm".into() }))
             .await
             .unwrap_err();
         assert_eq!(none.status, StatusCode::NOT_FOUND);
 
         // Portfolio access is replaced wholesale and audited.
-        set_portfolios(State(st.clone()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: true }]))
+        set_portfolios(State(st.clone()), Extension(actor()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: true }]))
             .await
             .unwrap();
-        set_portfolios(State(st.clone()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: false }]))
+        set_portfolios(State(st.clone()), Extension(actor()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: false }]))
             .await
             .unwrap();
         let rows = list_users(State(st.clone())).await.unwrap().0;
@@ -921,8 +1017,7 @@ mod tests {
         assert_eq!(me.portfolios.len(), 1);
         assert!(!me.portfolios[0].can_trade);
         assert_eq!(audit_count(&pool, "user.portfolios_changed", id).await, 2);
-        let unknown = set_portfolios(
-            State(st),
+        let unknown = set_portfolios(State(st), Extension(actor()),
             Path(id),
             Json(vec![PortfolioAccess { portfolio_id: Uuid::new_v4(), can_trade: false }]),
         )
@@ -962,7 +1057,7 @@ mod tests {
         assert_eq!(me.role.as_deref(), Some("trader"));
         assert_eq!(me.sign_in.as_deref(), Some("login.example.org"));
         // Strategies are not reachable through the user routes either.
-        let err = disable_user(State(st), Path(sid)).await.unwrap_err();
+        let err = disable_user(State(st), Extension(actor()), Path(sid)).await.unwrap_err();
         assert_eq!(err.status, StatusCode::NOT_FOUND);
         assert_eq!(status_of(&pool, sid).await, "ACTIVE");
     }
@@ -973,8 +1068,7 @@ mod tests {
         let pool = migrated_db().await;
         let st = state(&pool, Some(BASE)).await;
         let code = format!("bot-{}", Uuid::new_v4().simple());
-        let row = create_key_only_user(
-            State(st.clone()),
+        let row = create_key_only_user(State(st.clone()), Extension(actor()),
             Json(CreateKeyOnlyUser { code: code.clone(), display_name: "Bot".into(), role: "trader".into() }),
         )
         .await
@@ -990,7 +1084,7 @@ mod tests {
             .unwrap();
         assert_eq!(identities, 0);
 
-        let key = create_key(State(st.clone()), Path(row.principal_id), Json(CreateKey { name: Some("ci".into()) }))
+        let key = create_key(State(st.clone()), Extension(actor()), Path(row.principal_id), Json(CreateKey { name: Some("ci".into()) }))
             .await
             .unwrap()
             .0;
@@ -1001,24 +1095,124 @@ mod tests {
         assert_eq!((pid, pcode), (row.principal_id, code.clone()));
         assert_eq!(list_keys(State(st.clone()), Path(row.principal_id)).await.unwrap().0.len(), 1);
 
-        revoke_key(State(st.clone()), Path((row.principal_id, key.key_id.clone()))).await.unwrap();
+        revoke_key(State(st.clone()), Extension(actor()), Path((row.principal_id, key.key_id.clone()))).await.unwrap();
         assert!(crate::auth::verify_key(&pool, &key.key_id, key.secret.as_deref().unwrap()).await.unwrap().is_none());
         assert_eq!(audit_count(&pool, "key.created", row.principal_id).await, 1);
         assert_eq!(audit_count(&pool, "key.revoked", row.principal_id).await, 1);
 
-        let dup = create_key_only_user(
-            State(st.clone()),
+        let dup = create_key_only_user(State(st.clone()), Extension(actor()),
             Json(CreateKeyOnlyUser { code, display_name: "Bot".into(), role: "trader".into() }),
         )
         .await
         .unwrap_err();
         assert_eq!(dup.status, StatusCode::CONFLICT);
-        let bad = create_key_only_user(
-            State(st),
+        let bad = create_key_only_user(State(st), Extension(actor()),
             Json(CreateKeyOnlyUser { code: "x".into(), display_name: "x".into(), role: "strategy".into() }),
         )
         .await
         .unwrap_err();
         assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// An ACTIVE admin (no role) acting as themselves.
+    async fn admin(pool: &PgPool) -> AuthContext {
+        let id = Uuid::new_v4();
+        let code = format!("adm-{}", id.simple());
+        sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, $2, 'HUMAN', 'ACTIVE')")
+            .bind(id)
+            .bind(&code)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO principal_admin (principal_id, granted_by) VALUES ($1, 'test')")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+        AuthContext { principal_id: id, principal_code: code }
+    }
+
+    async fn is_admin(pool: &PgPool, id: Uuid) -> bool {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal_admin WHERE principal_id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn put_admin(st: &AppState, ctx: &AuthContext, id: Uuid, admin: bool) -> impl std::future::Future<Output = Result<StatusCode, ApiError>> {
+        set_admin(State(st.clone()), Extension(ctx.clone()), Path(id), Json(SetAdmin { admin }))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn last_admin_cannot_be_removed() {
+        let pool = migrated_db().await;
+        let st = state(&pool, Some(BASE)).await;
+        let ada = admin(&pool).await;
+
+        let err = put_admin(&st, &ada, ada.principal_id, false).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(is_admin(&pool, ada.principal_id).await);
+
+        // Granting needs no role and gives none.
+        let (bob, ..) = active_user(&pool, &st).await;
+        assert_eq!(put_admin(&st, &ada, bob, true).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(is_admin(&pool, bob).await);
+        assert_eq!(audit_count(&pool, "admin.granted", bob).await, 1);
+
+        assert_eq!(put_admin(&st, &ada, ada.principal_id, false).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(!is_admin(&pool, ada.principal_id).await);
+        assert_eq!(audit_count(&pool, "admin.revoked", ada.principal_id).await, 1);
+        let bob_ctx = AuthContext { principal_id: bob, principal_code: "bob".into() };
+        assert_eq!(put_admin(&st, &bob_ctx, bob, false).await.unwrap_err().status, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn last_admin_cannot_disable_self() {
+        let pool = migrated_db().await;
+        let st = state(&pool, Some(BASE)).await;
+        let ada = admin(&pool).await;
+
+        let err = disable_user(State(st.clone()), Extension(ada.clone()), Path(ada.principal_id)).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(status_of(&pool, ada.principal_id).await, "ACTIVE");
+
+        // With a second active admin it goes through.
+        admin(&pool).await;
+        disable_user(State(st.clone()), Extension(ada.clone()), Path(ada.principal_id)).await.unwrap();
+        assert_eq!(status_of(&pool, ada.principal_id).await, "DISABLED");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn audit_actor_is_named_admin() {
+        let pool = migrated_db().await;
+        let st = state(&pool, Some(BASE)).await;
+        let ada = admin(&pool).await;
+        let (id, ..) = active_user(&pool, &st).await;
+
+        set_role(State(st.clone()), Extension(ada.clone()), Path(id), Json(SetRole { role: "viewer".into() }))
+            .await
+            .unwrap();
+        let out = invite_user(
+            State(st.clone()),
+            Extension(ada.clone()),
+            Json(InviteRequest { email: format!("{}@fundco.com", Uuid::new_v4().simple()), role: "viewer".into(), portfolios: vec![] }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        for (action, target) in [("user.role_changed", id), ("invite.created", out.user_id)] {
+            let actor: String = sqlx::query_scalar("SELECT actor FROM audit_event WHERE action = $1 AND target_principal_id = $2")
+                .bind(action)
+                .bind(target)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(actor, ada.principal_code, "{action}");
+        }
     }
 }

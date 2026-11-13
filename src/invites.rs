@@ -422,7 +422,7 @@ pub fn mask_email(email: &str) -> String {
     }
 }
 
-async fn insert_invite(
+pub(crate) async fn insert_invite(
     tx: &mut Transaction<'_, Postgres>,
     principal_id: Uuid,
     email: &str,
@@ -472,7 +472,7 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 
 /// Slugifies `seed` and, if that code is taken, appends the lowest free
 /// numeric suffix (`-2`, `-3`, ...), so admins see a readable name.
-async fn generate_unique_code(
+pub(crate) async fn generate_unique_code(
     tx: &mut Transaction<'_, Postgres>,
     seed: &str,
 ) -> Result<String, sqlx::Error> {

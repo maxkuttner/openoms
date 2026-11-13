@@ -82,8 +82,11 @@ pub struct OidcStatus {
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    pub admin_token: String,
-    pub admin_auth_enabled: bool,
+    /// The deprecated shared admin password, accepted as a bearer on `/admin/*`
+    /// only while `system_setting.legacy_admin_enabled` is true and only for
+    /// reads and `bootstrap-admin` (see `auth::admin_middleware`). `None`
+    /// when none is configured: there is no built-in default.
+    pub legacy_admin_password: Option<String>,
     /// Cookie policy + TTLs for browser sessions. Derived once at boot from
     /// the OIDC public base URL, or the bind address when OIDC is off (see
     /// `sessions::cookie_policy`) rather than per request, and carried whole
@@ -133,8 +136,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
-        admin_token: String,
-        admin_auth_enabled: bool,
+        legacy_admin_password: Option<String>,
         registry: BrokerRegistry,
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
@@ -145,8 +147,7 @@ impl AppState {
     ) -> Self {
         Self {
             pool,
-            admin_token,
-            admin_auth_enabled,
+            legacy_admin_password,
             session_config,
             oidc_status: Arc::new(std::sync::RwLock::new(OidcStatus::default())),
             registry: Arc::new(ArcSwap::from_pointee(registry)),
@@ -267,8 +268,7 @@ mod tests {
         // the registry swap and the stream registry, never a real quote.
         AppState::new(
             pool,
-            "test-admin-token".to_string(),
-            false,
+            Some("test-admin-token".to_string()),
             registry,
             symbology,
             StreamHealthRegistry::new(),

@@ -21,6 +21,7 @@ mod local_auth_api;
 mod auth_api;
 mod invites;
 mod users_api;
+mod admin_bootstrap;
 mod authz;
 mod limits_api;
 
@@ -287,11 +288,6 @@ fn openapi_json() -> String {
 /// machine, and nothing more, until the operator says otherwise.
 const DEFAULT_BIND_ADDR: &str = "localhost:3001";
 
-/// Admin console password used when `OMS_ADMIN_PASSWORD` is unset *and* the bind
-/// address is loopback. Mirrors `config::DEFAULT_ROLE_PASSWORD`: convenient on a
-/// laptop, refused the moment the server is reachable from anywhere else.
-const DEFAULT_ADMIN_PASSWORD: &str = "openoms-dev";
-
 /// Is this bind address reachable only from this machine?
 ///
 /// Splits the host off a `host:port` pair before asking, and treats anything it
@@ -349,8 +345,8 @@ fn resolve_bind_addr(from_env: Option<String>, file: Option<&config::FileConfig>
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string())
 }
 
-/// Cockpit login password: env → file. `None` means unset, which the caller
-/// turns into the loopback-only default or a refusal.
+/// The deprecated shared admin password: env → file. `None` means unset, and
+/// unset means no shared password at all — there is no built-in default.
 fn resolve_admin_password(
     from_env: Option<String>,
     file: Option<&config::FileConfig>,
@@ -424,6 +420,9 @@ enum Command {
     /// Credential store maintenance.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Named admins: first-admin bootstrap and break-glass recovery (host only).
+    #[command(subcommand)]
+    Auth(AuthCmd),
     /// First-run setup: generate oms.toml and create the database.
     Init {
         /// Take values from flags and the environment instead of prompting.
@@ -432,9 +431,12 @@ enum Command {
         /// Where the database lives: start PostgreSQL 16 in Docker, or use an existing one [default: existing]
         #[arg(long, value_enum)]
         postgres: Option<setup::init::rules::DbSource>,
-        /// Cockpit admin password, at least 12 characters [env: OMS_ADMIN_PASSWORD] [default: generated]
+        /// Email of the first admin, who gets a one-time enrolment link [env: OMS_ADMIN_EMAIL]
         #[arg(long)]
-        admin_password: Option<String>,
+        admin_email: Option<String>,
+        /// Display name of the first admin [env: OMS_ADMIN_NAME]
+        #[arg(long)]
+        admin_name: Option<String>,
         /// Address the server listens on [env: OMS_BIND_ADDR] [default: localhost:3001]
         #[arg(long)]
         bind: Option<String>,
@@ -465,6 +467,36 @@ enum SetupCmd {
     /// Seed a synthetic SPY option chain — no broker, no network. For exercising
     /// instrument search / the option chain UI without a live catalog sync.
     SeedTestChain(setup::test_data::Args),
+}
+
+#[derive(clap::Subcommand)]
+enum AuthCmd {
+    /// Create a named admin and print their one-time enrolment link.
+    ///
+    /// Only while no active admin exists, unless --force-recovery. Never sets
+    /// a password: the admin chooses one, and TOTP, through the link.
+    BootstrapAdmin {
+        /// The admin's email.
+        #[arg(long)]
+        email: String,
+        /// The admin's display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Create the admin even though an active admin exists (break-glass).
+        #[arg(long)]
+        force_recovery: bool,
+        #[command(flatten)]
+        db: DbArgs,
+    },
+    /// Reset an admin's password and TOTP, sign them out everywhere, and
+    /// print a new enrolment link.
+    RecoverAdmin {
+        /// The admin's email.
+        #[arg(long)]
+        email: String,
+        #[command(flatten)]
+        db: DbArgs,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -708,7 +740,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Init { non_interactive, postgres, admin_password, bind, db }) => {
+        Some(Command::Init { non_interactive, postgres, admin_email, admin_name, bind, db }) => {
             // Checked here too, not only inside `run()`: `resolve()` below calls
             // `config::load()`, which exits the process over a *malformed*
             // oms.toml before `run()`'s own check ever runs — and interactively,
@@ -734,9 +766,10 @@ async fn main() {
                     None => (env(var), var.to_string()),
                 }
             };
-            let (admin_password, admin_src) = from(admin_password, "admin-password", "OMS_ADMIN_PASSWORD");
+            let (admin_email, admin_src) = from(admin_email, "admin-email", "OMS_ADMIN_EMAIL");
+            let (admin_name, _) = from(admin_name, "admin-name", "OMS_ADMIN_NAME");
             let (bind, bind_src) = from(bind, "bind", "OMS_BIND_ADDR");
-            let checked = admin_password.as_deref().map_or(Ok(()), setup::init::rules::check_admin_password)
+            let checked = admin_email.as_deref().map_or(Ok(()), setup::init::rules::check_admin_email)
                 .map_err(|e| format!("{admin_src}: {e}"))
                 .and(bind.as_deref().map_or(Ok(()), |b| setup::init::rules::parse_bind(b).map(|_| ()))
                     .map_err(|e| format!("{bind_src}: {e}")));
@@ -744,7 +777,7 @@ async fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
-            let flags = setup::init::InitFlags { source: postgres, admin_password, bind };
+            let flags = setup::init::InitFlags { source: postgres, admin_email, admin_name, bind };
             let container = setup::init::rules::container_mode(env("OMS_CONTAINER").as_deref());
             let answers = if non_interactive {
                 let cfg = setup::database::config::resolve(db.into());
@@ -810,7 +843,8 @@ async fn main() {
                     database: cfg.database,
                     username: cfg.username,
                     superuser_password: password_override,
-                    admin_password: flags.admin_password,
+                    admin_email: flags.admin_email,
+                    admin_name: flags.admin_name,
                     bind: flags.bind.unwrap_or_else(|| setup::init::DEFAULT_BIND.into()),
                     source: flags.source,
                     container,
@@ -831,6 +865,21 @@ async fn main() {
             if let Err(e) = setup::init::run(answers, &setup::init::docker::Cli, interactive).await {
                 eprintln!("{e}");
                 std::process::exit(1);
+            }
+        }
+        Some(Command::Auth(cmd)) => {
+            let result = match cmd {
+                AuthCmd::BootstrapAdmin { email, name, force_recovery, db } => {
+                    admin_bootstrap::cli_bootstrap(db.into(), &email, name.as_deref(), force_recovery).await
+                }
+                AuthCmd::RecoverAdmin { email, db } => admin_bootstrap::cli_recover(db.into(), &email).await,
+            };
+            match result {
+                Ok(link) => println!("One-time enrolment link (valid 7 days):\n\n    {link}\n"),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Some(Command::Status) => std::process::exit(setup::status::run().await),
@@ -890,7 +939,8 @@ fn build_app(
         .route("/instruments/options/chain", get(instruments_api::get_option_chain))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
-    // 2) Register admin routes (protected by static bearer token only)
+    // 2) Register admin routes: a named admin's session, or the legacy shared
+    // password for reads and bootstrap only (see `auth::admin_middleware`).
     let admin_router = Router::new()
         .route("/admin/orders", get(handlers::get_orders_blotter))
         .route(
@@ -906,6 +956,8 @@ fn build_app(
         .route("/admin/users/:id/link-invite", post(users_api::link_invite))
         .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
         .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
+        .route("/admin/users/bootstrap-admin", post(users_api::bootstrap_admin))
+        .route("/admin/users/:id/admin", axum::routing::put(users_api::set_admin))
         .route("/admin/users/:id/disable", post(users_api::disable_user))
         .route("/admin/users/:id/enable", post(users_api::enable_user))
         .route("/admin/users/:id/keys", get(users_api::list_keys).post(users_api::create_key))
@@ -1271,41 +1323,21 @@ async fn serve() {
     // machine — costs nothing extra.
     let bind_addr = resolve_bind_addr(env::var("OMS_BIND_ADDR").ok(), file_cfg);
 
-    let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
-
-    // The admin console login password. `OMS_ADMIN_PASSWORD` is the canonical name;
-    // `OMS_ADMIN_TOKEN` is still accepted for back-compat.
-    //
-    // Unset is not fatal on a loopback bind: a fresh clone must be able to run
-    // `cargo run` and reach the console, the same way `database init` works with no
-    // configuration at all. The moment the bind address is reachable from anywhere
-    // else, the default is refused instead — identical to the role-password rule.
-    let admin_token = if !admin_auth_enabled {
-        String::new()
-    } else {
-        let configured = resolve_admin_password(admin_password_from_env(), file_cfg);
-        match configured {
-            Some(token) => token,
-            None if bind_is_loopback(&bind_addr) => {
-                warn!(
-                    "OMS_ADMIN_PASSWORD is not set — using the built-in default \
-                     '{DEFAULT_ADMIN_PASSWORD}' for the admin console. Set OMS_ADMIN_PASSWORD \
-                     in .env before binding anywhere but localhost."
-                );
-                DEFAULT_ADMIN_PASSWORD.to_string()
-            }
-            None => {
-                error!(
-                    "refusing to start: OMS_ADMIN_PASSWORD is not set and OMS_BIND_ADDR \
-                     ({bind_addr}) is reachable beyond this machine. Set OMS_ADMIN_PASSWORD \
-                     in .env, or set OMS_ADMIN_AUTH_ENABLED=false to disable the console login."
-                );
-                std::process::exit(1);
-            }
-        }
-    };
+    // The deprecated shared admin password (`OMS_ADMIN_PASSWORD` →
+    // `OMS_ADMIN_TOKEN` → `[server].admin_password`). There is no built-in
+    // default any more, on loopback or anywhere: admins are named people who
+    // sign in. While `system_setting.legacy_admin_enabled` is still true the
+    // password may read `/admin/*` and bootstrap the first named admin, nothing
+    // else (see `auth::admin_middleware`).
+    let legacy_admin_password = resolve_admin_password(admin_password_from_env(), file_cfg);
+    if legacy_admin_password.is_some() {
+        warn!(
+            "the shared admin password (OMS_ADMIN_PASSWORD / [server].admin_password) is \
+             deprecated: it can only read the admin console and create a named admin. \
+             Create one with `oms auth bootstrap-admin --email <you@example.com>`, \
+             then remove the password."
+        );
+    }
 
     // Same rule, for OIDC login instead of the admin console. Plain http is
     // only tolerated when the whole deployment is loopback — see
@@ -1439,8 +1471,7 @@ async fn serve() {
 
     let state = AppState::new(
         pool,
-        admin_token,
-        admin_auth_enabled,
+        legacy_admin_password,
         BrokerRegistry::new(),
         symbology,
         stream_health,
@@ -1740,19 +1771,21 @@ mod tests {
         use crate::{setup, Cli, Command, ConfigCmd};
         let cli = Cli::try_parse_from([
             "oms", "init", "--non-interactive", "--postgres", "docker",
-            "--admin-password", "twelve-chars-ok", "--bind", "localhost:4000",
+            "--admin-email", "ada@example.com", "--admin-name", "Ada", "--bind", "localhost:4000",
         ])
         .unwrap();
         match cli.command {
-            Some(Command::Init { non_interactive, postgres, admin_password, bind, .. }) => {
+            Some(Command::Init { non_interactive, postgres, admin_email, admin_name, bind, .. }) => {
                 assert!(non_interactive);
                 assert_eq!(postgres, Some(setup::init::rules::DbSource::Docker));
-                assert_eq!(admin_password.as_deref(), Some("twelve-chars-ok"));
+                assert_eq!(admin_email.as_deref(), Some("ada@example.com"));
+                assert_eq!(admin_name.as_deref(), Some("Ada"));
                 assert_eq!(bind.as_deref(), Some("localhost:4000"));
             }
             _ => panic!("not init"),
         }
         assert!(Cli::try_parse_from(["oms", "init", "--postgres", "kubernetes"]).is_err());
+        assert!(Cli::try_parse_from(["oms", "init", "--admin-password", "twelve-chars-ok"]).is_err(), "init no longer takes a password");
     }
 
     #[test]

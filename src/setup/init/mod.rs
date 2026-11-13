@@ -15,7 +15,7 @@ pub mod docker;
 pub mod prompts;
 pub mod rules;
 
-use prompts::{AdminPassword, Answers, DbChoice};
+use prompts::{AdminAccount, Answers, DbChoice};
 use rules::DbSource;
 
 /// 32 bytes — the AES-256 key size the credential store expects.
@@ -68,10 +68,8 @@ impl std::fmt::Debug for Prompts {
 /// that is all. Persisting a credential that can `DROP DATABASE` is not worth
 /// saving one prompt on the rare `migrate`.
 ///
-/// The cockpit admin password is deliberately NOT generated here: `run()` needs
-/// the raw value for its success message, and generating it there — then
-/// assigning it into the config — is one step, versus generating it here and
-/// making the caller claw it back out of an `Option` afterwards.
+/// No admin password is written: the first admin is a named person, created
+/// in the database by `run()` with a one-time enrolment link.
 pub fn build_file_config(p: &Prompts, bind: &str) -> (FileConfig, String) {
     let role_password = generate_password();
     let mut cfg = FileConfig::default();
@@ -104,7 +102,8 @@ pub fn already_initialized_message(path: &std::path::Path) -> String {
 /// the whole answer, interactively they skip the matching prompt.
 pub struct InitFlags {
     pub source: Option<DbSource>,
-    pub admin_password: Option<String>,
+    pub admin_email: Option<String>,
+    pub admin_name: Option<String>,
     pub bind: Option<String>,
 }
 
@@ -119,21 +118,21 @@ pub fn superuser_password_default(flag: Option<String>, env: Option<String>, con
 }
 
 /// Non-interactive answers: `--postgres` defaults to `existing` (what scripts
-/// written before the flag existed expect), an absent admin password is
-/// generated, an absent bind is `localhost:3001`. Values are checked by the same
+/// written before the flag existed expect), the admin email is required, an
+/// absent bind is `localhost:3001`. Values are checked by the same
 /// rules the prompts use, so a script cannot write what a human could not type.
 pub fn answers_from_flags(f: &InitFlags, db: Prompts) -> Result<Answers, String> {
     let db = match f.source.unwrap_or(DbSource::Existing) {
         DbSource::Docker => DbChoice::Docker,
         DbSource::Existing => DbChoice::Existing(db),
     };
-    let admin = match &f.admin_password {
-        Some(pw) => {
-            rules::check_admin_password(pw)?;
-            AdminPassword::Typed(pw.clone())
-        }
-        None => AdminPassword::Generated(generate_password()),
-    };
+    let email = f
+        .admin_email
+        .as_deref()
+        .ok_or("the first admin's email is required: pass --admin-email (or set OMS_ADMIN_EMAIL)")?;
+    rules::check_admin_email(email)?;
+    let name = f.admin_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+    let admin = AdminAccount { email: email.trim().to_string(), name };
     let bind = rules::parse_bind(f.bind.as_deref().unwrap_or(DEFAULT_BIND))?;
     Ok(Answers { db, admin, bind })
 }
@@ -180,11 +179,11 @@ pub fn docker_cleanup_hint() -> String {
 
 /// The whole `oms init` flow.
 ///
-/// `interactive` controls only whether the generated cockpit password is printed:
-/// true (a human typed the prompts) is the sole way that value ever reaches the
-/// operator, so it must be shown; false (`--non-interactive`) is the mode most
-/// likely to run under CI/Ansible with stdout captured into a durable log, which
-/// is exactly what "secrets are never logged" rules out.
+/// `interactive` controls only whether the admin's enrolment link is printed:
+/// true (a human typed the prompts) shows it; false (`--non-interactive`) is
+/// the mode most likely to run under CI/Ansible with stdout captured into a
+/// durable log, and the link claims an admin account, so it names
+/// `oms auth recover-admin` to mint one at a terminal instead.
 pub async fn run(
     answers: Answers,
     docker: &dyn docker::DockerOps,
@@ -265,8 +264,7 @@ async fn run_with_timeout(
     conn.close().await.ok();
     println!("  connected to {}:{}", prompts.host, prompts.port);
 
-    let (mut file_cfg, role_password) = build_file_config(&prompts, &bind);
-    file_cfg.server.admin_password = Some(admin.value().to_string());
+    let (file_cfg, role_password) = build_file_config(&prompts, &bind);
 
     // Written before provisioning: if provisioning fails halfway, the generated
     // secrets survive and `oms database init --resume` can finish the job.
@@ -305,20 +303,51 @@ async fn run_with_timeout(
     // database it just created. `--resume` skips that and re-runs the remaining
     // steps, all of which tolerate re-application — see `database::init`'s doc
     // comment for why.
-    crate::setup::database::init(overrides, Some(role_password), false)
+    crate::setup::database::init(overrides.clone(), Some(role_password), false)
         .await
         .map_err(|e| provision_failure_message(&cfg_path, &e.to_string(), started_docker))?;
 
-    // Only a generated password is ever printed, and only to a human at a
-    // terminal: one the operator typed they already know.
-    let admin_line = match (&admin, interactive) {
-        (AdminPassword::Typed(_), _) => "Cockpit login password: the one you chose".to_string(),
-        (AdminPassword::Generated(pw), true) => format!("Cockpit login password: {pw}"),
-        (AdminPassword::Generated(_), false) => "Cockpit login password: written to oms.toml".to_string(),
+    // The first named admin: created now, enrolled (password + TOTP) by them
+    // through the one-time link.
+    let link = bootstrap_first_admin(overrides, &admin, &bind).await.map_err(|e| {
+        format!(
+            "error: the database is ready, but the first admin could not be created: {e}\n\
+             \x20        Finish with:  oms auth bootstrap-admin --email {}",
+            admin.email
+        )
+    })?;
+    let admin_line = if interactive {
+        format!("First admin ({}): open this one-time link to choose a password and set up TOTP:\n    {link}", admin.email)
+    } else {
+        format!(
+            "First admin ({}) created. Get their one-time enrolment link at a terminal with:\n    \
+             oms auth recover-admin --email {}",
+            admin.email, admin.email
+        )
     };
     let container = rules::container_mode(std::env::var("OMS_CONTAINER").ok().as_deref());
     println!("{}", closing_lines(&cfg_path, &admin_line, &bind, container));
     Ok(())
+}
+
+/// Create the first named admin on the freshly provisioned database and
+/// return their enrolment link. The link points at the address browsers will
+/// use: the loopback bind, or `localhost` with its port when the bind is a
+/// wildcard (the container, published on the host's loopback).
+async fn bootstrap_first_admin(
+    overrides: crate::setup::database::config::PostgresOverrides,
+    admin: &AdminAccount,
+    bind: &str,
+) -> Result<String, String> {
+    use crate::admin_bootstrap as ab;
+    let base = ab::link_base(None, bind)
+        .unwrap_or_else(|_| cockpit_url(bind).trim_end_matches("/cockpit/").to_string());
+    let pool = ab::cli_pool(overrides).await.map_err(|e| e.to_string())?;
+    let invite = ab::bootstrap(&pool, &admin.email, admin.name.as_deref(), ab::HOST_CLI_ACTOR, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    pool.close().await;
+    Ok(ab::enrolment_link(&base, &invite))
 }
 
 /// The summary after a successful init: what to back up, how to start, where
@@ -503,7 +532,11 @@ mod tests {
     }
 
     fn flags(admin: Option<&str>, bind: Option<&str>) -> InitFlags {
-        InitFlags { source: None, admin_password: admin.map(Into::into), bind: bind.map(Into::into) }
+        InitFlags { source: None, admin_email: admin.map(Into::into), admin_name: None, bind: bind.map(Into::into) }
+    }
+
+    fn ada() -> AdminAccount {
+        AdminAccount { email: "ada@example.com".into(), name: None }
     }
 
     #[test]
@@ -513,31 +546,40 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_defaults_to_existing_localhost_and_a_generated_password() {
-        let a = answers_from_flags(&flags(None, None), sample_prompts()).unwrap();
+    fn non_interactive_defaults_to_existing_and_localhost() {
+        let a = answers_from_flags(&flags(Some("ada@example.com"), None), sample_prompts()).unwrap();
         assert!(matches!(a.db, DbChoice::Existing(_)));
-        assert!(matches!(a.admin, AdminPassword::Generated(_)));
+        assert_eq!(a.admin, ada());
         assert_eq!(a.bind, "localhost:3001");
     }
 
     #[test]
-    fn non_interactive_docker_and_a_chosen_password_carry_through() {
-        let f = InitFlags { source: Some(DbSource::Docker), ..flags(Some("twelve-chars-ok"), Some("0.0.0.0:3001")) };
+    fn non_interactive_needs_the_admin_email() {
+        let e = answers_from_flags(&flags(None, None), sample_prompts()).unwrap_err();
+        assert!(e.contains("--admin-email"), "{e}");
+    }
+
+    #[test]
+    fn non_interactive_docker_and_the_admin_carry_through() {
+        let f = InitFlags {
+            source: Some(DbSource::Docker),
+            admin_name: Some(" Ada ".into()),
+            ..flags(Some("ada@example.com"), Some("0.0.0.0:3001"))
+        };
         let a = answers_from_flags(&f, sample_prompts()).unwrap();
         assert!(matches!(a.db, DbChoice::Docker));
-        assert!(matches!(a.admin, AdminPassword::Typed(ref p) if p == "twelve-chars-ok"));
+        assert_eq!(a.admin, AdminAccount { email: "ada@example.com".into(), name: Some("Ada".into()) });
         assert_eq!(a.bind, "0.0.0.0:3001");
     }
 
     #[test]
-    fn short_admin_password_flag_is_refused() {
-        let e = answers_from_flags(&flags(Some("short"), None), sample_prompts()).unwrap_err();
-        assert!(e.contains("12"), "{e}");
+    fn a_bad_admin_email_flag_is_refused() {
+        assert!(answers_from_flags(&flags(Some("ada"), None), sample_prompts()).is_err());
     }
 
     #[test]
     fn a_bad_bind_flag_is_refused() {
-        assert!(answers_from_flags(&flags(None, Some(":3001")), sample_prompts()).is_err());
+        assert!(answers_from_flags(&flags(Some("ada@example.com"), Some(":3001")), sample_prompts()).is_err());
     }
 
     /// A Docker that "starts" a container nobody listens for: readiness fails
@@ -558,7 +600,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("oms-init-test-{}", std::process::id()));
         let a = Answers {
             db: DbChoice::Docker,
-            admin: AdminPassword::Generated("x".repeat(24)),
+            admin: ada(),
             bind: "localhost:3001".into(),
         };
         let e = run_with_timeout(
@@ -588,7 +630,7 @@ mod tests {
         }
         let existing = std::env::temp_dir().join(format!("oms-init-existing-{}.toml", std::process::id()));
         std::fs::write(&existing, "").unwrap();
-        let a = Answers { db: DbChoice::Docker, admin: AdminPassword::Generated("x".repeat(24)), bind: "localhost:3001".into() };
+        let a = Answers { db: DbChoice::Docker, admin: ada(), bind: "localhost:3001".into() };
         let e = run_with_timeout(a, &Panics, false, std::time::Duration::from_millis(100), existing.clone(), existing.clone())
             .await
             .unwrap_err()
@@ -603,11 +645,12 @@ mod tests {
         assert_eq!(cockpit_url("0.0.0.0:4000"), "http://localhost:4000/cockpit/");
     }
 
+    /// The config file never carries an admin password any more.
     #[test]
-    fn answers_debug_never_shows_the_admin_password() {
-        let a = answers_from_flags(&flags(Some("very-secret-admin"), None), sample_prompts()).unwrap();
-        let d = format!("{a:?}");
-        assert!(!d.contains("very-secret-admin") && !d.contains("\"pw\""), "{d}");
+    fn the_written_config_has_no_admin_password() {
+        let (cfg, _) = build_file_config(&sample_prompts(), "localhost:3001");
+        assert_eq!(cfg.server.admin_password, None);
+        assert!(!toml::to_string_pretty(&cfg).unwrap().contains("admin_password"));
     }
 
     #[test]
@@ -633,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_docker_run_names_cleanup() {
         let tmp = std::env::temp_dir().join(format!("oms-init-runfails-{}", std::process::id()));
-        let a = Answers { db: DbChoice::Docker, admin: AdminPassword::Generated("x".repeat(24)), bind: "localhost:3001".into() };
+        let a = Answers { db: DbChoice::Docker, admin: ada(), bind: "localhost:3001".into() };
         let e = run_with_timeout(a, &RunFails, false, std::time::Duration::from_millis(100), tmp.join("none.toml"), tmp.join("oms.toml"))
             .await
             .unwrap_err()

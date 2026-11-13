@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::{extract::State, middleware, routing::post, Router};
+use axum::{extract::State, routing::post, Router};
 use sqlx::{postgres::PgConnectOptions, PgPool};
 use tokio::sync::Notify;
 
@@ -30,7 +30,7 @@ fn adapter() -> Arc<AlpacaAdapter> {
 }
 
 fn state(pool: PgPool) -> AppState {
-    AppState::new(pool, "test-admin".into(), true, BrokerRegistry::new(),
+    AppState::new(pool, None, BrokerRegistry::new(),
         symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
         StreamHealthRegistry::new(), crate::event_bus::EventBus::new(),
         gateway::contract::EngineHandle::new().0, std::sync::Arc::new(gateway::md::MarketDataGateway::new(StreamHealthRegistry::new()).0),
@@ -127,7 +127,7 @@ async fn serve(state: AppState, fake: FakeStreams) -> (String, tokio::task::Join
             let fake = fake.clone();
             async move { crate::admin::reload_using(state, Some(key()), fake).await }
         }))
-        .route_layer(middleware::from_fn_with_state(state.clone(), crate::auth::admin_middleware))
+        // Unguarded: who may call `/admin/*` is `admin_bootstrap`'s tests' concern.
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/admin/connections/reload", listener.local_addr().unwrap());
@@ -140,7 +140,7 @@ fn client() -> reqwest::Client {
 }
 
 async fn post_reload(url: &str) -> (u16, serde_json::Value) {
-    let response = client().post(url).bearer_auth("test-admin").send().await.unwrap();
+    let response = client().post(url).send().await.unwrap();
     let status = response.status().as_u16();
     let text = response.text().await.unwrap();
     (status, serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
@@ -160,8 +160,6 @@ async fn reload_http_auth_and_store_failure_preserve_state() {
     fake.spawn("alpaca-paper:exec", state.streams());
     let (url, server) = serve(state.clone(), fake.clone()).await;
 
-    assert_eq!(client().post(&url).send().await.unwrap().status(), 403);
-    assert_eq!(client().post(&url).bearer_auth("wrong").send().await.unwrap().status(), 403);
     assert_eq!(post_reload(&url).await.0, 500);
     assert!(same_adapter(&(before.clone() as Arc<dyn gateway::adapter::BrokerAdapter>), &state.registry().get("ALPACA", "PAPER").unwrap()));
     assert_eq!(fake.count("alpaca-paper:exec"), 1);

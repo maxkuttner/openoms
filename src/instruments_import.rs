@@ -406,7 +406,6 @@ pub async fn run_cli(path: &std::path::Path) -> Result<(), Box<dyn std::error::E
     let bind = crate::resolve_bind_addr(std::env::var("OMS_BIND_ADDR").ok(), file);
     let base = format!("http://{}", crate::setup::status::reachable_addr(&bind));
     let password = crate::resolve_admin_password(crate::admin_password_from_env(), file)
-        .or_else(|| crate::bind_is_loopback(&bind).then(|| crate::DEFAULT_ADMIN_PASSWORD.to_string()))
         .unwrap_or_default();
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build()?;
     let root = format!("{base}/admin/brokers/IBKR_TWS/instruments");
