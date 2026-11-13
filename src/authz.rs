@@ -365,6 +365,6 @@ pub fn require_mfa(ctx: &crate::auth::AuthContext) -> Result<(), ApiError> {
     match ctx.auth_method {
         AuthMethod::ApiKey | AuthMethod::HostCli => Ok(()),
         AuthMethod::Local | AuthMethod::Oidc if ctx.mfa => Ok(()),
-        _ => Err(ApiError { status: StatusCode::FORBIDDEN, message: MFA_REQUIRED_BODY.to_string() }),
+        _ => Err(ApiError::mfa_required()),
     }
 }

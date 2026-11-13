@@ -45,12 +45,24 @@ pub struct ApiError {
 
 }
 
+/// The only error bodies sent as `application/json`: fixed, server-defined
+/// constants. Every other message is plain text, whatever it starts with —
+/// messages can echo user input (a symbol, an id), which must never pick the
+/// response's content type.
+const JSON_ERROR_BODIES: &[&str] = &[crate::authz::MFA_REQUIRED_BODY];
+
+impl ApiError {
+    /// 403 `{"error":"mfa_required"}` (JSON): the action needs a session that passed MFA.
+    pub fn mfa_required() -> Self {
+        ApiError { status: StatusCode::FORBIDDEN, message: crate::authz::MFA_REQUIRED_BODY.to_string() }
+    }
+}
+
 // Trait: to provide an error message
 impl IntoResponse for ApiError {
 
     fn into_response(self) -> Response{
-        // A few errors carry a JSON body (e.g. `authz::MFA_REQUIRED_BODY`).
-        if self.message.starts_with('{') {
+        if JSON_ERROR_BODIES.contains(&self.message.as_str()) {
             return (self.status, [(axum::http::header::CONTENT_TYPE, "application/json")], self.message).into_response();
         }
         return (self.status, self.message).into_response();
@@ -1366,6 +1378,28 @@ pub async fn get_marks(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn content_type(r: &Response) -> Option<&str> {
+        r.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
+    }
+
+    /// User text echoed into an error (e.g. a symbol) may start with '{';
+    /// it must never be labelled JSON just because of that.
+    #[test]
+    fn a_plain_message_starting_with_a_brace_is_not_json() {
+        let r = ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message: r#"{"x":1} is not tradeable on V"#.into() }
+            .into_response();
+        assert!(!content_type(&r).unwrap_or_default().starts_with("application/json"), "{:?}", content_type(&r));
+    }
+
+    #[tokio::test]
+    async fn mfa_required_is_json_and_byte_identical() {
+        let r = ApiError::mfa_required().into_response();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(content_type(&r), Some("application/json"));
+        let body = axum::body::to_bytes(r.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], crate::authz::MFA_REQUIRED_BODY.as_bytes());
+    }
 
     #[test]
     fn not_tradeable_wins_over_every_other_reason() {

@@ -258,11 +258,14 @@ impl AuthMethod {
         }
     }
 
-    fn parse(s: &str) -> Self {
+    /// `None` for a value this build does not know: such a session must not
+    /// authenticate as anything (fail closed, not as OIDC).
+    fn parse(s: &str) -> Option<Self> {
         match s {
-            "local" => AuthMethod::Local,
-            "legacy_admin" => AuthMethod::LegacyAdmin,
-            _ => AuthMethod::Oidc,
+            "oidc" => Some(AuthMethod::Oidc),
+            "local" => Some(AuthMethod::Local),
+            "legacy_admin" => Some(AuthMethod::LegacyAdmin),
+            _ => None,
         }
     }
 }
@@ -377,13 +380,20 @@ pub async fn lookup_session(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| SessionRecord {
-        id: r.get("id"),
+    let Some(r) = row else { return Ok(None) };
+    let id: Uuid = r.get("id");
+    let raw_method: &str = r.get("auth_method");
+    let Some(auth_method) = AuthMethod::parse(raw_method) else {
+        tracing::warn!(session_id = %id, auth_method = raw_method, "session has an unknown auth_method; denying it");
+        return Ok(None);
+    };
+    Ok(Some(SessionRecord {
+        id,
         principal_id: r.get("principal_id"),
         principal_code: r.get("principal_code"),
         last_seen_at: r.get("last_seen_at"),
         absolute_expires_at: r.get("absolute_expires_at"),
-        auth_method: AuthMethod::parse(r.get::<&str, _>("auth_method")),
+        auth_method,
         mfa_verified_at: r.get("mfa_verified_at"),
     }))
 }
@@ -699,6 +709,17 @@ mod tests {
         headers.insert("cookie", "not_oms_session=wrong".parse().unwrap());
 
         assert_eq!(cookie_from_headers(&headers, "oms_session"), None);
+    }
+
+    /// An auth_method this build does not know fails closed: no silent
+    /// fallback to OIDC (whose MFA rule differs from local's).
+    #[test]
+    fn an_unknown_auth_method_does_not_parse() {
+        assert_eq!(AuthMethod::parse("oidc"), Some(AuthMethod::Oidc));
+        assert_eq!(AuthMethod::parse("local"), Some(AuthMethod::Local));
+        assert_eq!(AuthMethod::parse("legacy_admin"), Some(AuthMethod::LegacyAdmin));
+        assert_eq!(AuthMethod::parse("webauthn"), None);
+        assert_eq!(AuthMethod::parse(""), None);
     }
 
     #[test]
