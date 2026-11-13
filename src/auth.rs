@@ -207,6 +207,11 @@ pub async fn verify_key(
 /// create a named admin (`POST /admin/users/bootstrap-admin`), nothing else.
 /// Its `principal_id` is the nil UUID, which never exists in `principal`, so
 /// it can never satisfy a trading or authz check.
+///
+/// The host door: `Bearer <host token>` (written 0600 next to the config at
+/// boot) from a loopback peer acts as `host-cli` with full admin capability,
+/// before and after cutover. It is how `oms status` / `oms setup sync-broker`
+/// reach the server.
 pub async fn admin_middleware(
     State(state): State<AppState>,
     mut req: Request<Body>,
@@ -234,6 +239,13 @@ pub async fn admin_middleware(
     }
 
     let token = extract_bearer_token(req.headers()).map_err(|_| unauthorized())?;
+    // The per-boot host token: loopback peers only, independent of the
+    // legacy flag; acts as `host-cli`.
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+    if crate::admin_bootstrap::host_token_ok(state.host_token_hash.as_deref(), &token, peer) {
+        req.extensions_mut().insert(crate::admin_bootstrap::host_context());
+        return Ok(next.run(req).await);
+    }
     let Some(password) = state.legacy_admin_password.as_deref() else {
         return Err(unauthorized());
     };

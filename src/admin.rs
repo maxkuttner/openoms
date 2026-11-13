@@ -2176,6 +2176,7 @@ pub async fn resolve_symbology(
 )]
 pub async fn backfill_symbology(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::auth::AuthContext>,
     Json(req): Json<BackfillRequest>,
 ) -> Result<(StatusCode, Json<JobStarted>), AdminError> {
     let limit = req.limit.unwrap_or(50).clamp(1, 500);
@@ -2184,7 +2185,7 @@ pub async fn backfill_symbology(
         state.pool(),
         crate::jobs::JobKind::SymbologyBackfill,
         None,
-        "admin",
+        &ctx.principal_code,
         serde_json::json!({ "limit": limit }),
     )
     .await
@@ -2256,9 +2257,10 @@ async fn run_backfill(
 )]
 pub async fn expiry_sweep(
     State(state): State<AppState>,
+    axum::Extension(ctx): axum::Extension<crate::auth::AuthContext>,
 ) -> Result<(StatusCode, Json<JobStarted>), AdminError> {
     info!("admin expiry sweep");
-    let job_id = crate::jobs::api::start_expiry_sweep(state.pool(), "admin")
+    let job_id = crate::jobs::api::start_expiry_sweep(state.pool(), &ctx.principal_code)
         .await
         .map_err(|e| AdminError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("{e:?}") })?;
     Ok((StatusCode::ACCEPTED, Json(JobStarted { job_id })))

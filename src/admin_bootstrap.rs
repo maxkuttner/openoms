@@ -227,6 +227,10 @@ async fn local_invite(
 /// Break-glass: reset the admin's local password and TOTP, revoke their
 /// sessions and pending invites, and issue a new local-only enrolment invite.
 /// The admin is INVITED until they enrol again. Audited `admin.recovered`.
+///
+/// Recovering the sole admin leaves zero ACTIVE admins until they re-enrol,
+/// and the legacy shared password stays disabled if the cutover already
+/// happened: the new link (or the host CLI) is the only way back in.
 pub async fn recover(pool: &PgPool, email: &str, actor: &str) -> Result<NewInvite, BootstrapError> {
     let email = normalise_email(email)?;
     let mut tx = pool.begin().await?;
@@ -272,6 +276,70 @@ pub async fn recover(pool: &PgPool, email: &str, actor: &str) -> Result<NewInvit
     .await?;
     tx.commit().await?;
     Ok(invite)
+}
+
+// ── host token ─────────────────────────────────────────────────────────────
+
+/// File name of the per-boot host token, next to the config file in effect.
+pub const HOST_TOKEN_FILE: &str = "host-token";
+
+/// Where the host token lives: beside the `oms.toml` in effect, else beside
+/// the one `oms init` would create. Server and CLI resolve it identically.
+pub fn host_token_path() -> std::path::PathBuf {
+    let cfg = crate::config::path();
+    let cfg = if cfg.exists() { cfg } else { crate::config::init_target() };
+    let cfg = crate::config::absolute(cfg);
+    cfg.parent().map(|d| d.join(HOST_TOKEN_FILE)).unwrap_or_else(|| HOST_TOKEN_FILE.into())
+}
+
+/// Generate a new host token (32 random bytes, hex), write it to `path` with
+/// mode 0600 (replacing the previous boot's), and return its SHA-256 — the
+/// only form the server keeps.
+pub fn write_host_token(path: &std::path::Path) -> std::io::Result<String> {
+    use rand::RngCore;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut raw);
+    let token: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    if let Some(dir) = path.parent() {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    // `mode` applies only on creation; an older file keeps its bits otherwise.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    f.write_all(token.as_bytes())?;
+    Ok(crate::sessions::hash_session_token(&token))
+}
+
+/// The host token for a CLI call to the running server on this machine.
+pub fn read_host_token() -> Result<String, String> {
+    let path = host_token_path();
+    std::fs::read_to_string(&path).map(|t| t.trim().to_string()).map_err(|e| {
+        format!(
+            "cannot read the host token at {} ({e}): run this on the OMS host as the OMS user, \
+             with the server running",
+            path.display()
+        )
+    })
+}
+
+/// The synthetic context of the host token: actor `host-cli`, the nil UUID
+/// (never a `principal`), so it can never pass a trading or authz check.
+pub fn host_context() -> AuthContext {
+    AuthContext { principal_id: Uuid::nil(), principal_code: HOST_CLI_ACTOR.to_string() }
+}
+
+/// Does `token`, from `peer`, match this boot's host token? Only a loopback
+/// peer may present it; with no peer address known, refuse.
+pub fn host_token_ok(hash: Option<&str>, token: &str, peer: Option<std::net::SocketAddr>) -> bool {
+    let (Some(hash), Some(peer)) = (hash, peer) else { return false };
+    if !peer.ip().to_canonical().is_loopback() {
+        return false;
+    }
+    let given = crate::sessions::hash_session_token(token);
+    given.len() == hash.len() && given.bytes().zip(hash.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 /// The enrolment link for `invite`, the same shape the invite API returns.
@@ -390,7 +458,9 @@ mod tests {
         let app = crate::build_app(st.clone(), None, true, false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}{path}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap()
+        });
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let mut req = client.request(method.parse().unwrap(), url).header("origin", ORIGIN);
         match cred {
@@ -732,5 +802,112 @@ mod tests {
         assert_eq!(link_base(None, "localhost:3001").unwrap(), "http://localhost:3001");
         assert_eq!(link_base(Some("https://oms.example.com".into()), "0.0.0.0:3001").unwrap(), "https://oms.example.com");
         assert!(link_base(None, "0.0.0.0:3001").is_err());
+    }
+
+    fn temp_token_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("oms-host-token-{}", Uuid::new_v4().simple())).join(HOST_TOKEN_FILE)
+    }
+
+    /// A state holding a freshly written host token; returns the token.
+    fn with_host_token(st: &mut AppState) -> String {
+        let path = temp_token_path();
+        st.host_token_hash = Some(write_host_token(&path).unwrap());
+        let token = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        token
+    }
+
+    #[test]
+    fn host_token_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_token_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_host_token(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn host_token_rotates_each_boot() {
+        let path = temp_token_path();
+        let first_hash = write_host_token(&path).unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        let second_hash = write_host_token(&path).unwrap();
+        let second = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        assert_eq!(second.len(), 64);
+        assert_ne!(first, second);
+        assert_ne!(first_hash, second_hash);
+        assert!(!second.contains(&second_hash), "only the hash is kept, never the token");
+        let lo = Some("127.0.0.1:5000".parse().unwrap());
+        assert!(!host_token_ok(Some(&second_hash), &first, lo), "the previous boot's token is dead");
+        assert!(host_token_ok(Some(&second_hash), &second, lo));
+    }
+
+    #[test]
+    fn host_token_refused_from_non_loopback_peer() {
+        let path = temp_token_path();
+        let hash = write_host_token(&path).unwrap();
+        let token = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        for peer in ["10.0.0.1:5000", "192.168.1.2:5000", "[2001:db8::1]:5000"] {
+            assert!(!host_token_ok(Some(&hash), &token, Some(peer.parse().unwrap())), "{peer}");
+        }
+        assert!(!host_token_ok(Some(&hash), &token, None), "unknown peer");
+        assert!(host_token_ok(Some(&hash), &token, Some("[::1]:5000".parse().unwrap())));
+        assert!(host_token_ok(Some(&hash), &token, Some("[::ffff:127.0.0.1]:5000".parse().unwrap())));
+        assert!(!host_token_ok(None, &token, Some("127.0.0.1:5000".parse().unwrap())));
+    }
+
+    #[tokio::test]
+    async fn host_token_never_reaches_trading_routes() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let mut st = state(pool, None);
+        let token = with_host_token(&mut st);
+        assert_eq!(send(&st, "POST", "/orders/submit", Cred::Bearer(&token), Some(serde_json::json!({}))).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(send(&st, "GET", "/portfolios", Cred::Bearer(&token), None).await.0, StatusCode::UNAUTHORIZED);
+        assert!(host_context().principal_id.is_nil());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn host_token_accepted_from_loopback() {
+        let pool = migrated_db().await;
+        let mut st = state(pool.clone(), Some(LEGACY_PW));
+        let token = with_host_token(&mut st);
+        assert_eq!(send(&st, "GET", "/admin/users", Cred::Bearer(&token), None).await.0, StatusCode::OK);
+        assert_eq!(send(&st, "GET", "/admin/users", Cred::Bearer("not-the-token"), None).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// What `oms setup sync-broker` does: an admin mutation from the host,
+    /// after the legacy password has been cut over. Audited as `host-cli`.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn host_token_admin_post_works_after_cutover() {
+        let pool = migrated_db().await;
+        let mut st = state(pool.clone(), Some(LEGACY_PW));
+        let token = with_host_token(&mut st);
+        mfa_admin(&st, &email()).await;
+        assert!(!legacy_admin_enabled(&pool).await.unwrap());
+        assert_eq!(send(&st, "GET", "/admin/users", Cred::Bearer(LEGACY_PW), None).await.0, StatusCode::FORBIDDEN);
+
+        let (status, body) =
+            send(&st, "POST", BOOTSTRAP_PATH, Cred::Bearer(&token), Some(serde_json::json!({ "email": email() }))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let id: Uuid = serde_json::from_str::<serde_json::Value>(&body).unwrap()["user_id"].as_str().unwrap().parse().unwrap();
+        let (status, body) = send(
+            &st,
+            "PUT",
+            &format!("/admin/users/{id}/admin"),
+            Cred::Bearer(&token),
+            Some(serde_json::json!({ "admin": false })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert!(audit_rows(&pool, "admin.bootstrap").await.contains(&(HOST_CLI_ACTOR.to_string(), Some(id))));
+        assert_eq!(audit_rows(&pool, "admin.revoked").await, vec![(HOST_CLI_ACTOR.to_string(), Some(id))]);
     }
 }

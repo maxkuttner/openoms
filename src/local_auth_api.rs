@@ -561,7 +561,7 @@ async fn rotate_verified(state: &AppState, session: &SessionRecord, headers: &He
             // proven they can sign in (password + TOTP). A failure here only
             // delays the cutover to their next sign-in; it must not fail this one.
             if let Err(e) = crate::admin_bootstrap::disable_legacy_after_mfa(state.pool(), session.principal_id).await {
-                tracing::warn!(error = %e, "could not record the legacy admin cutover");
+                tracing::error!(error = %e, "could not record the legacy admin cutover");
             }
             with_cookie(res, session_cookie(state, &token.plaintext))
         }

@@ -1469,7 +1469,7 @@ async fn serve() {
         public_base_url,
     };
 
-    let state = AppState::new(
+    let mut state = AppState::new(
         pool,
         legacy_admin_password,
         BrokerRegistry::new(),
@@ -1480,6 +1480,12 @@ async fn serve() {
         std::sync::Arc::new(market_data),
         session_config,
     );
+    // A fresh host token every boot, for `oms` CLI commands on this machine.
+    let token_path = admin_bootstrap::host_token_path();
+    match admin_bootstrap::write_host_token(&token_path) {
+        Ok(hash) => state.host_token_hash = Some(hash),
+        Err(e) => warn!(path = %token_path.display(), error = %e, "could not write the host token; host CLI admin calls will be refused"),
+    }
     state.swap_registries(registry, daily_stats);
     if let Err(e) = state.strategies().reload(state.pool()).await {
         error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");

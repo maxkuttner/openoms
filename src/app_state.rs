@@ -87,6 +87,9 @@ pub struct AppState {
     /// reads and `bootstrap-admin` (see `auth::admin_middleware`). `None`
     /// when none is configured: there is no built-in default.
     pub legacy_admin_password: Option<String>,
+    /// SHA-256 of this boot's host token (see `admin_bootstrap::write_host_token`);
+    /// `None` when none was written. Only loopback peers may present it.
+    pub host_token_hash: Option<String>,
     /// Cookie policy + TTLs for browser sessions. Derived once at boot from
     /// the OIDC public base URL, or the bind address when OIDC is off (see
     /// `sessions::cookie_policy`) rather than per request, and carried whole
@@ -148,6 +151,7 @@ impl AppState {
         Self {
             pool,
             legacy_admin_password,
+            host_token_hash: None,
             session_config,
             oidc_status: Arc::new(std::sync::RwLock::new(OidcStatus::default())),
             registry: Arc::new(ArcSwap::from_pointee(registry)),
