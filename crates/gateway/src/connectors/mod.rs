@@ -67,6 +67,8 @@ pub struct Manifest {
     pub exec_stream: bool,
     /// Its session owns a running logon (FIX): a credential change needs a
     /// restart, and on reload the running adapter is carried forward instead.
+    /// The default for `Connector::session_bound`; a connector whose transport
+    /// is chosen per environment answers there instead.
     pub session_bound: bool,
     /// Skips the strategy price band: the venue has no reference price for
     /// the band to compare against (no quotes), while every other venue
@@ -122,6 +124,12 @@ pub trait Connector: Send + Sync {
     /// Build the adapter (and start a FIX session) for one connection. `Err` is
     /// the reason the connection is reported failed.
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String>;
+
+    /// Whether a connection in `env` owns a running logon that cannot be
+    /// swapped under itself (see `Manifest::session_bound`).
+    fn session_bound(&self, _env: &str) -> bool {
+        self.manifest().session_bound
+    }
 
     /// Check a credential against the venue before it is saved, where that is
     /// cheap and side-effect free.

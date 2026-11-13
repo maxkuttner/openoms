@@ -61,6 +61,13 @@ impl Connector for Binance {
     /// environment. `fix` runs one FIX session for order entry and execution
     /// reports; `rest` runs the REST adapter plus the WS user-data stream, built
     /// from the same stored credential.
+    /// Only the FIX transport is session-bound; the default REST transport
+    /// rebuilds on reload like any other REST connector.
+    fn session_bound(&self, env: &str) -> bool {
+        crate::adapter::Transport::from_env(&format!("BINANCE_{env}"), crate::adapter::Transport::Rest)
+            == crate::adapter::Transport::Fix
+    }
+
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
         use crate::adapter::Transport;
         match Transport::from_env(&format!("BINANCE_{env}"), Transport::Rest) {
