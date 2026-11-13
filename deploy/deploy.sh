@@ -9,8 +9,7 @@ cd "$(dirname "$0")/.."
 HOST="${OMS_DEPLOY_HOST:-100.80.233.3}"
 REF="${1:-HEAD}"
 REMOTE_SRC="${OMS_DEPLOY_DIR:-/opt/oms}/src"
-# Compose interpolation (the required Authentik secrets) reads this, not the
-# oms service env_file.
+# Compose interpolation reads this file too, not just the oms service env_file.
 CONFIG_DIR="${OMS_DEPLOY_CONFIG_DIR:-/opt/oms/config}"
 DC="docker compose --env-file $CONFIG_DIR/.env -f deploy/docker-compose.yml"
 

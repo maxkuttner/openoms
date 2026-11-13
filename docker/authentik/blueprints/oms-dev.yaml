@@ -1,6 +1,8 @@
 # Dev blueprint: the `oms` OAuth2/OpenID provider and application, so the local
-# Authentik needs no console clicking. DEV ONLY: the client secret below is
-# public; production creates its own secret (see the setup docs).
+# Authentik fixture (root docker-compose.yml, profile `oidc`) needs no console
+# clicking. LOCAL DEV ONLY: the client secret below is public, and the OMS
+# refuses `oms-dev-secret` unless the issuer is on loopback. For anything real,
+# use your own identity provider.
 #
 # Issuer: <authentik>/application/o/oms/   (per-provider issuer mode)
 # email_verified: a custom `email` scope mapping (below) replaces the stock one,
@@ -43,7 +45,7 @@ entries:
         - matching_mode: strict
           url: http://localhost:3001/auth/callback
         - matching_mode: strict
-          url: https://fedora-8gb-fsn1-1.tail291892.ts.net/auth/callback
+          url: http://localhost:3001/auth/oidc/callback
       signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
       property_mappings:
         - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-openid]]

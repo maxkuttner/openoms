@@ -10,10 +10,12 @@
 #                                    target database's encrypted columns
 #   /opt/oms/config/.env           — POSTGRES_PASSWORD=..., OMS_PASSWORD=...,
 #                                    and (with [auth.oidc] configured)
-#                                    OMS_OIDC_CLIENT_SECRET=oms-dev-secret,
-#                                    plus OMS_AUTHENTIK_SECRET_KEY,
-#                                    OMS_AUTHENTIK_PG_PASSWORD and
-#                                    OMS_AUTHENTIK_BOOTSTRAP_PASSWORD (required)
+#                                    OMS_OIDC_CLIENT_SECRET=<your provider's
+#                                    real client secret>
+#
+# No identity provider runs here: point [auth.oidc] in oms.toml at any OIDC
+# issuer you already have (see deploy/README.md). Authentik is only an opt-in
+# local dev fixture (root docker-compose.yml, profile "oidc").
 services:
   oms:
     build:
@@ -26,82 +28,3 @@ services:
     volumes:
       - ${OMS_DEPLOY_CONFIG_DIR:-/opt/oms/config}/oms.toml:/app/oms.toml:ro
     restart: unless-stopped
-
-  # Authentik, the identity provider for /trade/ sign-in. Same blueprint as the
-  # local docker-compose.yml at the repo root (docker/authentik/blueprints),
-  # which registers this box's tailscale HTTPS name as a second redirect URI.
-  # Authentik sits behind Tailscale Serve, so the OMS issuer must be its https
-  # front door (src/oidc.rs refuses non-https, non-loopback endpoints).
-  #
-  # OMS_AUTHENTIK_SECRET_KEY, OMS_AUTHENTIK_PG_PASSWORD and
-  # OMS_AUTHENTIK_BOOTSTRAP_PASSWORD are REQUIRED (no defaults: this stack is
-  # exposed on the tailnet). Compose interpolation does not read the oms
-  # service's env_file, so deploy.sh passes `--env-file` for the same .env;
-  # do the same when running compose by hand. Authentik 2026.8 needs no Redis.
-  authentik-postgres:
-    container_name: oms-test-authentik-postgres
-    image: docker.io/library/postgres:16-alpine
-    environment:
-      POSTGRES_DB: authentik
-      POSTGRES_USER: authentik
-      POSTGRES_PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:?set in /opt/oms/config/.env}
-    volumes:
-      - oms-test-authentik-pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-
-  authentik-server:
-    container_name: oms-test-authentik-server
-    image: ghcr.io/goauthentik/server:2026.8.5
-    command: server
-    environment: &authentik-env
-      AUTHENTIK_SECRET_KEY: ${OMS_AUTHENTIK_SECRET_KEY:?set in /opt/oms/config/.env}
-      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
-      AUTHENTIK_POSTGRESQL__NAME: authentik
-      AUTHENTIK_POSTGRESQL__USER: authentik
-      AUTHENTIK_POSTGRESQL__PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:?set in /opt/oms/config/.env}
-      AUTHENTIK_BOOTSTRAP_PASSWORD: ${OMS_AUTHENTIK_BOOTSTRAP_PASSWORD:?set in /opt/oms/config/.env}
-      AUTHENTIK_BOOTSTRAP_EMAIL: akadmin@example.com
-      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
-    depends_on:
-      authentik-postgres:
-        condition: service_healthy
-    ports:
-      - "127.0.0.1:9000:9000"
-    volumes:
-      - oms-test-authentik-data:/data
-      - ../docker/authentik/blueprints:/blueprints/custom:ro
-    healthcheck:
-      test: ["CMD", "ak", "healthcheck"]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 60s
-    restart: unless-stopped
-
-  authentik-worker:
-    container_name: oms-test-authentik-worker
-    image: ghcr.io/goauthentik/server:2026.8.5
-    command: worker
-    environment: *authentik-env
-    depends_on:
-      authentik-postgres:
-        condition: service_healthy
-    volumes:
-      - oms-test-authentik-data:/data
-      - ../docker/authentik/blueprints:/blueprints/custom:ro
-    healthcheck:
-      test: ["CMD", "ak", "healthcheck"]
-      interval: 15s
-      timeout: 10s
-      retries: 20
-      start_period: 60s
-    restart: unless-stopped
-
-volumes:
-  oms-test-authentik-pgdata:
-  oms-test-authentik-data:

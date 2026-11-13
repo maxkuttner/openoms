@@ -38,8 +38,12 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
-  # A disposable identity provider (Authentik) for exercising OIDC login end
-  # to end.
+  # DEV-ONLY, OPTIONAL: a disposable local SSO test provider (Authentik) for
+  # exercising OIDC login end to end. The OMS works with any OIDC issuer
+  # (Entra, Google, Okta, Keycloak, Authentik, ...); this is just a convenient
+  # one to test against. It is not used by the deploy, and its blueprint client
+  # secret `oms-dev-secret` is public, so the OMS refuses it unless the issuer
+  # is on loopback: this fixture only works for local development.
   #
   # Not part of the default `docker compose up -d` — it lives under the `oidc`
   # profile, so it only starts when explicitly asked for and stays out of CI
@@ -50,7 +54,8 @@ services:
   #
   # docker/authentik/blueprints/oms-dev.yaml is picked up by the worker on
   # boot and creates the `oms` provider + application (client secret
-  # `oms-dev-secret`, redirect URI `http://localhost:3001/auth/callback`).
+  # `oms-dev-secret`, redirect URIs `http://localhost:3001/auth/callback` and
+  # `http://localhost:3001/auth/oidc/callback`).
   # First start takes a minute or two while Authentik migrates its database.
   # Point `oms.toml` at it:
   #

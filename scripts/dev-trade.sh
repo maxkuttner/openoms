@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# One command for the trader-webapp dev loop: brings up Postgres + the disposable
-# Authentik (oidc profile), starts the OMS, starts the cockpit vite dev server, and
-# opens the trade app. Ctrl-C tears down the two background processes it started
+# One command for the trader-webapp dev loop: brings up Postgres + the optional
+# local SSO test provider, Authentik (oidc profile; any OIDC issuer works with
+# [auth.oidc], this one is just a dev fixture), starts the OMS, starts the
+# cockpit vite dev server, and opens the trade app. Ctrl-C tears down the two background processes it started
 # (docker containers are left running — they're cheap to leave up between runs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -35,9 +36,9 @@ echo "waiting for vite..."
 until curl -sf http://localhost:5173 -o /dev/null; do sleep 1; done
 
 echo
-echo "trade app:  http://localhost:5173/trade.html  (sign in through Authentik; invite yourself first)"
+echo "trade app:  http://localhost:5173/trade.html  (sign in through the local Authentik test provider; invite yourself first)"
 echo "admin console: http://localhost:5173/"
-echo "authentik admin: http://localhost:9000/if/admin/  (akadmin / admin)"
+echo "local test provider (Authentik) admin: http://localhost:9000/if/admin/  (akadmin / admin)"
 echo "  the oms provider + application come from docker/authentik/blueprints/oms-dev.yaml;"
 echo "  oms.toml: [auth.oidc] issuer = \"http://localhost:9000/application/o/oms/\", client_id = \"oms\""
 echo "documentation page: https://openoms.dev/ (docs)"

@@ -32,8 +32,15 @@ bind_addr = "0.0.0.0:3001"
 admin_password = "<a fresh one — this is a bearer token, not tied to the DB>"
 ```
 
-No `[auth.oidc]` block: this deploy skips login, admin console only (bearer
-token). Add one later if the trade app's login flow needs testing here too.
+The deploy runs only the OMS; no identity provider container is started. To
+enable SSO sign-in, add an `[auth.oidc]` block pointing at any OIDC issuer you
+already have (Entra, Google, Okta, Keycloak, Authentik, ...) with its
+`issuer`, `client_id` and `public_base_url`, and put the provider's real client
+secret in `.env` as `OMS_OIDC_CLIENT_SECRET`. The issuer must be https (or
+loopback), and the repository's public dev secret `oms-dev-secret` is refused
+off-loopback. Without the block, sign-in is local accounts only. The Authentik
+in the root `docker-compose.yml` (profile `oidc`) is a local dev fixture, not
+part of this deploy.
 
 **Important**: `master_key` decrypts already-stored secrets (broker
 credentials, etc.) in whichever database this points at. If it's pointed at
