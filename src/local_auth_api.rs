@@ -229,7 +229,9 @@ async fn burn_verify(password: &str) {
 /// material must not survive a new sign-in.
 async fn drop_prior_session(state: &AppState, headers: &HeaderMap) {
     if let Ok(prior) = current_session(state, headers).await {
-        let _ = sessions::revoke_session(state.pool(), prior.id).await;
+        if sessions::revoke_session(state.pool(), prior.id).await.is_ok() {
+            state.event_bus().publish_auth_changed(prior.principal_id);
+        }
     }
 }
 
@@ -557,6 +559,8 @@ async fn rotate_verified(state: &AppState, session: &SessionRecord, headers: &He
     .await
     {
         Ok(Some(token)) => {
+            // the old session is revoked: its open sockets close now, not at the next tick
+            state.event_bus().publish_auth_changed(session.principal_id);
             // The legacy shared admin password stops once a named admin has
             // proven they can sign in (password + TOTP). A failure here only
             // delays the cutover to their next sign-in; it must not fail this one.

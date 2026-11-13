@@ -131,7 +131,7 @@ impl StreamScope {
 
 /// What authenticated the socket, re-checked on every tick and on every
 /// [`AuthChanged`] for its principal.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Credential {
     /// A browser session, by token hash: live, not revoked, under its absolute
     /// cap, principal ACTIVE (all enforced by `lookup_session` + `keepalive_step`).
@@ -140,6 +140,9 @@ pub enum Credential {
     ApiKey(String),
     /// Anything else (host token, strategy session): principal ACTIVE.
     Principal,
+    /// Tests only: revoked once the flag is set.
+    #[cfg(test)]
+    TestSwitch(std::sync::Arc<std::sync::atomic::AtomicBool>),
 }
 
 /// Result of re-checking a [`Credential`].
@@ -176,6 +179,8 @@ impl Credential {
                 .await?;
                 Ok(valid(ok))
             }
+            #[cfg(test)]
+            Credential::TestSwitch(revoked) => Ok(valid(!revoked.load(std::sync::atomic::Ordering::SeqCst))),
             Credential::Principal => {
                 let ok: bool =
                     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM principal WHERE id = $1 AND status = 'ACTIVE')")
@@ -281,6 +286,24 @@ pub async fn pump(lanes: Lanes, out: mpsc::Sender<UiNotice>, mut viewer: Viewer)
 
     loop {
         let notices: Vec<UiNotice> = tokio::select! {
+            // auth first: a revocation ready alongside an order event wins
+            biased;
+            r = auth_rx.recv(), if auth_open => {
+                match r {
+                    Ok(AuthChanged { principal_id }) if principal_id != viewer.principal_id => continue,
+                    // a missed announcement might have been ours: re-check to be safe
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        auth_open = false;
+                        continue;
+                    }
+                }
+                if !viewer.recheck().await {
+                    let _ = out.send(UiNotice::AuthRevoked).await;
+                    return;
+                }
+                continue;
+            }
             r = order_rx.recv(), if order_open => {
                 if matches!(r, Err(broadcast::error::RecvError::Closed)) {
                     order_open = false;
@@ -299,22 +322,6 @@ pub async fn pump(lanes: Lanes, out: mpsc::Sender<UiNotice>, mut viewer: Viewer)
                     // marks conflate anyway: skipping ahead loses nothing
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => price_open = false,
-                }
-                continue;
-            }
-            r = auth_rx.recv(), if auth_open => {
-                match r {
-                    Ok(AuthChanged { principal_id }) if principal_id != viewer.principal_id => continue,
-                    // a missed announcement might have been ours: re-check to be safe
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => {
-                        auth_open = false;
-                        continue;
-                    }
-                }
-                if !viewer.recheck().await {
-                    let _ = out.send(UiNotice::AuthRevoked).await;
-                    return;
                 }
                 continue;
             }
@@ -367,11 +374,17 @@ pub async fn ws_updates(
     if !upgrade_allowed(&headers, state.session_config.public_base_url.as_deref()) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let Some(credential) = socket_credential(&auth, &headers, &state.session_config.cookie_policy) else {
+        // authenticated by a session or key we cannot read back: never fall
+        // back to a weaker check, refuse the socket
+        tracing::warn!(principal_id = %auth.principal_id, auth_method = ?auth.auth_method,
+            "live-update socket refused: its credential cannot be re-checked");
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     let scope = match StreamScope::load(state.pool(), auth.principal_id).await {
         Ok(scope) => scope,
         Err(err) => return crate::handlers::internal("failed to load permissions", err).into_response(),
     };
-    let credential = socket_credential(&auth, &headers, &state.session_config.cookie_policy);
     let viewer = Viewer { pool: state.pool().clone(), principal_id: auth.principal_id, credential, scope };
     // subscribe before the handshake completes, so nothing published in between is missed
     let lanes = Lanes::subscribe(state.event_bus());
@@ -380,21 +393,20 @@ pub async fn ws_updates(
 
 /// The credential to re-check for this socket. A browser session is keyed by
 /// its cookie; an API key by its `key_id` (the auth middleware already
-/// verified the secret); anything else by the principal alone.
-fn socket_credential(auth: &AuthContext, headers: &HeaderMap, policy: &crate::sessions::CookiePolicy) -> Credential {
+/// verified the secret); the host token by the principal alone. `None` when a
+/// session or key context carries no readable cookie/key: the caller refuses.
+///
+/// Revocations made outside this process (e.g. `oms auth recover-admin`) are
+/// never announced on the bus; the 15 s heartbeat re-check is their bound.
+fn socket_credential(auth: &AuthContext, headers: &HeaderMap, policy: &crate::sessions::CookiePolicy) -> Option<Credential> {
     use crate::auth::AuthMethod;
     match auth.auth_method {
         AuthMethod::Oidc | AuthMethod::Local | AuthMethod::LegacyAdmin => {
-            match crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy)) {
-                Some(token) => Credential::Session(crate::sessions::hash_session_token(&token)),
-                None => Credential::Principal,
-            }
+            crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy))
+                .map(|token| Credential::Session(crate::sessions::hash_session_token(&token)))
         }
-        AuthMethod::ApiKey => match crate::auth::trading_key_id(headers) {
-            Some(key_id) => Credential::ApiKey(key_id),
-            None => Credential::Principal,
-        },
-        AuthMethod::HostCli => Credential::Principal,
+        AuthMethod::ApiKey => crate::auth::trading_key_id(headers).map(Credential::ApiKey),
+        AuthMethod::HostCli => Some(Credential::Principal),
     }
 }
 
@@ -541,7 +553,8 @@ mod tests {
 
         let state = test_app_state(pool);
         let bus = state.event_bus().clone();
-        let auth = AuthContext::machine(me, code);
+        // the host token: re-checked by principal alone, so no header is needed
+        let auth = AuthContext { auth_method: crate::auth::AuthMethod::HostCli, ..AuthContext::machine(me, code) };
         let app = axum::Router::new()
             .route("/updates", axum::routing::get(ws_updates))
             .layer(axum::Extension(auth))
@@ -706,6 +719,90 @@ mod tests {
             .expect("open socket")
             .expect("frame");
         assert_eq!(frame.into_text().unwrap(), r#"{"type":"orders"}"#);
+    }
+
+    #[test]
+    fn credential_is_unreadable_for_a_session_or_key_context_without_it() {
+        use crate::auth::AuthMethod;
+        let policy = crate::sessions::cookie_policy("localhost:3001", None);
+        let ctx = |m| AuthContext { auth_method: m, ..AuthContext::machine(Uuid::nil(), "x".into()) };
+        let none = HeaderMap::new();
+        for m in [AuthMethod::Oidc, AuthMethod::Local, AuthMethod::LegacyAdmin, AuthMethod::ApiKey] {
+            assert!(socket_credential(&ctx(m), &none, &policy).is_none(), "{m:?}");
+        }
+        assert!(matches!(socket_credential(&ctx(AuthMethod::HostCli), &none, &policy), Some(Credential::Principal)));
+        let mut bearer = HeaderMap::new();
+        bearer.insert("authorization", "Bearer ak_1.secret".parse().unwrap());
+        assert!(matches!(socket_credential(&ctx(AuthMethod::ApiKey), &bearer, &policy), Some(Credential::ApiKey(k)) if k == "ak_1"));
+    }
+
+    /// A session-authenticated upgrade whose cookie cannot be read back is
+    /// refused (401), never downgraded to a principal-only check.
+    #[tokio::test]
+    async fn upgrade_refused_when_credential_cannot_be_rechecked() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://localhost/oms_test_never_connects").unwrap();
+        let state = crate::handlers::tests::test_app_state(pool);
+        let auth = AuthContext {
+            auth_method: crate::auth::AuthMethod::Local,
+            mfa: true,
+            ..AuthContext::machine(Uuid::new_v4(), "nocookie".into())
+        };
+        let app = axum::Router::new()
+            .route("/updates", axum::routing::get(ws_updates))
+            .layer(axum::Extension(auth))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        match tokio_tungstenite::connect_async(format!("ws://{addr}/updates")).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), StatusCode::UNAUTHORIZED),
+            other => panic!("expected a 401, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// A viewer whose credential is a test switch: no database involved, so
+    /// tokio's paused clock is safe (a real pool's timeouts would fire under it).
+    fn switchable(portfolio: Uuid) -> (Viewer, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let revoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut v = nobody();
+        v.credential = Credential::TestSwitch(revoked.clone());
+        v.scope.positions = [portfolio].into();
+        (v, revoked)
+    }
+
+    /// A revocation nobody announced (another process, a direct DB change) is
+    /// caught by the heartbeat tick alone, and nothing follows it.
+    #[tokio::test(start_paused = true)]
+    async fn tick_alone_closes_a_socket_revoked_without_an_announcement() {
+        let bus = crate::event_bus::EventBus::new();
+        let (out, mut rx) = tokio::sync::mpsc::channel(64);
+        let (viewer, revoked) = switchable(Uuid::from_u128(5));
+        tokio::spawn(pump(Lanes::subscribe(&bus), out, viewer));
+        revoked.store(true, std::sync::atomic::Ordering::SeqCst); // no publish
+        tokio::time::sleep(std::time::Duration::from_secs(HEARTBEAT_SECS - 1)).await;
+        assert!(rx.try_recv().is_err(), "still open before the tick");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert_eq!(rx.recv().await, Some(UiNotice::Heartbeat));
+        assert_eq!(rx.recv().await, Some(UiNotice::AuthRevoked));
+        bus.publish_order(OrderLaneEvent::PositionChanged { portfolio_id: Uuid::from_u128(5), instrument_id: "1".into() });
+        assert_eq!(rx.recv().await, None, "the pump ended: nothing after auth_revoked");
+    }
+
+    /// An event visible to the viewer, ready together with the revoking
+    /// announcement, never reaches the socket. (Conflation alone already holds
+    /// it until the next flush; `biased` additionally handles the auth lane first.)
+    #[tokio::test(start_paused = true)]
+    async fn auth_change_wins_over_a_simultaneous_event() {
+        let bus = crate::event_bus::EventBus::new();
+        let (out, mut rx) = tokio::sync::mpsc::channel(64);
+        let (viewer, revoked) = switchable(Uuid::from_u128(5));
+        let lanes = Lanes::subscribe(&bus);
+        revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+        bus.publish_order(OrderLaneEvent::PositionChanged { portfolio_id: Uuid::from_u128(5), instrument_id: "1".into() });
+        bus.publish_auth_changed(Uuid::nil());
+        tokio::spawn(pump(lanes, out, viewer));
+        assert_eq!(rx.recv().await, Some(UiNotice::AuthRevoked));
+        assert_eq!(rx.recv().await, None);
     }
 
     #[tokio::test]

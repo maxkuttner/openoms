@@ -236,6 +236,10 @@ async fn local_invite(
 /// Recovering the sole admin leaves zero ACTIVE admins until they re-enrol,
 /// and the legacy shared password stays disabled if the cutover already
 /// happened: the new link (or the host CLI) is the only way back in.
+///
+/// Run from the CLI (`oms auth recover-admin`), a separate process that cannot
+/// publish `AuthChanged` to the server's event bus: the admin's open live-update
+/// sockets close at their next 15 s heartbeat re-check, which is the bound.
 pub async fn recover(pool: &PgPool, email: &str, actor: &str) -> Result<NewInvite, BootstrapError> {
     let email = normalise_email(email)?;
     let mut tx = pool.begin().await?;
