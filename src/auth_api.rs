@@ -457,7 +457,7 @@ pub async fn callback(
 
     // A live session on this browser is the owner proof a link invite needs.
     let owner_session = match crate::auth::authenticate_session(state.pool(), &headers, &state.session_config).await {
-        Ok(record) => record.map(|r| r.principal_id),
+        Ok(record) => record.map(|r| (r.principal_id, r.mfa_verified_at.is_some())),
         Err(unavailable) => return Ok(unavailable),
     };
     let policy_for_claim = ClaimPolicy { trust_email_verified: auth_state.trust_email_verified, owner_session };

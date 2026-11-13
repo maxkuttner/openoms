@@ -34,6 +34,7 @@ export function accessMessage(reason: string | null, hint: string | null): strin
       return "This invite was revoked.";
     case "email_mismatch":
       return `This invite is for ${hint ?? "another address"}. Sign in with that address, or ask for a new invite.`;
+    // No longer sent by the server; kept for old bookmarked access URLs.
     case "email_unverified":
       return "Your sign-in provider didn't confirm your email address. Use another sign-in method or ask for a new invite.";
     case "pending_approval":

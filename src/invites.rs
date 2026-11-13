@@ -110,8 +110,9 @@ pub struct ClaimPolicy {
     /// invite directly. Off, every invite claim waits for admin approval.
     pub trust_email_verified: bool,
     /// The principal behind a live session cookie on the browser presenting
-    /// the callback. Only that same principal can claim its own link invite.
-    pub owner_session: Option<Uuid>,
+    /// the callback, and whether that session passed MFA. Only that same
+    /// principal, MFA-verified, can claim its own link invite.
+    pub owner_session: Option<(Uuid, bool)>,
 }
 
 impl Default for ClaimPolicy {
@@ -404,7 +405,7 @@ pub async fn resolve_login(
     let proven = if invite.status == "ACTIVE" {
         // A link invite adds a sign-in to an existing account: only that
         // account's own live session proves it, never the mailbox alone.
-        policy.owner_session == Some(invite.principal_id)
+        policy.owner_session == Some((invite.principal_id, true))
     } else {
         let verified_email = identity.email.as_deref().filter(|_| identity.email_verified && policy.trust_email_verified);
         match verified_email {
@@ -658,24 +659,28 @@ pub async fn list_bindings(pool: &PgPool) -> Result<Vec<PendingBinding>, sqlx::E
 /// decision and audit `binding.approved`. Returns the user's id.
 pub async fn approve_binding(pool: &PgPool, binding_id: Uuid, actor: &str) -> Result<Uuid, InviteError> {
     let mut tx = pool.begin().await?;
+    // Lock order is invite → binding, as on the claim path.
+    let invite_id: Uuid = sqlx::query_scalar("SELECT invite_id FROM pending_identity_binding WHERE id = $1")
+        .bind(binding_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(InviteError::NotFound)?;
+    let invite = sqlx::query(&format!("{LOCK_INVITE} WHERE i.id = $1 FOR UPDATE OF i"))
+        .bind(invite_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map(locked_invite)?;
     let binding = sqlx::query(
-        "SELECT invite_id, issuer, subject, display_name FROM pending_identity_binding \
+        "SELECT issuer, subject, display_name FROM pending_identity_binding \
           WHERE id = $1 AND decision IS NULL AND expires_at > now() FOR UPDATE",
     )
     .bind(binding_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(InviteError::NotFound)?;
-    let invite_id: Uuid = binding.get("invite_id");
     let issuer: String = binding.get("issuer");
     let subject: String = binding.get("subject");
     let display_name: Option<String> = binding.get("display_name");
-
-    let invite = sqlx::query(&format!("{LOCK_INVITE} WHERE i.id = $1 FOR UPDATE OF i"))
-        .bind(invite_id)
-        .fetch_one(&mut *tx)
-        .await
-        .map(locked_invite)?;
     if invite.refusal().is_some() {
         return Err(InviteError::NotFound);
     }
@@ -709,7 +714,7 @@ pub async fn reject_binding(pool: &PgPool, binding_id: Uuid, actor: &str) -> Res
         "UPDATE pending_identity_binding b \
             SET decision = 'rejected', decided_at = now(), decided_by = $2 \
            FROM invite i \
-          WHERE b.id = $1 AND b.decision IS NULL AND i.id = b.invite_id \
+          WHERE b.id = $1 AND b.decision IS NULL AND b.expires_at > now() AND i.id = b.invite_id \
          RETURNING i.principal_id, b.issuer, b.subject",
     )
     .bind(binding_id)
@@ -1164,18 +1169,51 @@ mod tests {
         let outcome = resolve_login(&pool, &github, Some(&hash), &ClaimPolicy::default()).await.unwrap();
         assert_eq!(outcome, ClaimOutcome::PendingApproval);
         // Nor is someone else's session.
-        let stranger = ClaimPolicy { trust_email_verified: true, owner_session: Some(Uuid::new_v4()) };
+        let stranger = ClaimPolicy { trust_email_verified: true, owner_session: Some((Uuid::new_v4(), true)) };
         let outcome = resolve_login(&pool, &github, Some(&hash), &stranger).await.unwrap();
         assert_eq!(outcome, ClaimOutcome::PendingApproval);
         assert_eq!(count(&pool, "principal_identity").await, 1);
         assert!(!invite_accepted(&pool, link.invite_id).await);
 
         // The owner's own session links it.
-        let owner = ClaimPolicy { trust_email_verified: true, owner_session: Some(invite.principal_id) };
+        let owner = ClaimPolicy { trust_email_verified: true, owner_session: Some((invite.principal_id, true)) };
         let outcome = resolve_login(&pool, &github, Some(&hash), &owner).await.unwrap();
         assert_eq!(outcome, ClaimOutcome::Linked { principal_id: invite.principal_id, code: "jane".into() });
         assert_eq!(count(&pool, "principal_identity").await, 2);
         assert!(open_bindings(&pool).await.is_empty(), "the linked identity's pending request is closed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn link_invite_with_non_mfa_owner_session_goes_pending() {
+        let pool = migrated_db().await;
+        let invite = invite_jane(&pool).await;
+        claim(&pool, &login(ISSUER, "s1", "jane@fundco.com", true), Some(&invite.token)).await.unwrap();
+        let link = create_link(&pool, invite.principal_id, "admin").await.unwrap();
+        let github = login("https://github.test", "gh-1", "jane@fundco.com", true);
+
+        let no_mfa = ClaimPolicy { trust_email_verified: true, owner_session: Some((invite.principal_id, false)) };
+        let outcome = resolve_login(&pool, &github, Some(&hash_session_token(&link.token)), &no_mfa).await.unwrap();
+        assert_eq!(outcome, ClaimOutcome::PendingApproval);
+        assert_eq!(count(&pool, "principal_identity").await, 1);
+        assert_eq!(open_bindings(&pool).await.len(), 1);
+        assert!(!invite_accepted(&pool, link.invite_id).await);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn expired_binding_cannot_be_rejected() {
+        let pool = migrated_db().await;
+        let invite = invite_jane(&pool).await;
+        claim(&pool, &login(ISSUER, "entra-1", "jane@fundco.com", false), Some(&invite.token)).await.unwrap();
+        let (binding, ..) = open_bindings(&pool).await[0];
+        sqlx::query("UPDATE pending_identity_binding SET expires_at = now() - interval '1 minute' WHERE id = $1")
+            .bind(binding)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(matches!(reject_binding(&pool, binding, "ada").await, Err(InviteError::NotFound)));
+        assert!(matches!(approve_binding(&pool, binding, "ada").await, Err(InviteError::NotFound)));
     }
 
     #[tokio::test]
@@ -1535,7 +1573,7 @@ mod tests {
         let link = create_link(&pool, invite.principal_id, "admin").await.unwrap();
         assert_eq!(link.principal_id, invite.principal_id);
         let github = login("https://github.test", "gh-1", "jane@fundco.com", true);
-        let owner = ClaimPolicy { trust_email_verified: true, owner_session: Some(invite.principal_id) };
+        let owner = ClaimPolicy { trust_email_verified: true, owner_session: Some((invite.principal_id, true)) };
         let outcome = resolve_login(&pool, &github, Some(&hash_session_token(&link.token)), &owner).await.unwrap();
         assert_eq!(outcome, ClaimOutcome::Linked { principal_id: invite.principal_id, code: "jane".into() });
         assert_eq!(status(&pool, invite.principal_id).await, "ACTIVE");
