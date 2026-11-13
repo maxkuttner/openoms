@@ -9,7 +9,7 @@ use axum::Json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::auth::AuthContext;
+use crate::auth::{AuthContext, AuthMethod};
 use crate::domain::orders::state::{OrderSide, OrderType, TimeInForce};
 use crate::handlers::tests::{seed_instrument, seed_order_state, test_app_state, test_pool};
 use crate::handlers::{self, BlotterFilter, SubmitOrderRequest};
@@ -34,10 +34,8 @@ async fn user(pool: &PgPool, role: &str, kind: &str) -> AuthContext {
         .execute(pool)
         .await
         .expect("seed role");
-    AuthContext {
-        principal_id: id,
-        principal_code: code,
-    }
+    // A human who signed in and passed MFA; the MFA tests below take it away.
+    AuthContext { principal_id: id, principal_code: code, auth_method: AuthMethod::Oidc, mfa: true }
 }
 
 async fn grant(pool: &PgPool, principal_id: Uuid, portfolio_id: Uuid, can_trade: bool) {
@@ -406,7 +404,7 @@ async fn strategy_of(pool: &PgPool, owner: Uuid) -> AuthContext {
     .execute(pool)
     .await
     .unwrap();
-    service
+    AuthContext::machine(service.principal_id, service.principal_code)
 }
 
 #[tokio::test]
@@ -561,4 +559,108 @@ async fn trader_with_trade_grant_can_allocate_to_visible_targets() {
     grant(&pool, trader.principal_id, a, false).await;
     grant(&pool, trader.principal_id, b, true).await;
     assert_eq!(allocate(&pool, &trader, order_id, &[a, b]).await, Ok(2));
+}
+
+// --- MFA gate -------------------------------------------------------------
+
+const MFA_REQUIRED: &str = r#"{"error":"mfa_required"}"#;
+
+fn local(ctx: &AuthContext, mfa: bool) -> AuthContext {
+    AuthContext { auth_method: AuthMethod::Local, mfa, ..ctx.clone() }
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; run with --ignored"]
+async fn local_session_without_mfa_cannot_submit() {
+    let pool = test_pool().await;
+    let me = local(&user(&pool, "trader", "HUMAN").await, false);
+    let (portfolio, instrument) = tradeable_portfolio(&pool).await;
+    grant(&pool, me.principal_id, portfolio, true).await;
+
+    let (_, req) = submit_request(portfolio, instrument);
+    let err = handlers::orders_submit(State(test_app_state(pool.clone())), Extension(me.clone()), Json(req))
+        .await
+        .expect_err("MFA pending: refused");
+    assert_eq!((err.status, err.message.as_str()), (StatusCode::FORBIDDEN, MFA_REQUIRED));
+
+    // Cancel is an order action too.
+    let order_id = order_in(&pool, me.principal_id, portfolio).await;
+    assert_eq!(may_cancel(&pool, &me, order_id).await, Ok(false));
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; run with --ignored"]
+async fn local_session_with_mfa_can_submit() {
+    let pool = test_pool().await;
+    let me = local(&user(&pool, "trader", "HUMAN").await, true);
+    let (portfolio, instrument) = tradeable_portfolio(&pool).await;
+    grant(&pool, me.principal_id, portfolio, true).await;
+
+    assert_eq!(submit(&pool, &me, portfolio, instrument).await.1, StatusCode::SERVICE_UNAVAILABLE, "authorized; only routing fails");
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; run with --ignored"]
+async fn local_session_without_mfa_can_read_orders() {
+    let pool = test_pool().await;
+    let me = local(&user(&pool, "trader", "HUMAN").await, false);
+    let (mine, portfolio) = order(&pool, me.principal_id).await;
+    grant(&pool, me.principal_id, portfolio, true).await;
+
+    assert!(listed(&pool, &me).await.contains(&mine));
+}
+
+#[tokio::test]
+#[ignore = "needs a live Postgres; run with --ignored"]
+async fn api_key_unaffected_by_mfa_gate() {
+    let pool = test_pool().await;
+    let human = user(&pool, "trader", "HUMAN").await;
+    let key = AuthContext::machine(human.principal_id, human.principal_code.clone());
+    assert!(!key.mfa);
+    let (portfolio, instrument) = tradeable_portfolio(&pool).await;
+    grant(&pool, key.principal_id, portfolio, true).await;
+
+    assert_eq!(submit(&pool, &key, portfolio, instrument).await.1, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+fn oidc_login(claims: serde_json::Value, require_amr: &[&str]) -> AuthContext {
+    let required: Vec<String> = require_amr.iter().map(|s| s.to_string()).collect();
+    AuthContext {
+        principal_id: Uuid::new_v4(),
+        principal_code: "oidc-user".into(),
+        auth_method: AuthMethod::Oidc,
+        mfa: crate::oidc::amr_satisfied(&claims, &required),
+    }
+}
+
+#[test]
+fn oidc_session_ok_when_no_amr_required() {
+    let ctx = oidc_login(serde_json::json!({}), &[]);
+    assert!(crate::authz::require_mfa(&ctx).is_ok(), "the IdP's own policy is trusted");
+}
+
+#[test]
+fn oidc_session_refused_when_amr_required_and_missing() {
+    for claims in [serde_json::json!({}), serde_json::json!({ "amr": ["pwd"] }), serde_json::json!({ "amr": "mfa" })] {
+        let err = crate::authz::require_mfa(&oidc_login(claims.clone(), &["mfa"])).expect_err("amr missing");
+        assert_eq!((err.status, err.message.as_str()), (StatusCode::FORBIDDEN, MFA_REQUIRED), "{claims}");
+    }
+    let partial = oidc_login(serde_json::json!({ "amr": ["pwd"] }), &["pwd", "otp"]);
+    assert!(crate::authz::require_mfa(&partial).is_err(), "every listed value is required");
+    let full = oidc_login(serde_json::json!({ "amr": ["pwd", "otp"] }), &["pwd", "otp"]);
+    assert!(crate::authz::require_mfa(&full).is_ok());
+}
+
+#[test]
+fn admin_mutation_needs_mfa() {
+    use axum::http::Method;
+    let admin = |auth_method, mfa| AuthContext { principal_id: Uuid::new_v4(), principal_code: "a".into(), auth_method, mfa };
+    let gate = crate::auth::admin_mfa_gate;
+
+    let err = gate(&Method::POST, &admin(AuthMethod::Local, false)).expect_err("local, no TOTP");
+    assert_eq!((err.status, err.message.as_str()), (StatusCode::FORBIDDEN, MFA_REQUIRED));
+    assert!(gate(&Method::DELETE, &admin(AuthMethod::Oidc, false)).is_err(), "OIDC without required amr");
+    assert!(gate(&Method::GET, &admin(AuthMethod::Local, false)).is_ok(), "reads need no MFA");
+    assert!(gate(&Method::PUT, &admin(AuthMethod::Local, true)).is_ok());
+    assert!(gate(&Method::POST, &crate::admin_bootstrap::host_context()).is_ok(), "host-cli is a machine credential");
 }

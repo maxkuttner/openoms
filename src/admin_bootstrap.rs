@@ -28,7 +28,12 @@ pub const BOOTSTRAP_PATH: &str = "/admin/users/bootstrap-admin";
 /// The synthetic context of the legacy password. The nil UUID never exists in
 /// `principal`, so no authz or trading check can ever pass for it.
 pub fn legacy_context() -> AuthContext {
-    AuthContext { principal_id: Uuid::nil(), principal_code: LEGACY_ACTOR.to_string() }
+    AuthContext {
+        principal_id: Uuid::nil(),
+        principal_code: LEGACY_ACTOR.to_string(),
+        auth_method: crate::auth::AuthMethod::LegacyAdmin,
+        mfa: false,
+    }
 }
 
 /// What `legacy-admin` may do: read anything under `/admin`, and create a
@@ -345,7 +350,12 @@ pub fn host_call_error(status: u16, body: &str) -> String {
 /// The synthetic context of the host token: actor `host-cli`, the nil UUID
 /// (never a `principal`), so it can never pass a trading or authz check.
 pub fn host_context() -> AuthContext {
-    AuthContext { principal_id: Uuid::nil(), principal_code: HOST_CLI_ACTOR.to_string() }
+    AuthContext {
+        principal_id: Uuid::nil(),
+        principal_code: HOST_CLI_ACTOR.to_string(),
+        auth_method: crate::auth::AuthMethod::HostCli,
+        mfa: false,
+    }
 }
 
 /// Does `token`, from `peer`, match this boot's host token? Only a loopback
@@ -706,7 +716,7 @@ mod tests {
 
         assert_eq!(send(&st, "GET", "/admin/users", Cred::Cookie(&cookie), None).await.0, StatusCode::OK, "reads need no MFA");
         let (status, body) = send(&st, "POST", BOOTSTRAP_PATH, Cred::Cookie(&cookie), Some(new_admin.clone())).await;
-        assert_eq!((status, body.as_str()), (StatusCode::FORBIDDEN, "mfa_required"));
+        assert_eq!((status, body.as_str()), (StatusCode::FORBIDDEN, crate::authz::MFA_REQUIRED_BODY));
         let cookie = verify_totp(&st, &la, &cookie).await;
         assert_eq!(send(&st, "POST", BOOTSTRAP_PATH, Cred::Cookie(&cookie), Some(new_admin)).await.0, StatusCode::OK);
     }

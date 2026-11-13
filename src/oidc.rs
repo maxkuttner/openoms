@@ -50,6 +50,19 @@ pub struct VerifiedIdentity {
     pub claims: serde_json::Value,
 }
 
+/// Does the ID token's `amr` claim (an array of strings) carry every value in
+/// `required`? An empty `required` is always satisfied: the identity
+/// provider's own MFA policy is trusted.
+pub fn amr_satisfied(claims: &serde_json::Value, required: &[String]) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let Some(amr) = claims.get("amr").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    required.iter().all(|r| amr.iter().any(|v| v.as_str() == Some(r.as_str())))
+}
+
 /// Why an ID token was refused. Each variant corresponds to a distinct,
 /// real-world OIDC failure mode — see the task brief's test suite.
 #[derive(Debug, PartialEq, Eq)]

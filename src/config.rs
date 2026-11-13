@@ -226,7 +226,10 @@ pub struct OidcSection {
     /// Accept an `email_verified` claim as proof of the email (default true).
     #[serde(default = "default_true")]
     pub trust_email_verified: bool,
-    /// Authentication methods references (`amr`) the ID token must carry.
+    /// Authentication methods references (`amr`) the ID token must carry for
+    /// the session to count as MFA-verified (order actions and admin changes
+    /// need it). Empty (the default) trusts the identity provider's own MFA
+    /// policy: every OIDC login counts as MFA-verified.
     #[serde(default)]
     pub require_amr: Vec<String>,
 }
@@ -242,7 +245,6 @@ pub struct OidcSettings {
     pub ttl: crate::sessions::SessionTtl,
     #[allow(dead_code)] // used by the OIDC identity task
     pub trust_email_verified: bool,
-    #[allow(dead_code)] // used by the OIDC identity task
     pub require_amr: Vec<String>,
 }
 

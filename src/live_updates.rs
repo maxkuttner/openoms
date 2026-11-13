@@ -439,7 +439,7 @@ mod tests {
 
         let state = test_app_state(pool);
         let bus = state.event_bus().clone();
-        let auth = AuthContext { principal_id: me, principal_code: code };
+        let auth = AuthContext::machine(me, code);
         let app = axum::Router::new()
             .route("/updates", axum::routing::get(ws_updates))
             .layer(axum::Extension(auth))

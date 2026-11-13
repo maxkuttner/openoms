@@ -40,6 +40,7 @@ pub async fn put_limit(
     Path((portfolio_id, instrument_id)): Path<(Uuid, String)>,
     Json(payload): Json<UpdateRiskLimit>,
 ) -> Result<Json<RiskLimit>, ApiError> {
+    crate::authz::require_mfa(&auth)?;
     authz::require(state.pool(), auth.principal_id, Permission::LimitsManage, portfolio_id).await?;
     if let Some(ts) = payload.trading_state.as_deref() {
         validate_trading_state(ts)?;
@@ -115,7 +116,7 @@ mod tests {
             .bind(id).bind(&code).execute(pool).await.unwrap();
         sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2)")
             .bind(id).bind(role).execute(pool).await.unwrap();
-        AuthContext { principal_id: id, principal_code: code }
+        AuthContext::machine(id, code)
     }
 
     async fn portfolio(pool: &PgPool) -> Uuid {

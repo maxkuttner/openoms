@@ -455,6 +455,7 @@ pub enum CancelOutcome {
 /// Validate, risk-check, store and route one order; returns its OMS order id.
 pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderRequest, origin: Origin) -> Result<Uuid, ApiError> {
     info!(?req, principal_id = %auth.principal_id, "submit order received");
+    crate::authz::require_mfa(auth)?;
     let pool = state.pool().clone();
     let event_store = OrderEventStore::new(pool.clone());
     let order_id = Uuid::parse_str(&req.order_id).map_err(|_| ApiError {
@@ -913,6 +914,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
 /// for the caller's own (both need the portfolio grant's `can_trade`).
 pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, reason: Option<String>) -> Result<CancelOutcome, ApiError> {
     info!(%order_id, principal_id = %auth.principal_id, "cancel order received");
+    crate::authz::require_mfa(auth)?;
 
     let pool = app_state.pool().clone();
     let event_store = OrderEventStore::new(pool.clone());
@@ -1230,7 +1232,7 @@ mod tests {
         let state = test_support::state(pool.clone());
         state.strategies().reload(&pool).await.unwrap();
         let s = state.strategies().by_code(&code).unwrap();
-        let other = AuthContext { principal_id: Uuid::new_v4(), principal_code: "someone".into() };
+        let other = AuthContext::machine(Uuid::new_v4(), "someone".into());
         let e = submit(&state, &other, request(s.portfolio_id, "BTCUSDT", "BINANCE"), Origin::Api).await.unwrap_err();
         assert!(e.message.contains("strategy_portfolio"), "{}", e.message);
         test_support::drop_strategy(&pool, &code).await;

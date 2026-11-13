@@ -671,7 +671,7 @@ mod tests {
     /// A named admin acting through these handlers, as `admin_middleware`
     /// would inject it.
     fn actor() -> AuthContext {
-        AuthContext { principal_id: Uuid::nil(), principal_code: "ada".to_string() }
+        AuthContext::machine(Uuid::nil(), "ada".to_string())
     }
 
     async fn state(pool: &PgPool, base: Option<&str>) -> AppState {
@@ -1129,7 +1129,7 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        AuthContext { principal_id: id, principal_code: code }
+        AuthContext::machine(id, code)
     }
 
     async fn is_admin(pool: &PgPool, id: Uuid) -> bool {
@@ -1164,7 +1164,7 @@ mod tests {
         assert_eq!(put_admin(&st, &ada, ada.principal_id, false).await.unwrap(), StatusCode::NO_CONTENT);
         assert!(!is_admin(&pool, ada.principal_id).await);
         assert_eq!(audit_count(&pool, "admin.revoked", ada.principal_id).await, 1);
-        let bob_ctx = AuthContext { principal_id: bob, principal_code: "bob".into() };
+        let bob_ctx = AuthContext::machine(bob, "bob".into());
         assert_eq!(put_admin(&st, &bob_ctx, bob, false).await.unwrap_err().status, StatusCode::CONFLICT);
     }
 

@@ -55,6 +55,7 @@ pub async fn create(
     Extension(auth): Extension<AuthContext>,
     Json(mut p): Json<CreateStrategy>,
 ) -> Result<Json<StrategyRow>, ApiError> {
+    crate::authz::require_mfa(&auth)?;
     authz::require(state.pool(), auth.principal_id, Permission::StrategiesManage, p.portfolio_id).await?;
     may_pick(&state, auth.principal_id, p.portfolio_id, p.owner_principal_id).await?;
     p.principal_id = None;
@@ -69,6 +70,7 @@ pub async fn handover(
     Path(code): Path<String>,
     Json(p): Json<Handover>,
 ) -> Result<Json<StrategyRow>, ApiError> {
+    crate::authz::require_mfa(&auth)?;
     let portfolio: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM strategy WHERE code = $1")
         .bind(&code)
         .fetch_optional(state.pool())
@@ -91,7 +93,7 @@ mod tests {
     use crate::strategies::test_support as ts;
 
     fn ctx(id: uuid::Uuid) -> Extension<AuthContext> {
-        Extension(AuthContext { principal_id: id, principal_code: "t".into() })
+        Extension(AuthContext::machine(id, "t".into()))
     }
 
     #[tokio::test]

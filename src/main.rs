@@ -1708,11 +1708,12 @@ async fn serve() {
                 }
                 Some(client_secret) => {
                     let required_claim = oidc_settings.required_claim.clone();
+                    let require_amr = oidc_settings.require_amr.clone();
                     match oidc::Provider::discover(oidc_settings, client_secret).await {
                         Ok(provider) => {
                             info!("OIDC discovery succeeded — login enabled");
                             oidc_status.discovery_ok = true;
-                            Some(auth_api::AuthApiState { provider: Arc::new(provider), required_claim })
+                            Some(auth_api::AuthApiState { provider: Arc::new(provider), required_claim, require_amr })
                         }
                         Err(e) => {
                             error!(error = ?e, "OIDC discovery failed — login is disabled for this run");
@@ -1761,6 +1762,7 @@ mod tests {
                 "https://oms.example.com",
             )),
             required_claim: None,
+            require_amr: Vec::new(),
         };
         // (local only), (OIDC configured, discovery failed), (neither),
         // then the discovered router: (OIDC only) and (both).

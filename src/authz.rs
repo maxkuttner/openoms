@@ -347,3 +347,24 @@ mod tests {
             .is_empty());
     }
 }
+
+/// The 403 body for an action that needs a session which passed MFA.
+pub const MFA_REQUIRED_BODY: &str = r#"{"error":"mfa_required"}"#;
+
+/// MFA gate for order actions (submit, cancel, allocate), strategy create and
+/// handover, limit changes, and every admin mutation. Reads never call it.
+///
+/// - Machine credentials (API keys, strategies, the host token) are exempt.
+/// - A local-password session must have passed TOTP.
+/// - An OIDC session passes when its login met `[auth.oidc].require_amr` —
+///   evaluated once at login and stored as `mfa_verified_at`. An empty
+///   `require_amr` trusts the identity provider's own MFA policy.
+/// - Anything else (the legacy shared password) is refused.
+pub fn require_mfa(ctx: &crate::auth::AuthContext) -> Result<(), ApiError> {
+    use crate::auth::AuthMethod;
+    match ctx.auth_method {
+        AuthMethod::ApiKey | AuthMethod::HostCli => Ok(()),
+        AuthMethod::Local | AuthMethod::Oidc if ctx.mfa => Ok(()),
+        _ => Err(ApiError { status: StatusCode::FORBIDDEN, message: MFA_REQUIRED_BODY.to_string() }),
+    }
+}

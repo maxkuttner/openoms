@@ -49,6 +49,10 @@ pub struct ApiError {
 impl IntoResponse for ApiError {
 
     fn into_response(self) -> Response{
+        // A few errors carry a JSON body (e.g. `authz::MFA_REQUIRED_BODY`).
+        if self.message.starts_with('{') {
+            return (self.status, [(axum::http::header::CONTENT_TYPE, "application/json")], self.message).into_response();
+        }
         return (self.status, self.message).into_response();
     }
 }
@@ -745,6 +749,7 @@ pub async fn create_allocations(
     Path(order_id): Path<Uuid>,
     Json(req): Json<CreateAllocations>,
 ) -> Result<Json<Vec<Allocation>>, ApiError> {
+    crate::authz::require_mfa(&auth)?;
     let pool = state.pool();
     let err422 = |m: &str| ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message: m.to_string() };
 
@@ -1449,10 +1454,7 @@ pub(crate) mod tests {
     /// point of carrying `principal_code` on `AuthContext`.
     #[test]
     fn an_authenticated_command_is_attributed_to_whoever_sent_it() {
-        let auth = AuthContext {
-            principal_id: Uuid::nil(),
-            principal_code: "jane.doe".to_string(),
-        };
+        let auth = AuthContext::machine(Uuid::nil(), "jane.doe".to_string());
 
         assert_eq!(actor_for(&auth), "jane.doe");
     }
@@ -1613,10 +1615,7 @@ pub(crate) mod tests {
             quantity: 1.0,
         };
 
-        let auth = AuthContext {
-            principal_id,
-            principal_code: principal_code.clone(),
-        };
+        let auth = AuthContext::machine(principal_id, principal_code.clone());
 
         let outcome = orders_submit(State(state), Extension(auth), Json(request)).await;
 
@@ -1751,7 +1750,7 @@ pub(crate) mod tests {
 
         let result = orders_submit(
             State(state),
-            Extension(AuthContext { principal_id, principal_code: "irrelevant".to_string() }),
+            Extension(AuthContext::machine(principal_id, "irrelevant".to_string())),
             Json(request),
         )
         .await;
@@ -1840,7 +1839,7 @@ pub(crate) mod tests {
         .expect("seed grant");
 
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
 
         let request = SubmitOrderRequest {
             order_id: Uuid::new_v4().to_string(),
@@ -1952,7 +1951,7 @@ pub(crate) mod tests {
         .expect("seed grant");
 
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
 
         let request = SubmitOrderRequest {
             order_id: Uuid::new_v4().to_string(),
@@ -1992,7 +1991,7 @@ pub(crate) mod tests {
         let (principal_id, principal_code) = seed_principal(&pool, "watch-roundtrip").await;
         let instrument_id = seed_instrument(&pool, "RT").await.to_string();
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
 
         add_watchlist_item(
             State(state.clone()),
@@ -2023,7 +2022,7 @@ pub(crate) mod tests {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "watch-404").await;
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
 
         let result = add_watchlist_item(
             State(state),
@@ -2042,7 +2041,7 @@ pub(crate) mod tests {
         let (principal_id, principal_code) = seed_principal(&pool, "watch-dup").await;
         let instrument_id = seed_instrument(&pool, "DUP").await.to_string();
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
 
         add_watchlist_item(State(state.clone()), Extension(auth.clone()), Json(AddWatchlistItem { instrument_id: instrument_id.clone() }))
             .await
@@ -2063,7 +2062,7 @@ pub(crate) mod tests {
 
         add_watchlist_item(
             State(state.clone()),
-            Extension(AuthContext { principal_id: principal_a, principal_code: code_a.clone() }),
+            Extension(AuthContext::machine(principal_a, code_a.clone())),
             Json(AddWatchlistItem { instrument_id: instrument_id.clone() }),
         )
         .await
@@ -2071,7 +2070,7 @@ pub(crate) mod tests {
 
         let b_list = list_watchlist(
             State(state.clone()),
-            Extension(AuthContext { principal_id: principal_b, principal_code: code_b.clone() }),
+            Extension(AuthContext::machine(principal_b, code_b.clone())),
         )
         .await
         .expect("list succeeds")
@@ -2082,14 +2081,14 @@ pub(crate) mod tests {
         // scoped to b's own rows, so it's a no-op, and a's row survives.
         remove_watchlist_item(
             State(state.clone()),
-            Extension(AuthContext { principal_id: principal_b, principal_code: code_b }),
+            Extension(AuthContext::machine(principal_b, code_b)),
             Path(instrument_id.clone()),
         )
         .await
         .expect("no-op delete still succeeds");
         let a_list = list_watchlist(
             State(state),
-            Extension(AuthContext { principal_id: principal_a, principal_code: code_a }),
+            Extension(AuthContext::machine(principal_a, code_a)),
         )
         .await
         .expect("list succeeds")
@@ -2433,7 +2432,7 @@ pub(crate) mod tests {
         .expect("seed broker_instrument b");
 
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
 
         let result = get_portfolio_venues(
             State(state),
@@ -2514,7 +2513,7 @@ pub(crate) mod tests {
         .expect("seed grant");
 
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
 
         let result = get_portfolio_venues(
             State(state),
@@ -2557,7 +2556,7 @@ pub(crate) mod tests {
         .expect("seed grant");
 
         let state = test_app_state(pool);
-        let auth = AuthContext { principal_id, principal_code };
+        let auth = AuthContext::machine(principal_id, principal_code);
         let result = get_portfolio_venues(
             State(state),
             Extension(auth),

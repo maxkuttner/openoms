@@ -44,6 +44,9 @@ use crate::sessions::{self, CookiePolicy};
 pub struct AuthApiState {
     pub provider: Arc<Provider>,
     pub required_claim: Option<(String, String)>,
+    /// `[auth.oidc].require_amr`: a login whose `amr` lacks any of these gets
+    /// a session without MFA (reads only; see `authz::require_mfa`).
+    pub require_amr: Vec<String>,
 }
 
 /// `state`, `nonce`, and the PKCE verifier for one pending login. Minted by
@@ -416,7 +419,9 @@ pub async fn callback(
     };
 
     let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-    let token = sessions::create_session(state.pool(), principal_id, sessions::AuthMethod::Oidc, false, &state.session_config.ttl, user_agent)
+    // The MFA policy is evaluated here, once: `require_mfa` only reads the stamp.
+    let mfa = crate::oidc::amr_satisfied(&identity.claims, &auth_state.require_amr);
+    let token = sessions::create_session(state.pool(), principal_id, sessions::AuthMethod::Oidc, mfa, &state.session_config.ttl, user_agent)
         .await
         .map_err(|err| db_error("create_session", err))?;
 
