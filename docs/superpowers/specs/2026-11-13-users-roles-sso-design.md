@@ -1,5 +1,12 @@
 # Users, roles and SSO: design
 
+> **Superseded in part (2026-11-13):** the owner's authentication redesign in
+> `2026-11-13-auth-redesign-instructions.md` overrides this document where they
+> conflict — Authentik is no longer a runtime dependency; local accounts
+> (Argon2id + TOTP) and provider-neutral OIDC replace it. Roles, portfolio
+> authorization, invites, strategies and audit below remain in force.
+
+
 Date: 2026-11-13. Status: draft, awaiting owner approval.
 
 ## Why
