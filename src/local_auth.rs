@@ -40,7 +40,7 @@ static COMMON_PASSWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 
 /// AAD binding a sealed TOTP secret to its purpose, so a blob sealed for
 /// something else (e.g. a broker credential) cannot be swapped in.
-const TOTP_AAD: &str = "oms:local_auth:totp_secret";
+pub(crate) const TOTP_AAD: &str = "oms:local_auth:totp_secret";
 const TOTP_DIGITS: u8 = 6;
 const TOTP_STEP_SECS: u64 = 30;
 const TOTP_SKEW_STEPS: u16 = 1;
@@ -225,6 +225,13 @@ pub fn verify_totp(
         return Err(TotpError::Replayed);
     }
     Ok(step)
+}
+
+/// The code a sealed secret produces at `unix` (tests only).
+#[cfg(test)]
+pub(crate) fn code_at(secret_enc: &[u8], master: &MasterKey, unix: u64) -> String {
+    let secret = secrets::open(master, TOTP_AAD, secret_enc).expect("opens");
+    totp_from_secret(&secret, None, "").generate(unix).to_string()
 }
 
 /// Canonical form a code is hashed in: uppercase base32, no separators.

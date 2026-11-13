@@ -62,7 +62,8 @@ pub async fn rotate(pool: &PgPool, old: &MasterKey, new: &MasterKey) -> Result<u
     let mut tx = pool.begin().await?;
 
     let n = rotate_table(&mut tx, "oms.broker_connection", old, new).await?
-        + rotate_table(&mut tx, "oms.feed_connection", old, new).await?;
+        + rotate_table(&mut tx, "oms.feed_connection", old, new).await?
+        + rotate_totp(&mut tx, old, new).await?;
 
     tx.commit().await?;
     Ok(n)
@@ -106,6 +107,30 @@ async fn rotate_table(
             .await?;
     }
     Ok(n)
+}
+
+/// Re-seal every local TOTP secret, pending enrolments included, with the
+/// same purpose AAD `local_auth` seals and opens them with.
+async fn rotate_totp(tx: &mut Transaction<'_, Postgres>, old: &MasterKey, new: &MasterKey) -> Result<usize, sqlx::Error> {
+    let rows: Vec<(uuid::Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT principal_id, totp_secret_enc FROM oms.local_credential WHERE totp_secret_enc IS NOT NULL FOR UPDATE")
+            .fetch_all(&mut **tx)
+            .await?;
+    let aad = crate::local_auth::TOTP_AAD;
+    for (principal_id, sealed) in &rows {
+        let resealed = rewrap(old, new, aad, sealed).map_err(|e| {
+            sqlx::Error::Protocol(format!(
+                "refusing to rotate: the TOTP secret of user {principal_id} will not open under the \
+                 current master key ({e}). No rows were changed."
+            ))
+        })?;
+        sqlx::query("UPDATE oms.local_credential SET totp_secret_enc = $2 WHERE principal_id = $1")
+            .bind(principal_id)
+            .bind(&resealed)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(rows.len())
 }
 
 #[cfg(test)]
@@ -176,5 +201,52 @@ mod tests {
             rewrap_rows(&old, &new, &rows).expect_err("the bad row must fail the whole batch, not just itself");
 
         assert_eq!(code, "binance-paper", "the error must name the row that actually failed to open");
+    }
+
+    /// Enrolled and pending TOTP secrets are re-sealed in the same rotation:
+    /// codes keep verifying under the new key, and no longer under the old.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn rotate_key_reseals_totp_secrets() {
+        use crate::local_auth::{code_at, new_totp, verify_totp};
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let old = parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap();
+        let new = parse_master_key("base64:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").unwrap();
+        let mut ids = Vec::new();
+        for (i, enrolled) in [true, false].into_iter().enumerate() {
+            let id = uuid::Uuid::new_v4();
+            sqlx::query("INSERT INTO principal (id, code, principal_type, display_name, status) VALUES ($1, $2, 'HUMAN', 'T', 'ACTIVE')")
+                .bind(id)
+                .bind(format!("rot-totp-{i}-{id}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let e = new_totp("OpenOMS", "t@example.com", &old).unwrap();
+            sqlx::query(
+                "INSERT INTO local_credential (principal_id, password_hash, totp_secret_enc, totp_enrolled_at) \
+                 VALUES ($1, 'x', $2, CASE WHEN $3 THEN now() END)",
+            )
+            .bind(id)
+            .bind(&e.secret_enc)
+            .bind(enrolled)
+            .execute(&pool)
+            .await
+            .unwrap();
+            ids.push((id, e.secret_enc));
+        }
+
+        rotate(&pool, &old, &new).await.expect("rotate");
+
+        let now: i64 = 1_800_000_015;
+        for (id, before) in ids {
+            let (sealed,): (Vec<u8>,) = sqlx::query_as("SELECT totp_secret_enc FROM local_credential WHERE principal_id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let code = code_at(&before, &old, now as u64);
+            assert_eq!(verify_totp(&sealed, &new, &code, None, now), Ok(now / 30), "valid code passes under the new key");
+            assert!(verify_totp(&sealed, &old, &code, None, now).is_err(), "old key no longer opens it");
+        }
     }
 }

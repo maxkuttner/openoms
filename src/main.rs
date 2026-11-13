@@ -707,7 +707,7 @@ async fn main() {
                     // The new key is deliberately printed — same trade `oms init` makes for
                     // the key it generates: this is the one time it can be handed to the
                     // operator at all. No credential is ever printed, only this key.
-                    println!("rotated {n} credential(s) to a new master key.\n");
+                    println!("rotated {n} sealed secret(s) (connection credentials and TOTP secrets) to a new master key.\n");
                     println!("new master key: {new_key_str}");
                     println!(
                         "\nPut this in {} as oms.master_key now — the credentials above are\n\
