@@ -232,7 +232,7 @@ const JWKS_REFETCH_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
 
 /// True for hosts reachable only from this machine — the one case
 /// `refuse_insecure_endpoint` tolerates an `http://` discovered endpoint for,
-/// so a local Keycloak run entirely on loopback still works without TLS.
+/// so a local Authentik run entirely on loopback still works without TLS.
 ///
 /// `host` is `url::Url::host_str()`'s output, which brackets an IPv6 literal
 /// (`"[::1]"`, not `"::1"`) — unlike `setup::database::config::is_loopback_host`,
@@ -251,7 +251,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// on the wire in clear text on every code exchange; for the authorization
 /// endpoint, it would send the PKCE challenge and the browser redirect over
 /// an interceptable channel. Loopback is the one deliberate exception, so a
-/// local Keycloak in development still works without standing up TLS for it.
+/// local Authentik in development still works without standing up TLS for it.
 fn refuse_insecure_endpoint(url: &str, label: &str) -> Result<(), OidcError> {
     let parsed = openidconnect::url::Url::parse(url).map_err(|e| {
         OidcError::ProviderUnavailable(format!("{label} endpoint is not a valid URL: {e}"))
@@ -533,7 +533,7 @@ fn build_http_client() -> Result<openidconnect::reqwest::Client, OidcError> {
         // response redirect these requests anywhere (SSRF).
         .redirect(openidconnect::reqwest::redirect::Policy::none())
         // Trust the host's own CA store, not just the roots `openidconnect`
-        // compiles in. A self-hosted OMS normally sits beside a Keycloak whose
+        // compiles in. A self-hosted OMS normally sits beside an IdP whose
         // certificate chains to a corporate or internal CA; with only the
         // bundled Mozilla roots, discovery fails and login is disabled for the
         // entire run. The feature this needs is unified in via the `reqwest012`
