@@ -213,7 +213,7 @@ async fn reload_http_lifecycle_against_postgres() {
     })).await.unwrap();
     credentials::save_broker(&pool, &key(), "binance-paper", &BrokerCredentials::from_typed("BinanceFix", &gateway::connectors::binance::adapter::BinanceCredentials {
         host: "never-connect.invalid".into(), port: 1, sender_comp_id: "OMS".into(),
-        target_comp_id: "SPOT".into(), api_key: "SYNTHETIC-BINANCE".into(), private_key: "SYNTHETIC-PEM".into(),
+        target_comp_id: "SPOT".into(), api_key: "SYNTHETIC-BINANCE".into(), private_key: "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAGvAMHEDQzczRRSN2T3AYeEUyaWSwA6GXlSZ2hjM8TC\n-----END PRIVATE KEY-----\n".into(),
     })).await.unwrap();
     credentials::save_broker(&pool, &key(), "bybit-paper", &BrokerCredentials::from_typed("Bybit", &gateway::connectors::bybit::adapter::BybitCredentials {
         api_key: "SYNTHETIC-BYBIT".into(), api_secret: "SYNTHETIC-BYBIT-SECRET".into(),
@@ -237,7 +237,10 @@ async fn reload_http_lifecycle_against_postgres() {
         assert_eq!(outcome(&body, "alpaca-paper"), "Registered");
         assert_eq!(outcome(&body, "databento-opra"), "Registered");
         assert_eq!(outcome(&body, "ibkr-paper"), "RestartRequired");
-        assert_eq!(outcome(&body, "binance-paper"), "RestartRequired");
+        // Binance's default transport is REST: it rebuilds on reload like Bybit
+        // and keeps exactly one execution stream (see fix #29).
+        assert_eq!(outcome(&body, "binance-paper"), "Registered");
+        assert_eq!(fake.count("binance-paper:exec"), 1);
         // Bybit applies on every reload and never runs two streams.
         assert_eq!(outcome(&body, "bybit-paper"), "Registered");
         assert_eq!(fake.count("bybit-paper:exec"), 1);
