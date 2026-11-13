@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
-import { Routes, Route, Navigate } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { AccessPage } from "./pages/Access";
 import { tradeApi, onLoginUnavailable, API_BASE } from "./api/client";
 import { TradePage } from "./pages/Trade";
 import { LiveUpdatesProvider, useLive } from "./api/liveUpdates";
@@ -61,6 +62,14 @@ export type Me = {
 };
 
 export function TradeApp() {
+  // The access page is where a refused sign-in lands, so it has no session to
+  // load: render it before the identity query, which would bounce to sign-in.
+  const { pathname } = useLocation();
+  if (pathname === "/access") return <AccessPage />;
+  return <SignedInTradeApp />;
+}
+
+function SignedInTradeApp() {
   // Set when the client finds /auth/login missing: /trade/ and /auth/* are
   // mounted under the same condition, but a provider-discovery failure can
   // leave this app served with no auth routes behind it. Without this the

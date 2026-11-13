@@ -1365,8 +1365,13 @@ async fn serve() {
     // configured `[auth.oidc]` still needs the rest of the OMS — order
     // routing, the admin console — to come up even if the IdP is down or the
     // secret hasn't been set yet. It is retried only on the next restart.
+    let mut oidc_status = app_state::OidcStatus::default();
     let auth_api_state: Option<auth_api::AuthApiState> =
         if let Some(oidc_settings) = file_cfg.and_then(|f| f.oidc()) {
+            oidc_status.configured = true;
+            oidc_status.issuer = Some(oidc_settings.issuer.clone());
+            oidc_status.redirect_uri =
+                Some(format!("{}/auth/callback", oidc_settings.public_base_url.trim_end_matches('/')));
             match env::var("OMS_OIDC_CLIENT_SECRET").ok().filter(|v| !v.is_empty()) {
                 None => {
                     error!(
@@ -1374,6 +1379,7 @@ async fn serve() {
                          login is disabled for this run. Set OMS_OIDC_CLIENT_SECRET to the client \
                          secret registered at the provider and restart."
                     );
+                    oidc_status.error = Some("OMS_OIDC_CLIENT_SECRET is not set".to_string());
                     None
                 }
                 Some(client_secret) => {
@@ -1381,10 +1387,15 @@ async fn serve() {
                     match oidc::Provider::discover(oidc_settings, client_secret).await {
                         Ok(provider) => {
                             info!("OIDC discovery succeeded — login enabled");
+                            oidc_status.discovery_ok = true;
                             Some(auth_api::AuthApiState { provider: Arc::new(provider), required_claim })
                         }
                         Err(e) => {
                             error!(error = ?e, "OIDC discovery failed — login is disabled for this run");
+                            oidc_status.error = Some(match e {
+                                oidc::OidcError::ProviderUnavailable(msg) => msg,
+                                other => format!("{other:?}"),
+                            });
                             None
                         }
                     }
@@ -1393,6 +1404,7 @@ async fn serve() {
         } else {
             None
         };
+    state.set_oidc_status(oidc_status);
 
     // Register routes
 
@@ -1438,6 +1450,8 @@ async fn serve() {
             get(order_events::get_order_events_admin),
         )
         .route("/admin/users", get(users_api::list_users).post(users_api::create_key_only_user))
+        .route("/admin/setup-status", get(users_api::setup_status))
+        .route("/admin/auth/status", get(users_api::auth_status))
         .route("/admin/users/invite", post(users_api::invite_user))
         .route("/admin/users/invites/:id/revoke", post(users_api::revoke_invite))
         .route("/admin/users/invites/:id/reissue", post(users_api::reissue_invite))

@@ -6,7 +6,10 @@ import { api, setToken, API_BASE } from "./api/client";
 import { Logo } from "./components/Logo";
 import { JobsIndicator } from "./components/JobsIndicator";
 import { LoginPage } from "./pages/Login";
-import { PrincipalsPage } from "./pages/Principals";
+import { UsersPage } from "./pages/Users";
+import { SignInPage } from "./pages/SignIn";
+import { SetupChecklist, useSetupStatus } from "./components/SetupChecklist";
+import { checklistVisible } from "./checklist";
 import { PortfoliosPage } from "./pages/Portfolios";
 import { AccountsPage } from "./pages/Accounts";
 import { BrokerConnectionsPage } from "./pages/BrokerConnections";
@@ -19,7 +22,8 @@ import { ApiPage } from "./pages/Api";
 import { palette } from "./palette";
 
 const NAV = [
-  { to: "/principals", label: "Principals" },
+  { to: "/users", label: "Users" },
+  { to: "/sign-in", label: "Sign-in" },
   { to: "/tokens", label: "API" },
   { to: "/portfolios", label: "Portfolios" },
   { to: "/accounts", label: "Accounts" },
@@ -43,6 +47,14 @@ function ConnectionDot() {
       <Text fz={12} c={palette.muted}>{ok ? "connected" : "offline"}</Text>
     </Group>
   );
+}
+
+/** Home: the setup checklist while anything is left, otherwise straight to Users. */
+function Home() {
+  const { data, isLoading } = useSetupStatus();
+  if (isLoading) return <Loader />;
+  if (!data || !checklistVisible(data)) return <Navigate to="/users" replace />;
+  return <SetupChecklist />;
 }
 
 /** The authenticated console. */
@@ -87,8 +99,9 @@ function Console({ onLogout }: { onLogout: () => void }) {
       </AppShell.Navbar>
       <AppShell.Main>
         <Routes>
-          <Route path="/" element={<Navigate to="/principals" replace />} />
-          <Route path="/principals" element={<PrincipalsPage />} />
+          <Route path="/" element={<Home />} />
+          <Route path="/users" element={<UsersPage />} />
+          <Route path="/sign-in" element={<SignInPage />} />
           <Route path="/tokens" element={<ApiPage />} />
           <Route path="/portfolios" element={<PortfoliosPage />} />
           <Route path="/accounts" element={<AccountsPage />} />

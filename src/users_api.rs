@@ -521,6 +521,41 @@ pub async fn revoke_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Serialize)]
+pub struct SetupStatus {
+    pub venue_connected: bool,
+    pub portfolio_exists: bool,
+    pub sign_in_ok: bool,
+    pub user_invited: bool,
+    pub first_order: bool,
+}
+
+/// `GET /admin/setup-status`: which first-run steps are done.
+pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
+    let (venue_connected, portfolio_exists, user_invited, first_order): (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM broker_connection WHERE status = 'ACTIVE'), \
+                EXISTS (SELECT 1 FROM portfolio), \
+                EXISTS (SELECT 1 FROM invite), \
+                EXISTS (SELECT 1 FROM order_state)",
+    )
+    .fetch_one(state.pool())
+    .await
+    .map_err(db)?;
+    let oidc = state.oidc_status();
+    Ok(Json(SetupStatus {
+        venue_connected,
+        portfolio_exists,
+        sign_in_ok: oidc.configured && oidc.discovery_ok,
+        user_invited,
+        first_order,
+    }))
+}
+
+/// `GET /admin/auth/status`: whether OIDC sign-in is on, and why not.
+pub async fn auth_status(State(state): State<AppState>) -> Json<crate::app_state::OidcStatus> {
+    Json(state.oidc_status())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +617,75 @@ mod tests {
             .0;
         let session = crate::sessions::create_session(pool, id, &Default::default(), None).await.unwrap();
         (id, key.key_id, key.secret.unwrap(), session.hash)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn setup_status_reflects_db_state() {
+        let pool = migrated_db().await;
+        let st = state(&pool, Some(BASE)).await;
+        let get = || async { setup_status(State(st.clone())).await.unwrap().0 };
+
+        let s = get().await;
+        assert!(!s.venue_connected && !s.portfolio_exists && !s.sign_in_ok && !s.user_invited && !s.first_order);
+
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment) VALUES ('alpaca-paper', 'ALPACA', 'PAPER')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let s = get().await;
+        assert!(s.venue_connected && !s.portfolio_exists);
+
+        let portfolio_id = portfolio(&pool).await;
+        assert!(get().await.portfolio_exists);
+
+        // Sign-in counts only once discovery has succeeded, not merely configured.
+        st.set_oidc_status(crate::app_state::OidcStatus {
+            configured: true,
+            issuer: Some("https://id.example.com".into()),
+            discovery_ok: false,
+            error: Some("down".into()),
+            redirect_uri: None,
+        });
+        assert!(!get().await.sign_in_ok);
+        st.set_oidc_status(crate::app_state::OidcStatus { discovery_ok: true, error: None, ..st.oidc_status() });
+        assert!(get().await.sign_in_ok);
+
+        let email = format!("inv-{}@fundco.com", Uuid::new_v4().simple());
+        let invite = crate::invites::create(&pool, &email, "viewer", &[], "admin").await.unwrap();
+        assert!(get().await.user_invited);
+        assert!(!get().await.first_order);
+
+        let account_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) VALUES ($1, 'acc1', 'alpaca-paper', 'acc1', 'ACTIVE')")
+            .bind(account_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO order_state (order_id, client_order_id, principal_id, portfolio_id, account_id, \
+             broker_connection_code, instrument_id, side, order_type, time_in_force, \
+             original_qty, leaves_qty, cum_qty, status, version) \
+             VALUES ($1, 'c1', $2, $3, $4, 'alpaca-paper', 'X', 'buy', 'market', 'day', 1, 1, 0, 'submitted', 1)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(invite.principal_id)
+        .bind(portfolio_id)
+        .bind(account_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(get().await.first_order);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn auth_status_reports_unconfigured() {
+        let pool = migrated_db().await;
+        let st = state(&pool, None).await;
+        let s = auth_status(State(st)).await.0;
+        assert!(!s.configured && !s.discovery_ok);
+        assert!(s.issuer.is_none() && s.error.is_none() && s.redirect_uri.is_none());
     }
 
     #[tokio::test]

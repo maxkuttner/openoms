@@ -2,16 +2,6 @@ import type { FeeAmount } from "../fees";
 // Hand-written mirror of the admin API resource shapes (src/admin.rs, src/handlers.rs).
 // Could be generated from the OpenAPI doc later (openapi-typescript) to avoid drift.
 
-export interface Principal {
-  id: string;
-  code: string;
-  principal_type: string;
-  display_name: string | null;
-  status: string;
-  created_at: string;
-  updated_at: string;
-}
-
 export interface Portfolio {
   id: string;
   code: string;
