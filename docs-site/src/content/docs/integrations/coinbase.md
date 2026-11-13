@@ -67,3 +67,4 @@ CHF; trade the pairs your account holds a balance in.
 - Spot only: no futures or perpetuals.
 - Market orders are sized in the base coin (for example 0.0001 BTC).
 - Orders cannot be amended; cancel and place a new one.
+- Fees: booked from the running fee total Coinbase reports per order; see [Fees](/concepts/fees/).

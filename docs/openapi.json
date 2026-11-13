@@ -4461,7 +4461,8 @@
           "leaves_qty",
           "cum_qty",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "fees"
         ],
         "properties": {
           "account_id": {
@@ -4486,6 +4487,13 @@
           "cum_qty": {
             "type": "number",
             "format": "double"
+          },
+          "fees": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeeAmount"
+            },
+            "description": "Venue fees booked on the order, summed per currency (never FX-converted)."
           },
           "instrument_id": {
             "type": "string"
@@ -5298,6 +5306,23 @@
           }
         }
       },
+      "FeeAmount": {
+        "type": "object",
+        "description": "A fee total in one currency. Fees stay per currency, never FX-converted.",
+        "required": [
+          "currency",
+          "amount"
+        ],
+        "properties": {
+          "amount": {
+            "type": "number",
+            "format": "double"
+          },
+          "currency": {
+            "type": "string"
+          }
+        }
+      },
       "FeedConnectionSummary": {
         "type": "object",
         "required": [
@@ -5925,7 +5950,8 @@
           "net_qty",
           "avg_cost",
           "realized_pnl",
-          "updated_at"
+          "updated_at",
+          "other_fees"
         ],
         "properties": {
           "avg_cost": {
@@ -5960,6 +5986,13 @@
           "net_qty": {
             "type": "number",
             "format": "double"
+          },
+          "other_fees": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FeeAmount"
+            },
+            "description": "Fees in currencies that don't touch the position (e.g. BNB on a USDT pair),\nsummed per currency. Empty when none."
           },
           "portfolio_id": {
             "type": "string",

@@ -8,6 +8,7 @@ import { tradeApi, ApiError } from "../api/client";
 import { useLive } from "../api/liveUpdates";
 import { numeric, columnHeader, sideColor } from "../table";
 import { OrderTimeline } from "../../components/OrderTimeline";
+import { formatFees } from "../../fees";
 import type { BlotterRow } from "../../api/types";
 import type { GrantedPortfolio } from "../App";
 
@@ -216,6 +217,7 @@ export function TradeBlotter({
               <Table.Th style={{ ...columnHeader, ...numeric }}>Cum</Table.Th>
               <Table.Th style={{ ...columnHeader, ...numeric }}>Leaves</Table.Th>
               <Table.Th style={{ ...columnHeader, ...numeric }}>Avg px</Table.Th>
+              <Table.Th style={{ ...columnHeader, ...numeric }}>Fees</Table.Th>
               <Table.Th />
             </Table.Tr>
           </Table.Thead>
@@ -262,6 +264,7 @@ export function TradeBlotter({
                   <Table.Td style={numeric}>{o.cum_qty}</Table.Td>
                   <Table.Td style={numeric}>{o.leaves_qty}</Table.Td>
                   <Table.Td style={numeric}>{o.avg_px ?? "—"}</Table.Td>
+                  <Table.Td style={numeric}>{formatFees(o.fees)}</Table.Td>
                   <Table.Td>
                     <Button
                       size="xs"
@@ -282,7 +285,7 @@ export function TradeBlotter({
             })}
             {windowFull && (
               <Table.Tr>
-                <Table.Td colSpan={10}>
+                <Table.Td colSpan={11}>
                   <Text c="dimmed" size="xs" ta="center">
                     Showing the {BLOTTER_LIMIT} most recent orders; older ones are not listed.
                   </Text>
@@ -291,7 +294,7 @@ export function TradeBlotter({
             )}
             {rows.length === 0 && (
               <Table.Tr>
-                <Table.Td colSpan={10}>
+                <Table.Td colSpan={11}>
                   <Text c="dimmed" ta="center" py="md">
                     No orders.
                   </Text>

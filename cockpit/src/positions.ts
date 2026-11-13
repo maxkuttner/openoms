@@ -1,6 +1,8 @@
 // Pure position maths for the Positions page. Amounts are in each instrument's
 // own currency and are never converted, so every total is kept per currency.
 
+import type { FeeAmount } from "./fees.ts";
+
 // Mirrors src/positions.rs Position. mark, market_value, unrealized_pnl and
 // mark_ts are None when no live mark exists for the instrument — an
 // unpriceable/expired contract, or a feed that's down — and MUST stay
@@ -18,6 +20,7 @@ export interface PositionRow {
   market_value: number | null;
   unrealized_pnl: number | null;
   mark_ts: string | null;
+  other_fees: FeeAmount[];
 }
 
 export interface CurrencyTotals {

@@ -131,6 +131,9 @@ pub fn summarize(event: &OrderDomainEvent) -> String {
                 format!("amended {}", changes.join(", "))
             }
         }
+        OrderEventPayload::OrderFeeCharged { amount, currency, .. } => {
+            format!("fee {amount} {currency}")
+        }
         OrderEventPayload::OrderCanceled { reason } => with_reason("canceled", reason.as_deref()),
         OrderEventPayload::CancelRejected { reason } => format!("cancel rejected: {reason}"),
         OrderEventPayload::OrderExpired { reason } => with_reason("expired", reason.as_deref()),
@@ -305,6 +308,22 @@ mod tests {
             schema_version: 0,
             created_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn order_fee_event_has_a_summary() {
+        let e = event(
+            OrderEventPayload::OrderFeeCharged {
+                fee_id: "f1".to_string(),
+                execution_id: Some("x1".to_string()),
+                amount: 1.5,
+                currency: "USD".to_string(),
+                effect: crate::fees::FeeEffect::Quote,
+            },
+            OrderEventType::OrderFeeCharged,
+            OrderStatus::Routed,
+        );
+        assert_eq!(view(&record_of(&e)).summary, "fee 1.5 USD");
     }
 
     #[test]

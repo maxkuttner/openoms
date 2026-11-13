@@ -7,11 +7,14 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+
+use crate::fees::FeeAmount;
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload};
 use crate::domain::orders::state::OrderSide;
+use crate::fees::FeeEffect;
 
 /// The signed holding + average cost + realized P&L. `avg_cost` is the average price
 /// of the *open* position (>= 0; 0 when flat). Pure value type — no DB.
@@ -65,6 +68,17 @@ impl PositionMath {
                 avg_cost: price,
                 realized_pnl,
             }
+        }
+    }
+
+    /// Apply a venue fee (charge > 0, rebate < 0). Quote: realized P&L. Base: the
+    /// held quantity always drops by the amount, cost and realized unchanged (it may
+    /// leave a residual or cross zero). Other: no position effect.
+    pub fn apply_fee(self, amount: f64, effect: FeeEffect) -> PositionMath {
+        match effect {
+            FeeEffect::Quote => PositionMath { realized_pnl: self.realized_pnl - amount, ..self },
+            FeeEffect::Base => PositionMath { net_qty: self.net_qty - amount, ..self },
+            FeeEffect::Other => self,
         }
     }
 
@@ -125,6 +139,9 @@ pub struct Position {
     pub unrealized_pnl: Option<f64>,
     /// When the mark was received; lets a caller judge staleness.
     pub mark_ts: Option<DateTime<Utc>>,
+    /// Fees in currencies that don't touch the position (e.g. BNB on a USDT pair),
+    /// summed per currency. Empty when none.
+    pub other_fees: Vec<FeeAmount>,
 }
 
 /// Read the current position (FOR UPDATE), or FLAT if none.
@@ -191,6 +208,22 @@ pub async fn persist_fill(
     upsert(conn, portfolio_id, instrument_id, next).await
 }
 
+/// Load → apply one venue fee → upsert, inside the caller's transaction. An
+/// `Other` fee has no position effect and writes nothing.
+pub async fn persist_fee(
+    conn: &mut PgConnection,
+    portfolio_id: Uuid,
+    instrument_id: &str,
+    amount: f64,
+    effect: FeeEffect,
+) -> Result<(), sqlx::Error> {
+    if effect == FeeEffect::Other {
+        return Ok(());
+    }
+    let next = load(conn, portfolio_id, instrument_id).await?.apply_fee(amount, effect);
+    upsert(conn, portfolio_id, instrument_id, next).await
+}
+
 /// Cost-preserving allocation transfer of `qty` (> 0) of `instrument_id` from one
 /// portfolio to another at `price`, inside the caller's tx. The source reduces at
 /// cost (no P&L — a conduit); the destination books at `price` via the normal fill
@@ -210,17 +243,25 @@ pub async fn persist_transfer(
     upsert(conn, to_portfolio, instrument_id, to).await
 }
 
-/// Recovery / backfill: rebuild every position by replaying the fill events from the
-/// order_event log in order. Idempotent (derived data).
+/// Recovery / backfill: rebuild every position by replaying the fill and fee events
+/// from the order_event log in order (fees use the effect stored on the event). Idempotent (derived data).
 pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
+    rebuild_positions_scoped(pool, None).await
+}
+
+/// [`rebuild_positions`] limited to one portfolio (`Some`), leaving every other
+/// portfolio's positions untouched; `None` rebuilds everything.
+pub async fn rebuild_positions_scoped(pool: &PgPool, portfolio: Option<Uuid>) -> Result<usize, sqlx::Error> {
     // Each fill event carries qty/price; portfolio/instrument/side live on order_state.
     let rows = sqlx::query(
         "SELECT e.payload_json, os.portfolio_id, os.instrument_id, os.side \
          FROM order_event e \
          JOIN order_state os ON os.order_id = e.order_id \
-         WHERE e.event_type IN ('order_partially_filled', 'order_filled') \
+         WHERE e.event_type IN ('order_partially_filled', 'order_filled', 'order_fee_charged') \
+           AND ($1::uuid IS NULL OR os.portfolio_id = $1) \
          ORDER BY e.global_position",
     )
+    .bind(portfolio)
     .fetch_all(pool)
     .await?;
 
@@ -230,23 +271,31 @@ pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
         let Ok(event) = serde_json::from_value::<OrderDomainEvent>(payload) else {
             continue;
         };
-        let (fill_qty, fill_price) = match event.payload {
-            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (fill_qty, fill_price),
-            _ => continue,
-        };
         let portfolio_id: Uuid = r.get("portfolio_id");
         let instrument_id: String = r.get("instrument_id");
         let side = match r.get::<String, _>("side").as_str() {
             "buy" => OrderSide::Buy,
             _ => OrderSide::Sell,
         };
-        let entry = acc.entry((portfolio_id, instrument_id)).or_insert(PositionMath::FLAT);
-        *entry = entry.apply_fill(side, fill_qty, fill_price);
+        match event.payload {
+            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
+            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => {
+                let entry = acc.entry((portfolio_id, instrument_id)).or_insert(PositionMath::FLAT);
+                *entry = entry.apply_fill(side, fill_qty, fill_price);
+            }
+            OrderEventPayload::OrderFeeCharged { amount, effect, .. } if effect != FeeEffect::Other => {
+                let entry = acc.entry((portfolio_id, instrument_id)).or_insert(PositionMath::FLAT);
+                *entry = entry.apply_fee(amount, effect);
+            }
+            _ => continue,
+        }
     }
 
     let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM position").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM position WHERE ($1::uuid IS NULL OR portfolio_id = $1)")
+        .bind(portfolio)
+        .execute(&mut *tx)
+        .await?;
     for ((portfolio_id, instrument_id), p) in &acc {
         sqlx::query(
             "INSERT INTO position \
@@ -287,10 +336,20 @@ mod tests {
             market_value: None,
             unrealized_pnl: None,
             mark_ts: None,
+            other_fees: vec![],
         };
         let json = serde_json::to_value(&p).unwrap();
         assert_eq!(json["currency"], "EUR");
     }
+
+    #[test] fn quote_fee_reduces_realized() { let p = PositionMath { net_qty: 1.0, avg_cost: 100.0, realized_pnl: 5.0 }.apply_fee(1.5, FeeEffect::Quote); approx(p.realized_pnl, 3.5); approx(p.net_qty, 1.0); }
+    #[test] fn rebate_increases_realized() { approx(PositionMath::FLAT.apply_fee(-0.2, FeeEffect::Quote).realized_pnl, 0.2); }
+    #[test] fn base_fee_shrinks_long_at_cost() { let p = PositionMath { net_qty: 1.0, avg_cost: 64000.0, realized_pnl: 0.0 }.apply_fee(0.001, FeeEffect::Base); approx(p.net_qty, 0.999); approx(p.avg_cost, 64000.0); approx(p.realized_pnl, 0.0); }
+    #[test] fn base_fee_on_short_grows_the_short() { approx(PositionMath { net_qty: -2.0, avg_cost: 10.0, realized_pnl: 0.0 }.apply_fee(0.5, FeeEffect::Base).net_qty, -2.5); }
+    #[test] fn base_fee_when_flat_leaves_a_residual() { let p = PositionMath::FLAT.apply_fee(0.001, FeeEffect::Base); approx(p.net_qty, -0.001); approx(p.avg_cost, 0.0); }
+    #[test] fn base_rebate_increases_quantity() { approx(PositionMath { net_qty: 1.0, avg_cost: 10.0, realized_pnl: 0.0 }.apply_fee(-0.001, FeeEffect::Base).net_qty, 1.001); }
+    #[test] fn base_fee_may_cross_zero() { let p = PositionMath { net_qty: 0.0005, avg_cost: 10.0, realized_pnl: 0.0 }.apply_fee(0.001, FeeEffect::Base); approx(p.net_qty, -0.0005); approx(p.avg_cost, 10.0); }
+    #[test] fn other_fee_changes_nothing() { let p = PositionMath { net_qty: 1.0, avg_cost: 1.0, realized_pnl: 1.0 }; assert_eq!(p.apply_fee(3.0, FeeEffect::Other), p); }
 
     #[test]
     fn open_long() {

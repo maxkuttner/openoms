@@ -14,6 +14,7 @@ use axum::{
 };
 
 use serde::{Deserialize, Serialize};
+use crate::fees::FeeAmount;
 use crate::app_state::AppState;
 use crate::domain::orders::commands;
 use crate::domain::orders::commands::SubmitOrder;
@@ -566,6 +567,12 @@ pub async fn get_portfolio_positions(
     // universe, so a clone would cost O(all marks) per request and hold the read
     // lock against the router's writes for the duration.
     let marks = state.marks();
+    let mut other_fees = crate::fees::other_fees_by_instrument(state.pool(), portfolio_id)
+        .await
+        .map_err(|err| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("failed to load position fees: {:?}", err),
+        })?;
 
     let positions = rows
         .iter()
@@ -581,6 +588,7 @@ pub async fn get_portfolio_positions(
 
             Position {
                 portfolio_id: r.get("portfolio_id"),
+                other_fees: other_fees.remove(&instrument_id).unwrap_or_default(),
                 instrument_id,
                 currency: r.get("currency"),
                 net_qty,
@@ -963,6 +971,8 @@ pub struct BlotterRow {
     pub avg_px: Option<f64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Venue fees booked on the order, summed per currency (never FX-converted).
+    pub fees: Vec<FeeAmount>,
 }
 
 /// Who a blotter query is allowed to see.
@@ -1038,9 +1048,16 @@ async fn load_blotter(
         message: format!("failed to load blotter: {:?}", err),
     })?;
 
+    let order_ids: Vec<Uuid> = rows.iter().map(|r| r.get("order_id")).collect();
+    let mut fees = crate::fees::fees_by_order(state.pool(), &order_ids).await.map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load order fees: {:?}", err),
+    })?;
+
     let out = rows
         .iter()
         .map(|r| BlotterRow {
+            fees: fees.remove(&r.get::<Uuid, _>("order_id")).unwrap_or_default(),
             order_id: r.get("order_id"),
             client_order_id: r.get("client_order_id"),
             principal_id: r.get("principal_id"),

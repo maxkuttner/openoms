@@ -189,18 +189,25 @@ pub async fn book_fill(state: &AppState, strategy: &Strategy, adapter: &BinanceA
     Ok(Booked::New)
 }
 
-/// Hand a trade's fill to the order engine, which books it and the position.
+/// Hand a trade's fill, then its fee, to the order engine, which books them
+/// and the position.
 async fn send_fill(state: &AppState, order_id: Uuid, fill: &ExternalFill) {
-    state
-        .engine()
-        .exec(ExecEvent {
-            order_id,
-            venue: "BINANCE".into(),
-            actor: "colo",
-            source: ExecSource::Session,
-            kind: ExecKind::Fill { execution_id: fill.trade_id.clone(), qty: fill.qty, price: fill.price },
-        })
-        .await;
+    for kind in fill_kinds(fill) {
+        state
+            .engine()
+            .exec(ExecEvent { order_id, venue: "BINANCE".into(), actor: "colo", source: ExecSource::Session, kind })
+            .await;
+    }
+}
+
+/// A trade's fill, and its fee when Binance reported a non-zero one. The fee id
+/// is the trade id, as on the session stream, so either path books it once.
+fn fill_kinds(fill: &ExternalFill) -> Vec<ExecKind> {
+    let mut out = vec![ExecKind::Fill { execution_id: fill.trade_id.clone(), qty: fill.qty, price: fill.price }];
+    if let (Some(amount), Some(currency)) = (fill.fee_amount, fill.fee_currency.as_deref()) {
+        out.extend(gateway::connectors::binance::stream::fee_kind(&fill.trade_id, amount, currency));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -238,6 +245,24 @@ mod tests {
         assert_eq!(book_fill(&state, &strategy, &adapter, &fill).await.unwrap(), Booked::AlreadyBooked);
         t::drop_orders(&pool, &code).await;
         t::drop_strategy(&pool, &code).await;
+    }
+
+    #[test]
+    fn colo_fill_with_fee_sends_fee_event() {
+        let mut fill = ExternalFill { trade_id: "77".into(), venue_order_id: "9".into(), client_order_id: "mm1-q-1".into(),
+            symbol: "BTCUSDT".into(), buy: true, qty: 0.5, price: 64000.0,
+            fee_amount: Some(0.01), fee_currency: Some("BNB".into()), executed_at: None };
+        assert_eq!(
+            fill_kinds(&fill),
+            vec![
+                ExecKind::Fill { execution_id: "77".into(), qty: 0.5, price: 64000.0 },
+                ExecKind::Fee { fee_id: "BINANCE-77".into(), execution_id: Some("77".into()), amount: 0.01, currency: "BNB".into() },
+            ]
+        );
+        fill.fee_amount = Some(0.0);
+        assert_eq!(fill_kinds(&fill).len(), 1);
+        fill.fee_amount = None;
+        assert_eq!(fill_kinds(&fill).len(), 1);
     }
 
     #[test]

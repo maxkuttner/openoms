@@ -44,6 +44,9 @@ pub struct Booked {
     exec_bases: HashSet<String>,
     canceled: HashSet<i32>,
     rejected: HashSet<i32>,
+    /// OMS order of each exec id seen, so a commission report (which names
+    /// only the exec id, and may come after the order is done) finds its order.
+    exec_orders: HashMap<String, Uuid>,
 }
 
 /// Everything one session needs besides the client.
@@ -90,14 +93,32 @@ impl Booked {
     }
 }
 
+/// Sends a commission report as the fee of its execution's order. The fee id
+/// is the exec id, so the live report and a catch-up replay book once.
+async fn send_commission(ctx: &Ctx, booked: &Booked, exec_id: String, amount: f64, currency: String) {
+    // TWS sends f64::MAX when it has no commission figure yet; a zero is free.
+    if amount == 0.0 || !amount.is_finite() || amount.abs() > 1e300 {
+        return;
+    }
+    let Some(&order) = booked.exec_orders.get(&exec_id) else {
+        return warn!(exec_id, amount, currency, "IBKR commission for an unknown execution; dropped");
+    };
+    let kind = ExecKind::Fee { fee_id: format!("{VENUE}-{exec_id}"), execution_id: Some(exec_id), amount, currency };
+    ctx.engine.exec(ExecEvent { order_id: order, venue: VENUE.into(), actor: ACTOR, source: ExecSource::Session, kind }).await;
+}
+
 /// Books one client event, at most once per exec id / order.
 pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
     match ev {
         TwsEvent::Execution { exec_id, order_id, order_ref, qty, price, .. } => {
+            let resolved = order_uuid(&ctx.adapter, order_id, &order_ref);
+            if let Some(order) = resolved {
+                booked.exec_orders.insert(exec_id.clone(), order);
+            }
             if booked.execs.contains(&exec_id) {
                 return;
             }
-            let Some(order) = order_uuid(&ctx.adapter, order_id, &order_ref) else {
+            let Some(order) = resolved else {
                 return unknown_order(ctx, "execution", order_id).await;
             };
             if booked.note_exec(&exec_id) {
@@ -108,10 +129,7 @@ pub async fn handle(ev: TwsEvent, ctx: &Ctx, booked: &mut Booked) {
             }
             send(ctx, order, VenueReport::Fill { execution_id: exec_id, fill_qty: qty, fill_price: price, venue: VENUE.into() }).await;
         }
-        // The engine's fill carries no fee yet: recorded in the log only.
-        TwsEvent::Commission { exec_id, amount, currency } => {
-            info!(exec_id, amount, currency, "IBKR commission");
-        }
+        TwsEvent::Commission { exec_id, amount, currency } => send_commission(ctx, booked, exec_id, amount, currency).await,
         TwsEvent::Status { order_id, order_ref, status, filled, .. } => {
             if outcome(&status) == BrokerOrderOutcome::Canceled && booked.canceled.insert(order_id) {
                 match order_uuid(&ctx.adapter, order_id, &order_ref) {
@@ -150,8 +168,16 @@ pub async fn catch_up(client: &dyn TwsClient, ctx: &Ctx, booked: &mut Booked) ->
     // (qty, notional) per order from today's executions: the fallback total for
     // an order neither listing reports.
     let mut execs: HashMap<i32, (String, f64, f64)> = HashMap::new();
+    let mut commissions = Vec::new();
     for ev in client.executions_today().await.map_err(|e| e.to_string())? {
+        if let TwsEvent::Commission { exec_id, amount, currency } = ev {
+            commissions.push((exec_id, amount, currency));
+            continue;
+        }
         if let TwsEvent::Execution { exec_id, order_id, order_ref, qty, price, .. } = ev {
+            if let Some(order) = order_uuid(&ctx.adapter, order_id, &order_ref) {
+                booked.exec_orders.insert(exec_id.clone(), order);
+            }
             let fresh = !booked.execs.contains(&exec_id);
             if booked.note_exec(&exec_id) {
                 // A correction: the reconcile after catch-up settles it.
@@ -188,6 +214,11 @@ pub async fn catch_up(client: &dyn TwsClient, ctx: &Ctx, booked: &mut Booked) ->
     for (id, (order_ref, qty, notional)) in execs {
         let Some(order) = order_uuid(&ctx.adapter, id, &order_ref) else { unknown = true; continue };
         send_state(ctx, order, ExecKind::Cumulative { cum_qty: qty, avg_px: notional / qty }).await;
+    }
+    // After the fills: the engine dedupes each fee on its id, so replaying
+    // today's commissions books only the ones it missed.
+    for (exec_id, amount, currency) in commissions {
+        send_commission(ctx, booked, exec_id, amount, currency).await;
     }
     if unknown {
         warn!("IBKR reports orders the OMS can't name; the reconcile settles them");
@@ -461,6 +492,68 @@ mod tests {
         handle(exec("e1", 42, &id.to_string()), &ctx, &mut booked).await;
         let n = fills(&mut rx).iter().filter(|(_, k)| matches!(k, ExecKind::Fill { .. })).count();
         assert_eq!(n, 1);
+    }
+
+    fn commission(exec_id: &str) -> TwsEvent {
+        TwsEvent::Commission { exec_id: exec_id.into(), amount: 1.0, currency: "USD".into() }
+    }
+
+    fn fees(rx: &mut tokio::sync::mpsc::Receiver<GatewayMsg>) -> Vec<(Uuid, ExecKind)> {
+        fills(rx).into_iter().filter(|(_, k)| matches!(k, ExecKind::Fee { .. })).collect()
+    }
+
+    #[tokio::test]
+    async fn ibkr_commission_report_becomes_fee() {
+        let (_, adapter) = rig();
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        let id = Uuid::new_v4();
+        let mut booked = Booked::default();
+        handle(exec("e1.01", 42, &id.to_string()), &ctx, &mut booked).await;
+        handle(commission("e1.01"), &ctx, &mut booked).await;
+        let kinds: Vec<_> = fills(&mut rx).into_iter().map(|(_, k)| k).collect();
+        assert!(matches!(kinds[0], ExecKind::Fill { .. }), "fill first");
+        assert_eq!(
+            kinds[1],
+            ExecKind::Fee { fee_id: "IBKR_TWS-e1.01".into(), execution_id: Some("e1.01".into()), amount: 1.0, currency: "USD".into() }
+        );
+    }
+
+    #[tokio::test]
+    async fn ibkr_commission_for_unknown_exec_is_dropped_with_warning() {
+        let (_, adapter) = rig();
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        handle(commission("nope"), &ctx, &mut Booked::default()).await;
+        assert!(fills(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ibkr_replayed_commission_has_the_same_fee_id() {
+        let (fake, adapter) = rig();
+        let id = Uuid::new_v4();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        // Today's executions as TWS replays them: the commission may come first.
+        fake.executions.lock().unwrap().push(commission("e1.01"));
+        fake.executions.lock().unwrap().push(exec("e1.01", 42, &id.to_string()));
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        let mut booked = Booked::default();
+        handle(exec("e1.01", 42, &id.to_string()), &ctx, &mut booked).await;
+        handle(commission("e1.01"), &ctx, &mut booked).await;
+        on_connected(fake.as_ref(), &ctx, &mut booked).await.unwrap();
+        let ids: Vec<_> = fees(&mut rx)
+            .into_iter()
+            .map(|(o, k)| match k { ExecKind::Fee { fee_id, .. } => (o, fee_id), _ => unreachable!() })
+            .collect();
+        assert_eq!(ids, vec![(id, "IBKR_TWS-e1.01".to_string()), (id, "IBKR_TWS-e1.01".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn ibkr_zero_commission_sends_no_fee() {
+        let (_, adapter) = rig();
+        let (ctx, mut rx, _reg) = ctx(adapter);
+        let mut booked = Booked::default();
+        handle(exec("e1", 42, &Uuid::new_v4().to_string()), &ctx, &mut booked).await;
+        handle(TwsEvent::Commission { exec_id: "e1".into(), amount: 0.0, currency: "USD".into() }, &ctx, &mut booked).await;
+        assert!(fees(&mut rx).is_empty());
     }
 
     fn order_state(id: i32, order_ref: &str, status: &str, filled: f64, avg: f64) -> (i32, String, TwsOrderState) {

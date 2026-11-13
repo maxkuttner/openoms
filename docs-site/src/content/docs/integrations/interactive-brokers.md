@@ -115,7 +115,7 @@ Day P&L are totalled per currency. A notional limit applies only to orders in th
 limit's currency, so for a non-USD instrument without a limit in its currency only
 quantity limits apply. The price band is not applied on this connection.
 
-Commissions are logged but not yet booked into P&L.
+Commissions are booked as fees; see [Fees](/concepts/fees/).
 
 ### Known gaps
 

@@ -156,7 +156,7 @@ pub struct OutboxRecord {
 
 /// The Kafka records one event becomes: always one on the orders topic (the stored
 /// payload, verbatim — the same message the direct publish used to send), plus one
-/// on fills for a fill, keyed by order so it shares the order's partition.
+/// on fills for a fill or a fee, keyed by order so it shares the order's partition.
 /// Positions come from [`position_record`] instead: not every position change is
 /// a fill.
 pub fn records_for(row: &OutboxRow, topics: &OutboxTopics) -> Vec<OutboxRecord> {
@@ -169,12 +169,32 @@ pub fn records_for(row: &OutboxRow, topics: &OutboxTopics) -> Vec<OutboxRecord> 
     if matches!(row.event_type.as_str(), "order_partially_filled" | "order_filled") {
         records.push(OutboxRecord {
             topic: topics.fills.clone(),
-            key: order_key,
+            key: order_key.clone(),
             payload: serde_json::json!({
                 "event": row.payload,
                 "portfolio_id": row.portfolio_id,
                 "instrument_id": row.instrument_id,
                 "side": row.side,
+            })
+            .to_string(),
+        });
+    }
+    // A fee is its own record on the fills topic (not a fill): flat fee fields so a
+    // consumer can book it without unpacking the event. The orders-topic record
+    // above already carries the full event.
+    if row.event_type == "order_fee_charged" {
+        let fee = &row.payload["payload"];
+        records.push(OutboxRecord {
+            topic: topics.fills.clone(),
+            key: order_key,
+            payload: serde_json::json!({
+                "record": "fee",
+                "event": row.payload,
+                "portfolio_id": row.portfolio_id,
+                "instrument_id": row.instrument_id,
+                "execution_id": fee["execution_id"],
+                "fee_amount": fee["amount"],
+                "fee_currency": fee["currency"],
             })
             .to_string(),
         });
@@ -424,6 +444,24 @@ mod tests {
         assert_eq!(names, ["orders", "fills"]);
         assert_eq!(json(&records[1])["portfolio_id"], row.portfolio_id.unwrap().to_string());
         assert_eq!(json(&records[1])["event"], row.payload);
+    }
+
+    #[test]
+    fn fee_event_maps_to_an_outbox_record() {
+        let mut row = row("order_fee_charged");
+        row.payload = serde_json::json!({
+            "event_type": "order_fee_charged",
+            "payload": { "fee_id": "f1", "execution_id": "x1", "amount": 1.5, "currency": "BNB", "effect": "other" }
+        });
+        let records = records_for(&row, &topics());
+        let names: Vec<&str> = records.iter().map(|r| r.topic.as_str()).collect();
+        assert_eq!(names, ["orders", "fills"]);
+        let fee = json(&records[1]);
+        assert_eq!(fee["record"], "fee");
+        assert_eq!(fee["fee_amount"], 1.5);
+        assert_eq!(fee["fee_currency"], "BNB");
+        assert_eq!(fee["execution_id"], "x1");
+        assert_eq!(fee["portfolio_id"], row.portfolio_id.unwrap().to_string());
     }
 
     #[test]

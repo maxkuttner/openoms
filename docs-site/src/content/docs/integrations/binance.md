@@ -69,3 +69,7 @@ that a restart is required, and the new credentials apply at the next start.
 Saving the credentials offers to load Binance's spot pairs as a background job; the
 **Instrument universe** column on **Broker connections** shows its state and has
 **Load** / **Reload**. From a terminal: `oms setup sync-broker --broker binance --no-enrich`.
+
+## Fees
+
+Each trade's fee and fee currency are booked with the fill. See [Fees](/concepts/fees/).

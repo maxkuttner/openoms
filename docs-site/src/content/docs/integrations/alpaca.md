@@ -93,3 +93,4 @@ any label for the Alpaca account — it must be unique per connection:
   `TXSE`) are skipped during sync, with a warning naming them.
 - Market orders outside US market hours wait at Alpaca for the open (`day`) — they show
   `routed` until then.
+- Fees: Alpaca charges no commission, so none is booked; see [Fees](/concepts/fees/).

@@ -40,7 +40,7 @@ export default defineConfig({
           label: "Configuration",
           items: ["configuration/reference", "configuration/file-locations", "configuration/login"],
         },
-        { label: "Concepts", items: ["concepts/architecture"] },
+        { label: "Concepts", items: ["concepts/architecture", "concepts/fees"] },
         { label: "Strategies", items: ["strategies/fix", "strategies/rest", "strategies/colocated"] },
         {
           label: "Integrations",
