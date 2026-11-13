@@ -5,7 +5,7 @@
 # Issuer: <authentik>/application/o/oms/   (per-provider issuer mode)
 # email_verified: a custom `email` scope mapping (below) replaces the stock one,
 # which reports email_verified = true for every account. Here it is true only
-# when the user's `email_verified` attribute is truthy (set by a source, an
+# when the user's `email_verified` attribute is boolean true (set by a source, an
 # invitation flow, or an admin). No enrollment flow ships with this blueprint;
 # any enrollment flow you add must use an invitation stage with a fixed email.
 version: 1
@@ -24,7 +24,7 @@ entries:
       expression: |
         return {
             "email": request.user.email,
-            "email_verified": bool(request.user.attributes.get("email_verified", False)),
+            "email_verified": request.user.attributes.get("email_verified") is True,
         }
   - model: authentik_providers_oauth2.oauth2provider
     id: oms-provider
