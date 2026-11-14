@@ -1,12 +1,17 @@
 import { useEffect, useState } from "react";
-import { AppShell, Group, NavLink, Button, Center, Text, Loader, Anchor } from "@mantine/core";
-import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
+import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor, Stack } from "@mantine/core";
+import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { api, setToken, API_BASE } from "./api/client";
+import { API_BASE, consoleAccess, goToLogin, isLegacySession, onMfaRequired, setLegacyPassword } from "./api/client";
+import { authApi, TRADE_HOME } from "./login/api";
+import { MfaPrompt } from "./login/MfaPrompt";
+import { Frame } from "./login/Frame";
 import { Logo } from "./components/Logo";
 import { JobsIndicator } from "./components/JobsIndicator";
 import { LoginPage } from "./pages/Login";
-import { PrincipalsPage } from "./pages/Principals";
+import { UsersPage } from "./pages/Users";
+import { SignInPage } from "./pages/SignIn";
+import { SetupChecklist } from "./components/SetupChecklist";
 import { PortfoliosPage } from "./pages/Portfolios";
 import { AccountsPage } from "./pages/Accounts";
 import { BrokerConnectionsPage } from "./pages/BrokerConnections";
@@ -19,7 +24,8 @@ import { ApiPage } from "./pages/Api";
 import { palette } from "./palette";
 
 const NAV = [
-  { to: "/principals", label: "Principals" },
+  { to: "/users", label: "Users" },
+  { to: "/sign-in", label: "Sign-in" },
   { to: "/tokens", label: "API" },
   { to: "/portfolios", label: "Portfolios" },
   { to: "/accounts", label: "Accounts" },
@@ -43,6 +49,12 @@ function ConnectionDot() {
       <Text fz={12} c={palette.muted}>{ok ? "connected" : "offline"}</Text>
     </Group>
   );
+}
+
+/** Home: straight to Users. The setup checklist is a banner above every page
+ *  (see Console) until all its steps are done, so it never vanishes on navigation. */
+function Home() {
+  return <Navigate to="/users" replace />;
 }
 
 /** The authenticated console. */
@@ -86,9 +98,13 @@ function Console({ onLogout }: { onLogout: () => void }) {
         </Group>
       </AppShell.Navbar>
       <AppShell.Main>
+        <Box mb="md">
+          <SetupChecklist />
+        </Box>
         <Routes>
-          <Route path="/" element={<Navigate to="/principals" replace />} />
-          <Route path="/principals" element={<PrincipalsPage />} />
+          <Route path="/" element={<Home />} />
+          <Route path="/users" element={<UsersPage />} />
+          <Route path="/sign-in" element={<SignInPage />} />
           <Route path="/tokens" element={<ApiPage />} />
           <Route path="/portfolios" element={<PortfoliosPage />} />
           <Route path="/accounts" element={<AccountsPage />} />
@@ -104,36 +120,37 @@ function Console({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-type Status = "checking" | "authed" | "login";
+type Status = "checking" | "admin" | "forbidden" | "unavailable";
 
-/**
- * Auth gate. Probes an authed endpoint rather than just checking for a token, so
- * dev with OMS_ADMIN_AUTH_ENABLED=false still enters straight through (no token
- * needed), while a real deployment shows the login screen on 401/403.
- */
+/** Signed in, but without the admin capability. */
+function NoAccess() {
+  return (
+    <Frame title="Admin console">
+      <Stack gap={12}>
+        <Text fz={13}>You don't have access to the admin console.</Text>
+        <Anchor href={TRADE_HOME}>Open the trader app</Anchor>
+      </Stack>
+    </Frame>
+  );
+}
+
+/** Auth gate: the console needs a session holding the admin capability. */
 export function App() {
+  const { pathname } = useLocation();
+  const navigate = useNavigate();
   const [status, setStatus] = useState<Status>("checking");
-  const [checking, setChecking] = useState(false);
-  const [error, setError] = useState<string | undefined>();
+  const onLoginPage = pathname === "/login";
 
-  async function probe(): Promise<boolean> {
-    try {
-      await api.get("/admin/principals");
-      return true;
-    } catch {
-      return false;
-    }
+  useEffect(() => {
+    if (onLoginPage) return;
+    consoleAccess()
+      .catch(() => "unavailable" as const)
+      .then((a) => (a === "signed_out" ? goToLogin() : setStatus(a)));
+  }, [onLoginPage]);
+
+  if (onLoginPage) {
+    return <LoginPage onLegacySignedIn={() => { setStatus("admin"); navigate("/users", { replace: true }); }} />;
   }
-
-  useEffect(() => {
-    probe().then((ok) => setStatus(ok ? "authed" : "login"));
-  }, []);
-
-  useEffect(() => {
-    const onUnauthorized = () => setStatus("login");
-    window.addEventListener("oms:unauthorized", onUnauthorized);
-    return () => window.removeEventListener("oms:unauthorized", onUnauthorized);
-  }, []);
 
   if (status === "checking") {
     return (
@@ -142,24 +159,21 @@ export function App() {
       </Center>
     );
   }
-
-  if (status === "login") {
-    return (
-      <LoginPage
-        checking={checking}
-        error={error}
-        onSubmit={async (token) => {
-          setToken(token);
-          setError(undefined);
-          setChecking(true);
-          const ok = await probe();
-          setChecking(false);
-          if (ok) setStatus("authed");
-          else setError("Invalid token");
-        }}
-      />
-    );
+  if (status === "forbidden") return <NoAccess />;
+  if (status === "unavailable") {
+    return <Frame title="Admin console"><Text fz={13}>The OMS isn't responding. Try again.</Text></Frame>;
   }
 
-  return <Console onLogout={() => { setToken(""); setStatus("login"); }} />;
+  return (
+    <>
+      <MfaPrompt register={onMfaRequired} />
+      <Console
+        onLogout={async () => {
+          if (!isLegacySession()) await authApi.logout().catch(() => undefined);
+          setLegacyPassword(null);
+          goToLogin();
+        }}
+      />
+    </>
+  );
 }

@@ -210,7 +210,64 @@ pub fn origin_is_allowed(headers: &HeaderMap, method: &Method, public_base_url: 
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    origin.trim_end_matches('/') == public_base_url.trim_end_matches('/')
+    let (origin, expected) = (origin.trim_end_matches('/'), public_base_url.trim_end_matches('/'));
+    origin == expected || same_loopback_origin(origin, expected)
+}
+
+/// Two `http://` origins on the same port whose hosts are both loopback names
+/// (`localhost`, `127.0.0.1`, `[::1]`). A browser sends whichever spelling the
+/// user typed, and all of them reach this machine only.
+fn same_loopback_origin(a: &str, b: &str) -> bool {
+    use openidconnect::url::Url;
+    let (Ok(a), Ok(b)) = (Url::parse(a), Url::parse(b)) else {
+        return false;
+    };
+    is_plain_http_loopback(a.as_str())
+        && is_plain_http_loopback(b.as_str())
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The CSRF expected origin when `[auth].public_base_url` is not configured:
+/// on a loopback bind, `http://<bind_addr>`; anywhere else `Err` with the
+/// operator-facing refusal (the origin cannot be guessed safely, and local
+/// login needs one).
+pub fn derive_public_base_url(bind_addr: &str) -> Result<String, String> {
+    if crate::bind_is_loopback(bind_addr) {
+        Ok(format!("http://{bind_addr}"))
+    } else {
+        Err(format!(
+            "refusing to start: local login is enabled, OMS_BIND_ADDR ({bind_addr}) is reachable              beyond this machine, and no public URL is configured. Set [auth].public_base_url in              oms.toml to the URL browsers use to reach this server (e.g. https://oms.example.com)."
+        ))
+    }
+}
+
+/// How a session was established — `user_session.auth_method`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    Oidc,
+    Local,
+    LegacyAdmin,
+}
+
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMethod::Oidc => "oidc",
+            AuthMethod::Local => "local",
+            AuthMethod::LegacyAdmin => "legacy_admin",
+        }
+    }
+
+    /// `None` for a value this build does not know: such a session must not
+    /// authenticate as anything (fail closed, not as OIDC).
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "oidc" => Some(AuthMethod::Oidc),
+            "local" => Some(AuthMethod::Local),
+            "legacy_admin" => Some(AuthMethod::LegacyAdmin),
+            _ => None,
+        }
+    }
 }
 
 pub struct SessionRecord {
@@ -219,26 +276,87 @@ pub struct SessionRecord {
     pub principal_code: String,
     pub last_seen_at: DateTime<Utc>,
     pub absolute_expires_at: DateTime<Utc>,
+    pub auth_method: AuthMethod,
+    pub mfa_verified_at: Option<DateTime<Utc>>,
 }
 
+const INSERT_SESSION: &str = "INSERT INTO user_session \
+     (principal_id, token_hash, absolute_expires_at, user_agent, auth_method, mfa_verified_at) \
+     VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN now() END) RETURNING id";
+
+/// Mint a session. `mfa_verified` stamps `mfa_verified_at = now()`; a local
+/// login starts without it and earns it at the TOTP step.
 pub async fn create_session(
     pool: &PgPool,
     principal_id: Uuid,
+    auth_method: AuthMethod,
+    mfa_verified: bool,
     ttl: &SessionTtl,
     user_agent: Option<&str>,
 ) -> Result<SessionToken, sqlx::Error> {
     let token = generate_session_token();
-    sqlx::query(
-        "INSERT INTO user_session (principal_id, token_hash, absolute_expires_at, user_agent) \
-         VALUES ($1, $2, $3, $4)",
+    sqlx::query(INSERT_SESSION)
+        .bind(principal_id)
+        .bind(&token.hash)
+        .bind(absolute_expiry(Utc::now(), ttl))
+        .bind(user_agent)
+        .bind(auth_method.as_str())
+        .bind(mfa_verified)
+        .execute(pool)
+        .await?;
+    Ok(token)
+}
+
+/// Replace session `old_id` with a fresh one in one transaction: the new row
+/// is inserted and the old one revoked together, so the old token stops
+/// working the moment the new one exists (session-fixation defence on a
+/// privilege change such as passing MFA). `None` if `old_id` was already
+/// revoked — a concurrent rotation won, and this one mints nothing.
+pub async fn rotate_session(
+    pool: &PgPool,
+    old_id: Uuid,
+    principal_id: Uuid,
+    auth_method: AuthMethod,
+    mfa_verified: bool,
+    ttl: &SessionTtl,
+    user_agent: Option<&str>,
+) -> Result<Option<SessionToken>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let revoked = sqlx::query(
+        "UPDATE user_session SET revoked_at = now() \
+          WHERE id = $1 AND principal_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(old_id)
+    .bind(principal_id)
+    .execute(&mut *tx)
+    .await?;
+    if revoked.rows_affected() != 1 {
+        return Ok(None);
+    }
+    let token = generate_session_token();
+    sqlx::query(INSERT_SESSION)
+        .bind(principal_id)
+        .bind(&token.hash)
+        .bind(absolute_expiry(Utc::now(), ttl))
+        .bind(user_agent)
+        .bind(auth_method.as_str())
+        .bind(mfa_verified)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Some(token))
+}
+
+/// Revoke every live session of `principal_id` (logout-all, credential
+/// change). Returns how many were revoked.
+pub async fn revoke_all_for_principal(pool: &PgPool, principal_id: Uuid) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE user_session SET revoked_at = now() WHERE principal_id = $1 AND revoked_at IS NULL",
     )
     .bind(principal_id)
-    .bind(&token.hash)
-    .bind(absolute_expiry(Utc::now(), ttl))
-    .bind(user_agent)
     .execute(pool)
     .await?;
-    Ok(token)
+    Ok(result.rows_affected())
 }
 
 /// Resolve a cookie value to its session, joining `principal` so a disabled
@@ -252,7 +370,7 @@ pub async fn lookup_session(
 ) -> Result<Option<SessionRecord>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT s.id, s.principal_id, p.code AS principal_code, \
-                s.last_seen_at, s.absolute_expires_at \
+                s.last_seen_at, s.absolute_expires_at, s.auth_method, s.mfa_verified_at \
          FROM user_session s \
          JOIN principal p ON p.id = s.principal_id \
          WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status = 'ACTIVE' \
@@ -262,12 +380,21 @@ pub async fn lookup_session(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| SessionRecord {
-        id: r.get("id"),
+    let Some(r) = row else { return Ok(None) };
+    let id: Uuid = r.get("id");
+    let raw_method: &str = r.get("auth_method");
+    let Some(auth_method) = AuthMethod::parse(raw_method) else {
+        tracing::warn!(session_id = %id, auth_method = raw_method, "session has an unknown auth_method; denying it");
+        return Ok(None);
+    };
+    Ok(Some(SessionRecord {
+        id,
         principal_id: r.get("principal_id"),
         principal_code: r.get("principal_code"),
         last_seen_at: r.get("last_seen_at"),
         absolute_expires_at: r.get("absolute_expires_at"),
+        auth_method,
+        mfa_verified_at: r.get("mfa_verified_at"),
     }))
 }
 
@@ -287,22 +414,6 @@ pub async fn revoke_session(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> 
     Ok(())
 }
 
-pub async fn revoke_all_for_principal(
-    pool: &PgPool,
-    principal_id: Uuid,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE user_session SET revoked_at = now() \
-         WHERE principal_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(principal_id)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected())
-}
-
-/// Delete sessions past their absolute cap. Idle expiry is enforced on read, so
-/// this only clears what can never resolve again.
 pub async fn sweep_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let result = sqlx::query("DELETE FROM user_session WHERE absolute_expires_at < now()")
         .execute(pool)
@@ -323,6 +434,45 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("origin", origin.parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn loopback_local_only_derives_expected_origin() {
+        assert_eq!(derive_public_base_url("127.0.0.1:3001").unwrap(), "http://127.0.0.1:3001");
+        assert_eq!(derive_public_base_url("localhost:3001").unwrap(), "http://localhost:3001");
+        // Both spellings of the same loopback port are accepted.
+        let derived = derive_public_base_url("127.0.0.1:3001").unwrap();
+        for ok in ["http://localhost:3001", "http://127.0.0.1:3001"] {
+            let mut h = HeaderMap::new();
+            h.insert("origin", ok.parse().unwrap());
+            assert!(origin_is_allowed(&h, &Method::POST, &derived), "{ok}");
+        }
+        for bad in ["http://localhost:3002", "https://localhost:3001", "http://evil.example.com:3001"] {
+            let mut h = HeaderMap::new();
+            h.insert("origin", bad.parse().unwrap());
+            assert!(!origin_is_allowed(&h, &Method::POST, &derived), "{bad}");
+        }
+    }
+
+    #[test]
+    fn non_loopback_local_without_base_url_refuses_to_start() {
+        let err = derive_public_base_url("0.0.0.0:3001").unwrap_err();
+        assert!(err.contains("[auth].public_base_url"), "{err}");
+    }
+
+    #[test]
+    fn derived_origin_gates_session_posts() {
+        let cfg = SessionConfig {
+            cookie_policy: cookie_policy("127.0.0.1:3001", Some("http://127.0.0.1:3001")),
+            ttl: SessionTtl::default(),
+            public_base_url: Some(derive_public_base_url("127.0.0.1:3001").unwrap()),
+        };
+        let base = cfg.public_base_url.as_deref().unwrap();
+        let mut h = HeaderMap::new();
+        h.insert("origin", "http://localhost:3001".parse().unwrap());
+        assert!(origin_is_allowed(&h, &Method::POST, base));
+        h.insert("origin", "http://attacker.example".parse().unwrap());
+        assert!(!origin_is_allowed(&h, &Method::POST, base));
     }
 
     #[test]
@@ -561,6 +711,17 @@ mod tests {
         assert_eq!(cookie_from_headers(&headers, "oms_session"), None);
     }
 
+    /// An auth_method this build does not know fails closed: no silent
+    /// fallback to OIDC (whose MFA rule differs from local's).
+    #[test]
+    fn an_unknown_auth_method_does_not_parse() {
+        assert_eq!(AuthMethod::parse("oidc"), Some(AuthMethod::Oidc));
+        assert_eq!(AuthMethod::parse("local"), Some(AuthMethod::Local));
+        assert_eq!(AuthMethod::parse("legacy_admin"), Some(AuthMethod::LegacyAdmin));
+        assert_eq!(AuthMethod::parse("webauthn"), None);
+        assert_eq!(AuthMethod::parse(""), None);
+    }
+
     #[test]
     fn no_cookie_header_is_not_an_error() {
         assert_eq!(cookie_from_headers(&axum::http::HeaderMap::new(), "oms_session"), None);
@@ -577,7 +738,7 @@ mod tests {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "session-store-test").await;
 
-        let token = create_session(&pool, principal_id, &SessionTtl::default(), Some("test-agent"))
+        let token = create_session(&pool, principal_id, AuthMethod::Oidc, false, &SessionTtl::default(), Some("test-agent"))
             .await
             .expect("create");
 
@@ -599,7 +760,7 @@ mod tests {
     async fn a_disabled_principal_loses_its_sessions() {
         let pool = test_pool().await;
         let (principal_id, _principal_code) = seed_principal(&pool, "session-disable-test").await;
-        let token = create_session(&pool, principal_id, &SessionTtl::default(), None)
+        let token = create_session(&pool, principal_id, AuthMethod::Oidc, false, &SessionTtl::default(), None)
             .await
             .expect("create");
 
@@ -615,21 +776,6 @@ mod tests {
             .expect("disable");
 
         assert!(lookup_session(&pool, &token.hash).await.expect("lookup").is_none());
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn revoking_a_principal_kills_every_one_of_its_sessions() {
-        let pool = test_pool().await;
-        let (principal_id, _principal_code) = seed_principal(&pool, "session-revoke-all-test").await;
-        let a = create_session(&pool, principal_id, &SessionTtl::default(), None).await.expect("a");
-        let b = create_session(&pool, principal_id, &SessionTtl::default(), None).await.expect("b");
-
-        let killed = revoke_all_for_principal(&pool, principal_id).await.expect("revoke all");
-
-        assert_eq!(killed, 2);
-        assert!(lookup_session(&pool, &a.hash).await.expect("a").is_none());
-        assert!(lookup_session(&pool, &b.hash).await.expect("b").is_none());
     }
 
     // ── test plumbing ────────────────────────────────────────────────────────

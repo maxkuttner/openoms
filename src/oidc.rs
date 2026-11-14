@@ -39,10 +39,28 @@ pub struct Expectations {
 /// group/role gate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerifiedIdentity {
+    /// The issuer the token was verified against; with `subject`, the
+    /// identity's key.
+    pub issuer: String,
     pub subject: String,
     pub display_name: Option<String>,
     pub email: Option<String>,
+    /// The `email_verified` claim; absent or anything but `true` is false.
+    pub email_verified: bool,
     pub claims: serde_json::Value,
+}
+
+/// Does the ID token's `amr` claim (an array of strings) carry every value in
+/// `required`? An empty `required` is always satisfied: the identity
+/// provider's own MFA policy is trusted.
+pub fn amr_satisfied(claims: &serde_json::Value, required: &[String]) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let Some(amr) = claims.get("amr").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    required.iter().all(|r| amr.iter().any(|v| v.as_str() == Some(r.as_str())))
 }
 
 /// Why an ID token was refused. Each variant corresponds to a distinct,
@@ -159,10 +177,14 @@ pub fn verify_id_token(
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let email_verified = matches!(raw_claims.get("email_verified"), Some(serde_json::Value::Bool(true)));
+
     Ok(VerifiedIdentity {
+        issuer: expected.issuer.clone(),
         subject,
         display_name,
         email,
+        email_verified,
         claims: raw_claims,
     })
 }
@@ -223,7 +245,7 @@ const JWKS_REFETCH_INTERVAL: chrono::Duration = chrono::Duration::seconds(60);
 
 /// True for hosts reachable only from this machine — the one case
 /// `refuse_insecure_endpoint` tolerates an `http://` discovered endpoint for,
-/// so a local Keycloak run entirely on loopback still works without TLS.
+/// so a local Authentik run entirely on loopback still works without TLS.
 ///
 /// `host` is `url::Url::host_str()`'s output, which brackets an IPv6 literal
 /// (`"[::1]"`, not `"::1"`) — unlike `setup::database::config::is_loopback_host`,
@@ -242,7 +264,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// on the wire in clear text on every code exchange; for the authorization
 /// endpoint, it would send the PKCE challenge and the browser redirect over
 /// an interceptable channel. Loopback is the one deliberate exception, so a
-/// local Keycloak in development still works without standing up TLS for it.
+/// local Authentik in development still works without standing up TLS for it.
 fn refuse_insecure_endpoint(url: &str, label: &str) -> Result<(), OidcError> {
     let parsed = openidconnect::url::Url::parse(url).map_err(|e| {
         OidcError::ProviderUnavailable(format!("{label} endpoint is not a valid URL: {e}"))
@@ -337,6 +359,8 @@ impl Provider {
                 scopes: vec!["openid".to_string()],
                 required_claim: None,
                 ttl: crate::sessions::SessionTtl::default(),
+                trust_email_verified: true,
+                require_amr: Vec::new(),
             },
             client_secret: "test-secret".to_string(),
             authorization_endpoint: format!("{issuer}/authorize"),
@@ -524,7 +548,7 @@ fn build_http_client() -> Result<openidconnect::reqwest::Client, OidcError> {
         // response redirect these requests anywhere (SSRF).
         .redirect(openidconnect::reqwest::redirect::Policy::none())
         // Trust the host's own CA store, not just the roots `openidconnect`
-        // compiles in. A self-hosted OMS normally sits beside a Keycloak whose
+        // compiles in. A self-hosted OMS normally sits beside an IdP whose
         // certificate chains to a corporate or internal CA; with only the
         // bundled Mozilla roots, discovery fails and login is disabled for the
         // entire run. The feature this needs is unified in via the `reqwest012`
@@ -575,6 +599,19 @@ mod tests {
         assert_eq!(identity.subject, "user-42");
         assert_eq!(identity.display_name.as_deref(), Some("Ada Lovelace"));
         assert_eq!(identity.email.as_deref(), Some("ada@example.com"));
+    }
+
+    #[test]
+    fn email_verified_is_true_only_when_the_token_says_so() {
+        let s = signer();
+        for (claim, expected) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let token = s.token_with(|mut c| {
+                c.email_verified = claim;
+                c
+            });
+            let identity = verify_id_token(&token, &s.keys(), &expectations(), Utc::now()).expect("verify");
+            assert_eq!(identity.email_verified, expected, "claim {claim:?}");
+        }
     }
 
     #[test]
@@ -841,6 +878,7 @@ mod tests {
         nonce: String,
         name: Option<String>,
         email: Option<String>,
+        email_verified: Option<bool>,
     }
 
     impl Default for Claims {
@@ -855,6 +893,7 @@ mod tests {
                 nonce: "n-123".into(),
                 name: Some("Ada Lovelace".into()),
                 email: Some("ada@example.com".into()),
+                email_verified: None,
             }
         }
     }
@@ -908,6 +947,7 @@ mod tests {
             if let Some(email) = c.email {
                 claims = claims.set_email(Some(EndUserEmail::new(email)));
             }
+            claims = claims.set_email_verified(c.email_verified);
 
             CoreIdToken::new(
                 claims,

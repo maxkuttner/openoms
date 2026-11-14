@@ -1,17 +1,14 @@
-//! Maps an authenticated OIDC subject onto a `principal` row.
-//!
-//! The OMS's existing identity for anything that can trade is `principal`; a
-//! human who successfully completes OIDC login needs one too. This module
-//! owns that mapping and, on first login, the provisioning of a new row.
-//!
-//! `resolve_or_provision` takes an already-`VerifiedIdentity` and a database
-//! pool, and makes no assumption about how either arrived — that's the job of
-//! the `/auth/*` HTTP handlers below, which route an OIDC login through it.
+//! The `/auth/*` HTTP handlers: OIDC login, the invite link that starts one,
+//! the callback that resolves the verified identity through
+//! `invites::resolve_login`, logout and `/auth/me`. Sign-in is invite-only:
+//! nothing here creates a user.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Extension, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
@@ -20,128 +17,28 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::handlers::GrantedPortfolio;
 use crate::handlers::{self, ApiError};
-use crate::oidc::{OidcError, Provider, VerifiedIdentity};
+use crate::invites::{self, ClaimOutcome, ClaimPolicy};
+use crate::oidc::{OidcError, Provider};
 use crate::sessions::{self, CookiePolicy};
 
-/// The result of matching a verified identity to a principal.
-pub enum ResolveOutcome {
-    /// Matched an existing principal, or provisioned a new one.
-    Resolved { principal_id: Uuid, principal_code: String },
-    /// `required_claim` is configured and the identity's claims don't satisfy
-    /// it. No principal was read, created, or touched.
-    ClaimRejected,
-    /// `external_subject` already belongs to a row this subject must never
-    /// resolve onto or touch — a non-HUMAN principal (SERVICE, STRATEGY,
-    /// DESK) or a DISABLED one. Nothing was created or modified: this is a
-    /// refusal, not a provisioning opportunity, since `external_subject` is
-    /// UNIQUE and this subject can never claim a different row.
-    SubjectNotAvailable,
-}
-
-/// Match an authenticated subject to its principal, creating one on first sight.
-///
-/// A provisioned principal has no grants, and a principal without grants can do
-/// nothing: `require_order_grant` gates every order path and `/portfolios`
-/// returns only granted rows. So first login yields an identity that can see
-/// nothing until an admin grants it a portfolio — which is why this is safe to
-/// do automatically, and why it beats making an admin hand-copy opaque subject
-/// strings before anyone can log in.
-pub async fn resolve_or_provision(
-    pool: &PgPool,
-    identity: &VerifiedIdentity,
-    required_claim: Option<&(String, String)>,
-) -> Result<ResolveOutcome, sqlx::Error> {
-    // A SERVICE or STRATEGY principal must never hold a browser session, and a
-    // DISABLED one must never resolve at all — both are enforced right here in
-    // the match, not left to a caller to remember.
-    let existing = sqlx::query(
-        "SELECT id, code FROM principal \
-         WHERE external_subject = $1 AND status = 'ACTIVE' AND principal_type = 'HUMAN'",
-    )
-    .bind(&identity.subject)
-    .fetch_optional(pool)
-    .await?;
-
-    if let Some(row) = existing {
-        return Ok(ResolveOutcome::Resolved {
-            principal_id: row.get("id"),
-            principal_code: row.get("code"),
-        });
-    }
-
-    // Checked before any insert: a rejected subject must leave no row behind.
-    if let Some((claim_name, required_value)) = required_claim {
-        if !claim_satisfies(&identity.claims, claim_name, required_value) {
-            return Ok(ResolveOutcome::ClaimRejected);
-        }
-    }
-
-    let code_seed = identity
-        .email
-        .as_deref()
-        .and_then(|email| email.split('@').next())
-        .filter(|local| !local.is_empty())
-        .or(identity.display_name.as_deref())
-        .unwrap_or(&identity.subject);
-    let code = generate_unique_code(pool, code_seed).await?;
-
-    // ON CONFLICT (external_subject) is what makes two concurrent first
-    // logins for the same subject idempotent rather than a unique-violation
-    // error: whichever insert loses the race just updates the winner's row
-    // (display_name only — code, id, and grants are untouched) and returns
-    // it, same as if it had matched on the lookup above.
-    //
-    // The DO UPDATE's WHERE guard is load-bearing: without it, a conflict
-    // against a SERVICE/STRATEGY/DESK or DISABLED principal would still fire
-    // the update and hand this subject that row's id, code, and every grant
-    // it holds — a privilege escalation. With the guard, a conflict against
-    // such a row satisfies no WHERE clause, so DO UPDATE affects zero rows
-    // and RETURNING yields nothing: `fetch_optional` sees `None`, and that is
-    // treated as a refusal below, not as "nothing happened, fall through to
-    // provisioning" (this row already exists — provisioning would collide on
-    // the UNIQUE external_subject too).
-    let row = sqlx::query(
-        "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-         VALUES ($1, $2, 'HUMAN', $3, $4, 'ACTIVE') \
-         ON CONFLICT (external_subject) DO UPDATE SET display_name = EXCLUDED.display_name \
-         WHERE principal.principal_type = 'HUMAN' AND principal.status = 'ACTIVE' \
-         RETURNING id, code",
-    )
-    .bind(Uuid::new_v4())
-    .bind(&code)
-    .bind(&identity.subject)
-    .bind(&identity.display_name)
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(ResolveOutcome::SubjectNotAvailable);
-    };
-
-    Ok(ResolveOutcome::Resolved {
-        principal_id: row.get("id"),
-        principal_code: row.get("code"),
-    })
-}
-
-// ── HTTP layer: /auth/login, /auth/callback, /auth/logout, /auth/me ────────
+// ── HTTP layer: /auth/oidc/login, /auth/oidc/callback, /auth/logout, /auth/me ──
 //
-// Mounted in `main.rs`'s `serve()`: `/auth/login`, `/auth/callback` and
+// Mounted in `main.rs`'s `serve()`: `/auth/oidc/login`, `/auth/oidc/callback` and
 // `/auth/logout` on their own unauthenticated router (merged only when
 // `config.oidc()` is `Some`), `/auth/me` on `orders_router` behind
 // `auth_middleware`. `AuthApiState` is constructed there too, from
 // `[auth.oidc]` config plus `oidc::Provider::discover`.
 
 /// What `login` and `callback` need beyond `AppState`: the configured
-/// provider connection and the optional claim gate `resolve_or_provision`
-/// checks. Kept out of `AppState` because OIDC is optional and off by
+/// provider connection and the optional claim gate the callback checks
+/// before resolving the login. Kept out of `AppState` because OIDC is optional and off by
 /// default (see `FileConfig::oidc`); Task 13 constructs this once at boot,
 /// only when `[auth.oidc]` is configured, and hands it to the router as an
 /// `Extension`.
@@ -149,25 +46,89 @@ pub async fn resolve_or_provision(
 pub struct AuthApiState {
     pub provider: Arc<Provider>,
     pub required_claim: Option<(String, String)>,
+    /// `[auth.oidc].require_amr`: a login whose `amr` lacks any of these gets
+    /// a session without MFA (reads only; see `authz::require_mfa`).
+    pub require_amr: Vec<String>,
+    /// `[auth.oidc].trust_email_verified`; off, every invite claim waits for
+    /// an admin to approve the binding.
+    pub trust_email_verified: bool,
+    /// Pending logins, keyed server-side; the browser holds only the id.
+    pub flows: Arc<FlowStore>,
 }
 
 /// `state`, `nonce`, and the PKCE verifier for one pending login. Minted by
-/// `login`, carried to the browser in a short-lived cookie (see
-/// `flow_cookie`), and read back by `callback` — never persisted to a table,
-/// since they are per-browser and worthless the moment the callback returns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `login`, kept in the `FlowStore` and found again by `callback` through the
+/// random flow id in the flow cookie — never persisted to a table, since they
+/// are per-browser and worthless the moment the callback returns.
+#[derive(Debug, Clone, PartialEq)]
 pub struct FlowState {
     pub state: String,
     pub nonce: String,
     pub pkce_verifier: String,
     pub return_to: String,
+    /// SHA-256 of the invite link token this login arrived with, if any. It
+    /// is the only way an unknown identity can get in; the token itself is
+    /// never kept or sent anywhere.
+    pub invite_token_hash: Option<String>,
+}
+
+/// How long a pending login stays usable, and how many may be pending at once.
+const FLOW_TTL: Duration = Duration::from_secs(300);
+const FLOW_CAP: usize = 10_000;
+
+/// Pending logins in memory, keyed by the SHA-256 of their flow id. Bounded
+/// so unauthenticated `/auth/oidc/login` hits cannot grow it without limit: expired
+/// flows are evicted, and past the cap a new login is refused. A restart drops
+/// every pending login, which costs a user one more click.
+pub struct FlowStore {
+    flows: Mutex<HashMap<String, (FlowState, Instant)>>,
+    ttl: Duration,
+    cap: usize,
+}
+
+impl Default for FlowStore {
+    fn default() -> Self {
+        FlowStore::new(FLOW_TTL, FLOW_CAP)
+    }
+}
+
+impl FlowStore {
+    pub fn new(ttl: Duration, cap: usize) -> Self {
+        FlowStore { flows: Mutex::new(HashMap::new()), ttl, cap }
+    }
+
+    /// Keeps `flow` and returns its fresh random id, or `None` when full.
+    pub fn insert(&self, flow: FlowState) -> Option<String> {
+        let mut flows = self.flows.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if flows.len() >= self.cap {
+            flows.retain(|_, (_, expires)| *expires > now);
+        }
+        if flows.len() >= self.cap {
+            return None;
+        }
+        let id = random_token();
+        flows.insert(flow_key(&id), (flow, now + self.ttl));
+        Some(id)
+    }
+
+    /// Removes and returns the flow behind `id`, if it is still live.
+    pub fn take(&self, id: &str) -> Option<FlowState> {
+        let mut flows = self.flows.lock().unwrap_or_else(|e| e.into_inner());
+        let (flow, expires) = flows.remove(&flow_key(id))?;
+        (expires > Instant::now()).then_some(flow)
+    }
+}
+
+fn flow_key(id: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(id.as_bytes()))
 }
 
 /// Validate a caller-supplied post-login destination.
 ///
 /// Only a same-site relative path is allowed. Everything else falls back to
 /// `/`. This is the whole security value of the feature: without it,
-/// `/auth/login` is an open redirect on the endpoint that mints the session,
+/// `/auth/oidc/login` is an open redirect on the endpoint that mints the session,
 /// which is worth more to an attacker than most bugs in this system.
 pub fn sanitize_return_to(raw: Option<&str>) -> String {
     const DEFAULT: &str = "/";
@@ -208,14 +169,12 @@ fn flow_cookie_name(policy: &CookiePolicy) -> &'static str {
     }
 }
 
-/// Builds the `Set-Cookie` header that carries `flow` to the browser.
-/// `HttpOnly` so no script on the page can read the PKCE verifier;
-/// `SameSite=Lax` and `Max-Age=300` so it cannot outlive the login it was
-/// minted for.
-pub fn flow_cookie(policy: &CookiePolicy, flow: &FlowState) -> String {
-    let encoded = encode_flow(flow);
+/// Builds the `Set-Cookie` header that carries the flow id to the browser.
+/// `HttpOnly` so no script on the page can read it; `SameSite=Lax` and
+/// `Max-Age=300` so it cannot outlive the login it was minted for.
+pub fn flow_cookie(policy: &CookiePolicy, flow_id: &str) -> String {
     let mut header = format!(
-        "{}={encoded}; Path=/; HttpOnly; SameSite=Lax; Max-Age={FLOW_COOKIE_MAX_AGE_SECONDS}",
+        "{}={flow_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={FLOW_COOKIE_MAX_AGE_SECONDS}",
         flow_cookie_name(policy)
     );
     if policy.secure {
@@ -237,26 +196,14 @@ fn clear_flow_cookie(policy: &CookiePolicy) -> String {
     header
 }
 
-/// Reads `flow_cookie`'s value back out, or `None` if it is absent, expired,
-/// or corrupt. A callback with no flow cookie cannot be trusted — there is
-/// nothing to compare its `state` against — so this is the gate `callback`
-/// checks before anything else touches the network.
-pub fn flow_from_cookie(headers: &HeaderMap, policy: &CookiePolicy) -> Option<FlowState> {
-    let value = sessions::cookie_from_headers(headers, flow_cookie_name(policy))?;
-    decode_flow(&value)
-}
-
-/// JSON, then base64url (no padding) — the same alphabet already used for
-/// `state`/`nonce`/`pkce_verifier` (see `random_token`), so the cookie value
-/// never needs percent-encoding.
-fn encode_flow(flow: &FlowState) -> String {
-    let json = serde_json::to_vec(flow).expect("FlowState is plain strings; serialization cannot fail");
-    URL_SAFE_NO_PAD.encode(json)
-}
-
-fn decode_flow(value: &str) -> Option<FlowState> {
-    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Takes the flow named by the request's flow cookie out of `store`, or
+/// `None` if the cookie is absent or its flow expired, was used, or never
+/// existed. A callback with no flow cannot be trusted — there is nothing to
+/// compare its `state` against — so this is the gate `callback` checks before
+/// anything else touches the network.
+pub fn take_flow(store: &FlowStore, headers: &HeaderMap, policy: &CookiePolicy) -> Option<FlowState> {
+    let id = sessions::cookie_from_headers(headers, flow_cookie_name(policy))?;
+    store.take(&id)
 }
 
 /// A cryptographically random, URL-safe token — used for `state`, `nonce`,
@@ -283,15 +230,16 @@ pub struct LoginParams {
     pub return_to: Option<String>,
 }
 
-/// Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in
-/// the flow cookie, and sends the browser to the provider. Cannot fail —
-/// there is no user input yet and no network call, only local randomness —
-/// so this returns a bare `Response`, not a `Result`.
+/// Starts a login: mints `state`/`nonce`/a PKCE verifier, keeps them in the
+/// flow store under a random id set as the flow cookie, and sends the browser
+/// to the provider. Refused with a generic 503 only when too many logins are
+/// pending at once.
 #[utoipa::path(
-    get, path = "/auth/login", tag = "auth",
+    get, path = "/auth/oidc/login", tag = "auth",
     params(LoginParams),
     responses(
-        (status = 302, description = "Redirects to the identity provider's authorization endpoint"),
+        (status = 303, description = "Redirects to the identity provider's authorization endpoint"),
+        (status = 503, description = "Too many sign-ins in progress; try again shortly"),
     ),
 )]
 pub async fn login(
@@ -299,17 +247,56 @@ pub async fn login(
     Extension(auth_state): Extension<AuthApiState>,
     Query(params): Query<LoginParams>,
 ) -> Response {
+    start_flow(&state, &auth_state, sanitize_return_to(params.return_to.as_deref()), None)
+}
+
+/// The invite link: starts a login with the invite token's hash bound to the
+/// server-side flow, and does nothing else. The token never reaches a cookie
+/// or the provider. Whether the token is any good is decided only after
+/// the provider has verified who is signing in.
+#[utoipa::path(
+    get, path = "/auth/invite/{token}", tag = "auth",
+    params(("token" = String, Path, description = "The invite link token")),
+    responses(
+        (status = 303, description = "Redirects to the identity provider's authorization endpoint"),
+        (status = 503, description = "Too many sign-ins in progress; try again shortly"),
+    ),
+)]
+pub async fn invite(
+    State(state): State<AppState>,
+    Extension(auth_state): Extension<AuthApiState>,
+    Path(token): Path<String>,
+) -> Response {
+    start_flow(&state, &auth_state, INVITE_LANDING.to_string(), Some(sessions::hash_session_token(&token)))
+}
+
+/// Where an accepted invite lands: the trader app, never the admin console at
+/// `/`. Invitees are traders, PMs and viewers; the cockpit is admin-only.
+const INVITE_LANDING: &str = "/trade/";
+
+fn start_flow(
+    state: &AppState,
+    auth_state: &AuthApiState,
+    return_to: String,
+    invite_token_hash: Option<String>,
+) -> Response {
     let flow = FlowState {
         state: random_token(),
         nonce: random_token(),
         pkce_verifier: random_token(),
-        return_to: sanitize_return_to(params.return_to.as_deref()),
+        return_to,
+        invite_token_hash,
     };
     let challenge = pkce_challenge(&flow.pkce_verifier);
     let authorize_url = auth_state.provider.authorize_url(&flow.state, &flow.nonce, &challenge);
+    let Some(flow_id) = auth_state.flows.insert(flow) else {
+        tracing::warn!("login refused: too many sign-ins in progress");
+        return ApiError { status: StatusCode::SERVICE_UNAVAILABLE, message: "sign-in unavailable, try again shortly".to_string() }
+            .into_response();
+    };
 
     let mut response = Redirect::to(&authorize_url).into_response();
-    let cookie = flow_cookie(&state.session_config.cookie_policy, &flow);
+    let cookie = flow_cookie(&state.session_config.cookie_policy, &flow_id);
     response.headers_mut().insert(
         header::SET_COOKIE,
         cookie.parse().expect("flow cookie header value is plain ASCII"),
@@ -400,21 +387,22 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
 }
 
 /// Completes a login: validates the callback, exchanges the code, resolves
-/// (or provisions) the principal, and mints a session.
+/// the identity (claiming the flow's invite if it is unknown), and mints a
+/// session. A login that resolves to no user is redirected to the access
+/// page with the reason; nothing is created for it.
 ///
-/// Every failure path here ends in a clean `ApiError` and no session:
-/// a provider error, a missing/expired flow cookie, a `state` mismatch, an
-/// exchange/token failure, `ClaimRejected`, and `SubjectNotAvailable` (the
-/// latter two both map to 403 — see `ResolveOutcome`) all return before
-/// `create_session` is ever called.
+/// Every failure path returns before `create_session` is ever called: a
+/// provider error, a missing/expired flow cookie, a `state` mismatch, an
+/// exchange/token failure or the claim gate end in an `ApiError`; a
+/// `ClaimOutcome` refusal ends in the access-page redirect.
 #[utoipa::path(
-    get, path = "/auth/callback", tag = "auth",
+    get, path = "/auth/oidc/callback", tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 302, description = "Login completed; session cookie set, redirects to the validated return_to (default /)"),
+        (status = 303, description = "Login completed (session cookie set, redirects to the validated return_to), or refused or awaiting admin approval (redirects to /trade/access?reason=..., e.g. pending_approval)"),
         (status = 400, description = "Malformed callback, or a missing/expired/mismatched login flow"),
         (status = 401, description = "The provider rejected the login, or the exchanged token failed verification"),
-        (status = 403, description = "The claim gate rejected the identity, or the subject belongs to a non-human or disabled principal"),
+        (status = 403, description = "The claim gate rejected the identity"),
         (status = 502, description = "The identity provider was unreachable"),
     ),
 )]
@@ -439,7 +427,7 @@ pub async fn callback(
     };
 
     let policy = &state.session_config.cookie_policy;
-    let flow = flow_from_cookie(&headers, policy).ok_or_else(|| ApiError {
+    let flow = take_flow(&auth_state.flows, &headers, policy).ok_or_else(|| ApiError {
         status: StatusCode::BAD_REQUEST,
         message: "missing or expired login flow".to_string(),
     })?;
@@ -459,24 +447,40 @@ pub async fn callback(
         .await
         .map_err(map_oidc_error)?;
 
-    let outcome = resolve_or_provision(state.pool(), &identity, auth_state.required_claim.as_ref())
-        .await
-        .map_err(|err| db_error("resolve_or_provision", err))?;
-
-    // Exhaustive on purpose: `SubjectNotAvailable` is a refusal, not a
-    // variant a catch-all should ever be allowed to treat as success.
-    let principal_id = match outcome {
-        ResolveOutcome::Resolved { principal_id, .. } => principal_id,
-        ResolveOutcome::ClaimRejected => {
+    // Checked before any lookup: a login outside the configured slice of the
+    // tenant is refused outright.
+    if let Some((claim_name, required_value)) = auth_state.required_claim.as_ref() {
+        if !claim_satisfies(&identity.claims, claim_name, required_value) {
             return Err(ApiError { status: StatusCode::FORBIDDEN, message: "not authorized".to_string() });
         }
-        ResolveOutcome::SubjectNotAvailable => {
-            return Err(ApiError { status: StatusCode::FORBIDDEN, message: "not authorized".to_string() });
+    }
+
+    // A live session on this browser is the owner proof a link invite needs.
+    let owner_session = match crate::auth::authenticate_session(state.pool(), &headers, &state.session_config).await {
+        Ok(record) => record.map(|r| (r.principal_id, r.mfa_verified_at.is_some())),
+        Err(unavailable) => return Ok(unavailable),
+    };
+    let policy_for_claim = ClaimPolicy { trust_email_verified: auth_state.trust_email_verified, owner_session };
+    let outcome = invites::resolve_login(state.pool(), &identity, flow.invite_token_hash.as_deref(), &policy_for_claim)
+        .await
+        .map_err(|err| db_error("resolve_login", err))?;
+
+    let principal_id = match outcome {
+        ClaimOutcome::Linked { principal_id, .. } | ClaimOutcome::Known { principal_id, .. } => principal_id,
+        refused => {
+            let mut response = Redirect::to(&access_refused_url(&refused)).into_response();
+            response.headers_mut().append(
+                header::SET_COOKIE,
+                clear_flow_cookie(policy).parse().expect("flow cookie header value is plain ASCII"),
+            );
+            return Ok(response);
         }
     };
 
     let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
-    let token = sessions::create_session(state.pool(), principal_id, &state.session_config.ttl, user_agent)
+    // The MFA policy is evaluated here, once: `require_mfa` only reads the stamp.
+    let mfa = crate::oidc::amr_satisfied(&identity.claims, &auth_state.require_amr);
+    let token = sessions::create_session(state.pool(), principal_id, sessions::AuthMethod::Oidc, mfa, &state.session_config.ttl, user_agent)
         .await
         .map_err(|err| db_error("create_session", err))?;
 
@@ -524,6 +528,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result
             sessions::revoke_session(state.pool(), record.id)
                 .await
                 .map_err(|err| db_error("revoke_session", err))?;
+            state.event_bus().publish_auth_changed(record.principal_id);
         }
     }
 
@@ -545,6 +550,9 @@ pub struct MeResponse {
     pub code: String,
     pub display_name: Option<String>,
     pub portfolios: Vec<GrantedPortfolio>,
+    /// How this session signed in (`local`, `oidc`, …): decides which step
+    /// a 403 `mfa_required` asks for.
+    pub auth_method: &'static str,
 }
 
 /// Who the caller is signed in as, and what they can act on.
@@ -603,6 +611,7 @@ pub async fn me(
         code: auth.principal_code,
         display_name,
         portfolios,
+        auth_method: auth.auth_method.as_str(),
     }))
 }
 
@@ -620,77 +629,92 @@ fn claim_satisfies(claims: &serde_json::Value, claim_name: &str, required_value:
     }
 }
 
-/// Slugifies `seed` and, if that code is already taken, appends the lowest
-/// free numeric suffix (`-2`, `-3`, ...). An admin granting portfolios should
-/// see a human-readable name, not a UUID.
-async fn generate_unique_code(pool: &PgPool, seed: &str) -> Result<String, sqlx::Error> {
-    let base = slugify(seed);
-    let base = if base.is_empty() { "principal".to_string() } else { base };
-
-    let mut candidate = base.clone();
-    let mut suffix = 1u32;
-    loop {
-        let taken: bool =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM principal WHERE code = $1)")
-                .bind(&candidate)
-                .fetch_one(pool)
-                .await?;
-        if !taken {
-            return Ok(candidate);
+/// Where a refused login lands: the access page with the reason, plus the
+/// masked invited address for an email mismatch.
+pub fn access_refused_url(outcome: &ClaimOutcome) -> String {
+    let reason = outcome.refusal_reason().unwrap_or("no_invite");
+    match outcome {
+        ClaimOutcome::EmailMismatch { invited_hint } => {
+            format!("/trade/access?reason={reason}&hint={}", percent_encode(invited_hint))
         }
-        suffix += 1;
-        candidate = format!("{base}-{suffix}");
+        _ => format!("/trade/access?reason={reason}"),
     }
 }
 
-/// Lowercase alphanumerics joined by single hyphens; no leading, trailing, or
-/// doubled hyphens.
-fn slugify(input: &str) -> String {
-    let mut out = String::new();
-    for c in input.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
-    fn the_flow_cookie_survives_a_round_trip() {
-        let policy = crate::sessions::cookie_policy("localhost:3001", None);
-        let flow = FlowState {
-            state: "st-1".into(),
+    fn an_invite_lands_in_the_trader_app() {
+        assert_eq!(super::INVITE_LANDING, "/trade/");
+        assert_eq!(super::sanitize_return_to(Some(super::INVITE_LANDING)), "/trade/");
+    }
+
+    use super::*;
+
+    fn flow(state: &str) -> FlowState {
+        FlowState {
+            state: state.into(),
             nonce: "n-1".into(),
             pkce_verifier: "v-1".into(),
             return_to: "/".into(),
-        };
+            invite_token_hash: None,
+        }
+    }
 
-        let header = flow_cookie(&policy, &flow);
+    fn cookie_request(set_cookie: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        let value = header.split(';').next().unwrap().to_string();
-        headers.insert("cookie", value.parse().unwrap());
+        headers.insert("cookie", set_cookie.split(';').next().unwrap().parse().unwrap());
+        headers
+    }
 
-        let read = flow_from_cookie(&headers, &policy).expect("flow");
+    #[test]
+    fn the_flow_is_kept_server_side_and_taken_once() {
+        let policy = crate::sessions::cookie_policy("localhost:3001", None);
+        let store = FlowStore::default();
+        let id = store.insert(flow("st-1")).expect("room");
+
+        let headers = cookie_request(&flow_cookie(&policy, &id));
+        let read = take_flow(&store, &headers, &policy).expect("flow");
         assert_eq!(read.state, "st-1");
-        assert_eq!(read.nonce, "n-1");
         assert_eq!(read.pkce_verifier, "v-1");
+        assert!(take_flow(&store, &headers, &policy).is_none(), "a flow is single use");
+    }
+
+    #[test]
+    fn an_expired_flow_is_gone() {
+        let store = FlowStore::new(Duration::ZERO, 10);
+        let id = store.insert(flow("st-1")).expect("room");
+        assert!(store.take(&id).is_none());
+    }
+
+    #[test]
+    fn the_flow_store_is_bounded() {
+        let store = FlowStore::new(Duration::from_secs(300), 2);
+        assert!(store.insert(flow("a")).is_some());
+        assert!(store.insert(flow("b")).is_some());
+        assert!(store.insert(flow("c")).is_none(), "past the cap a new flow is refused");
+
+        // Expired flows are evicted to make room.
+        let store = FlowStore::new(Duration::ZERO, 1);
+        assert!(store.insert(flow("a")).is_some());
+        assert!(store.insert(flow("b")).is_some());
     }
 
     #[test]
     fn the_flow_cookie_is_short_lived_and_unreadable_to_script() {
         let policy = crate::sessions::cookie_policy("localhost:3001", None);
-        let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(),
-        });
+        let header = flow_cookie(&policy, "flow-id");
 
         assert!(header.contains("HttpOnly"));
         assert!(header.contains("Max-Age=300"));
@@ -698,12 +722,13 @@ mod tests {
 
     #[test]
     fn a_callback_with_no_flow_cookie_cannot_be_trusted() {
-        assert!(flow_from_cookie(&HeaderMap::new(), &crate::sessions::cookie_policy("localhost:3001", None)).is_none());
+        let store = FlowStore::default();
+        assert!(take_flow(&store, &HeaderMap::new(), &crate::sessions::cookie_policy("localhost:3001", None)).is_none());
     }
 
     #[test]
     fn a_state_mismatch_is_rejected_before_anything_is_exchanged() {
-        let flow = FlowState { state: "expected".into(), nonce: "n".into(), pkce_verifier: "v".into(), return_to: "/".into() };
+        let flow = flow("expected");
 
         assert!(!callback_state_matches(&flow, "attacker-supplied"));
         assert!(callback_state_matches(&flow, "expected"));
@@ -730,12 +755,56 @@ mod tests {
     #[test]
     fn a_flow_cookie_on_a_public_bind_is_host_prefixed_and_secure() {
         let policy = crate::sessions::cookie_policy("0.0.0.0:3001", None);
-        let header = flow_cookie(&policy, &FlowState {
-            state: "st-1".into(), nonce: "n-1".into(), pkce_verifier: "v-1".into(), return_to: "/".into(),
-        });
+        let header = flow_cookie(&policy, "flow-id");
 
         assert!(header.starts_with("__Host-oms_login_flow="));
         assert!(header.contains("Secure"));
+    }
+
+    fn test_auth_state(store: Arc<FlowStore>) -> AuthApiState {
+        AuthApiState {
+            provider: Arc::new(crate::oidc::Provider::for_test("https://id.example.com", "oms", "https://oms.example.com")),
+            required_claim: None,
+            require_amr: Vec::new(),
+            trust_email_verified: true,
+            flows: store,
+        }
+    }
+
+    #[tokio::test]
+    async fn flow_cookie_has_no_invite_token() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let state = crate::handlers::tests::test_app_state(pool);
+        let store = Arc::new(FlowStore::default());
+        let token = "invite-token-plaintext-1234567890";
+
+        let response = invite(State(state.clone()), Extension(test_auth_state(store.clone())), Path(token.to_string())).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let set_cookie = response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
+        let location = response.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+        let token_hash = crate::sessions::hash_session_token(token);
+        for leaked in [token, token_hash.as_str()] {
+            assert!(!set_cookie.contains(leaked), "the cookie carries only the flow id");
+            assert!(!location.contains(leaked), "the IdP never sees the invite token");
+        }
+
+        // The flow id resolves server-side to the invite's hash, never the token.
+        let policy = &state.session_config.cookie_policy;
+        let flow = take_flow(&store, &cookie_request(&set_cookie), policy).expect("flow");
+        assert_eq!(flow.invite_token_hash.as_deref(), Some(token_hash.as_str()));
+        assert_eq!(flow.return_to, "/trade/");
+        assert!(location.contains(&format!("state={}", flow.state)));
+    }
+
+    #[tokio::test]
+    async fn a_full_flow_store_refuses_login_generically() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let state = crate::handlers::tests::test_app_state(pool);
+        let store = Arc::new(FlowStore::new(Duration::from_secs(300), 0));
+
+        let response = login(State(state), Extension(test_auth_state(store)), Query(LoginParams { return_to: None })).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
     }
 
     #[test]
@@ -810,250 +879,14 @@ mod tests {
     }
 
     #[test]
-    fn the_flow_cookie_carries_the_return_to() {
-        let policy = crate::sessions::cookie_policy("localhost:3001", None);
-        let flow = FlowState {
-            state: "st-1".into(),
-            nonce: "n-1".into(),
-            pkce_verifier: "v-1".into(),
-            return_to: "/trade/".into(),
-        };
-
-        let header = flow_cookie(&policy, &flow);
-        let mut headers = HeaderMap::new();
-        headers.insert("cookie", header.split(';').next().unwrap().parse().unwrap());
-
-        assert_eq!(flow_from_cookie(&headers, &policy).expect("flow").return_to, "/trade/");
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn a_first_login_provisions_a_human_with_no_grants() {
-        let pool = test_pool().await;
-        let identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-
-        let outcome = resolve_or_provision(&pool, &identity, None).await.expect("resolve");
-
-        let ResolveOutcome::Resolved { principal_id, .. } = outcome else {
-            panic!("expected a principal");
-        };
-        let grants: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM principal_portfolio_grant WHERE principal_id = $1",
-        )
-        .bind(principal_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count grants");
-        assert_eq!(grants, 0, "a new human must be able to do nothing until granted");
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn logging_in_twice_does_not_create_a_second_principal() {
-        let pool = test_pool().await;
-        let identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-
-        let first = resolve_or_provision(&pool, &identity, None).await.expect("first");
-        let second = resolve_or_provision(&pool, &identity, None).await.expect("second");
-
-        assert_eq!(principal_id_of(&first), principal_id_of(&second));
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn an_existing_principal_is_matched_on_its_external_subject() {
-        let pool = test_pool().await;
-        let subject = format!("sub-{}", Uuid::new_v4());
-        let expected = seed_principal_with_subject(&pool, &subject).await;
-
-        let outcome = resolve_or_provision(&pool, &identity_for(&subject), None)
-            .await
-            .expect("resolve");
-
-        assert_eq!(principal_id_of(&outcome), expected);
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn the_claim_gate_keeps_the_rest_of_the_tenant_out() {
-        let pool = test_pool().await;
-        let mut identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-        identity.claims = serde_json::json!({ "groups": "everyone-else" });
-
-        let gate = ("groups".to_string(), "traders".to_string());
-        let outcome = resolve_or_provision(&pool, &identity, Some(&gate)).await.expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::ClaimRejected));
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn the_claim_gate_lets_the_intended_slice_through() {
-        let pool = test_pool().await;
-        let mut identity = identity_for(&format!("sub-{}", Uuid::new_v4()));
-        identity.claims = serde_json::json!({ "groups": ["traders", "staff"] });
-
-        let gate = ("groups".to_string(), "traders".to_string());
-        let outcome = resolve_or_provision(&pool, &identity, Some(&gate)).await.expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::Resolved { .. }));
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn a_subject_already_held_by_a_service_principal_is_refused_not_hijacked() {
-        let pool = test_pool().await;
-        let subject = format!("sub-{}", Uuid::new_v4());
-        let (service_id, original_name) = seed_service_principal_with_subject(&pool, &subject).await;
-
-        // An attacker-controlled display_name must not leak into the service
-        // principal even though the ON CONFLICT arbiter (external_subject)
-        // does match this row.
-        let mut identity = identity_for(&subject);
-        identity.display_name = Some("Attacker-Controlled Name".to_string());
-
-        let outcome = resolve_or_provision(&pool, &identity, None).await.expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::SubjectNotAvailable));
-
-        let principal_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM principal WHERE external_subject = $1")
-                .bind(&subject)
-                .fetch_one(&pool)
-                .await
-                .expect("count principals for subject");
-        assert_eq!(principal_count, 1, "no second principal must be created for a taken subject");
-
-        let name: String = sqlx::query_scalar("SELECT display_name FROM principal WHERE id = $1")
-            .bind(service_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read display_name");
-        assert_eq!(name, original_name, "the service principal must not be touched");
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn a_subject_held_by_a_disabled_human_is_refused_not_reactivated() {
-        let pool = test_pool().await;
-        let subject = format!("sub-{}", Uuid::new_v4());
-        let disabled_id = seed_disabled_human_with_subject(&pool, &subject).await;
-
-        let outcome = resolve_or_provision(&pool, &identity_for(&subject), None)
-            .await
-            .expect("resolve");
-
-        assert!(matches!(outcome, ResolveOutcome::SubjectNotAvailable));
-
-        let status: String = sqlx::query_scalar("SELECT status FROM principal WHERE id = $1")
-            .bind(disabled_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read status");
-        assert_eq!(status, "DISABLED", "a disabled principal must not be reactivated by a login attempt");
-    }
-
-    // ── test plumbing ────────────────────────────────────────────────────────
-
-    fn principal_id_of(outcome: &ResolveOutcome) -> Uuid {
-        match outcome {
-            ResolveOutcome::Resolved { principal_id, .. } => *principal_id,
-            _ => panic!("expected a resolved principal"),
-        }
-    }
-
-    /// A `VerifiedIdentity` carrying `subject` unchanged, with an email whose
-    /// local part embeds `subject` so the code this test run provisions is
-    /// unique without leaning on the collision-suffix path.
-    fn identity_for(subject: &str) -> VerifiedIdentity {
-        VerifiedIdentity {
-            subject: subject.to_string(),
-            display_name: Some("Test User".to_string()),
-            email: Some(format!("{subject}@example.com")),
-            claims: serde_json::json!({}),
-        }
-    }
-
-    /// `main` loads .env before resolving config; a test binary does not, so
-    /// without this the test resolves a different database than the server
-    /// runs against. The `oms` role carries `search_path = oms, public`
-    /// (db/access/roles.sql); these are the admin credentials, so set it here.
-    async fn test_pool() -> sqlx::PgPool {
-        use crate::setup::database::config;
-        dotenvy::dotenv().ok();
-        let cfg = config::resolve(config::PostgresOverrides::default());
-        sqlx::postgres::PgPoolOptions::new()
-            .after_connect(|conn, _| {
-                Box::pin(async move {
-                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
-                    Ok(())
-                })
-            })
-            .connect(&cfg.url())
-            .await
-            .expect("connect")
-    }
-
-    /// Seeds an ACTIVE HUMAN principal already bound to `subject`, as if it
-    /// had been provisioned by an earlier login (or created by an admin).
-    /// Returns its id.
-    async fn seed_principal_with_subject(pool: &sqlx::PgPool, subject: &str) -> Uuid {
-        let id = Uuid::new_v4();
-        let code = format!("seeded-{id}");
-        sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-             VALUES ($1, $2, 'HUMAN', $3, $2, 'ACTIVE')",
-        )
-        .bind(id)
-        .bind(&code)
-        .bind(subject)
-        .execute(pool)
-        .await
-        .expect("seed principal");
-        id
-    }
-
-    /// Seeds an ACTIVE SERVICE principal already bound to `subject` — the
-    /// scenario where a human's `sub` collides with a machine credential's.
-    /// Returns its id and the `display_name` it was seeded with, so callers
-    /// can assert that name survives untouched.
-    async fn seed_service_principal_with_subject(
-        pool: &sqlx::PgPool,
-        subject: &str,
-    ) -> (Uuid, String) {
-        let id = Uuid::new_v4();
-        let code = format!("service-{id}");
-        let display_name = format!("Service {id}");
-        sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-             VALUES ($1, $2, 'SERVICE', $3, $4, 'ACTIVE')",
-        )
-        .bind(id)
-        .bind(&code)
-        .bind(subject)
-        .bind(&display_name)
-        .execute(pool)
-        .await
-        .expect("seed service principal");
-        (id, display_name)
-    }
-
-    /// Seeds a DISABLED HUMAN principal already bound to `subject` — e.g. an
-    /// offboarded user whose `external_subject` an admin never cleared.
-    /// Returns its id.
-    async fn seed_disabled_human_with_subject(pool: &sqlx::PgPool, subject: &str) -> Uuid {
-        let id = Uuid::new_v4();
-        let code = format!("disabled-{id}");
-        sqlx::query(
-            "INSERT INTO principal (id, code, principal_type, external_subject, display_name, status) \
-             VALUES ($1, $2, 'HUMAN', $3, $2, 'DISABLED')",
-        )
-        .bind(id)
-        .bind(&code)
-        .bind(subject)
-        .execute(pool)
-        .await
-        .expect("seed disabled principal");
-        id
+    fn a_refused_login_lands_on_the_access_page_with_its_reason() {
+        assert_eq!(access_refused_url(&ClaimOutcome::NoInvite), "/trade/access?reason=no_invite");
+        assert_eq!(access_refused_url(&ClaimOutcome::Expired), "/trade/access?reason=expired");
+        assert_eq!(access_refused_url(&ClaimOutcome::Revoked), "/trade/access?reason=revoked");
+        assert_eq!(access_refused_url(&ClaimOutcome::PendingApproval), "/trade/access?reason=pending_approval");
+        assert_eq!(
+            access_refused_url(&ClaimOutcome::EmailMismatch { invited_hint: "j…@fundco.com".into() }),
+            "/trade/access?reason=email_mismatch&hint=j%E2%80%A6%40fundco.com"
+        );
     }
 }

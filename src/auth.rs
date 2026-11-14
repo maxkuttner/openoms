@@ -17,6 +17,57 @@ pub struct AuthContext {
     /// The acting principal's `code`, carried so a handler can stamp an
     /// event's `actor` without a second query.
     pub principal_code: String,
+    /// How this request authenticated; decides whether `mfa` matters.
+    pub auth_method: AuthMethod,
+    /// The session passed MFA: a local session's TOTP, or an OIDC login whose
+    /// `amr` met `[auth.oidc].require_amr` (evaluated once, at login).
+    pub mfa: bool,
+}
+
+/// How a request authenticated, as far as the MFA gate cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    Oidc,
+    Local,
+    /// The deprecated shared admin password (or a session minted from it).
+    LegacyAdmin,
+    /// A machine credential: an API key, or a strategy's own session.
+    ApiKey,
+    /// The per-boot host token (`oms` CLI on the host), a machine credential.
+    HostCli,
+}
+
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMethod::Oidc => "oidc",
+            AuthMethod::Local => "local",
+            AuthMethod::LegacyAdmin => "legacy_admin",
+            AuthMethod::ApiKey => "api_key",
+            AuthMethod::HostCli => "host_cli",
+        }
+    }
+}
+
+impl AuthContext {
+    /// A machine identity (API key, strategy): exempt from the MFA gate.
+    pub fn machine(principal_id: Uuid, principal_code: String) -> Self {
+        AuthContext { principal_id, principal_code, auth_method: AuthMethod::ApiKey, mfa: false }
+    }
+
+    fn from_session(record: crate::sessions::SessionRecord) -> Self {
+        let auth_method = match record.auth_method {
+            crate::sessions::AuthMethod::Oidc => AuthMethod::Oidc,
+            crate::sessions::AuthMethod::Local => AuthMethod::Local,
+            crate::sessions::AuthMethod::LegacyAdmin => AuthMethod::LegacyAdmin,
+        };
+        AuthContext {
+            principal_id: record.principal_id,
+            principal_code: record.principal_code,
+            auth_method,
+            mfa: record.mfa_verified_at.is_some(),
+        }
+    }
 }
 
 /// Which door a request came through. Authorization never branches on this —
@@ -45,45 +96,43 @@ pub async fn authenticate(
     headers: &axum::http::HeaderMap,
     session_config: &SessionConfig,
 ) -> Result<Option<(AuthContext, CredentialKind)>, Response> {
-    let policy = &session_config.cookie_policy;
-    if let Some(value) =
-        crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy))
-    {
-        let hash = crate::sessions::hash_session_token(&value);
-        if let Some(record) = crate::sessions::lookup_session(pool, &hash)
-            .await
-            .map_err(|_| service_unavailable())?
-        {
-            let now = chrono::Utc::now();
-            if crate::sessions::is_expired(
-                now,
-                record.last_seen_at,
-                record.absolute_expires_at,
-                &session_config.ttl,
-            ) {
-                return Ok(None);
-            }
-            if crate::sessions::needs_touch(now, record.last_seen_at) {
-                crate::sessions::touch_session(pool, record.id)
-                    .await
-                    .map_err(|_| service_unavailable())?;
-            }
-            return Ok(Some((
-                AuthContext {
-                    principal_id: record.principal_id,
-                    principal_code: record.principal_code,
-                },
-                CredentialKind::Session,
-            )));
-        }
+    if let Some(record) = authenticate_session(pool, headers, session_config).await? {
+        return Ok(Some((AuthContext::from_session(record), CredentialKind::Session)));
     }
 
     let Ok((key_id, secret)) = extract_trading_credentials(headers) else {
         return Ok(None);
     };
     Ok(verify_key(pool, &key_id, &secret).await?.map(|(principal_id, principal_code)| {
-        (AuthContext { principal_id, principal_code }, CredentialKind::ApiKey)
+        (AuthContext::machine(principal_id, principal_code), CredentialKind::ApiKey)
     }))
+}
+
+/// The session half of `authenticate`: the live session record behind the
+/// request's cookie (ACTIVE HUMAN principal, not revoked, within its TTLs), or
+/// `None`. Exposed whole so `admin_middleware` can see how the session was
+/// established and whether it passed MFA.
+pub async fn authenticate_session(
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    session_config: &SessionConfig,
+) -> Result<Option<crate::sessions::SessionRecord>, Response> {
+    let policy = &session_config.cookie_policy;
+    let Some(value) = crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy)) else {
+        return Ok(None);
+    };
+    let hash = crate::sessions::hash_session_token(&value);
+    let Some(record) = crate::sessions::lookup_session(pool, &hash).await.map_err(|_| service_unavailable())? else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now();
+    if crate::sessions::is_expired(now, record.last_seen_at, record.absolute_expires_at, &session_config.ttl) {
+        return Ok(None);
+    }
+    if crate::sessions::needs_touch(now, record.last_seen_at) {
+        crate::sessions::touch_session(pool, record.id).await.map_err(|_| service_unavailable())?;
+    }
+    Ok(Some(record))
 }
 
 /// Authenticate a trading request and inject `AuthContext`.
@@ -193,22 +242,85 @@ pub async fn verify_key(
     Ok(valid.then_some((principal_id, principal_code)))
 }
 
+/// Guard for `/admin/*`.
+///
+/// The normal door is a session (cookie) of an ACTIVE principal holding a
+/// `principal_admin` row. A state-changing request on it must pass the CSRF
+/// origin check and, for a mutation, `authz::require_mfa`.
+/// API keys never open `/admin/*`.
+///
+/// The legacy door: while `system_setting.legacy_admin_enabled` is true, the
+/// deprecated shared password is also accepted as `Bearer <password>`. It
+/// acts as the synthetic `legacy-admin`, which may read any admin route and
+/// create a named admin (`POST /admin/users/bootstrap-admin`), nothing else.
+/// Its `principal_id` is the nil UUID, which never exists in `principal`, so
+/// it can never satisfy a trading or authz check.
+///
+/// The host door: `Bearer <host token>` (written 0600 next to the config at
+/// boot) from a loopback peer acts as `host-cli` with full admin capability,
+/// before and after cutover. It is how `oms status` / `oms setup sync-broker`
+/// reach the server.
 pub async fn admin_middleware(
     State(state): State<AppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    if !state.admin_auth_enabled {
+    let pool = state.pool();
+    if let Some(session) = authenticate_session(pool, req.headers(), &state.session_config).await? {
+        enforce_origin_for_session(CredentialKind::Session, req.headers(), req.method(), &state.session_config)?;
+        let is_admin = crate::admin_bootstrap::is_active_admin(pool, session.principal_id)
+            .await
+            .map_err(|_| service_unavailable())?;
+        if !is_admin {
+            return Err(forbidden_because("admin access required"));
+        }
+        let ctx = AuthContext::from_session(session);
+        admin_mfa_gate(req.method(), &ctx).map_err(axum::response::IntoResponse::into_response)?;
+        req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);
     }
 
-    let token = extract_bearer_token(req.headers()).map_err(|_| forbidden())?;
-
-    if !constant_time_eq(token.as_bytes(), state.admin_token.as_bytes()) {
-        return Err(forbidden());
+    let token = extract_bearer_token(req.headers()).map_err(|_| unauthorized())?;
+    // The per-boot host token: loopback peers only, independent of the
+    // legacy flag; acts as `host-cli`.
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+    if crate::admin_bootstrap::host_token_ok(state.host_token_hash.as_deref(), &token, peer) {
+        let ctx = crate::admin_bootstrap::host_context();
+        admin_mfa_gate(req.method(), &ctx).map_err(axum::response::IntoResponse::into_response)?;
+        req.extensions_mut().insert(ctx);
+        return Ok(next.run(req).await);
     }
-
+    let Some(password) = state.legacy_admin_password.as_deref() else {
+        return Err(unauthorized());
+    };
+    if !constant_time_eq(token.as_bytes(), password.as_bytes()) {
+        return Err(unauthorized());
+    }
+    let enabled = crate::admin_bootstrap::legacy_admin_enabled(pool).await.map_err(|_| service_unavailable())?;
+    if !enabled {
+        return Err(forbidden_because("the shared admin password is disabled; sign in as a named admin"));
+    }
+    if !crate::admin_bootstrap::legacy_may(req.method(), req.uri().path()) {
+        return Err(forbidden_because("create a named admin first"));
+    }
+    // Not passed through `admin_mfa_gate`: `legacy_may` already confines it to
+    // reads and the first-admin bootstrap, which must work before anyone has MFA.
+    req.extensions_mut().insert(crate::admin_bootstrap::legacy_context());
     Ok(next.run(req).await)
+}
+
+/// `/admin/*` mutations need MFA (`authz::require_mfa`); reads never do.
+pub fn admin_mfa_gate(method: &axum::http::Method, ctx: &AuthContext) -> Result<(), crate::handlers::ApiError> {
+    if crate::sessions::is_read_method(method) {
+        return Ok(());
+    }
+    crate::authz::require_mfa(ctx)
+}
+
+/// The `key_id` of the API key on this request, if it carries one in either
+/// form. Does not verify the secret — callers rely on the middleware for that.
+pub fn trading_key_id(headers: &header::HeaderMap) -> Option<String> {
+    extract_trading_credentials(headers).ok().map(|(key_id, _)| key_id)
 }
 
 /// Extract `(key_id, secret)` from either credential form:
@@ -277,6 +389,13 @@ fn forbidden() -> Response {
         .unwrap()
 }
 
+fn forbidden_because(reason: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(reason.into())
+        .unwrap()
+}
+
 fn service_unavailable() -> Response {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -286,6 +405,17 @@ fn service_unavailable() -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// `/auth/me` reports it, so the UI knows which MFA step to offer.
+    #[test]
+    fn auth_method_names() {
+        assert_eq!(AuthMethod::Local.as_str(), "local");
+        assert_eq!(AuthMethod::Oidc.as_str(), "oidc");
+        assert_eq!(AuthMethod::LegacyAdmin.as_str(), "legacy_admin");
+        assert_eq!(AuthMethod::ApiKey.as_str(), "api_key");
+        assert_eq!(AuthMethod::HostCli.as_str(), "host_cli");
+    }
+
     use super::*;
     use crate::sessions::{cookie_policy, SessionTtl};
 
@@ -380,6 +510,8 @@ mod tests {
         let token = crate::sessions::create_session(
             &pool,
             principal_id,
+            crate::sessions::AuthMethod::Oidc,
+            false,
             &SessionTtl::default(),
             None,
         )
@@ -407,6 +539,8 @@ mod tests {
         let token = crate::sessions::create_session(
             &pool,
             principal_id,
+            crate::sessions::AuthMethod::Oidc,
+            false,
             &SessionTtl::default(),
             None,
         )

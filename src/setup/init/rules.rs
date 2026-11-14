@@ -25,15 +25,14 @@ pub fn default_db_source(s: DockerStatus) -> DbSource {
     }
 }
 
-/// Long enough that a cockpit reachable from a network is not guessed; the
-/// generated one is 32 characters.
-pub const ADMIN_PASSWORD_MIN: usize = 12;
-
-pub fn check_admin_password(pw: &str) -> Result<(), String> {
-    if pw.chars().count() < ADMIN_PASSWORD_MIN {
-        return Err(format!("the admin password needs at least {ADMIN_PASSWORD_MIN} characters"));
+/// The first admin's email: where their sign-in is addressed. Only the
+/// shape is checked; the enrolment link proves the rest.
+pub fn check_admin_email(email: &str) -> Result<(), String> {
+    let email = email.trim();
+    match email.split_once('@') {
+        Some((local, domain)) if !local.is_empty() && domain.contains('.') && !email.contains(char::is_whitespace) => Ok(()),
+        _ => Err(format!("{email:?} is not an email address")),
     }
-    Ok(())
 }
 
 /// `host:port`, as `server.bind_addr` takes it. The host may be a name
@@ -121,9 +120,12 @@ mod tests {
     }
 
     #[test]
-    fn admin_password_needs_twelve_chars() {
-        assert!(check_admin_password("12345678901").is_err());
-        assert!(check_admin_password("123456789012").is_ok());
+    fn admin_email_needs_a_plausible_address() {
+        assert!(check_admin_email("ada@example.com").is_ok());
+        assert!(check_admin_email(" ada@example.com ").is_ok());
+        for bad in ["", "ada", "@example.com", "ada@localhost", "a da@example.com"] {
+            assert!(check_admin_email(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

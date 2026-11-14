@@ -10,7 +10,12 @@
 #                                    target database's encrypted columns
 #   /opt/oms/config/.env           — POSTGRES_PASSWORD=..., OMS_PASSWORD=...,
 #                                    and (with [auth.oidc] configured)
-#                                    OMS_OIDC_CLIENT_SECRET=oms-dev-secret
+#                                    OMS_OIDC_CLIENT_SECRET=<your provider's
+#                                    real client secret>
+#
+# No identity provider runs here: point [auth.oidc] in oms.toml at any OIDC
+# issuer you already have (see deploy/README.md). Authentik is only an opt-in
+# local dev fixture (root docker-compose.yml, profile "oidc").
 services:
   oms:
     build:
@@ -22,28 +27,4 @@ services:
       - ${OMS_DEPLOY_CONFIG_DIR:-/opt/oms/config}/.env
     volumes:
       - ${OMS_DEPLOY_CONFIG_DIR:-/opt/oms/config}/oms.toml:/app/oms.toml:ro
-    restart: unless-stopped
-
-  # Same disposable dev IdP as the local docker-compose.yml at the repo root
-  # (identical realm import), so /trade/ has something to log in against here
-  # too. The realm's "oms" client has this box's tailscale HTTPS name
-  # pre-registered as a second valid redirect URI alongside localhost's.
-  keycloak:
-    container_name: oms-test-keycloak
-    image: quay.io/keycloak/keycloak:26.0
-    command: start-dev --import-realm
-    environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-      # Port 8080 is already taken by something else on this box.
-      KC_HTTP_PORT: "8090"
-      # openidconnect (src/oidc.rs) refuses to trust a provider whose
-      # advertised endpoints are neither https:// nor loopback. Keycloak sits
-      # behind `tailscale serve --https=8443 8090`, so it must advertise ITS
-      # https front door, not the plain-http address it actually listens on.
-      KC_HOSTNAME: "https://fedora-8gb-fsn1-1.tail291892.ts.net:8443"
-      KC_PROXY_HEADERS: "xforwarded"
-    network_mode: host
-    volumes:
-      - ../docker/keycloak/oms-dev-realm.json:/opt/keycloak/data/import/oms-dev-realm.json:ro
     restart: unless-stopped

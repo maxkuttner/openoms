@@ -7,9 +7,11 @@ description: What to back up, why the master key matters, and how to rotate it.
 
 | What | Why |
 |---|---|
-| `oms.toml` | Holds the **master key**, the `oms` role password and the cockpit password. |
+| `oms.toml` | Holds the **master key** and the `oms` role password (and the deprecated shared admin password, if still set). |
 | The `.env` beside it, if you have one | Secrets that are not in `oms.toml`, such as `OMS_OIDC_CLIENT_SECRET`. |
-| The database | Orders, executions, positions, portfolios, principals, and the encrypted broker and feed credentials. |
+| The database | Orders, executions, positions, portfolios, users and their roles, invites, password hashes, sealed authenticator secrets, SSO identities, the audit log, and the encrypted broker and feed credentials. |
+
+The `host-token` file next to `oms.toml` is not a backup item: the server writes a new one at every start.
 
 Back up the database with standard Postgres tools, for example:
 
@@ -28,7 +30,9 @@ Broker and feed credentials are stored in Postgres encrypted with the master key
 database.
 
 - **Lose it** and every stored credential is unreadable. There is no recovery: enter the
-  credentials again.
+  credentials again. Authenticator (TOTP) secrets are sealed with the same key, so every
+  user with a local account has to enrol their authenticator again. Recover each admin from
+  the host with `oms auth recover-admin`; for everyone else an admin sends a new sign-in link.
 - **Point two installs at one database** and they must share the same key, or each will
   fail to decrypt what the other wrote.
 - **A wrong key** is caught at startup: each credential that fails to decrypt is logged,
@@ -56,5 +60,17 @@ The printed key is its only copy. Write it into `oms.toml` as `master_key` befor
 anything else, and keep the old key until that edit is saved.
 :::
 
+:::caution[Authenticator secrets are not re-wrapped]
+`rotate-key` re-encrypts broker and feed credentials only. Authenticator (TOTP) secrets stay
+sealed under the old key, so after a rotation local-account users must enrol again, exactly
+as if the key had been lost. Rotate only when you accept that.
+:::
+
 Then restart the server so it uses the new key. If rotation fails partway, the
 transaction rolls back and everything stays readable under the old key.
+
+## Your identity provider is backed up separately
+
+If you use SSO, accounts live at your identity provider, not in the OMS database, which
+holds only the `(issuer, subject)` of each sign-in. Back the provider up the way you
+already do. A restored OMS pointed at a different provider needs fresh sign-in links.

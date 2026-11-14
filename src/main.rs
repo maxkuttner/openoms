@@ -16,7 +16,14 @@ mod symbology_resolver;
 mod setup;
 mod sessions;
 mod oidc;
+mod local_auth;
+mod local_auth_api;
 mod auth_api;
+mod invites;
+mod users_api;
+mod admin_bootstrap;
+mod authz;
+mod limits_api;
 
 use gateway::adapter::BrokerRegistry;
 use gateway::md::daily_stats::DailyStatsRegistry;
@@ -29,14 +36,11 @@ use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, Allocat
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
-    CreatePrincipal, UpdatePrincipal,
     CreatePortfolio, UpdatePortfolio,
     CreateAccount, UpdateAccount,
     CreateBrokerConnection, UpdateBrokerConnection,
     CreateKey, ApiKeyRecord,
-    CreateGrant, UpdateGrant,
 };
-use crate::domain::identity::Grant;
 
 use axum::{
     response::Html,
@@ -87,6 +91,10 @@ mod cockpit;
 mod reload_tests;
 #[cfg(test)]
 mod boundary_tests;
+#[cfg(test)]
+mod authz_schema_tests;
+#[cfg(test)]
+mod authz_route_tests;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -108,20 +116,9 @@ mod boundary_tests;
         instruments_api::list_instruments_for_trader,
         instruments_api::list_option_expiries,
         instruments_api::get_option_chain,
-        admin::create_principal,
-        admin::list_principals,
-        admin::get_principal,
-        admin::update_principal,
-        admin::register_principal_key,
-        admin::list_principal_keys,
-        admin::revoke_principal_key,
         admin::create_trading_token,
         admin::list_trading_tokens,
         admin::revoke_trading_token,
-        admin::create_grant,
-        admin::list_grants,
-        admin::update_grant,
-        admin::delete_grant,
         admin::create_portfolio,
         admin::list_portfolios,
         admin::get_portfolio,
@@ -162,8 +159,7 @@ mod boundary_tests;
         admin::resolve_symbology,
         admin::backfill_symbology,
         admin::expiry_sweep,
-        admin::setup_status,
-        admin::revoke_principal_sessions,
+        users_api::setup_status,
         strategies::admin::list_strategies,
         strategies::admin::create_strategy,
         strategies::admin::update_strategy,
@@ -176,6 +172,7 @@ mod boundary_tests;
         strategies::admin::strategy_securities,
         strategies::admin::kill_strategy,
         strategies::admin::enable_strategy,
+        strategies::admin::handover,
         strategies::admin::rebaseline_strategy,
         strategies::admin::flatten_strategy,
         colo::deployment::register,
@@ -185,9 +182,18 @@ mod boundary_tests;
         colo::deployment::verified_stop,
         colo::ingest::adjustment,
         auth_api::login,
+        auth_api::invite,
         auth_api::callback,
         auth_api::logout,
         auth_api::me,
+        local_auth_api::preview,
+        local_auth_api::enroll,
+        local_auth_api::login,
+        local_auth_api::totp,
+        local_auth_api::totp_enroll,
+        local_auth_api::totp_confirm,
+        local_auth_api::logout_all,
+        local_auth_api::methods,
     ),
     components(schemas(
         SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
@@ -198,7 +204,6 @@ mod boundary_tests;
         order_events::OrderEventView,
         handlers::GrantedPortfolio,
         Principal, Portfolio, Account, BrokerConnection,
-        CreatePrincipal, UpdatePrincipal,
         CreatePortfolio, UpdatePortfolio,
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
@@ -210,24 +215,31 @@ mod boundary_tests;
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
         admin::CreateTradingToken, admin::TradingTokenCreated, admin::TradingTokenRow,
-        Grant, CreateGrant, UpdateGrant,
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary, admin::FeedSummary, admin::FeedConnectionSummary,
         instruments_api::ChainLeg, instruments_api::ChainRow,
         admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
         admin::ExpirySweepResult,
-        admin::SetupStatus, admin::SetupConnectionStatus, admin::SetupCatalogStatus,
+        users_api::SetupStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
-        admin::RevokedSessions,
         auth_api::MeResponse,
-        strategies::admin::StrategyRow, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
+        local_auth_api::InvitePreview,
+        local_auth_api::AuthMethods,
+        local_auth_api::EnrollBody,
+        local_auth_api::NextStep,
+        local_auth_api::LoginBody,
+        local_auth_api::CodeBody,
+        local_auth_api::MfaVerified,
+        local_auth_api::TotpEnrollResponse,
+        local_auth_api::RecoveryCodes,
+        strategies::admin::StrategyRow, strategies::admin::Responsible, strategies::admin::Handover, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
         strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted, strategies::admin::RebaselineIssued,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
         colo::deployment::Deployment, colo::deployment::DeploymentRegistration,
         colo::deployment::InstrumentBaseline, colo::deployment::AssetHolding,
         colo::deployment::RetireRequest, colo::ingest::AdjustmentRequest,
     )),
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &MfaAddon),
     tags(
         (name = "orders", description = "Order submission and cancellation"),
         (name = "admin", description = "Admin management of principals, portfolios, accounts, broker connections, and keys"),
@@ -264,6 +276,37 @@ impl utoipa::Modify for SecurityAddon {
     }
 }
 
+/// Documents the 403 `mfa_required` on every MFA-gated route: order actions
+/// (`authz::require_mfa` in the handler) and every `/admin` mutation
+/// (`auth::admin_mfa_gate`). Done here rather than per handler so a new admin
+/// mutation cannot forget it.
+struct MfaAddon;
+impl utoipa::Modify for MfaAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::{PathItemType, RefOr, ResponseBuilder};
+        const TRADING: [&str; 3] = ["/orders/submit", "/orders/cancel", "/orders/{id}/allocations"];
+        const NOTE: &str = "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)";
+        for (path, item) in openapi.paths.paths.iter_mut() {
+            for (method, op) in item.operations.iter_mut() {
+                let gated = match method {
+                    PathItemType::Get | PathItemType::Head | PathItemType::Options => false,
+                    PathItemType::Post => path.starts_with("/admin/") || TRADING.contains(&path.as_str()),
+                    _ => path.starts_with("/admin/"),
+                };
+                if !gated {
+                    continue;
+                }
+                match op.responses.responses.get_mut("403") {
+                    Some(RefOr::T(r)) => r.description = format!("{}; or {NOTE}", r.description),
+                    _ => {
+                        op.responses.responses.insert("403".into(), RefOr::T(ResponseBuilder::new().description(NOTE).build()));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The OpenAPI spec as pretty JSON.
 ///
 /// Split out from the subcommand so a test can assert the spec is complete without
@@ -277,11 +320,6 @@ fn openapi_json() -> String {
 /// design: a fresh clone should start and be reachable from a browser on the same
 /// machine, and nothing more, until the operator says otherwise.
 const DEFAULT_BIND_ADDR: &str = "localhost:3001";
-
-/// Admin console password used when `OMS_ADMIN_PASSWORD` is unset *and* the bind
-/// address is loopback. Mirrors `config::DEFAULT_ROLE_PASSWORD`: convenient on a
-/// laptop, refused the moment the server is reachable from anywhere else.
-const DEFAULT_ADMIN_PASSWORD: &str = "openoms-dev";
 
 /// Is this bind address reachable only from this machine?
 ///
@@ -329,6 +367,14 @@ fn refuses_plain_http_oidc(bind_addr: &str, public_base_url: &str) -> bool {
     !(https || purely_local)
 }
 
+/// The client secret the bundled dev identity-provider fixture registers.
+/// Anyone can read it, so it is refused anywhere but a loopback bind.
+const DEV_OIDC_CLIENT_SECRET: &str = "oms-dev-secret";
+
+fn refuses_dev_client_secret(bind_addr: &str, client_secret: Option<&str>) -> bool {
+    client_secret == Some(DEV_OIDC_CLIENT_SECRET) && !bind_is_loopback(bind_addr)
+}
+
 /// Bind address on the usual tiers. No CLI flag exists for this today, so the
 /// chain is env → file → default. Both sources are emptiness-filtered: a blank
 /// `bind_addr` in `oms.toml` must fall through to the default the same way a
@@ -340,8 +386,8 @@ fn resolve_bind_addr(from_env: Option<String>, file: Option<&config::FileConfig>
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string())
 }
 
-/// Cockpit login password: env → file. `None` means unset, which the caller
-/// turns into the loopback-only default or a refusal.
+/// The deprecated shared admin password: env → file. `None` means unset, and
+/// unset means no shared password at all — there is no built-in default.
 fn resolve_admin_password(
     from_env: Option<String>,
     file: Option<&config::FileConfig>,
@@ -415,6 +461,9 @@ enum Command {
     /// Credential store maintenance.
     #[command(subcommand)]
     Config(ConfigCmd),
+    /// Named admins: first-admin bootstrap and break-glass recovery (host only).
+    #[command(subcommand)]
+    Auth(AuthCmd),
     /// First-run setup: generate oms.toml and create the database.
     Init {
         /// Take values from flags and the environment instead of prompting.
@@ -423,9 +472,12 @@ enum Command {
         /// Where the database lives: start PostgreSQL 16 in Docker, or use an existing one [default: existing]
         #[arg(long, value_enum)]
         postgres: Option<setup::init::rules::DbSource>,
-        /// Cockpit admin password, at least 12 characters [env: OMS_ADMIN_PASSWORD] [default: generated]
+        /// Email of the first admin, who gets a one-time enrolment link [env: OMS_ADMIN_EMAIL]
         #[arg(long)]
-        admin_password: Option<String>,
+        admin_email: Option<String>,
+        /// Display name of the first admin [env: OMS_ADMIN_NAME]
+        #[arg(long)]
+        admin_name: Option<String>,
         /// Address the server listens on [env: OMS_BIND_ADDR] [default: localhost:3001]
         #[arg(long)]
         bind: Option<String>,
@@ -456,6 +508,36 @@ enum SetupCmd {
     /// Seed a synthetic SPY option chain — no broker, no network. For exercising
     /// instrument search / the option chain UI without a live catalog sync.
     SeedTestChain(setup::test_data::Args),
+}
+
+#[derive(clap::Subcommand)]
+enum AuthCmd {
+    /// Create a named admin and print their one-time enrolment link.
+    ///
+    /// Only while no active admin exists, unless --force-recovery. Never sets
+    /// a password: the admin chooses one, and TOTP, through the link.
+    BootstrapAdmin {
+        /// The admin's email.
+        #[arg(long)]
+        email: String,
+        /// The admin's display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Create the admin even though an active admin exists (break-glass).
+        #[arg(long)]
+        force_recovery: bool,
+        #[command(flatten)]
+        db: DbArgs,
+    },
+    /// Reset an admin's password and TOTP, sign them out everywhere, and
+    /// print a new enrolment link.
+    RecoverAdmin {
+        /// The admin's email.
+        #[arg(long)]
+        email: String,
+        #[command(flatten)]
+        db: DbArgs,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -656,7 +738,7 @@ async fn main() {
                     // The new key is deliberately printed — same trade `oms init` makes for
                     // the key it generates: this is the one time it can be handed to the
                     // operator at all. No credential is ever printed, only this key.
-                    println!("rotated {n} credential(s) to a new master key.\n");
+                    println!("rotated {n} sealed secret(s) (connection credentials and TOTP secrets) to a new master key.\n");
                     println!("new master key: {new_key_str}");
                     println!(
                         "\nPut this in {} as oms.master_key now — the credentials above are\n\
@@ -699,7 +781,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Init { non_interactive, postgres, admin_password, bind, db }) => {
+        Some(Command::Init { non_interactive, postgres, admin_email, admin_name, bind, db }) => {
             // Checked here too, not only inside `run()`: `resolve()` below calls
             // `config::load()`, which exits the process over a *malformed*
             // oms.toml before `run()`'s own check ever runs — and interactively,
@@ -725,9 +807,10 @@ async fn main() {
                     None => (env(var), var.to_string()),
                 }
             };
-            let (admin_password, admin_src) = from(admin_password, "admin-password", "OMS_ADMIN_PASSWORD");
+            let (admin_email, admin_src) = from(admin_email, "admin-email", "OMS_ADMIN_EMAIL");
+            let (admin_name, _) = from(admin_name, "admin-name", "OMS_ADMIN_NAME");
             let (bind, bind_src) = from(bind, "bind", "OMS_BIND_ADDR");
-            let checked = admin_password.as_deref().map_or(Ok(()), setup::init::rules::check_admin_password)
+            let checked = admin_email.as_deref().map_or(Ok(()), setup::init::rules::check_admin_email)
                 .map_err(|e| format!("{admin_src}: {e}"))
                 .and(bind.as_deref().map_or(Ok(()), |b| setup::init::rules::parse_bind(b).map(|_| ()))
                     .map_err(|e| format!("{bind_src}: {e}")));
@@ -735,7 +818,7 @@ async fn main() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
-            let flags = setup::init::InitFlags { source: postgres, admin_password, bind };
+            let flags = setup::init::InitFlags { source: postgres, admin_email, admin_name, bind };
             let container = setup::init::rules::container_mode(env("OMS_CONTAINER").as_deref());
             let answers = if non_interactive {
                 let cfg = setup::database::config::resolve(db.into());
@@ -801,7 +884,8 @@ async fn main() {
                     database: cfg.database,
                     username: cfg.username,
                     superuser_password: password_override,
-                    admin_password: flags.admin_password,
+                    admin_email: flags.admin_email,
+                    admin_name: flags.admin_name,
                     bind: flags.bind.unwrap_or_else(|| setup::init::DEFAULT_BIND.into()),
                     source: flags.source,
                     container,
@@ -824,6 +908,26 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Some(Command::Auth(cmd)) => {
+            let result = match cmd {
+                AuthCmd::BootstrapAdmin { email, name, force_recovery, db } => {
+                    admin_bootstrap::cli_bootstrap(db.into(), &email, name.as_deref(), force_recovery).await
+                }
+                AuthCmd::RecoverAdmin { email, db } => admin_bootstrap::cli_recover(db.into(), &email).await,
+            };
+            match result {
+                Ok(link) => {
+                    println!("One-time enrolment link (valid 7 days):\n\n    {link}\n");
+                    if let Some(note) = admin_bootstrap::cli_link_note_for_config() {
+                        println!("{note}\n");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Command::Status) => std::process::exit(setup::status::run().await),
         Some(Command::Openapi) => println!("{}", openapi_json()),
         Some(Command::Update { version, check }) => {
@@ -834,6 +938,256 @@ async fn main() {
         }
         None => serve().await,
     }
+}
+
+/// Assembles the full application router exactly as `serve` mounts it.
+/// Extracted so a test can build it: axum panics at build time on an
+/// overlapping (method, path) registration, which only boots would catch.
+fn build_app(
+    state: AppState,
+    auth_api_state: Option<auth_api::AuthApiState>,
+    local_enabled: bool,
+    oidc_configured: bool,
+) -> Router {
+    // Register routes
+
+    // 1) Register order routes
+    let orders_router = Router::new()
+        .route("/orders/submit", post(handlers::orders_submit))
+        .route("/orders/cancel", post(handlers::orders_cancel))
+        .route("/orders/:id", get(handlers::get_order))
+        .route("/orders/:id/events", get(order_events::get_order_events))
+        .route("/orders", get(handlers::list_orders))
+        .route("/strategies/securities", get(strategies::admin::strategy_securities))
+        .route("/strategies", get(strategies::trader_api::list).post(strategies::trader_api::create))
+        .route("/strategies/:code/handover", post(strategies::trader_api::handover))
+        .route("/portfolios", get(handlers::list_portfolios))
+        .route(
+            "/watchlist",
+            get(handlers::list_watchlist).post(handlers::add_watchlist_item),
+        )
+        .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
+        .route("/marks", get(handlers::get_marks))
+        .route("/updates", get(live_updates::ws_updates))
+        .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
+        .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
+        .route("/portfolios/:id/limits", get(limits_api::list_limits))
+        .route(
+            "/portfolios/:id/limits/:instrument_id",
+            axum::routing::put(limits_api::put_limit),
+        )
+        .route(
+            "/orders/:id/allocations",
+            post(handlers::create_allocations).get(handlers::list_allocations),
+        )
+        .route("/instruments", get(instruments_api::list_instruments_for_trader))
+        .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
+        .route("/instruments/options/chain", get(instruments_api::get_option_chain))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+    
+    // 2) Register admin routes: a named admin's session, or the legacy shared
+    // password for reads and bootstrap only (see `auth::admin_middleware`).
+    let admin_router = Router::new()
+        .route("/admin/orders", get(handlers::get_orders_blotter))
+        .route(
+            "/admin/orders/:id/events",
+            get(order_events::get_order_events_admin),
+        )
+        .route("/admin/users", get(users_api::list_users).post(users_api::create_key_only_user))
+        .route("/admin/setup-status", get(users_api::setup_status))
+        .route("/admin/auth/status", get(users_api::auth_status))
+        .route("/admin/users/invite", post(users_api::invite_user))
+        .route("/admin/users/invites/:id/revoke", post(users_api::revoke_invite))
+        .route("/admin/users/invites/:id/reissue", post(users_api::reissue_invite))
+        .route("/admin/users/:id/link-invite", post(users_api::link_invite))
+        .route("/admin/users/bindings", get(users_api::list_bindings))
+        .route("/admin/users/bindings/:id/approve", post(users_api::approve_binding))
+        .route("/admin/users/bindings/:id/reject", post(users_api::reject_binding))
+        .route("/admin/users/:id/identities", post(users_api::prebind_identity))
+        .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
+        .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
+        .route("/admin/users/bootstrap-admin", post(users_api::bootstrap_admin))
+        .route("/admin/users/:id/admin", axum::routing::put(users_api::set_admin))
+        .route("/admin/users/:id/disable", post(users_api::disable_user))
+        .route("/admin/users/:id/enable", post(users_api::enable_user))
+        .route("/admin/users/:id/keys", get(users_api::list_keys).post(users_api::create_key))
+        .route("/admin/users/:id/keys/:key_id", axum::routing::delete(users_api::revoke_key))
+        .route(
+            "/admin/trading-tokens",
+            post(admin::create_trading_token).get(admin::list_trading_tokens),
+        )
+        .route(
+            "/admin/trading-tokens/:key_id",
+            axum::routing::delete(admin::revoke_trading_token),
+        )
+        .route(
+            "/admin/portfolios",
+            post(admin::create_portfolio).get(admin::list_portfolios),
+        )
+        .route(
+            "/admin/portfolios/:id",
+            axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
+        )
+        .route(
+            "/admin/accounts",
+            post(admin::create_account).get(admin::list_accounts),
+        )
+        .route(
+            "/admin/accounts/:id",
+            axum::routing::patch(admin::update_account).get(admin::get_account),
+        )
+        .route("/admin/stream-health", get(admin::list_stream_health))
+        .route("/admin/venues", get(admin::list_venues))
+        .route(
+            "/admin/broker-connections",
+            post(admin::create_broker_connection).get(admin::list_broker_connections),
+        )
+        .route(
+            "/admin/broker-connections/:code",
+            axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
+        )
+        .route(
+            "/admin/broker-connections/:code/credentials",
+            get(admin::get_broker_connection_credentials)
+                .put(admin::put_broker_connection_credentials)
+                .delete(admin::delete_broker_connection_credentials),
+        )
+        .route(
+            "/admin/broker-connections/:code/credentials/test",
+            post(admin::test_broker_connection_credentials),
+        )
+        .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
+        .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
+        .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
+        .route("/admin/jobs", get(jobs::api::list_jobs))
+        .route("/admin/jobs/:id", get(jobs::api::get_job))
+        .route("/admin/feed-connections", get(admin::list_feed_connections))
+        .route(
+            "/admin/feed-connections/:code/credentials",
+            get(admin::get_feed_connection_credentials)
+                .put(admin::put_feed_connection_credentials)
+                .delete(admin::delete_feed_connection_credentials),
+        )
+        .route(
+            "/admin/feed-connections/:code/credentials/test",
+            post(admin::test_feed_connection_credentials),
+        )
+        .route("/admin/connections/reload", post(admin::reload_connections))
+        .route(
+            "/admin/risk-limits",
+            post(admin::create_risk_limit).get(admin::list_risk_limits),
+        )
+        .route(
+            "/admin/risk-limits/:id",
+            get(admin::get_risk_limit)
+                .patch(admin::update_risk_limit)
+                .delete(admin::delete_risk_limit),
+        )
+        .route(
+            "/admin/strategies",
+            post(strategies::admin::create_strategy).get(strategies::admin::list_strategies),
+        )
+        .route(
+            "/admin/strategies/:code",
+            axum::routing::patch(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
+        )
+        .route(
+            "/admin/strategies/:code/connections",
+            axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
+        )
+        .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
+        .route("/admin/strategies/:code/follow-credentials", axum::routing::put(strategies::admin::put_follow_credentials))
+        .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
+        .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
+        .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
+        .route("/admin/strategies/:code/handover", post(strategies::admin::handover))
+        .route("/admin/strategies/:code/rebaseline", post(strategies::admin::rebaseline_strategy))
+        .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
+        .route(
+            "/admin/strategies/:code/deployments",
+            post(colo::deployment::register).get(colo::deployment::list),
+        )
+        .route("/admin/strategies/:code/deployments/:id", get(colo::deployment::get))
+        .route(
+            "/admin/strategies/:code/deployments/:id/retire",
+            post(colo::deployment::retire),
+        )
+        .route(
+            "/admin/strategies/:code/deployments/:id/verified-stop",
+            post(colo::deployment::verified_stop),
+        )
+        .route(
+            "/admin/strategies/:code/deployments/:id/adjustments",
+            post(colo::ingest::adjustment),
+        )
+        .route("/admin/instruments", get(admin::list_instruments))
+        .merge(instruments_import::routes())
+        .route("/admin/feeds", get(admin::list_feeds))
+        .route("/admin/symbology/resolve", post(admin::resolve_symbology))
+        .route("/admin/symbology/backfill", post(admin::backfill_symbology))
+        .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
+        .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
+
+    let scalar_html = {
+        let config = json!({ "url": "/api-docs/openapi.json" });
+        scalar_api_reference::scalar_html_default(&config)
+    };
+
+    let mut app = Router::new()
+        .route("/scalar", get(move || async move { Html(scalar_html) }))
+        .route("/api-docs/openapi.json", get(|| async { axum::Json(ApiDoc::openapi()) }))
+        // add health check route
+        .route("/health", get(handlers::health))
+        .merge(orders_router)
+        .merge(admin_router)
+        .merge(cockpit::router());
+
+    // 3) Register the unauthenticated OIDC routes — merged only when
+    // `auth_api_state` resolved above, i.e. only when `[auth.oidc]` is
+    // configured and discovery succeeded. Left unmerged, `/auth/*` falls
+    // through to `handler_404` below exactly as it does with no OIDC config
+    // at all: the off-by-default behaviour holds whether the block is
+    // absent or merely not yet working.
+    if let Some(auth_state) = auth_api_state.clone() {
+        let auth_router = Router::new()
+            .route("/auth/oidc/login", get(auth_api::login))
+            .route("/auth/invite/:token", get(auth_api::invite))
+            .route("/auth/oidc/callback", get(auth_api::callback))
+            // Alias: the registered IdP redirect URIs still use the pre-rename path.
+            .route("/auth/callback", get(auth_api::callback))
+            .layer(Extension(auth_state));
+        app = app.merge(auth_router);
+    }
+
+    // Session routes. A session can be minted by local login or by OIDC, so
+    // these are mounted whenever either is enabled — and, for OIDC, whenever
+    // it is merely *configured*: discovery failing (IdP down, secret unset)
+    // must not take `/auth/me`, `/auth/logout` or `/trade/` away from
+    // sessions that already exist. With neither enabled, the whole `/auth/*`
+    // and `/trade/*` surface 404s, except `/auth/methods`, which says so.
+    //
+    // `/auth/me` requires authentication, so it carries `auth_middleware`;
+    // `/auth/logout` reads the session cookie itself and is idempotent.
+    let oidc_discovered = auth_api_state.is_some();
+    app = app.merge(local_auth_api::methods_routes(local_enabled, oidc_discovered));
+    if local_enabled || oidc_configured {
+        let local_auth = local_auth_api::LocalAuth::new(
+            admin::resolve_master_key().ok().flatten(),
+            local_enabled,
+            oidc_discovered,
+        );
+        app = app.merge(local_auth_api::routes(local_auth));
+        let me_router = Router::new()
+            .route("/auth/me", get(auth_api::me))
+            .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
+        let logout_router = Router::new().route("/auth/logout", post(auth_api::logout));
+        app = app.merge(me_router).merge(logout_router).merge(cockpit::trade_router());
+    }
+
+    app
+        // add 404 route as fallback
+        .fallback(handlers::handler_404)
+        .with_state(state)
 }
 
 // Server entry point (default when no subcommand is given).
@@ -1018,41 +1372,21 @@ async fn serve() {
     // machine — costs nothing extra.
     let bind_addr = resolve_bind_addr(env::var("OMS_BIND_ADDR").ok(), file_cfg);
 
-    let admin_auth_enabled = env::var("OMS_ADMIN_AUTH_ENABLED")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
-
-    // The admin console login password. `OMS_ADMIN_PASSWORD` is the canonical name;
-    // `OMS_ADMIN_TOKEN` is still accepted for back-compat.
-    //
-    // Unset is not fatal on a loopback bind: a fresh clone must be able to run
-    // `cargo run` and reach the console, the same way `database init` works with no
-    // configuration at all. The moment the bind address is reachable from anywhere
-    // else, the default is refused instead — identical to the role-password rule.
-    let admin_token = if !admin_auth_enabled {
-        String::new()
-    } else {
-        let configured = resolve_admin_password(admin_password_from_env(), file_cfg);
-        match configured {
-            Some(token) => token,
-            None if bind_is_loopback(&bind_addr) => {
-                warn!(
-                    "OMS_ADMIN_PASSWORD is not set — using the built-in default \
-                     '{DEFAULT_ADMIN_PASSWORD}' for the admin console. Set OMS_ADMIN_PASSWORD \
-                     in .env before binding anywhere but localhost."
-                );
-                DEFAULT_ADMIN_PASSWORD.to_string()
-            }
-            None => {
-                error!(
-                    "refusing to start: OMS_ADMIN_PASSWORD is not set and OMS_BIND_ADDR \
-                     ({bind_addr}) is reachable beyond this machine. Set OMS_ADMIN_PASSWORD \
-                     in .env, or set OMS_ADMIN_AUTH_ENABLED=false to disable the console login."
-                );
-                std::process::exit(1);
-            }
-        }
-    };
+    // The deprecated shared admin password (`OMS_ADMIN_PASSWORD` →
+    // `OMS_ADMIN_TOKEN` → `[server].admin_password`). There is no built-in
+    // default any more, on loopback or anywhere: admins are named people who
+    // sign in. While `system_setting.legacy_admin_enabled` is still true the
+    // password may read `/admin/*` and bootstrap the first named admin, nothing
+    // else (see `auth::admin_middleware`).
+    let legacy_admin_password = resolve_admin_password(admin_password_from_env(), file_cfg);
+    if legacy_admin_password.is_some() {
+        warn!(
+            "the shared admin password (OMS_ADMIN_PASSWORD / [server].admin_password) is \
+             deprecated: it can only read the admin console and create a named admin. \
+             Create one with `oms auth bootstrap-admin --email <you@example.com>`, \
+             then remove the password."
+        );
+    }
 
     // Same rule, for OIDC login instead of the admin console. Plain http is
     // only tolerated when the whole deployment is loopback — see
@@ -1066,6 +1400,14 @@ async fn serve() {
                  dropped by the browser for carrying Secure over http. Serve OIDC login behind \
                  https, or keep both the bind and the public base URL on loopback.",
                 oidc.public_base_url
+            );
+            std::process::exit(1);
+        }
+        if refuses_dev_client_secret(&bind_addr, env::var("OMS_OIDC_CLIENT_SECRET").ok().as_deref()) {
+            error!(
+                "refusing to start: OMS_OIDC_CLIENT_SECRET is the public development secret and \
+                 OMS_BIND_ADDR ({bind_addr}) is not loopback. Register a real client secret at \
+                 your identity provider and set OMS_OIDC_CLIENT_SECRET to it."
             );
             std::process::exit(1);
         }
@@ -1151,17 +1493,42 @@ async fn serve() {
     // function's doc comment for why a missing base URL still fails closed
     // there rather than assuming this.
     let oidc_settings = file_cfg.and_then(|f| f.oidc());
-    let public_base_url = oidc_settings.as_ref().map(|o| o.public_base_url.clone());
+    if let Some(f) = file_cfg {
+        f.warn_deprecated_auth();
+    }
+    // Built from `[auth]`/`[auth.session]` whether or not OIDC is configured:
+    // local login mints sessions too.
+    let (auth_settings, local_enabled) = match file_cfg {
+        Some(f) => {
+            let a = f.auth_settings();
+            let local = a.local_enabled;
+            (a, local)
+        }
+        None => (config::FileConfig::default().auth_settings(), true),
+    };
+    // The CSRF expected origin must be configured, never taken from a request.
+    // Unset on a loopback bind it is derived from the bind address; unset
+    // anywhere else, local login has no safe origin to check, so refuse.
+    let public_base_url = match auth_settings.public_base_url {
+        Some(url) => Some(url),
+        None if local_enabled => match sessions::derive_public_base_url(&bind_addr) {
+            Ok(url) => Some(url),
+            Err(msg) => {
+                error!("{msg}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
     let session_config = sessions::SessionConfig {
         cookie_policy: sessions::cookie_policy(&bind_addr, public_base_url.as_deref()),
-        ttl: oidc_settings.as_ref().map(|o| o.ttl.clone()).unwrap_or_default(),
+        ttl: auth_settings.ttl,
         public_base_url,
     };
 
-    let state = AppState::new(
+    let mut state = AppState::new(
         pool,
-        admin_token,
-        admin_auth_enabled,
+        legacy_admin_password,
         BrokerRegistry::new(),
         symbology,
         stream_health,
@@ -1170,6 +1537,12 @@ async fn serve() {
         std::sync::Arc::new(market_data),
         session_config,
     );
+    // A fresh host token every boot, for `oms` CLI commands on this machine.
+    let token_path = admin_bootstrap::host_token_path();
+    match admin_bootstrap::write_host_token(&token_path) {
+        Ok(hash) => state.host_token_hash = Some(hash),
+        Err(e) => warn!(path = %token_path.display(), error = %e, "could not write the host token; host CLI admin calls will be refused"),
+    }
     state.swap_registries(registry, daily_stats);
     if let Err(e) = state.strategies().reload(state.pool()).await {
         error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");
@@ -1373,8 +1746,13 @@ async fn serve() {
     // configured `[auth.oidc]` still needs the rest of the OMS — order
     // routing, the admin console — to come up even if the IdP is down or the
     // secret hasn't been set yet. It is retried only on the next restart.
+    let mut oidc_status = app_state::OidcStatus::default();
     let auth_api_state: Option<auth_api::AuthApiState> =
         if let Some(oidc_settings) = file_cfg.and_then(|f| f.oidc()) {
+            oidc_status.configured = true;
+            oidc_status.issuer = Some(oidc_settings.issuer.clone());
+            oidc_status.redirect_uri =
+                Some(format!("{}/auth/callback", oidc_settings.public_base_url.trim_end_matches('/')));
             match env::var("OMS_OIDC_CLIENT_SECRET").ok().filter(|v| !v.is_empty()) {
                 None => {
                     error!(
@@ -1382,17 +1760,31 @@ async fn serve() {
                          login is disabled for this run. Set OMS_OIDC_CLIENT_SECRET to the client \
                          secret registered at the provider and restart."
                     );
+                    oidc_status.error = Some("OMS_OIDC_CLIENT_SECRET is not set".to_string());
                     None
                 }
                 Some(client_secret) => {
                     let required_claim = oidc_settings.required_claim.clone();
+                    let require_amr = oidc_settings.require_amr.clone();
+                    let trust_email_verified = oidc_settings.trust_email_verified;
                     match oidc::Provider::discover(oidc_settings, client_secret).await {
                         Ok(provider) => {
                             info!("OIDC discovery succeeded — login enabled");
-                            Some(auth_api::AuthApiState { provider: Arc::new(provider), required_claim })
+                            oidc_status.discovery_ok = true;
+                            Some(auth_api::AuthApiState {
+                                provider: Arc::new(provider),
+                                required_claim,
+                                require_amr,
+                                trust_email_verified,
+                                flows: Arc::new(auth_api::FlowStore::default()),
+                            })
                         }
                         Err(e) => {
                             error!(error = ?e, "OIDC discovery failed — login is disabled for this run");
+                            oidc_status.error = Some(match e {
+                                oidc::OidcError::ProviderUnavailable(msg) => msg,
+                                other => format!("{other:?}"),
+                            });
                             None
                         }
                     }
@@ -1401,246 +1793,9 @@ async fn serve() {
         } else {
             None
         };
+    state.set_oidc_status(oidc_status);
 
-    // Register routes
-
-    // 1) Register order routes
-    let orders_router = Router::new()
-        .route("/orders/submit", post(handlers::orders_submit))
-        .route("/orders/cancel", post(handlers::orders_cancel))
-        .route("/orders/:id", get(handlers::get_order))
-        .route("/orders/:id/events", get(order_events::get_order_events))
-        .route("/orders", get(handlers::list_orders))
-        .route("/strategies/securities", get(strategies::admin::strategy_securities))
-        .route("/portfolios", get(handlers::list_portfolios))
-        .route(
-            "/watchlist",
-            get(handlers::list_watchlist).post(handlers::add_watchlist_item),
-        )
-        .route("/watchlist/:instrument_id", delete(handlers::remove_watchlist_item))
-        .route("/marks", get(handlers::get_marks))
-        .route("/updates", get(live_updates::ws_updates))
-        .route("/portfolios/:id/positions", get(handlers::get_portfolio_positions))
-        .route("/portfolios/:id/venues", get(handlers::get_portfolio_venues))
-        .route(
-            "/orders/:id/allocations",
-            post(handlers::create_allocations).get(handlers::list_allocations),
-        )
-        .route("/instruments", get(instruments_api::list_instruments_for_trader))
-        .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
-        .route("/instruments/options/chain", get(instruments_api::get_option_chain))
-        .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
-    
-    // 2) Register admin routes (protected by static bearer token only)
-    let admin_router = Router::new()
-        .route("/admin/orders", get(handlers::get_orders_blotter))
-        .route(
-            "/admin/orders/:id/events",
-            get(order_events::get_order_events_admin),
-        )
-        .route(
-            "/admin/principals",
-            post(admin::create_principal).get(admin::list_principals),
-        )
-        .route(
-            "/admin/principals/:id",
-            axum::routing::patch(admin::update_principal).get(admin::get_principal),
-        )
-        .route(
-            "/admin/principals/:id/keys",
-            post(admin::register_principal_key).get(admin::list_principal_keys),
-        )
-        .route(
-            "/admin/principals/:id/keys/:key_id",
-            axum::routing::delete(admin::revoke_principal_key),
-        )
-        .route(
-            "/admin/principals/:id/sessions",
-            axum::routing::delete(admin::revoke_principal_sessions),
-        )
-        .route(
-            "/admin/trading-tokens",
-            post(admin::create_trading_token).get(admin::list_trading_tokens),
-        )
-        .route(
-            "/admin/trading-tokens/:key_id",
-            axum::routing::delete(admin::revoke_trading_token),
-        )
-        .route(
-            "/admin/portfolios",
-            post(admin::create_portfolio).get(admin::list_portfolios),
-        )
-        .route(
-            "/admin/portfolios/:id",
-            axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
-        )
-        .route(
-            "/admin/accounts",
-            post(admin::create_account).get(admin::list_accounts),
-        )
-        .route(
-            "/admin/accounts/:id",
-            axum::routing::patch(admin::update_account).get(admin::get_account),
-        )
-        .route("/admin/stream-health", get(admin::list_stream_health))
-        .route("/admin/venues", get(admin::list_venues))
-        .route(
-            "/admin/broker-connections",
-            post(admin::create_broker_connection).get(admin::list_broker_connections),
-        )
-        .route(
-            "/admin/broker-connections/:code",
-            axum::routing::patch(admin::update_broker_connection).get(admin::get_broker_connection),
-        )
-        .route(
-            "/admin/broker-connections/:code/credentials",
-            get(admin::get_broker_connection_credentials)
-                .put(admin::put_broker_connection_credentials)
-                .delete(admin::delete_broker_connection_credentials),
-        )
-        .route(
-            "/admin/broker-connections/:code/credentials/test",
-            post(admin::test_broker_connection_credentials),
-        )
-        .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
-        .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
-        .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
-        .route("/admin/jobs", get(jobs::api::list_jobs))
-        .route("/admin/jobs/:id", get(jobs::api::get_job))
-        .route("/admin/feed-connections", get(admin::list_feed_connections))
-        .route(
-            "/admin/feed-connections/:code/credentials",
-            get(admin::get_feed_connection_credentials)
-                .put(admin::put_feed_connection_credentials)
-                .delete(admin::delete_feed_connection_credentials),
-        )
-        .route(
-            "/admin/feed-connections/:code/credentials/test",
-            post(admin::test_feed_connection_credentials),
-        )
-        .route("/admin/connections/reload", post(admin::reload_connections))
-        .route(
-            "/admin/principals/:id/grants",
-            post(admin::create_grant).get(admin::list_grants),
-        )
-        .route(
-            "/admin/principals/:id/grants/:grant_id",
-            axum::routing::patch(admin::update_grant).delete(admin::delete_grant),
-        )
-        .route(
-            "/admin/risk-limits",
-            post(admin::create_risk_limit).get(admin::list_risk_limits),
-        )
-        .route(
-            "/admin/risk-limits/:id",
-            get(admin::get_risk_limit)
-                .patch(admin::update_risk_limit)
-                .delete(admin::delete_risk_limit),
-        )
-        .route(
-            "/admin/strategies",
-            post(strategies::admin::create_strategy).get(strategies::admin::list_strategies),
-        )
-        .route(
-            "/admin/strategies/:code",
-            axum::routing::patch(strategies::admin::update_strategy).delete(strategies::admin::delete_strategy),
-        )
-        .route(
-            "/admin/strategies/:code/connections",
-            axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
-        )
-        .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
-        .route("/admin/strategies/:code/follow-credentials", axum::routing::put(strategies::admin::put_follow_credentials))
-        .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
-        .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
-        .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
-        .route("/admin/strategies/:code/rebaseline", post(strategies::admin::rebaseline_strategy))
-        .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
-        .route(
-            "/admin/strategies/:code/deployments",
-            post(colo::deployment::register).get(colo::deployment::list),
-        )
-        .route("/admin/strategies/:code/deployments/:id", get(colo::deployment::get))
-        .route(
-            "/admin/strategies/:code/deployments/:id/retire",
-            post(colo::deployment::retire),
-        )
-        .route(
-            "/admin/strategies/:code/deployments/:id/verified-stop",
-            post(colo::deployment::verified_stop),
-        )
-        .route(
-            "/admin/strategies/:code/deployments/:id/adjustments",
-            post(colo::ingest::adjustment),
-        )
-        .route("/admin/instruments", get(admin::list_instruments))
-        .merge(instruments_import::routes())
-        .route("/admin/feeds", get(admin::list_feeds))
-        .route("/admin/symbology/resolve", post(admin::resolve_symbology))
-        .route("/admin/symbology/backfill", post(admin::backfill_symbology))
-        .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
-        .route("/admin/setup-status", get(admin::setup_status))
-        .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
-
-    let scalar_html = {
-        let config = json!({ "url": "/api-docs/openapi.json" });
-        scalar_api_reference::scalar_html_default(&config)
-    };
-
-    let mut app = Router::new()
-        .route("/scalar", get(move || async move { Html(scalar_html) }))
-        .route("/api-docs/openapi.json", get(|| async { axum::Json(ApiDoc::openapi()) }))
-        // add health check route
-        .route("/health", get(handlers::health))
-        .merge(orders_router)
-        .merge(admin_router)
-        .merge(cockpit::router());
-
-    // 3) Register the unauthenticated OIDC routes — merged only when
-    // `auth_api_state` resolved above, i.e. only when `[auth.oidc]` is
-    // configured and discovery succeeded. Left unmerged, `/auth/*` falls
-    // through to `handler_404` below exactly as it does with no OIDC config
-    // at all: the off-by-default behaviour holds whether the block is
-    // absent or merely not yet working.
-    if let Some(auth_state) = auth_api_state {
-        let auth_router = Router::new()
-            .route("/auth/login", get(auth_api::login))
-            .route("/auth/callback", get(auth_api::callback))
-            .route("/auth/logout", post(auth_api::logout))
-            .layer(Extension(auth_state));
-        app = app.merge(auth_router);
-    }
-
-    // `/auth/me` is the one `/auth/*` route that requires authentication, so
-    // it carries `auth_middleware` rather than riding on the unauthenticated
-    // router above — but it is still an `/auth/*` route, and the spec's
-    // off-by-default promise is that with no `[auth.oidc]` block the whole
-    // prefix 404s and nothing else changes. Mounted unconditionally it broke
-    // that promise for every install that never enabled login.
-    //
-    // Gated on the config block, not on `auth_api_state`: discovery failing
-    // (IdP down, secret unset) must not take `/auth/me` away from sessions
-    // that already exist. The IdP is a dependency of login, not of every
-    // request — see the spec's "Token handling".
-    //
-    // `/trade/*` rides the same gate, for the same reason: the trade app
-    // authenticates by session cookie and nothing else, and a session can
-    // only ever be minted by the OIDC callback. With no `[auth.oidc]` block
-    // configured, `/trade/` would be a screen nobody could ever log into, so
-    // it stays off unless OIDC is at least configured — and, like `/auth/me`,
-    // it must not disappear out from under an already-signed-in trader just
-    // because discovery is transiently failing on this restart.
-    if oidc_settings.is_some() {
-        let me_router = Router::new()
-            .route("/auth/me", get(auth_api::me))
-            .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
-        app = app.merge(me_router).merge(cockpit::trade_router());
-    }
-
-    let app = app
-        // add 404 route as fallback
-        .fallback(handlers::handler_404)
-        .with_state(state);
+    let app = build_app(state, auth_api_state, local_enabled, oidc_settings.is_some());
 
     // Start TCP listener
     let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
@@ -1651,11 +1806,38 @@ async fn serve() {
     }
     info!("Scalar UI: {}/scalar", host_url);
     info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);
-    axum::serve(listener, app).await.unwrap();
+    // Peer address for the login rate limiter (never X-Forwarded-For).
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
 }
 
 #[cfg(test)]
 mod tests {
+    /// axum panics while *building* a router that registers one (method, path)
+    /// twice, so this fails at startup in production and here alike. Both OIDC
+    /// branches are built so the conditionally-merged routers are covered too.
+    #[tokio::test]
+    async fn the_full_router_builds() {
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let state = crate::handlers::tests::test_app_state(pool);
+        let discovered = || crate::auth_api::AuthApiState {
+            provider: std::sync::Arc::new(crate::oidc::Provider::for_test(
+                "https://id.example.com",
+                "oms",
+                "https://oms.example.com",
+            )),
+            required_claim: None,
+            require_amr: Vec::new(),
+            trust_email_verified: true,
+            flows: std::sync::Arc::new(crate::auth_api::FlowStore::default()),
+        };
+        // (local only), (OIDC configured, discovery failed), (neither),
+        // then the discovered router: (OIDC only) and (both).
+        let _ = crate::build_app(state.clone(), None, true, false);
+        let _ = crate::build_app(state.clone(), None, false, true);
+        let _ = crate::build_app(state.clone(), None, false, false);
+        let _ = crate::build_app(state.clone(), Some(discovered()), false, true);
+        let _ = crate::build_app(state, Some(discovered()), true, true);
+    }
 
     #[test]
     fn init_takes_the_guided_setup_flags() {
@@ -1663,19 +1845,21 @@ mod tests {
         use crate::{setup, Cli, Command, ConfigCmd};
         let cli = Cli::try_parse_from([
             "oms", "init", "--non-interactive", "--postgres", "docker",
-            "--admin-password", "twelve-chars-ok", "--bind", "localhost:4000",
+            "--admin-email", "ada@example.com", "--admin-name", "Ada", "--bind", "localhost:4000",
         ])
         .unwrap();
         match cli.command {
-            Some(Command::Init { non_interactive, postgres, admin_password, bind, .. }) => {
+            Some(Command::Init { non_interactive, postgres, admin_email, admin_name, bind, .. }) => {
                 assert!(non_interactive);
                 assert_eq!(postgres, Some(setup::init::rules::DbSource::Docker));
-                assert_eq!(admin_password.as_deref(), Some("twelve-chars-ok"));
+                assert_eq!(admin_email.as_deref(), Some("ada@example.com"));
+                assert_eq!(admin_name.as_deref(), Some("Ada"));
                 assert_eq!(bind.as_deref(), Some("localhost:4000"));
             }
             _ => panic!("not init"),
         }
         assert!(Cli::try_parse_from(["oms", "init", "--postgres", "kubernetes"]).is_err());
+        assert!(Cli::try_parse_from(["oms", "init", "--admin-password", "twelve-chars-ok"]).is_err(), "init no longer takes a password");
     }
 
     #[test]
@@ -1761,6 +1945,20 @@ mod tests {
     /// The OIDC start-up gate. Plain http is only ever acceptable when the
     /// whole deployment is loopback; `https://` is fine on any bind, which is
     /// the reverse-proxy topology C2 was about.
+    #[test]
+    fn boot_refuses_dev_secret_off_loopback() {
+        use super::refuses_dev_client_secret as refuses;
+
+        assert!(refuses("0.0.0.0:3001", Some("oms-dev-secret")));
+        assert!(refuses("oms.internal:3001", Some("oms-dev-secret")));
+        // Local development may keep the fixture's secret.
+        assert!(!refuses("127.0.0.1:3001", Some("oms-dev-secret")));
+        assert!(!refuses("localhost:3001", Some("oms-dev-secret")));
+        // A real secret, or none, is not this rule's business.
+        assert!(!refuses("0.0.0.0:3001", Some("a-real-registered-secret")));
+        assert!(!refuses("0.0.0.0:3001", None));
+    }
+
     #[test]
     fn plain_http_oidc_is_only_tolerated_when_everything_is_local() {
         use super::refuses_plain_http_oidc as refuses;
@@ -1891,6 +2089,32 @@ mod tests {
             .filter(|name| !defined.contains(name))
             .collect();
         assert!(dangling.is_empty(), "dangling schema refs: {dangling:?}");
+    }
+
+    /// Every route behind the MFA gate (order actions and every `/admin`
+    /// mutation) documents its 403 `mfa_required`; reads do not.
+    #[test]
+    fn every_mfa_gated_route_documents_mfa_required() {
+        let spec: serde_json::Value = serde_json::from_str(&super::openapi_json()).unwrap();
+        let trading = [("post", "/orders/submit"), ("post", "/orders/cancel"), ("post", "/orders/{id}/allocations")];
+        let mut missing = Vec::new();
+        let mut gated = 0;
+        for (path, ops) in spec["paths"].as_object().unwrap() {
+            for (method, op) in ops.as_object().unwrap() {
+                let is_gated = (path.starts_with("/admin/") && method != "get") || trading.contains(&(method.as_str(), path.as_str()));
+                let documented = op["responses"]["403"]["description"].as_str().is_some_and(|d| d.contains("mfa_required"));
+                if is_gated {
+                    gated += 1;
+                    if !documented {
+                        missing.push(format!("{method} {path}"));
+                    }
+                } else {
+                    assert!(!documented, "{method} {path} is not MFA-gated");
+                }
+            }
+        }
+        assert!(gated > 40, "{gated}");
+        assert!(missing.is_empty(), "no 403 mfa_required on: {missing:?}");
     }
 
     /// The trading endpoints are what the public API reference leads with, and

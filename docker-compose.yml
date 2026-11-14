@@ -38,45 +38,115 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
-  # A disposable identity provider for exercising OIDC login end to end.
+  # DEV-ONLY, OPTIONAL: a disposable local SSO test provider (Authentik) for
+  # exercising OIDC login end to end. The OMS works with any OIDC issuer
+  # (Entra, Google, Okta, Keycloak, Authentik, ...); this is just a convenient
+  # one to test against. It is not used by the deploy, and its blueprint client
+  # secret `oms-dev-secret` is public, so the OMS refuses it unless the issuer
+  # is on loopback: this fixture only works for local development.
   #
   # Not part of the default `docker compose up -d` — it lives under the `oidc`
   # profile, so it only starts when explicitly asked for and stays out of CI
   # and of every developer's normal Postgres-only loop:
   #
-  #     docker compose --profile oidc up -d keycloak
+  #     docker compose --profile oidc up -d
   #     OMS_OIDC_CLIENT_SECRET=oms-dev-secret cargo run
   #
-  # `--import-realm` loads docker/keycloak/oms-dev-realm.json on boot, which
-  # creates the `oms-dev` realm, one confidential client (`oms`, secret
-  # `oms-dev-secret`, redirect URI `http://localhost:3001/auth/callback`) and
-  # one user (`trader` / `trader`) — no manual console clicking needed. Point
-  # `oms.toml` at it:
+  # docker/authentik/blueprints/oms-dev.yaml is picked up by the worker on
+  # boot and creates the `oms` provider + application (client secret
+  # `oms-dev-secret`, redirect URIs `http://localhost:3001/auth/callback` and
+  # `http://localhost:3001/auth/oidc/callback`).
+  # First start takes a minute or two while Authentik migrates its database.
+  # Point `oms.toml` at it:
   #
   #     [auth.oidc]
-  #     issuer = "http://localhost:8090/realms/oms-dev"
+  #     issuer = "http://localhost:9000/application/o/oms/"
   #     client_id = "oms"
   #     public_base_url = "http://localhost:3001"
   #
-  # then open http://localhost:3001/auth/login and sign in as `trader` /
-  # `trader`. `start-dev` is Keycloak's own non-production mode — fine for
-  # this, not for anything real. Admin console at localhost:8090, `admin` /
-  # `admin`. (Host port 8090, not Keycloak's default 8080 — that's a common
-  # port for other local dev stacks to already hold.)
-  keycloak:
-    container_name: oms-keycloak
-    image: quay.io/keycloak/keycloak:26.0
+  # Admin UI: http://localhost:9000/if/admin/ as `akadmin` / `admin` (dev-only
+  # bootstrap credentials, only applied on first boot of an empty database).
+  # Create users (or invite flows) there. Authentik 2026.8 needs no Redis;
+  # it keeps cache and queues in its own Postgres. That Postgres is separate
+  # from `postgres` above, with its own volume, and is not published to the
+  # host.
+  #
+  # AUTHENTIK_SECRET_KEY below is a DEV-ONLY default. Never reuse it anywhere
+  # real; override via the environment.
+  authentik-postgres:
+    container_name: oms-authentik-postgres
+    image: docker.io/library/postgres:16-alpine
     profiles: ["oidc"]
-    command: start-dev --import-realm
     environment:
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
-    ports:
-      - "127.0.0.1:8090:8080"
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:-authentik-dev-only}
     volumes:
-      - ./docker/keycloak/oms-dev-realm.json:/opt/keycloak/data/import/oms-dev-realm.json:ro
+      - oms-authentik-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
     security_opt:
       - no-new-privileges:true
+    restart: unless-stopped
+
+  authentik-server:
+    container_name: oms-authentik-server
+    image: ghcr.io/goauthentik/server:2026.8.5
+    profiles: ["oidc"]
+    command: server
+    environment: &authentik-env
+      AUTHENTIK_SECRET_KEY: ${OMS_AUTHENTIK_SECRET_KEY:-dev-only-insecure-secret-key-change-me-0123456789}
+      AUTHENTIK_POSTGRESQL__HOST: authentik-postgres
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${OMS_AUTHENTIK_PG_PASSWORD:-authentik-dev-only}
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${OMS_AUTHENTIK_BOOTSTRAP_PASSWORD:-admin}
+      AUTHENTIK_BOOTSTRAP_EMAIL: akadmin@example.com
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - oms-authentik-data:/data
+      - ./docker/authentik/blueprints:/blueprints/custom:ro
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  authentik-worker:
+    container_name: oms-authentik-worker
+    image: ghcr.io/goauthentik/server:2026.8.5
+    profiles: ["oidc"]
+    command: worker
+    environment: *authentik-env
+    depends_on:
+      authentik-postgres:
+        condition: service_healthy
+    volumes:
+      - oms-authentik-data:/data
+      - ./docker/authentik/blueprints:/blueprints/custom:ro
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
 
 volumes:
   oms-postgres:
+  oms-authentik-pgdata:
+  oms-authentik-data:

@@ -68,17 +68,37 @@ impl StreamRegistry {
 }
 
 /// Shared application state injected into every Axum handler via State<AppState>.
+/// OIDC sign-in as boot found it. `discovery_ok` is true only when the
+/// provider answered discovery and the client secret was present.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct OidcStatus {
+    pub configured: bool,
+    pub issuer: Option<String>,
+    pub discovery_ok: bool,
+    pub error: Option<String>,
+    pub redirect_uri: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    pub admin_token: String,
-    pub admin_auth_enabled: bool,
+    /// The deprecated shared admin password, accepted as a bearer on `/admin/*`
+    /// only while `system_setting.legacy_admin_enabled` is true and only for
+    /// reads and `bootstrap-admin` (see `auth::admin_middleware`). `None`
+    /// when none is configured: there is no built-in default.
+    pub legacy_admin_password: Option<String>,
+    /// SHA-256 of this boot's host token (see `admin_bootstrap::write_host_token`);
+    /// `None` when none was written. Only loopback peers may present it.
+    pub host_token_hash: Option<String>,
     /// Cookie policy + TTLs for browser sessions. Derived once at boot from
     /// the OIDC public base URL, or the bind address when OIDC is off (see
     /// `sessions::cookie_policy`) rather than per request, and carried whole
     /// rather than as separate constructor arguments — see
     /// `auth::authenticate`, its only reader.
     pub session_config: crate::sessions::SessionConfig,
+    /// What boot learned about OIDC sign-in; shared by every clone so the
+    /// admin console can say why sign-in is or is not on.
+    oidc_status: Arc<std::sync::RwLock<OidcStatus>>,
     /// Swappable so a credential change can publish a new registry without
     /// restarting: readers on the order path take an atomic load, and an order
     /// already routing holds its own `Arc` and finishes against the adapter it
@@ -119,8 +139,7 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
-        admin_token: String,
-        admin_auth_enabled: bool,
+        legacy_admin_password: Option<String>,
         registry: BrokerRegistry,
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
@@ -131,9 +150,10 @@ impl AppState {
     ) -> Self {
         Self {
             pool,
-            admin_token,
-            admin_auth_enabled,
+            legacy_admin_password,
+            host_token_hash: None,
             session_config,
+            oidc_status: Arc::new(std::sync::RwLock::new(OidcStatus::default())),
             registry: Arc::new(ArcSwap::from_pointee(registry)),
             daily_stats_sources: Arc::new(ArcSwap::from_pointee(DailyStatsRegistry::new())),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -149,6 +169,14 @@ impl AppState {
             fix_sessions: crate::strategies::session::FixSessions::default(),
             colo: crate::colo::ColoHub::default(),
         }
+    }
+
+    pub fn oidc_status(&self) -> OidcStatus {
+        self.oidc_status.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_oidc_status(&self, status: OidcStatus) {
+        *self.oidc_status.write().unwrap_or_else(|e| e.into_inner()) = status;
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -244,8 +272,7 @@ mod tests {
         // the registry swap and the stream registry, never a real quote.
         AppState::new(
             pool,
-            "test-admin-token".to_string(),
-            false,
+            Some("test-admin-token".to_string()),
             registry,
             symbology,
             StreamHealthRegistry::new(),

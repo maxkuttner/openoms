@@ -14,7 +14,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useList, notifyError, notifyOk } from "../api/hooks";
 import { C, CmdLine, Eyebrow } from "../components/apiTheme";
-import type { Principal, Portfolio, TradingTokenCreated, TradingTokenRow } from "../api/types";
+import type { Portfolio, TradingTokenCreated, TradingTokenRow } from "../api/types";
 
 const PATH = "/admin/trading-tokens";
 
@@ -29,7 +29,7 @@ function ago(iso: string): string {
 export function ApiPage() {
   const qc = useQueryClient();
   const { data: tokens, isLoading } = useList<TradingTokenRow>(PATH);
-  const { data: principals } = useList<Principal>("/admin/principals");
+  const { data: users } = useList<{ principal_id: string; code: string; display_name: string | null; status: string }>("/admin/users");
   const { data: portfolios } = useList<Portfolio>("/admin/portfolios");
 
   const [principalId, setPrincipalId] = useState<string | null>(null);
@@ -38,8 +38,8 @@ export function ApiPage() {
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<TradingTokenCreated | null>(null);
 
-  const principalOpts = (principals ?? []).map((p) => ({
-    value: p.id,
+  const principalOpts = (users ?? []).filter((p) => p.status === "ACTIVE").map((p) => ({
+    value: p.principal_id,
     label: p.display_name ? `${p.display_name} · ${p.code}` : p.code,
   }));
   const portfolioOpts = (portfolios ?? []).map((p) => ({
@@ -97,7 +97,7 @@ export function ApiPage() {
         </Text>
         <Text fz={13} c={C.muted} mt={6} maw={620}>
           A token is a single bearer credential for a bot or strategy. It belongs to a
-          principal; what it can trade follows that principal's portfolio grants. Point
+          user; what it can trade follows that user's portfolio access. Point
           clients at your OMS host and send{" "}
           <Text component="span" c={C.green} inherit>Authorization: Bearer &lt;token&gt;</Text>.
         </Text>
@@ -111,15 +111,15 @@ export function ApiPage() {
         <Stack gap={14} p={16}>
           {principalOpts.length === 0 ? (
             <Text fz={12.5} c={C.muted}>
-              No principals yet. Create one on the{" "}
-              <Text component={Link} to="/principals" c={C.green} inherit>Principals</Text> tab,
+              No users yet. Create one on the{" "}
+              <Text component={Link} to="/users" c={C.green} inherit>Users</Text> tab,
               then mint its tokens here.
             </Text>
           ) : (
             <Group grow align="flex-start">
               <Select
-                label="Principal"
-                placeholder="trader / strategy / service"
+                label="User"
+                placeholder="trader / bot"
                 data={principalOpts}
                 value={principalId}
                 onChange={setPrincipalId}
@@ -192,7 +192,7 @@ export function ApiPage() {
             <>
               <Group px={16} py={8} style={{ borderBottom: `1px solid ${C.border}` }} wrap="nowrap">
                 <Box w={180}><Eyebrow>Label</Eyebrow></Box>
-                <Box style={{ flex: 1 }}><Eyebrow>Principal</Eyebrow></Box>
+                <Box style={{ flex: 1 }}><Eyebrow>User</Eyebrow></Box>
                 <Box w={230}><Eyebrow>Key id</Eyebrow></Box>
                 <Box w={44} style={{ textAlign: "right" }}><Eyebrow>Age</Eyebrow></Box>
                 <Box w={60} />

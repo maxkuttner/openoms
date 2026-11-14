@@ -3,7 +3,7 @@
 // Hand-placed SVG rather than Mermaid: at this size an automatic layout tangles
 // the edges. It reads top to bottom so it fits the content column; edges run in
 // the gaps between columns and are drawn before the boxes. Box and text colours follow Starlight's theme variables, so the
-// figure follows light and dark mode; the five accents mean the same in both
+// figure follows light and dark mode; the accents mean the same in both
 // (see the legend). On a narrow screen the figure keeps its size and scrolls.
 interface Props { target?: boolean }
 const { target = false } = Astro.props;
@@ -69,14 +69,14 @@ const { target = false } = Astro.props;
     >
       <title id="arch-title">OpenOMS architecture</title>
       <desc id="arch-desc">
-        From top to bottom: users and strategies; the OMS core with the order
-        engine, event store and event bus; the order and market data gateways;
+        From top to bottom: users, strategies and an optional external identity provider for single sign-on; the OMS core with the order
+        engine, event store, event bus and the users and access records (local accounts, invites, roles, identities) that the OMS itself owns; the order and market data gateways;
         the brokers, crypto venues and data vendors they connect to. At the
         bottom, a co-located strategy trades a crypto venue directly while the
         OMS follows its account and controls it over the control link.
       </desc>
       <defs>
-        {["order", "event", "price", "control"].map((k) => (
+        {["order", "event", "price", "control", "auth"].map((k) => (
           <marker id={`arch-arrow-${k}`} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
             <path d="M0,0 L10,5 L0,10 z" class={`arch-head-${k}`} />
           </marker>
@@ -95,17 +95,19 @@ const { target = false } = Astro.props;
       <text class="arch-region-label arch-colo-label" x="30" y="932">② CO-LOCATED SERVER · a separate program, next to the venue</text>
 
       <!-- Edges: drawn before the boxes, which cover their ends -->
-      <path class="arch-edge arch-edge-order" d="M138,96 C138,140 120,140 120,180" />
-      <path class="arch-edge arch-edge-order" d="M308,96 C308,140 160,136 160,180" />
-      <path class="arch-edge arch-edge-order" d="M478,96 C478,150 200,132 200,180" />
+      <path class="arch-edge arch-edge-order" d="M125,96 C125,140 120,140 120,180" />
+      <path class="arch-edge arch-edge-order" d="M267,96 C267,140 160,136 160,180" />
+      <path class="arch-edge arch-edge-order" d="M409,96 C409,150 200,132 200,180" />
       <path class="arch-edge arch-edge-order" d="M240,224 L262,224 L262,626" />
       <text class="arch-edge-label arch-label-order" transform="translate(256 520) rotate(-90)" text-anchor="middle">NewOrder · Cancel</text>
       <path class="arch-edge arch-edge-event" d="M288,626 L288,210 L310,210" />
       <text class="arch-edge-label arch-label-event" transform="translate(298 470) rotate(-90)" text-anchor="middle">ExecEvent</text>
       <path class="arch-edge arch-edge-event" d="M490,210 L560,210" />
       <path class="arch-edge arch-edge-event" d="M650,240 L650,262" />
-      <path class="arch-edge arch-edge-event" d="M740,292 L768,292 L768,65 L725,65" />
-      <text class="arch-edge-label arch-label-event" transform="translate(762 180) rotate(-90)" text-anchor="middle">Kafka</text>
+      <path class="arch-edge arch-edge-event" d="M740,292 L782,292 L782,20 L551,20 L551,34" />
+      <text class="arch-edge-label arch-label-event" transform="translate(776 180) rotate(-90)" text-anchor="middle">Kafka</text>
+      <path class="arch-edge arch-edge-auth" d="M693,96 L693,106 L760,106 L760,538 L740,538" />
+      <text class="arch-edge-label arch-label-auth" transform="translate(754 330) rotate(-90)" text-anchor="middle">optional SSO · OIDC</text>
       <path class="arch-edge arch-edge-event" d="M400,240 L400,344" />
       <path class="arch-edge arch-edge-event" d="M400,404 L400,426" />
       <path class="arch-edge arch-edge-event" d="M200,626 L200,568" />
@@ -125,13 +127,14 @@ const { target = false } = Astro.props;
       <text class="arch-edge-label arch-label-control" transform="translate(24 770) rotate(-90)" text-anchor="middle">control link · kill · limits · positions</text>
 
       <!-- Users -->
-      <g class="arch-box arch-user"><rect x="60" y="34" width="155" height="62" rx="8" /><text x="138" y="60" text-anchor="middle" class="arch-name">Cockpit</text><text x="138" y="78" text-anchor="middle" class="arch-sub">admin, risk, blotter</text></g>
-      <g class="arch-box arch-user"><rect x="230" y="34" width="155" height="62" rx="8" /><text x="308" y="60" text-anchor="middle" class="arch-name">Trader UI</text><text x="308" y="78" text-anchor="middle" class="arch-sub">tickets, positions</text></g>
-      <g class="arch-box arch-strategy"><rect x="400" y="34" width="155" height="62" rx="8" /><text x="478" y="60" text-anchor="middle" class="arch-name">Strategies ①</text><text x="478" y="78" text-anchor="middle" class="arch-sub">FIX 4.4 over TLS, or REST</text></g>
-      <g class="arch-box arch-ext"><rect x="570" y="34" width="155" height="62" rx="8" /><text x="648" y="60" text-anchor="middle" class="arch-name">Other systems</text><text x="648" y="78" text-anchor="middle" class="arch-sub">risk, accounting…</text></g>
+      <g class="arch-box arch-user"><rect x="60" y="34" width="130" height="62" rx="8" /><text x="125" y="60" text-anchor="middle" class="arch-name">Cockpit</text><text x="125" y="78" text-anchor="middle" class="arch-sub">admin, users, blotter</text></g>
+      <g class="arch-box arch-user"><rect x="202" y="34" width="130" height="62" rx="8" /><text x="267" y="60" text-anchor="middle" class="arch-name">Trader UI</text><text x="267" y="78" text-anchor="middle" class="arch-sub">invited users</text></g>
+      <g class="arch-box arch-strategy"><rect x="344" y="34" width="130" height="62" rx="8" /><text x="409" y="60" text-anchor="middle" class="arch-name">Strategies ①</text><text x="409" y="78" text-anchor="middle" class="arch-sub">FIX or REST</text></g>
+      <g class="arch-box arch-ext"><rect x="486" y="34" width="130" height="62" rx="8" /><text x="551" y="60" text-anchor="middle" class="arch-name">Other systems</text><text x="551" y="78" text-anchor="middle" class="arch-sub">risk, accounting…</text></g>
+      <g class="arch-box arch-ext"><rect x="628" y="34" width="130" height="62" rx="8" /><text x="693" y="60" text-anchor="middle" class="arch-name">Identity provider</text><text x="693" y="78" text-anchor="middle" class="arch-sub">optional SSO</text></g>
 
       <!-- Core: three columns, four rows; the bus spans the right two -->
-      <g class="arch-box"><rect x="60" y="180" width="180" height="60" rx="8" /><text x="150" y="205" text-anchor="middle" class="arch-name">Order API + Risk</text><text x="150" y="223" text-anchor="middle" class="arch-sub">checks, then stores</text></g>
+      <g class="arch-box"><rect x="60" y="180" width="180" height="60" rx="8" /><text x="150" y="205" text-anchor="middle" class="arch-name">Order API + Risk</text><text x="150" y="223" text-anchor="middle" class="arch-sub">role checks, risk, store</text></g>
       <g class="arch-box arch-key"><rect x="310" y="180" width="180" height="60" rx="8" /><text x="400" y="205" text-anchor="middle" class="arch-name">Order engine</text><text x="400" y="223" text-anchor="middle" class="arch-sub">the only place fills book</text></g>
       <g class="arch-box"><rect x="560" y="180" width="180" height="60" rx="8" /><text x="650" y="205" text-anchor="middle" class="arch-name">Event store</text><text x="650" y="223" text-anchor="middle" class="arch-sub">append-only, Postgres</text></g>
 
@@ -145,12 +148,14 @@ const { target = false } = Astro.props;
       <rect class="arch-lane arch-lane-price" x="534" y="370" width="190" height="30" rx="6" />
       <text class="arch-lane-text" x="629" y="390" text-anchor="middle">price lane · latest wins</text>
 
-      <g class="arch-box arch-strategy"><rect x="60" y="426" width="180" height="60" rx="8" /><text x="150" y="451" text-anchor="middle" class="arch-name">Strategy registry</text><text x="150" y="469" text-anchor="middle" class="arch-sub">limits · Kill · Enable</text></g>
+      <g class="arch-box arch-strategy"><rect x="60" y="426" width="180" height="60" rx="8" /><text x="150" y="451" text-anchor="middle" class="arch-name">Strategy registry</text><text x="150" y="469" text-anchor="middle" class="arch-sub">responsible user · Kill</text></g>
       <g class="arch-box"><rect x="310" y="426" width="180" height="60" rx="8" /><text x="400" y="451" text-anchor="middle" class="arch-name">Positions &amp; P&amp;L</text><text x="400" y="469" text-anchor="middle" class="arch-sub">from fills and marks</text></g>
       <g class="arch-box"><rect x="560" y="426" width="180" height="60" rx="8" /><text x="650" y="451" text-anchor="middle" class="arch-name">Pricing</text><text x="650" y="469" text-anchor="middle" class="arch-sub">best live source → mark</text></g>
 
       <g class="arch-box arch-strategy"><rect x="60" y="508" width="180" height="60" rx="8" /><text x="150" y="533" text-anchor="middle" class="arch-name">Co-located hub</text><text x="150" y="551" text-anchor="middle" class="arch-sub">books fills · link · alarms</text></g>
       <g class="arch-box"><rect x="310" y="508" width="180" height="60" rx="8" /><text x="400" y="533" text-anchor="middle" class="arch-name">UI updates</text><text x="400" y="551" text-anchor="middle" class="arch-sub">bus → open screens, live</text></g>
+
+      <g class="arch-box"><rect x="560" y="508" width="180" height="60" rx="8" /><text x="650" y="533" text-anchor="middle" class="arch-name">Users &amp; access</text><text x="650" y="551" text-anchor="middle" class="arch-sub">local accounts · MFA · roles</text></g>
 
       <!-- Gateways -->
       <g class="arch-gw"><rect x="60" y="626" width="330" height="150" rx="10" /><text x="225" y="650" text-anchor="middle" class="arch-name">Order gateway</text><text x="225" y="667" text-anchor="middle" class="arch-sub">orders and fills only · sessions, reconnect, health</text></g>
@@ -200,6 +205,7 @@ const { target = false } = Astro.props;
     <li><span class="arch-swatch arch-swatch-price"></span>prices</li>
     <li><span class="arch-swatch arch-swatch-strategy"></span>strategies</li>
     <li><span class="arch-swatch arch-swatch-control"></span>kill and limits</li>
+    <li><span class="arch-swatch arch-swatch-auth"></span>sign-in</li>
   </ul>
 </figure>
 
@@ -341,6 +347,11 @@ const { target = false } = Astro.props;
     stroke: var(--arch-event);
     marker-end: url(#arch-arrow-event);
   }
+  .arch-edge-auth {
+    stroke: var(--arch-muted);
+    stroke-dasharray: 2 4;
+    marker-end: url(#arch-arrow-auth);
+  }
   .arch-edge-price {
     stroke: var(--arch-price);
     marker-end: url(#arch-arrow-price);
@@ -359,6 +370,7 @@ const { target = false } = Astro.props;
   .arch-head-event { fill: var(--arch-event); }
   .arch-head-price { fill: var(--arch-price); }
   .arch-head-control { fill: var(--arch-control); }
+  .arch-head-auth { fill: var(--arch-muted); }
   .arch-edge-label {
     font-size: 11px;
     fill: var(--arch-muted);
@@ -370,6 +382,7 @@ const { target = false } = Astro.props;
   .arch-label-event { fill: var(--arch-event); }
   .arch-label-price { fill: var(--arch-price); }
   .arch-label-control { fill: var(--arch-control); }
+  .arch-label-auth { fill: var(--arch-muted); }
   .arch-legend {
     display: flex;
     flex-wrap: wrap;
@@ -396,4 +409,5 @@ const { target = false } = Astro.props;
   .arch-swatch-price { border-color: var(--arch-price); }
   .arch-swatch-strategy { border-color: var(--arch-strategy); }
   .arch-swatch-control { border-color: var(--arch-control); border-top-style: dashed; }
+  .arch-swatch-auth { border-color: var(--arch-muted); border-top-style: dotted; }
 </style>

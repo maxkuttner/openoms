@@ -49,9 +49,10 @@ filled in for you:
 Then reload:
 
 ```sh
-export OMS_ADMIN=$(sed -n 's/^admin_password = "\(.*\)"/\1/p' ~/.config/oms/oms.toml)
-
-curl -s -X POST localhost:3001/admin/connections/reload -H "Authorization: Bearer $OMS_ADMIN"
+# the host token is the file host-token next to your oms.toml (default ~/.config/oms/host-token);
+# the server accepts it from this machine only
+curl -s -X POST localhost:3001/admin/connections/reload \
+  -H "Authorization: Bearer $(cat ~/.config/oms/host-token)"
 ```
 
 A FIX session cannot be swapped while running: for a FIX connection the reload reports

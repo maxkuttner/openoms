@@ -62,6 +62,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Already exists"
           }
@@ -150,6 +153,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -216,6 +222,9 @@
           },
           "400": {
             "description": "Invalid environment (must be PAPER or LIVE)"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "409": {
             "description": "Already exists"
@@ -305,6 +314,9 @@
           },
           "400": {
             "description": "Invalid environment"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -402,6 +414,9 @@
           "400": {
             "description": "The request body was malformed, or could not be parsed into a credential (unknown field, bad port, ...)"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
@@ -446,6 +461,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -493,6 +511,9 @@
           },
           "400": {
             "description": "No credential is stored for this connection"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -577,6 +598,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
@@ -622,6 +646,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -679,6 +706,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "422": {
             "description": "A conId is unknown or unsupported; nothing was saved"
           },
@@ -734,6 +764,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "422": {
             "description": "The CSV is malformed"
@@ -812,6 +845,9 @@
         "responses": {
           "200": {
             "description": "Per-connection reload report (codes and outcomes only — no credential material)"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "500": {
             "description": "The credential store could not be read, the master key is invalid, or nothing at all decrypted; nothing was changed"
@@ -939,6 +975,9 @@
           "400": {
             "description": "The request body was malformed, or could not be parsed into a credential (unknown field, ...)"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
@@ -983,6 +1022,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -1030,6 +1072,9 @@
           },
           "400": {
             "description": "No credential is stored for this connection"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -1092,6 +1137,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "500": {
             "description": "The acceptor did not start again"
@@ -1171,6 +1219,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           }
         },
         "security": [
@@ -1501,6 +1552,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Already exists"
           }
@@ -1589,526 +1643,11 @@
               }
             }
           },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/principals": {
-      "get": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "list_principals",
-        "parameters": [
-          {
-            "name": "external_subject",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Principal"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      },
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "create_principal",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreatePrincipal"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Created",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Principal"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Already exists"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/principals/{id}": {
-      "get": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "get_principal",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Principal"
-                }
-              }
-            }
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      },
-      "patch": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "update_principal",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdatePrincipal"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Updated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Principal"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/principals/{id}/grants": {
-      "get": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "list_grants",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Grant"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      },
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "create_grant",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateGrant"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Created",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Grant"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Grant already exists for this principal/portfolio"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/principals/{id}/grants/{grant_id}": {
-      "delete": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "delete_grant",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "grant_id",
-            "in": "path",
-            "description": "Grant ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Deleted"
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      },
-      "patch": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "update_grant",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "grant_id",
-            "in": "path",
-            "description": "Grant ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateGrant"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Updated",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Grant"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/principals/{id}/keys": {
-      "get": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "list_principal_keys",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ApiKeyRecord"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      },
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "register_principal_key",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateKey"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Created — plaintext secret included once",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiKeyRecord"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/principals/{id}/keys/{key_id}": {
-      "delete": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "revoke_principal_key",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          },
-          {
-            "name": "key_id",
-            "in": "path",
-            "description": "Key ID",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Revoked"
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/principals/{id}/sessions": {
-      "delete": {
-        "tags": [
-          "admin"
-        ],
-        "summary": "Cut a principal off immediately: revoke every one of its live sessions.",
-        "description": "Effective on the very next request from any of them — `lookup_session`\nonly resolves a session while `revoked_at IS NULL`, so there is nothing\nto invalidate beyond the row itself (no cache sits in front of it).",
-        "operationId": "revoke_principal_sessions",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Principal ID",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RevokedSessions"
-                }
-              }
-            }
           }
         },
         "security": [
@@ -2186,6 +1725,9 @@
           "400": {
             "description": "Invalid trading_state"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Limit already exists for this portfolio/instrument"
           }
@@ -2257,6 +1799,9 @@
           "204": {
             "description": "Deleted"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2308,6 +1853,9 @@
           "400": {
             "description": "Invalid trading_state"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2324,8 +1872,7 @@
         "tags": [
           "admin"
         ],
-        "summary": "What is left to configure. Reuses `credentials::load_brokers`/`load_feeds`",
-        "description": "— the exact decode path `reload_connections` uses — so this checklist\ncannot report a connection \"configured\" that the reload path would\nactually refuse to register, or the reverse.",
+        "summary": "`GET /admin/setup-status`: which first-run steps are done.",
         "operationId": "setup_status",
         "responses": {
           "200": {
@@ -2402,8 +1949,14 @@
           "400": {
             "description": "Missing CompIDs"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "409": {
             "description": "Code, portfolio, principal or CompIDs already used"
+          },
+          "422": {
+            "description": "Not an active user as responsible"
           }
         },
         "security": [
@@ -2433,6 +1986,9 @@
         "responses": {
           "204": {
             "description": "Deleted"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2480,6 +2036,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2569,6 +2128,9 @@
           "400": {
             "description": "A broker twice, or an account of another portfolio or broker"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2657,6 +2219,9 @@
           },
           "400": {
             "description": "Invalid deployment"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "409": {
             "description": "Account already registered"
@@ -2762,6 +2327,9 @@
           "400": {
             "description": "Deployment not stopped or invalid"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2823,6 +2391,9 @@
           },
           "400": {
             "description": "Shutdown not verified"
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -2888,6 +2459,9 @@
           "400": {
             "description": "Shutdown not verified"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -2921,8 +2495,14 @@
           "204": {
             "description": "Enabled"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
+          },
+          "409": {
+            "description": "No active responsible user"
           }
         },
         "security": [
@@ -2961,6 +2541,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -3006,11 +2589,69 @@
           "204": {
             "description": "Stored"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           },
           "503": {
             "description": "No master key"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/admin/strategies/{code}/handover": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "handover",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "description": "Strategy code",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Handover"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Handed over",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StrategyRow"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "422": {
+            "description": "Not an active user"
           }
         },
         "security": [
@@ -3049,6 +2690,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -3089,6 +2733,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Not found"
@@ -3134,6 +2781,9 @@
           "400": {
             "description": "Not co-located, or no active deployment"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -3173,6 +2823,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           }
         },
         "security": [
@@ -3208,6 +2861,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           }
         },
         "security": [
@@ -3270,6 +2926,9 @@
               }
             }
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "422": {
             "description": "Auto-provision needs an active broker connection"
           }
@@ -3302,6 +2961,9 @@
           "204": {
             "description": "Revoked"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Not found"
           }
@@ -3313,84 +2975,253 @@
         ]
       }
     },
-    "/auth/callback": {
+    "/auth/invite/{token}": {
       "get": {
         "tags": [
           "auth"
         ],
-        "summary": "Completes a login: validates the callback, exchanges the code, resolves",
-        "description": "(or provisions) the principal, and mints a session.\n\nEvery failure path here ends in a clean `ApiError` and no session:\na provider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure, `ClaimRejected`, and `SubjectNotAvailable` (the\nlatter two both map to 403 — see `ResolveOutcome`) all return before\n`create_session` is ever called.",
-        "operationId": "callback",
+        "summary": "The invite link: starts a login with the invite token's hash bound to the",
+        "description": "server-side flow, and does nothing else. The token never reaches a cookie\nor the provider. Whether the token is any good is decided only after\nthe provider has verified who is signing in.",
+        "operationId": "invite",
         "parameters": [
           {
-            "name": "code",
+            "name": "token",
             "in": "path",
+            "description": "The invite link token",
             "required": true,
             "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          },
-          {
-            "name": "state",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
-            }
-          },
-          {
-            "name": "error",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "nullable": true
+              "type": "string"
             }
           }
         ],
         "responses": {
-          "302": {
-            "description": "Login completed; session cookie set, redirects to the validated return_to (default /)"
+          "303": {
+            "description": "Redirects to the identity provider's authorization endpoint"
           },
-          "400": {
-            "description": "Malformed callback, or a missing/expired/mismatched login flow"
-          },
-          "401": {
-            "description": "The provider rejected the login, or the exchanged token failed verification"
-          },
-          "403": {
-            "description": "The claim gate rejected the identity, or the subject belongs to a non-human or disabled principal"
-          },
-          "502": {
-            "description": "The identity provider was unreachable"
+          "503": {
+            "description": "Too many sign-ins in progress; try again shortly"
           }
         }
       }
     },
-    "/auth/login": {
+    "/auth/invite/{token}/preview": {
       "get": {
         "tags": [
           "auth"
         ],
-        "summary": "Starts a login: mints `state`/`nonce`/a PKCE verifier, remembers them in",
-        "description": "the flow cookie, and sends the browser to the provider. Cannot fail —\nthere is no user input yet and no network call, only local randomness —\nso this returns a bare `Response`, not a `Result`.",
-        "operationId": "login",
+        "summary": "What a valid, pending invite offers: masked email, role, portfolios and",
+        "description": "the enabled sign-in methods. Any other token gets `{valid:false}` with the\nsame fields, after the same single query.",
+        "operationId": "preview",
         "parameters": [
           {
-            "name": "return_to",
+            "name": "token",
             "in": "path",
+            "description": "The invite link token",
             "required": true,
             "schema": {
-              "type": "string",
-              "nullable": true
+              "type": "string"
             }
           }
         ],
         "responses": {
-          "302": {
-            "description": "Redirects to the identity provider's authorization endpoint"
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvitePreview"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/local/enroll": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Claim an invite with a new local password: in one transaction the",
+        "description": "credential is written, the local identity linked, the user activated, the\ninvite accepted and the claim audited. Then a session (MFA pending) is\nminted. Only for a pending `any`/`local` invite of a not-yet-active user\nwith no local credential; any refusal leaves the invite pending.",
+        "operationId": "enroll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Enrolled; session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NextStep"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid invite or weak password"
+          },
+          "403": {
+            "description": "Cross-origin request"
+          }
+        }
+      }
+    },
+    "/auth/local/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Email + password. Success mints a session with MFA pending and says which",
+        "description": "TOTP step comes next. Every failure is the same generic 401; over the\nrate limit it is a generic 429.",
+        "operationId": "local_login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Password accepted; session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NextStep"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "invalid_credentials"
+          },
+          "403": {
+            "description": "Cross-origin request"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/totp": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Second factor on the current local session: a TOTP code or an unused",
+        "description": "recovery code. Success sets `mfa_verified_at` by rotating the session —\nthe old token is revoked in the same transaction.",
+        "operationId": "totp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Verified; rotated session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaVerified"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Wrong code or no session"
+          },
+          "409": {
+            "description": "TOTP not enrolled yet"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/totp/confirm": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Activate the pending TOTP secret with a valid code. Issues the recovery",
+        "description": "codes (returned once) and rotates the session to an MFA-verified one.",
+        "operationId": "totp_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "TOTP active; rotated session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoveryCodes"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Wrong code or no session"
+          },
+          "409": {
+            "description": "No pending enrolment"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/totp/enroll": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Start TOTP enrolment on the current local session: a fresh secret is",
+        "description": "stored (sealed) as pending and its `otpauth://` URI returned. Calling it\nagain before confirming replaces the pending secret.",
+        "operationId": "totp_enroll",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TotpEnrollResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No session"
+          },
+          "409": {
+            "description": "TOTP already enrolled"
           }
         }
       }
@@ -3406,6 +3237,27 @@
         "responses": {
           "204": {
             "description": "Session revoked and cookie cleared (idempotent)"
+          }
+        }
+      }
+    },
+    "/auth/logout-all": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Revoke every session of the signed-in user, this one included, and clear",
+        "description": "the cookie.",
+        "operationId": "logout_all",
+        "responses": {
+          "204": {
+            "description": "All sessions revoked; cookie cleared"
+          },
+          "401": {
+            "description": "No session"
+          },
+          "403": {
+            "description": "Cross-origin request"
           }
         }
       }
@@ -3441,6 +3293,113 @@
             "bearer_token": []
           }
         ]
+      }
+    },
+    "/auth/methods": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Which sign-in buttons to show. Only enabled methods are reported; a",
+        "description": "database error reports the shared admin password as off.",
+        "operationId": "methods",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthMethods"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/oidc/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Completes a login: validates the callback, exchanges the code, resolves",
+        "description": "the identity (claiming the flow's invite if it is unknown), and mints a\nsession. A login that resolves to no user is redirected to the access\npage with the reason; nothing is created for it.\n\nEvery failure path returns before `create_session` is ever called: a\nprovider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure or the claim gate end in an `ApiError`; a\n`ClaimOutcome` refusal ends in the access-page redirect.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "state",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          },
+          {
+            "name": "error",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused or awaiting admin approval (redirects to /trade/access?reason=..., e.g. pending_approval)"
+          },
+          "400": {
+            "description": "Malformed callback, or a missing/expired/mismatched login flow"
+          },
+          "401": {
+            "description": "The provider rejected the login, or the exchanged token failed verification"
+          },
+          "403": {
+            "description": "The claim gate rejected the identity"
+          },
+          "502": {
+            "description": "The identity provider was unreachable"
+          }
+        }
+      }
+    },
+    "/auth/oidc/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Starts a login: mints `state`/`nonce`/a PKCE verifier, keeps them in the",
+        "description": "flow store under a random id set as the flow cookie, and sends the browser\nto the provider. Refused with a generic 503 only when too many logins are\npending at once.",
+        "operationId": "login",
+        "parameters": [
+          {
+            "name": "return_to",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "Redirects to the identity provider's authorization endpoint"
+          },
+          "503": {
+            "description": "Too many sign-ins in progress; try again shortly"
+          }
+        }
       }
     },
     "/health": {
@@ -3777,6 +3736,9 @@
           "400": {
             "description": "Invalid UUID"
           },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
           "404": {
             "description": "Order not found"
           },
@@ -3819,7 +3781,7 @@
             "description": "Validation error"
           },
           "403": {
-            "description": "No trade grant for principal/portfolio/account"
+            "description": "No trade grant for principal/portfolio/account; or mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "409": {
             "description": "Order already exists"
@@ -3977,7 +3939,7 @@
             }
           },
           "403": {
-            "description": "No allocate grant on the block portfolio"
+            "description": "No allocate grant on the block portfolio; or mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
           },
           "404": {
             "description": "Order not found"
@@ -4405,6 +4367,33 @@
           }
         }
       },
+      "AuthMethods": {
+        "type": "object",
+        "description": "The sign-in methods the login page may offer. Unauthenticated.",
+        "required": [
+          "local",
+          "sso",
+          "sso_label",
+          "legacy_admin"
+        ],
+        "properties": {
+          "legacy_admin": {
+            "type": "boolean",
+            "description": "The deprecated shared admin password still works (until the first\nnamed admin signs in); it can only bootstrap that admin."
+          },
+          "local": {
+            "type": "boolean",
+            "description": "Email + password (then TOTP)."
+          },
+          "sso": {
+            "type": "boolean",
+            "description": "The configured OIDC provider, reachable at boot."
+          },
+          "sso_label": {
+            "type": "string"
+          }
+        }
+      },
       "BackfillRequest": {
         "type": "object",
         "properties": {
@@ -4641,6 +4630,18 @@
           }
         }
       },
+      "CodeBody": {
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "A 6-digit TOTP code, or a recovery code."
+          }
+        }
+      },
       "ConnectionEntry": {
         "type": "object",
         "required": [
@@ -4803,30 +4804,6 @@
           }
         }
       },
-      "CreateGrant": {
-        "type": "object",
-        "required": [
-          "portfolio_id",
-          "can_trade",
-          "can_view",
-          "can_allocate"
-        ],
-        "properties": {
-          "can_allocate": {
-            "type": "boolean"
-          },
-          "can_trade": {
-            "type": "boolean"
-          },
-          "can_view": {
-            "type": "boolean"
-          },
-          "portfolio_id": {
-            "type": "string",
-            "format": "uuid"
-          }
-        }
-      },
       "CreateKey": {
         "type": "object",
         "properties": {
@@ -4857,33 +4834,6 @@
             "nullable": true
           },
           "name": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string"
-          }
-        }
-      },
-      "CreatePrincipal": {
-        "type": "object",
-        "required": [
-          "code",
-          "principal_type",
-          "status"
-        ],
-        "properties": {
-          "code": {
-            "type": "string"
-          },
-          "display_name": {
-            "type": "string",
-            "nullable": true
-          },
-          "external_subject": {
-            "type": "string",
-            "nullable": true
-          },
-          "principal_type": {
             "type": "string"
           },
           "status": {
@@ -4938,7 +4888,6 @@
           "name",
           "portfolio_id",
           "owner_principal_id",
-          "principal_id",
           "sender_comp_id",
           "target_comp_id"
         ],
@@ -4999,7 +4948,8 @@
           },
           "owner_principal_id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "description": "The responsible user: an ACTIVE person."
           },
           "portfolio_id": {
             "type": "string",
@@ -5012,7 +4962,9 @@
           },
           "principal_id": {
             "type": "string",
-            "format": "uuid"
+            "format": "uuid",
+            "description": "The principal it trades as. Omitted (the usual case): a new strategy\nprincipal is created, named after the strategy.",
+            "nullable": true
           },
           "sender_comp_id": {
             "type": "string"
@@ -5042,7 +4994,7 @@
           "principal_id": {
             "type": "string",
             "format": "uuid",
-            "description": "Mint the token under this existing principal (the trader/strategy/service it\nbelongs to). Create principals on the Principals admin surface first."
+            "description": "Mint the token under this existing principal (the trader/strategy/service it\nbelongs to). Create users on the Users admin surface first."
           }
         }
       },
@@ -5285,6 +5237,21 @@
           }
         }
       },
+      "EnrollBody": {
+        "type": "object",
+        "required": [
+          "token",
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          }
+        }
+      },
       "ExpirySweepResult": {
         "type": "object",
         "required": [
@@ -5405,50 +5372,6 @@
           }
         }
       },
-      "Grant": {
-        "type": "object",
-        "required": [
-          "id",
-          "principal_id",
-          "portfolio_id",
-          "can_trade",
-          "can_view",
-          "can_allocate",
-          "created_at",
-          "updated_at"
-        ],
-        "properties": {
-          "can_allocate": {
-            "type": "boolean"
-          },
-          "can_trade": {
-            "type": "boolean"
-          },
-          "can_view": {
-            "type": "boolean"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "portfolio_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "principal_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
-          }
-        }
-      },
       "GrantedPortfolio": {
         "type": "object",
         "description": "One portfolio the caller is entitled to, with the entitlement itself.\n\nThe flags are returned rather than filtered on, so a client can grey out what it\ncannot do instead of discovering it from a 403 mid-order.",
@@ -5486,6 +5409,18 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "Handover": {
+        "type": "object",
+        "required": [
+          "principal_id"
+        ],
+        "properties": {
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },
@@ -5561,6 +5496,44 @@
           },
           "venue": {
             "type": "string"
+          }
+        }
+      },
+      "InvitePreview": {
+        "type": "object",
+        "required": [
+          "valid",
+          "portfolios",
+          "methods"
+        ],
+        "properties": {
+          "email_hint": {
+            "type": "string",
+            "nullable": true
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "nullable": true
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "portfolios": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "role": {
+            "type": "string",
+            "nullable": true
+          },
+          "valid": {
+            "type": "boolean"
           }
         }
       },
@@ -5690,15 +5663,35 @@
           "interrupted"
         ]
       },
+      "LoginBody": {
+        "type": "object",
+        "required": [
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
       "MeResponse": {
         "type": "object",
         "description": "The signed-in principal plus its granted portfolios — the shape a\nfront end needs to render itself without a second round trip.",
         "required": [
           "principal_id",
           "code",
-          "portfolios"
+          "portfolios",
+          "auth_method"
         ],
         "properties": {
+          "auth_method": {
+            "type": "string",
+            "description": "How this session signed in (`local`, `oidc`, …): decides which step\na 403 `mfa_required` asks for."
+          },
           "code": {
             "type": "string"
           },
@@ -5717,6 +5710,17 @@
           }
         }
       },
+      "MfaVerified": {
+        "type": "object",
+        "required": [
+          "mfa_verified"
+        ],
+        "properties": {
+          "mfa_verified": {
+            "type": "boolean"
+          }
+        }
+      },
       "NewPassword": {
         "type": "object",
         "required": [
@@ -5726,6 +5730,18 @@
           "password": {
             "type": "string",
             "description": "Shown once; only its hash is stored."
+          }
+        }
+      },
+      "NextStep": {
+        "type": "object",
+        "required": [
+          "next"
+        ],
+        "properties": {
+          "next": {
+            "type": "string",
+            "description": "`totp` or `totp_enroll`."
           }
         }
       },
@@ -6036,10 +6052,6 @@
             "type": "string",
             "nullable": true
           },
-          "external_subject": {
-            "type": "string",
-            "nullable": true
-          },
           "id": {
             "type": "string",
             "format": "uuid"
@@ -6065,6 +6077,21 @@
           "command_id": {
             "type": "string",
             "description": "The command the runtime acknowledges: RECEIVED, then CONFIRMED_CLEAR\nonce it has taken the venue's balances as its expected inventory."
+          }
+        }
+      },
+      "RecoveryCodes": {
+        "type": "object",
+        "required": [
+          "recovery_codes"
+        ],
+        "properties": {
+          "recovery_codes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Shown exactly once; only hashes are stored."
           }
         }
       },
@@ -6300,6 +6327,30 @@
           }
         }
       },
+      "Responsible": {
+        "type": "object",
+        "required": [
+          "principal_id",
+          "code",
+          "status"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string",
+            "nullable": true
+          },
+          "principal_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
       "RetireRequest": {
         "type": "object",
         "required": [
@@ -6312,20 +6363,6 @@
           },
           "verified_shutdown": {
             "type": "boolean"
-          }
-        }
-      },
-      "RevokedSessions": {
-        "type": "object",
-        "description": "How many of a principal's sessions were just revoked.\n\nNot itself proof the principal has no *other* way in — a revoked session\nonly stops resolving on its next `lookup_session` (see\n`sessions::lookup_session`'s `revoked_at IS NULL` filter); this endpoint\ndoes not touch API keys.",
-        "required": [
-          "revoked"
-        ],
-        "properties": {
-          "revoked": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
           }
         }
       },
@@ -6427,80 +6464,30 @@
           }
         }
       },
-      "SetupCatalogStatus": {
-        "type": "object",
-        "required": [
-          "instruments",
-          "state"
-        ],
-        "properties": {
-          "instruments": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "state": {
-            "type": "string"
-          }
-        }
-      },
-      "SetupConnectionStatus": {
-        "type": "object",
-        "description": "One connection's classification, for the checklist below. Deliberately\nthe same three strings `RedactedCredentials` uses\n(`configured`/`unconfigured`/`error`) rather than a boolean — \"stored but\nthe master key can't open it\" is a different operator problem from\n\"never configured\", and collapsing them here would hide exactly the\nmisconfiguration this checklist exists to surface.",
-        "required": [
-          "code",
-          "state"
-        ],
-        "properties": {
-          "code": {
-            "type": "string"
-          },
-          "state": {
-            "type": "string"
-          }
-        }
-      },
       "SetupStatus": {
         "type": "object",
-        "description": "The checklist an operator (or the cockpit's own onboarding banner) reads to\nanswer \"what is left to configure\" — nothing else in this system can\nanswer that question in one call today.",
         "required": [
-          "database",
-          "admin_password",
-          "master_key",
-          "brokers",
-          "feeds",
-          "catalog",
-          "portfolios"
+          "venue_connected",
+          "portfolio_exists",
+          "sign_in_ok",
+          "user_invited",
+          "first_order"
         ],
         "properties": {
-          "admin_password": {
-            "type": "string",
-            "description": "`\"default\"` iff the admin console is still guarded by the built-in\ndev password rather than an operator-chosen one — see\n`admin_password_state`."
+          "first_order": {
+            "type": "boolean"
           },
-          "brokers": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SetupConnectionStatus"
-            }
+          "portfolio_exists": {
+            "type": "boolean"
           },
-          "catalog": {
-            "$ref": "#/components/schemas/SetupCatalogStatus"
+          "sign_in_ok": {
+            "type": "boolean"
           },
-          "database": {
-            "type": "string"
+          "user_invited": {
+            "type": "boolean"
           },
-          "feeds": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SetupConnectionStatus"
-            }
-          },
-          "master_key": {
-            "type": "string",
-            "description": "Whether a master key is configured. Never the key itself, nor even\nwhether it is *valid* — an invalid key surfaces the same way every\nother credential-reading endpoint surfaces it, as a 500 from\n`resolve_master_key`, not folded into this field."
-          },
-          "portfolios": {
-            "type": "integer",
-            "format": "int64"
+          "venue_connected": {
+            "type": "boolean"
           }
         }
       },
@@ -6530,7 +6517,8 @@
           "placed_per_min",
           "cancelled_per_min",
           "fighting",
-          "kill_ack_late"
+          "kill_ack_late",
+          "needs_responsible"
         ],
         "properties": {
           "acked_limits_version": {
@@ -6624,6 +6612,10 @@
           "name": {
             "type": "string"
           },
+          "needs_responsible": {
+            "type": "boolean",
+            "description": "The responsible user is not ACTIVE: the strategy cannot be (re)started\nuntil it is handed over."
+          },
           "open_orders": {
             "type": "integer",
             "format": "int64"
@@ -6648,6 +6640,14 @@
           "principal_id": {
             "type": "string",
             "format": "uuid"
+          },
+          "responsible": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Responsible"
+              }
+            ],
+            "nullable": true
           },
           "rest_enabled": {
             "type": "boolean"
@@ -6822,6 +6822,17 @@
           "ioc",
           "fok"
         ]
+      },
+      "TotpEnrollResponse": {
+        "type": "object",
+        "required": [
+          "otpauth_uri"
+        ],
+        "properties": {
+          "otpauth_uri": {
+            "type": "string"
+          }
+        }
       },
       "TradeableInstrument": {
         "type": "object",
@@ -7029,23 +7040,6 @@
           }
         }
       },
-      "UpdateGrant": {
-        "type": "object",
-        "properties": {
-          "can_allocate": {
-            "type": "boolean",
-            "nullable": true
-          },
-          "can_trade": {
-            "type": "boolean",
-            "nullable": true
-          },
-          "can_view": {
-            "type": "boolean",
-            "nullable": true
-          }
-        }
-      },
       "UpdatePortfolio": {
         "type": "object",
         "properties": {
@@ -7063,31 +7057,6 @@
             "nullable": true
           },
           "name": {
-            "type": "string",
-            "nullable": true
-          },
-          "status": {
-            "type": "string",
-            "nullable": true
-          }
-        }
-      },
-      "UpdatePrincipal": {
-        "type": "object",
-        "properties": {
-          "code": {
-            "type": "string",
-            "nullable": true
-          },
-          "display_name": {
-            "type": "string",
-            "nullable": true
-          },
-          "external_subject": {
-            "type": "string",
-            "nullable": true
-          },
-          "principal_type": {
             "type": "string",
             "nullable": true
           },

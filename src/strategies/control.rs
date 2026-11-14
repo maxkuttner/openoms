@@ -147,6 +147,7 @@ pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiErro
 }
 
 pub async fn enable(state: &AppState, code: &str) -> Result<(), ApiError> {
+    super::admin::require_responsible(state.pool(), code).await?;
     let strategy = set_state(state, code, "ACTIVE", true).await?;
     if strategy.mode == Mode::Colocated {
         if let Some(receipt) = crate::colo::deployment::record_enable_for_strategy(state.pool(), code)

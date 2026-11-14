@@ -405,9 +405,7 @@ pub async fn run_cli(path: &std::path::Path) -> Result<(), Box<dyn std::error::E
     let file = crate::config::load();
     let bind = crate::resolve_bind_addr(std::env::var("OMS_BIND_ADDR").ok(), file);
     let base = format!("http://{}", crate::setup::status::reachable_addr(&bind));
-    let password = crate::resolve_admin_password(crate::admin_password_from_env(), file)
-        .or_else(|| crate::bind_is_loopback(&bind).then(|| crate::DEFAULT_ADMIN_PASSWORD.to_string()))
-        .unwrap_or_default();
+    let password = crate::admin_bootstrap::read_host_token()?;
     let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build()?;
     let root = format!("{base}/admin/brokers/IBKR_TWS/instruments");
 
@@ -470,7 +468,7 @@ async fn admin_call<T: serde::de::DeserializeOwned>(req: reqwest::RequestBuilder
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("the OMS answered {status}: {body}").into());
+        return Err(crate::admin_bootstrap::host_call_error(status.as_u16(), &body).into());
     }
     Ok(resp.json().await?)
 }

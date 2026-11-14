@@ -38,6 +38,8 @@ FIX-*.pdf
 
 # openoms bootstrap config — holds the master key
 oms.toml
+# per-boot admin token the server writes beside oms.toml
+host-token
 
 # scripts/colo-demo.sh state
 /colo-demo/
