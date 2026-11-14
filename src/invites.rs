@@ -297,16 +297,18 @@ pub async fn revoke(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<(), I
 /// working, and only the user's newest unclaimed invite can be reissued;
 /// a user disabled by revoking an unclaimed invite is invited again.
 pub async fn reissue(pool: &PgPool, invite_id: Uuid, actor: &str) -> Result<NewInvite, InviteError> {
-    reissue_with_method(pool, invite_id, actor, "any").await
+    reissue_with_method(pool, invite_id, actor, None).await
 }
 
-/// `reissue`, the new invite redeemable only with `method`.
-pub async fn reissue_with_method(pool: &PgPool, invite_id: Uuid, actor: &str, method: &str) -> Result<NewInvite, InviteError> {
+/// `reissue`, the new invite redeemable only with `method`. With no method the
+/// new invite keeps the old one's: re-sending a local-only (e.g. admin
+/// bootstrap or recovery) invite must never widen it to SSO.
+pub async fn reissue_with_method(pool: &PgPool, invite_id: Uuid, actor: &str, method: Option<&str>) -> Result<NewInvite, InviteError> {
     let mut tx = pool.begin().await?;
     // Only an unclaimed invite, and only the user's newest one: an invite that
     // a later reissue already replaced must not mint a rival to the live one.
     let row = sqlx::query(
-        "SELECT principal_id, email FROM invite i \
+        "SELECT principal_id, email, method FROM invite i \
           WHERE id = $1 AND accepted_at IS NULL \
             AND created_at = (SELECT max(created_at) FROM invite WHERE principal_id = i.principal_id) \
             FOR UPDATE",
@@ -317,6 +319,8 @@ pub async fn reissue_with_method(pool: &PgPool, invite_id: Uuid, actor: &str, me
     .ok_or(InviteError::NotFound)?;
     let principal_id: Uuid = row.get("principal_id");
     let email: String = row.get("email");
+    let prior_method: String = row.get("method");
+    let method: &str = method.unwrap_or(&prior_method);
 
     // The user never has two live invites: retire whatever is still pending.
     sqlx::query(
@@ -1522,6 +1526,37 @@ mod tests {
             claim(&pool, &identity, Some(&new.token)).await.unwrap(),
             ClaimOutcome::Linked { .. }
         ));
+    }
+
+    /// Re-sending without naming a method keeps the old invite's method, so a
+    /// local-only invite (admin bootstrap or recovery) never widens to SSO; an
+    /// explicit method still overrides it.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn reissue_keeps_the_previous_method() {
+        let pool = migrated_db().await;
+        let old = invite_jane(&pool).await;
+        sqlx::query("UPDATE oms.invite SET method = 'local' WHERE id = $1")
+            .bind(old.invite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let method_of = |id: Uuid| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>("SELECT method FROM oms.invite WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let kept = reissue(&pool, old.invite_id, "admin").await.unwrap();
+        assert_eq!(method_of(kept.invite_id).await, "local");
+
+        let widened = reissue_with_method(&pool, kept.invite_id, "admin", Some("any")).await.unwrap();
+        assert_eq!(method_of(widened.invite_id).await, "any");
     }
 
     /// A pre-bound identity that never signed in does not block reissue after

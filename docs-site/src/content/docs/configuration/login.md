@@ -78,7 +78,8 @@ or use API keys until they accept.
 **Sign-in method** in the dialog restricts how the invite can be claimed: **Any sign-in method** (the
 default), **Email + password only**, or **SSO only**. The API takes the same choice as
 `"method": "any" | "local" | "oidc"` on `POST /admin/users/invite` and on reissue; any
-other value is refused with 422.
+other value is refused with 422. A reissue without a method keeps the previous invite's method,
+so re-sending an email + password only invite never opens it to SSO.
 
 From the list you can also **copy**, **revoke** or **reissue** a pending invite (a revoked
 or expired link shows its own message), change the **role** or **portfolios** (effective on

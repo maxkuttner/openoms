@@ -331,13 +331,17 @@ pub async fn reissue_invite(
     body: axum::body::Bytes,
 ) -> Result<Json<InviteResponse>, ApiError> {
     let base = public_base_url(&state)?;
-    // The body is optional: none (or empty) reissues for any method.
+    // The body is optional: none (or empty) keeps the old invite's method.
     let req: ReissueRequest = if body.iter().all(u8::is_ascii_whitespace) {
         ReissueRequest::default()
     } else {
         serde_json::from_slice(&body).map_err(|e| api_error(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid body: {e}")))?
     };
-    let method = invite_method(req.method.as_deref())?;
+    // No method given: keep the old invite's (never widen a local-only invite).
+    let method = match req.method.as_deref() {
+        Some(m) => Some(invite_method(Some(m))?),
+        None => None,
+    };
     let invite = invites::reissue_with_method(state.pool(), id, &ctx.principal_code, method).await.map_err(invite_error)?;
     Ok(Json(invite_response(base, invite)))
 }
@@ -1049,8 +1053,9 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(method_of(&pool, local.invite_id).await, "local");
-        let any = reissue_invite(State(st.clone()), Extension(actor()), Path(local.invite_id), bytes("")).await.unwrap().0;
-        assert_eq!(method_of(&pool, any.invite_id).await, "any");
+        // No body keeps the previous method: a local-only invite never widens.
+        let kept = reissue_invite(State(st.clone()), Extension(actor()), Path(local.invite_id), bytes("")).await.unwrap().0;
+        assert_eq!(method_of(&pool, kept.invite_id).await, "local");
 
         let other = format!("d-{}@fundco.com", Uuid::new_v4().simple());
         let out = invite_user(State(st.clone()), Extension(actor()), req(&other, None)).await.unwrap().0;
