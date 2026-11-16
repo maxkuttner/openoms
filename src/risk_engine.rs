@@ -427,6 +427,11 @@ mod tests {
             .execute(pool)
             .await
             .expect("seed principal");
+        sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, 'strategy')")
+            .bind(fixture.principal_id)
+            .execute(pool)
+            .await
+            .expect("seed role");
         sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'risk test', 'ACTIVE')")
             .bind(fixture.portfolio_id)
             .bind(format!("pf-{suffix}"))

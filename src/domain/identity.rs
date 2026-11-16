@@ -8,7 +8,6 @@ pub struct Principal {
     pub id: Uuid,
     pub code: String,
     pub principal_type: String,
-    pub external_subject: Option<String>,
     pub display_name: Option<String>,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -45,18 +44,6 @@ pub struct Account {
     pub external_account_ref: String,
     pub status: String,
     pub portfolio_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow, Clone, utoipa::ToSchema)]
-pub struct Grant {
-    pub id: Uuid,
-    pub principal_id: Uuid,
-    pub portfolio_id: Uuid,
-    pub can_trade: bool,
-    pub can_view: bool,
-    pub can_allocate: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

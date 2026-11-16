@@ -26,8 +26,9 @@ The trader requests a co-located strategy; an admin sets it up:
    - its limits;
    - optionally **Kill when unmonitored**.
 4. **Follow key:** enter the OMS's key. **Connections:** pick the strategy's Binance
-   account in its portfolio. Create a trading token for the strategy's principal on the
-   **API** page; the program uses it for the control link.
+   account in its portfolio. Create a trading token for the strategy on the
+   **API** page (it belongs to the strategy, not to its responsible user); the program
+   uses it for the control link.
 
 The OMS needs a `[control_link]` block in its configuration:
 
@@ -175,8 +176,8 @@ strategy, deployment and the reference market maker.
 
    Save the API key Binance shows in `api-key` in the same folder.
 2. From a checkout: `scripts/colo-demo.sh up`, then `scripts/colo-demo.sh mm`.
-   The cockpit runs at `http://127.0.0.1:3021/cockpit/`; the admin password is
-   in `~/.local/state/openoms/colo-demo/adminpw`.
+   The cockpit runs at `http://127.0.0.1:3021/cockpit/`; sign in as the admin
+   described in [Sign-in and users](/configuration/login/).
 3. `scripts/colo-demo.sh down` stops everything and deletes the demo.
 
 The demo uses one testnet account for both the OMS's own Binance connection and

@@ -31,11 +31,32 @@ oms database status
 server:   localhost:5432
 database: ods (present)
 role:     oms
-migrations: 51 applied, 0 pending
+migrations: 61 applied, 0 pending
 ```
 
 ## What's in it
 
 One role, `oms`, owns everything. The `public` schema holds shared reference data —
 instruments, venues, currencies. The `oms` schema holds the OMS's own tables — orders and
-their events, portfolios, principals, accounts, positions, and encrypted credentials.
+their events, portfolios, users, strategies, roles, accounts, positions, and encrypted credentials.
+
+Users and access are a small cluster in the `oms` schema. Every person and every strategy
+has one row in the identity record that orders and audit entries point at:
+
+```text
+role ──< role_permission                what each role may do
+  │
+  └──< role assignment >── user / strategy ──< sign-in identity    (issuer, subject)
+                              │   │
+                              │   ├──< local_credential           password hash, sealed TOTP secret, lockout
+                              │   │      └──< recovery_code       ten single-use codes, stored hashed
+                              │   ├──< principal_admin            the admin capability, separate from roles
+                              │   ├──< user_session               auth_method, MFA-verified time
+                              │   ├──< user_group_member          groups: view / trade / manage per portfolio (strategies: direct grants)
+                              │   ├──< api_key
+                              │   └──< audit_event                sign-ups, approvals, role and grant changes, revocations
+                              │
+                        strategy (own record + a responsible user, who is a person)
+
+system_setting                          key/value switches (currently unused)
+```

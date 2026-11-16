@@ -1,6 +1,6 @@
 //! The decisions `oms init` makes, kept free of I/O so each one is tested
-//! directly: which database source to offer first, what counts as an
-//! acceptable admin password, and what a listen address may look like.
+//! directly: which database source to offer first and what a listen address
+//! may look like.
 
 /// Whether `oms init` can start PostgreSQL in Docker on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,17 +23,6 @@ pub fn default_db_source(s: DockerStatus) -> DbSource {
         DockerStatus::Usable => DbSource::Docker,
         DockerStatus::NotFound | DockerStatus::NotRunning => DbSource::Existing,
     }
-}
-
-/// Long enough that a cockpit reachable from a network is not guessed; the
-/// generated one is 32 characters.
-pub const ADMIN_PASSWORD_MIN: usize = 12;
-
-pub fn check_admin_password(pw: &str) -> Result<(), String> {
-    if pw.chars().count() < ADMIN_PASSWORD_MIN {
-        return Err(format!("the admin password needs at least {ADMIN_PASSWORD_MIN} characters"));
-    }
-    Ok(())
 }
 
 /// `host:port`, as `server.bind_addr` takes it. The host may be a name
@@ -118,12 +107,6 @@ mod tests {
         assert_eq!(default_db_source(DockerStatus::Usable), DbSource::Docker);
         assert_eq!(default_db_source(DockerStatus::NotFound), DbSource::Existing);
         assert_eq!(default_db_source(DockerStatus::NotRunning), DbSource::Existing);
-    }
-
-    #[test]
-    fn admin_password_needs_twelve_chars() {
-        assert!(check_admin_password("12345678901").is_err());
-        assert!(check_admin_password("123456789012").is_ok());
     }
 
     #[test]

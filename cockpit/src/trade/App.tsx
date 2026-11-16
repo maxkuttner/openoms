@@ -1,8 +1,15 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
-import { Routes, Route, Navigate } from "react-router-dom";
-import { tradeApi, onLoginUnavailable, API_BASE } from "./api/client";
+import { Alert, Anchor, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
+import { Routes, Route, Navigate, Link, useLocation } from "react-router-dom";
+import { AccessPage } from "./pages/Access";
+import { tradeApi, API_BASE, onMfaRequired } from "./api/client";
+import { MfaPrompt } from "../login/MfaPrompt";
+import { LoginPage } from "../login/LoginPage";
+import { TRADE_HOME } from "../login/api";
+import { ForcedPasswordChange, PendingScreen } from "../login/ChangePassword";
+import { AccountSettings } from "../login/AccountSettings";
+import { isPendingAccount, mustChangePassword } from "../login";
 import { TradePage } from "./pages/Trade";
 import { LiveUpdatesProvider, useLive } from "./api/liveUpdates";
 
@@ -58,48 +65,35 @@ export type Me = {
   code: string;
   display_name: string | null;
   portfolios: GrantedPortfolio[];
+  auth_method: string;
+  /** `admin`, `user` or `pending`. */
+  role?: string;
+  must_change_password?: boolean;
+  totp_enrolled?: boolean;
 };
 
 export function TradeApp() {
-  // Set when the client finds /auth/login missing: /trade/ and /auth/* are
-  // mounted under the same condition, but a provider-discovery failure can
-  // leave this app served with no auth routes behind it. Without this the
-  // trader goes /trade/ -> 401 -> /auth/login -> bare 404, with nothing said
-  // and no way back.
-  const [loginUnavailable, setLoginUnavailable] = useState(false);
-  useEffect(() => onLoginUnavailable(() => setLoginUnavailable(true)), []);
+  // Sign-in and access pages have no session to load: render them
+  // before the identity query, which would bounce to sign-in.
+  const { pathname } = useLocation();
+  if (pathname === "/access") return <AccessPage />;
+  if (pathname === "/login") return <LoginPage home={TRADE_HOME} />;
+  return <SignedInTradeApp />;
+}
 
-  // A 401 here redirects to the identity provider from inside the client, so
-  // this query either resolves with an identity or the page navigates away —
-  // unless sign-in itself is unavailable, handled above.
+function SignedInTradeApp() {
+  // A 401 here sends the browser to the sign-in page from inside the client,
+  // so this query either resolves with an identity or the page navigates away.
   const me = useQuery<Me>({ queryKey: ["/auth/me"], queryFn: () => tradeApi.get<Me>("/auth/me") });
-
-  if (loginUnavailable) {
-    return (
-      <Container size="sm" py="xl">
-        <Alert color="amber" title="Sign-in is unavailable">
-          <Stack gap="sm" align="flex-start">
-            <Text size="sm">
-              This screen needs a signed-in session, but the OMS is not serving its sign-in
-              routes: <code>/auth/login</code> answered 404. That usually means the server
-              started without an identity provider configured, or its discovery call is
-              failing. Nothing you can do here will sign you in — an operator has to fix the
-              server. Your orders and positions are unaffected.
-            </Text>
-            <Button variant="default" onClick={() => window.location.reload()}>
-              Try again
-            </Button>
-          </Stack>
-        </Alert>
-      </Container>
-    );
-  }
 
   if (me.isLoading) return <Loader />;
   if (me.error) return <Text c="red">Could not load your session.</Text>;
+  if (isPendingAccount(me.data)) return <PendingScreen />;
+  if (mustChangePassword(me.data)) return <ForcedPasswordChange onDone={() => void me.refetch()} />;
 
   return (
     <LiveUpdatesProvider>
+      <MfaPrompt register={onMfaRequired} />
       <AppShell header={{ height: 48 }} padding="md">
         <AppShell.Header>
           <Group h="100%" px="md" justify="space-between" wrap="nowrap">
@@ -108,15 +102,16 @@ export function TradeApp() {
             </Text>
             <Group gap="xs" wrap="nowrap">
               <ConnectionDot />
-              <Text size="sm" c="dimmed">
+              <Anchor component={Link} to="/account" size="sm" c="dimmed">
                 {me.data?.display_name ?? me.data?.code}
-              </Text>
+              </Anchor>
             </Group>
           </Group>
         </AppShell.Header>
         <AppShell.Main>
           <Routes>
             <Route path="/" element={<TradePage me={me.data!} />} />
+            <Route path="/account" element={<Container size="sm"><AccountSettings /></Container>} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AppShell.Main>

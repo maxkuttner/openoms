@@ -18,8 +18,7 @@ On the cockpit's **Strategies** page, create a strategy:
 | Field | What it is |
 |---|---|
 | Portfolio | The portfolio the strategy trades. Only the strategy trades it: the cockpit can view it, kill and flatten, but not place orders on it. |
-| Owner | The person responsible for the strategy. |
-| Trades as | The principal the strategy's orders are recorded under. Give it its own principal (type `STRATEGY`). |
+| Responsible user | The active user accountable for the strategy. Required, shown on the Strategies page, and changed only by an audited **Handover**. If that user is disabled the strategy is flagged and cannot be started until you pick another. |
 | SenderCompID / TargetCompID | The strategy's session identity. The strategy sends with this SenderCompID to this TargetCompID. |
 | Allowed IP addresses | Optional. Comma-separated exact addresses the strategy may connect from; empty means any. |
 | Limits | Max order quantity and notional, max position quantity and notional, price band %. |

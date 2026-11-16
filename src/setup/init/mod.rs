@@ -15,7 +15,7 @@ pub mod docker;
 pub mod prompts;
 pub mod rules;
 
-use prompts::{AdminPassword, Answers, DbChoice};
+use prompts::{Answers, DbChoice};
 use rules::DbSource;
 
 /// 32 bytes — the AES-256 key size the credential store expects.
@@ -68,10 +68,8 @@ impl std::fmt::Debug for Prompts {
 /// that is all. Persisting a credential that can `DROP DATABASE` is not worth
 /// saving one prompt on the rare `migrate`.
 ///
-/// The cockpit admin password is deliberately NOT generated here: `run()` needs
-/// the raw value for its success message, and generating it there — then
-/// assigning it into the config — is one step, versus generating it here and
-/// making the caller claw it back out of an `Option` afterwards.
+/// No admin password is written: the first account created in the cockpit
+/// becomes the admin.
 pub fn build_file_config(p: &Prompts, bind: &str) -> (FileConfig, String) {
     let role_password = generate_password();
     let mut cfg = FileConfig::default();
@@ -104,7 +102,6 @@ pub fn already_initialized_message(path: &std::path::Path) -> String {
 /// the whole answer, interactively they skip the matching prompt.
 pub struct InitFlags {
     pub source: Option<DbSource>,
-    pub admin_password: Option<String>,
     pub bind: Option<String>,
 }
 
@@ -119,23 +116,15 @@ pub fn superuser_password_default(flag: Option<String>, env: Option<String>, con
 }
 
 /// Non-interactive answers: `--postgres` defaults to `existing` (what scripts
-/// written before the flag existed expect), an absent admin password is
-/// generated, an absent bind is `localhost:3001`. Values are checked by the same
+/// written before the flag existed expect), an absent bind is `localhost:3001`. Values are checked by the same
 /// rules the prompts use, so a script cannot write what a human could not type.
 pub fn answers_from_flags(f: &InitFlags, db: Prompts) -> Result<Answers, String> {
     let db = match f.source.unwrap_or(DbSource::Existing) {
         DbSource::Docker => DbChoice::Docker,
         DbSource::Existing => DbChoice::Existing(db),
     };
-    let admin = match &f.admin_password {
-        Some(pw) => {
-            rules::check_admin_password(pw)?;
-            AdminPassword::Typed(pw.clone())
-        }
-        None => AdminPassword::Generated(generate_password()),
-    };
     let bind = rules::parse_bind(f.bind.as_deref().unwrap_or(DEFAULT_BIND))?;
-    Ok(Answers { db, admin, bind })
+    Ok(Answers { db, bind })
 }
 
 /// What to do when provisioning fails after `oms.toml` was written. For a
@@ -179,21 +168,13 @@ pub fn docker_cleanup_hint() -> String {
 }
 
 /// The whole `oms init` flow.
-///
-/// `interactive` controls only whether the generated cockpit password is printed:
-/// true (a human typed the prompts) is the sole way that value ever reaches the
-/// operator, so it must be shown; false (`--non-interactive`) is the mode most
-/// likely to run under CI/Ansible with stdout captured into a durable log, which
-/// is exactly what "secrets are never logged" rules out.
 pub async fn run(
     answers: Answers,
     docker: &dyn docker::DockerOps,
-    interactive: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_timeout(
         answers,
         docker,
-        interactive,
         docker::READY_TIMEOUT,
         config::path(),
         config::init_target(),
@@ -206,7 +187,6 @@ pub async fn run(
 async fn run_with_timeout(
     answers: Answers,
     docker: &dyn docker::DockerOps,
-    interactive: bool,
     ready: std::time::Duration,
     existing_cfg: std::path::PathBuf,
     target_cfg: std::path::PathBuf,
@@ -219,7 +199,7 @@ async fn run_with_timeout(
     }
     let cfg_path = config::absolute(target_cfg);
 
-    let Answers { db, admin, bind } = answers;
+    let Answers { db, bind } = answers;
     let started_docker = matches!(db, DbChoice::Docker);
     let prompts = match db {
         DbChoice::Existing(p) => p,
@@ -265,8 +245,7 @@ async fn run_with_timeout(
     conn.close().await.ok();
     println!("  connected to {}:{}", prompts.host, prompts.port);
 
-    let (mut file_cfg, role_password) = build_file_config(&prompts, &bind);
-    file_cfg.server.admin_password = Some(admin.value().to_string());
+    let (file_cfg, role_password) = build_file_config(&prompts, &bind);
 
     // Written before provisioning: if provisioning fails halfway, the generated
     // secrets survive and `oms database init --resume` can finish the job.
@@ -305,21 +284,20 @@ async fn run_with_timeout(
     // database it just created. `--resume` skips that and re-runs the remaining
     // steps, all of which tolerate re-application — see `database::init`'s doc
     // comment for why.
-    crate::setup::database::init(overrides, Some(role_password), false)
+    crate::setup::database::init(overrides.clone(), Some(role_password), false)
         .await
         .map_err(|e| provision_failure_message(&cfg_path, &e.to_string(), started_docker))?;
 
-    // Only a generated password is ever printed, and only to a human at a
-    // terminal: one the operator typed they already know.
-    let admin_line = match (&admin, interactive) {
-        (AdminPassword::Typed(_), _) => "Cockpit login password: the one you chose".to_string(),
-        (AdminPassword::Generated(pw), true) => format!("Cockpit login password: {pw}"),
-        (AdminPassword::Generated(_), false) => "Cockpit login password: written to oms.toml".to_string(),
-    };
+    // The first account signed up in the cockpit becomes the admin: nothing
+    // to create or print here.
     let container = rules::container_mode(std::env::var("OMS_CONTAINER").ok().as_deref());
-    println!("{}", closing_lines(&cfg_path, &admin_line, &bind, container));
+    println!("{}", closing_lines(&cfg_path, FIRST_SIGN_IN, &bind, container));
     Ok(())
 }
+
+/// How the operator gets in after `oms init`.
+pub const FIRST_SIGN_IN: &str =
+    "Open the cockpit and create the admin account: on a fresh install the first account signed up is the admin.";
 
 /// The summary after a successful init: what to back up, how to start, where
 /// to log in. In the published container the config lives in a compose
@@ -502,8 +480,8 @@ mod tests {
         }
     }
 
-    fn flags(admin: Option<&str>, bind: Option<&str>) -> InitFlags {
-        InitFlags { source: None, admin_password: admin.map(Into::into), bind: bind.map(Into::into) }
+    fn flags(bind: Option<&str>) -> InitFlags {
+        InitFlags { source: None, bind: bind.map(Into::into) }
     }
 
     #[test]
@@ -513,31 +491,29 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_defaults_to_existing_localhost_and_a_generated_password() {
-        let a = answers_from_flags(&flags(None, None), sample_prompts()).unwrap();
+    fn non_interactive_defaults_to_existing_and_localhost() {
+        let a = answers_from_flags(&flags(None), sample_prompts()).unwrap();
         assert!(matches!(a.db, DbChoice::Existing(_)));
-        assert!(matches!(a.admin, AdminPassword::Generated(_)));
         assert_eq!(a.bind, "localhost:3001");
     }
 
     #[test]
-    fn non_interactive_docker_and_a_chosen_password_carry_through() {
-        let f = InitFlags { source: Some(DbSource::Docker), ..flags(Some("twelve-chars-ok"), Some("0.0.0.0:3001")) };
+    fn non_interactive_docker_carries_through() {
+        let f = InitFlags { source: Some(DbSource::Docker), ..flags(Some("0.0.0.0:3001")) };
         let a = answers_from_flags(&f, sample_prompts()).unwrap();
         assert!(matches!(a.db, DbChoice::Docker));
-        assert!(matches!(a.admin, AdminPassword::Typed(ref p) if p == "twelve-chars-ok"));
         assert_eq!(a.bind, "0.0.0.0:3001");
     }
 
     #[test]
-    fn short_admin_password_flag_is_refused() {
-        let e = answers_from_flags(&flags(Some("short"), None), sample_prompts()).unwrap_err();
-        assert!(e.contains("12"), "{e}");
+    fn a_bad_bind_flag_is_refused() {
+        assert!(answers_from_flags(&flags(Some(":3001")), sample_prompts()).is_err());
     }
 
     #[test]
-    fn a_bad_bind_flag_is_refused() {
-        assert!(answers_from_flags(&flags(None, Some(":3001")), sample_prompts()).is_err());
+    fn the_closing_lines_say_create_the_admin_account() {
+        let m = closing_lines(std::path::Path::new("/x/oms.toml"), FIRST_SIGN_IN, "localhost:3001", false);
+        assert!(m.contains("create the admin account"), "{m}");
     }
 
     /// A Docker that "starts" a container nobody listens for: readiness fails
@@ -558,13 +534,11 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("oms-init-test-{}", std::process::id()));
         let a = Answers {
             db: DbChoice::Docker,
-            admin: AdminPassword::Generated("x".repeat(24)),
             bind: "localhost:3001".into(),
         };
         let e = run_with_timeout(
             a,
             &StartsButNeverListens,
-            false,
             std::time::Duration::from_millis(500),
             tmp.join("none.toml"),
             tmp.join("oms.toml"),
@@ -588,8 +562,8 @@ mod tests {
         }
         let existing = std::env::temp_dir().join(format!("oms-init-existing-{}.toml", std::process::id()));
         std::fs::write(&existing, "").unwrap();
-        let a = Answers { db: DbChoice::Docker, admin: AdminPassword::Generated("x".repeat(24)), bind: "localhost:3001".into() };
-        let e = run_with_timeout(a, &Panics, false, std::time::Duration::from_millis(100), existing.clone(), existing.clone())
+        let a = Answers { db: DbChoice::Docker, bind: "localhost:3001".into() };
+        let e = run_with_timeout(a, &Panics, std::time::Duration::from_millis(100), existing.clone(), existing.clone())
             .await
             .unwrap_err()
             .to_string();
@@ -603,11 +577,12 @@ mod tests {
         assert_eq!(cockpit_url("0.0.0.0:4000"), "http://localhost:4000/cockpit/");
     }
 
+    /// The config file never carries an admin password any more.
     #[test]
-    fn answers_debug_never_shows_the_admin_password() {
-        let a = answers_from_flags(&flags(Some("very-secret-admin"), None), sample_prompts()).unwrap();
-        let d = format!("{a:?}");
-        assert!(!d.contains("very-secret-admin") && !d.contains("\"pw\""), "{d}");
+    fn the_written_config_has_no_admin_password() {
+        let (cfg, _) = build_file_config(&sample_prompts(), "localhost:3001");
+        assert_eq!(cfg.server.admin_password, None);
+        assert!(!toml::to_string_pretty(&cfg).unwrap().contains("admin_password"));
     }
 
     #[test]
@@ -633,8 +608,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_docker_run_names_cleanup() {
         let tmp = std::env::temp_dir().join(format!("oms-init-runfails-{}", std::process::id()));
-        let a = Answers { db: DbChoice::Docker, admin: AdminPassword::Generated("x".repeat(24)), bind: "localhost:3001".into() };
-        let e = run_with_timeout(a, &RunFails, false, std::time::Duration::from_millis(100), tmp.join("none.toml"), tmp.join("oms.toml"))
+        let a = Answers { db: DbChoice::Docker, bind: "localhost:3001".into() };
+        let e = run_with_timeout(a, &RunFails, std::time::Duration::from_millis(100), tmp.join("none.toml"), tmp.join("oms.toml"))
             .await
             .unwrap_err()
             .to_string();

@@ -5,7 +5,8 @@ description: Common startup and setup errors, and what to do about them.
 
 | Symptom | Cause and fix |
 |---|---|
-| `refusing to start: OMS_ADMIN_PASSWORD is not set` | The bind address is not loopback and no cockpit password is configured. Set `admin_password` in `oms.toml` (or `OMS_ADMIN_PASSWORD`). |
+| Nobody can sign in as an admin | Lost password, authenticator and recovery codes, or no admin exists yet. On the server run `oms auth recover-admin --email <admin>` (or `oms auth bootstrap-admin --email <you>` if there is none); under Docker, `docker exec <container> oms auth …`. See [Sign-in and users](/configuration/login/#recover-an-admin-from-the-host). |
+| `refusing to start` mentioning `public_base_url` or https | Sign-in cookies need HTTPS unless everything is loopback. Put TLS in front and set `[auth] public_base_url` to the `https://` address. |
 | `password authentication failed for user "oms"` | The `oms` role's password doesn't match `oms.password` / `OMS_PASSWORD`. Fix the value, or reset it with `ALTER ROLE oms PASSWORD '…'`. |
 | `role "oms" already exists` on init | The database is already provisioned. Use `oms database migrate`, or `oms database drop` to start over. |
 | SQL errors such as `column … does not exist` or `relation … does not exist` | The database is behind the binary — the server does not migrate on its own. Run `oms database migrate`; `oms database status` shows what is pending. |

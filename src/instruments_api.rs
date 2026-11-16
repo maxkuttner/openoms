@@ -56,7 +56,7 @@ pub async fn search_instruments(
              SELECT instrument_id FROM watchlist_item WHERE principal_id = $3 \
              UNION \
              SELECT p.instrument_id FROM position p \
-             JOIN principal_portfolio_grant g ON g.portfolio_id = p.portfolio_id \
+             JOIN portfolio_access g ON g.portfolio_id = p.portfolio_id \
              WHERE g.principal_id = $3 AND g.can_view AND p.net_qty <> 0 \
              UNION \
              SELECT instrument_id FROM order_state WHERE principal_id = $3 \

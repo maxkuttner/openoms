@@ -193,21 +193,18 @@ async fn check_login(issuer: Option<String>) -> Check {
     Check { name: "Login (OIDC)".into(), state, target: issuer, detail }
 }
 
-/// Asked of the running OMS with the admin password, resolved exactly as the
-/// server resolves it, so it works wherever this shell sees the same settings.
-async fn streams(base: &str, bind: &str, file: Option<&crate::config::FileConfig>) -> Streams {
-    let password = crate::resolve_admin_password(crate::admin_password_from_env(), file)
-        .or_else(|| crate::bind_is_loopback(bind).then(|| crate::DEFAULT_ADMIN_PASSWORD.to_string()))
-        .unwrap_or_default();
+/// Asked of the running OMS with its per-boot host token (loopback only).
+async fn streams(base: &str) -> Streams {
+    let password = match crate::admin_bootstrap::read_host_token() {
+        Ok(t) => t,
+        Err(e) => return Streams::Unknown(e),
+    };
     let resp = match client().get(format!("{base}/admin/stream-health")).bearer_auth(password).send().await {
         Ok(resp) => resp,
         Err(e) => return Streams::Unknown(e.to_string()),
     };
     if !resp.status().is_success() {
-        return Streams::Unknown(format!(
-            "the OMS answered {} (is OMS_ADMIN_PASSWORD set in this shell?)",
-            resp.status()
-        ));
+        return Streams::Unknown(crate::admin_bootstrap::host_call_error(resp.status().as_u16(), ""));
     }
     match resp.json().await {
         Ok(list) => Streams::List(list),
@@ -237,7 +234,7 @@ pub async fn run() -> i32 {
     }
 
     let (uis, streams) = if oms.state == State::Up {
-        (ui_links(&base, crate::cockpit::is_bundled(), issuer.is_some()), streams(&base, &bind, file).await)
+        (ui_links(&base, crate::cockpit::is_bundled(), issuer.is_some()), streams(&base).await)
     } else {
         (Vec::new(), Streams::Unknown("OMS not running".into()))
     };

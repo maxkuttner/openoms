@@ -4,7 +4,7 @@ import { useList } from "../api/hooks";
 import { api } from "../api/client";
 import { InstrumentSelect } from "../components/InstrumentSelect";
 import { OrderTimeline } from "../components/OrderTimeline";
-import type { BlotterRow, Portfolio, Principal } from "../api/types";
+import type { BlotterRow, Portfolio } from "../api/types";
 
 const STATUSES = ["submitted", "routed", "partially_filled", "filled", "canceled", "rejected", "expired"].map(
   (s) => ({ value: s, label: s }),
@@ -28,7 +28,7 @@ export function BlotterPage() {
   const [selected, setSelected] = useState<BlotterRow | null>(null);
 
   const portfolios = useList<Portfolio>("/admin/portfolios");
-  const principals = useList<Principal>("/admin/principals");
+  const users = useList<{ principal_id: string; code: string }>("/admin/users");
 
   const qs = new URLSearchParams();
   if (status) qs.set("status", status);
@@ -61,8 +61,8 @@ export function BlotterPage() {
           w={180}
         />
         <Select
-          label="Principal"
-          data={(principals.data ?? []).map((p) => ({ value: p.id, label: p.code }))}
+          label="User"
+          data={(users.data ?? []).map((u) => ({ value: u.principal_id, label: u.code }))}
           value={principalId}
           onChange={setPrincipalId}
           clearable
@@ -104,7 +104,7 @@ export function BlotterPage() {
           <Table.Thead>
             <Table.Tr>
               <Table.Th>Time</Table.Th>
-              <Table.Th>Principal</Table.Th>
+              <Table.Th>User</Table.Th>
               <Table.Th>Portfolio</Table.Th>
               <Table.Th>Instrument</Table.Th>
               <Table.Th>Side</Table.Th>

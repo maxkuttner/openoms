@@ -9,6 +9,7 @@ pub mod admin;
 pub mod control;
 pub mod guard;
 pub mod session;
+pub mod trader_api;
 #[cfg(test)]
 pub(crate) mod test_support;
 

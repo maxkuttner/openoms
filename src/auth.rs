@@ -17,6 +17,53 @@ pub struct AuthContext {
     /// The acting principal's `code`, carried so a handler can stamp an
     /// event's `actor` without a second query.
     pub principal_code: String,
+    /// How this request authenticated; decides whether `mfa` matters.
+    pub auth_method: AuthMethod,
+    /// The session passed MFA: a local session's TOTP, or an OIDC login whose
+    /// `amr` met `[auth.oidc].require_amr` (evaluated once, at login).
+    pub mfa: bool,
+}
+
+/// How a request authenticated, as far as the MFA gate cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    Oidc,
+    Local,
+    /// A machine credential: an API key, or a strategy's own session.
+    ApiKey,
+    /// The per-boot host token (`oms` CLI on the host), a machine credential.
+    HostCli,
+}
+
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMethod::Oidc => "oidc",
+            AuthMethod::Local => "local",
+            AuthMethod::ApiKey => "api_key",
+            AuthMethod::HostCli => "host_cli",
+        }
+    }
+}
+
+impl AuthContext {
+    /// A machine identity (API key, strategy): exempt from the MFA gate.
+    pub fn machine(principal_id: Uuid, principal_code: String) -> Self {
+        AuthContext { principal_id, principal_code, auth_method: AuthMethod::ApiKey, mfa: false }
+    }
+
+    fn from_session(record: crate::sessions::SessionRecord) -> Self {
+        let auth_method = match record.auth_method {
+            crate::sessions::AuthMethod::Oidc => AuthMethod::Oidc,
+            crate::sessions::AuthMethod::Local => AuthMethod::Local,
+        };
+        AuthContext {
+            principal_id: record.principal_id,
+            principal_code: record.principal_code,
+            auth_method,
+            mfa: record.mfa_verified_at.is_some(),
+        }
+    }
 }
 
 /// Which door a request came through. Authorization never branches on this —
@@ -40,50 +87,114 @@ pub enum CredentialKind {
 /// here, so the cookie policy is computed once at boot (see `AppState`) and
 /// so the idle/absolute TTL is never silently hardcoded — a later task makes
 /// it configurable, and doing the derivation per call would ignore that.
+///
+/// The middlewares use `resolve`, which also says whether the session is held
+/// to a password change; this is its plain form, for tests.
+#[cfg(test)]
 pub async fn authenticate(
     pool: &sqlx::PgPool,
     headers: &axum::http::HeaderMap,
     session_config: &SessionConfig,
 ) -> Result<Option<(AuthContext, CredentialKind)>, Response> {
-    let policy = &session_config.cookie_policy;
-    if let Some(value) =
-        crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy))
-    {
-        let hash = crate::sessions::hash_session_token(&value);
-        if let Some(record) = crate::sessions::lookup_session(pool, &hash)
-            .await
-            .map_err(|_| service_unavailable())?
-        {
-            let now = chrono::Utc::now();
-            if crate::sessions::is_expired(
-                now,
-                record.last_seen_at,
-                record.absolute_expires_at,
-                &session_config.ttl,
-            ) {
-                return Ok(None);
-            }
-            if crate::sessions::needs_touch(now, record.last_seen_at) {
-                crate::sessions::touch_session(pool, record.id)
-                    .await
-                    .map_err(|_| service_unavailable())?;
-            }
-            return Ok(Some((
-                AuthContext {
-                    principal_id: record.principal_id,
-                    principal_code: record.principal_code,
-                },
-                CredentialKind::Session,
-            )));
-        }
+    Ok(resolve(pool, headers, session_config).await?.map(|r| (r.ctx, r.kind)))
+}
+
+/// What `authenticate` found, plus whether the account is PENDING approval.
+struct Resolved {
+    ctx: AuthContext,
+    kind: CredentialKind,
+    pending: bool,
+    must_change_password: bool,
+}
+
+async fn resolve(
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    session_config: &SessionConfig,
+) -> Result<Option<Resolved>, Response> {
+    if let Some(record) = authenticate_session(pool, headers, session_config).await? {
+        let (pending, must_change_password) = (record.pending, record.must_change_password);
+        return Ok(Some(Resolved { ctx: AuthContext::from_session(record), kind: CredentialKind::Session, pending, must_change_password }));
     }
 
     let Ok((key_id, secret)) = extract_trading_credentials(headers) else {
         return Ok(None);
     };
-    Ok(verify_key(pool, &key_id, &secret).await?.map(|(principal_id, principal_code)| {
-        (AuthContext { principal_id, principal_code }, CredentialKind::ApiKey)
+    Ok(verify_key(pool, &key_id, &secret).await?.map(|(principal_id, principal_code)| Resolved {
+        ctx: AuthContext::machine(principal_id, principal_code),
+        kind: CredentialKind::ApiKey,
+        pending: false,
+        must_change_password: false,
     }))
+}
+
+/// The JSON body of the 403 a PENDING account gets.
+pub const APPROVAL_PENDING_BODY: &str = r#"{"error":"approval_pending"}"#;
+
+/// The only route behind `auth_middleware` a PENDING account, or a session
+/// that must change its password, may call. The others they may use
+/// (`/auth/methods`, `/auth/logout`, and for the latter `/auth/local/password`)
+/// carry no auth middleware at all.
+const GATED_ALLOWED: &[&str] = &["/auth/me"];
+
+/// The JSON body of the 403 a session on a host-CLI password gets.
+pub const PASSWORD_CHANGE_REQUIRED_BODY: &str = r#"{"error":"password_change_required"}"#;
+
+pub fn password_change_required() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(PASSWORD_CHANGE_REQUIRED_BODY.into())
+        .unwrap()
+}
+
+/// The refusal for a session that is PENDING or must change its password,
+/// unless `path` is one of the few routes it may still call.
+pub fn gate_for(pending: bool, must_change_password: bool, path: &str) -> Option<Response> {
+    if GATED_ALLOWED.contains(&path) {
+        None
+    } else if pending {
+        Some(approval_pending())
+    } else if must_change_password {
+        Some(password_change_required())
+    } else {
+        None
+    }
+}
+
+pub fn approval_pending() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(APPROVAL_PENDING_BODY.into())
+        .unwrap()
+}
+
+/// The session half of `authenticate`: the live session record behind the
+/// request's cookie (ACTIVE HUMAN principal, not revoked, within its TTLs), or
+/// `None`. Exposed whole so `admin_middleware` can see how the session was
+/// established and whether it passed MFA.
+pub async fn authenticate_session(
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    session_config: &SessionConfig,
+) -> Result<Option<crate::sessions::SessionRecord>, Response> {
+    let policy = &session_config.cookie_policy;
+    let Some(value) = crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy)) else {
+        return Ok(None);
+    };
+    let hash = crate::sessions::hash_session_token(&value);
+    let Some(record) = crate::sessions::lookup_session(pool, &hash).await.map_err(|_| service_unavailable())? else {
+        return Ok(None);
+    };
+    let now = chrono::Utc::now();
+    if crate::sessions::is_expired(now, record.last_seen_at, record.absolute_expires_at, &session_config.ttl) {
+        return Ok(None);
+    }
+    if crate::sessions::needs_touch(now, record.last_seen_at) {
+        crate::sessions::touch_session(pool, record.id).await.map_err(|_| service_unavailable())?;
+    }
+    Ok(Some(record))
 }
 
 /// Authenticate a trading request and inject `AuthContext`.
@@ -105,11 +216,13 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    let (ctx, kind) = authenticate(state.pool(), req.headers(), &state.session_config)
-        .await?
-        .ok_or_else(unauthorized)?;
+    let Resolved { ctx, kind, pending, must_change_password } =
+        resolve(state.pool(), req.headers(), &state.session_config).await?.ok_or_else(unauthorized)?;
 
     enforce_origin_for_session(kind, req.headers(), req.method(), &state.session_config)?;
+    if let Some(refused) = gate_for(pending, must_change_password, req.uri().path()) {
+        return Err(refused);
+    }
 
     if let Some(code) = crate::strategies::stopped_strategy(&state.strategies().all(), ctx.principal_id) {
         return Err(axum::response::IntoResponse::into_response((StatusCode::FORBIDDEN, format!("strategy {code} is stopped"))));
@@ -172,6 +285,8 @@ pub async fn verify_key(
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         WHERE k.key_id = $1 AND k.revoked_at IS NULL AND p.status = 'ACTIVE'
+          AND NOT EXISTS (SELECT 1 FROM local_credential c
+                           WHERE c.principal_id = k.principal_id AND c.must_change_password)
         "#,
     )
     .bind(key_id)
@@ -193,22 +308,66 @@ pub async fn verify_key(
     Ok(valid.then_some((principal_id, principal_code)))
 }
 
+/// Guard for `/admin/*`.
+///
+/// The normal door is a session (cookie) of an ACTIVE principal holding a
+/// `principal_admin` row. A state-changing request on it must pass the CSRF
+/// origin check and, for a mutation, `authz::require_mfa`.
+/// API keys never open `/admin/*`.
+///
+/// A PENDING account gets 403 `approval_pending`.
+///
+/// The host door: `Bearer <host token>` (written 0600 next to the config at
+/// boot) from a loopback peer acts as `host-cli` with full admin capability.
+/// It is how `oms status` / `oms setup sync-broker` reach the server. There
+/// is no other bearer: the old shared admin password is gone.
 pub async fn admin_middleware(
     State(state): State<AppState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    if !state.admin_auth_enabled {
+    let pool = state.pool();
+    if let Some(session) = authenticate_session(pool, req.headers(), &state.session_config).await? {
+        enforce_origin_for_session(CredentialKind::Session, req.headers(), req.method(), &state.session_config)?;
+        if let Some(refused) = gate_for(session.pending, session.must_change_password, req.uri().path()) {
+            return Err(refused);
+        }
+        let is_admin = crate::admin_bootstrap::is_active_admin(pool, session.principal_id)
+            .await
+            .map_err(|_| service_unavailable())?;
+        if !is_admin {
+            return Err(forbidden_because("admin access required"));
+        }
+        let ctx = AuthContext::from_session(session);
+        admin_mfa_gate(req.method(), &ctx).map_err(axum::response::IntoResponse::into_response)?;
+        req.extensions_mut().insert(ctx);
         return Ok(next.run(req).await);
     }
 
-    let token = extract_bearer_token(req.headers()).map_err(|_| forbidden())?;
-
-    if !constant_time_eq(token.as_bytes(), state.admin_token.as_bytes()) {
-        return Err(forbidden());
+    let token = extract_bearer_token(req.headers()).map_err(|_| unauthorized())?;
+    // The per-boot host token: loopback peers only; acts as `host-cli`.
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
+    if !crate::admin_bootstrap::host_token_ok(state.host_token_hash.as_deref(), &token, peer) {
+        return Err(unauthorized());
     }
-
+    let ctx = crate::admin_bootstrap::host_context();
+    admin_mfa_gate(req.method(), &ctx).map_err(axum::response::IntoResponse::into_response)?;
+    req.extensions_mut().insert(ctx);
     Ok(next.run(req).await)
+}
+
+/// `/admin/*` mutations need MFA (`authz::require_mfa`); reads never do.
+pub fn admin_mfa_gate(method: &axum::http::Method, ctx: &AuthContext) -> Result<(), crate::handlers::ApiError> {
+    if crate::sessions::is_read_method(method) {
+        return Ok(());
+    }
+    crate::authz::require_mfa(ctx)
+}
+
+/// The `key_id` of the API key on this request, if it carries one in either
+/// form. Does not verify the secret — callers rely on the middleware for that.
+pub fn trading_key_id(headers: &header::HeaderMap) -> Option<String> {
+    extract_trading_credentials(headers).ok().map(|(key_id, _)| key_id)
 }
 
 /// Extract `(key_id, secret)` from either credential form:
@@ -256,13 +415,6 @@ fn extract_bearer_token(headers: &header::HeaderMap) -> Result<String, ()> {
     Ok(token.to_string())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 fn unauthorized() -> Response {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
@@ -277,6 +429,13 @@ fn forbidden() -> Response {
         .unwrap()
 }
 
+fn forbidden_because(reason: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .body(reason.into())
+        .unwrap()
+}
+
 fn service_unavailable() -> Response {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -286,6 +445,26 @@ fn service_unavailable() -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// `/auth/me` reports it, so the UI knows which MFA step to offer.
+    #[test]
+    fn auth_method_names() {
+        assert_eq!(AuthMethod::Local.as_str(), "local");
+        assert_eq!(AuthMethod::Oidc.as_str(), "oidc");
+        assert_eq!(AuthMethod::ApiKey.as_str(), "api_key");
+        assert_eq!(AuthMethod::HostCli.as_str(), "host_cli");
+    }
+
+    #[test]
+    fn the_session_gate_lets_only_me_through() {
+        assert!(gate_for(false, false, "/orders/submit").is_none());
+        assert!(gate_for(true, true, "/auth/me").is_none());
+        for path in ["/orders/submit", "/admin/users", "/portfolios", "/updates"] {
+            assert_eq!(gate_for(true, false, path).unwrap().status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(gate_for(false, true, path).unwrap().status(), StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
     use super::*;
     use crate::sessions::{cookie_policy, SessionTtl};
 
@@ -380,6 +559,8 @@ mod tests {
         let token = crate::sessions::create_session(
             &pool,
             principal_id,
+            crate::sessions::AuthMethod::Oidc,
+            false,
             &SessionTtl::default(),
             None,
         )
@@ -407,6 +588,8 @@ mod tests {
         let token = crate::sessions::create_session(
             &pool,
             principal_id,
+            crate::sessions::AuthMethod::Oidc,
+            false,
             &SessionTtl::default(),
             None,
         )

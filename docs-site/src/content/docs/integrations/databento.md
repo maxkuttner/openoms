@@ -21,9 +21,10 @@ One API key. Enter it in the cockpit under **Data feeds → databento-opra →
 Credentials** (**Test**, then **Save**), then reload:
 
 ```sh
-export OMS_ADMIN=$(sed -n 's/^admin_password = "\(.*\)"/\1/p' ~/.config/oms/oms.toml)
-
-curl -s -X POST localhost:3001/admin/connections/reload -H "Authorization: Bearer $OMS_ADMIN"
+# the host token is the file host-token next to your oms.toml (default ~/.config/oms/host-token);
+# the server accepts it from this machine only
+curl -s -X POST localhost:3001/admin/connections/reload \
+  -H "Authorization: Bearer $(cat ~/.config/oms/host-token)"
 ```
 
 `databento-opra` should report `Registered`.

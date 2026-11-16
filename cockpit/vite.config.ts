@@ -41,10 +41,9 @@ export default defineConfig(({ command }) => ({
         rewrite: (p) => p.replace(/^\/api/, ""),
         configure: rewriteOriginHeader,
       },
-      // The trade app's own client-side redirect to a missing session
-      // (cockpit/src/trade/api/client.ts) navigates to `/auth/login`
-      // relative to whatever origin it's running on. Without this, that
-      // lands on vite's own dev server, which has no such route.
+      // The SSO buttons navigate to `/auth/oidc/login` and `/auth/invite/…`
+      // relative to whatever origin they run on. Without this, that lands
+      // on vite's own dev server, which has no such route.
       "/auth": { target, changeOrigin: true, configure: rewriteOriginHeader },
     },
   },

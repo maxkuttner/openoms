@@ -25,7 +25,6 @@
 //!
 //! [server]
 //! bind_addr = "localhost:3001"
-//! admin_password = "generated-by-init"
 //!
 //! # Uncomment to enable OIDC login. With no [auth.oidc] block at all, login
 //! # stays off and the OMS behaves exactly as it does today: /auth/* returns
@@ -134,15 +133,115 @@ pub struct OmsSection {
 pub struct ServerSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
+    /// The removed shared admin password. Still parsed so an old `oms.toml`
+    /// loads (`deny_unknown_fields`), then ignored with a warning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_password: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthSection {
+    /// The browser-facing origin of this server (CSRF origin check, cookie
+    /// scheme, OIDC redirect URI). `[auth.oidc].public_base_url` is the
+    /// deprecated fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_base_url: Option<String>,
+    #[serde(default)]
+    pub policy: AuthPolicy,
+    /// Let people create their own account from the sign-in page (default
+    /// true). The very first account is always possible: it becomes the admin.
+    #[serde(default = "default_true")]
+    pub enable_signup: bool,
+    /// The account role a self-signup gets (default `pending`).
+    #[serde(default)]
+    pub default_user_role: DefaultUserRole,
+    #[serde(default)]
+    pub local: LocalSection,
+    #[serde(default)]
+    pub session: SessionSection,
     #[serde(default)]
     pub oidc: OidcSection,
+}
+
+impl Default for AuthSection {
+    fn default() -> Self {
+        Self {
+            public_base_url: None,
+            policy: AuthPolicy::default(),
+            enable_signup: true,
+            default_user_role: DefaultUserRole::default(),
+            local: LocalSection::default(),
+            session: SessionSection::default(),
+            oidc: OidcSection::default(),
+        }
+    }
+}
+
+/// The account role of a new self-signup (local or SSO).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultUserRole {
+    /// Signed in, but sees nothing until an admin approves the account.
+    #[default]
+    Pending,
+    /// Active at once, with no portfolio access until an admin grants some.
+    User,
+}
+
+/// Which sign-in methods are allowed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthPolicy {
+    #[default]
+    LocalAndSso,
+    SsoOnly,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalSection {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Force TOTP on every local account. Off by default: TOTP is then
+    /// optional, but an enrolled user still needs their code to sign in.
+    #[serde(default)]
+    pub require_mfa: bool,
+}
+
+impl Default for LocalSection {
+    fn default() -> Self {
+        Self { enabled: true, require_mfa: false }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_ttl_minutes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absolute_ttl_hours: Option<i64>,
+}
+
+/// Resolved `[auth]` / `[auth.session]` settings, independent of whether OIDC
+/// is configured. Local login and the session routes depend on these alone.
+#[derive(Debug)]
+pub struct AuthSettings {
+    pub public_base_url: Option<String>,
+    pub policy: AuthPolicy,
+    /// Effective: `[auth.local].enabled` and not `policy = "sso_only"`.
+    pub local_enabled: bool,
+    /// `[auth.local].require_mfa`.
+    pub require_mfa: bool,
+    /// `[auth].enable_signup` (only meaningful with local sign-in on).
+    pub enable_signup: bool,
+    pub default_user_role: DefaultUserRole,
+    pub ttl: crate::sessions::SessionTtl,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -160,10 +259,30 @@ pub struct OidcSection {
     pub required_claim: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required_claim_value: Option<String>,
+    /// Deprecated: use `[auth.session].idle_ttl_minutes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_ttl_minutes: Option<i64>,
+    /// Deprecated: use `[auth.session].absolute_ttl_hours`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub absolute_ttl_hours: Option<i64>,
+    /// Accept an `email_verified` claim as proof of the email (default true).
+    #[serde(default = "default_true")]
+    pub trust_email_verified: bool,
+    /// Authentication methods references (`amr`) the ID token must carry for
+    /// the session to count as MFA-verified (order actions and admin changes
+    /// need it). Empty (the default) trusts the identity provider's own MFA
+    /// policy: every OIDC login counts as MFA-verified.
+    #[serde(default)]
+    pub require_amr: Vec<String>,
+    /// An unknown SSO identity creates an account (role
+    /// `[auth].default_user_role`) instead of being refused (default false).
+    #[serde(default)]
+    pub enable_signup: bool,
+    /// An unknown SSO identity whose *verified* email matches an existing
+    /// account is linked to it (default false). Trusts the provider's email
+    /// verification completely: see the docs before turning it on.
+    #[serde(default)]
+    pub merge_accounts_by_email: bool,
 }
 
 #[derive(Debug)]
@@ -173,7 +292,12 @@ pub struct OidcSettings {
     pub public_base_url: String,
     pub scopes: Vec<String>,
     pub required_claim: Option<(String, String)>,
+    #[allow(dead_code)] // superseded by auth_settings().ttl
     pub ttl: crate::sessions::SessionTtl,
+    pub trust_email_verified: bool,
+    pub require_amr: Vec<String>,
+    pub enable_signup: bool,
+    pub merge_accounts_by_email: bool,
 }
 
 // Hand-written so a stray `{:?}` — in a log line, a panic message, an
@@ -377,8 +501,8 @@ impl FileConfig {
     /// clearer signal than a redirect into a broken exchange.
     pub fn oidc(&self) -> Option<OidcSettings> {
         let s = &self.auth.oidc;
-        let (issuer, client_id, public_base_url) =
-            (s.issuer.clone()?, s.client_id.clone()?, s.public_base_url.clone()?);
+        let (issuer, client_id) = (s.issuer.clone()?, s.client_id.clone()?);
+        let public_base_url = self.auth_settings().public_base_url?;
 
         Some(OidcSettings {
             issuer,
@@ -391,11 +515,52 @@ impl FileConfig {
                 .required_claim
                 .clone()
                 .zip(s.required_claim_value.clone()),
-            ttl: crate::sessions::SessionTtl {
-                idle: chrono::Duration::minutes(s.idle_ttl_minutes.unwrap_or(30)),
-                absolute: chrono::Duration::hours(s.absolute_ttl_hours.unwrap_or(12)),
-            },
+            ttl: self.auth_settings().ttl,
+            trust_email_verified: s.trust_email_verified,
+            require_amr: s.require_amr.clone(),
+            enable_signup: s.enable_signup,
+            merge_accounts_by_email: s.merge_accounts_by_email,
         })
+    }
+
+    /// The `[auth]` settings every sign-in method shares. Deprecated
+    /// `[auth.oidc]` spellings (`public_base_url`, the TTLs) are still read as
+    /// fallbacks; `warn_deprecated_auth` reports them once at boot.
+    pub fn auth_settings(&self) -> AuthSettings {
+        let a = &self.auth;
+        AuthSettings {
+            public_base_url: a.public_base_url.clone().or_else(|| a.oidc.public_base_url.clone()),
+            policy: a.policy,
+            local_enabled: a.local.enabled && a.policy != AuthPolicy::SsoOnly,
+            require_mfa: a.local.require_mfa,
+            enable_signup: a.enable_signup,
+            default_user_role: a.default_user_role,
+            ttl: crate::sessions::SessionTtl {
+                idle: chrono::Duration::minutes(
+                    a.session.idle_ttl_minutes.or(a.oidc.idle_ttl_minutes).unwrap_or(30),
+                ),
+                absolute: chrono::Duration::hours(
+                    a.session.absolute_ttl_hours.or(a.oidc.absolute_ttl_hours).unwrap_or(12),
+                ),
+            },
+        }
+    }
+
+    /// Logs a warning for each deprecated `[auth.oidc]` key still in use.
+    pub fn warn_deprecated_auth(&self) {
+        if self.server.admin_password.is_some() {
+            tracing::warn!(
+                "[server].admin_password is no longer used and is ignored; remove it. \
+                 Sign in as a named admin (or admin / admin on a fresh install)"
+            );
+        }
+        let o = &self.auth.oidc;
+        if o.public_base_url.is_some() {
+            tracing::warn!("[auth.oidc].public_base_url is deprecated; move it to [auth].public_base_url");
+        }
+        if o.idle_ttl_minutes.is_some() || o.absolute_ttl_hours.is_some() {
+            tracing::warn!("[auth.oidc] idle_ttl_minutes/absolute_ttl_hours are deprecated; use [auth.session]");
+        }
     }
 }
 
@@ -760,6 +925,121 @@ admin_password = "admin-pw"
         let cfg: FileConfig = toml::from_str("[server]\nbind_addr = \"localhost:3001\"\n").unwrap();
 
         assert!(cfg.oidc().is_none(), "absent configuration must not half-enable login");
+    }
+
+    #[test]
+    fn auth_section_parses_with_defaults() {
+        let cfg: FileConfig = toml::from_str("[server]\nbind_addr = \"localhost:3001\"\n").unwrap();
+        let a = cfg.auth_settings();
+        assert_eq!(a.policy, AuthPolicy::LocalAndSso);
+        assert!(a.local_enabled);
+        assert!(a.public_base_url.is_none());
+        assert_eq!(a.ttl.idle, chrono::Duration::minutes(30));
+        assert_eq!(a.ttl.absolute, chrono::Duration::hours(12));
+
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth]
+            public_base_url = "https://oms.example.com"
+            policy = "sso_only"
+            [auth.local]
+            enabled = false
+            [auth.session]
+            idle_ttl_minutes = 5
+            absolute_ttl_hours = 2
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            trust_email_verified = false
+            require_amr = ["mfa"]
+            "#,
+        )
+        .unwrap();
+        let a = cfg.auth_settings();
+        assert_eq!(a.policy, AuthPolicy::SsoOnly);
+        assert!(!a.local_enabled);
+        assert_eq!(a.public_base_url.as_deref(), Some("https://oms.example.com"));
+        assert_eq!(a.ttl.idle, chrono::Duration::minutes(5));
+        assert_eq!(a.ttl.absolute, chrono::Duration::hours(2));
+        let o = cfg.oidc().expect("[auth].public_base_url completes the block");
+        assert_eq!(o.public_base_url, "https://oms.example.com");
+        assert!(!o.trust_email_verified);
+        assert_eq!(o.require_amr, vec!["mfa"]);
+
+        let d: FileConfig = toml::from_str(
+            "[auth.oidc]\nissuer = \"https://i\"\nclient_id = \"oms\"\npublic_base_url = \"https://x\"\n",
+        )
+        .unwrap();
+        let o = d.oidc().unwrap();
+        assert!(o.trust_email_verified);
+        assert!(o.require_amr.is_empty());
+    }
+
+    #[test]
+    fn legacy_oidc_public_base_url_still_used() {
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://legacy.example.com"
+            idle_ttl_minutes = 7
+            "#,
+        )
+        .unwrap();
+        let a = cfg.auth_settings();
+        assert_eq!(a.public_base_url.as_deref(), Some("https://legacy.example.com"));
+        assert_eq!(a.ttl.idle, chrono::Duration::minutes(7));
+        assert_eq!(cfg.oidc().unwrap().public_base_url, "https://legacy.example.com");
+
+        // The new location wins when both are present.
+        let cfg: FileConfig = toml::from_str(
+            r#"
+            [auth]
+            public_base_url = "https://new.example.com"
+            [auth.oidc]
+            issuer = "https://id.example.com"
+            client_id = "oms"
+            public_base_url = "https://legacy.example.com"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.auth_settings().public_base_url.as_deref(), Some("https://new.example.com"));
+    }
+
+    #[test]
+    fn old_oms_toml_with_server_admin_password_still_parses() {
+        let cfg: FileConfig = toml::from_str(
+            "[server]\nbind_addr = \"localhost:3001\"\nadmin_password = \"x\"\n",
+        )
+        .unwrap();
+        assert!(cfg.auth_settings().local_enabled);
+    }
+
+    #[test]
+    fn signup_defaults_follow_open_webui() {
+        let a = FileConfig::default().auth_settings();
+        assert!(a.enable_signup);
+        assert_eq!(a.default_user_role, DefaultUserRole::Pending);
+        let cfg: FileConfig =
+            toml::from_str("[auth]\nenable_signup = false\ndefault_user_role = \"user\"\n").unwrap();
+        let a = cfg.auth_settings();
+        assert!(!a.enable_signup);
+        assert_eq!(a.default_user_role, DefaultUserRole::User);
+        let cfg: FileConfig = toml::from_str(
+            "[auth.oidc]\nissuer = \"https://id.example.com\"\nclient_id = \"c\"\npublic_base_url = \"https://oms.example.com\"\n",
+        )
+        .unwrap();
+        let o = cfg.oidc().unwrap();
+        assert!(!o.enable_signup && !o.merge_accounts_by_email);
+    }
+
+    #[test]
+    fn require_mfa_is_off_by_default_and_can_be_switched_on() {
+        assert!(!FileConfig::default().auth_settings().require_mfa);
+        let cfg: FileConfig = toml::from_str("[auth.local]\nrequire_mfa = true\n").unwrap();
+        let a = cfg.auth_settings();
+        assert!(a.require_mfa && a.local_enabled);
     }
 
     #[test]

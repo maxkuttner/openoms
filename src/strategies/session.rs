@@ -289,7 +289,7 @@ async fn run(state: AppState, mut inbound: mpsc::UnboundedReceiver<(SessionKey, 
 }
 
 pub(crate) fn auth(strategy: &Strategy) -> AuthContext {
-    AuthContext { principal_id: strategy.principal_id, principal_code: format!("strategy:{}", strategy.code) }
+    AuthContext::machine(strategy.principal_id, format!("strategy:{}", strategy.code))
 }
 
 fn rejected(cl_ord_id: &str, symbol: &str, side: Side, qty: f64, text: String) -> ClientReport {

@@ -13,7 +13,7 @@ Trading tokens are minted by an admin, once, and shown once:
 
 ```bash
 curl -X POST "$OMS_URL/admin/trading-tokens" \
-  -H "Authorization: Bearer $OMS_ADMIN_PASSWORD" \
+  -H "Authorization: Bearer $(cat ~/.config/oms/host-token)" \
   -H 'Content-Type: application/json' \
   -d '{"principal_id":"<uuid>","portfolio_id":"<uuid>","label":"my-laptop"}'
 ```

@@ -8,3 +8,5 @@ docs-site
 docs
 .env
 oms.toml
+# per-boot admin token the server writes beside oms.toml
+host-token
