@@ -749,3 +749,44 @@ async fn user_can_manage_own_api_keys() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_none());
 }
+
+/// Break-glass recovery also stops the admin's API keys.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn recover_revokes_api_keys() {
+    let pool = migrated_db().await;
+    let e = email();
+    let (id, _) = crate::admin_bootstrap::bootstrap(&pool, &e, None, crate::admin_bootstrap::HOST_CLI_ACTOR, true).await.unwrap();
+    sqlx::query("UPDATE local_credential SET must_change_password = false WHERE principal_id = $1").bind(id).execute(&pool).await.unwrap();
+    let (key_id, secret) = mint_key(&pool, id).await;
+    assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_some());
+    crate::admin_bootstrap::recover(&pool, &e, crate::admin_bootstrap::HOST_CLI_ACTOR).await.unwrap();
+    assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_none(), "recovery revokes keys");
+}
+
+/// A key of someone who must change a generated password does nothing until they do.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn api_key_refused_while_password_must_change() {
+    let pool = migrated_db().await;
+    let st = state(pool.clone(), false);
+    let e = email();
+    signup(&st, &e, PASSWORD).await;
+    let id: Uuid = sqlx::query_scalar("SELECT id FROM principal WHERE email = $1").bind(&e).fetch_one(&pool).await.unwrap();
+    let (key_id, secret) = mint_key(&pool, id).await;
+    assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_some());
+    sqlx::query("UPDATE local_credential SET must_change_password = true WHERE principal_id = $1").bind(id).execute(&pool).await.unwrap();
+    assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_none());
+}
+
+async fn mint_key(pool: &PgPool, principal: Uuid) -> (String, String) {
+    let m = crate::admin::generate_key_material().await.unwrap();
+    sqlx::query("INSERT INTO api_key (principal_id, key_id, secret_hash, name) VALUES ($1, $2, $3, 't')")
+        .bind(principal)
+        .bind(&m.key_id)
+        .bind(&m.secret_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+    (m.key_id, m.plaintext_secret)
+}

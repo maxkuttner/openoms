@@ -138,7 +138,7 @@ pub async fn bootstrap(
 
 /// Break-glass: give the admin a new generated password (returned once),
 /// remove their TOTP and recovery codes, unlock the credential and revoke
-/// every session. Audited `admin.recovered`.
+/// every session and API key. Audited `admin.recovered`.
 ///
 /// Run from the CLI, a separate process that cannot publish `AuthChanged`:
 /// the admin's open sockets close at their next 15 s heartbeat re-check.
@@ -185,7 +185,20 @@ pub async fn recover(pool: &PgPool, email: &str, actor: &str) -> Result<(Uuid, S
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    crate::accounts::audit(&mut tx, actor, "admin.recovered", principal_id, serde_json::json!({ "sessions_revoked": sessions })).await?;
+    // Whoever could not sign in may have lost a key too: none survive recovery.
+    let keys = sqlx::query("UPDATE api_key SET revoked_at = now() WHERE principal_id = $1 AND revoked_at IS NULL")
+        .bind(principal_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    crate::accounts::audit(
+        &mut tx,
+        actor,
+        "admin.recovered",
+        principal_id,
+        serde_json::json!({ "sessions_revoked": sessions, "keys_revoked": keys }),
+    )
+    .await?;
     tx.commit().await?;
     Ok((principal_id, password))
 }

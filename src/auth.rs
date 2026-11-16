@@ -135,8 +135,7 @@ pub const APPROVAL_PENDING_BODY: &str = r#"{"error":"approval_pending"}"#;
 /// that must change its password, may call. The others they may use
 /// (`/auth/methods`, `/auth/logout`, and for the latter `/auth/local/password`)
 /// carry no auth middleware at all.
-const PENDING_ALLOWED: &[&str] = &["/auth/me"];
-
+const GATED_ALLOWED: &[&str] = &["/auth/me"];
 
 /// The JSON body of the 403 a session on a host-CLI password gets.
 pub const PASSWORD_CHANGE_REQUIRED_BODY: &str = r#"{"error":"password_change_required"}"#;
@@ -152,7 +151,7 @@ pub fn password_change_required() -> Response {
 /// The refusal for a session that is PENDING or must change its password,
 /// unless `path` is one of the few routes it may still call.
 pub fn gate_for(pending: bool, must_change_password: bool, path: &str) -> Option<Response> {
-    if PENDING_ALLOWED.contains(&path) {
+    if GATED_ALLOWED.contains(&path) {
         None
     } else if pending {
         Some(approval_pending())
@@ -286,6 +285,8 @@ pub async fn verify_key(
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         WHERE k.key_id = $1 AND k.revoked_at IS NULL AND p.status = 'ACTIVE'
+          AND NOT EXISTS (SELECT 1 FROM local_credential c
+                           WHERE c.principal_id = k.principal_id AND c.must_change_password)
         "#,
     )
     .bind(key_id)
