@@ -1,5 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import path from "node:path";
 
 // Dev: proxy the admin/order API to the running OMS so there is no CORS to deal with.
 // The OMS listens on :3001 (see src/main.rs). Override with OMS_URL if needed.
@@ -23,7 +25,8 @@ function rewriteOriginHeader(proxy: import("http-proxy").default) {
 }
 
 export default defineConfig(({ command }) => ({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
+  resolve: { alias: { "@": path.resolve(__dirname, "src") } },
   // Both bundles share one asset tree; each app's SHELL is served at its own
   // path (/cockpit/, /trade/) by src/cockpit.rs. Vite's base is global per
   // build, so it cannot be either app's path.
