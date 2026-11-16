@@ -94,8 +94,8 @@ export function InstrumentSelect({
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <Button type="button" variant="outline" role="combobox" aria-expanded={open}
-            className="h-8 w-full justify-between bg-background px-2.5 font-normal">
-            <span className={cn("truncate", !current && "text-muted-foreground")}>
+            className="h-8 w-full min-w-0 justify-between bg-background px-2.5 font-normal">
+            <span className={cn("min-w-0 truncate", !current && "text-muted-foreground")}>
               {current ?? placeholder ?? "Search symbol or name…"}
             </span>
             <ChevronsUpDown className="size-3.5 opacity-50" />
