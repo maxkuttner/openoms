@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { ChevronsUpDown, ExternalLink, LogOut, Settings, Shield, KeyRound } from "lucide-react";
+import { ChevronsUpDown, ExternalLink, LogOut, Settings, Shield } from "lucide-react";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -21,7 +21,6 @@ export function UserMenu({ onSignOut }: { onSignOut: () => void }) {
       <DropdownMenuContent side="top" align="start" className="w-52">
         <DropdownMenuLabel className="truncate text-xs text-muted-foreground">{me.code}</DropdownMenuLabel>
         <DropdownMenuItem asChild><Link to="/settings"><Settings /> Settings</Link></DropdownMenuItem>
-        <DropdownMenuItem asChild><Link to="/access"><KeyRound /> Access</Link></DropdownMenuItem>
         {admin && <DropdownMenuItem asChild><Link to="/admin"><Shield /> Admin Panel</Link></DropdownMenuItem>}
         <DropdownMenuItem asChild>
           <a href="https://openoms.dev/" target="_blank" rel="noreferrer"><ExternalLink /> Docs</a>

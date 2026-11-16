@@ -12,7 +12,6 @@ export const SIDEBAR: Page[] = [
 
 export const ACCOUNT_PAGES: Page[] = [
   { id: "settings", title: "Settings", path: "/settings" },
-  { id: "access", title: "Access", path: "/access" },
 ];
 
 const admin = (id: string, title: string): Page => ({ id, title, path: `/admin/${id}` });
