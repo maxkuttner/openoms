@@ -22,14 +22,6 @@ use uuid::Uuid;
 
 use crate::oidc::VerifiedIdentity;
 
-/// Portfolio roles a person can hold. `strategy` belongs to algorithms only.
-const ASSIGNABLE_ROLES: [&str; 3] = ["pm", "trader", "viewer"];
-
-/// Whether `role` is a portfolio role a person can hold.
-pub fn is_assignable_role(role: &str) -> bool {
-    ASSIGNABLE_ROLES.contains(&role)
-}
-
 /// The account-level role (admin / user / pending).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -406,6 +398,5 @@ mod tests {
         assert_eq!(slugify("Ada.Lovelace+x"), "ada-lovelace-x");
         assert_eq!(normalise_email(" Ada@Example.COM ").unwrap(), "ada@example.com");
         assert!(normalise_email("ada").is_err());
-        assert!(is_assignable_role("pm") && !is_assignable_role("strategy"));
     }
 }

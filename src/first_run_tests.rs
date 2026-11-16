@@ -434,36 +434,48 @@ async fn mfa_optional_by_default_allows_order_without_totp() {
     assert_eq!(submit_status(&st, &cookie, id).await, StatusCode::SERVICE_UNAVAILABLE, "authorized; only routing fails");
 }
 
-#[tokio::test]
-#[ignore = "requires a live Postgres (seeded); run with --ignored"]
-async fn mfa_required_config_restores_strict_mode() {
-    let st = state(crate::handlers::tests::test_pool().await, true);
-    let (id, cookie, next) = enrolled_trader(&st, &email()).await;
-    assert_eq!(next, "totp_enroll");
-    assert_eq!(session_mfa(st.pool(), &cookie).await, Some(false));
-    assert_eq!(submit_status(&st, &cookie, id).await, StatusCode::FORBIDDEN);
-    let (_, cookie) = enrol_totp(&st, &cookie).await;
-    assert_eq!(session_mfa(st.pool(), &cookie).await, Some(true));
+/// Whether the session behind `cookie` passes the MFA gate on order and
+/// admin mutations. TOTP tests run on their own database: a TOTP secret
+/// sealed with the test key must never land in the shared one.
+async fn passes_mfa_gate(st: &AppState, cookie: &str) -> bool {
+    let (ctx, _) = crate::auth::authenticate(st.pool(), &hdrs(Some(cookie)), &st.session_config)
+        .await
+        .ok()
+        .flatten()
+        .expect("the session authenticates");
+    crate::authz::require_mfa(&ctx).is_ok()
 }
 
 #[tokio::test]
-#[ignore = "requires a live Postgres (seeded); run with --ignored"]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn mfa_required_config_restores_strict_mode() {
+    let st = state(migrated_db().await, true);
+    let (_, cookie, next) = enrolled_trader(&st, &email()).await;
+    assert_eq!(next, "totp_enroll");
+    assert_eq!(session_mfa(st.pool(), &cookie).await, Some(false));
+    assert!(!passes_mfa_gate(&st, &cookie).await);
+    let (_, cookie) = enrol_totp(&st, &cookie).await;
+    assert_eq!(session_mfa(st.pool(), &cookie).await, Some(true));
+    assert!(passes_mfa_gate(&st, &cookie).await);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
 async fn enrolled_totp_still_required_at_login_when_optional() {
-    let st = state(crate::handlers::tests::test_pool().await, false);
+    let st = state(migrated_db().await, false);
     let e = email();
-    let (id, cookie, _) = enrolled_trader(&st, &e).await;
+    let (_, cookie, _) = enrolled_trader(&st, &e).await;
     let (uri, _) = enrol_totp(&st, &cookie).await;
 
     let resp = login(&st, &e, PASSWORD).await;
     let cookie = cookie_of(&resp);
     assert_eq!(json(resp).await, serde_json::json!({ "next": "totp" }));
     assert_eq!(session_mfa(st.pool(), &cookie).await, Some(false));
-    assert_eq!(submit_status(&st, &cookie, id).await, StatusCode::FORBIDDEN);
+    assert!(!passes_mfa_gate(&st, &cookie).await);
 
     let resp = la_api::totp(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: code(&uri, 30) })).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let cookie = cookie_of(&resp);
-    assert_eq!(submit_status(&st, &cookie, id).await, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(passes_mfa_gate(&st, &cookie_of(&resp)).await);
 }
 
 #[tokio::test]
@@ -696,4 +708,44 @@ async fn legacy_admin_sessions_are_no_session() {
     .unwrap();
     assert_eq!(send(&st, "GET", "/auth/me", Some(token), None, None).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(send(&st, "GET", "/admin/users", Some(token), None, None).await.0, StatusCode::UNAUTHORIZED);
+}
+
+/// Open WebUI's per-user keys: a signed-in user lists, creates and revokes
+/// their own keys, which act with that user's access; nobody else's.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn user_can_manage_own_api_keys() {
+    let pool = migrated_db().await;
+    let st = state(pool.clone(), false);
+    let me = email();
+    signup(&st, &email(), PASSWORD).await; // the admin
+    let cookie = cookie_of(&signup(&st, &me, PASSWORD).await);
+    let my_id: Uuid = sqlx::query_scalar("SELECT id FROM principal WHERE email = $1").bind(&me).fetch_one(&pool).await.unwrap();
+
+    let (status, text, _) = send(&st, "POST", "/auth/keys", Some(&cookie), None, Some(serde_json::json!({ "name": "laptop" }))).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let key: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let (key_id, secret) = (key["key_id"].as_str().unwrap().to_string(), key["secret"].as_str().unwrap().to_string());
+    let (who, _) = crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().expect("the key works");
+    assert_eq!(who, my_id, "it acts as me");
+
+    let (_, text, _) = send(&st, "GET", "/auth/keys", Some(&cookie), None, None).await;
+    let keys: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(keys.as_array().unwrap().len(), 1);
+    assert!(keys[0].get("secret").is_none_or(|s| s.is_null()), "the secret is shown once");
+
+    // A key cannot mint keys.
+    let bearer = format!("{key_id}.{secret}");
+    let (status, _, _) = send(&st, "POST", "/auth/keys", None, Some(&bearer), Some(serde_json::json!({ "name": "x" }))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Someone else's key is not mine to revoke.
+    let other = email();
+    let other_cookie = cookie_of(&signup(&st, &other, PASSWORD).await);
+    let (status, _, _) = send(&st, "DELETE", &format!("/auth/keys/{key_id}"), Some(&other_cookie), None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, _) = send(&st, "DELETE", &format!("/auth/keys/{key_id}"), Some(&cookie), None, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_none());
 }

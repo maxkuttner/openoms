@@ -23,7 +23,7 @@ async fn may_pick(state: &AppState, caller: Uuid, portfolio: Uuid, responsible: 
         return Ok(());
     }
     let granted: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant WHERE principal_id = $1 AND portfolio_id = $2 AND can_view)",
+        "SELECT EXISTS (SELECT 1 FROM portfolio_access WHERE principal_id = $1 AND portfolio_id = $2 AND can_view)",
     )
     .bind(responsible)
     .bind(portfolio)

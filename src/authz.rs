@@ -1,5 +1,8 @@
 //! Role and portfolio permission checks. A role is data (`role_permission`);
-//! a portfolio grant says where a principal may act. Both must allow.
+//! `portfolio_access` (a view) says where a principal may act and with which
+//! role: a person's highest group access there (manage = pm, trade = trader,
+//! view = viewer), or a strategy's direct grant with its own role. Both must
+//! allow; no row means no access.
 
 use axum::http::StatusCode;
 use sqlx::PgPool;
@@ -45,14 +48,14 @@ impl Permission {
     }
 }
 
-/// Portfolios on which `principal_id` holds `perm`: ACTIVE, role has the
-/// permission, grant has `can_view` (and `can_trade` for order actions).
+/// Portfolios on which `principal_id` holds `perm`: ACTIVE, the access row's
+/// role has the permission, the row has `can_view` (and `can_trade` for order
+/// actions).
 const VISIBLE_SQL: &str = "\
     SELECT g.portfolio_id \
       FROM principal p \
-      JOIN principal_role pr ON pr.principal_id = p.id \
-      JOIN role_permission rp ON rp.role_code = pr.role_code AND rp.permission = $2 \
-      JOIN principal_portfolio_grant g ON g.principal_id = p.id \
+      JOIN portfolio_access g ON g.principal_id = p.id \
+      JOIN role_permission rp ON rp.role_code = g.role_code AND rp.permission = $2 \
      WHERE p.id = $1 AND p.status = 'ACTIVE' \
        AND g.can_view AND (g.can_trade OR NOT $3)";
 

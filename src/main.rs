@@ -21,6 +21,7 @@ mod local_auth_api;
 mod auth_api;
 mod accounts;
 mod users_api;
+mod groups_api;
 mod admin_bootstrap;
 mod authz;
 mod limits_api;
@@ -966,8 +967,11 @@ fn build_app(
         .route("/admin/auth/status", get(users_api::auth_status))
         .route("/admin/users/:id/approve", post(users_api::approve_user))
         .route("/admin/users/:id/reject", post(users_api::reject_user))
-        .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
-        .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
+        .route("/admin/users/:id/groups", axum::routing::put(users_api::set_groups))
+        .route("/admin/groups", get(groups_api::list_groups).post(groups_api::create_group))
+        .route("/admin/groups/:id", axum::routing::put(groups_api::update_group).delete(groups_api::delete_group))
+        .route("/admin/groups/:id/members", axum::routing::put(groups_api::set_members))
+        .route("/admin/groups/:id/portfolios", axum::routing::put(groups_api::set_portfolios))
         .route("/admin/users/:id/admin", axum::routing::put(users_api::set_admin))
         .route("/admin/users/:id/disable", post(users_api::disable_user))
         .route("/admin/users/:id/enable", post(users_api::enable_user))
@@ -1138,6 +1142,8 @@ fn build_app(
         app = app.merge(local_auth_api::routes(local_auth));
         let me_router = Router::new()
             .route("/auth/me", get(auth_api::me))
+            .route("/auth/keys", get(users_api::list_own_keys).post(users_api::create_own_key))
+            .route("/auth/keys/:key_id", axum::routing::delete(users_api::revoke_own_key))
             .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
         let logout_router = Router::new().route("/auth/logout", post(auth_api::logout));
         app = app.merge(me_router).merge(logout_router).merge(cockpit::trade_router());

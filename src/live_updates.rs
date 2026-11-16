@@ -703,14 +703,25 @@ mod tests {
         assert!(quiet.is_err(), "no grant yet: no notice");
 
         let admin = AuthContext::machine(Uuid::new_v4(), "ws-test-admin".into());
-        crate::users_api::set_portfolios(
+        let (_, created) = crate::groups_api::create_group(
             axum::extract::State(state.clone()),
-            axum::Extension(admin),
-            axum::extract::Path(me),
-            axum::Json(vec![crate::users_api::PortfolioAccess { portfolio_id: portfolio, can_trade: false }]),
+            axum::Extension(admin.clone()),
+            axum::Json(crate::groups_api::GroupBody { name: format!("ws-{}", Uuid::new_v4().simple()), description: None }),
         )
         .await
         .unwrap();
+        let group: Uuid = created.0["id"].as_str().unwrap().parse().unwrap();
+        crate::groups_api::set_portfolios(
+            axum::extract::State(state.clone()),
+            axum::Extension(admin.clone()),
+            axum::extract::Path(group),
+            axum::Json(vec![crate::groups_api::GroupPortfolio { portfolio_id: portfolio, code: String::new(), access: crate::groups_api::Access::View }]),
+        )
+        .await
+        .unwrap();
+        crate::groups_api::set_members(axum::extract::State(state.clone()), axum::Extension(admin), axum::extract::Path(group), axum::Json(vec![me]))
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         bus.publish_order(appended());
         let frame = tokio::time::timeout(std::time::Duration::from_secs(3), socket.next())

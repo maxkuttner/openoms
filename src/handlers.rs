@@ -499,7 +499,7 @@ pub async fn list_portfolios(
     let rows = sqlx::query(
         "SELECT p.id, p.code, p.name, p.status, p.base_currency, \
                 g.portfolio_id = ANY($3) AS can_trade, g.can_view, g.can_allocate \
-         FROM principal_portfolio_grant g \
+         FROM portfolio_access g \
          JOIN portfolio p ON p.id = g.portfolio_id \
          WHERE g.principal_id = $1 AND g.portfolio_id = ANY($2) \
          ORDER BY p.code",
@@ -792,7 +792,7 @@ pub async fn create_allocations(
     // carries can_allocate there, and the block order is one the caller may see.
     let fail = |e| internal("failed to check allocation access", e);
     let can_allocate: bool = query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM principal_portfolio_grant \
+        "SELECT EXISTS (SELECT 1 FROM portfolio_access \
          WHERE principal_id = $1 AND portfolio_id = $2 AND can_allocate = true)",
     )
     .bind(auth.principal_id)

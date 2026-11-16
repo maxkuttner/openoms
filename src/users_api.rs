@@ -16,17 +16,18 @@ use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::handlers::ApiError;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PortfolioAccess {
-    pub portfolio_id: Uuid,
-    pub can_trade: bool,
-}
-
+/// A user's effective access on one portfolio: the highest across their groups.
 #[derive(Debug, Serialize)]
 pub struct UserPortfolio {
     pub portfolio_id: Uuid,
     pub code: String,
-    pub can_trade: bool,
+    pub access: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserGroupRef {
+    pub id: Uuid,
+    pub name: String,
 }
 
 
@@ -36,7 +37,7 @@ pub struct UserRow {
     pub code: String,
     pub display_name: Option<String>,
     pub email: Option<String>,
-    pub role: Option<String>,
+    pub groups: Vec<UserGroupRef>,
     pub portfolios: Vec<UserPortfolio>,
     /// Host of the issuer the user last signed in with.
     pub sign_in: Option<String>,
@@ -62,19 +63,12 @@ pub struct AddedUser {
     pub user_id: Uuid,
 }
 
-/// `POST /admin/users/:id/approve`: activate a pending account, optionally
-/// with a portfolio role and portfolio access in the same step.
+/// `POST /admin/users/:id/approve`: activate a pending account as a `user`,
+/// in these groups.
 #[derive(Debug, Default, Deserialize)]
 pub struct Approve {
     #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub portfolios: Vec<PortfolioAccess>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SetRole {
-    pub role: String,
+    pub groups: Vec<Uuid>,
 }
 
 fn api_error(status: StatusCode, message: impl Into<String>) -> ApiError {
@@ -87,14 +81,6 @@ fn db(err: sqlx::Error) -> ApiError {
 
 fn is_violation(err: &sqlx::Error, check: impl Fn(&dyn sqlx::error::DatabaseError) -> bool) -> bool {
     matches!(err, sqlx::Error::Database(d) if check(d.as_ref()))
-}
-
-fn require_role(role: &str) -> Result<(), ApiError> {
-    if crate::accounts::is_assignable_role(role) {
-        Ok(())
-    } else {
-        Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "role must be pm, trader or viewer"))
-    }
 }
 
 /// `https://login.example.org/realms/x` -> `login.example.org`.
@@ -134,13 +120,12 @@ async fn lock_human(tx: &mut Transaction<'_, Postgres>, id: Uuid) -> Result<Stri
 /// Users (HUMAN only), newest first; `only` narrows to one.
 async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, ApiError> {
     let rows = sqlx::query(
-        "SELECT p.id, p.code, p.display_name, p.email, p.status, r.role_code, \
+        "SELECT p.id, p.code, p.display_name, p.email, p.status, \
                 (SELECT i.issuer FROM principal_identity i \
                   WHERE i.principal_id = p.id AND i.last_login_at IS NOT NULL \
                   ORDER BY i.last_login_at DESC LIMIT 1) AS issuer, \
                 EXISTS (SELECT 1 FROM principal_admin a WHERE a.principal_id = p.id) AS admin \
            FROM principal p \
-           LEFT JOIN principal_role r ON r.principal_id = p.id \
           WHERE p.principal_type = 'HUMAN' AND ($1::uuid IS NULL OR p.id = $1) \
           ORDER BY p.created_at DESC, p.code",
     )
@@ -149,10 +134,18 @@ async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, 
     .await
     .map_err(db)?;
     let grants = sqlx::query(
-        "SELECT g.principal_id, g.portfolio_id, pf.code, g.can_trade \
-           FROM principal_portfolio_grant g JOIN portfolio pf ON pf.id = g.portfolio_id \
+        "SELECT g.principal_id, g.portfolio_id, pf.code, g.role_code \
+           FROM portfolio_access g JOIN portfolio pf ON pf.id = g.portfolio_id \
           WHERE g.can_view AND ($1::uuid IS NULL OR g.principal_id = $1) \
           ORDER BY pf.code",
+    )
+    .bind(only)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    let groups = sqlx::query(
+        "SELECT m.principal_id, g.id, g.name FROM user_group_member m JOIN user_group g ON g.id = m.group_id \
+          WHERE ($1::uuid IS NULL OR m.principal_id = $1) ORDER BY lower(g.name)",
     )
     .bind(only)
     .fetch_all(pool)
@@ -168,14 +161,22 @@ async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, 
                 code: r.get("code"),
                 display_name: r.get("display_name"),
                 email: r.get("email"),
-                role: r.get("role_code"),
+                groups: groups
+                    .iter()
+                    .filter(|g| g.get::<Uuid, _>("principal_id") == id)
+                    .map(|g| UserGroupRef { id: g.get("id"), name: g.get("name") })
+                    .collect(),
                 portfolios: grants
                     .iter()
                     .filter(|g| g.get::<Uuid, _>("principal_id") == id)
                     .map(|g| UserPortfolio {
                         portfolio_id: g.get("portfolio_id"),
                         code: g.get("code"),
-                        can_trade: g.get("can_trade"),
+                        access: match g.get::<Option<String>, _>("role_code").as_deref() {
+                            Some("pm") => "manage",
+                            Some("trader") => "trade",
+                            _ => "view",
+                        },
                     })
                     .collect(),
                 sign_in: r.get::<Option<String>, _>("issuer").map(|i| issuer_host(&i)),
@@ -226,17 +227,14 @@ pub async fn add_user(
     Ok((StatusCode::CREATED, Json(AddedUser { user_id: id })))
 }
 
-/// Approve a pending account: it becomes an active `user`, with the given
-/// portfolio role and access, if any. Audited `signup.approved`.
+/// Approve a pending account: it becomes an active `user`, in the given
+/// groups. Audited `signup.approved`.
 pub async fn approve_user(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
     Path(id): Path<Uuid>,
     Json(p): Json<Approve>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(role) = &p.role {
-        require_role(role)?;
-    }
     let mut tx = state.pool().begin().await.map_err(db)?;
     if lock_human(&mut tx, id).await? != "PENDING" {
         return Err(api_error(StatusCode::CONFLICT, "user is not pending"));
@@ -246,19 +244,24 @@ pub async fn approve_user(
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-    if let Some(role) = &p.role {
-        sqlx::query(
-            "INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2) \
-             ON CONFLICT (principal_id) DO UPDATE SET role_code = EXCLUDED.role_code",
-        )
-        .bind(id)
-        .bind(role)
-        .execute(&mut *tx)
-        .await
-        .map_err(db)?;
-    }
-    write_grants(&mut tx, id, &p.portfolios).await?;
-    audit(&mut tx, &ctx, "signup.approved", id, serde_json::json!({ "role": p.role, "portfolios": p.portfolios })).await?;
+    crate::groups_api::set_user_groups(&mut tx, id, &p.groups).await?;
+    audit(&mut tx, &ctx, "signup.approved", id, serde_json::json!({ "groups": p.groups })).await?;
+    tx.commit().await.map_err(db)?;
+    state.event_bus().publish_auth_changed(id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /admin/users/:id/groups`: put the user in exactly these groups.
+pub async fn set_groups(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(groups): Json<Vec<Uuid>>,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = state.pool().begin().await.map_err(db)?;
+    lock_human(&mut tx, id).await?;
+    crate::groups_api::set_user_groups(&mut tx, id, &groups).await?;
+    audit(&mut tx, &ctx, "user.groups_changed", id, serde_json::json!({ "groups": groups })).await?;
     tx.commit().await.map_err(db)?;
     state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
@@ -282,87 +285,6 @@ pub async fn reject_user(State(state): State<AppState>, Extension(ctx): Extensio
         .await
         .map_err(db)?;
     audit(&mut tx, &ctx, "signup.rejected", id, serde_json::json!({})).await?;
-    tx.commit().await.map_err(db)?;
-    state.event_bus().publish_auth_changed(id);
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub async fn set_role(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-    Json(p): Json<SetRole>,
-) -> Result<StatusCode, ApiError> {
-    require_role(&p.role)?;
-    let mut tx = state.pool().begin().await.map_err(db)?;
-    lock_human(&mut tx, id).await?;
-    let from: Option<String> = sqlx::query_scalar("SELECT role_code FROM principal_role WHERE principal_id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(db)?;
-    sqlx::query(
-        "INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2) \
-         ON CONFLICT (principal_id) DO UPDATE SET role_code = EXCLUDED.role_code",
-    )
-    .bind(id)
-    .bind(&p.role)
-    .execute(&mut *tx)
-    .await
-    .map_err(db)?;
-    audit(&mut tx, &ctx, "user.role_changed", id, serde_json::json!({ "from": from, "to": p.role })).await?;
-    tx.commit().await.map_err(db)?;
-    state.event_bus().publish_auth_changed(id);
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Replace `id`'s portfolio access with exactly `grants`.
-async fn write_grants(tx: &mut Transaction<'_, Postgres>, id: Uuid, grants: &[PortfolioAccess]) -> Result<(), ApiError> {
-    let ids: Vec<Uuid> = grants.iter().map(|g| g.portfolio_id).collect();
-    sqlx::query("DELETE FROM principal_portfolio_grant WHERE principal_id = $1 AND NOT (portfolio_id = ANY($2))")
-        .bind(id)
-        .bind(&ids)
-        .execute(&mut **tx)
-        .await
-        .map_err(db)?;
-    for g in grants {
-        sqlx::query(
-            // The trade toggle also controls allocation out of the portfolio.
-            "INSERT INTO principal_portfolio_grant \
-                (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \
-             VALUES ($1, $2, $3, $4, true, $4) \
-             ON CONFLICT (principal_id, portfolio_id) \
-             DO UPDATE SET can_trade = EXCLUDED.can_trade, can_allocate = EXCLUDED.can_allocate, \
-                           can_view = true, updated_at = now()",
-        )
-        .bind(Uuid::new_v4())
-        .bind(id)
-        .bind(g.portfolio_id)
-        .bind(g.can_trade)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            if is_violation(&e, |d| d.is_foreign_key_violation()) {
-                api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown portfolio")
-            } else {
-                db(e)
-            }
-        })?;
-    }
-    Ok(())
-}
-
-/// Replace the user's portfolio access with exactly `grants`.
-pub async fn set_portfolios(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-    Json(grants): Json<Vec<PortfolioAccess>>,
-) -> Result<StatusCode, ApiError> {
-    let mut tx = state.pool().begin().await.map_err(db)?;
-    lock_human(&mut tx, id).await?;
-    write_grants(&mut tx, id, &grants).await?;
-    audit(&mut tx, &ctx, "user.portfolios_changed", id, serde_json::json!({ "portfolios": grants })).await?;
     tx.commit().await.map_err(db)?;
     state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
@@ -570,6 +492,50 @@ pub async fn revoke_key(
     tx.commit().await.map_err(db)?;
     state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── your own API keys (settings) ───────────────────────────────────────────
+
+/// Only a signed-in person manages their own keys: an API key cannot mint or
+/// revoke keys, and creating or revoking one is a mutation behind the MFA gate.
+fn own_keys_session(ctx: &AuthContext, mutation: bool) -> Result<(), ApiError> {
+    use crate::auth::AuthMethod;
+    if !matches!(ctx.auth_method, AuthMethod::Local | AuthMethod::Oidc) {
+        return Err(api_error(StatusCode::FORBIDDEN, "sign in to manage your API keys"));
+    }
+    if mutation {
+        crate::authz::require_mfa(ctx)?;
+    }
+    Ok(())
+}
+
+/// `GET /auth/keys`: the signed-in user's active keys.
+pub async fn list_own_keys(state: State<AppState>, Extension(ctx): Extension<AuthContext>) -> Result<Json<Vec<ApiKeyRecord>>, ApiError> {
+    own_keys_session(&ctx, false)?;
+    list_keys(state, Path(ctx.principal_id)).await
+}
+
+/// `POST /auth/keys`: a key acting as the signed-in user, with their group
+/// access; the secret is in this response only.
+pub async fn create_own_key(
+    state: State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    body: Json<CreateKey>,
+) -> Result<Json<ApiKeyRecord>, ApiError> {
+    own_keys_session(&ctx, true)?;
+    let id = ctx.principal_id;
+    create_key(state, Extension(ctx), Path(id), body).await
+}
+
+/// `DELETE /auth/keys/:key_id`: revoke one of the signed-in user's own keys.
+pub async fn revoke_own_key(
+    state: State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(key_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    own_keys_session(&ctx, true)?;
+    let id = ctx.principal_id;
+    revoke_key(state, Extension(ctx), Path((id, key_id))).await
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -789,7 +755,7 @@ mod tests {
 
     async fn grant_flags(pool: &PgPool, principal_id: Uuid, portfolio_id: Uuid) -> (bool, bool) {
         let row = sqlx::query(
-            "SELECT can_trade, can_allocate FROM principal_portfolio_grant \
+            "SELECT can_trade, can_allocate FROM portfolio_access \
               WHERE principal_id = $1 AND portfolio_id = $2",
         )
         .bind(principal_id)
@@ -798,76 +764,6 @@ mod tests {
         .await
         .unwrap();
         (row.get("can_trade"), row.get("can_allocate"))
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn set_portfolios_sets_can_allocate_with_can_trade() {
-        let pool = migrated_db().await;
-        let st = state(&pool, Some(BASE)).await;
-        let (id, ..) = active_user(&pool, &st).await;
-        let p = portfolio(&pool).await;
-        for trade in [true, false, true] {
-            set_portfolios(State(st.clone()), Extension(actor()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: trade }]))
-                .await
-                .unwrap();
-            assert_eq!(grant_flags(&pool, id, p).await, (trade, trade));
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn role_change_is_audited() {
-        let pool = migrated_db().await;
-        let st = state(&pool, Some(BASE)).await;
-        let (id, ..) = active_user(&pool, &st).await;
-        let p = portfolio(&pool).await;
-
-        set_role(State(st.clone()), Extension(actor()), Path(id), Json(SetRole { role: "viewer".into() })).await.unwrap();
-        let role: String = sqlx::query_scalar("SELECT role_code FROM principal_role WHERE principal_id = $1")
-            .bind(id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(role, "viewer");
-        let detail: serde_json::Value = sqlx::query_scalar(
-            "SELECT detail FROM audit_event WHERE action = 'user.role_changed' AND target_principal_id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(detail["from"], "trader");
-        assert_eq!(detail["to"], "viewer");
-
-        let bad = set_role(State(st.clone()), Extension(actor()), Path(id), Json(SetRole { role: "strategy".into() }))
-            .await
-            .unwrap_err();
-        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
-        let none = set_role(State(st.clone()), Extension(actor()), Path(Uuid::new_v4()), Json(SetRole { role: "pm".into() }))
-            .await
-            .unwrap_err();
-        assert_eq!(none.status, StatusCode::NOT_FOUND);
-
-        // Portfolio access is replaced wholesale and audited.
-        set_portfolios(State(st.clone()), Extension(actor()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: true }]))
-            .await
-            .unwrap();
-        set_portfolios(State(st.clone()), Extension(actor()), Path(id), Json(vec![PortfolioAccess { portfolio_id: p, can_trade: false }]))
-            .await
-            .unwrap();
-        let rows = list_users(State(st.clone())).await.unwrap().0;
-        let me = rows.iter().find(|u| u.principal_id == id).unwrap();
-        assert_eq!(me.portfolios.len(), 1);
-        assert!(!me.portfolios[0].can_trade);
-        assert_eq!(audit_count(&pool, "user.portfolios_changed", id).await, 2);
-        let unknown = set_portfolios(State(st), Extension(actor()),
-            Path(id),
-            Json(vec![PortfolioAccess { portfolio_id: Uuid::new_v4(), can_trade: false }]),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(unknown.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
@@ -898,7 +794,6 @@ mod tests {
         let users = list_users(State(st.clone())).await.unwrap().0;
         assert!(users.iter().all(|u| u.principal_id != sid));
         let me = users.iter().find(|u| u.principal_id == human).unwrap();
-        assert_eq!(me.role.as_deref(), Some("trader"));
         assert_eq!(me.sign_in.as_deref(), Some("login.example.org"));
         // Strategies are not reachable through the user routes either.
         let err = disable_user(State(st), Extension(actor()), Path(sid)).await.unwrap_err();
@@ -969,10 +864,15 @@ mod tests {
         let st = state(&pool, Some(BASE)).await;
         let id = pending_user(&pool).await;
         let pf = portfolio(&pool).await;
-        let body = Approve { role: Some("trader".into()), portfolios: vec![PortfolioAccess { portfolio_id: pf, can_trade: true }] };
+        let g = Uuid::new_v4();
+        sqlx::query("INSERT INTO user_group (id, name) VALUES ($1, 'desk')").bind(g).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO user_group_portfolio (group_id, portfolio_id, access) VALUES ($1, $2, 'trade')").bind(g).bind(pf).execute(&pool).await.unwrap();
+        let body = Approve { groups: vec![g] };
         assert_eq!(approve_user(State(st.clone()), Extension(actor()), Path(id), Json(body)).await.unwrap(), StatusCode::NO_CONTENT);
         let row = fetch_users(&pool, Some(id)).await.unwrap().pop().unwrap();
-        assert_eq!((row.status.as_str(), row.account_role, row.role.as_deref()), ("ACTIVE", "user", Some("trader")));
+        assert_eq!((row.status.as_str(), row.account_role), ("ACTIVE", "user"));
+        assert_eq!(row.groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["desk"]);
+        assert_eq!((row.portfolios.len(), row.portfolios[0].access), (1, "trade"));
         assert_eq!(grant_flags(&pool, id, pf).await, (true, true));
         assert_eq!(audit_count(&pool, "signup.approved", id).await, 1);
         let again = approve_user(State(st.clone()), Extension(actor()), Path(id), Json(Approve::default())).await.unwrap_err();
@@ -1063,12 +963,10 @@ mod tests {
         let ada = admin(&pool).await;
         let (id, ..) = active_user(&pool, &st).await;
 
-        set_role(State(st.clone()), Extension(ada.clone()), Path(id), Json(SetRole { role: "viewer".into() }))
-            .await
-            .unwrap();
+        set_groups(State(st.clone()), Extension(ada.clone()), Path(id), Json(vec![])).await.unwrap();
         let added = add(&st, &ada, &format!("{}@fundco.com", Uuid::new_v4().simple()), AccountRole::User).await;
 
-        for (action, target) in [("user.role_changed", id), ("user.added", added)] {
+        for (action, target) in [("user.groups_changed", id), ("user.added", added)] {
             let actor: String = sqlx::query_scalar("SELECT actor FROM audit_event WHERE action = $1 AND target_principal_id = $2")
                 .bind(action)
                 .bind(target)

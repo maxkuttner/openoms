@@ -562,7 +562,7 @@ pub async fn me(
     let rows = sqlx::query(
         "SELECT p.id, p.code, p.name, p.status, p.base_currency, \
                 g.can_trade, g.can_view, g.can_allocate \
-         FROM principal_portfolio_grant g \
+         FROM portfolio_access g \
          JOIN portfolio p ON p.id = g.portfolio_id \
          WHERE g.principal_id = $1 \
          ORDER BY p.code",
