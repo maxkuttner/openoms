@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
-import { Button, Indicator, Loader } from "@mantine/core";
+import { Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { useJobs } from "../api/jobs";
 import { TaskCenter } from "./TaskCenter";
 
@@ -27,17 +29,13 @@ export function JobsIndicator() {
   return (
     <>
       {(running > 0 || failedSinceSeen || opened) && (
-        <Indicator color="red" size={8} disabled={!failedSinceSeen} offset={4}>
-          <Button
-            variant="light"
-            size="xs"
-            color={running > 0 ? "teal" : "gray"}
-            leftSection={running > 0 ? <Loader size={10} color="teal" /> : undefined}
-            onClick={() => setOpened(true)}
-          >
+        <span className="relative">
+          <Button size="xs" variant="secondary" className={cn(running > 0 && "text-buy")} onClick={() => setOpened(true)}>
+            {running > 0 && <Loader2 className="animate-spin" />}
             {label}
           </Button>
-        </Indicator>
+          {failedSinceSeen && <span className="absolute -top-0.5 -right-0.5 size-2 rounded-full bg-sell" aria-label="A job failed" />}
+        </span>
       )}
       <TaskCenter opened={opened} onClose={() => setOpened(false)} jobs={jobs} />
     </>

@@ -39,12 +39,12 @@ export const JOB_KIND_LABEL: Record<string, string> = {
   expiry_sweep: "Expiry sweep",
 };
 
-export const JOB_STATUS_COLOR: Record<JobStatus, string> = {
-  queued: "gray",
-  running: "brand",
-  succeeded: "green",
-  failed: "red",
-  interrupted: "amber",
+export const JOB_STATUS_TONE: Record<JobStatus, "muted" | "info" | "buy" | "sell" | "warn"> = {
+  queued: "muted",
+  running: "info",
+  succeeded: "buy",
+  failed: "sell",
+  interrupted: "warn",
 };
 
 export const isActive = (j: JobRecord) => j.status === "queued" || j.status === "running";

@@ -1,15 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
-import { Badge, Group, Loader, Paper, Stack, Text, Tooltip } from "@mantine/core";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Spinner } from "./common";
+import { Pill, type Tone } from "./status";
 import { api } from "../api/client";
 import type { StreamHealth } from "../api/types";
 import { ago, healthLabel } from "../streamHealth";
 
 const PATH = "/admin/stream-health";
 
-const STATE_COLOR: Record<StreamHealth["state"], string> = {
-  live: "green",
-  connecting: "yellow",
-  down: "red",
+const STATE_TONE: Record<StreamHealth["state"], Tone> = {
+  live: "buy",
+  connecting: "warn",
+  down: "sell",
 };
 
 /**
@@ -32,52 +34,30 @@ export function StreamHealthStrip({
     refetchInterval: 5000,
   });
 
-  if (isLoading) return <Loader size="sm" />;
+  if (isLoading) return <Spinner />;
   if (isError) return null;
   const streams = (data ?? []).filter((s) => s.kind === kind);
-  if (streams.length === 0) {
-    return (
-      <Text size="sm" c="dimmed">
-        {emptyText}
-      </Text>
-    );
-  }
+  if (streams.length === 0) return <p className="text-muted-foreground">{emptyText}</p>;
 
   return (
-    <Stack gap="xs">
-      <Text size="sm" fw={600}>
-        {title}
-      </Text>
-      <Group gap="sm">
+    <div className="flex flex-col gap-2">
+      <h2 className="text-sm font-semibold">{title}</h2>
+      <div className="flex flex-wrap gap-2">
         {streams.map((s) => (
-          <Tooltip
-            key={`${s.broker_code}/${s.environment}`}
-            label={healthLabel(s)}
-          >
-            <Paper withBorder p="xs" radius="md">
-              <Group gap={8} wrap="nowrap">
-                <Badge color={STATE_COLOR[s.state]} variant="filled" size="sm">
-                  {s.state}
-                </Badge>
-                <Text size="sm" fw={500}>
-                  {s.broker_code}
-                </Text>
-                {s.transport === "fix" && (
-                  <Badge color="grape" variant="light" size="sm">
-                    FIX
-                  </Badge>
-                )}
-                <Text size="sm" c="dimmed">
-                  {s.environment}
-                </Text>
-                <Text size="xs" c="dimmed">
-                  {ago(s.last_event_at)}
-                </Text>
-              </Group>
-            </Paper>
+          <Tooltip key={`${s.broker_code}/${s.environment}`}>
+            <TooltipTrigger asChild>
+              <div className="flex items-center gap-2 rounded-md border bg-card px-2.5 py-1.5">
+                <Pill tone={STATE_TONE[s.state]}>{s.state}</Pill>
+                <span className="font-medium">{s.broker_code}</span>
+                {s.transport === "fix" && <Pill tone="info">FIX</Pill>}
+                <span className="text-muted-foreground">{s.environment}</span>
+                <span className="num text-xs text-muted-foreground">{ago(s.last_event_at)}</span>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent>{healthLabel(s)}</TooltipContent>
           </Tooltip>
         ))}
-      </Group>
-    </Stack>
+      </div>
+    </div>
   );
 }

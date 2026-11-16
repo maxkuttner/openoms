@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { Button, Drawer, Stack } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Drawer } from "../../components/overlay";
 import { CrudResource } from "../../components/CrudResource";
 import { statusOptions } from "../../lifecycle";
 import { api } from "../../api/client";
@@ -18,7 +19,7 @@ export function BrokerConnectionsPage() {
   const venueOf = (code: string) => venues.find((v) => v.code === code);
 
   return (
-    <Stack gap="lg">
+    <div className="flex flex-col gap-4">
       <StreamHealthStrip
         kind="execution"
         title="Live execution streams"
@@ -34,7 +35,7 @@ export function BrokerConnectionsPage() {
       // Credentials are the next step for a new connection, so open them.
       onCreated={(row: BrokerConnection) => setSelected(row)}
       rowAction={(row: BrokerConnection) => (
-        <Button size="xs" variant="light" onClick={() => setSelected(row)}>
+        <Button size="xs" variant="secondary" onClick={() => setSelected(row)}>
           Credentials
         </Button>
       )}
@@ -76,13 +77,7 @@ export function BrokerConnectionsPage() {
       ]}
       />
 
-      <Drawer
-        opened={!!selected}
-        onClose={() => setSelected(null)}
-        title={selected ? `Credentials — ${selected.code}` : undefined}
-        position="right"
-        size="md"
-      >
+      <Drawer open={!!selected} onClose={() => setSelected(null)} title={selected ? `Credentials — ${selected.code}` : ""} className="sm:max-w-md">
         {selected && (
           <CredentialsPanel
             kind="broker"
@@ -92,6 +87,6 @@ export function BrokerConnectionsPage() {
           />
         )}
       </Drawer>
-    </Stack>
+    </div>
   );
 }

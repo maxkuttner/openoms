@@ -1,5 +1,9 @@
 import { useState } from "react";
-import { Badge, Button, Drawer, Group, Loader, Stack, Table, Text, Title } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Spinner } from "../../components/common";
+import { Drawer } from "../../components/overlay";
+import { Pill } from "../../components/status";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../../api/client";
 import { StreamHealthStrip } from "../../components/StreamHealthStrip";
@@ -25,119 +29,97 @@ export function DataFeedsPage() {
   const [selected, setSelected] = useState<FeedConnectionSummary | null>(null);
 
   return (
-    <Stack gap="lg">
+    <div className="flex flex-col gap-5">
       <StreamHealthStrip
         kind="feed"
         title="Live data feeds"
         emptyText="No data feeds running in this process."
       />
 
-      <Stack gap="xs">
-        <Title order={4}>Feed connections</Title>
-        <Text size="sm" c="dimmed">
-          Configure, test, and clear the API key each feed connection uses.
-        </Text>
+      <div className="flex flex-col gap-2">
+        <h2 className="text-sm font-semibold">Feed connections</h2>
+        <p className="text-muted-foreground">Configure, test, and clear the API key each feed connection uses.</p>
         {connections.isLoading ? (
-          <Loader size="sm" />
+          <Spinner />
         ) : (
-          <Table striped highlightOnHover withTableBorder>
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th>Code</Table.Th>
-                <Table.Th>Provider</Table.Th>
-                <Table.Th>Dataset</Table.Th>
-                <Table.Th>Status</Table.Th>
-                <Table.Th />
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
-              {(connections.data ?? []).map((row) => (
-                <Table.Tr key={row.code}>
-                  <Table.Td>{row.code}</Table.Td>
-                  <Table.Td>{row.provider}</Table.Td>
-                  <Table.Td>{row.dataset ?? <Text c="dimmed">—</Text>}</Table.Td>
-                  <Table.Td>
-                    <Badge color={row.status === "ACTIVE" ? "green" : "gray"} variant="light">
-                      {row.status}
-                    </Badge>
-                  </Table.Td>
-                  <Table.Td>
-                    <Group justify="flex-end">
-                      <Button size="xs" variant="light" onClick={() => setSelected(row)}>
-                        Credentials
-                      </Button>
-                    </Group>
-                  </Table.Td>
-                </Table.Tr>
-              ))}
-              {(connections.data ?? []).length === 0 && (
-                <Table.Tr>
-                  <Table.Td colSpan={5}>
-                    <Text c="dimmed" ta="center" py="md">No feed connections yet.</Text>
-                  </Table.Td>
-                </Table.Tr>
-              )}
-            </Table.Tbody>
-          </Table>
+          <div className="rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Code</TableHead>
+                  <TableHead>Provider</TableHead>
+                  <TableHead>Dataset</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {(connections.data ?? []).map((row) => (
+                  <TableRow key={row.code}>
+                    <TableCell>{row.code}</TableCell>
+                    <TableCell>{row.provider}</TableCell>
+                    <TableCell>{row.dataset ?? <span className="text-muted-foreground">—</span>}</TableCell>
+                    <TableCell><Pill tone={row.status === "ACTIVE" ? "buy" : "muted"}>{row.status}</Pill></TableCell>
+                    <TableCell className="text-right">
+                      <Button size="xs" variant="secondary" onClick={() => setSelected(row)}>Credentials</Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+                {(connections.data ?? []).length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={5} className="py-4 text-center text-muted-foreground">No feed connections yet.</TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
         )}
-      </Stack>
+      </div>
 
-      <Stack gap="xs">
-        <Group justify="space-between">
-          <Title order={4}>Feed policy</Title>
-          {isLoading && <Loader size="sm" />}
-        </Group>
-        <Text size="sm" c="dimmed">
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold">Feed policy</h2>
+          {isLoading && <Spinner />}
+        </div>
+        <p className="text-muted-foreground">
           Ranked market-data sources per instrument class; lower rank wins, higher ranks are
           failover. Coverage is derived from each feed's own symbology — there is no mapping table.
-        </Text>
-        {error && <Text c="red">Failed to load feeds.</Text>}
-        <Table striped highlightOnHover>
-          <Table.Thead>
-            <Table.Tr>
-              <Table.Th>Feed</Table.Th>
-              <Table.Th>Instrument class</Table.Th>
-              <Table.Th>Rank</Table.Th>
-              <Table.Th>Enabled</Table.Th>
-              <Table.Th>Mapped instruments</Table.Th>
-            </Table.Tr>
-          </Table.Thead>
-          <Table.Tbody>
-            {(data ?? []).map((f) => (
-              <Table.Tr key={`${f.feed_code}/${f.instrument_class}`}>
-                <Table.Td><b>{f.feed_code}</b></Table.Td>
-                <Table.Td>{f.instrument_class}</Table.Td>
-                <Table.Td>{f.rank}</Table.Td>
-                <Table.Td>
-                  <Badge color={f.enabled ? "green" : "gray"} variant="light">
-                    {f.enabled ? "enabled" : "disabled"}
-                  </Badge>
-                </Table.Td>
-                <Table.Td>{f.mapped_instruments.toLocaleString()}</Table.Td>
-              </Table.Tr>
-            ))}
-            {!isLoading && (data ?? []).length === 0 && (
-              <Table.Tr>
-                <Table.Td colSpan={5}>
-                  <Text c="dimmed" ta="center" py="md">
-                    No feed policy configured.
-                  </Text>
-                </Table.Td>
-              </Table.Tr>
-            )}
-          </Table.Tbody>
-        </Table>
-      </Stack>
+        </p>
+        {error && <p className="text-sell">Failed to load feeds.</p>}
+        <div className="rounded-md border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Feed</TableHead>
+                <TableHead>Instrument class</TableHead>
+                <TableHead className="text-right">Rank</TableHead>
+                <TableHead>Enabled</TableHead>
+                <TableHead className="text-right">Mapped instruments</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(data ?? []).map((f) => (
+                <TableRow key={`${f.feed_code}/${f.instrument_class}`}>
+                  <TableCell className="font-semibold">{f.feed_code}</TableCell>
+                  <TableCell>{f.instrument_class}</TableCell>
+                  <TableCell className="num text-right">{f.rank}</TableCell>
+                  <TableCell><Pill tone={f.enabled ? "buy" : "muted"}>{f.enabled ? "enabled" : "disabled"}</Pill></TableCell>
+                  <TableCell className="num text-right">{f.mapped_instruments.toLocaleString()}</TableCell>
+                </TableRow>
+              ))}
+              {!isLoading && (data ?? []).length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={5} className="py-4 text-center text-muted-foreground">No feed policy configured.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </div>
 
-      <Drawer
-        opened={!!selected}
-        onClose={() => setSelected(null)}
-        title={selected ? `Credentials — ${selected.code}` : undefined}
-        position="right"
-        size="md"
-      >
+      <Drawer open={!!selected} onClose={() => setSelected(null)} title={selected ? `Credentials — ${selected.code}` : ""} className="sm:max-w-md">
         {selected && <CredentialsPanel kind="feed" code={selected.code} providerCode={selected.provider} />}
       </Drawer>
-    </Stack>
+    </div>
   );
 }
