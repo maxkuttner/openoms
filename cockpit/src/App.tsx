@@ -3,7 +3,7 @@ import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor, St
 import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { API_BASE, consoleAccess, goToLogin, onMfaRequired } from "./api/client";
-import { authApi, COCKPIT_HOME, TRADE_HOME } from "./login/api";
+import { authApi, APP_HOME } from "./login/api";
 import { MfaPrompt } from "./login/MfaPrompt";
 import { Frame } from "./login/Frame";
 import { Logo } from "./components/Logo";
@@ -135,7 +135,7 @@ function NoAccess() {
     <Frame title="Admin console">
       <Stack gap={12}>
         <Text fz={13}>You don't have access to the admin console.</Text>
-        <Anchor href={TRADE_HOME}>Open the trader app</Anchor>
+        <Anchor href={APP_HOME}>Open the trader app</Anchor>
       </Stack>
     </Frame>
   );
@@ -154,7 +154,7 @@ export function App() {
       .then((a) => (a === "signed_out" ? goToLogin() : setStatus(a)));
   }, [onLoginPage]);
 
-  if (onLoginPage) return <LoginPage home={COCKPIT_HOME} />;
+  if (onLoginPage) return <LoginPage home={APP_HOME} />;
 
   if (status === "checking") {
     return (

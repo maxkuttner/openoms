@@ -6,7 +6,7 @@ import { AccessPage } from "./pages/Access";
 import { tradeApi, API_BASE, onMfaRequired } from "./api/client";
 import { MfaPrompt } from "../login/MfaPrompt";
 import { LoginPage } from "../login/LoginPage";
-import { TRADE_HOME } from "../login/api";
+import { APP_HOME } from "../login/api";
 import { ForcedPasswordChange, PendingScreen } from "../login/ChangePassword";
 import { AccountSettings } from "../login/AccountSettings";
 import { isPendingAccount, mustChangePassword } from "../login";
@@ -77,7 +77,7 @@ export function TradeApp() {
   // before the identity query, which would bounce to sign-in.
   const { pathname } = useLocation();
   if (pathname === "/access") return <AccessPage />;
-  if (pathname === "/login") return <LoginPage home={TRADE_HOME} />;
+  if (pathname === "/login") return <LoginPage home={APP_HOME} />;
   return <SignedInTradeApp />;
 }
 
