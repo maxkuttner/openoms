@@ -25,7 +25,9 @@ becomes the admin; the other is an ordinary sign-up.
 `oms init` does not ask for an admin any more. For scripted installs,
 `oms auth bootstrap-admin --email you@example.com --name "Your Name"` creates an admin and
 prints a generated password once (only while no active admin exists, or with
-`--force-recovery`).
+`--force-recovery`). That password must be changed at the first sign-in: until then the
+session can only change it (every other call answers `403 password_change_required`), and if
+nobody signs in with it within 24 hours it stops working.
 
 ## Sign-up and approval
 
@@ -172,7 +174,7 @@ weaker login.
 | `[auth.oidc] scopes` | `openid profile email` | |
 | `[auth.oidc] required_claim`, `required_claim_value` | none | Also require this claim in the ID token (both keys, e.g. `groups` and `oms-traders`). |
 | `[auth.oidc] enable_signup` | `false` | An unknown SSO login creates an account with `default_user_role`. |
-| `[auth.oidc] merge_accounts_by_email` | `false` | An unknown SSO login whose **verified** email matches an account is linked to it. See the warning below. |
+| `[auth.oidc] merge_accounts_by_email` | `false` | An unknown SSO login whose **verified** email matches an account is linked to it. This lets the identity provider take over **any** matching account, admins included, without that account's password or authenticator. See the warning below. |
 | `[auth.oidc] trust_email_verified` | `true` | `false`: never trust the provider's email (merging never matches). |
 | `[auth.oidc] require_amr` | `[]` | See below. |
 
@@ -194,7 +196,8 @@ identity arrives:
 
 :::caution[Merging by email trusts your provider completely]
 With `merge_accounts_by_email` on, anyone who can make your identity provider assert a
-verified email address gets into the account with that address, admins included. Turn it on
+verified email address gets into the account with that address, admins included, and the
+account's own password and authenticator app are not asked for. Turn it on
 only for a provider you control whose users cannot choose or change their verified email (a
 company Entra ID or Google Workspace tenant, for example), never for a public provider where
 anyone can register an address.
@@ -247,7 +250,8 @@ oms auth recover-admin --email you@example.com
 ```
 
 This gives the admin a new generated password (printed once), removes their authenticator,
-and signs them out everywhere. Change the password under **Account** after signing in. It is audited. To create a new admin while one already exists,
+and signs them out everywhere. The first sign-in with it asks for a new password before
+anything else, and it stops working if unused for 24 hours. It is audited. To create a new admin while one already exists,
 add `--force-recovery` to `oms auth bootstrap-admin`.
 
 These commands use a per-boot **host token**, the file `host-token` next to `oms.toml`
