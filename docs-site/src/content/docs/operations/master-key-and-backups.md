@@ -7,9 +7,9 @@ description: What to back up, why the master key matters, and how to rotate it.
 
 | What | Why |
 |---|---|
-| `oms.toml` | Holds the **master key** and the `oms` role password (and the deprecated shared admin password, if still set). |
+| `oms.toml` | Holds the **master key** and the `oms` role password. |
 | The `.env` beside it, if you have one | Secrets that are not in `oms.toml`, such as `OMS_OIDC_CLIENT_SECRET`. |
-| The database | Orders, executions, positions, portfolios, users and their roles, invites, password hashes, sealed authenticator secrets, SSO identities, the audit log, and the encrypted broker and feed credentials. |
+| The database | Orders, executions, positions, portfolios, users and their roles, password hashes, sealed authenticator secrets, SSO identities, the audit log, and the encrypted broker and feed credentials. |
 
 The `host-token` file next to `oms.toml` is not a backup item: the server writes a new one at every start.
 

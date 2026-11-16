@@ -17,16 +17,16 @@
 
 ```sh
 curl -fsSL https://openoms.dev/install.sh | sh
-oms init     # database (it can start PostgreSQL in Docker), first admin, listen address
+oms init     # database (it can start PostgreSQL in Docker), listen address
 oms          # starts the OMS on localhost:3001
 ```
 
-Then open <http://localhost:3001/cockpit/> and sign in as the admin you created: `oms init`
-prints a one-time link to choose a password and set up an authenticator app. Everyone else
-is invited from the Users page; single sign-on with your own identity provider is optional.
-See [Sign-in and users](https://openoms.dev/configuration/login/). The old shared admin
-password (`OMS_ADMIN_PASSWORD`, `[server].admin_password`) is deprecated and only for
-upgrades.
+Then open <http://localhost:3001/cockpit/> and create the admin account: on a fresh install the
+first account signed up is the admin. Everyone else signs up and waits for your approval, or
+you add them on the Users page; an authenticator app and single sign-on with your own identity
+provider are optional. See
+[Sign-in and users](https://openoms.dev/configuration/login/). The old shared admin password
+(`OMS_ADMIN_PASSWORD`, `[server].admin_password`) no longer works.
 
 Prebuilt binaries cover macOS (Apple Silicon) and Linux (x86_64, OpenSSL 3).
 

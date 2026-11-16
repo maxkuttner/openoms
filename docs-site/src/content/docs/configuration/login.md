@@ -1,58 +1,93 @@
 ---
 title: Sign-in and users
-description: Local accounts with an authenticator app by default, invites for everyone else, and optional single sign-on with your own identity provider.
+description: The first account becomes the admin, people sign up (and wait for approval) or are added by an admin, an authenticator app is optional, and single sign-on with your own identity provider can create or link accounts.
 ---
 
 Everyone signs in the same way, to the cockpit (`/cockpit/`) and to the trading app
 (`/trade/`): one session, one account per person. The OMS has its own accounts (a password
-plus an authenticator app), so a fresh install needs no identity provider, mail server or
+plus, optionally, an authenticator app), so a fresh install needs no identity provider, mail server or
 extra container. If your organisation has single sign-on (SSO), you can add it later, next
 to local accounts or instead of them.
 
-Access is by **invitation only**. There is no public sign-up, and a successful sign-in at an
-identity provider creates nothing: an uninvited sign-in shows "Access not granted".
+Accounts work the way [Open WebUI](https://docs.openwebui.com/)'s do: the first account
+signed up is the admin; after that people sign up themselves and wait for an admin to approve
+them, or an admin adds them directly. Each account has a role: **admin**, **user** or
+**pending**.
 
-## First admin
+## First start: create the admin account
 
-`oms init` asks for the first admin's email and name, creates that admin, and, when you run
-it at a terminal, prints a one-time link:
+On a fresh install (no admin exists yet) the sign-in page shows **Create the admin account**:
+name, email and a password. That account gets the admin capability (the admin console) and
+nothing else: it cannot place orders until it is given a portfolio role and portfolios (see
+[Roles](#roles-and-permissions)). If two people submit the form at the same moment, exactly one
+becomes the admin; the other is an ordinary sign-up.
 
-```text
-First admin (you@example.com): open this one-time link to choose a password and set up TOTP:
-    http://localhost:3001/trade/invite#…
+`oms init` does not ask for an admin any more. For scripted installs,
+`oms auth bootstrap-admin --email you@example.com --name "Your Name"` creates an admin and
+prints a generated password once (only while no active admin exists, or with
+`--force-recovery`).
+
+## Sign-up and approval
+
+```toml
+[auth]
+enable_signup = true          # default: the sign-in page offers "Sign up"
+default_user_role = "pending" # default; "user" activates sign-ups at once
 ```
 
-Open it, choose a password, scan the QR code with an authenticator app, and save the ten
-recovery codes it shows (once). With `--non-interactive` (CI, Ansible) the link is not
-printed, since it would end up in a log; the output names the command that mints one later
-at a terminal.
+A **pending** account can sign in, but sees only "Your account is waiting for an administrator
+to approve it." Every API call except `GET /auth/me`, `GET /auth/methods` and
+`POST /auth/logout` answers `403 {"error":"approval_pending"}`. Admins find pending accounts at
+the top of the **Users** page: **Approve** (choose a portfolio role and portfolios) or
+**Reject** (the account is disabled). With `default_user_role = "user"` a sign-up is active at
+once, but with no portfolio access until an admin grants some.
 
-If you skipped it, or lost the link, use the host CLI:
+With `enable_signup = false` there is no "Sign up" link and `POST /auth/local/signup` answers
+`403 signup_disabled` (the very first account, the admin, is still allowed). Sign-ups are
+rate-limited like logins, follow the password policy, and are audited.
 
-```sh
-oms auth bootstrap-admin --email you@example.com --name "Your Name"
-```
+## Add a user
 
-This works only while no active admin exists. The admin chooses their own password through
-the link; nobody sets one for them. Admin is a separate capability from trading: an admin
-can run the console but cannot place orders until someone gives them a role and portfolios
-(see [Roles](#roles-and-permissions)).
+On the **Users** page, **Add user** creates a local account directly: name, email, a password
+and a role (admin, user or pending). Pass the password on yourself, by a channel you trust; the
+user can change it under **Account**. The API is `POST /admin/users` with
+`{"name", "email", "password", "role"}`.
+
+From the list you can also change a user's **portfolio role** and **portfolios** (effective on
+the next request), grant or remove **admin**, **disable** a user (sessions end at once and API
+keys stop), and create or revoke their **API keys**. Revoking access ends the user's open
+live-update connections immediately; changes the running server is not told about (a host-CLI
+`oms auth recover-admin`, a session reaching its absolute lifetime) close them within 15
+seconds.
 
 ## Local accounts
 
-- **Password.** 15 to 128 characters, no composition rules. Stored as an Argon2id hash.
-- **Authenticator app (TOTP).** Standard 6-digit codes, renewed every 30 seconds. The
-  secret is sealed with the [master key](/operations/master-key-and-backups/).
+- **Password.** 15 to 128 characters, no composition rules, not a common password. Stored as
+  an Argon2id hash. Change it under **Account** in either app (`POST /auth/local/password`).
+- **Authenticator app (TOTP), optional.** Standard 6-digit codes, renewed every 30 seconds.
+  Turn it on (or off, with a current code) under **Account → Two-step sign-in**. Once it is
+  on, every sign-in asks for a code after the password. The secret is sealed with the
+  [master key](/operations/master-key-and-backups/).
 - **Recovery codes.** Ten single-use codes, shown once at enrolment, each standing in for
   one authenticator code.
 - **Rate limits.** More than 5 failed attempts per account, or 20 per client address, in
   15 minutes are refused, and 10 failures in a row lock the account for 15 minutes. Every
   failure looks the same, so a response never reveals whether an email has an account.
 
-### Where MFA is required
+### Two-step sign-in (MFA)
 
-A session that signed in with a password but has not passed the authenticator check can
-read, and nothing else. These need a session that passed MFA:
+By default MFA is **optional**: a password sign-in is enough for someone without an
+authenticator app, and someone who has one must enter its code to sign in. To require it of
+everyone:
+
+```toml
+[auth.local]
+require_mfa = true
+```
+
+Then every local account sets up an authenticator app at its first sign-in, it cannot be turned off, and a session that signed in with a password but has not
+passed the authenticator check can read, and nothing else. A session that passed MFA is
+needed for:
 
 - submitting, cancelling or allocating orders;
 - creating or handing over strategies, and changing limits;
@@ -63,43 +98,15 @@ watchlist: that is a personal view setting, not an order or admin action. API ke
 machine credentials with their own scope. For SSO sessions see
 [`require_amr`](#require-mfa-from-the-identity-provider).
 
-## Invite someone
-
-On the cockpit's **Users** page choose **Invite user**, then enter the email, a role and
-the portfolios (view, and optionally trade, for each). The dialog shows the invite link and
-its expiry (7 days). The OMS sends no email: copy the link and send it through a channel you
-trust, since whoever holds it can start the claim.
-
-The link is `{public_base_url}/trade/invite#{token}`. It opens a page that shows the role
-and portfolios first, then offers the enabled sign-in methods: set a password and
-authenticator, or sign in with SSO. The new user appears as **Invited** and cannot sign in
-or use API keys until they accept.
-
-**Sign-in method** in the dialog restricts how the invite can be claimed: **Any sign-in method** (the
-default), **Email + password only**, or **SSO only**. The API takes the same choice as
-`"method": "any" | "local" | "oidc"` on `POST /admin/users/invite` and on reissue; any
-other value is refused with 422. A reissue without a method keeps the previous invite's method,
-so re-sending an email + password only invite never opens it to SSO.
-
-From the list you can also **copy**, **revoke** or **reissue** a pending invite (a revoked
-or expired link shows its own message), change the **role** or **portfolios** (effective on
-the next request), **disable** a user (sessions end at once and API keys stop), and create
-or revoke their **API keys**.
-
-Revoking access ends the user's open live-update connections immediately. Revocations the
-running server is not told about, a session reaching its absolute lifetime or a host-CLI
-`oms auth recover-admin`, close those connections at the next check, within 15 seconds.
-
-The home page has a **setup checklist** until you are done: connect a venue, create a
-portfolio, confirm sign-in works, invite a user and see a first order. Invites,
-acceptances, role and portfolio changes, enrolments and recoveries are recorded with who
-did them.
-
 ## Roles and permissions
 
-Each user has one role. The backend checks every request against the role's permissions,
+Each user has one portfolio role. The backend checks every request against the role's permissions,
 inside the portfolios the user has been given: *view* puts a portfolio in scope, *trade*
 allows creating and cancelling there.
+
+The account role (admin / user / pending) says whether someone may use the OMS and the admin
+console. What a **user** may do with orders comes from their **portfolio role** and the
+portfolios they have access to:
 
 | Permission | PM | Trader | Viewer |
 |---|---|---|---|
@@ -114,8 +121,8 @@ allows creating and cancelling there.
 | Manage strategies (`strategies.manage`) | yes | | |
 
 "Own" means submitted by that user. A fourth role, **strategy**, is for automated
-[strategies](/strategies/fix/) and cannot be given to a person. **Admin** is not a role: it
-is a switch on the Users page that opens the admin console. The last active admin cannot be
+[strategies](/strategies/fix/) and cannot be given to a person. **Admin** is not a portfolio
+role: it is a switch on the Users page that opens the admin console. The last active admin cannot be
 removed or disabled.
 
 Every strategy has a **responsible user**, shown on the **Strategies** page. Handing a
@@ -156,35 +163,42 @@ weaker login.
 |---|---|---|
 | `[auth] public_base_url` | | Browser-facing origin. `[auth.oidc].public_base_url` still works but is deprecated and logs a warning. |
 | `[auth.local] enabled` | `true` | `false` turns local sign-in off. |
+| `[auth] enable_signup` | `true` | Offer "Sign up" (see [Sign-up and approval](#sign-up-and-approval)). |
+| `[auth] default_user_role` | `pending` | `pending` or `user`: the role of a new sign-up, local or SSO. |
+| `[auth.local] require_mfa` | `false` | `true` makes an authenticator app mandatory for local accounts (see [Two-step sign-in](#two-step-sign-in-mfa)). |
 | `[auth.session] idle_ttl_minutes` | `30` | A session ends after this much inactivity. |
 | `[auth.session] absolute_ttl_hours` | `12` | A session ends after this regardless. |
 | `[auth.oidc] issuer`, `client_id` | required | |
 | `[auth.oidc] scopes` | `openid profile email` | |
-| `[auth.oidc] required_claim`, `required_claim_value` | none | Also require this claim in the ID token (both keys, e.g. `groups` and `oms-traders`). Invites already gate access, so this is rarely needed. |
-| `[auth.oidc] trust_email_verified` | `true` | See below. |
+| `[auth.oidc] required_claim`, `required_claim_value` | none | Also require this claim in the ID token (both keys, e.g. `groups` and `oms-traders`). |
+| `[auth.oidc] enable_signup` | `false` | An unknown SSO login creates an account with `default_user_role`. |
+| `[auth.oidc] merge_accounts_by_email` | `false` | An unknown SSO login whose **verified** email matches an account is linked to it. See the warning below. |
+| `[auth.oidc] trust_email_verified` | `true` | `false`: never trust the provider's email (merging never matches). |
 | `[auth.oidc] require_amr` | `[]` | See below. |
 
-### How an SSO invite is claimed
+### Which SSO logins get in
 
-The invitee opens the invite link, sees the role and portfolios, and chooses SSO. What
-happens next depends on what the provider says about the email:
+A login is keyed by the provider's `(issuer, subject)`, never by email. The first time an
+identity arrives:
 
-- **Verified email.** If the ID token says `email_verified: true` and the address equals the
-  invited one (case-insensitive), the invite is claimed. A different address is refused and
-  the invite stays pending.
-- **No verified email, or `trust_email_verified = false`.** The person signs in at the
-  provider but gets **no access** yet. The sign-in appears under **Waiting for approval** on
-  the Users page, with who it was. Check by a channel you trust that it is the right person,
-  then **Approve** or **Reject**. Approval binds that exact sign-in to the invited user.
-- **Pre-bind.** If you already know the provider's stable user ID (`sub`), an admin can
-  attach it to the invited user directly (`POST /admin/users/{id}/identities`), with no
-  pending step.
+- **Already linked** (an earlier login, or a merge): signed in.
+- **`merge_accounts_by_email = true`** and the ID token says `email_verified: true` with an
+  address equal (case-insensitive) to an existing account's: the identity is linked to that
+  account and signed in. An unverified email never merges.
+- **`enable_signup = true`**: a new account is created with `default_user_role` (pending by
+  default, so it waits for approval). Its email is recorded only if verified and not already
+  taken; it never takes over another account.
+- **Neither**: no access ("There is no account for this sign-in"). Nothing is created. Add the
+  person with **Add user** and turn on `merge_accounts_by_email`, or turn on `enable_signup`
+  and approve them.
 
-After the first sign-in the login is bound to the provider's `(issuer, subject)`, never to
-the email: later sign-ins look up that pair only, and two logins are never merged because
-their emails match. To let someone use a second sign-in method, use **Sign-in link** on
-their row; the person must open it in a session that passed MFA, or an admin approves the
-pending link.
+:::caution[Merging by email trusts your provider completely]
+With `merge_accounts_by_email` on, anyone who can make your identity provider assert a
+verified email address gets into the account with that address, admins included. Turn it on
+only for a provider you control whose users cannot choose or change their verified email (a
+company Entra ID or Google Workspace tenant, for example), never for a public provider where
+anyone can register an address.
+:::
 
 ### Providers
 
@@ -192,7 +206,7 @@ pending link.
 |---|---|
 | Google | Sends `email_verified`. |
 | Okta, Keycloak, Authentik | Send `email_verified` when the user's email is verified in the provider. Check that yours does, or rely on approval. |
-| Microsoft Entra ID | Does not reliably send `email_verified`, and its `email` or `upn` is not proof of a mailbox, so sign-ins arrive as pending approvals. Use your tenant's issuer (`https://login.microsoftonline.com/{tenant-id}/v2.0`), never `common`. |
+| Microsoft Entra ID | Does not reliably send `email_verified`, and its `email` or `upn` is not proof of a mailbox, so merging by email rarely matches; use `enable_signup` and approval. Use your tenant's issuer (`https://login.microsoftonline.com/{tenant-id}/v2.0`), never `common`. |
 
 ### Require MFA from the identity provider
 
@@ -214,27 +228,26 @@ settings. Use the values your provider emits (for example `mfa`, `otp`, `hwk`).
 policy = "sso_only"
 ```
 
-Local sign-in and enrolment are refused and the login page shows only SSO, whatever
+Local sign-in and sign-up are refused and the login page shows only SSO, whatever
 `[auth.local].enabled` says (`[auth.local] enabled = false` has the same effect). Set this
-only after SSO works and an admin has signed in through it.
+only after SSO works and an admin has signed in through it (or is linked to it by email).
 
-The host CLI still works, but the links `oms auth bootstrap-admin` and
-`oms auth recover-admin` print enrol a **local** password and authenticator, which this
-policy refuses; the command prints a note saying so. To use such a link, set
-`policy = "local_and_sso"` and restart, enrol with the link, then set `sso_only` back and
-restart.
+The host CLI still works, but the passwords `oms auth bootstrap-admin` and
+`oms auth recover-admin` print are for **local** sign-in, which this policy refuses; the
+command prints a note saying so. To use one, set `policy = "local_and_sso"` and restart, sign
+in, then set `sso_only` back and restart.
 
 ## Recover an admin from the host
 
-If nobody can sign in as an admin (authenticator and recovery codes lost, or a provider
-outage), recover from the machine the OMS runs on:
+If nobody can sign in as an admin (password, or authenticator and recovery codes, lost; or a
+provider outage), recover from the machine the OMS runs on:
 
 ```sh
 oms auth recover-admin --email you@example.com
 ```
 
-This resets the admin's password and authenticator, signs them out everywhere, and prints a
-new one-time enrolment link. It is audited. To create a new admin while one already exists,
+This gives the admin a new generated password (printed once), removes their authenticator,
+and signs them out everywhere. Change the password under **Account** after signing in. It is audited. To create a new admin while one already exists,
 add `--force-recovery` to `oms auth bootstrap-admin`.
 
 These commands use a per-boot **host token**, the file `host-token` next to `oms.toml`
@@ -248,15 +261,14 @@ docker exec <container> oms auth recover-admin --email you@example.com
 ## Upgrading from the shared admin password
 
 Earlier versions had one cockpit password (`[server].admin_password` or
-`OMS_ADMIN_PASSWORD`). After upgrading, it still opens the cockpit, but **read-only**, plus
-one action: **create the first admin**. Do that (or run `oms auth bootstrap-admin`), sign in
-as the new admin and finish enrolment. As soon as a named admin signs in with MFA, the
-shared password is switched off for good and you can delete it from the config. The
-loopback default `openoms-dev` and `OMS_ADMIN_AUTH_ENABLED=false` no longer exist. If
-something goes wrong in between, host recovery above is the way back in.
+`OMS_ADMIN_PASSWORD`). It no longer works: the bearer is refused, and the setting is ignored
+with a warning at startup (delete it). If no admin exists yet, open the cockpit and **create
+the admin account**. If an admin already exists, sign in as them; if nobody can, use
+[`oms auth recover-admin`](#recover-an-admin-from-the-host).
 
-Existing SSO users keep their login as long as the `issuer` is unchanged. If you moved to a
-different provider, send each person a **Sign-in link**.
+Invites are gone too: pending invite links stop working. Add those people with **Add user**,
+or let them sign up and approve them. Existing SSO users keep their login as long as the
+`issuer` is unchanged.
 
 ## HTTPS beyond localhost
 

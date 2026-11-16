@@ -55,16 +55,13 @@ credential can drop the database — so those commands prompt for it or take it 
 | Key | Environment | Default |
 |---|---|---|
 | `bind_addr` | `OMS_BIND_ADDR` | `localhost:3001` |
-| `admin_password` | `OMS_ADMIN_PASSWORD` | none (deprecated) |
 
 - **`bind_addr`** — set by `oms init`'s "Listen on" question; where the HTTP server listens: the cockpit, the trading API and the
   admin API, all on one port. The default only accepts connections from the same machine.
   To serve other machines, bind to an address they can reach (`0.0.0.0:3001`), and put
   HTTPS in front (see [Sign-in and users](/configuration/login/#https-beyond-localhost)).
-- **`admin_password`** — deprecated, for upgrades only. The old shared cockpit password now
-  reads the admin console and can create the first named admin, nothing else, and stops
-  working once a named admin has signed in with MFA. There is no default value, and
-  `oms init` no longer asks for one. See
+- **`admin_password`** — removed. An old `oms.toml` that still has it loads, with a warning,
+  and the value is ignored (so is `OMS_ADMIN_PASSWORD`). See
   [Upgrading from the shared admin password](/configuration/login/#upgrading-from-the-shared-admin-password).
 
 ## `[auth]`
@@ -75,7 +72,10 @@ Details and examples are on [Sign-in and users](/configuration/login/).
 | Key | Default |
 |---|---|
 | `public_base_url` | derived from a loopback bind; required otherwise |
+| `enable_signup` | `true` |
+| `default_user_role` | `"pending"` |
 | `[auth.local] enabled` | `true` |
+| `[auth.local] require_mfa` | `false` |
 | `[auth.session] idle_ttl_minutes` | `30` |
 | `[auth.session] absolute_ttl_hours` | `12` |
 
@@ -91,6 +91,8 @@ Single sign-on through your identity provider. Off unless `issuer` and `client_i
 | `required_claim`, `required_claim_value` | *(none)* |
 | `trust_email_verified` | `true` |
 | `require_amr` | `[]` |
+| `enable_signup` | `false` |
+| `merge_accounts_by_email` | `false` |
 
 The client secret is never in `oms.toml`: set `OMS_OIDC_CLIENT_SECRET` in the environment.
 `public_base_url`, `idle_ttl_minutes` and `absolute_ttl_hours` in this block still work but

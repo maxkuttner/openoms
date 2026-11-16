@@ -29,8 +29,10 @@ database = "ods"
 
 [server]
 bind_addr = "0.0.0.0:3001"
-admin_password = "<a fresh one — this is a bearer token, not tied to the DB>"
 ```
+
+On a fresh database, open the cockpit and create the admin account: the first account
+signed up is the admin. Do it before anyone else can reach the server.
 
 The deploy runs only the OMS; no identity provider container is started. To
 enable SSO sign-in, add an `[auth.oidc]` block pointing at any OIDC issuer you
