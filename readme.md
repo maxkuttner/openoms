@@ -21,7 +21,7 @@ oms init     # database (it can start PostgreSQL in Docker), listen address
 oms          # starts the OMS on localhost:3001
 ```
 
-Then open <http://localhost:3001/cockpit/> and create the admin account: on a fresh install the
+Then open <http://localhost:3001/app/> and create the admin account: on a fresh install the
 first account signed up is the admin. Everyone else signs up and waits for your approval, or
 you add them on the Users page; an authenticator app and single sign-on with your own identity
 provider are optional. See

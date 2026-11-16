@@ -3,8 +3,8 @@ title: Sign-in and users
 description: The first account becomes the admin, people sign up (and wait for approval) or are added by an admin, an authenticator app is optional, and single sign-on with your own identity provider can create or link accounts.
 ---
 
-Everyone signs in the same way, to the cockpit (`/cockpit/`) and to the trading app
-(`/trade/`): one session, one account per person. The OMS has its own accounts (a password
+Everyone signs in the same way, to the one app at `/app/` (trading, plus the Admin Panel for
+admins): one session, one account per person. The OMS has its own accounts (a password
 plus, optionally, an authenticator app), so a fresh install needs no identity provider, mail server or
 extra container. If your organisation has single sign-on (SSO), you can add it later, next
 to local accounts or instead of them.

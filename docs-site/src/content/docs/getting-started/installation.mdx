@@ -74,7 +74,7 @@ docker compose run --rm oms init
 docker compose up -d
 ```
 
-Then open `http://localhost:3001/cockpit/` and create the admin account (the first account
+Then open `http://localhost:3001/app/` and create the admin account (the first account
 signed up is the admin). See
 [Sign-in and users](/configuration/login/).
 
@@ -127,7 +127,7 @@ cargo build --release
 cp target/release/oms ~/.local/bin/
 ```
 
-A binary built without the cockpit bundle serves a 404 at `/cockpit/`.
+A binary built without the cockpit bundle serves a 404 at `/app/`.
 
 ## Upgrading
 

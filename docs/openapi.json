@@ -3372,7 +3372,7 @@
         ],
         "responses": {
           "303": {
-            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=no_account)"
+            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /app/access?reason=no_account)"
           },
           "400": {
             "description": "Malformed callback, or a missing/expired/mismatched login flow"

@@ -107,7 +107,7 @@ main() {
 	                 # sets the cockpit password, writes oms.toml
 	    oms          # starts the OMS
 
-	then open http://localhost:3001/cockpit/
+	then open http://localhost:3001/app/
 
 	Later, `oms update` installs the newest release in place.
 	EOF

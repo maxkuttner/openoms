@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 [ -f src/styles/tokens.css ] || { echo "src/styles/tokens.css is missing" >&2; exit 1; }
 
 if grep -rnE '#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b' src --include='*.ts' --include='*.tsx' --include='*.css' |
-	grep -vE "^src/(palette\.ts|styles/tokens\.css):"; then
+	grep -v "^src/styles/tokens\.css:"; then
 	echo "colours above are hard-coded; add them to src/styles/tokens.css" >&2
 	exit 1
 fi

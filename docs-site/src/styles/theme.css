@@ -1,6 +1,6 @@
-/* The openoms colour scheme. Copies of cockpit/src/palette.ts, the one list of
-   openoms colours; a docs test (dist.test.mjs) fails if they drift apart. The
-   landing page's glows (GrainBackground.astro) are glow-green and orange. */
+/* The openoms brand colours for the docs site. The web app has its own dark
+   tokens (cockpit/src/styles/tokens.css). The landing page's glows
+   (GrainBackground.astro) are glow-green and orange. */
 :root {
   --oms-black: #0d1014;
   --oms-surface: #13171d;

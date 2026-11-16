@@ -15,5 +15,5 @@ description: Common startup and setup errors, and what to do about them.
 | `422 instrument not found` | The catalog has no such instrument. Load the broker's instruments from **Broker connections** in the cockpit (the **Instrument universe** column). |
 | A load shows ✕ Failed or ◑ Partial | Open **Jobs** in the cockpit's top bar: the job's error and log say why. ◑ Partial "interrupted" means the OMS restarted mid-load — click **Load again**. |
 | The server can't connect, and the log says no config file was found | It is looking in the wrong place. The error lists every location searched — see [Config file locations](/configuration/file-locations/). |
-| `/cockpit/` returns 404 on a source build | The cockpit bundle wasn't built before `cargo build`. See [Getting started → From source](/getting-started/#1-install). |
+| `/app/` returns 404 on a source build | The cockpit bundle wasn't built before `cargo build`. See [Getting started → From source](/getting-started/#1-install). |
 | Link error mentioning `-lssl` on macOS (source build) | `brew install openssl@3`, or set `OPENSSL_DIR`. |

@@ -337,7 +337,7 @@ pub fn cockpit_url(bind: &str) -> String {
         "0.0.0.0" | "[::]" => "localhost",
         h => h,
     };
-    format!("http://{host}:{port}/cockpit/")
+    format!("http://{host}:{port}/app/")
 }
 
 /// Append the config filename to `.gitignore` if it is not already covered.
@@ -368,7 +368,7 @@ mod tests {
         let out = closing_lines(std::path::Path::new("/config/oms.toml"), "Cockpit login password: x", "0.0.0.0:3001", true);
         assert!(out.contains("docker compose up -d"), "{out}");
         assert!(out.contains("docker compose cp oms:/config/oms.toml"), "{out}");
-        assert!(out.contains("http://localhost:3001/cockpit/"), "{out}");
+        assert!(out.contains("http://localhost:3001/app/"), "{out}");
         assert!(!out.contains("Start the server:  oms\n"), "{out}");
     }
 
@@ -573,8 +573,8 @@ mod tests {
 
     #[test]
     fn the_cockpit_url_opens_in_a_browser() {
-        assert_eq!(cockpit_url("localhost:3001"), "http://localhost:3001/cockpit/");
-        assert_eq!(cockpit_url("0.0.0.0:4000"), "http://localhost:4000/cockpit/");
+        assert_eq!(cockpit_url("localhost:3001"), "http://localhost:3001/app/");
+        assert_eq!(cockpit_url("0.0.0.0:4000"), "http://localhost:4000/app/");
     }
 
     /// The config file never carries an admin password any more.

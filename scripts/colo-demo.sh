@@ -88,7 +88,7 @@ s = open(conf).read().replace("[control_link]\n", link.lstrip("\n"), 1)
 open(conf, "w").write(s)
 PY
 
-  echo "starting the OMS (http://$HTTP/cockpit/)…"
+  echo "starting the OMS (http://$HTTP/app/)…"
   cd "$DIR"
   OMS_CONFIG="$DIR/oms.toml" nohup "$ROOT/target/debug/oms" </dev/null >"$DIR/oms.log" 2>&1 &
   echo $! > "$DIR/oms.pid"
@@ -102,7 +102,7 @@ PY
   echo "setting up the strategy and its deployment…"
   python3 -I "$ROOT/scripts/colo_demo_setup.py" "$DIR" "$KEYS" "http://$HTTP" "$STRATEGY"
   echo
-  echo "ready. Cockpit: http://$HTTP/cockpit/  (admin password in $DIR/adminpw)"
+  echo "ready. Cockpit: http://$HTTP/app/  (admin password in $DIR/adminpw)"
   echo "start the market maker:  scripts/colo-demo.sh mm"
 }
 

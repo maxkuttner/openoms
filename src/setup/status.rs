@@ -75,17 +75,13 @@ pub fn kafka_brokers(list: &str) -> Vec<String> {
     list.split(',').map(str::trim).filter(|b| !b.is_empty()).map(String::from).collect()
 }
 
-/// The admin UI is there when the bundle is built in; the trader UI only with
-/// `[auth.oidc]` configured, the same gate `serve()` mounts `/trade/` behind.
-pub fn ui_links(base: &str, bundled: bool, oidc: bool) -> Vec<(String, String)> {
-    let mut links = Vec::new();
+/// The one UI (trading and the Admin Panel) is there when the bundle is built in.
+pub fn ui_links(base: &str, bundled: bool) -> Vec<(String, String)> {
     if bundled {
-        links.push(("admin UI".to_string(), format!("{base}/cockpit/")));
-        if oidc {
-            links.push(("trader UI".to_string(), format!("{base}/trade/")));
-        }
+        vec![("UI".to_string(), format!("{base}/app/"))]
+    } else {
+        Vec::new()
     }
-    links
 }
 
 pub fn exit_code(r: &Report) -> i32 {
@@ -234,7 +230,7 @@ pub async fn run() -> i32 {
     }
 
     let (uis, streams) = if oms.state == State::Up {
-        (ui_links(&base, crate::cockpit::is_bundled(), issuer.is_some()), streams(&base).await)
+        (ui_links(&base, crate::cockpit::is_bundled()), streams(&base).await)
     } else {
         (Vec::new(), Streams::Unknown("OMS not running".into()))
     };
@@ -270,7 +266,7 @@ mod tests {
         Report {
             config: Some("/home/me/.config/oms/oms.toml".into()),
             oms: check("OMS", oms, "http://localhost:3001", ""),
-            uis: ui_links("http://localhost:3001", true, true),
+            uis: ui_links("http://localhost:3001", true),
             deps: vec![
                 check("Postgres", State::Up, "localhost:5432/ods", ""),
                 check("Kafka", kafka, "localhost:9092", "connection refused"),
@@ -293,18 +289,12 @@ mod tests {
     }
 
     #[test]
-    fn the_trader_ui_is_listed_only_with_login_configured() {
-        let with = ui_links("http://localhost:3001", true, true);
+    fn the_one_ui_is_listed_when_bundled() {
         assert_eq!(
-            with,
-            vec![
-                ("admin UI".to_string(), "http://localhost:3001/cockpit/".to_string()),
-                ("trader UI".to_string(), "http://localhost:3001/trade/".to_string()),
-            ]
+            ui_links("http://localhost:3001", true),
+            vec![("UI".to_string(), "http://localhost:3001/app/".to_string())]
         );
-        let without = ui_links("http://localhost:3001", true, false);
-        assert_eq!(without.len(), 1);
-        assert!(ui_links("http://localhost:3001", false, false).is_empty());
+        assert!(ui_links("http://localhost:3001", false).is_empty());
     }
 
     #[test]
@@ -331,7 +321,7 @@ mod tests {
         let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no {needle} in:\n{out}")).to_string();
         assert!(line("config").contains("/home/me/.config/oms/oms.toml"));
         assert!(line("OMS").contains("up") && line("OMS").contains("http://localhost:3001"));
-        assert!(line("admin UI").contains("http://localhost:3001/cockpit/"));
+        assert!(line("UI").contains("http://localhost:3001/app/"));
         assert!(line("Kafka").contains("down") && line("Kafka").contains("connection refused"));
         assert!(line("alpaca-paper").contains("live"));
         assert!(line("ibkr-paper").contains("down") && line("ibkr-paper").contains("connection reset"));

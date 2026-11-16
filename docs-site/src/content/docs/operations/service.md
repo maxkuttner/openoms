@@ -85,8 +85,7 @@ oms status
 config          /home/you/.config/oms/oms.toml
 
 OMS             up              http://localhost:3001
-  admin UI                      http://localhost:3001/cockpit/
-  trader UI                     http://localhost:3001/trade/
+  UI                            http://localhost:3001/app/
 Postgres        up              localhost:5432/ods
 Login (OIDC)    up              http://localhost:8090/realms/oms
 Kafka           not configured
