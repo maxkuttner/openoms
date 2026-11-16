@@ -1,12 +1,13 @@
 import { useState } from "react";
 import {
-  Stack, Group, Title, Button, Table, Modal, Drawer, TextInput, PasswordInput, Select, Checkbox, Text, Badge, Loader,
+  Stack, Group, Title, Button, Table, Modal, Drawer, TextInput, PasswordInput, Select, MultiSelect, Text, Badge, Loader,
   ActionIcon, Alert, Code, CopyButton, Divider, Switch,
 } from "@mantine/core";
 import { api } from "../api/client";
 import { useList, useApiMutation } from "../api/hooks";
 import type { ApiKeyRecord, Portfolio } from "../api/types";
-import { ACCOUNT_ROLE_OPTIONS, ROLE_OPTIONS, accessBody, accountRoleLabel, pendingUsers, roleLabel, type Access } from "../users";
+import { ACCOUNT_ROLE_OPTIONS, accountRoleLabel, pendingUsers } from "../users";
+import { accessLabel } from "../groups";
 
 const PATH = "/admin/users";
 
@@ -15,9 +16,9 @@ type UserRow = {
   code: string;
   display_name: string | null;
   email: string | null;
-  role: string | null;
   account_role: "admin" | "user" | "pending";
-  portfolios: { portfolio_id: string; code: string; can_trade: boolean }[];
+  groups: { id: string; name: string }[];
+  portfolios: { portfolio_id: string; code: string; access: string }[];
   sign_in: string | null;
   status: string;
   admin: boolean;
@@ -27,39 +28,14 @@ function who(u: UserRow) {
   return u.display_name ?? u.email ?? u.code;
 }
 
-/** Portfolio checkboxes, each with a trade/view select. Unchecked = no access. */
-function PortfolioPicker({ value, onChange }: { value: Record<string, Access>; onChange: (v: Record<string, Access>) => void }) {
-  const portfolios = useList<Portfolio>("/admin/portfolios");
+type GroupRef = { id: string; name: string };
+
+/** Pick groups: they decide the user's portfolio access. */
+function GroupPicker({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  const groups = useList<GroupRef>("/admin/groups");
   return (
-    <Stack gap={6}>
-      <Text size="sm" fw={500}>Portfolios</Text>
-      {(portfolios.data ?? []).map((p) => (
-        <Group key={p.id} gap="sm">
-          <Checkbox
-            label={p.code}
-            w={200}
-            checked={p.id in value}
-            onChange={(e) => {
-              const next = { ...value };
-              if (e.currentTarget.checked) next[p.id] = "view";
-              else delete next[p.id];
-              onChange(next);
-            }}
-          />
-          {p.id in value && (
-            <Select
-              size="xs"
-              w={110}
-              allowDeselect={false}
-              data={[{ value: "trade", label: "Trade" }, { value: "view", label: "View" }]}
-              value={value[p.id]}
-              onChange={(v) => v && onChange({ ...value, [p.id]: v as Access })}
-            />
-          )}
-        </Group>
-      ))}
-      {portfolios.data?.length === 0 && <Text size="sm" c="dimmed">No portfolios yet.</Text>}
-    </Stack>
+    <MultiSelect label="Groups" description="Portfolio access comes from groups (Groups page)." searchable
+      data={(groups.data ?? []).map((g) => ({ value: g.id, label: g.name }))} value={value} onChange={onChange} />
   );
 }
 
@@ -112,6 +88,7 @@ export function UsersPage() {
             <Table.Tr>
               <Table.Th>User</Table.Th>
               <Table.Th>Role</Table.Th>
+              <Table.Th>Groups</Table.Th>
               <Table.Th>Portfolio access</Table.Th>
               <Table.Th>Sign-in</Table.Th>
               <Table.Th>Status</Table.Th>
@@ -127,10 +104,11 @@ export function UsersPage() {
                   {u.email && u.display_name && <Text size="xs" c="dimmed">{u.email}</Text>}
                 </Table.Td>
                 <Table.Td>{accountRoleLabel(u.account_role)}</Table.Td>
+                <Table.Td>{u.groups.length ? u.groups.map((g) => g.name).join(", ") : <Text c="dimmed">—</Text>}</Table.Td>
                 <Table.Td>
                   {u.portfolios.length === 0
                     ? <Text c="dimmed">—</Text>
-                    : `${roleLabel(u.role)}: ` + u.portfolios.map((p) => `${p.code} (${p.can_trade ? "trade" : "view"})`).join(", ")}
+                    : u.portfolios.map((p) => `${p.code} (${accessLabel(p.access)})`).join(", ")}
                 </Table.Td>
                 <Table.Td>{u.sign_in ?? <Text c="dimmed">—</Text>}</Table.Td>
                 <Table.Td><Badge variant="light">{u.status}</Badge></Table.Td>
@@ -147,7 +125,7 @@ export function UsersPage() {
                 </Table.Td>
                 <Table.Td>
                   <Group gap="xs" justify="flex-end">
-                    {u.status === "ACTIVE" && <Button size="xs" variant="light" onClick={() => setEditing(u)}>Edit access</Button>}
+                    {u.status === "ACTIVE" && <Button size="xs" variant="light" onClick={() => setEditing(u)}>Groups</Button>}
                     {u.status === "ACTIVE" && <Button size="xs" variant="light" onClick={() => setKeysFor(u)}>API keys</Button>}
                     {u.status === "ACTIVE" && (
                       <Button size="xs" variant="light" color="red"
@@ -163,7 +141,7 @@ export function UsersPage() {
               </Table.Tr>
             ))}
             {(list.data ?? []).length === 0 && (
-              <Table.Tr><Table.Td colSpan={7}><Text c="dimmed" ta="center">No users yet.</Text></Table.Td></Table.Tr>
+              <Table.Tr><Table.Td colSpan={8}><Text c="dimmed" ta="center">No users yet.</Text></Table.Td></Table.Tr>
             )}
           </Table.Tbody>
         </Table>
@@ -213,20 +191,18 @@ function AddUserModal({ opened, onClose }: { opened: boolean; onClose: () => voi
   );
 }
 
-/** Approve a pending account: it becomes a user, with a portfolio role and access. */
+/** Approve a pending account: it becomes a user, in the chosen groups. */
 function ApproveModal({ user, onClose }: { user: UserRow; onClose: () => void }) {
-  const [role, setRole] = useState<string>("viewer");
-  const [picked, setPicked] = useState<Record<string, Access>>({});
+  const [groups, setGroups] = useState<string[]>([]);
   const approve = useApiMutation(
-    () => api.post(`${PATH}/${user.principal_id}/approve`, { role, portfolios: accessBody(picked) }),
+    () => api.post(`${PATH}/${user.principal_id}/approve`, { groups }),
     { invalidate: [PATH], success: "Approved", onDone: onClose },
   );
   return (
     <Modal opened onClose={onClose} title={`Approve ${who(user)}`} centered>
       <form onSubmit={(e) => { e.preventDefault(); approve.mutate(undefined); }}>
         <Stack>
-          <Select label="Portfolio role" data={ROLE_OPTIONS} allowDeselect={false} value={role} onChange={(v) => v && setRole(v)} />
-          <PortfolioPicker value={picked} onChange={setPicked} />
+          <GroupPicker value={groups} onChange={setGroups} />
           <Group justify="flex-end">
             <Button variant="default" onClick={onClose}>Cancel</Button>
             <Button type="submit" loading={approve.isPending}>Approve</Button>
@@ -237,23 +213,17 @@ function ApproveModal({ user, onClose }: { user: UserRow; onClose: () => void })
   );
 }
 
+/** Which groups a user is in. */
 function EditAccessModal({ user, onClose }: { user: UserRow; onClose: () => void }) {
-  const [role, setRole] = useState<string>(user.role ?? "trader");
-  const [picked, setPicked] = useState<Record<string, Access>>(
-    Object.fromEntries(user.portfolios.map((p) => [p.portfolio_id, p.can_trade ? "trade" : "view"] as [string, Access])),
-  );
+  const [groups, setGroups] = useState<string[]>(user.groups.map((g) => g.id));
   const save = useApiMutation(
-    async () => {
-      if (role !== user.role) await api.put(`${PATH}/${user.principal_id}/role`, { role });
-      await api.put(`${PATH}/${user.principal_id}/portfolios`, accessBody(picked));
-    },
-    { invalidate: [PATH], success: "Access updated", onDone: onClose },
+    () => api.put(`${PATH}/${user.principal_id}/groups`, groups),
+    { invalidate: [PATH, "/admin/groups"], success: "Groups updated", onDone: onClose },
   );
   return (
-    <Modal opened onClose={onClose} title={`Edit access — ${who(user)}`} centered>
+    <Modal opened onClose={onClose} title={`Groups — ${who(user)}`} centered>
       <Stack>
-        <Select label="Role" data={ROLE_OPTIONS} allowDeselect={false} value={role} onChange={(v) => v && setRole(v)} />
-        <PortfolioPicker value={picked} onChange={setPicked} />
+        <GroupPicker value={groups} onChange={setGroups} />
         <Group justify="flex-end">
           <Button variant="default" onClick={onClose}>Cancel</Button>
           <Button onClick={() => save.mutate(undefined)} loading={save.isPending}>Save</Button>

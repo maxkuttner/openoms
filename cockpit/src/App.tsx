@@ -12,6 +12,7 @@ import { LoginPage } from "./login/LoginPage";
 import { ForcedPasswordChange, PendingScreen } from "./login/ChangePassword";
 import { AccountSettings } from "./login/AccountSettings";
 import { UsersPage } from "./pages/Users";
+import { GroupsPage } from "./pages/Groups";
 import { SignInPage } from "./pages/SignIn";
 import { SetupChecklist } from "./components/SetupChecklist";
 import { PortfoliosPage } from "./pages/Portfolios";
@@ -27,6 +28,7 @@ import { palette } from "./palette";
 
 const NAV = [
   { to: "/users", label: "Users" },
+  { to: "/groups", label: "Groups" },
   { to: "/sign-in", label: "Sign-in" },
   { to: "/tokens", label: "API" },
   { to: "/portfolios", label: "Portfolios" },
@@ -107,6 +109,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/users" element={<UsersPage />} />
+          <Route path="/groups" element={<GroupsPage />} />
           <Route path="/sign-in" element={<SignInPage />} />
           <Route path="/tokens" element={<ApiPage />} />
           <Route path="/portfolios" element={<PortfoliosPage />} />

@@ -16,7 +16,7 @@ export class AuthError extends Error {
   }
 }
 
-async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+async function call<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     method,
     credentials: "same-origin",
@@ -49,8 +49,14 @@ export const authApi = {
   changePassword: (current_password: string, new_password: string) =>
     call<unknown>("POST", "/auth/local/password", { current_password, new_password }),
   me: () => call<SessionInfo>("GET", "/auth/me"),
+  myKeys: () => call<OwnKey[]>("GET", "/auth/keys"),
+  createKey: (name: string) => call<OwnKey>("POST", "/auth/keys", { name: name || null }),
+  revokeKey: (keyId: string) => call<void>("DELETE", `/auth/keys/${encodeURIComponent(keyId)}`),
   logout: () => call<void>("POST", "/auth/logout", {}),
 };
+
+/** One of the signed-in user's API keys; `secret` only right after creation. */
+export type OwnKey = { key_id: string; name: string | null; created_at: string; secret?: string | null };
 
 /** The parts of `GET /auth/me` the sign-in screens care about. */
 export type SessionInfo = {

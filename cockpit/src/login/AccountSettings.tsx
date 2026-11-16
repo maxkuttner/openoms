@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { Alert, Button, Loader, Paper, Stack, Text, TextInput, Title } from "@mantine/core";
-import { authApi, authErrorText, type SessionInfo } from "./api";
+import { Alert, Button, Code, CopyButton, Group, Loader, Paper, Stack, Table, Text, TextInput, Title } from "@mantine/core";
+import { authApi, authErrorText, type OwnKey, type SessionInfo } from "./api";
 import { ChangePassword } from "./ChangePassword";
 import { inputStyles } from "./Frame";
 import { TotpEnroll } from "./Totp";
@@ -63,6 +63,62 @@ function TwoStepSignIn({ me, onChanged }: { me: SessionInfo; onChanged: () => vo
   );
 }
 
+/** "API keys": keys that act as you, with your group access (Open WebUI style). */
+function OwnKeys() {
+  const [keys, setKeys] = useState<OwnKey[] | null>(null);
+  const [name, setName] = useState("");
+  const [created, setCreated] = useState<OwnKey | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const load = () => authApi.myKeys().then(setKeys, (e) => setError(authErrorText(e)));
+  useEffect(() => { void load(); }, []);
+  const act = async (fn: () => Promise<unknown>) => {
+    setError(null);
+    try { await fn(); await load(); } catch (e) { setError(authErrorText(e)); }
+  };
+  return (
+    <Paper withBorder p="md">
+      <Stack gap={12}>
+        <Title order={4}>API keys</Title>
+        <Text fz={13} c="dimmed">A key acts as you, with your portfolio access. Use it as <Code>Authorization: Bearer key_id.secret</Code>.</Text>
+        {error && <Alert color="red">{error}</Alert>}
+        {created?.secret && (
+          <Alert color="green" title="Copy the secret now: it is shown once">
+            <Group gap="xs" wrap="nowrap">
+              <Code style={{ overflowWrap: "anywhere" }}>{`${created.key_id}.${created.secret}`}</Code>
+              <CopyButton value={`${created.key_id}.${created.secret}`}>
+                {({ copied, copy }) => <Button size="xs" variant="light" onClick={copy}>{copied ? "Copied" : "Copy"}</Button>}
+              </CopyButton>
+            </Group>
+          </Alert>
+        )}
+        <form onSubmit={(e) => { e.preventDefault(); void act(async () => { setCreated(await authApi.createKey(name.trim())); setName(""); }); }}>
+          <Group align="flex-end">
+            <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
+            <Button type="submit">Create key</Button>
+          </Group>
+        </form>
+        {keys === null ? <Loader size="sm" /> : keys.length === 0 ? <Text fz={13} c="dimmed">No keys.</Text> : (
+          <Table>
+            <Table.Tbody>
+              {keys.map((k) => (
+                <Table.Tr key={k.key_id}>
+                  <Table.Td><Code>{k.key_id}</Code></Table.Td>
+                  <Table.Td>{k.name ?? "—"}</Table.Td>
+                  <Table.Td>{new Date(k.created_at).toLocaleDateString()}</Table.Td>
+                  <Table.Td>
+                    <Button size="xs" variant="light" color="red"
+                      onClick={() => confirm(`Revoke ${k.key_id}?`) && void act(() => authApi.revokeKey(k.key_id))}>Revoke</Button>
+                  </Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+        )}
+      </Stack>
+    </Paper>
+  );
+}
+
 /** The account page of both apps: password and two-step sign-in, for local accounts. */
 export function AccountSettings() {
   const [me, setMe] = useState<SessionInfo | null>(null);
@@ -78,6 +134,7 @@ export function AccountSettings() {
       <Stack>
         <Title order={3}>Account</Title>
         <Text fz={13} c="dimmed">You signed in with SSO: your password and two-step sign-in are managed by your identity provider.</Text>
+        <OwnKeys />
       </Stack>
     );
   }
@@ -92,6 +149,7 @@ export function AccountSettings() {
         </Stack>
       </Paper>
       <TwoStepSignIn me={me} onChanged={() => void reload()} />
+      <OwnKeys />
     </Stack>
   );
 }
