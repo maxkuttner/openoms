@@ -30,7 +30,6 @@ export function SignInPage() {
           <Table.Tbody>
             <Table.Tr><Table.Th w={200}>Email and password</Table.Th><Table.Td>{onOff(m.local)}</Table.Td></Table.Tr>
             <Table.Tr><Table.Th>Single sign-on (SSO)</Table.Th><Table.Td>{onOff(m.sso)}</Table.Td></Table.Tr>
-            <Table.Tr><Table.Th>Shared admin password</Table.Th><Table.Td>{onOff(m.legacy_admin)}</Table.Td></Table.Tr>
           </Table.Tbody>
         </Table>
       )}

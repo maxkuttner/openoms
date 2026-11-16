@@ -1,14 +1,12 @@
 import { useState } from "react";
 import {
-  Stack, Group, Title, Button, Table, Modal, Drawer, TextInput, Select, Checkbox, Text, Badge, Loader,
-  ActionIcon, Alert, Code, CopyButton, Divider, Anchor, Switch,
+  Stack, Group, Title, Button, Table, Modal, Drawer, TextInput, PasswordInput, Select, Checkbox, Text, Badge, Loader,
+  ActionIcon, Alert, Code, CopyButton, Divider, Switch,
 } from "@mantine/core";
-import { Link } from "react-router-dom";
-import { api, isLegacySession } from "../api/client";
+import { api } from "../api/client";
 import { useList, useApiMutation } from "../api/hooks";
 import type { ApiKeyRecord, Portfolio } from "../api/types";
-import { useSetupStatus } from "../components/SetupChecklist";
-import { INVITE_METHOD_OPTIONS, ROLE_OPTIONS, SIGN_IN_WARNING, accessBody, inviteNotice, roleLabel, type Access } from "../users";
+import { ACCOUNT_ROLE_OPTIONS, ROLE_OPTIONS, accessBody, accountRoleLabel, pendingUsers, roleLabel, type Access } from "../users";
 
 const PATH = "/admin/users";
 
@@ -18,25 +16,12 @@ type UserRow = {
   display_name: string | null;
   email: string | null;
   role: string | null;
+  account_role: "admin" | "user" | "pending";
   portfolios: { portfolio_id: string; code: string; can_trade: boolean }[];
   sign_in: string | null;
   status: string;
-  invite: { invite_id: string; expires_at: string } | null;
   admin: boolean;
 };
-
-type PendingBinding = {
-  binding_id: string;
-  user_code: string;
-  invited_email: string;
-  issuer: string;
-  subject: string;
-  untrusted_email: string | null;
-  display_name: string | null;
-  created_at: string;
-};
-
-type InviteResult = { link: string; expires_at: string | null };
 
 function who(u: UserRow) {
   return u.display_name ?? u.email ?? u.code;
@@ -78,67 +63,44 @@ function PortfolioPicker({ value, onChange }: { value: Record<string, Access>; o
   );
 }
 
-function LinkBox({ email, result }: { email: string; result: InviteResult }) {
-  return (
-    <Stack gap="xs">
-      <Text size="sm">{result.expires_at ? inviteNotice(email, result.expires_at) : `Send this link to ${email}.`}</Text>
-      <Group gap="xs" wrap="nowrap">
-        <Code style={{ overflowWrap: "anywhere" }}>{result.link}</Code>
-        <CopyButton value={result.link}>
-          {({ copied, copy }) => <Button size="xs" variant="light" onClick={copy}>{copied ? "Copied" : "Copy"}</Button>}
-        </CopyButton>
-      </Group>
-    </Stack>
-  );
-}
-
 export function UsersPage() {
   const list = useList<UserRow>(PATH);
-  const setup = useSetupStatus();
-  const [inviting, setInviting] = useState(false);
-  const [keyOnly, setKeyOnly] = useState(false);
+  const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<UserRow | null>(null);
+  const [approving, setApproving] = useState<UserRow | null>(null);
   const [keysFor, setKeysFor] = useState<UserRow | null>(null);
-  const [shown, setShown] = useState<{ email: string; result: InviteResult } | null>(null);
-  const [bootstrapping, setBootstrapping] = useState(false);
-  const legacy = isLegacySession();
 
   const reload = [PATH, "/admin/setup-status"];
-  const linkAction = (path: (u: UserRow) => string) => (u: UserRow) =>
-    api.post<InviteResult>(path(u), {}).then((result) => setShown({ email: u.email ?? who(u), result }));
   const act = useApiMutation(
     ({ u, fn }: { u: UserRow; fn: (u: UserRow) => Promise<unknown> }) => fn(u),
     { invalidate: reload, success: "Done" },
   );
   const run = (u: UserRow, fn: (u: UserRow) => Promise<unknown>) => act.mutate({ u, fn });
+  const pending = pendingUsers(list.data ?? []);
 
   return (
     <Stack>
       <Group justify="space-between">
         <Title order={3}>Users</Title>
-        {legacy ? (
-          <Button onClick={() => setBootstrapping(true)}>Bootstrap named admin</Button>
-        ) : (
-          <Group>
-            <Button variant="default" onClick={() => setKeyOnly(true)}>New API-key user</Button>
-            <Button onClick={() => setInviting(true)}>Invite user</Button>
-          </Group>
-        )}
+        <Button onClick={() => setAdding(true)}>Add user</Button>
       </Group>
 
-      {legacy && (
-        <Alert color="yellow">
-          You're using the shared admin password. It can only create a named admin: do that, open the link,
-          set a password and authenticator, then sign in as that admin.
-        </Alert>
-      )}
-
-      {!legacy && <PendingBindings />}
-
-      {setup.data && !setup.data.sign_in_ok && (
-        <Alert color="yellow">
-          {SIGN_IN_WARNING}{" "}
-          <Anchor component={Link} to="/sign-in" inherit>Sign-in settings</Anchor>
+      {pending.length > 0 && (
+        <Alert color="yellow" title="Waiting for approval">
+          <Stack gap="xs">
+            {pending.map((u) => (
+              <Group key={u.principal_id} justify="space-between">
+                <Text size="sm">{who(u)}{u.email && u.display_name ? ` (${u.email})` : ""}{u.sign_in ? ` — via ${u.sign_in}` : ""}</Text>
+                <Group gap="xs">
+                  <Button size="xs" onClick={() => setApproving(u)}>Approve</Button>
+                  <Button size="xs" variant="light" color="red"
+                    onClick={() => confirm(`Reject ${who(u)}? The account is disabled.`) && run(u, (x) => api.post(`${PATH}/${x.principal_id}/reject`, {}))}>
+                    Reject
+                  </Button>
+                </Group>
+              </Group>
+            ))}
+          </Stack>
         </Alert>
       )}
 
@@ -150,7 +112,7 @@ export function UsersPage() {
             <Table.Tr>
               <Table.Th>User</Table.Th>
               <Table.Th>Role</Table.Th>
-              <Table.Th>Portfolios</Table.Th>
+              <Table.Th>Portfolio access</Table.Th>
               <Table.Th>Sign-in</Table.Th>
               <Table.Th>Status</Table.Th>
               <Table.Th>Admin</Table.Th>
@@ -164,23 +126,19 @@ export function UsersPage() {
                   {who(u)}
                   {u.email && u.display_name && <Text size="xs" c="dimmed">{u.email}</Text>}
                 </Table.Td>
-                <Table.Td>{roleLabel(u.role)}</Table.Td>
+                <Table.Td>{accountRoleLabel(u.account_role)}</Table.Td>
                 <Table.Td>
                   {u.portfolios.length === 0
                     ? <Text c="dimmed">—</Text>
-                    : u.portfolios.map((p) => `${p.code} (${p.can_trade ? "trade" : "view"})`).join(", ")}
+                    : `${roleLabel(u.role)}: ` + u.portfolios.map((p) => `${p.code} (${p.can_trade ? "trade" : "view"})`).join(", ")}
                 </Table.Td>
-                <Table.Td>
-                  {u.invite
-                    ? <Text size="sm">Invite expires {new Date(u.invite.expires_at).toLocaleDateString()}</Text>
-                    : u.sign_in ?? <Text c="dimmed">—</Text>}
-                </Table.Td>
+                <Table.Td>{u.sign_in ?? <Text c="dimmed">—</Text>}</Table.Td>
                 <Table.Td><Badge variant="light">{u.status}</Badge></Table.Td>
                 <Table.Td>
                   <Switch
                     aria-label="Admin"
                     checked={u.admin}
-                    disabled={legacy || u.status === "DISABLED"}
+                    disabled={u.status !== "ACTIVE"}
                     onChange={(e) => {
                       const admin = e.currentTarget.checked;
                       run(u, (x) => api.put(`${PATH}/${x.principal_id}/admin`, { admin }));
@@ -189,16 +147,7 @@ export function UsersPage() {
                 </Table.Td>
                 <Table.Td>
                   <Group gap="xs" justify="flex-end">
-                    {u.invite && (
-                      <>
-                        <Button size="xs" variant="light" onClick={() => run(u, linkAction((x) => `${PATH}/invites/${x.invite!.invite_id}/reissue`))}>New link</Button>
-                        <Button size="xs" variant="light" color="red" onClick={() => run(u, (x) => api.post(`${PATH}/invites/${x.invite!.invite_id}/revoke`, {}))}>Revoke</Button>
-                      </>
-                    )}
-                    {u.status === "ACTIVE" && !u.sign_in && !u.invite && (
-                      <Button size="xs" variant="light" onClick={() => run(u, linkAction((x) => `${PATH}/${x.principal_id}/link-invite`))}>Sign-in link</Button>
-                    )}
-                    {u.status !== "DISABLED" && <Button size="xs" variant="light" onClick={() => setEditing(u)}>Edit access</Button>}
+                    {u.status === "ACTIVE" && <Button size="xs" variant="light" onClick={() => setEditing(u)}>Edit access</Button>}
                     {u.status === "ACTIVE" && <Button size="xs" variant="light" onClick={() => setKeysFor(u)}>API keys</Button>}
                     {u.status === "ACTIVE" && (
                       <Button size="xs" variant="light" color="red"
@@ -220,14 +169,9 @@ export function UsersPage() {
         </Table>
       )}
 
-      <InviteModal opened={inviting} onClose={() => setInviting(false)} onDone={(email, result) => { setInviting(false); setShown({ email, result }); }} />
-      <BootstrapAdminModal opened={bootstrapping} onClose={() => setBootstrapping(false)} onDone={(email, result) => { setBootstrapping(false); setShown({ email, result }); }} />
-      <KeyOnlyModal opened={keyOnly} onClose={() => setKeyOnly(false)} />
+      <AddUserModal opened={adding} onClose={() => setAdding(false)} />
       {editing && <EditAccessModal user={editing} onClose={() => setEditing(null)} />}
-
-      <Modal opened={!!shown} onClose={() => setShown(null)} title="Invite link" centered size="lg">
-        {shown && <LinkBox email={shown.email} result={shown.result} />}
-      </Modal>
+      {approving && <ApproveModal user={approving} onClose={() => setApproving(null)} />}
 
       <Drawer opened={!!keysFor} onClose={() => setKeysFor(null)} position="right" size="lg" title={keysFor ? `${who(keysFor)} — API keys` : ""}>
         {keysFor && <KeysSection userId={keysFor.principal_id} />}
@@ -236,130 +180,56 @@ export function UsersPage() {
   );
 }
 
-function InviteModal({ opened, onClose, onDone }: { opened: boolean; onClose: () => void; onDone: (email: string, r: InviteResult) => void }) {
+/** Open WebUI's "Add user": a local account with a password you pass on yourself. */
+function AddUserModal({ opened, onClose }: { opened: boolean; onClose: () => void }) {
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
-  const [role, setRole] = useState<string>("trader");
-  const [method, setMethod] = useState<string>("any");
-  const [picked, setPicked] = useState<Record<string, Access>>({});
-  const send = useApiMutation(
-    () => api.post<InviteResult>(`${PATH}/invite`, { email: email.trim(), role, method, portfolios: accessBody(picked) }),
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState<string>("user");
+  const create = useApiMutation(
+    () => api.post(PATH, { name: name.trim(), email: email.trim(), password, role }),
     {
       invalidate: [PATH, "/admin/setup-status"],
-      success: "Invite created",
-      onDone: (r) => { onDone(email.trim(), r as InviteResult); setEmail(""); setPicked({}); },
+      success: "User added",
+      onDone: () => { setName(""); setEmail(""); setPassword(""); onClose(); },
     },
   );
   return (
-    <Modal opened={opened} onClose={onClose} title="Invite user" centered>
-      <form onSubmit={(e) => { e.preventDefault(); send.mutate(undefined); }}>
+    <Modal opened={opened} onClose={onClose} title="Add user" centered>
+      <form onSubmit={(e) => { e.preventDefault(); create.mutate(undefined); }}>
         <Stack>
-          <TextInput label="Email" type="email" required value={email} onChange={(e) => setEmail(e.currentTarget.value)} />
-          <Select label="Role" data={ROLE_OPTIONS} allowDeselect={false} value={role} onChange={(v) => v && setRole(v)} />
-          <Select label="Sign-in method" data={INVITE_METHOD_OPTIONS} allowDeselect={false} value={method} onChange={(v) => v && setMethod(v)} />
+          <TextInput label="Name" required value={name} onChange={(e) => setName(e.currentTarget.value)} />
+          <TextInput label="Email" required value={email} onChange={(e) => setEmail(e.currentTarget.value)} />
+          <PasswordInput label="Password" description="At least 15 characters. Give it to them yourself; they can change it under Account."
+            required value={password} onChange={(e) => setPassword(e.currentTarget.value)} autoComplete="new-password" />
+          <Select label="Role" data={ACCOUNT_ROLE_OPTIONS} allowDeselect={false} value={role} onChange={(v) => v && setRole(v)} />
+          <Group justify="flex-end">
+            <Button variant="default" onClick={onClose}>Cancel</Button>
+            <Button type="submit" loading={create.isPending}>Add user</Button>
+          </Group>
+        </Stack>
+      </form>
+    </Modal>
+  );
+}
+
+/** Approve a pending account: it becomes a user, with a portfolio role and access. */
+function ApproveModal({ user, onClose }: { user: UserRow; onClose: () => void }) {
+  const [role, setRole] = useState<string>("viewer");
+  const [picked, setPicked] = useState<Record<string, Access>>({});
+  const approve = useApiMutation(
+    () => api.post(`${PATH}/${user.principal_id}/approve`, { role, portfolios: accessBody(picked) }),
+    { invalidate: [PATH], success: "Approved", onDone: onClose },
+  );
+  return (
+    <Modal opened onClose={onClose} title={`Approve ${who(user)}`} centered>
+      <form onSubmit={(e) => { e.preventDefault(); approve.mutate(undefined); }}>
+        <Stack>
+          <Select label="Portfolio role" data={ROLE_OPTIONS} allowDeselect={false} value={role} onChange={(v) => v && setRole(v)} />
           <PortfolioPicker value={picked} onChange={setPicked} />
           <Group justify="flex-end">
             <Button variant="default" onClick={onClose}>Cancel</Button>
-            <Button type="submit" loading={send.isPending}>Create invite</Button>
-          </Group>
-        </Stack>
-      </form>
-    </Modal>
-  );
-}
-
-/** Sign-in identities waiting for an admin to compare and approve them. */
-function PendingBindings() {
-  const path = `${PATH}/bindings`;
-  const list = useList<PendingBinding>(path);
-  const decide = useApiMutation(
-    ({ id, verdict }: { id: string; verdict: "approve" | "reject" }) => api.post(`${path}/${id}/${verdict}`, {}),
-    { invalidate: [path, PATH], success: "Done" },
-  );
-  if (!list.data?.length) return null;
-  return (
-    <Stack gap="xs">
-      <Title order={5}>Waiting for approval</Title>
-      <Text size="sm" c="dimmed">
-        Someone opened an invite and signed in with SSO. Check with the invited person, by a channel you trust,
-        that this sign-in is theirs before approving. The provider's email is not verified.
-      </Text>
-      <Table withTableBorder>
-        <Table.Thead>
-          <Table.Tr><Table.Th>Invite</Table.Th><Table.Th>Signed in as</Table.Th><Table.Th>Provider</Table.Th><Table.Th /></Table.Tr>
-        </Table.Thead>
-        <Table.Tbody>
-          {list.data.map((b) => (
-            <Table.Tr key={b.binding_id}>
-              <Table.Td>{b.invited_email}</Table.Td>
-              <Table.Td>
-                {b.display_name ?? "—"}
-                {b.untrusted_email && <Text size="xs" c="dimmed">{b.untrusted_email} (unverified)</Text>}
-              </Table.Td>
-              <Table.Td>
-                <Text size="xs">{b.issuer}</Text>
-                <Text size="xs" c="dimmed">{b.subject}</Text>
-              </Table.Td>
-              <Table.Td>
-                <Group gap="xs" justify="flex-end">
-                  <Button size="xs" variant="light" onClick={() => decide.mutate({ id: b.binding_id, verdict: "approve" })}>Approve</Button>
-                  <Button size="xs" variant="light" color="red" onClick={() => decide.mutate({ id: b.binding_id, verdict: "reject" })}>Reject</Button>
-                </Group>
-              </Table.Td>
-            </Table.Tr>
-          ))}
-        </Table.Tbody>
-      </Table>
-    </Stack>
-  );
-}
-
-/** Create the first named admin with the shared admin password. */
-function BootstrapAdminModal({ opened, onClose, onDone }: { opened: boolean; onClose: () => void; onDone: (email: string, r: InviteResult) => void }) {
-  const [email, setEmail] = useState("");
-  const [name, setName] = useState("");
-  const create = useApiMutation(
-    () => api.post<{ user_id: string; link: string }>(`${PATH}/bootstrap-admin`, { email: email.trim(), display_name: name.trim() || null }),
-    {
-      invalidate: [PATH],
-      success: "Admin created",
-      onDone: (r) => onDone(email.trim(), { link: (r as { link: string }).link, expires_at: null }),
-    },
-  );
-  return (
-    <Modal opened={opened} onClose={onClose} title="Bootstrap named admin" centered>
-      <form onSubmit={(e) => { e.preventDefault(); create.mutate(undefined); }}>
-        <Stack>
-          <TextInput label="Email" type="email" required value={email} onChange={(e) => setEmail(e.currentTarget.value)} />
-          <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
-          <Group justify="flex-end">
-            <Button variant="default" onClick={onClose}>Cancel</Button>
-            <Button type="submit" loading={create.isPending}>Create</Button>
-          </Group>
-        </Stack>
-      </form>
-    </Modal>
-  );
-}
-
-function KeyOnlyModal({ opened, onClose }: { opened: boolean; onClose: () => void }) {
-  const [code, setCode] = useState("");
-  const [name, setName] = useState("");
-  const [role, setRole] = useState<string>("trader");
-  const create = useApiMutation(
-    () => api.post(PATH, { code: code.trim(), display_name: name.trim(), role }),
-    { invalidate: [PATH], success: "User created", onDone: () => { setCode(""); setName(""); onClose(); } },
-  );
-  return (
-    <Modal opened={opened} onClose={onClose} title="New API-key user" centered>
-      <form onSubmit={(e) => { e.preventDefault(); create.mutate(undefined); }}>
-        <Stack>
-          <Text size="sm" c="dimmed">For a bot or script. It can't sign in; it connects with API keys.</Text>
-          <TextInput label="Code" required value={code} onChange={(e) => setCode(e.currentTarget.value)} />
-          <TextInput label="Name" required value={name} onChange={(e) => setName(e.currentTarget.value)} />
-          <Select label="Role" data={ROLE_OPTIONS} allowDeselect={false} value={role} onChange={(v) => v && setRole(v)} />
-          <Group justify="flex-end">
-            <Button variant="default" onClick={onClose}>Cancel</Button>
-            <Button type="submit" loading={create.isPending}>Create</Button>
+            <Button type="submit" loading={approve.isPending}>Approve</Button>
           </Group>
         </Stack>
       </form>

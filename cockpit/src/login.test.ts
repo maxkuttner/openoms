@@ -1,43 +1,46 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  accessMessage, authErrorMessage, inviteSummary, mfaPromptText, mfaStepFor, inviteTokenFromHash, loginHref, nextStepFromLoginResponse, safeReturnTo,
-  secretFromOtpauth, visibleMethods,
+  accessMessage, authErrorMessage, isApprovalPending, isPendingAccount, loginMode, mfaPromptText, mfaStepFor, loginHref,
+  nextStepFromLoginResponse, safeReturnTo, secretFromOtpauth, twoStepSection, visibleMethods,
 } from "./login.ts";
 
 test("only enabled sign-in methods are shown", () => {
-  const off = { local: false, sso: false, sso_label: "Sign in with SSO", legacy_admin: false };
+  const off = { local: false, sso: false, sso_label: "Sign in with SSO" };
   assert.deepEqual(visibleMethods(off), []);
   assert.deepEqual(visibleMethods({ ...off, sso: true }), ["sso"]);
   assert.deepEqual(visibleMethods({ ...off, local: true }), ["local"]);
   assert.deepEqual(visibleMethods({ ...off, local: true, sso: true }), ["sso", "local"]);
-  assert.deepEqual(visibleMethods({ ...off, legacy_admin: true }), ["legacy_admin"]);
 });
 
 test("the login response names the next step", () => {
   assert.equal(nextStepFromLoginResponse({ next: "totp" }), "totp");
   assert.equal(nextStepFromLoginResponse({ next: "totp_enroll" }), "totp_enroll");
+  assert.equal(nextStepFromLoginResponse({ next: "done" }), "done");
   assert.equal(nextStepFromLoginResponse({ mfa_verified: true }), "done");
   assert.equal(nextStepFromLoginResponse(undefined), "done");
   assert.equal(nextStepFromLoginResponse({ next: "something_else" }), "done");
 });
 
 test("access reasons read as plain text", () => {
-  assert.equal(accessMessage("pending_approval", null), "Your sign-in is waiting for an administrator to approve it.");
-  assert.equal(accessMessage("expired", null), "This invite expired. Ask for a new one.");
-  assert.equal(accessMessage("revoked", null), "This invite was revoked.");
-  assert.equal(
-    accessMessage("email_mismatch", "j…@fundco.com"),
-    "This invite is for j…@fundco.com. Sign in with that address, or ask for a new invite.",
-  );
-  assert.equal(accessMessage(null, null), "Access not granted. Ask the OMS admin for an invite.");
+  assert.equal(accessMessage("no_account", null), "There is no account for this sign-in. Ask the OMS admin to add you.");
+  assert.equal(accessMessage(null, null), "Access not granted. Ask the OMS admin to add you.");
 });
 
-test("an invite reads as role and portfolios", () => {
-  assert.equal(inviteSummary({ role: "trader", portfolios: ["ALPHA", "BETA"] }), "You're invited as Trader on ALPHA, BETA.");
-  assert.equal(inviteSummary({ role: "pm", portfolios: ["ALPHA"] }), "You're invited as PM on ALPHA.");
-  assert.equal(inviteSummary({ role: "viewer", portfolios: [] }), "You're invited as Viewer.");
-  assert.equal(inviteSummary({ role: null, portfolios: [] }), "You're invited as Admin.");
+test("a pending account is gated until approved", () => {
+  assert.equal(isPendingAccount({ role: "pending" }), true);
+  assert.equal(isPendingAccount({ role: "user" }), false);
+  assert.equal(isPendingAccount(null), false);
+  assert.equal(isApprovalPending(403, '{"error":"approval_pending"}'), true);
+  assert.equal(isApprovalPending(403, '{"error":"mfa_required"}'), false);
+  assert.equal(isApprovalPending(401, '{"error":"approval_pending"}'), false);
+});
+
+test("a fresh install offers to create the admin account", () => {
+  const m = { local: true, sso: false, sso_label: "SSO" };
+  assert.equal(loginMode({ ...m, first_run: true }), "create_admin");
+  assert.equal(loginMode({ ...m, first_run: false }), "signin");
+  assert.equal(loginMode({ ...m, local: false, first_run: true }), "signin", "no local sign-in, no form");
 });
 
 test("the TOTP secret is read from the otpauth URI", () => {
@@ -53,12 +56,6 @@ test("return_to stays on this site", () => {
   assert.equal(safeReturnTo("/\\evil.example"), null);
   assert.equal(safeReturnTo(null), null);
   assert.equal(loginHref("/cockpit/", "/cockpit/users"), "/cockpit/login?return_to=%2Fcockpit%2Fusers");
-});
-
-test("the invite token comes from the URL fragment", () => {
-  assert.equal(inviteTokenFromHash("#abc_DEF-123"), "abc_DEF-123");
-  assert.equal(inviteTokenFromHash(""), null);
-  assert.equal(inviteTokenFromHash("#"), null);
 });
 
 test("the MFA step follows how the session signed in", () => {
@@ -78,4 +75,12 @@ test("auth errors read by their code", () => {
   assert.equal(authErrorMessage(429, "too_many_attempts", null), "Too many attempts. Wait a few minutes and try again.");
   assert.equal(authErrorMessage(400, "weak_password", "too common"), "too common");
   assert.equal(authErrorMessage(500, null, null), "Something went wrong. Try again.");
+});
+
+test("two-step sign-in settings show only for local accounts", () => {
+  assert.equal(twoStepSection({ auth_method: "local", totp_enrolled: false }), "enroll");
+  assert.equal(twoStepSection({ auth_method: "local", totp_enrolled: true }), "disable");
+  assert.equal(twoStepSection({ auth_method: "oidc", totp_enrolled: false }), "hidden");
+  assert.equal(twoStepSection({ auth_method: "local" }), "enroll");
+  assert.equal(twoStepSection(null), "hidden");
 });

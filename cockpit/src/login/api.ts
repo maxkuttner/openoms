@@ -39,23 +39,27 @@ async function call<T>(method: "GET" | "POST", path: string, body?: unknown): Pr
 
 export const authApi = {
   methods: () => call<AuthMethods>("GET", "/auth/methods"),
-  preview: (token: string) => call<InvitePreview>("GET", `/auth/invite/${encodeURIComponent(token)}/preview`),
   login: (email: string, password: string) => call<unknown>("POST", "/auth/local/login", { email, password }),
-  enroll: (token: string, password: string) => call<unknown>("POST", "/auth/local/enroll", { token, password }),
+  signup: (name: string, email: string, password: string) =>
+    call<{ role: string; next: string }>("POST", "/auth/local/signup", { name, email, password }),
   totp: (code: string) => call<unknown>("POST", "/auth/local/totp", { code }),
   totpEnroll: () => call<{ otpauth_uri: string }>("POST", "/auth/local/totp/enroll", {}),
   totpConfirm: (code: string) => call<{ recovery_codes: string[] }>("POST", "/auth/local/totp/confirm", { code }),
+  totpDisable: (code: string) => call<void>("POST", "/auth/local/totp/disable", { code }),
+  changePassword: (current_password: string, new_password: string) =>
+    call<unknown>("POST", "/auth/local/password", { current_password, new_password }),
+  me: () => call<SessionInfo>("GET", "/auth/me"),
   logout: () => call<void>("POST", "/auth/logout", {}),
 };
 
-export type InvitePreview = {
-  valid: boolean;
-  email_hint: string | null;
-  role: string | null;
-  portfolios: string[];
-  methods: string[];
-  expires_at: string | null;
+/** The parts of `GET /auth/me` the sign-in screens care about. */
+export type SessionInfo = {
+  auth_method: string;
+  /** `admin`, `user` or `pending`. */
+  role?: string;
+  totp_enrolled?: boolean;
 };
+
 
 /** User-facing text for a failed sign-in call. */
 export function authErrorText(err: unknown): string {

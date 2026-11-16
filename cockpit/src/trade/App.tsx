@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Alert, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
-import { Routes, Route, Navigate, useLocation } from "react-router-dom";
+import { Alert, Anchor, AppShell, Box, Button, Container, Group, Loader, Stack, Text, Tooltip } from "@mantine/core";
+import { Routes, Route, Navigate, Link, useLocation } from "react-router-dom";
 import { AccessPage } from "./pages/Access";
 import { tradeApi, API_BASE, onMfaRequired } from "./api/client";
 import { MfaPrompt } from "../login/MfaPrompt";
 import { LoginPage } from "../login/LoginPage";
-import { InvitePreview } from "../login/InvitePreview";
 import { TRADE_HOME } from "../login/api";
+import { PendingScreen } from "../login/ChangePassword";
+import { AccountSettings } from "../login/AccountSettings";
+import { isPendingAccount } from "../login";
 import { TradePage } from "./pages/Trade";
 import { LiveUpdatesProvider, useLive } from "./api/liveUpdates";
 
@@ -63,15 +65,18 @@ export type Me = {
   code: string;
   display_name: string | null;
   portfolios: GrantedPortfolio[];
+  auth_method: string;
+  /** `admin`, `user` or `pending`. */
+  role?: string;
+  totp_enrolled?: boolean;
 };
 
 export function TradeApp() {
-  // Sign-in, invite and access pages have no session to load: render them
+  // Sign-in and access pages have no session to load: render them
   // before the identity query, which would bounce to sign-in.
   const { pathname } = useLocation();
   if (pathname === "/access") return <AccessPage />;
   if (pathname === "/login") return <LoginPage home={TRADE_HOME} />;
-  if (pathname === "/invite") return <InvitePreview />;
   return <SignedInTradeApp />;
 }
 
@@ -82,6 +87,7 @@ function SignedInTradeApp() {
 
   if (me.isLoading) return <Loader />;
   if (me.error) return <Text c="red">Could not load your session.</Text>;
+  if (isPendingAccount(me.data)) return <PendingScreen />;
 
   return (
     <LiveUpdatesProvider>
@@ -94,15 +100,16 @@ function SignedInTradeApp() {
             </Text>
             <Group gap="xs" wrap="nowrap">
               <ConnectionDot />
-              <Text size="sm" c="dimmed">
+              <Anchor component={Link} to="/account" size="sm" c="dimmed">
                 {me.data?.display_name ?? me.data?.code}
-              </Text>
+              </Anchor>
             </Group>
           </Group>
         </AppShell.Header>
         <AppShell.Main>
           <Routes>
             <Route path="/" element={<TradePage me={me.data!} />} />
+            <Route path="/account" element={<Container size="sm"><AccountSettings /></Container>} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AppShell.Main>

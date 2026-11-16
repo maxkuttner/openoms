@@ -4,7 +4,7 @@ export type SetupStatus = {
   venue_connected: boolean;
   portfolio_exists: boolean;
   sign_in_ok: boolean;
-  user_invited: boolean;
+  user_added: boolean;
   first_order: boolean;
 };
 
@@ -15,7 +15,7 @@ export function checklistSteps(s: SetupStatus): ChecklistStep[] {
     { key: "venue_connected", label: "Connect a venue", to: "/broker-connections", done: s.venue_connected },
     { key: "portfolio_exists", label: "Create a portfolio", to: "/portfolios", done: s.portfolio_exists },
     { key: "sign_in_ok", label: "Turn on sign-in", to: "/sign-in", done: s.sign_in_ok },
-    { key: "user_invited", label: "Invite a user", to: "/users", done: s.user_invited },
+    { key: "user_added", label: "Add a user", to: "/users", done: s.user_added },
     { key: "first_order", label: "First order shows in the blotter", to: "/blotter", done: s.first_order },
   ];
 }

@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
 import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor, Stack } from "@mantine/core";
-import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation, useNavigate } from "react-router-dom";
+import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { API_BASE, consoleAccess, goToLogin, isLegacySession, onMfaRequired, setLegacyPassword } from "./api/client";
-import { authApi, TRADE_HOME } from "./login/api";
+import { API_BASE, consoleAccess, goToLogin, onMfaRequired } from "./api/client";
+import { authApi, COCKPIT_HOME, TRADE_HOME } from "./login/api";
 import { MfaPrompt } from "./login/MfaPrompt";
 import { Frame } from "./login/Frame";
 import { Logo } from "./components/Logo";
 import { JobsIndicator } from "./components/JobsIndicator";
-import { LoginPage } from "./pages/Login";
+import { LoginPage } from "./login/LoginPage";
+import { PendingScreen } from "./login/ChangePassword";
+import { AccountSettings } from "./login/AccountSettings";
 import { UsersPage } from "./pages/Users";
 import { SignInPage } from "./pages/SignIn";
 import { SetupChecklist } from "./components/SetupChecklist";
@@ -35,6 +37,7 @@ const NAV = [
   { to: "/strategies", label: "Strategies" },
   { to: "/blotter", label: "Blotter" },
   { to: "/instruments", label: "Instruments" },
+  { to: "/account", label: "Account" },
 ];
 
 function ConnectionDot() {
@@ -114,13 +117,14 @@ function Console({ onLogout }: { onLogout: () => void }) {
           <Route path="/strategies" element={<StrategiesPage />} />
           <Route path="/blotter" element={<BlotterPage />} />
           <Route path="/instruments" element={<InstrumentsPage />} />
+          <Route path="/account" element={<AccountSettings />} />
         </Routes>
       </AppShell.Main>
     </AppShell>
   );
 }
 
-type Status = "checking" | "admin" | "forbidden" | "unavailable";
+type Status = "checking" | "admin" | "pending" | "forbidden" | "unavailable";
 
 /** Signed in, but without the admin capability. */
 function NoAccess() {
@@ -137,7 +141,6 @@ function NoAccess() {
 /** Auth gate: the console needs a session holding the admin capability. */
 export function App() {
   const { pathname } = useLocation();
-  const navigate = useNavigate();
   const [status, setStatus] = useState<Status>("checking");
   const onLoginPage = pathname === "/login";
 
@@ -148,9 +151,7 @@ export function App() {
       .then((a) => (a === "signed_out" ? goToLogin() : setStatus(a)));
   }, [onLoginPage]);
 
-  if (onLoginPage) {
-    return <LoginPage onLegacySignedIn={() => { setStatus("admin"); navigate("/users", { replace: true }); }} />;
-  }
+  if (onLoginPage) return <LoginPage home={COCKPIT_HOME} />;
 
   if (status === "checking") {
     return (
@@ -159,6 +160,7 @@ export function App() {
       </Center>
     );
   }
+  if (status === "pending") return <PendingScreen />;
   if (status === "forbidden") return <NoAccess />;
   if (status === "unavailable") {
     return <Frame title="Admin console"><Text fz={13}>The OMS isn't responding. Try again.</Text></Frame>;
@@ -169,8 +171,7 @@ export function App() {
       <MfaPrompt register={onMfaRequired} />
       <Console
         onLogout={async () => {
-          if (!isLegacySession()) await authApi.logout().catch(() => undefined);
-          setLegacyPassword(null);
+          await authApi.logout().catch(() => undefined);
           goToLogin();
         }}
       />

@@ -1,7 +1,7 @@
 // The trade app authenticates by session cookie and NOTHING else.
 //
-// It deliberately does not reuse cockpit/src/api/client.ts, which can carry
-// the deprecated shared admin password as a bearer.
+// It keeps its own client rather than reusing cockpit/src/api/client.ts, whose
+// 401 handling sends the browser to the cockpit's sign-in page.
 
 import { loginHref } from "../../login";
 import { TRADE_HOME } from "../../login/api";

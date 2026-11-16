@@ -6,53 +6,71 @@ export type AuthMethods = {
   local: boolean;
   sso: boolean;
   sso_label: string;
-  legacy_admin: boolean;
+  /** The sign-up form may be shown. */
+  signup?: boolean;
+  /** No admin exists yet: offer "Create the admin account". */
+  first_run?: boolean;
 };
 
-export type Method = "sso" | "local" | "legacy_admin";
+export type Method = "sso" | "local";
 
 /** The sign-in methods to offer, in display order. Disabled ones never appear. */
 export function visibleMethods(m: AuthMethods): Method[] {
   const out: Method[] = [];
   if (m.sso) out.push("sso");
   if (m.local) out.push("local");
-  if (m.legacy_admin) out.push("legacy_admin");
   return out;
 }
 
 export type Step = "totp" | "totp_enroll" | "done";
 
-/** The step after a password login, enrolment or TOTP check. */
+/** The step after a password login, enrolment, password change or TOTP check. */
 export function nextStepFromLoginResponse(body: unknown): Step {
   const next = (body as { next?: unknown } | null | undefined)?.next;
   return next === "totp" || next === "totp_enroll" ? next : "done";
 }
 
-/** Text for the access page a refused sign-in lands on; unknown reasons read as no invite. */
-export function accessMessage(reason: string | null, hint: string | null): string {
-  switch (reason) {
-    case "expired":
-      return "This invite expired. Ask for a new one.";
-    case "revoked":
-      return "This invite was revoked.";
-    case "email_mismatch":
-      return `This invite is for ${hint ?? "another address"}. Sign in with that address, or ask for a new invite.`;
-    // No longer sent by the server; kept for old bookmarked access URLs.
-    case "email_unverified":
-      return "Your sign-in provider didn't confirm your email address. Use another sign-in method or ask for a new invite.";
-    case "pending_approval":
-      return "Your sign-in is waiting for an administrator to approve it.";
-    default:
-      return "Access not granted. Ask the OMS admin for an invite.";
+/** `/auth/me` says the account is waiting for an admin's approval. */
+export function isPendingAccount(me: { role?: string } | null | undefined): boolean {
+  return me?.role === "pending";
+}
+
+/** Is this response the 403 a pending account gets everywhere? */
+export function isApprovalPending(status: number, body: string): boolean {
+  if (status !== 403) return false;
+  try {
+    return JSON.parse(body)?.error === "approval_pending";
+  } catch {
+    return false;
   }
 }
 
-const ROLE_LABELS: Record<string, string> = { pm: "PM", trader: "Trader", viewer: "Viewer" };
+/** What the sign-in page offers besides signing in. */
+export function loginMode(m: AuthMethods): "create_admin" | "signin" {
+  return m.local && m.first_run ? "create_admin" : "signin";
+}
 
-/** "You're invited as {Role} on {portfolios}." An invite with no role is a named admin's. */
-export function inviteSummary(p: { role: string | null; portfolios: string[] }): string {
-  const role = p.role === null ? "Admin" : (ROLE_LABELS[p.role] ?? p.role);
-  return p.portfolios.length ? `You're invited as ${role} on ${p.portfolios.join(", ")}.` : `You're invited as ${role}.`;
+export const PENDING_MESSAGE = "Your account is waiting for an administrator to approve it.";
+
+/**
+ * What the "Two-step sign-in" settings section offers: nothing for an SSO
+ * session (the provider owns its MFA), else turning the authenticator on or off.
+ */
+export function twoStepSection(
+  me: { auth_method?: string; totp_enrolled?: boolean } | null | undefined,
+): "hidden" | "enroll" | "disable" {
+  if (me?.auth_method !== "local") return "hidden";
+  return me.totp_enrolled ? "disable" : "enroll";
+}
+
+/** Text for the access page a refused sign-in lands on. */
+export function accessMessage(reason: string | null, _hint?: string | null): string {
+  switch (reason) {
+    case "no_account":
+      return "There is no account for this sign-in. Ask the OMS admin to add you.";
+    default:
+      return "Access not granted. Ask the OMS admin to add you.";
+  }
 }
 
 /** The base32 secret inside an `otpauth://` URI, for typing in by hand. */
@@ -71,12 +89,6 @@ export function safeReturnTo(raw: string | null): string | null {
 /** The login page of an app whose router lives under `appBase` (e.g. "/cockpit/"). */
 export function loginHref(appBase: string, returnTo: string): string {
   return `${appBase}login?return_to=${encodeURIComponent(returnTo)}`;
-}
-
-/** Invite links carry the token in the fragment, so it never reaches a server log or referrer. */
-export function inviteTokenFromHash(hash: string): string | null {
-  const t = hash.replace(/^#/, "");
-  return t || null;
 }
 
 export type MfaStep = "totp" | "sso";
@@ -108,6 +120,16 @@ export function authErrorMessage(status: number, code: string | null, reason: st
       return "Your sign-in expired. Sign in again.";
     case "invalid_code":
       return "That code didn't work. Try again.";
+    case "same_password":
+      return "Choose a password different from the current one.";
+    case "signup_disabled":
+      return "Sign-up is turned off. Ask the OMS admin to add you.";
+    case "email_taken":
+      return "An account with this email already exists. Sign in instead.";
+    case "invalid_email":
+      return "Enter a valid email address.";
+    case "mfa_required_by_policy":
+      return "This OMS requires two-step sign-in, so it can't be turned off.";
   }
   if (status === 429) return "Too many attempts. Wait a few minutes and try again.";
   return "Something went wrong. Try again.";

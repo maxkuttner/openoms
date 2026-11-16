@@ -1,29 +1,15 @@
 // Thin typed fetch wrapper over the OMS admin API.
 // In dev, requests go to "/api/*" which Vite proxies to the OMS (see vite.config.ts).
 //
-// Authentication is the session cookie. The one exception is the deprecated
-// shared admin password, accepted by the server only until the first named
-// admin exists and only to create that admin: it is held in memory for this
-// page (never stored) and sent as a bearer.
+// Authentication is the session cookie, nothing else.
 
 import { COCKPIT_HOME } from "../login/api";
-import { loginHref } from "../login";
+import { isApprovalPending, loginHref } from "../login";
 
 // Dev runs behind Vite's proxy, which strips this prefix (see vite.config.ts).
 // A production bundle is served by the OMS itself at /cockpit/, so it is
 // same-origin and calls the API with no prefix at all.
 export const API_BASE = import.meta.env.DEV ? "/api" : "";
-
-let legacyPassword: string | null = null;
-
-/** Use the shared admin password for this page's requests (null to stop). */
-export function setLegacyPassword(password: string | null): void {
-  legacyPassword = password;
-}
-
-export function isLegacySession(): boolean {
-  return legacyPassword !== null;
-}
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -52,10 +38,7 @@ function send(method: string, path: string, body?: unknown): Promise<Response> {
   return fetch(`${API_BASE}${path}`, {
     method,
     credentials: "same-origin",
-    headers: {
-      "Content-Type": "application/json",
-      ...(legacyPassword ? { Authorization: `Bearer ${legacyPassword}` } : {}),
-    },
+    headers: { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 }
@@ -80,7 +63,6 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
   if (!res.ok) {
     if (res.status === 401) {
-      setLegacyPassword(null);
       goToLogin();
       // Never resolves: the page is navigating away.
       return new Promise<T>(() => {});
@@ -94,13 +76,17 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 /**
- * Who may open the console: "admin", "forbidden" (signed in, but no admin
- * capability), "signed_out", or "unavailable" (server error). Does not redirect.
+ * Who may open the console: "admin", "pending" (account waiting for
+ * approval), "forbidden" (signed in, but no admin capability),
+ * "signed_out", or "unavailable" (server error). Does not redirect.
  */
-export async function consoleAccess(): Promise<"admin" | "forbidden" | "signed_out" | "unavailable"> {
+export async function consoleAccess(): Promise<"admin" | "pending" | "forbidden" | "signed_out" | "unavailable"> {
   const res = await send("GET", "/admin/users");
   if (res.ok) return "admin";
-  if (res.status === 403) return "forbidden";
+  if (res.status === 403) {
+    const text = await res.text().catch(() => "");
+    return isApprovalPending(res.status, text) ? "pending" : "forbidden";
+  }
   return res.status === 401 ? "signed_out" : "unavailable";
 }
 
