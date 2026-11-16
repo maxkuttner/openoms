@@ -52,7 +52,7 @@ role ──< role_permission                what each role may do
                               │   │      └──< recovery_code       ten single-use codes, stored hashed
                               │   ├──< principal_admin            the admin capability, separate from roles
                               │   ├──< user_session               auth_method, MFA-verified time
-                              │   ├──< portfolio grant            view / trade / allocate per portfolio
+                              │   ├──< user_group_member          groups: view / trade / manage per portfolio (strategies: direct grants)
                               │   ├──< api_key
                               │   └──< audit_event                sign-ups, approvals, role and grant changes, revocations
                               │

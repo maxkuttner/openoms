@@ -18,8 +18,8 @@ them, or an admin adds them directly. Each account has a role: **admin**, **user
 
 On a fresh install (no admin exists yet) the sign-in page shows **Create the admin account**:
 name, email and a password. That account gets the admin capability (the admin console) and
-nothing else: it cannot place orders until it is given a portfolio role and portfolios (see
-[Roles](#roles-and-permissions)). If two people submit the form at the same moment, exactly one
+nothing else: it cannot place orders until it is put in a group with portfolio access (see
+[Groups](#groups-and-permissions)). If two people submit the form at the same moment, exactly one
 becomes the admin; the other is an ordinary sign-up.
 
 `oms init` does not ask for an admin any more. For scripted installs,
@@ -40,7 +40,7 @@ default_user_role = "pending" # default; "user" activates sign-ups at once
 A **pending** account can sign in, but sees only "Your account is waiting for an administrator
 to approve it." Every API call except `GET /auth/me`, `GET /auth/methods` and
 `POST /auth/logout` answers `403 {"error":"approval_pending"}`. Admins find pending accounts at
-the top of the **Users** page: **Approve** (choose a portfolio role and portfolios) or
+the top of the **Users** page: **Approve** (choose the groups it joins) or
 **Reject** (the account is disabled). With `default_user_role = "user"` a sign-up is active at
 once, but with no portfolio access until an admin grants some.
 
@@ -55,9 +55,10 @@ and a role (admin, user or pending). Pass the password on yourself, by a channel
 user can change it under **Account**. The API is `POST /admin/users` with
 `{"name", "email", "password", "role"}`.
 
-From the list you can also change a user's **portfolio role** and **portfolios** (effective on
-the next request), grant or remove **admin**, **disable** a user (sessions end at once and API
-keys stop), and create or revoke their **API keys**. Revoking access ends the user's open
+From the list you can also change a user's **groups** (effective on the next request), grant or remove **admin**, **disable** a user (sessions end at once and API
+keys stop), and create or revoke their **API keys**. Users manage their own keys under
+**Account → API keys** (`GET`/`POST /auth/keys`, `DELETE /auth/keys/{key_id}`); a key acts as
+its user, with that user's group access, and the secret is shown once. Revoking access ends the user's open
 live-update connections immediately; changes the running server is not told about (a host-CLI
 `oms auth recover-admin`, a session reaching its absolute lifetime) close them within 15
 seconds.
@@ -100,17 +101,16 @@ watchlist: that is a personal view setting, not an order or admin action. API ke
 machine credentials with their own scope. For SSO sessions see
 [`require_amr`](#require-mfa-from-the-identity-provider).
 
-## Roles and permissions
-
-Each user has one portfolio role. The backend checks every request against the role's permissions,
-inside the portfolios the user has been given: *view* puts a portfolio in scope, *trade*
-allows creating and cancelling there.
+## Groups and permissions
 
 The account role (admin / user / pending) says whether someone may use the OMS and the admin
-console. What a **user** may do with orders comes from their **portfolio role** and the
-portfolios they have access to:
+console. What a **user** may do with a portfolio comes from **groups**: on the cockpit's
+**Groups** page, a group has members and, per portfolio, an access level: **view**, **trade**
+or **manage**. Someone in several groups gets the highest level on each portfolio; no group
+with that portfolio means no access. The levels carry these permissions (view = Viewer,
+trade = Trader, manage = PM), checked by the backend on every request:
 
-| Permission | PM | Trader | Viewer |
+| Permission | Manage (PM) | Trade (Trader) | View (Viewer) |
 |---|---|---|---|
 | View own orders (`orders.view_own`) | yes | yes | yes |
 | View all orders in the portfolio (`orders.view_all`) | yes | | yes |
@@ -123,8 +123,8 @@ portfolios they have access to:
 | Manage strategies (`strategies.manage`) | yes | | |
 
 "Own" means submitted by that user. A fourth role, **strategy**, is for automated
-[strategies](/strategies/fix/) and cannot be given to a person. **Admin** is not a portfolio
-role: it is a switch on the Users page that opens the admin console. The last active admin cannot be
+[strategies](/strategies/fix/): strategies keep their own direct portfolio grants, not groups.
+**Admin** is not an access level: it is a switch on the Users page that opens the admin console. The last active admin cannot be
 removed or disabled.
 
 Every strategy has a **responsible user**, shown on the **Strategies** page. Handing a
@@ -302,3 +302,10 @@ server.
 `oms-dev-secret` is public. The OMS refuses to start with it unless the bind address is
 loopback. Never run this fixture beyond your own machine.
 :::
+
+## Upgrading to groups
+
+Each person's existing portfolio grants became a group of their own, named `user <code>`, so
+nobody lost access: PM with trade became **manage**, trader with trade became **trade**, and
+everything else **view** (a view-only PM grant therefore no longer sets limits; give that
+person a manage group if they should). Rename, merge or delete these groups as you like.
