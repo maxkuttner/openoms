@@ -112,7 +112,8 @@ async fn migrations_backfill_identities_and_roles() {
     .unwrap();
     assert_eq!(column, 0, "external_subject must be dropped");
 
-    assert_eq!(role_of(&pool, human).await.as_deref(), Some("pm"));
+    // 0048 gave people a role; 0065 removed people's roles again (groups decide).
+    assert_eq!(role_of(&pool, human).await, None);
     assert_eq!(role_of(&pool, strategy).await.as_deref(), Some("strategy"));
 
     let service_type: String =
@@ -122,7 +123,7 @@ async fn migrations_backfill_identities_and_roles() {
             .await
             .unwrap();
     assert_eq!(service_type, "HUMAN");
-    assert_eq!(role_of(&pool, service).await.as_deref(), Some("trader"));
+    assert_eq!(role_of(&pool, service).await, None, "now a person: groups decide");
 
     let desk_left: i64 = sqlx::query_scalar("SELECT count(*) FROM oms.principal WHERE id = $1")
         .bind(desk)

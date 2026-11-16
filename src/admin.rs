@@ -1723,8 +1723,17 @@ pub async fn create_trading_token(
     let mut tx = state.pool().begin().await.map_err(map_db_error)?;
 
     // Optionally entitle the principal to trade a portfolio. (The token belongs to
-    // this principal; its grants decide what the token can trade.)
+    // this principal; its grants decide what the token can trade.) People get
+    // portfolio access through groups only, never a direct grant.
     if let Some(portfolio_id) = payload.portfolio_id {
+        let human: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM principal WHERE id = $1 AND principal_type = 'HUMAN')")
+            .bind(principal_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+        if human {
+            return Err(AdminError::new(StatusCode::UNPROCESSABLE_ENTITY, "people get portfolio access through groups"));
+        }
         sqlx::query(
             "INSERT INTO principal_portfolio_grant \
                 (id, principal_id, portfolio_id, can_trade, can_view, can_allocate) \

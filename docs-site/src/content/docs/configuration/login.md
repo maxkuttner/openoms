@@ -108,7 +108,9 @@ console. What a **user** may do with a portfolio comes from **groups**: on the c
 **Groups** page, a group has members and, per portfolio, an access level: **view**, **trade**
 or **manage**. Someone in several groups gets the highest level on each portfolio; no group
 with that portfolio means no access. The levels carry these permissions (view = Viewer,
-trade = Trader, manage = PM), checked by the backend on every request:
+trade = Trader, manage = PM), checked by the backend on every request. Allocating a block
+order out of a portfolio needs trade rights there: **trade** and **manage** allocate,
+**view** does not.
 
 | Permission | Manage (PM) | Trade (Trader) | View (Viewer) |
 |---|---|---|---|
@@ -308,4 +310,8 @@ loopback. Never run this fixture beyond your own machine.
 Each person's existing portfolio grants became a group of their own, named `user <code>`, so
 nobody lost access: PM with trade became **manage**, trader with trade became **trade**, and
 everything else **view** (a view-only PM grant therefore no longer sets limits; give that
-person a manage group if they should). Rename, merge or delete these groups as you like.
+person a manage group if they should). A grant held without any portfolio role gave no
+permission before and gives none now. A trade grant that could not allocate now can, since
+allocation follows trade rights. People's old portfolio roles and direct grants are removed;
+only strategies keep direct grants, and an admin trading token can no longer add a portfolio
+to a person (`422`: use a group). Rename, merge or delete these groups as you like.

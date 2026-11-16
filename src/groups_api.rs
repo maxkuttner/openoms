@@ -267,6 +267,10 @@ pub async fn set_portfolios(
     Path(id): Path<Uuid>,
     Json(access): Json<Vec<GroupPortfolio>>,
 ) -> Result<StatusCode, ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    if !access.iter().all(|a| seen.insert(a.portfolio_id)) {
+        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "a portfolio is listed twice"));
+    }
     let mut tx = state.pool().begin().await.map_err(db)?;
     lock_group(&mut tx, id).await?;
     sqlx::query("DELETE FROM user_group_portfolio WHERE group_id = $1").bind(id).execute(&mut *tx).await.map_err(db)?;
@@ -407,15 +411,21 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn removing_user_from_group_revokes_access_next_request_and_closes_socket() {
+    async fn removing_user_from_group_revokes_access_and_reloads_socket_scope() {
         let pool = migrated_db().await;
         let st = state(pool.clone());
         let (me, pf) = (person(&pool).await, portfolio(&pool).await);
         let g = group(&st, "desk", &[me], &[(pf, Access::Trade)]).await;
         assert!(allowed(&pool, me, Permission::OrdersCreate, pf).await.unwrap());
+        let scope = crate::live_updates::StreamScope::load(&pool, me).await.unwrap();
+        assert!(scope.sees_positions(pf), "the socket scope includes the portfolio");
         // The live-updates socket of this person reloads its scope on AuthChanged.
         let mut auth = st.event_bus().subscribe_auth();
         set_members(State(st.clone()), Extension(admin()), Path(g), Json(vec![])).await.unwrap();
+        let members: i64 = sqlx::query_scalar("SELECT count(*) FROM user_group_member WHERE group_id = $1").bind(g).fetch_one(&pool).await.unwrap();
+        assert_eq!(members, 0, "an empty body clears the members");
+        let reloaded = crate::live_updates::StreamScope::load(&pool, me).await.unwrap();
+        assert!(!reloaded.sees_positions(pf), "the reloaded socket scope drops it");
         assert!(!allowed(&pool, me, Permission::OrdersCreate, pf).await.unwrap(), "the next request is refused");
         assert!(!allowed(&pool, me, Permission::PositionsView, pf).await.unwrap());
         assert_eq!(auth.try_recv().unwrap().principal_id, me, "AuthChanged for the removed member");
@@ -475,5 +485,106 @@ mod tests {
         assert_eq!(direct, 0, "people's direct grants moved into their groups");
         assert!(allowed(&pool, trader, Permission::OrdersCreate, pf1).await.unwrap(), "nobody lost access");
         assert!(allowed(&pool, pm, Permission::OrdersCancelAny, pf1).await.unwrap());
+        let roles: i64 = sqlx::query_scalar("SELECT count(*) FROM oms.principal_role r JOIN oms.principal p ON p.id = r.principal_id WHERE p.principal_type = 'HUMAN'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(roles, 0, "people's leftover roles are gone: groups decide");
+    }
+
+    /// Seed one person (with `role`, if any) holding one grant, migrated from
+    /// just before 0064. Returns the pool and the person.
+    async fn migrate_one_grant(role: Option<&str>, can_view: bool, can_trade: bool) -> (PgPool, Uuid, Uuid) {
+        use crate::setup::database::migrate;
+        let pool = crate::authz_schema_tests::fresh_db().await;
+        migrate::ensure_tracking(&pool).await.unwrap();
+        migrate::apply_matching(&pool, |schema, f| schema != "oms" || f < "0064_").await.unwrap();
+        let (who, pf) = (Uuid::new_v4(), Uuid::new_v4());
+        sqlx::query("INSERT INTO oms.principal (id, code, principal_type, status) VALUES ($1, 'one', 'HUMAN', 'ACTIVE')").bind(who).execute(&pool).await.unwrap();
+        if let Some(role) = role {
+            sqlx::query("INSERT INTO oms.principal_role (principal_id, role_code) VALUES ($1, $2)").bind(who).bind(role).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO oms.portfolio (id, code, name, status) VALUES ($1, 'one-p', 'p', 'ACTIVE')").bind(pf).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO oms.principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view) VALUES ($1, $2, $3, $4, $5)")
+            .bind(Uuid::new_v4()).bind(who).bind(pf).bind(can_trade).bind(can_view).execute(&pool).await.unwrap();
+        migrate::apply_all(&pool).await.unwrap();
+        sqlx::query("SET search_path TO oms, public").execute(&pool).await.unwrap();
+        (pool, who, pf)
+    }
+
+    async fn access_rows(pool: &PgPool, who: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM oms.portfolio_access WHERE principal_id = $1").bind(who).fetch_one(pool).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn grant_without_role_migrates_to_no_access() {
+        let (pool, who, pf) = migrate_one_grant(None, true, true).await;
+        assert_eq!(access_rows(&pool, who).await, 0, "no role meant no permission before: still none");
+        assert!(!allowed(&pool, who, Permission::PositionsView, pf).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn grant_without_view_is_dropped() {
+        let (pool, who, _) = migrate_one_grant(Some("viewer"), false, false).await;
+        assert_eq!(access_rows(&pool, who).await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn a_repeated_portfolio_in_the_access_table_is_refused_cleanly() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let pf = portfolio(&pool).await;
+        let g = group(&st, "dup", &[], &[(pf, Access::View)]).await;
+        let twice = vec![
+            GroupPortfolio { portfolio_id: pf, code: String::new(), access: Access::Trade },
+            GroupPortfolio { portfolio_id: pf, code: String::new(), access: Access::View },
+        ];
+        let err = set_portfolios(State(st.clone()), Extension(admin()), Path(g), Json(twice)).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let kept: String = sqlx::query_scalar("SELECT access FROM user_group_portfolio WHERE group_id = $1").bind(g).fetch_one(&pool).await.unwrap();
+        assert_eq!(kept, "view", "nothing changed");
+    }
+
+    /// Admin trading tokens never hand a person portfolio access outside groups.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn trading_token_refuses_portfolio_for_a_person() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (me, pf) = (person(&pool).await, portfolio(&pool).await);
+        let body = crate::admin::CreateTradingToken { principal_id: me, portfolio_id: Some(pf), label: None };
+        let Err(err) = crate::admin::create_trading_token(State(st.clone()), Json(body)).await else {
+            panic!("a person's portfolio must be refused");
+        };
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(access_rows(&pool, me).await, 0);
+        let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM api_key WHERE principal_id = $1").bind(me).fetch_one(&pool).await.unwrap();
+        assert_eq!(keys, 0, "nothing was created");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn portfolios_list_has_no_duplicates() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (me, pf) = (person(&pool).await, portfolio(&pool).await);
+        group(&st, "a", &[me], &[(pf, Access::View)]).await;
+        group(&st, "b", &[me], &[(pf, Access::Trade)]).await;
+        // A direct grant on the same portfolio (only strategies get these now;
+        // tests and old data may still hold one): still one row.
+        sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, 'trader')").bind(me).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view) VALUES ($1, $2, $3, true, true)")
+            .bind(Uuid::new_v4()).bind(me).bind(pf).execute(&pool).await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM portfolio_access WHERE principal_id = $1 AND portfolio_id = $2")
+            .bind(me).bind(pf).fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 1, "one access row per (principal, portfolio)");
+        let ctx = AuthContext { principal_id: me, principal_code: "x".into(), auth_method: crate::auth::AuthMethod::Oidc, mfa: true };
+        let list = crate::handlers::list_portfolios(State(st), Extension(ctx)).await.unwrap().0;
+        assert_eq!(list.len(), 1, "one row per portfolio");
+        assert!(list[0].can_trade);
     }
 }
