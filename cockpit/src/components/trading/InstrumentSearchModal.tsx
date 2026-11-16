@@ -1,10 +1,13 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useDebouncedValue } from "@mantine/hooks";
-import {
-  Alert, Badge, Button, Group, Loader, Modal, Paper, Stack, Table, Text, TextInput, Title,
-  UnstyledButton,
-} from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { cn } from "@/lib/utils";
+import { useDebounced } from "@/lib/useDebounced";
+import { Notice, Spinner } from "../common";
+import { Pill } from "../status";
 import { api, ApiError } from "../../api/client";
 import type { SearchInstrument, ChainRow, StrategyLeg } from "./types";
 
@@ -60,7 +63,7 @@ export function InstrumentSearchModal({
 }) {
   const [step, setStep] = useState<Step>("search");
   const [search, setSearch] = useState("");
-  const [debounced] = useDebouncedValue(search, 250);
+  const debounced = useDebounced(search, 250);
   const [underlying, setUnderlying] = useState<SearchInstrument | null>(null);
   const [expiry, setExpiry] = useState<string | null>(null);
   const [legs, setLegs] = useState<StrategyLeg[]>([]);
@@ -278,212 +281,162 @@ export function InstrumentSearchModal({
     resetAndClose();
   }
 
+  // One priced cell of the chain: Ask buys, Bid sells; highlighted when that leg is picked.
+  const cell = (row: ChainRow, side: "call" | "put", tradeSide: "buy" | "sell", price: number | null | undefined, has: boolean) => {
+    const ref = side === "call" ? row.call : row.put;
+    return (
+      <TableCell
+        className={cn(
+          "num text-right",
+          ref ? "cursor-pointer" : "text-muted-foreground",
+          ref && (side === "call" ? "text-buy" : "text-sell"),
+          tradeSide === "buy" && "font-semibold",
+          has && (tradeSide === "buy" ? "bg-buy/15" : "bg-sell/15"),
+        )}
+        onClick={() => ref && toggleLeg(row, side, tradeSide)}
+      >
+        {ref ? price ?? "—" : "—"}
+      </TableCell>
+    );
+  };
+
   return (
-    <Modal opened={opened} onClose={resetAndClose} fullScreen title="Search instruments">
-      <Stack gap="md">
+    <Dialog open={opened} onOpenChange={(open) => { if (!open) resetAndClose(); }}>
+      <DialogContent className="flex h-[90vh] max-w-[min(1100px,95vw)] flex-col gap-3 overflow-y-auto sm:max-w-[min(1100px,95vw)]">
+        <DialogHeader><DialogTitle>Search instruments</DialogTitle></DialogHeader>
         {step === "search" && (
           <>
-            <TextInput
-              placeholder="Search symbol or name…"
-              value={search}
-              onChange={(e) => setSearch(e.currentTarget.value)}
-              autoFocus
-            />
-            {results.isLoading && <Loader size="sm" />}
-            {results.error && <Alert color="red">{notifyableMessage(results.error)}</Alert>}
-            {debounced.length === 0 && <Text c="dimmed">Type a symbol or name to search.</Text>}
+            <Input placeholder="Search symbol or name…" value={search} onChange={(e) => setSearch(e.currentTarget.value)} autoFocus />
+            {results.isLoading && <Spinner />}
+            {results.error && <Notice>{notifyableMessage(results.error)}</Notice>}
+            {debounced.length === 0 && <p className="text-muted-foreground">Type a symbol or name to search.</p>}
             {debounced.length > 0 && !results.isLoading && (results.data ?? []).length === 0 && (
-              <Text c="dimmed">No instruments match "{debounced}".</Text>
+              <p className="text-muted-foreground">No instruments match "{debounced}".</p>
             )}
             {/* One list, in the server's ranked order (see search_instruments
                 in src/instruments_api.rs) — never regrouped here, or the exact
                 match can be pushed below a section header. */}
-            <Stack gap={4}>
+            <ul className="flex flex-col gap-1">
               {(results.data ?? []).map((r) => (
-                <Paper key={r.id} withBorder p={0}>
-                  <Group justify="space-between" wrap="nowrap" gap={0}>
-                    <UnstyledButton onClick={() => pickInstrument(r)} p="sm" style={{ flex: 1, minWidth: 0 }}>
-                      <Group gap="xs" wrap="nowrap">
-                        <Text fw={600}>{r.symbol}</Text>
-                        <Text c="dimmed" size="sm" truncate>
-                          {r.name} · {r.venue}
-                        </Text>
-                      </Group>
-                    </UnstyledButton>
-                    {r.has_options && (
-                      <Button variant="light" color="depth" size="xs" mr="sm" onClick={() => openOptions(r)}>
-                        Options
-                      </Button>
-                    )}
-                  </Group>
-                </Paper>
+                <li key={r.id} className="flex items-center justify-between rounded-md border hover:bg-accent">
+                  <button type="button" onClick={() => pickInstrument(r)} className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left">
+                    <span className="font-semibold">{r.symbol}</span>
+                    <span className="truncate text-muted-foreground">{r.name} · {r.venue}</span>
+                  </button>
+                  {r.has_options && (
+                    <Button variant="secondary" size="xs" className="mr-2 text-buy" onClick={() => openOptions(r)}>Options</Button>
+                  )}
+                </li>
               ))}
-            </Stack>
+            </ul>
           </>
         )}
 
         {step === "underlying" && underlying && (
           <>
-            <Group justify="space-between">
-              <Title order={4}>{underlying.symbol}</Title>
-              <Group gap="xs">
-                <Button variant="light" onClick={() => pickInstrument(underlying)}>
-                  Trade {underlying.symbol} directly
-                </Button>
-                <Button variant="subtle" onClick={() => { setTemplateError(null); setStep("search"); }}>
-                  ← Back to search
-                </Button>
-              </Group>
-            </Group>
-            {expiries.isLoading && <Loader size="sm" />}
-            {expiries.error && <Alert color="red">{notifyableMessage(expiries.error)}</Alert>}
-            {templateError && <Alert color="red">{templateError}</Alert>}
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold">{underlying.symbol}</h3>
+              <div className="flex gap-2">
+                <Button variant="secondary" onClick={() => pickInstrument(underlying)}>Trade {underlying.symbol} directly</Button>
+                <Button variant="ghost" onClick={() => { setTemplateError(null); setStep("search"); }}>← Back to search</Button>
+              </div>
+            </div>
+            {expiries.isLoading && <Spinner />}
+            {expiries.error && <Notice>{notifyableMessage(expiries.error)}</Notice>}
+            {templateError && <Notice>{templateError}</Notice>}
             {expiries.data && expiries.data.length === 0 && (
-              <Alert color="yellow">
+              <Notice tone="info">
                 {underlying.symbol} has no active option expiries right now — use "Trade {underlying.symbol} directly"
                 above, or check back later.
-              </Alert>
+              </Notice>
             )}
             {expiries.data && expiries.data.length > 0 && (
-              <Group grow>
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
                 {TEMPLATES.map((t) => (
-                  <UnstyledButton key={t.key} onClick={() => pickTemplate(t.key)}>
-                    <Paper withBorder p="sm">
-                      <Stack gap={4}>
-                        <Group justify="space-between">
-                          <Text fw={600}>{t.name}</Text>
-                          <Badge size="sm" color="gray">
-                            {t.legCount}
-                          </Badge>
-                        </Group>
-                        <Text size="xs" c="dimmed">
-                          {t.description}
-                        </Text>
-                      </Stack>
-                    </Paper>
-                  </UnstyledButton>
+                  <button key={t.key} type="button" onClick={() => pickTemplate(t.key)}
+                    className="flex flex-col gap-1 rounded-md border bg-card p-3 text-left hover:bg-accent">
+                    <span className="flex items-center justify-between">
+                      <span className="font-semibold">{t.name}</span>
+                      <Pill>{t.legCount}</Pill>
+                    </span>
+                    <span className="text-xs text-muted-foreground">{t.description}</span>
+                  </button>
                 ))}
-              </Group>
+              </div>
             )}
           </>
         )}
 
         {step === "chain" && underlying && (
           <>
-            <Group justify="space-between">
-              <Title order={4}>
-                {underlying.symbol} chain — {expiry}
-              </Title>
-              <Button variant="subtle" onClick={() => { setTemplateError(null); setStep("underlying"); }}>
-                ← Back to templates
-              </Button>
-            </Group>
-            <Group gap="xs">
+            <div className="flex items-center justify-between">
+              <h3 className="font-semibold">{underlying.symbol} chain — <span className="num">{expiry}</span></h3>
+              <Button variant="ghost" onClick={() => { setTemplateError(null); setStep("underlying"); }}>← Back to templates</Button>
+            </div>
+            <div className="flex flex-wrap gap-1">
               {(expiries.data ?? []).map((d) => (
-                <Badge
-                  key={d}
-                  variant={d === expiry ? "filled" : "outline"}
-                  style={{ cursor: "pointer" }}
-                  onClick={() => setExpiry(d)}
-                >
+                <button key={d} type="button" onClick={() => setExpiry(d)}
+                  className={cn("num rounded border px-2 py-0.5 text-xs", d === expiry ? "border-primary bg-primary text-primary-foreground" : "hover:bg-accent")}>
                   {d}
-                </Badge>
+                </button>
               ))}
-            </Group>
-            {chain.isLoading && <Loader size="sm" />}
-            {chain.error && <Alert color="red">{notifyableMessage(chain.error)}</Alert>}
+            </div>
+            {chain.isLoading && <Spinner />}
+            {chain.error && <Notice>{notifyableMessage(chain.error)}</Notice>}
             {chain.data && chain.data.length === 0 && !chain.isLoading && (
-              <Alert color="yellow">No strikes listed for {underlying.symbol} on {expiry}.</Alert>
+              <Notice tone="info">No strikes listed for {underlying.symbol} on {expiry}.</Notice>
             )}
-            <Text size="xs" c="dimmed">
-              Click a price to add that leg — Ask buys, Bid sells. Click again to remove it.
-            </Text>
-            <Table striped highlightOnHover>
-              <Table.Thead>
-                <Table.Tr>
-                  <Table.Th colSpan={2} ta="center" c="depth">
-                    Calls
-                  </Table.Th>
-                  <Table.Th ta="center">Strike</Table.Th>
-                  <Table.Th colSpan={2} ta="center" c="offer">
-                    Puts
-                  </Table.Th>
-                </Table.Tr>
-                <Table.Tr>
-                  <Table.Th>Bid</Table.Th>
-                  <Table.Th>Ask</Table.Th>
-                  <Table.Th />
-                  <Table.Th>Bid</Table.Th>
-                  <Table.Th>Ask</Table.Th>
-                </Table.Tr>
-              </Table.Thead>
-              <Table.Tbody>
-                {(chain.data ?? []).map((row) => {
-                  const callMark = row.call ? marks.data?.[row.call.instrument_id] : undefined;
-                  const putMark = row.put ? marks.data?.[row.put.instrument_id] : undefined;
-                  const has = (side: "call" | "put", tradeSide: "buy" | "sell") => {
-                    const ref = side === "call" ? row.call : row.put;
-                    return !!ref && legs.some((l) => l.instrumentId === String(ref.instrument_id) && l.side === tradeSide);
-                  };
-                  return (
-                    <Table.Tr key={row.strike}>
-                      <Table.Td
-                        style={{ cursor: row.call ? "pointer" : "default" }}
-                        onClick={() => row.call && toggleLeg(row, "call", "sell")}
-                        bg={has("call", "sell") ? "var(--mantine-color-offer-light)" : undefined}
-                        c={row.call ? "depth" : "dimmed"}
-                      >
-                        {row.call ? callMark?.bid ?? "—" : "—"}
-                      </Table.Td>
-                      <Table.Td
-                        style={{ cursor: row.call ? "pointer" : "default" }}
-                        onClick={() => row.call && toggleLeg(row, "call", "buy")}
-                        bg={has("call", "buy") ? "var(--mantine-color-depth-light)" : undefined}
-                        c={row.call ? "depth" : "dimmed"}
-                        fw={600}
-                      >
-                        {row.call ? callMark?.ask ?? "—" : "—"}
-                      </Table.Td>
-                      <Table.Td ta="center" fw={700}>
-                        {row.strike}
-                      </Table.Td>
-                      <Table.Td
-                        style={{ cursor: row.put ? "pointer" : "default" }}
-                        onClick={() => row.put && toggleLeg(row, "put", "sell")}
-                        bg={has("put", "sell") ? "var(--mantine-color-offer-light)" : undefined}
-                        c={row.put ? "offer" : "dimmed"}
-                      >
-                        {row.put ? putMark?.bid ?? "—" : "—"}
-                      </Table.Td>
-                      <Table.Td
-                        style={{ cursor: row.put ? "pointer" : "default" }}
-                        onClick={() => row.put && toggleLeg(row, "put", "buy")}
-                        bg={has("put", "buy") ? "var(--mantine-color-depth-light)" : undefined}
-                        c={row.put ? "offer" : "dimmed"}
-                        fw={600}
-                      >
-                        {row.put ? putMark?.ask ?? "—" : "—"}
-                      </Table.Td>
-                    </Table.Tr>
-                  );
-                })}
-              </Table.Tbody>
-            </Table>
-            <Group justify="space-between">
-              <Text>
+            <p className="text-xs text-muted-foreground">Click a price to add that leg — Ask buys, Bid sells. Click again to remove it.</p>
+            <div className="rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead colSpan={2} className="text-center text-buy">Calls</TableHead>
+                    <TableHead className="text-center">Strike</TableHead>
+                    <TableHead colSpan={2} className="text-center text-sell">Puts</TableHead>
+                  </TableRow>
+                  <TableRow>
+                    <TableHead className="text-right">Bid</TableHead>
+                    <TableHead className="text-right">Ask</TableHead>
+                    <TableHead />
+                    <TableHead className="text-right">Bid</TableHead>
+                    <TableHead className="text-right">Ask</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {(chain.data ?? []).map((row) => {
+                    const callMark = row.call ? marks.data?.[row.call.instrument_id] : undefined;
+                    const putMark = row.put ? marks.data?.[row.put.instrument_id] : undefined;
+                    const has = (side: "call" | "put", tradeSide: "buy" | "sell") => {
+                      const ref = side === "call" ? row.call : row.put;
+                      return !!ref && legs.some((l) => l.instrumentId === String(ref.instrument_id) && l.side === tradeSide);
+                    };
+                    return (
+                      <TableRow key={row.strike}>
+                        {cell(row, "call", "sell", callMark?.bid, has("call", "sell"))}
+                        {cell(row, "call", "buy", callMark?.ask, has("call", "buy"))}
+                        <TableCell className="num text-center font-bold">{row.strike}</TableCell>
+                        {cell(row, "put", "sell", putMark?.bid, has("put", "sell"))}
+                        {cell(row, "put", "buy", putMark?.ask, has("put", "buy"))}
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </div>
+            <div className="flex items-center justify-between">
+              <p>
                 {legs.length} leg{legs.length === 1 ? "" : "s"} selected
                 {legs.length > 0 &&
                   (allChainLegsPriced
                     ? ` · net ${netPremium >= 0 ? "debit" : "credit"} ${Math.abs(netPremium).toFixed(2)}`
                     : " · net premium unavailable (not all legs priced)")}
-              </Text>
-              <Button disabled={legs.length === 0} onClick={useCombo}>
-                Use this combo
-              </Button>
-            </Group>
+              </p>
+              <Button disabled={legs.length === 0} onClick={useCombo}>Use this combo</Button>
+            </div>
           </>
         )}
-      </Stack>
-    </Modal>
+      </DialogContent>
+    </Dialog>
   );
 }

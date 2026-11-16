@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Loader, Paper, Select, SimpleGrid, Stack, Table, Text, Title, Group } from "@mantine/core";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Select, Stat } from "../../components/form";
+import { Spinner } from "../../components/common";
 import { api } from "../../api/client";
 import { useLive } from "../../api/liveUpdates";
-import { numeric, columnHeader } from "../../components/trading/table";
+import { numeric } from "../../components/trading/table";
 import { formatFees } from "../../fees";
 import type { Me } from "../../access";
 import type { MarkRow } from "../../components/trading/types";
@@ -17,22 +19,6 @@ export type { PositionRow };
 // them as "—", NEVER as 0: a zero mark silently misstates P&L, and unrealized
 // P&L is exactly the number someone glances at before deciding something.
 const num = (v: number | null | undefined) => (v === null || v === undefined ? "—" : v);
-
-/// One derived total for the summary row. `pnlColor` on a P&L figure, omitted
-/// for market value (a size, not a gain or loss).
-function SummaryCard({ label, value, pnlColor }: { label: string; value: string; pnlColor?: boolean }) {
-  const signed = pnlColor ? (value.startsWith("-") ? "offer" : value === "0.00" ? undefined : "depth") : undefined;
-  return (
-    <Paper withBorder p="md">
-      <Text size="xs" c="dimmed" tt="uppercase" fw={600} style={{ letterSpacing: "0.05em" }}>
-        {label}
-      </Text>
-      <Text size="xl" fw={600} c={signed} mt={4}>
-        {value}
-      </Text>
-    </Paper>
-  );
-}
 
 export function PositionsPage({ me }: { me: Me }) {
   const viewable = me.portfolios.filter((p) => p.can_view);
@@ -68,94 +54,88 @@ export function PositionsPage({ me }: { me: Me }) {
     return mark?.mid == null || mark?.prev_close == null;
   }).length;
 
+  const tone = (v: number) => (v < 0 ? "neg" : v > 0 ? "pos" : undefined);
+  const COLS: [string, boolean][] = [
+    ["Instrument", false], ["Net qty", true], ["Avg cost", true], ["Mark", true], ["Market value", true],
+    ["Unrealized P&L", true], ["Realized P&L", true], ["Other fees", true], ["Mark time", false],
+  ];
+
   return (
-    <Stack>
-      <Group justify="space-between" align="flex-end">
-        <Title order={3}>Positions</Title>
+    <div className="flex flex-col gap-3">
+      <div className="flex items-end justify-between gap-3">
+        <h2 className="text-sm font-semibold">Positions</h2>
         {viewable.length > 1 && (
           <Select
+            className="w-52"
             label="Portfolio"
             data={viewable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
             value={portfolioId}
-            onChange={setPortfolioId}
-            clearable={false}
-            searchable
-            w={200}
+            onChange={(v) => v && setPortfolioId(v)}
           />
         )}
-      </Group>
+      </div>
 
       {rows.length > 0 && (
-        <Stack gap={4}>
+        <div className="flex flex-col gap-1">
           {[...totals].map(([ccy, t]) => (
-            <SimpleGrid key={ccy} cols={{ base: 1, sm: 5 }}>
-              <SummaryCard label={`Unrealized P&L · ${ccy}`} value={t.unrealized.toFixed(2)} pnlColor />
-              <SummaryCard label={`Realized P&L · ${ccy}`} value={t.realized.toFixed(2)} pnlColor />
-              <SummaryCard label={`Market value · ${ccy}`} value={t.marketValue.toFixed(2)} />
-              <SummaryCard label={`Day P&L · ${ccy}`} value={t.day.toFixed(2)} pnlColor />
-              <SummaryCard label={`Gross exposure · ${ccy}`} value={t.grossExposure.toFixed(2)} />
-            </SimpleGrid>
+            <div key={ccy} className="grid grid-cols-1 gap-2 sm:grid-cols-5">
+              <Stat label={`Unrealized P&L · ${ccy}`} value={t.unrealized.toFixed(2)} tone={tone(t.unrealized)} />
+              <Stat label={`Realized P&L · ${ccy}`} value={t.realized.toFixed(2)} tone={tone(t.realized)} />
+              <Stat label={`Market value · ${ccy}`} value={t.marketValue.toFixed(2)} />
+              <Stat label={`Day P&L · ${ccy}`} value={t.day.toFixed(2)} tone={tone(t.day)} />
+              <Stat label={`Gross exposure · ${ccy}`} value={t.grossExposure.toFixed(2)} />
+            </div>
           ))}
           {unpriced > 0 && (
-            <Text size="xs" c="dimmed">
+            <p className="text-xs text-muted-foreground">
               {unpriced} of {rows.length} position{rows.length === 1 ? "" : "s"} {unpriced === 1 ? "has" : "have"} no
               live mark and {unpriced === 1 ? "is" : "are"} excluded from these totals.
-            </Text>
+            </p>
           )}
           {dayPnlUnpriced > 0 && (
-            <Text size="xs" c="dimmed">
+            <p className="text-xs text-muted-foreground">
               {dayPnlUnpriced} of {rows.length} position{rows.length === 1 ? "" : "s"} {dayPnlUnpriced === 1 ? "is" : "are"} missing
               a live mark or a previous close and {dayPnlUnpriced === 1 ? "is" : "are"} excluded from Day P&L.
-            </Text>
+            </p>
           )}
-        </Stack>
+        </div>
       )}
 
       {portfolioId === null ? (
-        <Text c="dimmed">No portfolio to view.</Text>
+        <p className="text-muted-foreground">No portfolio to view.</p>
       ) : positions.isLoading ? (
-        <Loader />
+        <Spinner />
       ) : (
-        <Table striped highlightOnHover withTableBorder verticalSpacing={6} fz="sm">
-          <Table.Thead>
-            <Table.Tr>
-              <Table.Th style={columnHeader}>Instrument</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Net qty</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Avg cost</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Mark</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Market value</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Unrealized P&L</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Realized P&L</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Other fees</Table.Th>
-              <Table.Th style={columnHeader}>Mark time</Table.Th>
-            </Table.Tr>
-          </Table.Thead>
-          <Table.Tbody>
-            {rows.map((p) => (
-              <Table.Tr key={p.instrument_id}>
-                <Table.Td>{p.instrument_id}</Table.Td>
-                <Table.Td style={numeric}>{p.net_qty}</Table.Td>
-                <Table.Td style={numeric}>{p.avg_cost}</Table.Td>
-                <Table.Td style={numeric}>{num(p.mark)}</Table.Td>
-                <Table.Td style={numeric}>{num(p.market_value)}</Table.Td>
-                <Table.Td style={numeric}>{num(p.unrealized_pnl)}</Table.Td>
-                <Table.Td style={numeric}>{p.realized_pnl}</Table.Td>
-                <Table.Td style={numeric}>{formatFees(p.other_fees)}</Table.Td>
-                <Table.Td>{p.mark_ts ? new Date(p.mark_ts).toLocaleString() : "—"}</Table.Td>
-              </Table.Tr>
-            ))}
-            {rows.length === 0 && (
-              <Table.Tr>
-                <Table.Td colSpan={9}>
-                  <Text c="dimmed" ta="center" py="md">
-                    No positions.
-                  </Text>
-                </Table.Td>
-              </Table.Tr>
-            )}
-          </Table.Tbody>
-        </Table>
+        <div className="rounded-md border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                {COLS.map(([h, n]) => <TableHead key={h} className={n ? "text-right" : undefined}>{h}</TableHead>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((p) => (
+                <TableRow key={p.instrument_id}>
+                  <TableCell>{p.instrument_id}</TableCell>
+                  <TableCell className={numeric}>{p.net_qty}</TableCell>
+                  <TableCell className={numeric}>{p.avg_cost}</TableCell>
+                  <TableCell className={numeric}>{num(p.mark)}</TableCell>
+                  <TableCell className={numeric}>{num(p.market_value)}</TableCell>
+                  <TableCell className={numeric}>{num(p.unrealized_pnl)}</TableCell>
+                  <TableCell className={numeric}>{p.realized_pnl}</TableCell>
+                  <TableCell className={numeric}>{formatFees(p.other_fees)}</TableCell>
+                  <TableCell className="num">{p.mark_ts ? new Date(p.mark_ts).toLocaleString() : "—"}</TableCell>
+                </TableRow>
+              ))}
+              {rows.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={9} className="py-4 text-center text-muted-foreground">No positions.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
       )}
-    </Stack>
+    </div>
   );
 }

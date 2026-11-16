@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Button, Grid, Tabs } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Search } from "lucide-react";
 import type { Me } from "../../access";
 import { TradeBlotter } from "../../components/trading/TradeBlotter";
 import { OrderTicket } from "../../components/trading/OrderTicket";
@@ -66,14 +68,14 @@ export function TradePage({ me }: { me: Me }) {
         }}
         onPickLegs={(legs) => setPendingLegs(legs)}
       />
-      <Grid>
-        <Grid.Col span={{ base: 12, md: 3 }}>
-          <Button fullWidth variant="light" mb="sm" onClick={() => setSearchOpen(true)}>
-            Search instruments
+      <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(220px,1fr)_minmax(260px,1fr)_minmax(0,2fr)]">
+        <div className="flex flex-col gap-2">
+          <Button variant="secondary" onClick={() => setSearchOpen(true)}>
+            <Search /> Search instruments
           </Button>
           <Watchlist onSelectInstrument={setSelectedInstrument} />
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 3 }}>
+        </div>
+        <div>
           {pendingLegs ? (
             // Keyed by the combo's own legs so a new "Use this combo" pick
             // mounts a fresh ticket (fresh order ids, fresh per-leg status)
@@ -97,22 +99,22 @@ export function TradePage({ me }: { me: Me }) {
               onSubmitted={onOrdersSubmitted}
             />
           )}
-        </Grid.Col>
-        <Grid.Col span={{ base: 12, md: 6 }}>
-          <Tabs value={activeTab} onChange={setActiveTab}>
-            <Tabs.List>
-              <Tabs.Tab value="orders">Orders</Tabs.Tab>
-              <Tabs.Tab value="positions">Positions</Tabs.Tab>
-            </Tabs.List>
-            <Tabs.Panel value="orders" pt="md">
+        </div>
+        <div className="min-w-0">
+          <Tabs value={activeTab ?? "orders"} onValueChange={setActiveTab}>
+            <TabsList>
+              <TabsTrigger value="orders">Orders</TabsTrigger>
+              <TabsTrigger value="positions">Positions</TabsTrigger>
+            </TabsList>
+            <TabsContent value="orders" className="pt-2">
               <TradeBlotter portfolios={me.portfolios} followOrderId={followOrderId} />
-            </Tabs.Panel>
-            <Tabs.Panel value="positions" pt="md">
+            </TabsContent>
+            <TabsContent value="positions" className="pt-2">
               <PositionsPage me={me} />
-            </Tabs.Panel>
+            </TabsContent>
           </Tabs>
-        </Grid.Col>
-      </Grid>
+        </div>
+      </div>
     </>
   );
 }

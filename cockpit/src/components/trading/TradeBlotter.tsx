@@ -1,28 +1,21 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { notifications } from "@mantine/notifications";
-import {
-  Alert, Badge, Button, Drawer, Group, Loader, Select, Stack, Table, Text, Title, Tooltip,
-} from "@mantine/core";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Select } from "../form";
+import { Notice, Spinner } from "../common";
+import { OrderStatus, Pill, SideBadge, ORDER_STATUS_TONE } from "../status";
+import { cn } from "@/lib/utils";
 import { api, ApiError } from "../../api/client";
 import { useLive } from "../../api/liveUpdates";
-import { numeric, columnHeader, sideColor } from "./table";
+import { numeric } from "./table";
 import { OrderTimeline } from "../OrderTimeline";
 import { formatFees } from "../../fees";
 import type { BlotterRow } from "../../api/types";
 import type { GrantedPortfolio } from "../../access";
-
-// Same palette as the cockpit blotter (src/pages/Blotter.tsx) — one status
-// vocabulary, one set of colours, wherever it's rendered.
-const STATUS_COLOR: Record<string, string> = {
-  filled: "green",
-  partially_filled: "teal",
-  routed: "brand",
-  submitted: "gray",
-  canceled: "amber",
-  rejected: "red",
-  expired: "yellow",
-};
 
 // Statuses the OMS will never move on from. Mirrors the terminal check in
 // POST /orders/cancel (src/handlers.rs) — an order in one of these states is
@@ -40,7 +33,7 @@ type OrderState = { order_id: string; status: string };
 
 function notifyError(err: unknown) {
   const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
-  notifications.show({ message, color: "red" });
+  toast.error(message);
 }
 
 export function TradeBlotter({
@@ -125,7 +118,7 @@ export function TradeBlotter({
       // Either 202 or 204: in both cases the row keeps polling until the
       // order's own status changes. We never render "cancelled" on our own
       // authority.
-      notifications.show({ message: "Cancel sent", color: "brand" });
+      toast("Cancel sent");
     } catch (err) {
       setCancelling((s) => {
         const n = new Set(s);
@@ -140,30 +133,32 @@ export function TradeBlotter({
   const rows = orders.data ?? [];
   const windowFull = rows.length >= BLOTTER_LIMIT;
 
+  const HEAD: [string, boolean][] = [
+    ["Time", false], ["Instrument", false], ["Side", false], ["Type", false], ["Status", false],
+    ["Qty", true], ["Cum", true], ["Leaves", true], ["Avg px", true], ["Fees", true], ["", false],
+  ];
+  const followTone = followedStatus === null || followedStatus === "submitted" ? "muted" : ORDER_STATUS_TONE[followedStatus] ?? "muted";
+
   return (
-    <Stack>
-      <Group justify="space-between" align="flex-end">
-        <Title order={3}>Blotter</Title>
+    <div className="flex flex-col gap-3">
+      <div className="flex items-end justify-between gap-3">
+        <h2 className="text-sm font-semibold">Blotter</h2>
         {viewable.length > 1 && (
           <Select
+            className="w-52"
             label="Portfolio"
+            placeholder="All portfolios"
             data={viewable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
             value={portfolioId}
             onChange={setPortfolioId}
             clearable
-            searchable
-            w={200}
           />
         )}
-      </Group>
+      </div>
 
       {followOrderId !== null && (
-        <Alert
-          color={
-            followedStatus === null || followedStatus === "submitted"
-              ? "gray"
-              : STATUS_COLOR[followedStatus] ?? "gray"
-          }
+        <Notice
+          tone={followTone === "sell" ? "error" : followTone === "buy" ? "success" : "info"}
           title={
             followedStatus === null
               ? "Watching your order…"
@@ -172,138 +167,105 @@ export function TradeBlotter({
                 : `Your order is ${followedStatus}`
           }
         >
-          <Text size="sm">
-            {followOrderId}
-            {followedStatus === "submitted" &&
-              " — it has not reached a broker yet. If it stays here, it was never routed: cancel it below."}
-            {followed.isError && " — could not read this order back; check the rows below."}
-          </Text>
-        </Alert>
+          <span className="num">{followOrderId}</span>
+          {followedStatus === "submitted" &&
+            " — it has not reached a broker yet. If it stays here, it was never routed: cancel it below."}
+          {followed.isError && " — could not read this order back; check the rows below."}
+        </Notice>
       )}
 
-      <Drawer
-        opened={selected !== null}
-        onClose={() => setSelected(null)}
-        position="right"
-        size="lg"
-        title={
-          selected && (
-            <Stack gap={0}>
-              <Text fw={600}>
-                {selected.instrument_symbol ?? selected.instrument_id} · {selected.side} {selected.original_qty}
-              </Text>
-              <Text size="xs" c="dimmed">
-                {selected.order_id} · {selected.portfolio_code}
-              </Text>
-            </Stack>
-          )
-        }
-      >
-        {selected && <OrderTimeline orderId={selected.order_id} eventsPath="/orders" apiGet={api.get} />}
-      </Drawer>
+      <Sheet open={selected !== null} onOpenChange={(open) => { if (!open) setSelected(null); }}>
+        <SheetContent className="w-full overflow-y-auto sm:max-w-xl">
+          {selected && (
+            <>
+              <SheetHeader>
+                <SheetTitle>
+                  {selected.instrument_symbol ?? selected.instrument_id} · {selected.side} <span className="num">{selected.original_qty}</span>
+                </SheetTitle>
+                <SheetDescription className="num text-xs">{selected.order_id} · {selected.portfolio_code}</SheetDescription>
+              </SheetHeader>
+              <div className="px-4 pb-4">
+                <OrderTimeline orderId={selected.order_id} eventsPath="/orders" apiGet={api.get} />
+              </div>
+            </>
+          )}
+        </SheetContent>
+      </Sheet>
 
       {orders.isLoading ? (
-        <Loader />
+        <Spinner />
       ) : (
-        <Table striped highlightOnHover withTableBorder verticalSpacing={6} fz="sm">
-          <Table.Thead>
-            <Table.Tr>
-              <Table.Th style={columnHeader}>Time</Table.Th>
-              <Table.Th style={columnHeader}>Instrument</Table.Th>
-              <Table.Th style={columnHeader}>Side</Table.Th>
-              <Table.Th style={columnHeader}>Type</Table.Th>
-              <Table.Th style={columnHeader}>Status</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Qty</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Cum</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Leaves</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Avg px</Table.Th>
-              <Table.Th style={{ ...columnHeader, ...numeric }}>Fees</Table.Th>
-              <Table.Th />
-            </Table.Tr>
-          </Table.Thead>
-          <Table.Tbody>
-            {rows.map((o) => {
-              const isCancelling = cancelling.has(o.order_id) && !TERMINAL.has(o.status);
-              const canCancel = !TERMINAL.has(o.status) && !isCancelling;
-              return (
-                <Table.Tr
-                  key={o.order_id}
-                  onClick={() => setSelected(o)}
-                  style={{ cursor: "pointer" }}
-                  bg={o.order_id === followOrderId ? "var(--mantine-color-brand-light)" : undefined}
-                >
-                  <Table.Td>{new Date(o.created_at).toLocaleString()}</Table.Td>
-                  <Table.Td>
-                    <Stack gap={0}>
-                      <Tooltip label={o.instrument_name ?? `id ${o.instrument_id}`} disabled={!o.instrument_name}>
-                        <Text size="sm">{o.instrument_symbol ?? o.instrument_id}</Text>
-                      </Tooltip>
-                      {o.client_order_id.startsWith("combo-") && (
-                        <Badge size="xs" variant="dot" color="gray">
-                          {o.client_order_id}
-                        </Badge>
-                      )}
-                    </Stack>
-                  </Table.Td>
-                  <Table.Td>
-                    <Badge color={sideColor(o.side)} variant="light">
-                      {o.side}
-                    </Badge>
-                  </Table.Td>
-                  <Table.Td>{o.order_type}</Table.Td>
-                  <Table.Td>
-                    {isCancelling ? (
-                      <Badge color="gray" variant="light">
-                        cancelling…
-                      </Badge>
-                    ) : (
-                      <Badge color={STATUS_COLOR[o.status] ?? "gray"}>{o.status}</Badge>
-                    )}
-                  </Table.Td>
-                  <Table.Td style={numeric}>{o.original_qty}</Table.Td>
-                  <Table.Td style={numeric}>{o.cum_qty}</Table.Td>
-                  <Table.Td style={numeric}>{o.leaves_qty}</Table.Td>
-                  <Table.Td style={numeric}>{o.avg_px ?? "—"}</Table.Td>
-                  <Table.Td style={numeric}>{formatFees(o.fees)}</Table.Td>
-                  <Table.Td>
-                    <Button
-                      size="xs"
-                      variant="light"
-                      color="red"
-                      disabled={!canCancel}
-                      loading={isCancelling}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        cancel(o.order_id);
-                      }}
-                    >
-                      Cancel
-                    </Button>
-                  </Table.Td>
-                </Table.Tr>
-              );
-            })}
-            {windowFull && (
-              <Table.Tr>
-                <Table.Td colSpan={11}>
-                  <Text c="dimmed" size="xs" ta="center">
+        <div className="rounded-md border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                {HEAD.map(([h, n], i) => <TableHead key={i} className={n ? "text-right" : undefined}>{h}</TableHead>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((o) => {
+                const isCancelling = cancelling.has(o.order_id) && !TERMINAL.has(o.status);
+                const canCancel = !TERMINAL.has(o.status) && !isCancelling;
+                return (
+                  <TableRow
+                    key={o.order_id}
+                    onClick={() => setSelected(o)}
+                    className={cn("cursor-pointer", o.order_id === followOrderId && "bg-primary/10")}
+                  >
+                    <TableCell className="num">{new Date(o.created_at).toLocaleString()}</TableCell>
+                    <TableCell>
+                      <div className="flex flex-col items-start">
+                        {o.instrument_name ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild><span>{o.instrument_symbol ?? o.instrument_id}</span></TooltipTrigger>
+                            <TooltipContent>{o.instrument_name}</TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <span>{o.instrument_symbol ?? o.instrument_id}</span>
+                        )}
+                        {o.client_order_id.startsWith("combo-") && <Pill className="num">{o.client_order_id}</Pill>}
+                      </div>
+                    </TableCell>
+                    <TableCell><SideBadge side={o.side} /></TableCell>
+                    <TableCell>{o.order_type}</TableCell>
+                    <TableCell>{isCancelling ? <Pill>cancelling…</Pill> : <OrderStatus status={o.status} />}</TableCell>
+                    <TableCell className={numeric}>{o.original_qty}</TableCell>
+                    <TableCell className={numeric}>{o.cum_qty}</TableCell>
+                    <TableCell className={numeric}>{o.leaves_qty}</TableCell>
+                    <TableCell className={numeric}>{o.avg_px ?? "—"}</TableCell>
+                    <TableCell className={numeric}>{formatFees(o.fees)}</TableCell>
+                    <TableCell className="text-right">
+                      <Button
+                        size="xs"
+                        variant="destructive"
+                        disabled={!canCancel}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          cancel(o.order_id);
+                        }}
+                      >
+                        {isCancelling ? "Cancelling…" : "Cancel"}
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+              {windowFull && (
+                <TableRow>
+                  <TableCell colSpan={11} className="text-center text-xs text-muted-foreground">
                     Showing the {BLOTTER_LIMIT} most recent orders; older ones are not listed.
-                  </Text>
-                </Table.Td>
-              </Table.Tr>
-            )}
-            {rows.length === 0 && (
-              <Table.Tr>
-                <Table.Td colSpan={11}>
-                  <Text c="dimmed" ta="center" py="md">
-                    No orders.
-                  </Text>
-                </Table.Td>
-              </Table.Tr>
-            )}
-          </Table.Tbody>
-        </Table>
+                  </TableCell>
+                </TableRow>
+              )}
+              {rows.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={11} className="py-4 text-center text-muted-foreground">No orders.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
       )}
-    </Stack>
+    </div>
   );
 }

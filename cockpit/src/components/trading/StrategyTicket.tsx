@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { notifications } from "@mantine/notifications";
-import { Alert, Badge, Button, Group, Paper, Select, SimpleGrid, Stack, Text, Title } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Select } from "../form";
+import { Notice } from "../common";
+import { SideBadge } from "../status";
+import { notify } from "../notify";
 import { api } from "../../api/client";
 import { submitOrder, RECORDED_NOT_ROUTED, type SubmitOutcome } from "../../api/submitOrder";
 import type { GrantedPortfolio } from "../../access";
@@ -95,7 +98,7 @@ function PayoffDiagram({ payoff }: { payoff: Payoff }) {
 
   return (
     <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" role="img" aria-label="Payoff at expiry">
-      <line x1={0} y1={zeroY} x2={W} y2={zeroY} stroke="var(--mantine-color-dark-3)" strokeWidth={1} />
+      <line x1={0} y1={zeroY} x2={W} y2={zeroY} stroke="var(--border)" strokeWidth={1} />
       {payoff.breakevens.map((be) => (
         <line
           key={be}
@@ -103,12 +106,12 @@ function PayoffDiagram({ payoff }: { payoff: Payoff }) {
           y1={0}
           x2={x(be)}
           y2={H}
-          stroke="var(--mantine-color-dark-2)"
+          stroke="var(--muted-foreground)"
           strokeWidth={1}
           strokeDasharray="3 3"
         />
       ))}
-      <path d={path} fill="none" stroke="var(--mantine-color-depth-6)" strokeWidth={2} strokeLinejoin="round" />
+      <path d={path} fill="none" stroke="var(--buy)" strokeWidth={2} strokeLinejoin="round" />
     </svg>
   );
 }
@@ -243,13 +246,13 @@ export function StrategyTicket({
 
     const followIds = [...liveOrderIds, ...persistedOrderIds];
     if (liveOrderIds.length === legs.length) {
-      notifications.show({
+      notify({
         color: "green",
         title: `${liveOrderIds.length}/${legs.length} legs sent`,
         message: `Tag: ${clientOrderId}`,
       });
     } else if (followIds.length > 0) {
-      notifications.show({
+      notify({
         color: "amber",
         title: `${liveOrderIds.length}/${legs.length} legs sent`,
         message: `${persistedOrderIds.length} recorded but NOT routed, ${
@@ -258,7 +261,7 @@ export function StrategyTicket({
         autoClose: false,
       });
     } else {
-      notifications.show({
+      notify({
         color: "red",
         title: "No legs sent",
         message: `Nothing reached the OMS. Tag: ${clientOrderId}`,
@@ -268,158 +271,122 @@ export function StrategyTicket({
     if (followIds.length > 0) onSubmitted(followIds);
   }
 
+  const TONE_CLASS: Record<string, string> = { green: "text-buy", red: "text-sell", amber: "text-warn" };
+
   return (
-    <Paper withBorder p="md">
-      <Stack gap="sm">
-        <Group justify="space-between">
-          <Title order={4}>Strategy ({legs.length} legs)</Title>
-          <Button variant="subtle" size="xs" onClick={onCancel} disabled={submitting}>
-            {phase === "done" ? "Close" : "Cancel"}
-          </Button>
-        </Group>
+    <section className="flex flex-col gap-2.5 rounded-md border bg-card p-3">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold">Strategy ({legs.length} legs)</h2>
+        <Button variant="ghost" size="xs" onClick={onCancel} disabled={submitting}>
+          {phase === "done" ? "Close" : "Cancel"}
+        </Button>
+      </div>
 
-        {legs.map((leg) => {
-          const key = leg.instrumentId + leg.side;
-          const status = statuses[key];
-          return (
-            <Group key={key} justify="space-between">
-              <Group gap="xs">
-                <Badge color={leg.side === "buy" ? "depth" : "offer"}>{leg.side.toUpperCase()}</Badge>
-                <Text size="sm">
-                  {leg.optionKind} {leg.strike} · {leg.expiry}
-                </Text>
-              </Group>
-              <Group gap="xs">
-                <Text size="sm" c="dimmed">
-                  {leg.referencePrice != null ? leg.referencePrice.toFixed(2) : "—"}
-                </Text>
-                {status === "sending" && (
-                  <Text size="xs" c="dimmed">
-                    Sending…
-                  </Text>
-                )}
-                {status && status !== "sending" && (
-                  <Text size="xs" c={colors[key]}>
-                    {messages[key]}
-                  </Text>
-                )}
-              </Group>
-            </Group>
-          );
-        })}
+      {legs.map((leg) => {
+        const key = leg.instrumentId + leg.side;
+        const status = statuses[key];
+        return (
+          <div key={key} className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <SideBadge side={leg.side} />
+              <span>
+                {leg.optionKind} <span className="num">{leg.strike}</span> · <span className="num">{leg.expiry}</span>
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="num text-muted-foreground">{leg.referencePrice != null ? leg.referencePrice.toFixed(2) : "—"}</span>
+              {status === "sending" && <span className="text-xs text-muted-foreground">Sending…</span>}
+              {status && status !== "sending" && (
+                <span className={`text-xs ${TONE_CLASS[colors[key]] ?? "text-muted-foreground"}`}>{messages[key]}</span>
+              )}
+            </div>
+          </div>
+        );
+      })}
 
-        {payoff ? (
-          <>
-            <PayoffDiagram payoff={payoff} />
-            <SimpleGrid cols={4} spacing="xs">
-              <Stack gap={0} align="center">
-                <Text size="xs" c="dimmed">
-                  Max loss
-                </Text>
-                <Text size="sm" c="offer" fw={600}>
-                  {money(payoff.maxLoss)}
-                </Text>
-              </Stack>
-              <Stack gap={0} align="center">
-                <Text size="xs" c="dimmed">
-                  Max profit
-                </Text>
-                <Text size="sm" c="depth" fw={600}>
-                  {money(payoff.maxProfit)}
-                </Text>
-              </Stack>
-              <Stack gap={0} align="center">
-                <Text size="xs" c="dimmed">
-                  Breakeven{payoff.breakevens.length === 1 ? "" : "s"}
-                </Text>
-                <Text size="sm" fw={600}>
-                  {payoff.breakevens.length > 0 ? payoff.breakevens.map((b) => b.toFixed(2)).join(" / ") : "—"}
-                </Text>
-              </Stack>
-              <Stack gap={0} align="center">
-                <Text size="xs" c="dimmed">
-                  Net {netPremium >= 0 ? "debit" : "credit"}
-                </Text>
-                <Text size="sm" fw={600}>
-                  ${Math.abs(netPremium).toFixed(2)}
-                </Text>
-              </Stack>
-            </SimpleGrid>
-          </>
-        ) : (
-          <Text size="sm" c="dimmed">
-            Payoff diagram needs a live price on every leg — unavailable right now.
-          </Text>
-        )}
+      {payoff ? (
+        <>
+          <PayoffDiagram payoff={payoff} />
+          <div className="grid grid-cols-4 gap-2 text-center">
+            <div>
+              <div className="text-xs text-muted-foreground">Max loss</div>
+              <div className="num font-semibold text-sell">{money(payoff.maxLoss)}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Max profit</div>
+              <div className="num font-semibold text-buy">{money(payoff.maxProfit)}</div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Breakeven{payoff.breakevens.length === 1 ? "" : "s"}</div>
+              <div className="num font-semibold">
+                {payoff.breakevens.length > 0 ? payoff.breakevens.map((b) => b.toFixed(2)).join(" / ") : "—"}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs text-muted-foreground">Net {netPremium >= 0 ? "debit" : "credit"}</div>
+              <div className="num font-semibold">${Math.abs(netPremium).toFixed(2)}</div>
+            </div>
+          </div>
+        </>
+      ) : (
+        <p className="text-muted-foreground">Payoff diagram needs a live price on every leg — unavailable right now.</p>
+      )}
 
-        {phase !== "done" && (
-          <>
-            <Select
-              label="Portfolio"
-              data={tradeable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
-              value={portfolioId}
-              onChange={setPortfolioId}
-              disabled={phase === "confirm"}
-            />
-            <Select
-              label="Order type"
-              data={[{ value: "market", label: "Market" }]}
-              value={orderType}
-              onChange={(v) => v && setOrderType(v as OrderType)}
-              disabled={phase === "confirm"}
-            />
-            <Select
-              label="Time in force"
-              data={[
-                { value: "day", label: "Day" },
-                { value: "gtc", label: "GTC" },
-                { value: "ioc", label: "IOC" },
-                { value: "fok", label: "FOK" },
-              ]}
-              value={tif}
-              onChange={(v) => v && setTif(v as TimeInForce)}
-              disabled={phase === "confirm"}
-            />
-          </>
-        )}
+      {phase !== "done" && (
+        <>
+          <Select
+            label="Portfolio"
+            data={tradeable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
+            value={portfolioId}
+            onChange={setPortfolioId}
+            disabled={phase === "confirm"}
+          />
+          <Select
+            label="Order type"
+            data={[{ value: "market", label: "Market" }]}
+            value={orderType}
+            onChange={(v) => v && setOrderType(v as OrderType)}
+            disabled={phase === "confirm"}
+          />
+          <Select
+            label="Time in force"
+            data={[
+              { value: "day", label: "Day" },
+              { value: "gtc", label: "GTC" },
+              { value: "ioc", label: "IOC" },
+              { value: "fok", label: "FOK" },
+            ]}
+            value={tif}
+            onChange={(v) => v && setTif(v as TimeInForce)}
+            disabled={phase === "confirm"}
+          />
+        </>
+      )}
 
-        {phase === "edit" && (
-          <Button
-            disabled={!portfolioId || venues.isLoading}
-            loading={venues.isLoading && !!portfolioId}
-            onClick={() => setPhase("confirm")}
-          >
-            Review {legs.length} leg{legs.length === 1 ? "" : "s"}
-          </Button>
-        )}
+      {phase === "edit" && (
+        <Button disabled={!portfolioId || venues.isLoading} onClick={() => setPhase("confirm")}>
+          {venues.isLoading && !!portfolioId ? "Loading venues…" : `Review ${legs.length} leg${legs.length === 1 ? "" : "s"}`}
+        </Button>
+      )}
 
-        {phase === "confirm" && (
-          <>
-            <Alert color="brand" title="Confirm strategy">
-              <Stack gap={4}>
-                <Text size="sm">
-                  {legs.length} leg{legs.length === 1 ? "" : "s"} · {orderType} · {tif} · portfolio{" "}
-                  {tradeable.find((p) => p.portfolio_id === portfolioId)?.code}
-                </Text>
-                <Text size="sm">
-                  Route:{" "}
-                  {eligibleVenue
-                    ? `${eligibleVenue.broker_code} ${eligibleVenue.environment ?? ""}`
-                    : "portfolio default account"}
-                </Text>
-              </Stack>
-            </Alert>
-            <Group grow>
-              <Button variant="default" onClick={() => setPhase("edit")} disabled={submitting}>
-                Back
-              </Button>
-              <Button loading={submitting} onClick={confirmSubmit}>
-                Confirm &amp; submit
-              </Button>
-            </Group>
-          </>
-        )}
-      </Stack>
-    </Paper>
+      {phase === "confirm" && (
+        <>
+          <Notice tone="info" title="Confirm strategy">
+            <span className="block">
+              {legs.length} leg{legs.length === 1 ? "" : "s"} · {orderType} · {tif} · portfolio{" "}
+              {tradeable.find((p) => p.portfolio_id === portfolioId)?.code}
+            </span>
+            <span className="block">
+              Route:{" "}
+              {eligibleVenue ? `${eligibleVenue.broker_code} ${eligibleVenue.environment ?? ""}` : "portfolio default account"}
+            </span>
+          </Notice>
+          <div className="grid grid-cols-2 gap-2">
+            <Button variant="outline" onClick={() => setPhase("edit")} disabled={submitting}>Back</Button>
+            <Button disabled={submitting} onClick={confirmSubmit}>{submitting ? "Submitting…" : "Confirm & submit"}</Button>
+          </div>
+        </>
+      )}
+    </section>
   );
 }

@@ -1,17 +1,15 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { notifications } from "@mantine/notifications";
-import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title, UnstyledButton } from "@mantine/core";
-import { api, ApiError } from "../../api/client";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
+import { api } from "../../api/client";
+import { notify, notifyError } from "../notify";
+import { NumberInput, Select } from "../form";
 import { submitOrder, RECORDED_NOT_ROUTED } from "../../api/submitOrder";
 import { InstrumentSelect, type Instrument } from "../InstrumentSelect";
 import type { GrantedPortfolio } from "../../access";
 import type { VenueOption, Side, OrderType, TimeInForce } from "./types";
-
-function notifyError(err: unknown) {
-  const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
-  notifications.show({ message, color: "red" });
-}
 
 // Only what this ticket actually renders from a selected instrument: the
 // confirmation label ("SYMBOL@VENUE") and, if the pick came from outside
@@ -28,47 +26,29 @@ type InstrumentLabel = Pick<Instrument, "symbol" | "venue" | "name">;
 /// field that, when wrong, sends the opposite order — a dropdown renders it as
 /// one row of text among six, which is not the weight it deserves.
 function SideSelector({ value, onChange }: { value: Side; onChange: (s: Side) => void }) {
-  const half = (s: Side, label: string, color: string) => {
+  const half = (s: Side, label: string) => {
     const selected = value === s;
+    const on = s === "buy" ? "bg-buy text-primary-foreground" : "bg-sell text-primary-foreground";
+    const off = s === "buy" ? "text-buy" : "text-sell";
     return (
-      <UnstyledButton
+      <button
+        type="button"
         onClick={() => onChange(s)}
         aria-pressed={selected}
-        style={{
-          flex: 1,
-          padding: "10px 0",
-          textAlign: "center",
-          fontWeight: 700,
-          letterSpacing: "0.06em",
-          textTransform: "uppercase",
-          fontSize: "var(--mantine-font-size-sm)",
-          color: selected ? "var(--mantine-color-black)" : `var(--mantine-color-${color}-6)`,
-          background: selected ? `var(--mantine-color-${color}-6)` : "transparent",
-          transition: "background 80ms linear, color 80ms linear",
-        }}
+        className={cn("flex-1 py-2 text-center text-xs font-bold tracking-wider uppercase transition-colors", selected ? on : off)}
       >
         {label}
-      </UnstyledButton>
+      </button>
     );
   };
 
   return (
-    <div>
-      <Text size="sm" fw={500} mb={4}>
-        Side
-      </Text>
-      <Group
-        gap={0}
-        wrap="nowrap"
-        style={{
-          border: "1px solid var(--mantine-color-dark-5)",
-          borderRadius: "var(--mantine-radius-sm)",
-          overflow: "hidden",
-        }}
-      >
-        {half("buy", "Buy", "depth")}
-        {half("sell", "Sell", "offer")}
-      </Group>
+    <div className="flex flex-col gap-1">
+      <span className="text-xs text-muted-foreground">Side</span>
+      <div className="flex overflow-hidden rounded-md border">
+        {half("buy", "Buy")}
+        {half("sell", "Sell")}
+      </div>
     </div>
   );
 }
@@ -233,7 +213,7 @@ export function OrderTicket({
 
       switch (outcome.kind) {
         case "sent":
-          notifications.show({
+          notify({
             color: "green",
             title: "Order sent",
             message: `${side === "buy" ? "Buy" : "Sell"} ${quantity} ${instrumentLabel}`,
@@ -243,7 +223,7 @@ export function OrderTicket({
           reset();
           break;
         case "idempotent_live":
-          notifications.show({
+          notify({
             color: "green",
             title: "Order sent",
             message: `${side === "buy" ? "Buy" : "Sell"} ${quantity} ${instrumentLabel} — status ${outcome.status}.`,
@@ -253,7 +233,7 @@ export function OrderTicket({
           reset();
           break;
         case "idempotent_recorded":
-          notifications.show({
+          notify({
             color: "amber",
             title: "Order NOT sent",
             message: `This order id already exists and is still \`submitted\`. ${RECORDED_NOT_ROUTED}`,
@@ -264,7 +244,7 @@ export function OrderTicket({
           reset();
           break;
         case "idempotent_terminal":
-          notifications.show({
+          notify({
             color: "red",
             title: `Order NOT sent — already ${outcome.status}`,
             message: `An order with this id already exists and its status is ${outcome.status}. See the blotter.`,
@@ -275,7 +255,7 @@ export function OrderTicket({
           reset();
           break;
         case "idempotent_unknown":
-          notifications.show({
+          notify({
             color: "amber",
             title: "Already submitted — status unknown",
             message:
@@ -288,10 +268,10 @@ export function OrderTicket({
           reset();
           break;
         case "rejected":
-          notifications.show({ color: "red", title: "Rejected", message: outcome.message });
+          notify({ color: "red", title: "Rejected", message: outcome.message });
           break;
         case "broker_rejected":
-          notifications.show({
+          notify({
             color: "red",
             title: "Broker rejected — order NOT sent",
             message: `${outcome.message} ${RECORDED_NOT_ROUTED}`,
@@ -300,7 +280,7 @@ export function OrderTicket({
           onSubmitted(orderId);
           break;
         case "no_broker":
-          notifications.show({
+          notify({
             color: "amber",
             title: "No broker configured — order NOT sent",
             message: `An operator needs to configure a broker connection. ${RECORDED_NOT_ROUTED}`,
@@ -312,14 +292,14 @@ export function OrderTicket({
           // portfolios is already filtered to can_trade above, so this
           // should be unreachable. Presented as a bug to report, not a
           // routine rejection.
-          notifications.show({
+          notify({
             color: "red",
             title: "Not permitted",
             message: "This portfolio is not tradeable by your account. Please report this.",
           });
           break;
         case "unknown_error":
-          notifications.show({ message: outcome.message, color: "red" });
+          notify({ message: outcome.message, color: "red" });
           break;
       }
     } finally {
@@ -333,150 +313,125 @@ export function OrderTicket({
   // confirmation that there is nothing to send it against.
   if (tradeable.length === 0) {
     return (
-      <Paper withBorder p="md">
-        <Stack gap="xs">
-          <Title order={3}>Order ticket</Title>
-          <Text c="dimmed" size="sm">
-            None of your portfolios can be traded: you either have view-only access, or the
-            portfolios you may trade are closed. The blotter and positions still work.
-          </Text>
-        </Stack>
-      </Paper>
+      <section className="flex flex-col gap-2 rounded-md border bg-card p-3">
+        <h2 className="text-sm font-semibold">Order ticket</h2>
+        <p className="text-muted-foreground">
+          None of your portfolios can be traded: you either have view-only access, or the
+          portfolios you may trade are closed. The blotter and positions still work.
+        </p>
+      </section>
     );
   }
 
   return (
-    <Paper withBorder p="md">
-      <Stack>
-        <Title order={3}>Order ticket</Title>
+    <section className="flex flex-col gap-3 rounded-md border bg-card p-3">
+      <h2 className="text-sm font-semibold">Order ticket</h2>
 
+      <Select
+        label="Portfolio"
+        placeholder="Select portfolio"
+        required
+        data={tradeable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
+        value={portfolioId}
+        onChange={setPortfolioId}
+      />
+
+      <InstrumentSelect
+        label="Instrument"
+        required
+        value={instrumentId}
+        onChange={setInstrumentId}
+        onSelected={setSelectedInstrument}
+        // A Watchlist-picked instrument may not be on InstrumentSelect's own
+        // current search-result page (first 50 rows, or the active search) —
+        // without this it would render blank/wrong in this dropdown even
+        // though instrumentId and selectedInstrument are both correct.
+        externalSelection={
+          instrumentId && selectedInstrument
+            ? { id: instrumentId, symbol: selectedInstrument.symbol, name: selectedInstrument.name }
+            : null
+        }
+        basePath="/instruments"
+        apiGet={api.get}
+      />
+
+      {venues.data && venues.data.length > 0 && (
         <Select
-          label="Portfolio"
-          placeholder="Select portfolio"
-          required
-          data={tradeable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
-          value={portfolioId}
-          onChange={setPortfolioId}
+          label="Venue"
+          placeholder="Default (portfolio's own account)"
+          // Every option needs a UNIQUE value. Eligible rows always carry a
+          // real account_id (see classify_venue in src/handlers.rs), but
+          // ineligible rows all have account_id: null. Give each ineligible
+          // row its own synthetic, collision-free value; it is never sent
+          // anywhere (see selectedAccountId's uses below, which only ever
+          // treat it as a real account id when it matches an ELIGIBLE row).
+          data={venues.data.map((v) => ({
+            value: v.account_id ?? `none:${v.broker_code}:${v.broker_connection_code ?? ""}`,
+            label: `${v.broker_code}${v.environment ? ` (${v.environment})` : ""}${
+              !v.eligible && v.reason ? ` — ${v.reason}` : ""
+            }`,
+            disabled: !v.eligible,
+          }))}
+          value={selectedAccountId}
+          onChange={setSelectedAccountId}
+          clearable
         />
+      )}
 
-        <InstrumentSelect
-          label="Instrument"
-          required
-          value={instrumentId}
-          onChange={setInstrumentId}
-          onSelected={setSelectedInstrument}
-          // A Watchlist-picked instrument may not be on InstrumentSelect's own
-          // current search-result page (first 50 rows, or the active search) —
-          // without this it would render blank/wrong in this dropdown even
-          // though instrumentId and selectedInstrument are both correct.
-          externalSelection={
-            instrumentId && selectedInstrument
-              ? { id: instrumentId, symbol: selectedInstrument.symbol, name: selectedInstrument.name }
-              : null
-          }
-          basePath="/instruments"
-          apiGet={api.get}
+      <SideSelector value={side} onChange={setSide} />
+
+      <NumberInput label="Quantity" required min={0} value={quantity} onChange={setQuantity} />
+
+      <div className="grid grid-cols-2 gap-2">
+        <Select
+          label="Order type"
+          data={[
+            { value: "market", label: "Market" },
+            { value: "limit", label: "Limit" },
+          ]}
+          value={orderType}
+          onChange={(v) => v && setOrderType(v as OrderType)}
         />
+        <Select
+          label="Time in force"
+          data={[
+            { value: "day", label: "Day" },
+            { value: "gtc", label: "GTC" },
+            { value: "ioc", label: "IOC" },
+            { value: "fok", label: "FOK" },
+          ]}
+          value={tif}
+          onChange={(v) => v && setTif(v as TimeInForce)}
+        />
+      </div>
 
-        {venues.data && venues.data.length > 0 && (
-          <Select
-            label="Venue"
-            placeholder="Default (portfolio's own account)"
-            // Every option needs a UNIQUE value. Eligible rows always carry a
-            // real account_id (see classify_venue in src/handlers.rs), but
-            // ineligible rows all have account_id: null — mapping every one of
-            // them to the same "" would hand Mantine's Select/Combobox
-            // duplicate option values, which it throws on (unmounting the
-            // whole app) as soon as ≥2 ineligible rows exist, e.g. two
-            // brokers with no account, or one broker with two environments
-            // and no account on either. Give each ineligible row its own
-            // synthetic, collision-free value instead; it is never sent
-            // anywhere (see selectedAccountId's uses below, which only ever
-            // treat it as a real account id when it matches an ELIGIBLE row).
-            data={venues.data.map((v) => ({
-              value: v.account_id ?? `none:${v.broker_code}:${v.broker_connection_code ?? ""}`,
-              label: `${v.broker_code}${v.environment ? ` (${v.environment})` : ""}${
-                !v.eligible && v.reason ? ` — ${v.reason}` : ""
-              }`,
-              disabled: !v.eligible,
-            }))}
-            value={selectedAccountId}
-            onChange={setSelectedAccountId}
-            clearable
-          />
-        )}
+      {orderType === "limit" && (
+        <NumberInput label="Limit price" required min={0} step={0.0001} value={limitPrice} onChange={setLimitPrice} />
+      )}
 
-        <SideSelector value={side} onChange={setSide} />
+      {Number(quantity) > 0 && (
+        <div className="flex items-center justify-between rounded-md border bg-background px-2.5 py-1.5">
+          <span className="text-muted-foreground">Est. notional</span>
+          <span className="num font-semibold">
+            {notional !== null ? notional.toFixed(2) : "Set by the venue (market order)"}
+          </span>
+        </div>
+      )}
 
-        <NumberInput label="Quantity" required min={0} value={quantity} onChange={setQuantity} />
-
-        <Group grow>
-          <Select
-            label="Order type"
-            data={[
-              { value: "market", label: "Market" },
-              { value: "limit", label: "Limit" },
-            ]}
-            value={orderType}
-            onChange={(v) => v && setOrderType(v as OrderType)}
-            allowDeselect={false}
-          />
-          <Select
-            label="Time in force"
-            data={[
-              { value: "day", label: "Day" },
-              { value: "gtc", label: "GTC" },
-              { value: "ioc", label: "IOC" },
-              { value: "fok", label: "FOK" },
-            ]}
-            value={tif}
-            onChange={(v) => v && setTif(v as TimeInForce)}
-            allowDeselect={false}
-          />
-        </Group>
-
-        {orderType === "limit" && (
-          <NumberInput
-            label="Limit price"
-            required
-            min={0}
-            decimalScale={4}
-            value={limitPrice}
-            onChange={setLimitPrice}
-          />
-        )}
-
-        {Number(quantity) > 0 && (
-          <Paper withBorder p="xs" bg="var(--mantine-color-dark-6)">
-            <Group justify="space-between" wrap="nowrap">
-              <Text size="sm" c="dimmed">
-                Est. notional
-              </Text>
-              <Text size="sm" fw={600}>
-                {notional !== null ? notional.toFixed(2) : "Set by the venue (market order)"}
-              </Text>
-            </Group>
-          </Paper>
-        )}
-
-        <Group justify="flex-end">
-          <Button variant="subtle" onClick={reset}>
-            Reset
-          </Button>
-          <Button disabled={!canConfirm} onClick={() => setConfirmOpen(true)}>
-            Review order
-          </Button>
-        </Group>
-      </Stack>
+      <div className="flex justify-end gap-2">
+        <Button variant="ghost" onClick={reset}>Reset</Button>
+        <Button disabled={!canConfirm} onClick={() => setConfirmOpen(true)}>Review order</Button>
+      </div>
 
       {/* The confirmation is the only path to the API: no other button here
           ever calls submitOrder. It restates the resolved order in words so
           the trader confirms what will actually be sent, not just that they
           clicked a button. */}
-      <Modal opened={confirmOpen} onClose={() => !submitting && setConfirmOpen(false)} title="Confirm order">
-        <Stack>
-          <Text>
-            {side === "buy" ? "Buy" : "Sell"} {quantity} {instrumentLabel}
+      <Dialog open={confirmOpen} onOpenChange={(open) => { if (!open && !submitting) setConfirmOpen(false); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader><DialogTitle>Confirm order</DialogTitle></DialogHeader>
+          <p>
+            {side === "buy" ? "Buy" : "Sell"} <span className="num">{quantity}</span> {instrumentLabel}
             {orderType === "limit" ? ` · limit ${limitPrice}` : " · market"} · {tif} · portfolio {portfolioLabel}
             {selectedAccountId &&
               (() => {
@@ -489,17 +444,19 @@ export function OrderTicket({
                 return venue ? ` · via ${venue.broker_code}${venue.environment ? ` (${venue.environment})` : ""}` : "";
               })()}
             {notional !== null && ` · est. notional ${notional.toFixed(2)}`}
-          </Text>
-          <Group justify="flex-end">
-            <Button variant="default" onClick={() => setConfirmOpen(false)} disabled={submitting}>
-              Cancel
+          </p>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmOpen(false)} disabled={submitting}>Cancel</Button>
+            <Button
+              className={side === "buy" ? "bg-buy text-primary-foreground hover:bg-buy/90" : "bg-sell text-primary-foreground hover:bg-sell/90"}
+              disabled={submitting}
+              onClick={confirmSubmit}
+            >
+              {submitting ? "Sending…" : `Confirm ${side}`}
             </Button>
-            <Button color={side === "buy" ? "depth" : "offer"} loading={submitting} onClick={confirmSubmit}>
-              Confirm {side}
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-    </Paper>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </section>
   );
 }

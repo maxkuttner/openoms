@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { notifications } from "@mantine/notifications";
-import { Button, Group, Paper, Stack, Text, Title } from "@mantine/core";
+import { toast } from "sonner";
+import { Plus, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { api, ApiError } from "../../api/client";
 import { useLive } from "../../api/liveUpdates";
 import { InstrumentSelect, type Instrument } from "../InstrumentSelect";
@@ -17,16 +19,12 @@ interface WatchlistRow {
 
 function notifyError(err: unknown) {
   const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
-  notifications.show({ message, color: "red" });
+  toast.error(message);
 }
 
 // Live watchlist: a trader's own list of symbols, ticking price + day
 // %-change. Polls /marks on the same ~3s cadence TradeBlotter already uses
 // for orders — no new transport, just another poll.
-//
-// Uses plain "×"/"+" text in a subtle Button rather than ActionIcon +
-// @tabler/icons-react: that package is not a dependency of this app, and
-// this task does not add one just for two glyphs.
 export function Watchlist({
   onSelectInstrument,
 }: {
@@ -72,18 +70,13 @@ export function Watchlist({
   });
 
   return (
-    <Paper withBorder p="md">
-      <Group justify="space-between" mb="xs">
-        <Title order={4}>Watchlist</Title>
-        <Button
-          variant="subtle"
-          size="compact-sm"
-          onClick={() => setAdding((v) => !v)}
-          aria-label="Add symbol"
-        >
-          +
+    <section className="rounded-md border bg-card p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <h2 className="text-sm font-semibold">Watchlist</h2>
+        <Button variant="ghost" size="icon-xs" onClick={() => setAdding((v) => !v)} aria-label="Add symbol">
+          <Plus />
         </Button>
-      </Group>
+      </div>
 
       {adding && (
         <InstrumentSelect
@@ -98,16 +91,14 @@ export function Watchlist({
         />
       )}
 
-      <Stack gap={4} mt="xs">
+      <ul className="mt-2 flex flex-col">
         {(watchlist.data ?? []).map((row) => {
           const mark = markByInstrument.get(row.instrument_id);
           const pct = mark?.pct_change ?? null;
           return (
-            <Group
+            <li
               key={row.instrument_id}
-              justify="space-between"
-              wrap="nowrap"
-              style={{ cursor: "pointer" }}
+              className="group flex cursor-pointer items-center justify-between gap-2 rounded px-1.5 py-1 hover:bg-accent"
               onClick={() =>
                 onSelectInstrument({
                   id: row.instrument_id,
@@ -117,35 +108,29 @@ export function Watchlist({
                 })
               }
             >
-              <Text size="sm">{row.symbol}</Text>
-              <Group gap="xs" wrap="nowrap">
-                <Text size="sm" ff="monospace">
-                  {mark?.mid !== null && mark?.mid !== undefined ? mark.mid.toFixed(2) : "—"}
-                </Text>
-                <Text size="xs" c={pct === null ? "dimmed" : pct >= 0 ? "depth" : "offer"}>
+              <span>{row.symbol}</span>
+              <span className="flex items-center gap-2">
+                <span className="num">{mark?.mid !== null && mark?.mid !== undefined ? mark.mid.toFixed(2) : "—"}</span>
+                <span className={cn("num w-14 text-right text-xs", pct === null ? "text-muted-foreground" : pct >= 0 ? "text-buy" : "text-sell")}>
                   {pct === null ? "" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}
-                </Text>
+                </span>
                 <Button
-                  size="compact-xs"
-                  variant="subtle"
+                  size="icon-xs"
+                  variant="ghost"
                   aria-label="Remove from watchlist"
                   onClick={(e) => {
                     e.stopPropagation();
                     removeMutation.mutate(row.instrument_id);
                   }}
                 >
-                  ×
+                  <X />
                 </Button>
-              </Group>
-            </Group>
+              </span>
+            </li>
           );
         })}
-        {watchlist.data?.length === 0 && (
-          <Text size="sm" c="dimmed">
-            No symbols yet — add one above.
-          </Text>
-        )}
-      </Stack>
-    </Paper>
+        {watchlist.data?.length === 0 && <li className="text-muted-foreground">No symbols yet — add one above.</li>}
+      </ul>
+    </section>
   );
 }
