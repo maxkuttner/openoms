@@ -10,7 +10,7 @@ import { numeric, columnHeader, sideColor } from "../table";
 import { OrderTimeline } from "../../components/OrderTimeline";
 import { formatFees } from "../../fees";
 import type { BlotterRow } from "../../api/types";
-import type { GrantedPortfolio } from "../App";
+import type { GrantedPortfolio } from "../../access";
 
 // Same palette as the cockpit blotter (src/pages/Blotter.tsx) — one status
 // vocabulary, one set of colours, wherever it's rendered.

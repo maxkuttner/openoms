@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, Grid, Tabs } from "@mantine/core";
-import type { Me } from "../App";
+import type { Me } from "../../access";
 import { TradeBlotter } from "../components/TradeBlotter";
 import { OrderTicket } from "../components/OrderTicket";
 import { StrategyTicket } from "../components/StrategyTicket";

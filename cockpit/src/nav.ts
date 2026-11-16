@@ -49,3 +49,10 @@ export function commandItems(isAdmin: boolean): Page[] {
   const pages = [...SIDEBAR, ...ACCOUNT_PAGES];
   return isAdmin ? [...pages, ...ADMIN_TABS.flatMap((t) => t.pages)] : pages;
 }
+
+/** The page a router path belongs to (for the top bar title), or null. */
+export function pageFor(path: string): Page | null {
+  const p = path.length > 1 ? path.replace(/\/+$/, "") : path;
+  const all = [...SIDEBAR, ...ACCOUNT_PAGES, ...ADMIN_TABS.flatMap((t) => t.pages)];
+  return all.find((pg) => pg.path === p) ?? all.find((pg) => pg.path !== "/" && p.startsWith(pg.path + "/")) ?? null;
+}

@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
-import { Alert, Button, Code, CopyButton, Group, Loader, Paper, Stack, Table, Text, TextInput, Title } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
+import { ConfirmButton } from "../components/ConfirmButton";
+import { CopyText, FormRow, Notice, Section, Spinner } from "../components/common";
 import { authApi, authErrorText, type OwnKey, type SessionInfo } from "./api";
 import { ChangePassword } from "./ChangePassword";
-import { inputStyles } from "./Frame";
 import { TotpEnroll } from "./Totp";
 import { twoStepSection } from "../login";
 
@@ -26,13 +29,13 @@ function DisableTotp({ onDone }: { onDone: () => void }) {
   }
 
   return (
-    <form onSubmit={(e) => { e.preventDefault(); void submit(); }}>
-      <Stack gap={12} maw={360}>
-        <Text fz={13}>Two-step sign-in is on. To turn it off, enter a current code from your authenticator app.</Text>
-        <TextInput label="Code" value={code} onChange={(e) => setCode(e.currentTarget.value)} autoComplete="one-time-code"
-          inputMode="numeric" error={error} styles={inputStyles} />
-        <Button type="submit" variant="default" loading={busy}>Turn off two-step sign-in</Button>
-      </Stack>
+    <form onSubmit={(e) => { e.preventDefault(); void submit(); }} className="flex max-w-sm flex-col gap-3">
+      <p>Two-step sign-in is on. To turn it off, enter a current code from your authenticator app.</p>
+      <FormRow label="Code" error={error} htmlFor="dt-code">
+        <Input id="dt-code" className="num" value={code} onChange={(e) => setCode(e.currentTarget.value)}
+          autoComplete="one-time-code" inputMode="numeric" aria-invalid={!!error} />
+      </FormRow>
+      <Button type="submit" variant="outline" disabled={busy}>Turn off two-step sign-in</Button>
     </form>
   );
 }
@@ -43,23 +46,20 @@ function TwoStepSignIn({ me, onChanged }: { me: SessionInfo; onChanged: () => vo
   const section = twoStepSection(me);
   if (section === "hidden") return null;
   return (
-    <Paper withBorder p="md">
-      <Stack gap={12}>
-        <Title order={4}>Two-step sign-in</Title>
-        {section === "disable" && <DisableTotp onDone={onChanged} />}
-        {section === "enroll" && !enrolling && (
-          <Stack gap={12} maw={360}>
-            <Text fz={13}>Ask for a code from an authenticator app after your password.</Text>
-            <Button onClick={() => setEnrolling(true)}>Turn on two-step sign-in</Button>
-          </Stack>
-        )}
-        {section === "enroll" && enrolling && (
-          <Stack maw={420}>
-            <TotpEnroll onDone={() => { setEnrolling(false); onChanged(); }} />
-          </Stack>
-        )}
-      </Stack>
-    </Paper>
+    <Section title="Two-step sign-in">
+      {section === "disable" && <DisableTotp onDone={onChanged} />}
+      {section === "enroll" && !enrolling && (
+        <div className="flex max-w-sm flex-col gap-3">
+          <p>Ask for a code from an authenticator app after your password.</p>
+          <Button className="self-start" onClick={() => setEnrolling(true)}>Turn on two-step sign-in</Button>
+        </div>
+      )}
+      {section === "enroll" && enrolling && (
+        <div className="max-w-md">
+          <TotpEnroll onDone={() => { setEnrolling(false); onChanged(); }} />
+        </div>
+      )}
+    </Section>
   );
 }
 
@@ -76,50 +76,45 @@ function OwnKeys() {
     try { await fn(); await load(); } catch (e) { setError(authErrorText(e)); }
   };
   return (
-    <Paper withBorder p="md">
-      <Stack gap={12}>
-        <Title order={4}>API keys</Title>
-        <Text fz={13} c="dimmed">A key acts as you, with your portfolio access. Use it as <Code>Authorization: Bearer key_id.secret</Code>.</Text>
-        {error && <Alert color="red">{error}</Alert>}
-        {created?.secret && (
-          <Alert color="green" title="Copy the secret now: it is shown once">
-            <Group gap="xs" wrap="nowrap">
-              <Code style={{ overflowWrap: "anywhere" }}>{`${created.key_id}.${created.secret}`}</Code>
-              <CopyButton value={`${created.key_id}.${created.secret}`}>
-                {({ copied, copy }) => <Button size="xs" variant="light" onClick={copy}>{copied ? "Copied" : "Copy"}</Button>}
-              </CopyButton>
-            </Group>
-          </Alert>
-        )}
-        <form onSubmit={(e) => { e.preventDefault(); void act(async () => { setCreated(await authApi.createKey(name.trim())); setName(""); }); }}>
-          <Group align="flex-end">
-            <TextInput label="Name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
-            <Button type="submit">Create key</Button>
-          </Group>
-        </form>
-        {keys === null ? <Loader size="sm" /> : keys.length === 0 ? <Text fz={13} c="dimmed">No keys.</Text> : (
-          <Table>
-            <Table.Tbody>
-              {keys.map((k) => (
-                <Table.Tr key={k.key_id}>
-                  <Table.Td><Code>{k.key_id}</Code></Table.Td>
-                  <Table.Td>{k.name ?? "—"}</Table.Td>
-                  <Table.Td>{new Date(k.created_at).toLocaleDateString()}</Table.Td>
-                  <Table.Td>
-                    <Button size="xs" variant="light" color="red"
-                      onClick={() => confirm(`Revoke ${k.key_id}?`) && void act(() => authApi.revokeKey(k.key_id))}>Revoke</Button>
-                  </Table.Td>
-                </Table.Tr>
-              ))}
-            </Table.Tbody>
-          </Table>
-        )}
-      </Stack>
-    </Paper>
+    <Section title="API keys">
+      <p className="text-muted-foreground">
+        A key acts as you, with your portfolio access. Use it as <code className="num">Authorization: Bearer key_id.secret</code>.
+      </p>
+      {error && <Notice>{error}</Notice>}
+      {created?.secret && (
+        <Notice tone="success" title="Copy the secret now: it is shown once">
+          <CopyText value={`${created.key_id}.${created.secret}`} />
+        </Notice>
+      )}
+      <form className="flex items-end gap-2"
+        onSubmit={(e) => { e.preventDefault(); void act(async () => { setCreated(await authApi.createKey(name.trim())); setName(""); }); }}>
+        <FormRow label="Name" htmlFor="key-name">
+          <Input id="key-name" value={name} onChange={(e) => setName(e.currentTarget.value)} />
+        </FormRow>
+        <Button type="submit">Create key</Button>
+      </form>
+      {keys === null ? <Spinner /> : keys.length === 0 ? <p className="text-muted-foreground">No keys.</p> : (
+        <Table>
+          <TableBody>
+            {keys.map((k) => (
+              <TableRow key={k.key_id}>
+                <TableCell><code className="num">{k.key_id}</code></TableCell>
+                <TableCell>{k.name ?? "—"}</TableCell>
+                <TableCell className="num">{new Date(k.created_at).toLocaleDateString()}</TableCell>
+                <TableCell className="text-right">
+                  <ConfirmButton size="xs" variant="destructive" title={`Revoke ${k.key_id}?`} confirmLabel="Revoke"
+                    onConfirm={() => act(() => authApi.revokeKey(k.key_id))}>Revoke</ConfirmButton>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </Section>
   );
 }
 
-/** The account page of both apps: password and two-step sign-in, for local accounts. */
+/** The account page: password and two-step sign-in for local accounts, and API keys. */
 export function AccountSettings() {
   const [me, setMe] = useState<SessionInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -127,29 +122,24 @@ export function AccountSettings() {
   const reload = () => authApi.me().then(setMe, (e) => setError(authErrorText(e)));
   useEffect(() => { void reload(); }, []);
 
-  if (error) return <Alert color="red">{error}</Alert>;
-  if (!me) return <Loader />;
-  if (me.auth_method !== "local") {
-    return (
-      <Stack>
-        <Title order={3}>Account</Title>
-        <Text fz={13} c="dimmed">You signed in with SSO: your password and two-step sign-in are managed by your identity provider.</Text>
-        <OwnKeys />
-      </Stack>
-    );
-  }
+  if (error) return <Notice>{error}</Notice>;
+  if (!me) return <Spinner />;
   return (
-    <Stack>
-      <Title order={3}>Account</Title>
-      <Paper withBorder p="md">
-        <Stack gap={12} maw={360}>
-          <Title order={4}>Password</Title>
-          {saved && <Alert color="green">Password changed.</Alert>}
-          <ChangePassword key={String(saved)} onNext={() => setSaved(true)} />
-        </Stack>
-      </Paper>
-      <TwoStepSignIn me={me} onChanged={() => void reload()} />
+    <div className="flex max-w-3xl flex-col gap-4">
+      {me.auth_method !== "local" ? (
+        <p className="text-muted-foreground">You signed in with SSO: your password and two-step sign-in are managed by your identity provider.</p>
+      ) : (
+        <>
+          <Section title="Password">
+            <div className="flex max-w-sm flex-col gap-3">
+              {saved && <Notice tone="success">Password changed.</Notice>}
+              <ChangePassword key={String(saved)} onNext={() => setSaved(true)} />
+            </div>
+          </Section>
+          <TwoStepSignIn me={me} onChanged={() => void reload()} />
+        </>
+      )}
       <OwnKeys />
-    </Stack>
+    </div>
   );
 }

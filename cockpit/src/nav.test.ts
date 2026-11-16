@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ADMIN_TABS, SIDEBAR, ACCOUNT_PAGES, adminRouteAllowed, adminTabFor, commandItems } from "./nav.ts";
+import { ADMIN_TABS, SIDEBAR, ACCOUNT_PAGES, adminRouteAllowed, adminTabFor, commandItems, pageFor } from "./nav.ts";
 
 test("sidebar is Trade and Positions", () => assert.deepEqual(SIDEBAR.map((p) => p.title), ["Trade", "Positions"]));
 test("account pages are settings and access", () =>
@@ -27,4 +27,12 @@ test("command menu hides admin pages from non-admins", () => {
   assert.ok(commandItems(false).every((p) => !p.path.startsWith("/admin")));
   assert.equal(commandItems(true).filter((p) => p.path.startsWith("/admin")).length, 12);
   assert.ok(commandItems(false).some((p) => p.path === "/settings"));
+});
+test("pageFor names the page a path belongs to", () => {
+  assert.equal(pageFor("/")?.title, "Trade");
+  assert.equal(pageFor("/positions")?.title, "Positions");
+  assert.equal(pageFor("/settings")?.title, "Settings");
+  assert.equal(pageFor("/admin/broker-connections")?.title, "Broker connections");
+  assert.equal(pageFor("/admin/users/")?.title, "Users");
+  assert.equal(pageFor("/nowhere"), null);
 });

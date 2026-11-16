@@ -14,6 +14,26 @@ export type SessionInfo = {
   display_name?: string | null;
 };
 
+/** One portfolio the signed-in user has been granted, from `GET /auth/me`. */
+export type GrantedPortfolio = {
+  portfolio_id: string;
+  code: string;
+  name: string;
+  status: string;
+  base_currency: string | null;
+  can_trade: boolean;
+  can_view: boolean;
+  can_allocate: boolean;
+};
+
+/** The full `GET /auth/me` answer for a ready session. */
+export type Me = SessionInfo & {
+  principal_id: string;
+  code: string;
+  display_name: string | null;
+  portfolios: GrantedPortfolio[];
+};
+
 export type AccessState = "signed_out" | "pending" | "change_password" | "ready" | "unavailable";
 
 /** `status` 0 means the request never got an answer. `body` is the raw text of a non-2xx reply. */

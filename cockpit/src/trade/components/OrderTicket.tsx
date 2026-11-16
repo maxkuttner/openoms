@@ -5,7 +5,7 @@ import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title, U
 import { tradeApi, ApiError } from "../api/client";
 import { submitOrder, RECORDED_NOT_ROUTED } from "../api/submitOrder";
 import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
-import type { GrantedPortfolio } from "../App";
+import type { GrantedPortfolio } from "../../access";
 import type { VenueOption, Side, OrderType, TimeInForce } from "../types";
 
 function notifyError(err: unknown) {

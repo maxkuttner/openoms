@@ -4,7 +4,7 @@ import { notifications } from "@mantine/notifications";
 import { Alert, Badge, Button, Group, Paper, Select, SimpleGrid, Stack, Text, Title } from "@mantine/core";
 import { tradeApi } from "../api/client";
 import { submitOrder, RECORDED_NOT_ROUTED, type SubmitOutcome } from "../api/submitOrder";
-import type { GrantedPortfolio } from "../App";
+import type { GrantedPortfolio } from "../../access";
 import type { StrategyLeg, VenueOption, OrderType, TimeInForce } from "../types";
 
 type LegStatus = "pending" | "sending" | SubmitOutcome["kind"];

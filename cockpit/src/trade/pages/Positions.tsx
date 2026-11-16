@@ -5,7 +5,7 @@ import { tradeApi } from "../api/client";
 import { useLive } from "../api/liveUpdates";
 import { numeric, columnHeader } from "../table";
 import { formatFees } from "../../fees";
-import type { Me } from "../App";
+import type { Me } from "../../access";
 import type { MarkRow } from "../types";
 import { totalsByCurrency } from "../../positions";
 import type { PositionRow } from "../../positions";
