@@ -4,7 +4,7 @@ import { isAdmin, type AccessState, type Me } from "../access";
 import { Frame } from "../login/Frame";
 import { MfaPrompt } from "../login/MfaPrompt";
 import { ForcedPasswordChange, PendingScreen } from "../login/ChangePassword";
-import { LiveUpdatesProvider } from "../trade/api/liveUpdates";
+import { LiveUpdatesProvider } from "../api/liveUpdates";
 import { Spinner } from "../components/common";
 import { SessionContext } from "./session";
 

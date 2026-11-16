@@ -5,8 +5,8 @@ import {
   Alert, Badge, Button, Group, Loader, Modal, Paper, Stack, Table, Text, TextInput, Title,
   UnstyledButton,
 } from "@mantine/core";
-import { tradeApi, ApiError } from "../api/client";
-import type { SearchInstrument, ChainRow, StrategyLeg } from "../types";
+import { api, ApiError } from "../../api/client";
+import type { SearchInstrument, ChainRow, StrategyLeg } from "./types";
 
 type Step = "search" | "underlying" | "chain";
 
@@ -81,21 +81,21 @@ export function InstrumentSearchModal({
 
   const results = useQuery<SearchInstrument[]>({
     queryKey: ["/instruments", "search-modal", debounced],
-    queryFn: () => tradeApi.get<SearchInstrument[]>(`/instruments?search=${encodeURIComponent(debounced)}&limit=50`),
+    queryFn: () => api.get<SearchInstrument[]>(`/instruments?search=${encodeURIComponent(debounced)}&limit=50`),
     enabled: step === "search" && debounced.length > 0,
   });
 
   const expiries = useQuery<string[]>({
     queryKey: ["/instruments/options/expiries", underlying?.symbol],
     queryFn: () =>
-      tradeApi.get<string[]>(`/instruments/options/expiries?underlying=${encodeURIComponent(underlying!.symbol)}`),
+      api.get<string[]>(`/instruments/options/expiries?underlying=${encodeURIComponent(underlying!.symbol)}`),
     enabled: step === "underlying" && !!underlying,
   });
 
   const chain = useQuery<ChainRow[]>({
     queryKey: ["/instruments/options/chain", underlying?.symbol, expiry],
     queryFn: () =>
-      tradeApi.get<ChainRow[]>(
+      api.get<ChainRow[]>(
         `/instruments/options/chain?underlying=${encodeURIComponent(underlying!.symbol)}&expiry=${expiry}`,
       ),
     enabled: step === "chain" && !!underlying && !!expiry,
@@ -108,7 +108,7 @@ export function InstrumentSearchModal({
         .flatMap((r) => [r.call?.instrument_id, r.put?.instrument_id])
         .filter((id): id is number => id != null);
       if (ids.length === 0) return {};
-      const rows = await tradeApi.get<{ instrument_id: number; bid: number | null; ask: number | null }[]>(
+      const rows = await api.get<{ instrument_id: number; bid: number | null; ask: number | null }[]>(
         `/marks?instrument_ids=${ids.join(",")}`,
       );
       const byId: Record<number, { bid: number | null; ask: number | null }> = {};
@@ -177,7 +177,7 @@ export function InstrumentSearchModal({
     try {
       const dates =
         expiries.data ??
-        (await tradeApi.get<string[]>(`/instruments/options/expiries?underlying=${encodeURIComponent(underlying.symbol)}`));
+        (await api.get<string[]>(`/instruments/options/expiries?underlying=${encodeURIComponent(underlying.symbol)}`));
       if (dates.length === 0) {
         setTemplateError(`${underlying.symbol} has no active option expiries.`);
         return;
@@ -191,7 +191,7 @@ export function InstrumentSearchModal({
         return;
       }
 
-      const rows = await tradeApi.get<ChainRow[]>(
+      const rows = await api.get<ChainRow[]>(
         `/instruments/options/chain?underlying=${encodeURIComponent(underlying.symbol)}&expiry=${nearest}`,
       );
       if (rows.length === 0) {

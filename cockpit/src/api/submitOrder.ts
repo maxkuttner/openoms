@@ -1,5 +1,5 @@
-import { tradeApi, ApiError } from "./client";
-import type { Side, OrderType, TimeInForce } from "../types";
+import { api, ApiError } from "./client";
+import type { Side, OrderType, TimeInForce } from "../components/trading/types";
 
 // GET /orders/{id}, of which only the status is used here. Mirrors
 // OrderAggregateState in src/domain/orders/state.rs.
@@ -53,7 +53,7 @@ export type SubmitOutcome =
 async function classifyReplay(orderId: string): Promise<SubmitOutcome> {
   let status: string | null = null;
   try {
-    const order = await tradeApi.get<OrderState>(`/orders/${orderId}`);
+    const order = await api.get<OrderState>(`/orders/${orderId}`);
     status = order?.status ?? null;
   } catch {
     status = null;
@@ -66,7 +66,7 @@ async function classifyReplay(orderId: string): Promise<SubmitOutcome> {
 
 export async function submitOrder(params: SubmitOrderParams): Promise<SubmitOutcome> {
   try {
-    await tradeApi.post("/orders/submit", {
+    await api.post("/orders/submit", {
       order_id: params.orderId,
       client_order_id: params.clientOrderId,
       portfolio_id: params.portfolioId,

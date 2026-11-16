@@ -2,10 +2,10 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
 import { Alert, Badge, Button, Group, Paper, Select, SimpleGrid, Stack, Text, Title } from "@mantine/core";
-import { tradeApi } from "../api/client";
-import { submitOrder, RECORDED_NOT_ROUTED, type SubmitOutcome } from "../api/submitOrder";
+import { api } from "../../api/client";
+import { submitOrder, RECORDED_NOT_ROUTED, type SubmitOutcome } from "../../api/submitOrder";
 import type { GrantedPortfolio } from "../../access";
-import type { StrategyLeg, VenueOption, OrderType, TimeInForce } from "../types";
+import type { StrategyLeg, VenueOption, OrderType, TimeInForce } from "./types";
 
 type LegStatus = "pending" | "sending" | SubmitOutcome["kind"];
 
@@ -190,7 +190,7 @@ export function StrategyTicket({
   const firstLegId = legs[0]?.instrumentId;
   const venues = useQuery<VenueOption[]>({
     queryKey: ["/portfolios", portfolioId, "venues", firstLegId],
-    queryFn: () => tradeApi.get<VenueOption[]>(`/portfolios/${portfolioId}/venues?instrument_id=${firstLegId}`),
+    queryFn: () => api.get<VenueOption[]>(`/portfolios/${portfolioId}/venues?instrument_id=${firstLegId}`),
     enabled: !!portfolioId && !!firstLegId,
   });
   const eligibleVenue = venues.data?.find((v) => v.eligible);

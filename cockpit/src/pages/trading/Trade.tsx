@@ -2,13 +2,13 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, Grid, Tabs } from "@mantine/core";
 import type { Me } from "../../access";
-import { TradeBlotter } from "../components/TradeBlotter";
-import { OrderTicket } from "../components/OrderTicket";
-import { StrategyTicket } from "../components/StrategyTicket";
-import { InstrumentSearchModal } from "../components/InstrumentSearchModal";
-import { Watchlist } from "../components/Watchlist";
+import { TradeBlotter } from "../../components/trading/TradeBlotter";
+import { OrderTicket } from "../../components/trading/OrderTicket";
+import { StrategyTicket } from "../../components/trading/StrategyTicket";
+import { InstrumentSearchModal } from "../../components/trading/InstrumentSearchModal";
+import { Watchlist } from "../../components/trading/Watchlist";
 import { PositionsPage } from "./Positions";
-import type { Side, StrategyLeg } from "../types";
+import type { Side, StrategyLeg } from "../../components/trading/types";
 
 export function TradePage({ me }: { me: Me }) {
   const queryClient = useQueryClient();

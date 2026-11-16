@@ -2,10 +2,10 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
 import { Button, Group, Paper, Stack, Text, Title } from "@mantine/core";
-import { tradeApi, ApiError } from "../api/client";
-import { useLive } from "../api/liveUpdates";
-import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
-import type { MarkRow } from "../types";
+import { api, ApiError } from "../../api/client";
+import { useLive } from "../../api/liveUpdates";
+import { InstrumentSelect, type Instrument } from "../InstrumentSelect";
+import type { MarkRow } from "./types";
 
 interface WatchlistRow {
   instrument_id: string;
@@ -43,20 +43,20 @@ export function Watchlist({
 
   const watchlist = useQuery<WatchlistRow[]>({
     queryKey: ["/watchlist"],
-    queryFn: () => tradeApi.get<WatchlistRow[]>("/watchlist"),
+    queryFn: () => api.get<WatchlistRow[]>("/watchlist"),
   });
 
   const instrumentIds = (watchlist.data ?? []).map((w) => w.instrument_id);
   const marks = useQuery<MarkRow[]>({
     queryKey: ["/marks", instrumentIds],
-    queryFn: () => tradeApi.get<MarkRow[]>(`/marks?instrument_ids=${instrumentIds.join(",")}`),
+    queryFn: () => api.get<MarkRow[]>(`/marks?instrument_ids=${instrumentIds.join(",")}`),
     enabled: instrumentIds.length > 0,
     refetchInterval: live ? false : 3000,
   });
   const markByInstrument = new Map((marks.data ?? []).map((m) => [String(m.instrument_id), m]));
 
   const addMutation = useMutation({
-    mutationFn: (instrumentId: string) => tradeApi.post("/watchlist", { instrument_id: instrumentId }),
+    mutationFn: (instrumentId: string) => api.post("/watchlist", { instrument_id: instrumentId }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/watchlist"] });
       setAdding(false);
@@ -66,7 +66,7 @@ export function Watchlist({
   });
 
   const removeMutation = useMutation({
-    mutationFn: (instrumentId: string) => tradeApi.del(`/watchlist/${instrumentId}`),
+    mutationFn: (instrumentId: string) => api.del(`/watchlist/${instrumentId}`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["/watchlist"] }),
     onError: notifyError,
   });
@@ -94,7 +94,7 @@ export function Watchlist({
           }}
           placeholder="Search symbol to add"
           basePath="/instruments"
-          apiGet={tradeApi.get}
+          apiGet={api.get}
         />
       )}
 

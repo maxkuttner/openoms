@@ -47,7 +47,7 @@ export function InstrumentSelect({
   // Authorization: Bearer <admin token>) would be fail-open — one forgotten prop
   // on a trade-side usage would put the admin token on a trader request. Making
   // it required turns that into a compile error instead. The cockpit passes
-  // `api.get`; the trade app passes `tradeApi.get`.
+  // `api.get`; the trade app passes `api.get`.
   apiGet: (path: string) => Promise<unknown>;
   // An instrument selected OUTSIDE this component's own search (e.g. a
   // Watchlist row elsewhere on the page) that `value` may now point at. This

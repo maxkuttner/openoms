@@ -2,11 +2,11 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { notifications } from "@mantine/notifications";
 import { Button, Group, Modal, NumberInput, Paper, Select, Stack, Text, Title, UnstyledButton } from "@mantine/core";
-import { tradeApi, ApiError } from "../api/client";
-import { submitOrder, RECORDED_NOT_ROUTED } from "../api/submitOrder";
-import { InstrumentSelect, type Instrument } from "../../components/InstrumentSelect";
+import { api, ApiError } from "../../api/client";
+import { submitOrder, RECORDED_NOT_ROUTED } from "../../api/submitOrder";
+import { InstrumentSelect, type Instrument } from "../InstrumentSelect";
 import type { GrantedPortfolio } from "../../access";
-import type { VenueOption, Side, OrderType, TimeInForce } from "../types";
+import type { VenueOption, Side, OrderType, TimeInForce } from "./types";
 
 function notifyError(err: unknown) {
   const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
@@ -146,7 +146,7 @@ export function OrderTicket({
 
   const venues = useQuery<VenueOption[]>({
     queryKey: ["/portfolios", portfolioId, "venues", instrumentId],
-    queryFn: () => tradeApi.get<VenueOption[]>(`/portfolios/${portfolioId}/venues?instrument_id=${instrumentId}`),
+    queryFn: () => api.get<VenueOption[]>(`/portfolios/${portfolioId}/venues?instrument_id=${instrumentId}`),
     enabled: !!portfolioId && !!instrumentId,
   });
 
@@ -375,7 +375,7 @@ export function OrderTicket({
               : null
           }
           basePath="/instruments"
-          apiGet={tradeApi.get}
+          apiGet={api.get}
         />
 
         {venues.data && venues.data.length > 0 && (

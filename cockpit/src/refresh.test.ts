@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { QueryClient, QueryObserver } from "@tanstack/query-core";
-import { createRefresher } from "./trade/api/refresh.ts";
+import { createRefresher } from "./api/refresh.ts";
 
 const settle = () => new Promise((r) => setTimeout(r, 10));
 

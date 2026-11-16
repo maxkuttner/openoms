@@ -27,12 +27,11 @@ function rewriteOriginHeader(proxy: import("http-proxy").default) {
 export default defineConfig(({ command }) => ({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { "@": path.resolve(__dirname, "src") } },
-  // Both bundles share one asset tree; each app's SHELL is served at its own
-  // path (/cockpit/, /trade/) by src/cockpit.rs. Vite's base is global per
-  // build, so it cannot be either app's path.
+  // Assets live under /ui/; the app's shell is served at /app/ by
+  // src/cockpit.rs, so the asset base cannot be the app's path.
   base: command === "build" ? "/ui/" : "/",
   build: {
-    rollupOptions: { input: { cockpit: "index.html", trade: "trade.html" } },
+    rollupOptions: { input: { app: "index.html" } },
   },
   server: {
     port: 5173,

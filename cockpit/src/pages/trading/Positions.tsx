@@ -1,12 +1,12 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Loader, Paper, Select, SimpleGrid, Stack, Table, Text, Title, Group } from "@mantine/core";
-import { tradeApi } from "../api/client";
-import { useLive } from "../api/liveUpdates";
-import { numeric, columnHeader } from "../table";
+import { api } from "../../api/client";
+import { useLive } from "../../api/liveUpdates";
+import { numeric, columnHeader } from "../../components/trading/table";
 import { formatFees } from "../../fees";
 import type { Me } from "../../access";
-import type { MarkRow } from "../types";
+import type { MarkRow } from "../../components/trading/types";
 import { totalsByCurrency } from "../../positions";
 import type { PositionRow } from "../../positions";
 
@@ -41,7 +41,7 @@ export function PositionsPage({ me }: { me: Me }) {
   const live = useLive();
   const positions = useQuery<PositionRow[]>({
     queryKey: ["/portfolios", portfolioId, "positions"],
-    queryFn: () => tradeApi.get<PositionRow[]>(`/portfolios/${portfolioId}/positions`),
+    queryFn: () => api.get<PositionRow[]>(`/portfolios/${portfolioId}/positions`),
     enabled: portfolioId !== null,
     refetchInterval: live ? false : 5000,
   });
@@ -51,7 +51,7 @@ export function PositionsPage({ me }: { me: Me }) {
   const heldInstrumentIds = rows.map((p) => p.instrument_id);
   const marks = useQuery<MarkRow[]>({
     queryKey: ["/marks", heldInstrumentIds],
-    queryFn: () => tradeApi.get<MarkRow[]>(`/marks?instrument_ids=${heldInstrumentIds.join(",")}`),
+    queryFn: () => api.get<MarkRow[]>(`/marks?instrument_ids=${heldInstrumentIds.join(",")}`),
     enabled: heldInstrumentIds.length > 0,
     refetchInterval: live ? false : 3000,
   });

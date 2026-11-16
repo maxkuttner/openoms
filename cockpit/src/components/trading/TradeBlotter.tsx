@@ -4,10 +4,10 @@ import { notifications } from "@mantine/notifications";
 import {
   Alert, Badge, Button, Drawer, Group, Loader, Select, Stack, Table, Text, Title, Tooltip,
 } from "@mantine/core";
-import { tradeApi, ApiError } from "../api/client";
-import { useLive } from "../api/liveUpdates";
-import { numeric, columnHeader, sideColor } from "../table";
-import { OrderTimeline } from "../../components/OrderTimeline";
+import { api, ApiError } from "../../api/client";
+import { useLive } from "../../api/liveUpdates";
+import { numeric, columnHeader, sideColor } from "./table";
+import { OrderTimeline } from "../OrderTimeline";
 import { formatFees } from "../../fees";
 import type { BlotterRow } from "../../api/types";
 import type { GrantedPortfolio } from "../../access";
@@ -79,7 +79,7 @@ export function TradeBlotter({
     queryFn: () => {
       const params = new URLSearchParams({ limit: String(BLOTTER_LIMIT) });
       if (portfolioId) params.set("portfolio_id", portfolioId);
-      return tradeApi.get<BlotterRow[]>(`/orders?${params.toString()}`);
+      return api.get<BlotterRow[]>(`/orders?${params.toString()}`);
     },
     refetchInterval: live ? false : 2000,
   });
@@ -92,7 +92,7 @@ export function TradeBlotter({
   // where a trader sees it rather than being told.
   const followed = useQuery<OrderState>({
     queryKey: ["/orders", followOrderId, "state"],
-    queryFn: () => tradeApi.get<OrderState>(`/orders/${followOrderId}`),
+    queryFn: () => api.get<OrderState>(`/orders/${followOrderId}`),
     enabled: followOrderId !== null,
     // Stop polling once it has moved: there is nothing further to learn. While
     // live, the orders notice refreshes it instead.
@@ -121,7 +121,7 @@ export function TradeBlotter({
   async function cancel(orderId: string) {
     setCancelling((s) => new Set(s).add(orderId));
     try {
-      await tradeApi.post("/orders/cancel", { order_id: orderId });
+      await api.post("/orders/cancel", { order_id: orderId });
       // Either 202 or 204: in both cases the row keeps polling until the
       // order's own status changes. We never render "cancelled" on our own
       // authority.
@@ -199,7 +199,7 @@ export function TradeBlotter({
           )
         }
       >
-        {selected && <OrderTimeline orderId={selected.order_id} eventsPath="/orders" apiGet={tradeApi.get} />}
+        {selected && <OrderTimeline orderId={selected.order_id} eventsPath="/orders" apiGet={api.get} />}
       </Drawer>
 
       {orders.isLoading ? (

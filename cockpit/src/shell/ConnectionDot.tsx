@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { API_BASE } from "../api/client";
-import { useLive } from "../trade/api/liveUpdates";
+import { useLive } from "../api/liveUpdates";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 /// Reachability of the OMS, polled on its own. `/health` is unauthenticated,
