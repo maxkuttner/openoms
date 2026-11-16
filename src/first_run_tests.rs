@@ -562,3 +562,138 @@ async fn removed_invite_routes_404() {
             "{method} {path}: {status}");
     }
 }
+
+/// A host-CLI password (bootstrap or recover) is someone else's choice: the
+/// session it opens can only change it.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn cli_password_must_be_changed_before_anything_else() {
+    let pool = migrated_db().await;
+    let st = state(pool.clone(), false);
+    let e = email();
+    let (_, password) = crate::admin_bootstrap::bootstrap(&pool, &e, None, crate::admin_bootstrap::HOST_CLI_ACTOR, true).await.unwrap();
+    let resp = login(&st, &e, &password).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = cookie_of(&resp);
+    assert_eq!(json(resp).await, serde_json::json!({ "next": "change_password" }));
+
+    let blocked = r#"{"error":"password_change_required"}"#;
+    for (method, path, body) in [
+        ("GET", "/admin/users", None),
+        ("GET", "/portfolios", None),
+        ("POST", "/orders/submit", Some(serde_json::json!({}))),
+        ("POST", "/auth/local/totp/enroll", None),
+        ("POST", "/auth/logout-all", None),
+    ] {
+        let (status, text, _) = send(&st, method, path, Some(&cookie), None, body).await;
+        assert_eq!((status, text.as_str()), (StatusCode::FORBIDDEN, blocked), "{method} {path}");
+    }
+    let (status, text, _) = send(&st, "GET", "/auth/me", Some(&cookie), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["must_change_password"], true);
+    assert_eq!(send(&st, "GET", "/auth/methods", Some(&cookie), None, None).await.0, StatusCode::OK);
+
+    let change = serde_json::json!({ "current_password": password, "new_password": NEW_PASSWORD });
+    let (status, text, new) = send(&st, "POST", "/auth/local/password", Some(&cookie), None, Some(change)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let new = new.unwrap();
+    assert_eq!(send(&st, "GET", "/admin/users", Some(&new), None, None).await.0, StatusCode::OK);
+    let (_, text, _) = send(&st, "GET", "/auth/me", Some(&new), None, None).await;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&text).unwrap()["must_change_password"], false);
+
+    // Recovery hands out another such password.
+    let (_, again) = crate::admin_bootstrap::recover(&pool, &e, crate::admin_bootstrap::HOST_CLI_ACTOR).await.unwrap();
+    assert_eq!(json(login(&st, &e, &again).await).await, serde_json::json!({ "next": "change_password" }));
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn cli_password_expires_after_24h() {
+    let pool = migrated_db().await;
+    let st = state(pool.clone(), false);
+    let e = email();
+    let (id, password) = crate::admin_bootstrap::bootstrap(&pool, &e, None, crate::admin_bootstrap::HOST_CLI_ACTOR, true).await.unwrap();
+    let expires: bool = sqlx::query_scalar(
+        "SELECT password_expires_at BETWEEN now() + interval '23 hours' AND now() + interval '25 hours' FROM local_credential WHERE principal_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(expires, "valid for 24 h");
+    sqlx::query("UPDATE local_credential SET password_expires_at = now() - interval '1 minute' WHERE principal_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resp = login(&st, &e, &password).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json(resp).await, serde_json::json!({ "error": "invalid_credentials" }));
+
+    // Used in time, it no longer expires (the change is still required).
+    let (_, password) = crate::admin_bootstrap::recover(&pool, &e, crate::admin_bootstrap::HOST_CLI_ACTOR).await.unwrap();
+    assert_eq!(login(&st, &e, &password).await.status(), StatusCode::OK);
+    let cleared: bool = sqlx::query_scalar("SELECT password_expires_at IS NULL FROM local_credential WHERE principal_id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(cleared);
+}
+
+/// A password change ends every other session of the user.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn password_change_revokes_other_sessions() {
+    let pool = migrated_db().await;
+    let st = state(pool.clone(), false);
+    let e = email();
+    let first = cookie_of(&signup(&st, &e, PASSWORD).await);
+    let other = cookie_of(&login(&st, &e, PASSWORD).await);
+    let mut auth = st.event_bus().subscribe_auth();
+    let change = serde_json::json!({ "current_password": PASSWORD, "new_password": NEW_PASSWORD });
+    assert_eq!(send(&st, "POST", "/auth/local/password", Some(&other), None, Some(change)).await.0, StatusCode::OK);
+    assert_eq!(session_mfa(&pool, &first).await, None, "the other session is revoked");
+    assert!(auth.try_recv().is_ok(), "AuthChanged published");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn totp_disable_consumes_the_code_and_announces_it() {
+    let pool = migrated_db().await;
+    let st = state(pool.clone(), false);
+    let e = email();
+    let (_, cookie, _) = enrolled_trader(&st, &e).await;
+    let (uri, cookie) = enrol_totp(&st, &cookie).await;
+    let used = code(&uri, 0);
+    // The confirm consumed this step already: replaying it must fail.
+    let resp = la_api::totp_disable(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: used })).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a consumed code cannot disable TOTP");
+    let mut auth = st.event_bus().subscribe_auth();
+    let resp = la_api::totp_disable(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: code(&uri, 30) })).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(auth.try_recv().is_ok(), "AuthChanged published");
+}
+
+/// Sessions minted under the removed shared password (`auth_method =
+/// 'legacy_admin'`) resolve to no session: 401, never a 500.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn legacy_admin_sessions_are_no_session() {
+    let pool = migrated_db().await;
+    let st = state(pool.clone(), false);
+    let e = email();
+    signup(&st, &e, PASSWORD).await;
+    let token = "legacy-session-token-0123456789";
+    sqlx::query(
+        "INSERT INTO user_session (principal_id, token_hash, absolute_expires_at, auth_method) \
+         SELECT id, $2, now() + interval '1 day', 'legacy_admin' FROM principal WHERE email = $1",
+    )
+    .bind(&e)
+    .bind(crate::sessions::hash_session_token(token))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(send(&st, "GET", "/auth/me", Some(token), None, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&st, "GET", "/admin/users", Some(token), None, None).await.0, StatusCode::UNAUTHORIZED);
+}

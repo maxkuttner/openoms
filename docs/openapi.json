@@ -3022,7 +3022,7 @@
           "auth"
         ],
         "summary": "Change the current local session's password. The new one must pass the",
-        "description": "password policy (15 to 128 characters, not a common password) and differ\nfrom the current one. Rotates the session (the old token stops at once;\nMFA state carries over) and says what comes next (`totp`, `totp_enroll` or\n`done`). Audited `local.password_changed`.",
+        "description": "password policy (15 to 128 characters, not a common password) and differ\nfrom the current one. Clears `must_change_password`, ends every other\nsession of the user, rotates this one (the old token stops at once; MFA\nstate carries over) and says what comes next (`totp`, `totp_enroll` or\n`done`). Audited `local.password_changed`. The one mutation a session on a\nhost-CLI password may make.",
         "operationId": "change_password",
         "requestBody": {
           "content": {
@@ -5670,6 +5670,7 @@
           "portfolios",
           "auth_method",
           "role",
+          "must_change_password",
           "totp_enrolled"
         ],
         "properties": {
@@ -5683,6 +5684,10 @@
           "display_name": {
             "type": "string",
             "nullable": true
+          },
+          "must_change_password": {
+            "type": "boolean",
+            "description": "The session is on a password the host CLI generated: it must choose a\nnew one before anything else (403 `password_change_required`)."
           },
           "portfolios": {
             "type": "array",
@@ -5734,7 +5739,7 @@
         "properties": {
           "next": {
             "type": "string",
-            "description": "`totp`, `totp_enroll` (only with `[auth.local].require_mfa`) or `done`."
+            "description": "`change_password` (a host-CLI password), `totp`, `totp_enroll` (only\nwith `[auth.local].require_mfa`) or `done`."
           }
         }
       },

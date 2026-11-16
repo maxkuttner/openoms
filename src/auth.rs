@@ -104,6 +104,7 @@ struct Resolved {
     ctx: AuthContext,
     kind: CredentialKind,
     pending: bool,
+    must_change_password: bool,
 }
 
 async fn resolve(
@@ -112,8 +113,8 @@ async fn resolve(
     session_config: &SessionConfig,
 ) -> Result<Option<Resolved>, Response> {
     if let Some(record) = authenticate_session(pool, headers, session_config).await? {
-        let pending = record.pending;
-        return Ok(Some(Resolved { ctx: AuthContext::from_session(record), kind: CredentialKind::Session, pending }));
+        let (pending, must_change_password) = (record.pending, record.must_change_password);
+        return Ok(Some(Resolved { ctx: AuthContext::from_session(record), kind: CredentialKind::Session, pending, must_change_password }));
     }
 
     let Ok((key_id, secret)) = extract_trading_credentials(headers) else {
@@ -123,20 +124,43 @@ async fn resolve(
         ctx: AuthContext::machine(principal_id, principal_code),
         kind: CredentialKind::ApiKey,
         pending: false,
+        must_change_password: false,
     }))
 }
 
 /// The JSON body of the 403 a PENDING account gets.
 pub const APPROVAL_PENDING_BODY: &str = r#"{"error":"approval_pending"}"#;
 
-/// The only route behind `auth_middleware` a PENDING account may call. The
-/// others it may use (`/auth/methods`, `/auth/logout`) carry no auth
-/// middleware at all.
+/// The only route behind `auth_middleware` a PENDING account, or a session
+/// that must change its password, may call. The others they may use
+/// (`/auth/methods`, `/auth/logout`, and for the latter `/auth/local/password`)
+/// carry no auth middleware at all.
 const PENDING_ALLOWED: &[&str] = &["/auth/me"];
 
-/// Whether a PENDING account must be refused `path` (with `approval_pending`).
-pub fn pending_blocks(pending: bool, path: &str) -> bool {
-    pending && !PENDING_ALLOWED.contains(&path)
+
+/// The JSON body of the 403 a session on a host-CLI password gets.
+pub const PASSWORD_CHANGE_REQUIRED_BODY: &str = r#"{"error":"password_change_required"}"#;
+
+pub fn password_change_required() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(PASSWORD_CHANGE_REQUIRED_BODY.into())
+        .unwrap()
+}
+
+/// The refusal for a session that is PENDING or must change its password,
+/// unless `path` is one of the few routes it may still call.
+pub fn gate_for(pending: bool, must_change_password: bool, path: &str) -> Option<Response> {
+    if PENDING_ALLOWED.contains(&path) {
+        None
+    } else if pending {
+        Some(approval_pending())
+    } else if must_change_password {
+        Some(password_change_required())
+    } else {
+        None
+    }
 }
 
 pub fn approval_pending() -> Response {
@@ -193,12 +217,12 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    let Resolved { ctx, kind, pending } =
+    let Resolved { ctx, kind, pending, must_change_password } =
         resolve(state.pool(), req.headers(), &state.session_config).await?.ok_or_else(unauthorized)?;
 
     enforce_origin_for_session(kind, req.headers(), req.method(), &state.session_config)?;
-    if pending_blocks(pending, req.uri().path()) {
-        return Err(approval_pending());
+    if let Some(refused) = gate_for(pending, must_change_password, req.uri().path()) {
+        return Err(refused);
     }
 
     if let Some(code) = crate::strategies::stopped_strategy(&state.strategies().all(), ctx.principal_id) {
@@ -304,8 +328,8 @@ pub async fn admin_middleware(
     let pool = state.pool();
     if let Some(session) = authenticate_session(pool, req.headers(), &state.session_config).await? {
         enforce_origin_for_session(CredentialKind::Session, req.headers(), req.method(), &state.session_config)?;
-        if pending_blocks(session.pending, req.uri().path()) {
-            return Err(approval_pending());
+        if let Some(refused) = gate_for(session.pending, session.must_change_password, req.uri().path()) {
+            return Err(refused);
         }
         let is_admin = crate::admin_bootstrap::is_active_admin(pool, session.principal_id)
             .await
@@ -431,13 +455,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_lets_only_me_through() {
-        assert!(!pending_blocks(false, "/orders/submit"));
-        assert!(!pending_blocks(true, "/auth/me"));
+    fn the_session_gate_lets_only_me_through() {
+        assert!(gate_for(false, false, "/orders/submit").is_none());
+        assert!(gate_for(true, true, "/auth/me").is_none());
         for path in ["/orders/submit", "/admin/users", "/portfolios", "/updates"] {
-            assert!(pending_blocks(true, path), "{path}");
+            assert_eq!(gate_for(true, false, path).unwrap().status(), StatusCode::FORBIDDEN, "{path}");
+            assert_eq!(gate_for(false, true, path).unwrap().status(), StatusCode::FORBIDDEN, "{path}");
         }
-        assert_eq!(approval_pending().status(), StatusCode::FORBIDDEN);
     }
 
     use super::*;

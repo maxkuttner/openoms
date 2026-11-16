@@ -86,7 +86,20 @@ impl std::fmt::Display for BootstrapError {
 
 impl std::error::Error for BootstrapError {}
 
-/// A one-time password the host CLI prints; the admin changes it under Account.
+/// A password the host CLI generated is someone else's choice: it must be
+/// changed at first sign-in, and dies after 24 h if never used.
+async fn mark_cli_password(tx: &mut Transaction<'_, Postgres>, principal_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE local_credential SET must_change_password = true, password_expires_at = now() + interval '24 hours' \
+          WHERE principal_id = $1",
+    )
+    .bind(principal_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// A one-time password the host CLI prints; it must be changed at sign-in.
 fn one_time_password() -> String {
     crate::setup::init::generate_password()
 }
@@ -118,6 +131,7 @@ pub async fn bootstrap(
         role: crate::accounts::AccountRole::Admin,
     };
     let (id, _) = crate::accounts::create_account(&mut tx, &acct, actor, "admin.bootstrap").await?;
+    mark_cli_password(&mut tx, id).await?;
     tx.commit().await?;
     Ok((id, password))
 }
@@ -164,6 +178,7 @@ pub async fn recover(pool: &PgPool, email: &str, actor: &str) -> Result<(Uuid, S
     .bind(principal_id)
     .execute(&mut *tx)
     .await?;
+    mark_cli_password(&mut tx, principal_id).await?;
     sqlx::query("UPDATE principal SET status = 'ACTIVE', updated_at = now() WHERE id = $1").bind(principal_id).execute(&mut *tx).await?;
     let sessions = sqlx::query("UPDATE user_session SET revoked_at = now() WHERE principal_id = $1 AND revoked_at IS NULL")
         .bind(principal_id)
@@ -410,11 +425,22 @@ mod tests {
         .await
     }
 
-    /// A bootstrapped admin signed in with its password: MFA still pending
-    /// (strict mode). Returns (principal_id, cookie).
+    const NEW_PASSWORD: &str = "the admin's own long passphrase";
+
+    /// A bootstrapped admin signed in, past the forced password change: MFA
+    /// still pending (strict mode). Returns (principal_id, cookie).
     async fn signed_in_admin(st: &AppState, email: &str) -> (Uuid, String) {
         let (id, password) = bootstrap(st.pool(), email, Some("Ada"), HOST_CLI_ACTOR, false).await.unwrap();
         let resp = login(st, email, &password).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = la_api::change_password(
+            State(st.clone()),
+            Extension(la()),
+            None,
+            hdrs(Some(&cookie_of(&resp))),
+            Json(la_api::ChangePasswordBody { current_password: password, new_password: NEW_PASSWORD.into() }),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         (id, cookie_of(&resp))
     }
@@ -560,6 +586,7 @@ mod tests {
         assert_eq!((live, totp, codes), (0, false, 0));
         assert_eq!(audit_rows(&pool, "admin.recovered").await, vec![(HOST_CLI_ACTOR.to_string(), Some(id))]);
         assert_eq!(login(&st, &e, &password).await.status(), StatusCode::OK, "the new password works");
+        assert_eq!(login(&st, &e, NEW_PASSWORD).await.status(), StatusCode::UNAUTHORIZED, "the old one does not");
         assert!(matches!(recover(&pool, &email(), HOST_CLI_ACTOR).await, Err(BootstrapError::NotAnAdmin)));
     }
 

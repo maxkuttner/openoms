@@ -843,6 +843,7 @@ mod tests {
             auth_method: crate::sessions::AuthMethod::Oidc,
             mfa_verified_at: None,
             pending: false,
+            must_change_password: false,
         }
     }
 

@@ -195,8 +195,19 @@ async fn current_session(state: &AppState, headers: &HeaderMap) -> Result<Sessio
 }
 
 /// The current local session of an approved account: a PENDING one answers
-/// 403 `approval_pending`.
+/// 403 `approval_pending`, one on a host-CLI password 403
+/// `password_change_required`.
 async fn local_session(state: &AppState, headers: &HeaderMap) -> Result<SessionRecord, Response> {
+    let s = any_local_session(state, headers).await?;
+    if s.must_change_password {
+        return Err(crate::auth::password_change_required());
+    }
+    Ok(s)
+}
+
+/// The current local session of an approved account, even one that must
+/// change its password (for `change_password` itself).
+async fn any_local_session(state: &AppState, headers: &HeaderMap) -> Result<SessionRecord, Response> {
     let s = current_session(state, headers).await?;
     if s.pending {
         return Err(crate::auth::approval_pending());
@@ -261,13 +272,18 @@ async fn record_db_failure(pool: &PgPool, principal_id: Uuid) -> Result<bool, sq
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct NextStep {
-    /// `totp`, `totp_enroll` (only with `[auth.local].require_mfa`) or `done`.
+    /// `change_password` (a host-CLI password), `totp`, `totp_enroll` (only
+    /// with `[auth.local].require_mfa`) or `done`.
     pub next: &'static str,
 }
 
 /// What a local session must do next, given its credential and the policy.
-fn next_step(has_totp: bool, mfa_verified: bool, require_mfa: bool) -> &'static str {
-    if has_totp && !mfa_verified {
+/// A pending password change comes first: until it is done the session can
+/// do nothing else, TOTP included.
+fn next_step(must_change_password: bool, has_totp: bool, mfa_verified: bool, require_mfa: bool) -> &'static str {
+    if must_change_password {
+        "change_password"
+    } else if has_totp && !mfa_verified {
         "totp"
     } else if require_mfa && !has_totp {
         "totp_enroll"
@@ -354,7 +370,7 @@ pub async fn signup(
         Err(e) => return internal("create_session", e),
     };
     // A pending account can do nothing yet, TOTP enrolment included.
-    let next = if created.role == AccountRole::Pending { "done" } else { next_step(false, mfa, state.require_mfa) };
+    let next = if created.role == AccountRole::Pending { "done" } else { next_step(false, false, mfa, state.require_mfa) };
     let res = Json(SignupResponse { role: created.role.as_str(), next }).into_response();
     with_cookie(res, session_cookie(&state, &token.plaintext))
 }
@@ -404,8 +420,9 @@ pub async fn login(
     }
 
     let row = sqlx::query(
-        "SELECT p.id, c.password_hash, c.totp_enrolled_at IS NOT NULL AS has_totp, \
-                COALESCE(c.locked_until > now(), false) AS locked \
+        "SELECT p.id, c.password_hash, c.totp_enrolled_at IS NOT NULL AS has_totp, c.must_change_password, \
+                COALESCE(c.locked_until > now(), false) AS locked, \
+                COALESCE(c.password_expires_at <= now(), false) AS expired \
            FROM principal p JOIN local_credential c ON c.principal_id = p.id \
           WHERE lower(p.email) = $1 AND p.status IN ('ACTIVE', 'PENDING') AND p.principal_type = 'HUMAN' \
           LIMIT 1",
@@ -424,7 +441,9 @@ pub async fn login(
     let principal_id: Uuid = row.get("id");
     let hash: String = row.get("password_hash");
     let ok = local_auth::verify_password(&hash, &body.password).await;
-    if row.get::<bool, _>("locked") {
+    // A host-CLI password never used within 24 h is dead: it fails like a
+    // wrong one, so the answer says nothing about the account.
+    if row.get::<bool, _>("locked") || row.get::<bool, _>("expired") {
         return invalid_credentials();
     }
     if !ok {
@@ -436,10 +455,13 @@ pub async fn login(
     la.limiter.refund(&account, &ip);
     la.limiter.clear_account(&account);
 
-    if let Err(e) = sqlx::query("UPDATE local_credential SET failed_attempts = 0, locked_until = NULL WHERE principal_id = $1")
-        .bind(principal_id)
-        .execute(state.pool())
-        .await
+    // Used in time: the password no longer expires (it must still be changed).
+    if let Err(e) = sqlx::query(
+        "UPDATE local_credential SET failed_attempts = 0, locked_until = NULL, password_expires_at = NULL WHERE principal_id = $1",
+    )
+    .bind(principal_id)
+    .execute(state.pool())
+    .await
     {
         return internal("reset failed logins", e);
     }
@@ -454,7 +476,7 @@ pub async fn login(
         Ok(t) => t,
         Err(e) => return internal("create_session", e),
     };
-    let next = next_step(has_totp, mfa, state.require_mfa);
+    let next = next_step(row.get("must_change_password"), has_totp, mfa, state.require_mfa);
     with_cookie(Json(NextStep { next }).into_response(), session_cookie(&state, &token.plaintext))
 }
 
@@ -847,33 +869,42 @@ pub async fn totp_disable(
     let Some((secret, last_step, locked)) = row else {
         return fail(StatusCode::CONFLICT, "totp_not_enrolled");
     };
-    let valid = !locked
-        && looks_like_totp(&body.code)
-        && local_auth::verify_totp(&secret, master, &body.code, last_step, Utc::now().timestamp()).is_ok();
-    if !valid {
+    let step = if !locked && looks_like_totp(&body.code) {
+        local_auth::verify_totp(&secret, master, &body.code, last_step, Utc::now().timestamp()).ok()
+    } else {
+        None
+    };
+    let Some(step) = step else {
         return match record_db_failure(state.pool(), session.principal_id).await {
             Ok(_) => fail(StatusCode::UNAUTHORIZED, "invalid_code"),
             Err(e) => internal("record failed totp", e),
         };
-    }
+    };
     la.limiter.refund(&account, &ip);
-    match remove_totp(state.pool(), session.principal_id, &session.principal_code, &secret).await {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+    match remove_totp(state.pool(), session.principal_id, &session.principal_code, &secret, step).await {
+        Ok(true) => {
+            state.event_bus().publish_auth_changed(session.principal_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => fail(StatusCode::CONFLICT, "totp_not_enrolled"),
         Err(e) => internal("disable totp", e),
     }
 }
 
-/// Removes only `verified_secret`, the one the code was checked against.
-async fn remove_totp(pool: &PgPool, principal_id: Uuid, code: &str, verified_secret: &[u8]) -> Result<bool, sqlx::Error> {
+/// Removes only `verified_secret`, the one the code was checked against, and
+/// only if `step` is still unused: two requests with the same code cannot
+/// both pass, and a code already spent (sign-in, confirm) is refused.
+async fn remove_totp(pool: &PgPool, principal_id: Uuid, code: &str, verified_secret: &[u8], step: i64) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let removed = sqlx::query(
         "UPDATE local_credential SET totp_secret_enc = NULL, totp_enrolled_at = NULL, totp_last_step = NULL, \
                 failed_attempts = 0, locked_until = NULL \
-          WHERE principal_id = $1 AND totp_enrolled_at IS NOT NULL AND totp_secret_enc = $2",
+          WHERE principal_id = $1 AND totp_enrolled_at IS NOT NULL AND totp_secret_enc = $2 \
+            AND (totp_last_step IS NULL OR totp_last_step < $3)",
     )
     .bind(principal_id)
     .bind(verified_secret)
+    .bind(step)
     .execute(&mut *tx)
     .await?;
     if removed.rows_affected() != 1 {
@@ -895,9 +926,11 @@ pub struct ChangePasswordBody {
 
 /// Change the current local session's password. The new one must pass the
 /// password policy (15 to 128 characters, not a common password) and differ
-/// from the current one. Rotates the session (the old token stops at once;
-/// MFA state carries over) and says what comes next (`totp`, `totp_enroll` or
-/// `done`). Audited `local.password_changed`.
+/// from the current one. Clears `must_change_password`, ends every other
+/// session of the user, rotates this one (the old token stops at once; MFA
+/// state carries over) and says what comes next (`totp`, `totp_enroll` or
+/// `done`). Audited `local.password_changed`. The one mutation a session on a
+/// host-CLI password may make.
 #[utoipa::path(
     post, path = "/auth/local/password", tag = "auth",
     request_body = ChangePasswordBody,
@@ -918,7 +951,7 @@ pub async fn change_password(
     if let Err(r) = check_origin(&state, &headers) {
         return *r;
     }
-    let session = match local_session(&state, &headers).await {
+    let session = match any_local_session(&state, &headers).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -959,11 +992,11 @@ pub async fn change_password(
         Ok(h) => h,
         Err(e) => return internal("hash_password", e),
     };
-    if let Err(e) = store_password(state.pool(), session.principal_id, &session.principal_code, &new_hash).await {
+    if let Err(e) = store_password(state.pool(), session.principal_id, session.id, &session.principal_code, &new_hash).await {
         return internal("store password", e);
     }
     let mfa = session.mfa_verified_at.is_some();
-    let next = next_step(has_totp, mfa, state.require_mfa);
+    let next = next_step(false, has_totp, mfa, state.require_mfa);
     match sessions::rotate_session(
         state.pool(),
         session.id,
@@ -984,16 +1017,23 @@ pub async fn change_password(
     }
 }
 
-async fn store_password(pool: &PgPool, principal_id: Uuid, code: &str, hash: &str) -> Result<(), sqlx::Error> {
+/// Store the new hash and end every session of the user except `keep`
+/// (which the caller rotates).
+async fn store_password(pool: &PgPool, principal_id: Uuid, keep: Uuid, code: &str, hash: &str) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query(
-        "UPDATE local_credential SET password_hash = $2, \
+        "UPDATE local_credential SET password_hash = $2, must_change_password = false, password_expires_at = NULL, \
                 failed_attempts = 0, locked_until = NULL WHERE principal_id = $1",
     )
     .bind(principal_id)
     .bind(hash)
     .execute(&mut *tx)
     .await?;
+    sqlx::query("UPDATE user_session SET revoked_at = now() WHERE principal_id = $1 AND id <> $2 AND revoked_at IS NULL")
+        .bind(principal_id)
+        .bind(keep)
+        .execute(&mut *tx)
+        .await?;
     crate::accounts::audit(&mut tx, code, "local.password_changed", principal_id, serde_json::json!({})).await?;
     tx.commit().await
 }
@@ -1086,8 +1126,8 @@ pub async fn logout_all(State(state): State<AppState>, headers: HeaderMap) -> Re
         Ok(s) => s,
         Err(r) => return r,
     };
-    if session.pending {
-        return crate::auth::approval_pending();
+    if let Some(refused) = crate::auth::gate_for(session.pending, session.must_change_password, "/auth/logout-all") {
+        return refused;
     }
     if let Err(e) = sessions::revoke_all_for_principal(state.pool(), session.principal_id).await {
         return internal("revoke_all_for_principal", e);
@@ -1299,10 +1339,11 @@ mod tests {
 
     #[test]
     fn next_step_follows_the_mfa_policy() {
-        assert_eq!(next_step(true, false, false), "totp");
-        assert_eq!(next_step(true, true, false), "done");
-        assert_eq!(next_step(false, false, true), "totp_enroll");
-        assert_eq!(next_step(false, true, false), "done");
+        assert_eq!(next_step(true, true, false, true), "change_password");
+        assert_eq!(next_step(false, true, false, false), "totp");
+        assert_eq!(next_step(false, true, true, false), "done");
+        assert_eq!(next_step(false, false, false, true), "totp_enroll");
+        assert_eq!(next_step(false, false, true, false), "done");
         assert!(password_is_enough(false, false));
         assert!(!password_is_enough(false, true), "an enrolled TOTP is always asked for");
         assert!(!password_is_enough(true, false));

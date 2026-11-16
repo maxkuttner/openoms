@@ -48,7 +48,8 @@ pub struct UserRow {
 }
 
 /// `POST /admin/users`: a local account with a password the admin passes on.
-#[derive(Debug, Deserialize)]
+/// No `Debug`: it carries a password.
+#[derive(Deserialize)]
 pub struct AddUser {
     pub name: String,
     pub email: String,
@@ -194,8 +195,8 @@ pub async fn list_users(State(state): State<AppState>) -> Result<Json<Vec<UserRo
     Ok(Json(fetch_users(state.pool(), None).await?))
 }
 
-/// Add a local account directly (Open WebUI's admin "Add user"): the admin
-/// chooses the password and passes it on out of band; the user can change it
+/// Add a local account directly (Open WebUI's admin "Add user"), as `user` or
+/// `admin` (422 otherwise): the admin chooses the password and passes it on out of band; the user can change it
 /// under Account. The password policy applies. Audited `user.added`.
 pub async fn add_user(
     State(state): State<AppState>,
@@ -203,6 +204,9 @@ pub async fn add_user(
     Json(p): Json<AddUser>,
 ) -> Result<(StatusCode, Json<AddedUser>), ApiError> {
     use crate::accounts::{create_account, normalise_email, AccountError, NewAccount};
+    if p.role == crate::accounts::AccountRole::Pending {
+        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "role must be user or admin"));
+    }
     let email = normalise_email(&p.email).map_err(|e| api_error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
     crate::local_auth::check_password_policy(&p.password).map_err(|r| api_error(StatusCode::UNPROCESSABLE_ENTITY, r))?;
     let hash = crate::local_auth::hash_password(&p.password)
@@ -937,8 +941,9 @@ mod tests {
 
         let admin_id = add(&st, &actor(), &format!("ad-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Admin).await;
         assert!(fetch_users(&pool, Some(admin_id)).await.unwrap()[0].admin);
-        let pending = add(&st, &actor(), &format!("pe-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Pending).await;
-        assert_eq!(status_of(&pool, pending).await, "PENDING");
+        let pending = add_user(State(st.clone()), Extension(actor()),
+            Json(AddUser { name: "x".into(), email: "pe@fundco.com".into(), password: PW.into(), role: AccountRole::Pending })).await.unwrap_err();
+        assert_eq!(pending.status, StatusCode::UNPROCESSABLE_ENTITY, "pending is for sign-ups, not added users");
 
         let dup = add_user(State(st.clone()), Extension(actor()),
             Json(AddUser { name: "x".into(), email: email.to_uppercase(), password: PW.into(), role: AccountRole::User })).await.unwrap_err();
@@ -948,12 +953,21 @@ mod tests {
         assert_eq!(weak.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// A self-signup waiting for approval.
+    async fn pending_user(pool: &PgPool) -> Uuid {
+        let email = format!("p-{}@fundco.com", Uuid::new_v4().simple());
+        let policy = crate::accounts::SignupPolicy { enabled: true, pending_by_default: true };
+        // The first signup on a fresh database would be the admin.
+        add(&test_app_state(pool.clone()), &actor(), &format!("a-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Admin).await;
+        crate::accounts::signup(pool, "P", &email, "x", policy).await.unwrap().principal_id
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
     async fn approve_pending_sets_user_and_portfolio_access() {
         let pool = migrated_db().await;
         let st = state(&pool, Some(BASE)).await;
-        let id = add(&st, &actor(), &format!("p-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Pending).await;
+        let id = pending_user(&pool).await;
         let pf = portfolio(&pool).await;
         let body = Approve { role: Some("trader".into()), portfolios: vec![PortfolioAccess { portfolio_id: pf, can_trade: true }] };
         assert_eq!(approve_user(State(st.clone()), Extension(actor()), Path(id), Json(body)).await.unwrap(), StatusCode::NO_CONTENT);
@@ -964,7 +978,7 @@ mod tests {
         let again = approve_user(State(st.clone()), Extension(actor()), Path(id), Json(Approve::default())).await.unwrap_err();
         assert_eq!(again.status, StatusCode::CONFLICT, "only a pending account can be approved");
 
-        let other = add(&st, &actor(), &format!("r-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Pending).await;
+        let other = pending_user(&pool).await;
         reject_user(State(st.clone()), Extension(actor()), Path(other)).await.unwrap();
         assert_eq!(status_of(&pool, other).await, "DISABLED");
         assert_eq!(audit_count(&pool, "signup.rejected", other).await, 1);

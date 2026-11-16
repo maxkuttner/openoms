@@ -276,8 +276,11 @@ pub struct SessionRecord {
     pub auth_method: AuthMethod,
     pub mfa_verified_at: Option<DateTime<Utc>>,
     /// The account is PENDING (self-signup awaiting approval): it may only
-    /// read who it is and sign out (see `auth::pending_blocks`).
+    /// read who it is and sign out (see `auth::gate_for`).
     pub pending: bool,
+    /// A local session on a password the host CLI generated: it may only
+    /// change it (see `auth::gate_for`).
+    pub must_change_password: bool,
 }
 
 const INSERT_SESSION: &str = "INSERT INTO user_session \
@@ -371,9 +374,11 @@ pub async fn lookup_session(
     let row = sqlx::query(
         "SELECT s.id, s.principal_id, p.code AS principal_code, \
                 s.last_seen_at, s.absolute_expires_at, s.auth_method, s.mfa_verified_at, \
-                p.status = 'PENDING' AS pending \
+                p.status = 'PENDING' AS pending, \
+                COALESCE(s.auth_method = 'local' AND c.must_change_password, false) AS must_change_password \
          FROM user_session s \
          JOIN principal p ON p.id = s.principal_id \
+         LEFT JOIN local_credential c ON c.principal_id = s.principal_id \
          WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status IN ('ACTIVE', 'PENDING') \
                AND p.principal_type = 'HUMAN'",
     )
@@ -397,6 +402,7 @@ pub async fn lookup_session(
         auth_method,
         mfa_verified_at: r.get("mfa_verified_at"),
         pending: r.get("pending"),
+        must_change_password: r.get("must_change_password"),
     }))
 }
 

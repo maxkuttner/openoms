@@ -528,6 +528,9 @@ pub struct MeResponse {
     /// waiting for approval: 403 `approval_pending` everywhere but a few
     /// `/auth` routes) or `user`.
     pub role: &'static str,
+    /// The session is on a password the host CLI generated: it must choose a
+    /// new one before anything else (403 `password_change_required`).
+    pub must_change_password: bool,
     /// A local account with an authenticator app enrolled.
     pub totp_enrolled: bool,
 }
@@ -583,11 +586,12 @@ pub async fn me(
         })
         .collect();
 
-    let (role, totp_enrolled): (String, bool) = sqlx::query_as(
+    let (role, totp_enrolled, must_change_password): (String, bool, bool) = sqlx::query_as(
         "SELECT CASE WHEN p.status = 'PENDING' THEN 'pending' \
                      WHEN EXISTS (SELECT 1 FROM principal_admin a WHERE a.principal_id = p.id) THEN 'admin' \
                      ELSE 'user' END, \
-                COALESCE((SELECT c.totp_enrolled_at IS NOT NULL FROM local_credential c WHERE c.principal_id = p.id), false) \
+                COALESCE((SELECT c.totp_enrolled_at IS NOT NULL FROM local_credential c WHERE c.principal_id = p.id), false), \
+                COALESCE((SELECT c.must_change_password FROM local_credential c WHERE c.principal_id = p.id), false) \
            FROM principal p WHERE p.id = $1",
     )
     .bind(auth.principal_id)
@@ -599,7 +603,8 @@ pub async fn me(
         "admin" => "admin",
         _ => "user",
     };
-    let totp_enrolled = totp_enrolled && auth.auth_method == crate::auth::AuthMethod::Local;
+    let local = auth.auth_method == crate::auth::AuthMethod::Local;
+    let (totp_enrolled, must_change_password) = (totp_enrolled && local, must_change_password && local);
 
     Ok(Json(MeResponse {
         principal_id: auth.principal_id.to_string(),
@@ -608,6 +613,7 @@ pub async fn me(
         portfolios,
         auth_method: auth.auth_method.as_str(),
         role,
+        must_change_password,
         totp_enrolled,
     }))
 }
