@@ -1,6 +1,6 @@
 //! The decisions `oms init` makes, kept free of I/O so each one is tested
-//! directly: which database source to offer first, what counts as an
-//! acceptable admin password, and what a listen address may look like.
+//! directly: which database source to offer first and what a listen address
+//! may look like.
 
 /// Whether `oms init` can start PostgreSQL in Docker on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,16 +22,6 @@ pub fn default_db_source(s: DockerStatus) -> DbSource {
     match s {
         DockerStatus::Usable => DbSource::Docker,
         DockerStatus::NotFound | DockerStatus::NotRunning => DbSource::Existing,
-    }
-}
-
-/// The first admin's email: where their sign-in is addressed. Only the
-/// shape is checked; the enrolment link proves the rest.
-pub fn check_admin_email(email: &str) -> Result<(), String> {
-    let email = email.trim();
-    match email.split_once('@') {
-        Some((local, domain)) if !local.is_empty() && domain.contains('.') && !email.contains(char::is_whitespace) => Ok(()),
-        _ => Err(format!("{email:?} is not an email address")),
     }
 }
 
@@ -117,15 +107,6 @@ mod tests {
         assert_eq!(default_db_source(DockerStatus::Usable), DbSource::Docker);
         assert_eq!(default_db_source(DockerStatus::NotFound), DbSource::Existing);
         assert_eq!(default_db_source(DockerStatus::NotRunning), DbSource::Existing);
-    }
-
-    #[test]
-    fn admin_email_needs_a_plausible_address() {
-        assert!(check_admin_email("ada@example.com").is_ok());
-        assert!(check_admin_email(" ada@example.com ").is_ok());
-        for bad in ["", "ada", "@example.com", "ada@localhost", "a da@example.com"] {
-            assert!(check_admin_email(bad).is_err(), "{bad:?}");
-        }
     }
 
     #[test]

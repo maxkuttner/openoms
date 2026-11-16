@@ -1,4 +1,5 @@
-//! Admin API for users: invite, role, portfolio access, disable and API keys.
+//! Admin API for users: add, approve or reject sign-ups, role, portfolio
+//! access, disable and API keys.
 //! Admin-token routes (`/admin/users*`), HUMAN principals only; strategies
 //! keep their own admin surface. Every mutation writes an `audit_event`.
 
@@ -6,7 +7,6 @@ use axum::extract::{Path, State};
 use axum::Extension;
 use axum::http::StatusCode;
 use axum::Json;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -15,7 +15,6 @@ use crate::admin::{ApiKeyRecord, CreateKey};
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::handlers::ApiError;
-use crate::invites::{self, InviteError, NewInvite};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PortfolioAccess {
@@ -30,11 +29,6 @@ pub struct UserPortfolio {
     pub can_trade: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct PendingInvite {
-    pub invite_id: Uuid,
-    pub expires_at: DateTime<Utc>,
-}
 
 #[derive(Debug, Serialize)]
 pub struct UserRow {
@@ -47,56 +41,34 @@ pub struct UserRow {
     /// Host of the issuer the user last signed in with.
     pub sign_in: Option<String>,
     pub status: String,
-    pub invite: Option<PendingInvite>,
     /// Holds the admin capability (opens the cockpit).
     pub admin: bool,
+    /// The account role: `admin`, `user` or `pending` (see `accounts`).
+    pub account_role: &'static str,
 }
 
+/// `POST /admin/users`: a local account with a password the admin passes on.
 #[derive(Debug, Deserialize)]
-pub struct InviteRequest {
+pub struct AddUser {
+    pub name: String,
     pub email: String,
-    pub role: String,
-    #[serde(default)]
-    pub portfolios: Vec<PortfolioAccess>,
-    /// Which sign-in method may redeem the invite: "any" (default), "local"
-    /// or "oidc".
-    #[serde(default)]
-    pub method: Option<String>,
-}
-
-/// Optional body of a reissue.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReissueRequest {
-    #[serde(default)]
-    pub method: Option<String>,
-}
-
-/// An invite's sign-in method: absent means "any"; anything else is 422.
-fn invite_method(method: Option<&str>) -> Result<&'static str, ApiError> {
-    let m = method.unwrap_or("any");
-    invites::INVITE_METHODS
-        .iter()
-        .copied()
-        .find(|&known| known == m)
-        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "method must be one of any, local, oidc"))
+    pub password: String,
+    pub role: crate::accounts::AccountRole,
 }
 
 #[derive(Debug, Serialize)]
-pub struct InviteResponse {
-    pub invite_id: Uuid,
-    /// The invited user, so the caller can open them straight away.
+pub struct AddedUser {
     pub user_id: Uuid,
-    pub link: String,
-    pub expires_at: DateTime<Utc>,
 }
 
-/// An API-key-only user: no sign-in, access through keys alone.
-#[derive(Debug, Deserialize)]
-pub struct CreateKeyOnlyUser {
-    pub code: String,
-    pub display_name: String,
-    pub role: String,
+/// `POST /admin/users/:id/approve`: activate a pending account, optionally
+/// with a portfolio role and portfolio access in the same step.
+#[derive(Debug, Default, Deserialize)]
+pub struct Approve {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub portfolios: Vec<PortfolioAccess>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,39 +88,8 @@ fn is_violation(err: &sqlx::Error, check: impl Fn(&dyn sqlx::error::DatabaseErro
     matches!(err, sqlx::Error::Database(d) if check(d.as_ref()))
 }
 
-fn invite_error(err: InviteError) -> ApiError {
-    match err {
-        InviteError::AlreadyInvited | InviteError::AlreadyUser | InviteError::NotLinkable | InviteError::IdentityTaken => {
-            api_error(StatusCode::CONFLICT, err.to_string())
-        }
-        InviteError::BadRole => api_error(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
-        InviteError::NotFound => api_error(StatusCode::NOT_FOUND, err.to_string()),
-        InviteError::Db(err) => db(err),
-    }
-}
-
-/// The configured public origin that invite links point at.
-fn public_base_url(state: &AppState) -> Result<&str, ApiError> {
-    state
-        .session_config
-        .public_base_url
-        .as_deref()
-        .map(|u| u.trim_end_matches('/'))
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| api_error(StatusCode::UNPROCESSABLE_ENTITY, "Set public_base_url before inviting"))
-}
-
-fn invite_response(base: &str, invite: NewInvite) -> InviteResponse {
-    InviteResponse {
-        link: crate::admin_bootstrap::invite_link(base, &invite.token),
-        invite_id: invite.invite_id,
-        user_id: invite.principal_id,
-        expires_at: invite.expires_at,
-    }
-}
-
 fn require_role(role: &str) -> Result<(), ApiError> {
-    if invites::is_assignable_role(role) {
+    if crate::accounts::is_assignable_role(role) {
         Ok(())
     } else {
         Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "role must be pm, trader or viewer"))
@@ -196,14 +137,9 @@ async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, 
                 (SELECT i.issuer FROM principal_identity i \
                   WHERE i.principal_id = p.id AND i.last_login_at IS NOT NULL \
                   ORDER BY i.last_login_at DESC LIMIT 1) AS issuer, \
-                v.id AS invite_id, v.expires_at, \
                 EXISTS (SELECT 1 FROM principal_admin a WHERE a.principal_id = p.id) AS admin \
            FROM principal p \
            LEFT JOIN principal_role r ON r.principal_id = p.id \
-           LEFT JOIN LATERAL ( \
-                SELECT id, expires_at FROM invite \
-                 WHERE principal_id = p.id AND accepted_at IS NULL AND revoked_at IS NULL \
-                 ORDER BY created_at DESC LIMIT 1) v ON true \
           WHERE p.principal_type = 'HUMAN' AND ($1::uuid IS NULL OR p.id = $1) \
           ORDER BY p.created_at DESC, p.code",
     )
@@ -226,7 +162,6 @@ async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, 
         .into_iter()
         .map(|r| {
             let id: Uuid = r.get("id");
-            let invite_id: Option<Uuid> = r.get("invite_id");
             UserRow {
                 principal_id: id,
                 code: r.get("code"),
@@ -244,7 +179,11 @@ async fn fetch_users(pool: &PgPool, only: Option<Uuid>) -> Result<Vec<UserRow>, 
                     .collect(),
                 sign_in: r.get::<Option<String>, _>("issuer").map(|i| issuer_host(&i)),
                 status: r.get("status"),
-                invite: invite_id.map(|invite_id| PendingInvite { invite_id, expires_at: r.get("expires_at") }),
+                account_role: match (r.get::<String, _>("status").as_str(), r.get::<bool, _>("admin")) {
+                    ("PENDING", _) => "pending",
+                    (_, true) => "admin",
+                    _ => "user",
+                },
                 admin: r.get("admin"),
             }
         })
@@ -255,168 +194,93 @@ pub async fn list_users(State(state): State<AppState>) -> Result<Json<Vec<UserRo
     Ok(Json(fetch_users(state.pool(), None).await?))
 }
 
-pub async fn create_key_only_user(
+/// Add a local account directly (Open WebUI's admin "Add user"): the admin
+/// chooses the password and passes it on out of band; the user can change it
+/// under Account. The password policy applies. Audited `user.added`.
+pub async fn add_user(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
-    Json(p): Json<CreateKeyOnlyUser>,
-) -> Result<Json<UserRow>, ApiError> {
-    require_role(&p.role)?;
-    let code = p.code.trim();
-    if code.is_empty() {
-        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "code is required"));
-    }
-    let id = Uuid::new_v4();
+    Json(p): Json<AddUser>,
+) -> Result<(StatusCode, Json<AddedUser>), ApiError> {
+    use crate::accounts::{create_account, normalise_email, AccountError, NewAccount};
+    let email = normalise_email(&p.email).map_err(|e| api_error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    crate::local_auth::check_password_policy(&p.password).map_err(|r| api_error(StatusCode::UNPROCESSABLE_ENTITY, r))?;
+    let hash = crate::local_auth::hash_password(&p.password)
+        .await
+        .map_err(|e| crate::handlers::internal("hash password", e))?;
     let mut tx = state.pool().begin().await.map_err(db)?;
-    sqlx::query(
-        "INSERT INTO principal (id, code, principal_type, display_name, status) \
-         VALUES ($1, $2, 'HUMAN', $3, 'ACTIVE')",
-    )
-    .bind(id)
-    .bind(code)
-    .bind(p.display_name.trim())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        if is_violation(&e, |d| d.is_unique_violation()) {
-            api_error(StatusCode::CONFLICT, "a user with this code already exists")
-        } else {
-            db(e)
-        }
+    if p.role == crate::accounts::AccountRole::Admin {
+        crate::admin_bootstrap::lock_admins(&mut tx).await.map_err(db)?;
+    }
+    let acct = NewAccount { name: Some(&p.name), email: Some(&email), password_hash: Some(&hash), role: p.role };
+    let (id, _) = create_account(&mut tx, &acct, &ctx.principal_code, "user.added").await.map_err(|e| match e {
+        AccountError::Db(e) => db(e),
+        AccountError::EmailTaken => api_error(StatusCode::CONFLICT, e.to_string()),
+        other => api_error(StatusCode::UNPROCESSABLE_ENTITY, other.to_string()),
     })?;
-    sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2)")
+    tx.commit().await.map_err(db)?;
+    Ok((StatusCode::CREATED, Json(AddedUser { user_id: id })))
+}
+
+/// Approve a pending account: it becomes an active `user`, with the given
+/// portfolio role and access, if any. Audited `signup.approved`.
+pub async fn approve_user(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(p): Json<Approve>,
+) -> Result<StatusCode, ApiError> {
+    if let Some(role) = &p.role {
+        require_role(role)?;
+    }
+    let mut tx = state.pool().begin().await.map_err(db)?;
+    if lock_human(&mut tx, id).await? != "PENDING" {
+        return Err(api_error(StatusCode::CONFLICT, "user is not pending"));
+    }
+    sqlx::query("UPDATE principal SET status = 'ACTIVE', updated_at = now() WHERE id = $1")
         .bind(id)
-        .bind(&p.role)
         .execute(&mut *tx)
         .await
         .map_err(db)?;
-    audit(&mut tx, &ctx, "user.created", id, serde_json::json!({ "code": code, "role": p.role, "key_only": true })).await?;
-    tx.commit().await.map_err(db)?;
-    let user = fetch_users(state.pool(), Some(id)).await?.pop();
-    user.map(Json).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "user not found"))
-}
-
-pub async fn invite_user(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Json(p): Json<InviteRequest>,
-) -> Result<Json<InviteResponse>, ApiError> {
-    let base = public_base_url(&state)?;
-    require_role(&p.role)?;
-    let method = invite_method(p.method.as_deref())?;
-    let mut ids: Vec<Uuid> = p.portfolios.iter().map(|g| g.portfolio_id).collect();
-    ids.sort();
-    ids.dedup();
-    let known: i64 = sqlx::query_scalar("SELECT count(*) FROM portfolio WHERE id = ANY($1)")
-        .bind(&ids)
-        .fetch_one(state.pool())
+    if let Some(role) = &p.role {
+        sqlx::query(
+            "INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2) \
+             ON CONFLICT (principal_id) DO UPDATE SET role_code = EXCLUDED.role_code",
+        )
+        .bind(id)
+        .bind(role)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
-    if known != ids.len() as i64 || ids.len() != p.portfolios.len() {
-        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "unknown or repeated portfolio"));
     }
-    let grants: Vec<(Uuid, bool)> = p.portfolios.iter().map(|g| (g.portfolio_id, g.can_trade)).collect();
-    let invite = invites::create_with_method(state.pool(), &p.email, &p.role, &grants, &ctx.principal_code, method).await.map_err(invite_error)?;
-    Ok(Json(invite_response(base, invite)))
-}
-
-pub async fn revoke_invite(State(state): State<AppState>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
-    invites::revoke(state.pool(), id, &ctx.principal_code).await.map_err(invite_error)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub async fn reissue_invite(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-    body: axum::body::Bytes,
-) -> Result<Json<InviteResponse>, ApiError> {
-    let base = public_base_url(&state)?;
-    // The body is optional: none (or empty) keeps the old invite's method.
-    let req: ReissueRequest = if body.iter().all(u8::is_ascii_whitespace) {
-        ReissueRequest::default()
-    } else {
-        serde_json::from_slice(&body).map_err(|e| api_error(StatusCode::UNPROCESSABLE_ENTITY, format!("invalid body: {e}")))?
-    };
-    // No method given: keep the old invite's (never widen a local-only invite).
-    let method = match req.method.as_deref() {
-        Some(m) => Some(invite_method(Some(m))?),
-        None => None,
-    };
-    let invite = invites::reissue_with_method(state.pool(), id, &ctx.principal_code, method).await.map_err(invite_error)?;
-    Ok(Json(invite_response(base, invite)))
-}
-
-/// A link for an active user to add a second sign-in provider. Claiming it
-/// needs that user's own live session on the same browser; otherwise the
-/// login waits as a pending binding for admin approval.
-pub async fn link_invite(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<InviteResponse>, ApiError> {
-    let base = public_base_url(&state)?;
-    let invite = invites::create_link(state.pool(), id, &ctx.principal_code).await.map_err(invite_error)?;
-    Ok(Json(invite_response(base, invite)))
-}
-
-/// An explicit pre-binding of a sign-in identity.
-#[derive(Debug, Deserialize)]
-pub struct PrebindIdentity {
-    pub issuer: String,
-    pub subject: String,
-}
-
-/// Sign-in identities waiting for an admin to approve their binding.
-pub async fn list_bindings(State(state): State<AppState>) -> Result<Json<Vec<invites::PendingBinding>>, ApiError> {
-    Ok(Json(invites::list_bindings(state.pool()).await.map_err(db)?))
-}
-
-/// Approve a pending binding: links the identity, activates the user and
-/// consumes the invite in one step.
-pub async fn approve_binding(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
-    let principal_id = invites::approve_binding(state.pool(), id, &ctx.principal_code).await.map_err(binding_error)?;
-    state.event_bus().publish_auth_changed(principal_id);
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Reject a pending binding; the invite stays pending.
-pub async fn reject_binding(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
-    invites::reject_binding(state.pool(), id, &ctx.principal_code).await.map_err(binding_error)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Bind an independently verified `(issuer, subject)` to a user directly.
-pub async fn prebind_identity(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-    Json(p): Json<PrebindIdentity>,
-) -> Result<StatusCode, ApiError> {
-    let (issuer, subject) = (p.issuer.trim(), p.subject.trim());
-    if issuer.is_empty() || subject.is_empty() {
-        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "issuer and subject are required"));
-    }
-    invites::prebind_identity(state.pool(), id, issuer, subject, &ctx.principal_code).await.map_err(|err| match err {
-        InviteError::NotFound => api_error(StatusCode::NOT_FOUND, "user not found, or not active or invited"),
-        other => invite_error(other),
-    })?;
+    write_grants(&mut tx, id, &p.portfolios).await?;
+    audit(&mut tx, &ctx, "signup.approved", id, serde_json::json!({ "role": p.role, "portfolios": p.portfolios })).await?;
+    tx.commit().await.map_err(db)?;
     state.event_bus().publish_auth_changed(id);
-    Ok(StatusCode::CREATED)
+    Ok(StatusCode::NO_CONTENT)
 }
 
-fn binding_error(err: InviteError) -> ApiError {
-    match err {
-        InviteError::NotFound => api_error(StatusCode::NOT_FOUND, "binding not found, already decided, or its invite is no longer pending"),
-        other => invite_error(other),
+/// Reject a pending account: it is disabled and signed out everywhere.
+/// Audited `signup.rejected`.
+pub async fn reject_user(State(state): State<AppState>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
+    let mut tx = state.pool().begin().await.map_err(db)?;
+    if lock_human(&mut tx, id).await? != "PENDING" {
+        return Err(api_error(StatusCode::CONFLICT, "user is not pending"));
     }
+    sqlx::query("UPDATE principal SET status = 'DISABLED', updated_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    sqlx::query("UPDATE user_session SET revoked_at = now() WHERE principal_id = $1 AND revoked_at IS NULL")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    audit(&mut tx, &ctx, "signup.rejected", id, serde_json::json!({})).await?;
+    tx.commit().await.map_err(db)?;
+    state.event_bus().publish_auth_changed(id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn set_role(
@@ -448,23 +312,16 @@ pub async fn set_role(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Replace the user's portfolio access with exactly `grants`.
-pub async fn set_portfolios(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-    Json(grants): Json<Vec<PortfolioAccess>>,
-) -> Result<StatusCode, ApiError> {
+/// Replace `id`'s portfolio access with exactly `grants`.
+async fn write_grants(tx: &mut Transaction<'_, Postgres>, id: Uuid, grants: &[PortfolioAccess]) -> Result<(), ApiError> {
     let ids: Vec<Uuid> = grants.iter().map(|g| g.portfolio_id).collect();
-    let mut tx = state.pool().begin().await.map_err(db)?;
-    lock_human(&mut tx, id).await?;
     sqlx::query("DELETE FROM principal_portfolio_grant WHERE principal_id = $1 AND NOT (portfolio_id = ANY($2))")
         .bind(id)
         .bind(&ids)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(db)?;
-    for g in &grants {
+    for g in grants {
         sqlx::query(
             // The trade toggle also controls allocation out of the portfolio.
             "INSERT INTO principal_portfolio_grant \
@@ -478,7 +335,7 @@ pub async fn set_portfolios(
         .bind(id)
         .bind(g.portfolio_id)
         .bind(g.can_trade)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(|e| {
             if is_violation(&e, |d| d.is_foreign_key_violation()) {
@@ -488,13 +345,26 @@ pub async fn set_portfolios(
             }
         })?;
     }
+    Ok(())
+}
+
+/// Replace the user's portfolio access with exactly `grants`.
+pub async fn set_portfolios(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(grants): Json<Vec<PortfolioAccess>>,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = state.pool().begin().await.map_err(db)?;
+    lock_human(&mut tx, id).await?;
+    write_grants(&mut tx, id, &grants).await?;
     audit(&mut tx, &ctx, "user.portfolios_changed", id, serde_json::json!({ "portfolios": grants })).await?;
     tx.commit().await.map_err(db)?;
     state.event_bus().publish_auth_changed(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Cut a user off now: no sign-in, no session, no API key, no pending invite.
+/// Cut a user off now: no sign-in, no session, no API key.
 /// Keys are kept but stop verifying while the user is not ACTIVE.
 pub async fn disable_user(State(state): State<AppState>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool().begin().await.map_err(db)?;
@@ -513,14 +383,6 @@ pub async fn disable_user(State(state): State<AppState>, Extension(ctx): Extensi
         .await
         .map_err(db)?
         .rows_affected();
-    sqlx::query(
-        "UPDATE invite SET revoked_at = now() \
-          WHERE principal_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
-    )
-    .bind(id)
-    .execute(&mut *tx)
-    .await
-    .map_err(db)?;
     audit(&mut tx, &ctx, "user.disabled", id, serde_json::json!({ "sessions_revoked": sessions })).await?;
     tx.commit().await.map_err(db)?;
     state.event_bus().publish_auth_changed(id);
@@ -594,35 +456,12 @@ pub async fn set_admin(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /admin/users/bootstrap-admin`: create a named admin (no role, no
-/// portfolios) and return their one-time local enrolment link. The one
-/// mutation the legacy shared password may make, and only while no ACTIVE
-/// named admin exists (409 after, the CLI's rule without --force-recovery).
-pub async fn bootstrap_admin(
-    State(state): State<AppState>,
-    Extension(ctx): Extension<AuthContext>,
-    Json(p): Json<crate::admin_bootstrap::BootstrapRequest>,
-) -> Result<Json<crate::admin_bootstrap::BootstrapResponse>, ApiError> {
-    use crate::admin_bootstrap::{bootstrap, enrolment_link, BootstrapError, BootstrapResponse, LEGACY_ACTOR};
-    let base = public_base_url(&state)?;
-    let only_if_no_admin = ctx.principal_code == LEGACY_ACTOR;
-    let invite = bootstrap(state.pool(), &p.email, p.display_name.as_deref(), &ctx.principal_code, only_if_no_admin)
-        .await
-        .map_err(|e| match e {
-            BootstrapError::Db(e) => db(e),
-            BootstrapError::BadEmail => api_error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
-            other => api_error(StatusCode::CONFLICT, other.to_string()),
-        })?;
-    Ok(Json(BootstrapResponse { user_id: invite.principal_id, link: enrolment_link(base, &invite) }))
-}
-
 /// Re-activate a disabled user who has signed in before or holds an API key.
-/// One who never got in has to be invited again.
 pub async fn enable_user(State(state): State<AppState>, Extension(ctx): Extension<AuthContext>, Path(id): Path<Uuid>) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool().begin().await.map_err(db)?;
     match lock_human(&mut tx, id).await?.as_str() {
         "ACTIVE" => return Ok(StatusCode::NO_CONTENT),
-        "INVITED" => return Err(api_error(StatusCode::CONFLICT, "user has a pending invite")),
+        "INVITED" | "PENDING" => return Err(api_error(StatusCode::CONFLICT, "user is not approved; approve or reject them")),
         _ => {}
     }
     let has_access: bool = sqlx::query_scalar(
@@ -634,7 +473,7 @@ pub async fn enable_user(State(state): State<AppState>, Extension(ctx): Extensio
     .await
     .map_err(db)?;
     if !has_access {
-        return Err(api_error(StatusCode::CONFLICT, "user never signed in; reissue the invite instead"));
+        return Err(api_error(StatusCode::CONFLICT, "user never signed in; add them again"));
     }
     sqlx::query("UPDATE principal SET status = 'ACTIVE', updated_at = now() WHERE id = $1")
         .bind(id)
@@ -734,7 +573,7 @@ pub struct SetupStatus {
     pub venue_connected: bool,
     pub portfolio_exists: bool,
     pub sign_in_ok: bool,
-    pub user_invited: bool,
+    pub user_added: bool,
     pub first_order: bool,
 }
 
@@ -745,10 +584,11 @@ pub struct SetupStatus {
     security(("bearer_token" = []))
 )]
 pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, ApiError> {
-    let (venue_connected, portfolio_exists, user_invited, first_order): (bool, bool, bool, bool) = sqlx::query_as(
+    let (venue_connected, portfolio_exists, user_added, first_order): (bool, bool, bool, bool) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM broker_connection WHERE status = 'ACTIVE' AND credentials IS NOT NULL), \
                 EXISTS (SELECT 1 FROM portfolio), \
-                EXISTS (SELECT 1 FROM invite), \
+                EXISTS (SELECT 1 FROM principal p WHERE p.principal_type = 'HUMAN' \
+                         AND NOT EXISTS (SELECT 1 FROM principal_admin a WHERE a.principal_id = p.id)), \
                 EXISTS (SELECT 1 FROM order_state)",
     )
     .fetch_one(state.pool())
@@ -759,7 +599,7 @@ pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupSta
         venue_connected,
         portfolio_exists,
         sign_in_ok: oidc.configured && oidc.discovery_ok,
-        user_invited,
+        user_added,
         first_order,
     }))
 }
@@ -773,6 +613,7 @@ pub async fn auth_status(State(state): State<AppState>) -> Json<crate::app_state
 mod tests {
     use super::*;
     use crate::authz_schema_tests::migrated_db;
+    use crate::accounts::AccountRole;
     use crate::handlers::tests::test_app_state;
     const BASE: &str = "https://oms.example.com";
 
@@ -846,7 +687,7 @@ mod tests {
         let get = || async { setup_status(State(st.clone())).await.unwrap().0 };
 
         let s = get().await;
-        assert!(!s.venue_connected && !s.portfolio_exists && !s.sign_in_ok && !s.user_invited && !s.first_order);
+        assert!(!s.venue_connected && !s.portfolio_exists && !s.sign_in_ok && !s.user_added && !s.first_order);
 
         sqlx::query("INSERT INTO broker_connection (code, broker_code, environment) VALUES ('alpaca-paper', 'ALPACA', 'PAPER')")
             .execute(&pool)
@@ -874,9 +715,8 @@ mod tests {
         st.set_oidc_status(crate::app_state::OidcStatus { discovery_ok: true, error: None, ..st.oidc_status() });
         assert!(get().await.sign_in_ok);
 
-        let email = format!("inv-{}@fundco.com", Uuid::new_v4().simple());
-        let invite = crate::invites::create(&pool, &email, "viewer", &[], "admin").await.unwrap();
-        assert!(get().await.user_invited);
+        let added = add(&st, &actor(), &format!("u-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::User).await;
+        assert!(get().await.user_added);
         assert!(!get().await.first_order);
 
         let account_id = Uuid::new_v4();
@@ -892,7 +732,7 @@ mod tests {
              VALUES ($1, 'c1', $2, $3, $4, 'alpaca-paper', 'X', 'buy', 'market', 'day', 1, 1, 0, 'submitted', 1)",
         )
         .bind(Uuid::new_v4())
-        .bind(invite.principal_id)
+        .bind(added)
         .bind(portfolio_id)
         .bind(account_id)
         .execute(&pool)
@@ -941,158 +781,6 @@ mod tests {
         // Enabling does not resurrect the killed session.
         assert!(crate::sessions::lookup_session(&pool, &hash).await.unwrap().is_none());
         assert!(crate::auth::verify_key(&pool, &key_id, &secret).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn invited_user_api_key_is_refused() {
-        let pool = migrated_db().await;
-        let st = state(&pool, Some(BASE)).await;
-        let email = format!("inv-{}@fundco.com", Uuid::new_v4().simple());
-        let invite = crate::invites::create(&pool, &email, "viewer", &[], "admin").await.unwrap();
-
-        let err = create_key(State(st), Extension(actor()), Path(invite.principal_id), Json(CreateKey { name: None }))
-            .await
-            .unwrap_err();
-        assert_eq!(err.status, StatusCode::CONFLICT);
-        let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM api_key WHERE principal_id = $1")
-            .bind(invite.principal_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(keys, 0);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn invite_endpoint_returns_link_with_public_base_url() {
-        let pool = migrated_db().await;
-        let p = portfolio(&pool).await;
-        let st = state(&pool, Some("https://oms.example.com/")).await;
-        let email = format!("new-{}@fundco.com", Uuid::new_v4().simple());
-
-        let out = invite_user(State(st.clone()), Extension(actor()),
-            Json(InviteRequest {
-                email: email.clone(),
-                role: "trader".into(),
-                portfolios: vec![PortfolioAccess { portfolio_id: p, can_trade: true }],
-                method: None,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        let token = out.link.strip_prefix("https://oms.example.com/trade/invite#").expect("link shape");
-        let stored: String = sqlx::query_scalar("SELECT token_hash FROM invite WHERE id = $1")
-            .bind(out.invite_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(stored, crate::sessions::hash_session_token(token));
-        // The trade toggle also controls allocation.
-        assert_eq!(grant_flags(&pool, out.user_id, p).await, (true, true));
-
-        // Duplicate email -> 409; bad role -> 422.
-        let dup = invite_user(State(st.clone()), Extension(actor()),
-            Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![], method: None }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(dup.status, StatusCode::CONFLICT);
-        let bad = invite_user(State(st.clone()), Extension(actor()),
-            Json(InviteRequest { email: "x@fundco.com".into(), role: "strategy".into(), portfolios: vec![], method: None }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
-
-        // The row shows the pending invite, and reissue/revoke work through the API.
-        let users = list_users(State(st.clone())).await.unwrap().0;
-        let row = users.iter().find(|u| u.email.as_deref() == Some(email.as_str())).unwrap();
-        assert_eq!(row.status, "INVITED");
-        assert_eq!(row.invite.as_ref().unwrap().invite_id, out.invite_id);
-        let again = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id), Default::default()).await.unwrap().0;
-        assert_ne!(again.link, out.link);
-        revoke_invite(State(st.clone()), Extension(actor()), Path(again.invite_id)).await.unwrap();
-        assert_eq!(status_of(&pool, row.principal_id).await, "DISABLED");
-        let gone = revoke_invite(State(st.clone()), Extension(actor()), Path(again.invite_id)).await.unwrap_err();
-        assert_eq!(gone.status, StatusCode::NOT_FOUND);
-    }
-
-    async fn method_of(pool: &PgPool, invite_id: Uuid) -> String {
-        sqlx::query_scalar("SELECT method FROM invite WHERE id = $1").bind(invite_id).fetch_one(pool).await.unwrap()
-    }
-
-    /// `method` on invite and reissue: stored when valid, "any" when absent,
-    /// 422 (creating nothing) otherwise.
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn invite_method_is_validated_and_stored() {
-        let pool = migrated_db().await;
-        let st = state(&pool, Some("https://oms.example.com")).await;
-        let req = |email: &str, method: Option<&str>| {
-            Json(InviteRequest { email: email.into(), role: "viewer".into(), portfolios: vec![], method: method.map(str::to_string) })
-        };
-        let email = format!("m-{}@fundco.com", Uuid::new_v4().simple());
-
-        let bad = invite_user(State(st.clone()), Extension(actor()), req(&email, Some("password"))).await.unwrap_err();
-        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM principal WHERE email = $1").bind(&email).fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 0);
-
-        let out = invite_user(State(st.clone()), Extension(actor()), req(&email, Some("oidc"))).await.unwrap().0;
-        assert_eq!(method_of(&pool, out.invite_id).await, "oidc");
-
-        let bytes = |s: &str| axum::body::Bytes::from(s.to_string());
-        let bad = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id), bytes(r#"{"method":"sms"}"#))
-            .await
-            .unwrap_err();
-        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
-        let local = reissue_invite(State(st.clone()), Extension(actor()), Path(out.invite_id), bytes(r#"{"method":"local"}"#))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(method_of(&pool, local.invite_id).await, "local");
-        // No body keeps the previous method: a local-only invite never widens.
-        let kept = reissue_invite(State(st.clone()), Extension(actor()), Path(local.invite_id), bytes("")).await.unwrap().0;
-        assert_eq!(method_of(&pool, kept.invite_id).await, "local");
-
-        let other = format!("d-{}@fundco.com", Uuid::new_v4().simple());
-        let out = invite_user(State(st.clone()), Extension(actor()), req(&other, None)).await.unwrap().0;
-        assert_eq!(method_of(&pool, out.invite_id).await, "any");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn invite_without_public_base_url_creates_nothing() {
-        let pool = migrated_db().await;
-        let st = state(&pool, None).await;
-        let email = format!("nobase-{}@fundco.com", Uuid::new_v4().simple());
-        let err = invite_user(State(st), Extension(actor()),
-            Json(InviteRequest { email: email.clone(), role: "viewer".into(), portfolios: vec![], method: None }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(err.message.contains("public_base_url"));
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM principal WHERE email = $1")
-            .bind(&email)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(n, 0);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn link_invite_returns_link_for_active_user() {
-        let pool = migrated_db().await;
-        let st = state(&pool, Some(BASE)).await;
-        let (id, ..) = active_user(&pool, &st).await;
-        let out = link_invite(State(st.clone()), Extension(actor()), Path(id)).await.unwrap().0;
-        assert!(out.link.starts_with("https://oms.example.com/trade/invite#"));
-        let missing = link_invite(State(st), Extension(actor()), Path(Uuid::new_v4())).await.unwrap_err();
-        assert_eq!(missing.status, StatusCode::CONFLICT);
     }
 
     async fn grant_flags(pool: &PgPool, principal_id: Uuid, portfolio_id: Uuid) -> (bool, bool) {
@@ -1214,56 +902,72 @@ mod tests {
         assert_eq!(status_of(&pool, sid).await, "ACTIVE");
     }
 
+    const PW: &str = "correct horse battery staple";
+
+    async fn add(st: &AppState, ctx: &AuthContext, email: &str, role: AccountRole) -> Uuid {
+        let body = AddUser { name: "Bo".into(), email: email.into(), password: PW.into(), role };
+        let (status, out) = add_user(State(st.clone()), Extension(ctx.clone()), Json(body)).await.unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        out.0.user_id
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn key_only_user_can_hold_api_key() {
+    async fn add_user_creates_local_account_with_password() {
         let pool = migrated_db().await;
         let st = state(&pool, Some(BASE)).await;
-        let code = format!("bot-{}", Uuid::new_v4().simple());
-        let row = create_key_only_user(State(st.clone()), Extension(actor()),
-            Json(CreateKeyOnlyUser { code: code.clone(), display_name: "Bot".into(), role: "trader".into() }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(row.status, "ACTIVE");
-        assert_eq!(row.role.as_deref(), Some("trader"));
-        assert_eq!(row.sign_in, None);
-        let identities: i64 = sqlx::query_scalar("SELECT count(*) FROM principal_identity WHERE principal_id = $1")
-            .bind(row.principal_id)
+        let email = format!("bo-{}@fundco.com", Uuid::new_v4().simple());
+        let id = add(&st, &actor(), &email, AccountRole::User).await;
+        let row = fetch_users(&pool, Some(id)).await.unwrap().pop().unwrap();
+        assert_eq!((row.status.as_str(), row.account_role, row.admin), ("ACTIVE", "user", false));
+        let hash: String = sqlx::query_scalar("SELECT password_hash FROM local_credential WHERE principal_id = $1")
+            .bind(id)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(identities, 0);
+        assert!(crate::local_auth::verify_password(&hash, PW).await);
+        assert_eq!(audit_count(&pool, "user.added", id).await, 1);
 
-        let key = create_key(State(st.clone()), Extension(actor()), Path(row.principal_id), Json(CreateKey { name: Some("ci".into()) }))
+        // Keys work for it, as for anyone.
+        let key = create_key(State(st.clone()), Extension(actor()), Path(id), Json(CreateKey { name: Some("ci".into()) }))
             .await
             .unwrap()
             .0;
-        let (pid, pcode) = crate::auth::verify_key(&pool, &key.key_id, key.secret.as_deref().unwrap())
-            .await
-            .unwrap()
-            .expect("key works");
-        assert_eq!((pid, pcode), (row.principal_id, code.clone()));
-        assert_eq!(list_keys(State(st.clone()), Path(row.principal_id)).await.unwrap().0.len(), 1);
+        assert!(crate::auth::verify_key(&pool, &key.key_id, key.secret.as_deref().unwrap()).await.unwrap().is_some());
 
-        revoke_key(State(st.clone()), Extension(actor()), Path((row.principal_id, key.key_id.clone()))).await.unwrap();
-        assert!(crate::auth::verify_key(&pool, &key.key_id, key.secret.as_deref().unwrap()).await.unwrap().is_none());
-        assert_eq!(audit_count(&pool, "key.created", row.principal_id).await, 1);
-        assert_eq!(audit_count(&pool, "key.revoked", row.principal_id).await, 1);
+        let admin_id = add(&st, &actor(), &format!("ad-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Admin).await;
+        assert!(fetch_users(&pool, Some(admin_id)).await.unwrap()[0].admin);
+        let pending = add(&st, &actor(), &format!("pe-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Pending).await;
+        assert_eq!(status_of(&pool, pending).await, "PENDING");
 
-        let dup = create_key_only_user(State(st.clone()), Extension(actor()),
-            Json(CreateKeyOnlyUser { code, display_name: "Bot".into(), role: "trader".into() }),
-        )
-        .await
-        .unwrap_err();
+        let dup = add_user(State(st.clone()), Extension(actor()),
+            Json(AddUser { name: "x".into(), email: email.to_uppercase(), password: PW.into(), role: AccountRole::User })).await.unwrap_err();
         assert_eq!(dup.status, StatusCode::CONFLICT);
-        let bad = create_key_only_user(State(st), Extension(actor()),
-            Json(CreateKeyOnlyUser { code: "x".into(), display_name: "x".into(), role: "strategy".into() }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let weak = add_user(State(st), Extension(actor()),
+            Json(AddUser { name: "x".into(), email: "w@fundco.com".into(), password: "short".into(), role: AccountRole::User })).await.unwrap_err();
+        assert_eq!(weak.status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn approve_pending_sets_user_and_portfolio_access() {
+        let pool = migrated_db().await;
+        let st = state(&pool, Some(BASE)).await;
+        let id = add(&st, &actor(), &format!("p-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Pending).await;
+        let pf = portfolio(&pool).await;
+        let body = Approve { role: Some("trader".into()), portfolios: vec![PortfolioAccess { portfolio_id: pf, can_trade: true }] };
+        assert_eq!(approve_user(State(st.clone()), Extension(actor()), Path(id), Json(body)).await.unwrap(), StatusCode::NO_CONTENT);
+        let row = fetch_users(&pool, Some(id)).await.unwrap().pop().unwrap();
+        assert_eq!((row.status.as_str(), row.account_role, row.role.as_deref()), ("ACTIVE", "user", Some("trader")));
+        assert_eq!(grant_flags(&pool, id, pf).await, (true, true));
+        assert_eq!(audit_count(&pool, "signup.approved", id).await, 1);
+        let again = approve_user(State(st.clone()), Extension(actor()), Path(id), Json(Approve::default())).await.unwrap_err();
+        assert_eq!(again.status, StatusCode::CONFLICT, "only a pending account can be approved");
+
+        let other = add(&st, &actor(), &format!("r-{}@fundco.com", Uuid::new_v4().simple()), AccountRole::Pending).await;
+        reject_user(State(st.clone()), Extension(actor()), Path(other)).await.unwrap();
+        assert_eq!(status_of(&pool, other).await, "DISABLED");
+        assert_eq!(audit_count(&pool, "signup.rejected", other).await, 1);
     }
 
     /// An ACTIVE admin (no role) acting as themselves.
@@ -1348,16 +1052,9 @@ mod tests {
         set_role(State(st.clone()), Extension(ada.clone()), Path(id), Json(SetRole { role: "viewer".into() }))
             .await
             .unwrap();
-        let out = invite_user(
-            State(st.clone()),
-            Extension(ada.clone()),
-            Json(InviteRequest { email: format!("{}@fundco.com", Uuid::new_v4().simple()), role: "viewer".into(), portfolios: vec![], method: None }),
-        )
-        .await
-        .unwrap()
-        .0;
+        let added = add(&st, &ada, &format!("{}@fundco.com", Uuid::new_v4().simple()), AccountRole::User).await;
 
-        for (action, target) in [("user.role_changed", id), ("invite.created", out.user_id)] {
+        for (action, target) in [("user.role_changed", id), ("user.added", added)] {
             let actor: String = sqlx::query_scalar("SELECT actor FROM audit_event WHERE action = $1 AND target_principal_id = $2")
                 .bind(action)
                 .bind(target)

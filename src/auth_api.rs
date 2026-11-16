@@ -1,14 +1,13 @@
-//! The `/auth/*` HTTP handlers: OIDC login, the invite link that starts one,
-//! the callback that resolves the verified identity through
-//! `invites::resolve_login`, logout and `/auth/me`. Sign-in is invite-only:
-//! nothing here creates a user.
+//! The `/auth/*` HTTP handlers: OIDC login, the callback that resolves the
+//! verified identity through `accounts::resolve_sso` (which may create or
+//! merge an account only when `[auth.oidc]` allows it), logout and `/auth/me`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Extension, Path, Query, State},
+    extract::{Extension, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Json,
@@ -24,7 +23,7 @@ use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::handlers::GrantedPortfolio;
 use crate::handlers::{self, ApiError};
-use crate::invites::{self, ClaimOutcome, ClaimPolicy};
+use crate::accounts::{SsoOutcome, SsoPolicy};
 use crate::oidc::{OidcError, Provider};
 use crate::sessions::{self, CookiePolicy};
 
@@ -49,9 +48,13 @@ pub struct AuthApiState {
     /// `[auth.oidc].require_amr`: a login whose `amr` lacks any of these gets
     /// a session without MFA (reads only; see `authz::require_mfa`).
     pub require_amr: Vec<String>,
-    /// `[auth.oidc].trust_email_verified`; off, every invite claim waits for
-    /// an admin to approve the binding.
+    /// `[auth.oidc].trust_email_verified`; off, no provider email is trusted
+    /// (so `merge_accounts_by_email` never matches).
     pub trust_email_verified: bool,
+    /// `[auth.oidc].enable_signup`: an unknown identity creates an account.
+    pub enable_signup: bool,
+    /// `[auth.oidc].merge_accounts_by_email`: a verified matching email links.
+    pub merge_accounts_by_email: bool,
     /// Pending logins, keyed server-side; the browser holds only the id.
     pub flows: Arc<FlowStore>,
 }
@@ -66,10 +69,6 @@ pub struct FlowState {
     pub nonce: String,
     pub pkce_verifier: String,
     pub return_to: String,
-    /// SHA-256 of the invite link token this login arrived with, if any. It
-    /// is the only way an unknown identity can get in; the token itself is
-    /// never kept or sent anywhere.
-    pub invite_token_hash: Option<String>,
 }
 
 /// How long a pending login stays usable, and how many may be pending at once.
@@ -247,45 +246,19 @@ pub async fn login(
     Extension(auth_state): Extension<AuthApiState>,
     Query(params): Query<LoginParams>,
 ) -> Response {
-    start_flow(&state, &auth_state, sanitize_return_to(params.return_to.as_deref()), None)
+    start_flow(&state, &auth_state, sanitize_return_to(params.return_to.as_deref()))
 }
-
-/// The invite link: starts a login with the invite token's hash bound to the
-/// server-side flow, and does nothing else. The token never reaches a cookie
-/// or the provider. Whether the token is any good is decided only after
-/// the provider has verified who is signing in.
-#[utoipa::path(
-    get, path = "/auth/invite/{token}", tag = "auth",
-    params(("token" = String, Path, description = "The invite link token")),
-    responses(
-        (status = 303, description = "Redirects to the identity provider's authorization endpoint"),
-        (status = 503, description = "Too many sign-ins in progress; try again shortly"),
-    ),
-)]
-pub async fn invite(
-    State(state): State<AppState>,
-    Extension(auth_state): Extension<AuthApiState>,
-    Path(token): Path<String>,
-) -> Response {
-    start_flow(&state, &auth_state, INVITE_LANDING.to_string(), Some(sessions::hash_session_token(&token)))
-}
-
-/// Where an accepted invite lands: the trader app, never the admin console at
-/// `/`. Invitees are traders, PMs and viewers; the cockpit is admin-only.
-const INVITE_LANDING: &str = "/trade/";
 
 fn start_flow(
     state: &AppState,
     auth_state: &AuthApiState,
     return_to: String,
-    invite_token_hash: Option<String>,
 ) -> Response {
     let flow = FlowState {
         state: random_token(),
         nonce: random_token(),
         pkce_verifier: random_token(),
         return_to,
-        invite_token_hash,
     };
     let challenge = pkce_challenge(&flow.pkce_verifier);
     let authorize_url = auth_state.provider.authorize_url(&flow.state, &flow.nonce, &challenge);
@@ -387,19 +360,18 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
 }
 
 /// Completes a login: validates the callback, exchanges the code, resolves
-/// the identity (claiming the flow's invite if it is unknown), and mints a
-/// session. A login that resolves to no user is redirected to the access
-/// page with the reason; nothing is created for it.
+/// the identity (`accounts::resolve_sso`), and mints a session. A login that
+/// resolves to no account is redirected to the access page.
 ///
 /// Every failure path returns before `create_session` is ever called: a
 /// provider error, a missing/expired flow cookie, a `state` mismatch, an
-/// exchange/token failure or the claim gate end in an `ApiError`; a
-/// `ClaimOutcome` refusal ends in the access-page redirect.
+/// exchange/token failure or the claim gate end in an `ApiError`; no account
+/// ends in the access-page redirect.
 #[utoipa::path(
     get, path = "/auth/oidc/callback", tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 303, description = "Login completed (session cookie set, redirects to the validated return_to), or refused or awaiting admin approval (redirects to /trade/access?reason=..., e.g. pending_approval)"),
+        (status = 303, description = "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=no_account)"),
         (status = 400, description = "Malformed callback, or a missing/expired/mismatched login flow"),
         (status = 401, description = "The provider rejected the login, or the exchanged token failed verification"),
         (status = 403, description = "The claim gate rejected the identity"),
@@ -455,27 +427,26 @@ pub async fn callback(
         }
     }
 
-    // A live session on this browser is the owner proof a link invite needs.
-    let owner_session = match crate::auth::authenticate_session(state.pool(), &headers, &state.session_config).await {
-        Ok(record) => record.map(|r| (r.principal_id, r.mfa_verified_at.is_some())),
-        Err(unavailable) => return Ok(unavailable),
+    let sso_policy = SsoPolicy {
+        enable_signup: auth_state.enable_signup,
+        merge_accounts_by_email: auth_state.merge_accounts_by_email,
+        trust_email_verified: auth_state.trust_email_verified,
+        pending_by_default: state.signup.pending_by_default,
     };
-    let policy_for_claim = ClaimPolicy { trust_email_verified: auth_state.trust_email_verified, owner_session };
-    let outcome = invites::resolve_login(state.pool(), &identity, flow.invite_token_hash.as_deref(), &policy_for_claim)
+    let outcome = crate::accounts::resolve_sso(state.pool(), &identity, sso_policy)
         .await
-        .map_err(|err| db_error("resolve_login", err))?;
-
-    let principal_id = match outcome {
-        ClaimOutcome::Linked { principal_id, .. } | ClaimOutcome::Known { principal_id, .. } => principal_id,
-        refused => {
-            let mut response = Redirect::to(&access_refused_url(&refused)).into_response();
-            response.headers_mut().append(
-                header::SET_COOKIE,
-                clear_flow_cookie(policy).parse().expect("flow cookie header value is plain ASCII"),
-            );
-            return Ok(response);
-        }
+        .map_err(|err| db_error("resolve_sso", err))?;
+    let Some(principal_id) = outcome.principal_id() else {
+        let mut response = Redirect::to(NO_ACCOUNT_URL).into_response();
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            clear_flow_cookie(policy).parse().expect("flow cookie header value is plain ASCII"),
+        );
+        return Ok(response);
     };
+    if outcome == SsoOutcome::Created(principal_id) {
+        tracing::info!(%principal_id, "SSO sign-up created an account");
+    }
 
     let user_agent = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     // The MFA policy is evaluated here, once: `require_mfa` only reads the stamp.
@@ -553,6 +524,12 @@ pub struct MeResponse {
     /// How this session signed in (`local`, `oidc`, …): decides which step
     /// a 403 `mfa_required` asks for.
     pub auth_method: &'static str,
+    /// The account role: `admin` (the admin capability), `pending` (signed up,
+    /// waiting for approval: 403 `approval_pending` everywhere but a few
+    /// `/auth` routes) or `user`.
+    pub role: &'static str,
+    /// A local account with an authenticator app enrolled.
+    pub totp_enrolled: bool,
 }
 
 /// Who the caller is signed in as, and what they can act on.
@@ -606,12 +583,32 @@ pub async fn me(
         })
         .collect();
 
+    let (role, totp_enrolled): (String, bool) = sqlx::query_as(
+        "SELECT CASE WHEN p.status = 'PENDING' THEN 'pending' \
+                     WHEN EXISTS (SELECT 1 FROM principal_admin a WHERE a.principal_id = p.id) THEN 'admin' \
+                     ELSE 'user' END, \
+                COALESCE((SELECT c.totp_enrolled_at IS NOT NULL FROM local_credential c WHERE c.principal_id = p.id), false) \
+           FROM principal p WHERE p.id = $1",
+    )
+    .bind(auth.principal_id)
+    .fetch_one(state.pool())
+    .await
+    .map_err(|err| db_error("select account role", err))?;
+    let role = match role.as_str() {
+        "pending" => "pending",
+        "admin" => "admin",
+        _ => "user",
+    };
+    let totp_enrolled = totp_enrolled && auth.auth_method == crate::auth::AuthMethod::Local;
+
     Ok(Json(MeResponse {
         principal_id: auth.principal_id.to_string(),
         code: auth.principal_code,
         display_name,
         portfolios,
         auth_method: auth.auth_method.as_str(),
+        role,
+        totp_enrolled,
     }))
 }
 
@@ -629,36 +626,11 @@ fn claim_satisfies(claims: &serde_json::Value, claim_name: &str, required_value:
     }
 }
 
-/// Where a refused login lands: the access page with the reason, plus the
-/// masked invited address for an email mismatch.
-pub fn access_refused_url(outcome: &ClaimOutcome) -> String {
-    let reason = outcome.refusal_reason().unwrap_or("no_invite");
-    match outcome {
-        ClaimOutcome::EmailMismatch { invited_hint } => {
-            format!("/trade/access?reason={reason}&hint={}", percent_encode(invited_hint))
-        }
-        _ => format!("/trade/access?reason={reason}"),
-    }
-}
-
-fn percent_encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
+/// Where a login with no account lands.
+pub const NO_ACCOUNT_URL: &str = "/trade/access?reason=no_account";
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn an_invite_lands_in_the_trader_app() {
-        assert_eq!(super::INVITE_LANDING, "/trade/");
-        assert_eq!(super::sanitize_return_to(Some(super::INVITE_LANDING)), "/trade/");
-    }
 
     use super::*;
 
@@ -668,7 +640,6 @@ mod tests {
             nonce: "n-1".into(),
             pkce_verifier: "v-1".into(),
             return_to: "/".into(),
-            invite_token_hash: None,
         }
     }
 
@@ -767,33 +738,10 @@ mod tests {
             required_claim: None,
             require_amr: Vec::new(),
             trust_email_verified: true,
+            enable_signup: false,
+            merge_accounts_by_email: false,
             flows: store,
         }
-    }
-
-    #[tokio::test]
-    async fn flow_cookie_has_no_invite_token() {
-        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
-        let state = crate::handlers::tests::test_app_state(pool);
-        let store = Arc::new(FlowStore::default());
-        let token = "invite-token-plaintext-1234567890";
-
-        let response = invite(State(state.clone()), Extension(test_auth_state(store.clone())), Path(token.to_string())).await;
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        let set_cookie = response.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().to_string();
-        let location = response.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
-        let token_hash = crate::sessions::hash_session_token(token);
-        for leaked in [token, token_hash.as_str()] {
-            assert!(!set_cookie.contains(leaked), "the cookie carries only the flow id");
-            assert!(!location.contains(leaked), "the IdP never sees the invite token");
-        }
-
-        // The flow id resolves server-side to the invite's hash, never the token.
-        let policy = &state.session_config.cookie_policy;
-        let flow = take_flow(&store, &cookie_request(&set_cookie), policy).expect("flow");
-        assert_eq!(flow.invite_token_hash.as_deref(), Some(token_hash.as_str()));
-        assert_eq!(flow.return_to, "/trade/");
-        assert!(location.contains(&format!("state={}", flow.state)));
     }
 
     #[tokio::test]
@@ -879,14 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_login_lands_on_the_access_page_with_its_reason() {
-        assert_eq!(access_refused_url(&ClaimOutcome::NoInvite), "/trade/access?reason=no_invite");
-        assert_eq!(access_refused_url(&ClaimOutcome::Expired), "/trade/access?reason=expired");
-        assert_eq!(access_refused_url(&ClaimOutcome::Revoked), "/trade/access?reason=revoked");
-        assert_eq!(access_refused_url(&ClaimOutcome::PendingApproval), "/trade/access?reason=pending_approval");
-        assert_eq!(
-            access_refused_url(&ClaimOutcome::EmailMismatch { invited_hint: "j…@fundco.com".into() }),
-            "/trade/access?reason=email_mismatch&hint=j%E2%80%A6%40fundco.com"
-        );
+    fn a_login_without_an_account_lands_on_the_access_page() {
+        assert_eq!(NO_ACCOUNT_URL, "/trade/access?reason=no_account");
     }
 }

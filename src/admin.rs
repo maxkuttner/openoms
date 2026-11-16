@@ -2747,7 +2747,6 @@ mod tests {
 
         AppState::new(
             pool,
-            Some("test-admin-token".to_string()),
             BrokerRegistry::new(),
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),

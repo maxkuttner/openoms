@@ -82,11 +82,11 @@ pub struct OidcStatus {
 #[derive(Clone)]
 pub struct AppState {
     pool: PgPool,
-    /// The deprecated shared admin password, accepted as a bearer on `/admin/*`
-    /// only while `system_setting.legacy_admin_enabled` is true and only for
-    /// reads and `bootstrap-admin` (see `auth::admin_middleware`). `None`
-    /// when none is configured: there is no built-in default.
-    pub legacy_admin_password: Option<String>,
+    /// `[auth.local].require_mfa`: when false (the default) a local password
+    /// sign-in satisfies the MFA gate unless the user has enrolled TOTP.
+    pub require_mfa: bool,
+    /// `[auth].enable_signup` / `default_user_role`.
+    pub signup: crate::accounts::SignupPolicy,
     /// SHA-256 of this boot's host token (see `admin_bootstrap::write_host_token`);
     /// `None` when none was written. Only loopback peers may present it.
     pub host_token_hash: Option<String>,
@@ -139,7 +139,6 @@ impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: PgPool,
-        legacy_admin_password: Option<String>,
         registry: BrokerRegistry,
         symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
@@ -150,7 +149,8 @@ impl AppState {
     ) -> Self {
         Self {
             pool,
-            legacy_admin_password,
+            require_mfa: false,
+            signup: Default::default(),
             host_token_hash: None,
             session_config,
             oidc_status: Arc::new(std::sync::RwLock::new(OidcStatus::default())),
@@ -272,7 +272,6 @@ mod tests {
         // the registry swap and the stream registry, never a real quote.
         AppState::new(
             pool,
-            Some("test-admin-token".to_string()),
             registry,
             symbology,
             StreamHealthRegistry::new(),

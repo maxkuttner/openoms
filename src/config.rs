@@ -25,7 +25,6 @@
 //!
 //! [server]
 //! bind_addr = "localhost:3001"
-//! admin_password = "generated-by-init"
 //!
 //! # Uncomment to enable OIDC login. With no [auth.oidc] block at all, login
 //! # stays off and the OMS behaves exactly as it does today: /auth/* returns
@@ -134,11 +133,13 @@ pub struct OmsSection {
 pub struct ServerSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bind_addr: Option<String>,
+    /// The removed shared admin password. Still parsed so an old `oms.toml`
+    /// loads (`deny_unknown_fields`), then ignored with a warning.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admin_password: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthSection {
     /// The browser-facing origin of this server (CSRF origin check, cookie
@@ -148,12 +149,44 @@ pub struct AuthSection {
     pub public_base_url: Option<String>,
     #[serde(default)]
     pub policy: AuthPolicy,
+    /// Let people create their own account from the sign-in page (default
+    /// true). The very first account is always possible: it becomes the admin.
+    #[serde(default = "default_true")]
+    pub enable_signup: bool,
+    /// The account role a self-signup gets (default `pending`).
+    #[serde(default)]
+    pub default_user_role: DefaultUserRole,
     #[serde(default)]
     pub local: LocalSection,
     #[serde(default)]
     pub session: SessionSection,
     #[serde(default)]
     pub oidc: OidcSection,
+}
+
+impl Default for AuthSection {
+    fn default() -> Self {
+        Self {
+            public_base_url: None,
+            policy: AuthPolicy::default(),
+            enable_signup: true,
+            default_user_role: DefaultUserRole::default(),
+            local: LocalSection::default(),
+            session: SessionSection::default(),
+            oidc: OidcSection::default(),
+        }
+    }
+}
+
+/// The account role of a new self-signup (local or SSO).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultUserRole {
+    /// Signed in, but sees nothing until an admin approves the account.
+    #[default]
+    Pending,
+    /// Active at once, with no portfolio access until an admin grants some.
+    User,
 }
 
 /// Which sign-in methods are allowed.
@@ -170,11 +203,15 @@ pub enum AuthPolicy {
 pub struct LocalSection {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Force TOTP on every local account. Off by default: TOTP is then
+    /// optional, but an enrolled user still needs their code to sign in.
+    #[serde(default)]
+    pub require_mfa: bool,
 }
 
 impl Default for LocalSection {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: true, require_mfa: false }
     }
 }
 
@@ -199,6 +236,11 @@ pub struct AuthSettings {
     pub policy: AuthPolicy,
     /// Effective: `[auth.local].enabled` and not `policy = "sso_only"`.
     pub local_enabled: bool,
+    /// `[auth.local].require_mfa`.
+    pub require_mfa: bool,
+    /// `[auth].enable_signup` (only meaningful with local sign-in on).
+    pub enable_signup: bool,
+    pub default_user_role: DefaultUserRole,
     pub ttl: crate::sessions::SessionTtl,
 }
 
@@ -232,6 +274,15 @@ pub struct OidcSection {
     /// policy: every OIDC login counts as MFA-verified.
     #[serde(default)]
     pub require_amr: Vec<String>,
+    /// An unknown SSO identity creates an account (role
+    /// `[auth].default_user_role`) instead of being refused (default false).
+    #[serde(default)]
+    pub enable_signup: bool,
+    /// An unknown SSO identity whose *verified* email matches an existing
+    /// account is linked to it (default false). Trusts the provider's email
+    /// verification completely: see the docs before turning it on.
+    #[serde(default)]
+    pub merge_accounts_by_email: bool,
 }
 
 #[derive(Debug)]
@@ -245,6 +296,8 @@ pub struct OidcSettings {
     pub ttl: crate::sessions::SessionTtl,
     pub trust_email_verified: bool,
     pub require_amr: Vec<String>,
+    pub enable_signup: bool,
+    pub merge_accounts_by_email: bool,
 }
 
 // Hand-written so a stray `{:?}` — in a log line, a panic message, an
@@ -465,6 +518,8 @@ impl FileConfig {
             ttl: self.auth_settings().ttl,
             trust_email_verified: s.trust_email_verified,
             require_amr: s.require_amr.clone(),
+            enable_signup: s.enable_signup,
+            merge_accounts_by_email: s.merge_accounts_by_email,
         })
     }
 
@@ -477,6 +532,9 @@ impl FileConfig {
             public_base_url: a.public_base_url.clone().or_else(|| a.oidc.public_base_url.clone()),
             policy: a.policy,
             local_enabled: a.local.enabled && a.policy != AuthPolicy::SsoOnly,
+            require_mfa: a.local.require_mfa,
+            enable_signup: a.enable_signup,
+            default_user_role: a.default_user_role,
             ttl: crate::sessions::SessionTtl {
                 idle: chrono::Duration::minutes(
                     a.session.idle_ttl_minutes.or(a.oidc.idle_ttl_minutes).unwrap_or(30),
@@ -490,6 +548,12 @@ impl FileConfig {
 
     /// Logs a warning for each deprecated `[auth.oidc]` key still in use.
     pub fn warn_deprecated_auth(&self) {
+        if self.server.admin_password.is_some() {
+            tracing::warn!(
+                "[server].admin_password is no longer used and is ignored; remove it. \
+                 Sign in as a named admin (or admin / admin on a fresh install)"
+            );
+        }
         let o = &self.auth.oidc;
         if o.public_base_url.is_some() {
             tracing::warn!("[auth.oidc].public_base_url is deprecated; move it to [auth].public_base_url");
@@ -950,6 +1014,32 @@ admin_password = "admin-pw"
         )
         .unwrap();
         assert!(cfg.auth_settings().local_enabled);
+    }
+
+    #[test]
+    fn signup_defaults_follow_open_webui() {
+        let a = FileConfig::default().auth_settings();
+        assert!(a.enable_signup);
+        assert_eq!(a.default_user_role, DefaultUserRole::Pending);
+        let cfg: FileConfig =
+            toml::from_str("[auth]\nenable_signup = false\ndefault_user_role = \"user\"\n").unwrap();
+        let a = cfg.auth_settings();
+        assert!(!a.enable_signup);
+        assert_eq!(a.default_user_role, DefaultUserRole::User);
+        let cfg: FileConfig = toml::from_str(
+            "[auth.oidc]\nissuer = \"https://id.example.com\"\nclient_id = \"c\"\npublic_base_url = \"https://oms.example.com\"\n",
+        )
+        .unwrap();
+        let o = cfg.oidc().unwrap();
+        assert!(!o.enable_signup && !o.merge_accounts_by_email);
+    }
+
+    #[test]
+    fn require_mfa_is_off_by_default_and_can_be_switched_on() {
+        assert!(!FileConfig::default().auth_settings().require_mfa);
+        let cfg: FileConfig = toml::from_str("[auth.local]\nrequire_mfa = true\n").unwrap();
+        let a = cfg.auth_settings();
+        assert!(a.require_mfa && a.local_enabled);
     }
 
     #[test]

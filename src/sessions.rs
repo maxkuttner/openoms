@@ -246,7 +246,6 @@ pub fn derive_public_base_url(bind_addr: &str) -> Result<String, String> {
 pub enum AuthMethod {
     Oidc,
     Local,
-    LegacyAdmin,
 }
 
 impl AuthMethod {
@@ -254,7 +253,6 @@ impl AuthMethod {
         match self {
             AuthMethod::Oidc => "oidc",
             AuthMethod::Local => "local",
-            AuthMethod::LegacyAdmin => "legacy_admin",
         }
     }
 
@@ -264,7 +262,6 @@ impl AuthMethod {
         match s {
             "oidc" => Some(AuthMethod::Oidc),
             "local" => Some(AuthMethod::Local),
-            "legacy_admin" => Some(AuthMethod::LegacyAdmin),
             _ => None,
         }
     }
@@ -278,6 +275,9 @@ pub struct SessionRecord {
     pub absolute_expires_at: DateTime<Utc>,
     pub auth_method: AuthMethod,
     pub mfa_verified_at: Option<DateTime<Utc>>,
+    /// The account is PENDING (self-signup awaiting approval): it may only
+    /// read who it is and sign out (see `auth::pending_blocks`).
+    pub pending: bool,
 }
 
 const INSERT_SESSION: &str = "INSERT INTO user_session \
@@ -370,10 +370,11 @@ pub async fn lookup_session(
 ) -> Result<Option<SessionRecord>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT s.id, s.principal_id, p.code AS principal_code, \
-                s.last_seen_at, s.absolute_expires_at, s.auth_method, s.mfa_verified_at \
+                s.last_seen_at, s.absolute_expires_at, s.auth_method, s.mfa_verified_at, \
+                p.status = 'PENDING' AS pending \
          FROM user_session s \
          JOIN principal p ON p.id = s.principal_id \
-         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status = 'ACTIVE' \
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND p.status IN ('ACTIVE', 'PENDING') \
                AND p.principal_type = 'HUMAN'",
     )
     .bind(token_hash)
@@ -395,6 +396,7 @@ pub async fn lookup_session(
         absolute_expires_at: r.get("absolute_expires_at"),
         auth_method,
         mfa_verified_at: r.get("mfa_verified_at"),
+        pending: r.get("pending"),
     }))
 }
 
@@ -717,7 +719,7 @@ mod tests {
     fn an_unknown_auth_method_does_not_parse() {
         assert_eq!(AuthMethod::parse("oidc"), Some(AuthMethod::Oidc));
         assert_eq!(AuthMethod::parse("local"), Some(AuthMethod::Local));
-        assert_eq!(AuthMethod::parse("legacy_admin"), Some(AuthMethod::LegacyAdmin));
+        assert_eq!(AuthMethod::parse("legacy_admin"), None, "the shared admin password is gone");
         assert_eq!(AuthMethod::parse("webauthn"), None);
         assert_eq!(AuthMethod::parse(""), None);
     }

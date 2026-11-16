@@ -1619,7 +1619,6 @@ pub(crate) mod tests {
         // ── the real order path ──────────────────────────────────────────────
         let state = AppState::new(
             pool.clone(),
-            Some("test-admin-token".to_string()),
             BrokerRegistry::new(), // empty: nothing can route
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
@@ -2373,7 +2372,6 @@ pub(crate) mod tests {
 
         AppState::new(
             pool,
-            Some("test-admin-token".to_string()),
             BrokerRegistry::new(),
             Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),

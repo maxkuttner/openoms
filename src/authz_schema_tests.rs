@@ -192,17 +192,6 @@ async fn auth_redesign_schema() {
         ("local_credential", "locked_until"),
         ("recovery_code", "code_hash"),
         ("recovery_code", "used_at"),
-        ("pending_identity_binding", "invite_id"),
-        ("pending_identity_binding", "issuer"),
-        ("pending_identity_binding", "subject"),
-        ("pending_identity_binding", "untrusted_email"),
-        ("pending_identity_binding", "display_name"),
-        ("pending_identity_binding", "metadata"),
-        ("pending_identity_binding", "expires_at"),
-        ("pending_identity_binding", "decided_at"),
-        ("pending_identity_binding", "decided_by"),
-        ("pending_identity_binding", "decision"),
-        ("invite", "method"),
         ("system_setting", "key"),
         ("system_setting", "value"),
         ("system_setting", "updated_at"),
@@ -258,54 +247,17 @@ async fn auth_redesign_schema() {
         .await
         .unwrap();
 
-    // One open binding per (issuer, subject); a decided one frees the slot.
-    let invite = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO oms.invite (id, token_hash, email, principal_id, created_by, expires_at) \
-         VALUES ($1, 'auth_tok', 'a@example.com', $2, 'test', now() + interval '1 day')",
-    )
-    .bind(invite)
-    .bind(human)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let method: String = sqlx::query_scalar("SELECT method FROM oms.invite WHERE id = $1")
-        .bind(invite)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(method, "any");
-    let open = "INSERT INTO oms.pending_identity_binding \
-                (id, invite_id, issuer, subject, expires_at) \
-                VALUES ($1, $2, 'https://idp', 'sub-1', now() + interval '1 day')";
-    sqlx::query(open)
-        .bind(Uuid::new_v4())
-        .bind(invite)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let dup = sqlx::query(open)
-        .bind(Uuid::new_v4())
-        .bind(invite)
-        .execute(&pool)
-        .await;
-    assert!(
-        dup.is_err(),
-        "second open binding for the same identity must fail"
-    );
-    sqlx::query(
-        "UPDATE oms.pending_identity_binding SET decision = 'rejected', \
-         decided_at = now(), decided_by = 'test'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(open)
-        .bind(Uuid::new_v4())
-        .bind(invite)
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Invites are gone; PENDING is a status (self-signup awaiting approval).
+    for table in ["invite", "pending_identity_binding"] {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'oms' AND table_name = $1")
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table} should be dropped");
+    }
+    sqlx::query("UPDATE oms.principal SET status = 'PENDING' WHERE id = $1").bind(human).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE oms.principal SET status = 'ACTIVE' WHERE id = $1").bind(human).execute(&pool).await.unwrap();
 
     // Sessions default to the OIDC method.
     let session: Uuid = sqlx::query_scalar(

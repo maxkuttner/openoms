@@ -361,6 +361,8 @@ impl Provider {
                 ttl: crate::sessions::SessionTtl::default(),
                 trust_email_verified: true,
                 require_amr: Vec::new(),
+                enable_signup: false,
+                merge_accounts_by_email: false,
             },
             client_secret: "test-secret".to_string(),
             authorization_endpoint: format!("{issuer}/authorize"),

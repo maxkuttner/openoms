@@ -401,7 +401,7 @@ pub async fn ws_updates(
 fn socket_credential(auth: &AuthContext, headers: &HeaderMap, policy: &crate::sessions::CookiePolicy) -> Option<Credential> {
     use crate::auth::AuthMethod;
     match auth.auth_method {
-        AuthMethod::Oidc | AuthMethod::Local | AuthMethod::LegacyAdmin => {
+        AuthMethod::Oidc | AuthMethod::Local => {
             crate::sessions::cookie_from_headers(headers, crate::sessions::cookie_name(policy))
                 .map(|token| Credential::Session(crate::sessions::hash_session_token(&token)))
         }
@@ -727,7 +727,7 @@ mod tests {
         let policy = crate::sessions::cookie_policy("localhost:3001", None);
         let ctx = |m| AuthContext { auth_method: m, ..AuthContext::machine(Uuid::nil(), "x".into()) };
         let none = HeaderMap::new();
-        for m in [AuthMethod::Oidc, AuthMethod::Local, AuthMethod::LegacyAdmin, AuthMethod::ApiKey] {
+        for m in [AuthMethod::Oidc, AuthMethod::Local, AuthMethod::ApiKey] {
             assert!(socket_credential(&ctx(m), &none, &policy).is_none(), "{m:?}");
         }
         assert!(matches!(socket_credential(&ctx(AuthMethod::HostCli), &none, &policy), Some(Credential::Principal)));
@@ -842,6 +842,7 @@ mod tests {
             absolute_expires_at: now + chrono::Duration::minutes(expires_in_mins),
             auth_method: crate::sessions::AuthMethod::Oidc,
             mfa_verified_at: None,
+            pending: false,
         }
     }
 

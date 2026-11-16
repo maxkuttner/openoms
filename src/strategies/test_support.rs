@@ -31,7 +31,6 @@ pub fn state(pool: PgPool) -> AppState {
     use symbology::{Identifier, InMemoryCache, OpenFigiClient};
     AppState::new(
         pool,
-        Some("test-admin-token".to_string()),
         BrokerRegistry::new(),
         Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
         StreamHealthRegistry::new(),

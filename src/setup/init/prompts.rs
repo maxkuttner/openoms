@@ -7,7 +7,7 @@
 use std::io;
 
 use super::rules::{
-    check_admin_email, default_db_source, docker_fix_hint, docker_status_note, exposure_warning,
+    default_db_source, docker_fix_hint, docker_status_note, exposure_warning,
     parse_bind, DbSource, DockerStatus,
 };
 use super::Prompts;
@@ -31,36 +31,24 @@ pub enum DbChoice {
     Existing(Prompts),
 }
 
-/// The first named admin. `oms init` creates them and prints their one-time
-/// enrolment link; they choose their own password and TOTP through it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdminAccount {
-    pub email: String,
-    pub name: Option<String>,
-}
-
 #[derive(Debug)]
 pub struct Answers {
     pub db: DbChoice,
-    pub admin: AdminAccount,
     pub bind: String,
 }
 
 /// What Enter takes at each prompt, seeded from flags and the environment. A
-/// `Some` in `superuser_password`, `admin_email` or `source` skips that prompt
-/// (`admin_email` skips the name prompt too).
+/// `Some` in `superuser_password` or `source` skips that prompt.
 pub struct Defaults {
     pub host: String,
     pub port: u16,
     pub database: String,
     pub username: String,
     pub superuser_password: Option<String>,
-    pub admin_email: Option<String>,
-    pub admin_name: Option<String>,
     pub bind: String,
     pub source: Option<DbSource>,
     /// Inside the published image (`OMS_CONTAINER=1`): compose supplies the
-    /// database and publishes the port, so only the admin is asked.
+    /// database and publishes the port, so nothing is asked.
     pub container: bool,
 }
 
@@ -80,22 +68,18 @@ pub fn collect(p: &mut dyn Prompter, d: &Defaults, docker: DockerStatus) -> io::
         DbSource::Existing if d.container => DbChoice::Existing(compose_postgres(p, d)?),
         DbSource::Existing => DbChoice::Existing(existing_postgres(p, d)?),
     };
-    let admin = match &d.admin_email {
-        Some(email) => AdminAccount { email: email.trim().to_string(), name: d.admin_name.clone() },
-        None => admin_account(p, d.admin_name.as_deref())?,
-    };
     if d.container {
         // Bound on all interfaces inside the container; compose publishes it on
         // the host's loopback only, so the exposure warning would be wrong.
         let bind = parse_bind(&d.bind).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        return Ok(Answers { db, admin, bind });
+        return Ok(Answers { db, bind });
     }
     let bind = p.input("Listen on", &d.bind, &|v| parse_bind(v).map(|_| ()))?;
     let bind = parse_bind(&bind).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     if let Some(w) = exposure_warning(&bind) {
         p.note(&w);
     }
-    Ok(Answers { db, admin, bind })
+    Ok(Answers { db, bind })
 }
 
 fn choose_source(p: &mut dyn Prompter, docker: DockerStatus) -> io::Result<DbSource> {
@@ -166,13 +150,6 @@ fn superuser_password(p: &mut dyn Prompter) -> io::Result<String> {
 
 fn non_empty(v: &str, what: &str) -> Result<(), String> {
     if v.trim().is_empty() { Err(format!("the {what} cannot be empty")) } else { Ok(()) }
-}
-
-fn admin_account(p: &mut dyn Prompter, name: Option<&str>) -> io::Result<AdminAccount> {
-    let email = p.input("Admin email", "", &check_admin_email)?;
-    let name = p.input("Admin name (optional)", name.unwrap_or(""), &|_| Ok(()))?;
-    let name = name.trim();
-    Ok(AdminAccount { email: email.trim().to_string(), name: (!name.is_empty()).then(|| name.to_string()) })
 }
 
 /// The real terminal, through dialoguer.
@@ -335,8 +312,6 @@ mod tests {
             database: "ods".into(),
             username: "postgres".into(),
             superuser_password: None,
-            admin_email: None,
-            admin_name: None,
             bind: "localhost:3001".into(),
             source: None,
             container: false,
@@ -344,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn container_asks_only_the_admin() {
+    fn container_asks_nothing() {
         let d = Defaults {
             container: true,
             host: "postgres".into(),
@@ -352,7 +327,7 @@ mod tests {
             bind: "0.0.0.0:3001".into(),
             ..defaults()
         };
-        let mut s = Script::new().inputs(["ada@example.com", "Ada"]);
+        let mut s = Script::new();
         let a = collect(&mut s, &d, DockerStatus::NotFound).unwrap();
         match &a.db {
             DbChoice::Existing(p) => {
@@ -361,20 +336,18 @@ mod tests {
             }
             other => panic!("expected the compose database, got {other:?}"),
         }
-        assert_eq!(a.admin, AdminAccount { email: "ada@example.com".into(), name: Some("Ada".into()) });
         assert_eq!(a.bind, "0.0.0.0:3001");
-        assert_eq!((s.selects, s.passwords), (0, 0), "only the admin is asked");
+        assert_eq!((s.selects, s.passwords), (0, 0), "nothing is asked");
         assert!(s.replies.is_empty());
         assert!(s.notes.is_empty(), "no exposure warning in a container: {:?}", s.notes);
     }
 
     #[test]
     fn enter_everywhere_with_docker_takes_docker_and_localhost() {
-        let mut s = Script::new().select_default().inputs(["ada@example.com", ""]).input("localhost:3001");
+        let mut s = Script::new().select_default().input("localhost:3001");
         let a = collect(&mut s, &defaults(), DockerStatus::Usable).unwrap();
         assert_eq!(s.select_defaults, vec![0]);
         assert!(matches!(a.db, DbChoice::Docker));
-        assert_eq!(a.admin, AdminAccount { email: "ada@example.com".into(), name: None });
         assert_eq!(a.bind, "localhost:3001");
         assert!(s.replies.is_empty());
     }
@@ -385,7 +358,6 @@ mod tests {
             .select_default()
             .inputs(["db.internal", "5433", "ods", "postgres"])
             .password("su-pw")
-            .inputs(["ada@example.com", ""])
             .input("localhost:3001");
         let a = collect(&mut s, &defaults(), DockerStatus::NotFound).unwrap();
         assert_eq!(s.select_defaults, vec![1]);
@@ -400,7 +372,6 @@ mod tests {
             .select(1)
             .inputs(["localhost", "5432", "ods", "postgres"])
             .password("su")
-            .inputs(["ada@example.com", ""])
             .input("localhost:3001");
         let a = collect(&mut s, &defaults(), DockerStatus::NotRunning).unwrap();
         assert!(matches!(a.db, DbChoice::Existing(_)));
@@ -414,38 +385,26 @@ mod tests {
             .inputs(["localhost", "5432", "ods", "postgres"])
             .password("")
             .password("su")
-            .inputs(["ada@example.com", ""])
             .input("localhost:3001");
         let a = collect(&mut s, &defaults(), DockerStatus::Usable).unwrap();
         assert!(matches!(a.db, DbChoice::Existing(ref p) if p.password == "su"));
     }
 
     #[test]
-    fn the_admin_is_asked_after_the_database() {
-        let mut s = Script::new().select(0).inputs(["  ada@example.com ", " Ada Lovelace "]).input("localhost:3001");
-        let a = collect(&mut s, &defaults(), DockerStatus::Usable).unwrap();
-        assert_eq!(a.admin, AdminAccount { email: "ada@example.com".into(), name: Some("Ada Lovelace".into()) });
-        assert_eq!(s.passwords, 0, "no admin password is asked");
-    }
-
-    #[test]
     fn flag_values_skip_their_prompts() {
         let d = Defaults {
             source: Some(DbSource::Docker),
-            admin_email: Some("ada@example.com".into()),
-            admin_name: Some("Ada".into()),
             ..defaults()
         };
         let mut s = Script::new().input("localhost:3001");
-        let a = collect(&mut s, &d, DockerStatus::Usable).unwrap();
-        assert_eq!(a.admin, AdminAccount { email: "ada@example.com".into(), name: Some("Ada".into()) });
+        collect(&mut s, &d, DockerStatus::Usable).unwrap();
         assert_eq!(s.selects + s.passwords, 0);
     }
 
     #[test]
     fn a_supplied_superuser_password_skips_its_prompt() {
         let d = Defaults { source: Some(DbSource::Existing), superuser_password: Some("given".into()), ..defaults() };
-        let mut s = Script::new().inputs(["localhost", "5432", "ods", "postgres", "ada@example.com", ""]).input("localhost:3001");
+        let mut s = Script::new().inputs(["localhost", "5432", "ods", "postgres"]).input("localhost:3001");
         let a = collect(&mut s, &d, DockerStatus::Usable).unwrap();
         assert!(matches!(a.db, DbChoice::Existing(ref p) if p.password == "given"));
         assert_eq!(s.passwords, 0, "the superuser password is not asked again");
@@ -453,7 +412,7 @@ mod tests {
 
     #[test]
     fn a_network_bind_warns_once() {
-        let mut s = Script::new().select(0).inputs(["ada@example.com", ""]).input("0.0.0.0:3001");
+        let mut s = Script::new().select(0).input("0.0.0.0:3001");
         collect(&mut s, &defaults(), DockerStatus::Usable).unwrap();
         assert_eq!(s.notes.iter().filter(|n| n.contains("network")).count(), 1);
     }

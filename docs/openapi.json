@@ -2975,113 +2975,13 @@
         ]
       }
     },
-    "/auth/invite/{token}": {
-      "get": {
-        "tags": [
-          "auth"
-        ],
-        "summary": "The invite link: starts a login with the invite token's hash bound to the",
-        "description": "server-side flow, and does nothing else. The token never reaches a cookie\nor the provider. Whether the token is any good is decided only after\nthe provider has verified who is signing in.",
-        "operationId": "invite",
-        "parameters": [
-          {
-            "name": "token",
-            "in": "path",
-            "description": "The invite link token",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "303": {
-            "description": "Redirects to the identity provider's authorization endpoint"
-          },
-          "503": {
-            "description": "Too many sign-ins in progress; try again shortly"
-          }
-        }
-      }
-    },
-    "/auth/invite/{token}/preview": {
-      "get": {
-        "tags": [
-          "auth"
-        ],
-        "summary": "What a valid, pending invite offers: masked email, role, portfolios and",
-        "description": "the enabled sign-in methods. Any other token gets `{valid:false}` with the\nsame fields, after the same single query.",
-        "operationId": "preview",
-        "parameters": [
-          {
-            "name": "token",
-            "in": "path",
-            "description": "The invite link token",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InvitePreview"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/auth/local/enroll": {
-      "post": {
-        "tags": [
-          "auth"
-        ],
-        "summary": "Claim an invite with a new local password: in one transaction the",
-        "description": "credential is written, the local identity linked, the user activated, the\ninvite accepted and the claim audited. Then a session (MFA pending) is\nminted. Only for a pending `any`/`local` invite of a not-yet-active user\nwith no local credential; any refusal leaves the invite pending.",
-        "operationId": "enroll",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/EnrollBody"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Enrolled; session cookie set",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NextStep"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid invite or weak password"
-          },
-          "403": {
-            "description": "Cross-origin request"
-          }
-        }
-      }
-    },
     "/auth/local/login": {
       "post": {
         "tags": [
           "auth"
         ],
-        "summary": "Email + password. Success mints a session with MFA pending and says which",
-        "description": "TOTP step comes next. Every failure is the same generic 401; over the\nrate limit it is a generic 429.",
+        "summary": "Email + password. Success mints a",
+        "description": "session and says what comes next (see `NextStep`). MFA is pending when the\nuser has TOTP or `[auth.local].require_mfa` is on. Every failure is the same generic 401; over the\nrate limit it is a generic 429.",
         "operationId": "local_login",
         "requestBody": {
           "content": {
@@ -3109,6 +3009,88 @@
           },
           "403": {
             "description": "Cross-origin request"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/password": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Change the current local session's password. The new one must pass the",
+        "description": "password policy (15 to 128 characters, not a common password) and differ\nfrom the current one. Rotates the session (the old token stops at once;\nMFA state carries over) and says what comes next (`totp`, `totp_enroll` or\n`done`). Audited `local.password_changed`.",
+        "operationId": "change_password",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangePasswordBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Changed; rotated session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NextStep"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "weak_password or same_password"
+          },
+          "401": {
+            "description": "Wrong current password, or no session"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/signup": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Create a local account and sign it in. The first account on a fresh",
+        "description": "install becomes the admin; later ones need `[auth].enable_signup` (403\n`signup_disabled` otherwise) and get `[auth].default_user_role`. The\npassword policy applies. Rate-limited like login.",
+        "operationId": "signup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SignupBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Created; session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignupResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "weak_password, invalid_email or email_taken"
+          },
+          "403": {
+            "description": "signup_disabled, or a cross-origin request"
           },
           "429": {
             "description": "too_many_attempts"
@@ -3191,6 +3173,40 @@
           },
           "409": {
             "description": "No pending enrolment"
+          },
+          "429": {
+            "description": "too_many_attempts"
+          }
+        }
+      }
+    },
+    "/auth/local/totp/disable": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Turn TOTP off for the current local session's user. Needs a valid current",
+        "description": "6-digit code; clears the secret and the recovery codes; audited\n`local.totp_disabled`. Refused (409 `mfa_required_by_policy`) while\n`[auth.local].require_mfa` is on.",
+        "operationId": "totp_disable",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "TOTP removed"
+          },
+          "401": {
+            "description": "Wrong code or no session"
+          },
+          "409": {
+            "description": "Not enrolled, or MFA is required by policy"
           },
           "429": {
             "description": "too_many_attempts"
@@ -3301,7 +3317,7 @@
           "auth"
         ],
         "summary": "Which sign-in buttons to show. Only enabled methods are reported; a",
-        "description": "database error reports the shared admin password as off.",
+        "description": "database error reports `first_run` false (fail closed).",
         "operationId": "methods",
         "responses": {
           "200": {
@@ -3323,7 +3339,7 @@
           "auth"
         ],
         "summary": "Completes a login: validates the callback, exchanges the code, resolves",
-        "description": "the identity (claiming the flow's invite if it is unknown), and mints a\nsession. A login that resolves to no user is redirected to the access\npage with the reason; nothing is created for it.\n\nEvery failure path returns before `create_session` is ever called: a\nprovider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure or the claim gate end in an `ApiError`; a\n`ClaimOutcome` refusal ends in the access-page redirect.",
+        "description": "the identity (`accounts::resolve_sso`), and mints a session. A login that\nresolves to no account is redirected to the access page.\n\nEvery failure path returns before `create_session` is ever called: a\nprovider error, a missing/expired flow cookie, a `state` mismatch, an\nexchange/token failure or the claim gate end in an `ApiError`; no account\nends in the access-page redirect.",
         "operationId": "callback",
         "parameters": [
           {
@@ -3356,7 +3372,7 @@
         ],
         "responses": {
           "303": {
-            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused or awaiting admin approval (redirects to /trade/access?reason=..., e.g. pending_approval)"
+            "description": "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=no_account)"
           },
           "400": {
             "description": "Malformed callback, or a missing/expired/mismatched login flow"
@@ -4374,16 +4390,21 @@
           "local",
           "sso",
           "sso_label",
-          "legacy_admin"
+          "signup",
+          "first_run"
         ],
         "properties": {
-          "legacy_admin": {
+          "first_run": {
             "type": "boolean",
-            "description": "The deprecated shared admin password still works (until the first\nnamed admin signs in); it can only bootstrap that admin."
+            "description": "No admin exists yet: the page offers \"Create the admin account\"."
           },
           "local": {
             "type": "boolean",
-            "description": "Email + password (then TOTP)."
+            "description": "Email + password (then TOTP, if the user has it)."
+          },
+          "signup": {
+            "type": "boolean",
+            "description": "The sign-up form may be shown (`[auth].enable_signup`, local on)."
           },
           "sso": {
             "type": "boolean",
@@ -4627,6 +4648,21 @@
           "strike": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "ChangePasswordBody": {
+        "type": "object",
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "properties": {
+          "current_password": {
+            "type": "string"
+          },
+          "new_password": {
+            "type": "string"
           }
         }
       },
@@ -5237,21 +5273,6 @@
           }
         }
       },
-      "EnrollBody": {
-        "type": "object",
-        "required": [
-          "token",
-          "password"
-        ],
-        "properties": {
-          "password": {
-            "type": "string"
-          },
-          "token": {
-            "type": "string"
-          }
-        }
-      },
       "ExpirySweepResult": {
         "type": "object",
         "required": [
@@ -5499,44 +5520,6 @@
           }
         }
       },
-      "InvitePreview": {
-        "type": "object",
-        "required": [
-          "valid",
-          "portfolios",
-          "methods"
-        ],
-        "properties": {
-          "email_hint": {
-            "type": "string",
-            "nullable": true
-          },
-          "expires_at": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "methods": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "portfolios": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "role": {
-            "type": "string",
-            "nullable": true
-          },
-          "valid": {
-            "type": "boolean"
-          }
-        }
-      },
       "JobDetail": {
         "type": "object",
         "required": [
@@ -5685,7 +5668,9 @@
           "principal_id",
           "code",
           "portfolios",
-          "auth_method"
+          "auth_method",
+          "role",
+          "totp_enrolled"
         ],
         "properties": {
           "auth_method": {
@@ -5707,6 +5692,14 @@
           },
           "principal_id": {
             "type": "string"
+          },
+          "role": {
+            "type": "string",
+            "description": "The account role: `admin` (the admin capability), `pending` (signed up,\nwaiting for approval: 403 `approval_pending` everywhere but a few\n`/auth` routes) or `user`."
+          },
+          "totp_enrolled": {
+            "type": "boolean",
+            "description": "A local account with an authenticator app enrolled."
           }
         }
       },
@@ -5741,7 +5734,7 @@
         "properties": {
           "next": {
             "type": "string",
-            "description": "`totp` or `totp_enroll`."
+            "description": "`totp`, `totp_enroll` (only with `[auth.local].require_mfa`) or `done`."
           }
         }
       },
@@ -6470,7 +6463,7 @@
           "venue_connected",
           "portfolio_exists",
           "sign_in_ok",
-          "user_invited",
+          "user_added",
           "first_order"
         ],
         "properties": {
@@ -6483,11 +6476,47 @@
           "sign_in_ok": {
             "type": "boolean"
           },
-          "user_invited": {
+          "user_added": {
             "type": "boolean"
           },
           "venue_connected": {
             "type": "boolean"
+          }
+        }
+      },
+      "SignupBody": {
+        "type": "object",
+        "required": [
+          "name",
+          "email",
+          "password"
+        ],
+        "properties": {
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          }
+        }
+      },
+      "SignupResponse": {
+        "type": "object",
+        "required": [
+          "role",
+          "next"
+        ],
+        "properties": {
+          "next": {
+            "type": "string",
+            "description": "As on login: `totp_enroll` (only with `require_mfa`) or `done`."
+          },
+          "role": {
+            "type": "string",
+            "description": "`admin` (the first account), `user` or `pending`."
           }
         }
       },

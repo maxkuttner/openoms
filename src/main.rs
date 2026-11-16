@@ -19,7 +19,7 @@ mod oidc;
 mod local_auth;
 mod local_auth_api;
 mod auth_api;
-mod invites;
+mod accounts;
 mod users_api;
 mod admin_bootstrap;
 mod authz;
@@ -95,6 +95,8 @@ mod boundary_tests;
 mod authz_schema_tests;
 #[cfg(test)]
 mod authz_route_tests;
+#[cfg(test)]
+mod first_run_tests;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -182,16 +184,16 @@ mod authz_route_tests;
         colo::deployment::verified_stop,
         colo::ingest::adjustment,
         auth_api::login,
-        auth_api::invite,
         auth_api::callback,
         auth_api::logout,
         auth_api::me,
-        local_auth_api::preview,
-        local_auth_api::enroll,
+        local_auth_api::signup,
         local_auth_api::login,
         local_auth_api::totp,
         local_auth_api::totp_enroll,
         local_auth_api::totp_confirm,
+        local_auth_api::totp_disable,
+        local_auth_api::change_password,
         local_auth_api::logout_all,
         local_auth_api::methods,
     ),
@@ -223,15 +225,16 @@ mod authz_route_tests;
         users_api::SetupStatus,
         crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         auth_api::MeResponse,
-        local_auth_api::InvitePreview,
         local_auth_api::AuthMethods,
-        local_auth_api::EnrollBody,
+        local_auth_api::SignupBody,
+        local_auth_api::SignupResponse,
         local_auth_api::NextStep,
         local_auth_api::LoginBody,
         local_auth_api::CodeBody,
         local_auth_api::MfaVerified,
         local_auth_api::TotpEnrollResponse,
         local_auth_api::RecoveryCodes,
+        local_auth_api::ChangePasswordBody,
         strategies::admin::StrategyRow, strategies::admin::Responsible, strategies::admin::Handover, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
         strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted, strategies::admin::RebaselineIssued,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
@@ -386,30 +389,6 @@ fn resolve_bind_addr(from_env: Option<String>, file: Option<&config::FileConfig>
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string())
 }
 
-/// The deprecated shared admin password: env → file. `None` means unset, and
-/// unset means no shared password at all — there is no built-in default.
-fn resolve_admin_password(
-    from_env: Option<String>,
-    file: Option<&config::FileConfig>,
-) -> Option<String> {
-    from_env
-        .filter(|v| !v.is_empty())
-        .or_else(|| file.and_then(|f| f.server.admin_password.clone()))
-        .filter(|v| !v.is_empty())
-}
-
-/// Merges the two admin-password env vars for `resolve_admin_password`'s `from_env`
-/// argument. `OMS_ADMIN_PASSWORD` must be emptiness-filtered *before* the
-/// `or_else`, not after: `Option::or_else` only runs on `None`, so an unfiltered
-/// `Some("")` from `OMS_ADMIN_PASSWORD=""` would short-circuit past a configured
-/// `OMS_ADMIN_TOKEN` instead of falling through to it.
-fn admin_password_from_env() -> Option<String> {
-    env::var("OMS_ADMIN_PASSWORD")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| env::var("OMS_ADMIN_TOKEN").ok())
-}
-
 /// Whether the credential-decrypt gate says nothing usable came back — true
 /// iff something is stored and unusable AND *nothing at all* decoded. Named
 /// for what it answers, not for either of its two callers: `serve()` uses it
@@ -472,12 +451,6 @@ enum Command {
         /// Where the database lives: start PostgreSQL 16 in Docker, or use an existing one [default: existing]
         #[arg(long, value_enum)]
         postgres: Option<setup::init::rules::DbSource>,
-        /// Email of the first admin, who gets a one-time enrolment link [env: OMS_ADMIN_EMAIL]
-        #[arg(long)]
-        admin_email: Option<String>,
-        /// Display name of the first admin [env: OMS_ADMIN_NAME]
-        #[arg(long)]
-        admin_name: Option<String>,
         /// Address the server listens on [env: OMS_BIND_ADDR] [default: localhost:3001]
         #[arg(long)]
         bind: Option<String>,
@@ -512,10 +485,10 @@ enum SetupCmd {
 
 #[derive(clap::Subcommand)]
 enum AuthCmd {
-    /// Create a named admin and print their one-time enrolment link.
+    /// Create a named admin and print a generated password (shown once).
     ///
-    /// Only while no active admin exists, unless --force-recovery. Never sets
-    /// a password: the admin chooses one, and TOTP, through the link.
+    /// Only while no active admin exists, unless --force-recovery. On a fresh
+    /// install the simpler way is to create the admin account in the cockpit.
     BootstrapAdmin {
         /// The admin's email.
         #[arg(long)]
@@ -529,8 +502,8 @@ enum AuthCmd {
         #[command(flatten)]
         db: DbArgs,
     },
-    /// Reset an admin's password and TOTP, sign them out everywhere, and
-    /// print a new enrolment link.
+    /// Give an admin a new generated password (shown once), remove their
+    /// TOTP and sign them out everywhere.
     RecoverAdmin {
         /// The admin's email.
         #[arg(long)]
@@ -781,7 +754,7 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Init { non_interactive, postgres, admin_email, admin_name, bind, db }) => {
+        Some(Command::Init { non_interactive, postgres, bind, db }) => {
             // Checked here too, not only inside `run()`: `resolve()` below calls
             // `config::load()`, which exits the process over a *malformed*
             // oms.toml before `run()`'s own check ever runs — and interactively,
@@ -795,7 +768,6 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            let interactive = !non_interactive;
             let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
             // Checked before any prompt, in both modes: a bad value should not
             // cost the operator a round of typing first. Each error names where
@@ -807,18 +779,14 @@ async fn main() {
                     None => (env(var), var.to_string()),
                 }
             };
-            let (admin_email, admin_src) = from(admin_email, "admin-email", "OMS_ADMIN_EMAIL");
-            let (admin_name, _) = from(admin_name, "admin-name", "OMS_ADMIN_NAME");
             let (bind, bind_src) = from(bind, "bind", "OMS_BIND_ADDR");
-            let checked = admin_email.as_deref().map_or(Ok(()), setup::init::rules::check_admin_email)
-                .map_err(|e| format!("{admin_src}: {e}"))
-                .and(bind.as_deref().map_or(Ok(()), |b| setup::init::rules::parse_bind(b).map(|_| ()))
-                    .map_err(|e| format!("{bind_src}: {e}")));
+            let checked = bind.as_deref().map_or(Ok(()), |b| setup::init::rules::parse_bind(b).map(|_| ()))
+                .map_err(|e| format!("{bind_src}: {e}"));
             if let Err(e) = checked {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
-            let flags = setup::init::InitFlags { source: postgres, admin_email, admin_name, bind };
+            let flags = setup::init::InitFlags { source: postgres, bind };
             let container = setup::init::rules::container_mode(env("OMS_CONTAINER").as_deref());
             let answers = if non_interactive {
                 let cfg = setup::database::config::resolve(db.into());
@@ -884,8 +852,6 @@ async fn main() {
                     database: cfg.database,
                     username: cfg.username,
                     superuser_password: password_override,
-                    admin_email: flags.admin_email,
-                    admin_name: flags.admin_name,
                     bind: flags.bind.unwrap_or_else(|| setup::init::DEFAULT_BIND.into()),
                     source: flags.source,
                     container,
@@ -903,7 +869,7 @@ async fn main() {
                     Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
                 }
             };
-            if let Err(e) = setup::init::run(answers, &setup::init::docker::Cli, interactive).await {
+            if let Err(e) = setup::init::run(answers, &setup::init::docker::Cli).await {
                 eprintln!("{e}");
                 std::process::exit(1);
             }
@@ -916,9 +882,11 @@ async fn main() {
                 AuthCmd::RecoverAdmin { email, db } => admin_bootstrap::cli_recover(db.into(), &email).await,
             };
             match result {
-                Ok(link) => {
-                    println!("One-time enrolment link (valid 7 days):\n\n    {link}\n");
-                    if let Some(note) = admin_bootstrap::cli_link_note_for_config() {
+                Ok(password) => {
+                    println!(
+                        "Password (shown once; sign in and change it under Account):\n\n    {password}\n"
+                    );
+                    if let Some(note) = admin_bootstrap::cli_password_note_for_config() {
                         println!("{note}\n");
                     }
                 }
@@ -993,20 +961,13 @@ fn build_app(
             "/admin/orders/:id/events",
             get(order_events::get_order_events_admin),
         )
-        .route("/admin/users", get(users_api::list_users).post(users_api::create_key_only_user))
+        .route("/admin/users", get(users_api::list_users).post(users_api::add_user))
         .route("/admin/setup-status", get(users_api::setup_status))
         .route("/admin/auth/status", get(users_api::auth_status))
-        .route("/admin/users/invite", post(users_api::invite_user))
-        .route("/admin/users/invites/:id/revoke", post(users_api::revoke_invite))
-        .route("/admin/users/invites/:id/reissue", post(users_api::reissue_invite))
-        .route("/admin/users/:id/link-invite", post(users_api::link_invite))
-        .route("/admin/users/bindings", get(users_api::list_bindings))
-        .route("/admin/users/bindings/:id/approve", post(users_api::approve_binding))
-        .route("/admin/users/bindings/:id/reject", post(users_api::reject_binding))
-        .route("/admin/users/:id/identities", post(users_api::prebind_identity))
+        .route("/admin/users/:id/approve", post(users_api::approve_user))
+        .route("/admin/users/:id/reject", post(users_api::reject_user))
         .route("/admin/users/:id/role", axum::routing::put(users_api::set_role))
         .route("/admin/users/:id/portfolios", axum::routing::put(users_api::set_portfolios))
-        .route("/admin/users/bootstrap-admin", post(users_api::bootstrap_admin))
         .route("/admin/users/:id/admin", axum::routing::put(users_api::set_admin))
         .route("/admin/users/:id/disable", post(users_api::disable_user))
         .route("/admin/users/:id/enable", post(users_api::enable_user))
@@ -1151,7 +1112,6 @@ fn build_app(
     if let Some(auth_state) = auth_api_state.clone() {
         let auth_router = Router::new()
             .route("/auth/oidc/login", get(auth_api::login))
-            .route("/auth/invite/:token", get(auth_api::invite))
             .route("/auth/oidc/callback", get(auth_api::callback))
             // Alias: the registered IdP redirect URIs still use the pre-rename path.
             .route("/auth/callback", get(auth_api::callback))
@@ -1174,7 +1134,6 @@ fn build_app(
         let local_auth = local_auth_api::LocalAuth::new(
             admin::resolve_master_key().ok().flatten(),
             local_enabled,
-            oidc_discovered,
         );
         app = app.merge(local_auth_api::routes(local_auth));
         let me_router = Router::new()
@@ -1372,20 +1331,8 @@ async fn serve() {
     // machine — costs nothing extra.
     let bind_addr = resolve_bind_addr(env::var("OMS_BIND_ADDR").ok(), file_cfg);
 
-    // The deprecated shared admin password (`OMS_ADMIN_PASSWORD` →
-    // `OMS_ADMIN_TOKEN` → `[server].admin_password`). There is no built-in
-    // default any more, on loopback or anywhere: admins are named people who
-    // sign in. While `system_setting.legacy_admin_enabled` is still true the
-    // password may read `/admin/*` and bootstrap the first named admin, nothing
-    // else (see `auth::admin_middleware`).
-    let legacy_admin_password = resolve_admin_password(admin_password_from_env(), file_cfg);
-    if legacy_admin_password.is_some() {
-        warn!(
-            "the shared admin password (OMS_ADMIN_PASSWORD / [server].admin_password) is \
-             deprecated: it can only read the admin console and create a named admin. \
-             Create one with `oms auth bootstrap-admin --email <you@example.com>`, \
-             then remove the password."
-        );
+    if env::var_os("OMS_ADMIN_PASSWORD").is_some() || env::var_os("OMS_ADMIN_TOKEN").is_some() {
+        warn!("OMS_ADMIN_PASSWORD / OMS_ADMIN_TOKEN are no longer used and are ignored; sign in as a named admin");
     }
 
     // Same rule, for OIDC login instead of the admin console. Plain http is
@@ -1528,7 +1475,6 @@ async fn serve() {
 
     let mut state = AppState::new(
         pool,
-        legacy_admin_password,
         BrokerRegistry::new(),
         symbology,
         stream_health,
@@ -1537,6 +1483,11 @@ async fn serve() {
         std::sync::Arc::new(market_data),
         session_config,
     );
+    state.require_mfa = auth_settings.require_mfa;
+    state.signup = accounts::SignupPolicy {
+        enabled: auth_settings.enable_signup,
+        pending_by_default: auth_settings.default_user_role == config::DefaultUserRole::Pending,
+    };
     // A fresh host token every boot, for `oms` CLI commands on this machine.
     let token_path = admin_bootstrap::host_token_path();
     match admin_bootstrap::write_host_token(&token_path) {
@@ -1767,6 +1718,8 @@ async fn serve() {
                     let required_claim = oidc_settings.required_claim.clone();
                     let require_amr = oidc_settings.require_amr.clone();
                     let trust_email_verified = oidc_settings.trust_email_verified;
+                    let enable_signup = oidc_settings.enable_signup;
+                    let merge_accounts_by_email = oidc_settings.merge_accounts_by_email;
                     match oidc::Provider::discover(oidc_settings, client_secret).await {
                         Ok(provider) => {
                             info!("OIDC discovery succeeded — login enabled");
@@ -1776,6 +1729,8 @@ async fn serve() {
                                 required_claim,
                                 require_amr,
                                 trust_email_verified,
+                                enable_signup,
+                                merge_accounts_by_email,
                                 flows: Arc::new(auth_api::FlowStore::default()),
                             })
                         }
@@ -1828,6 +1783,8 @@ mod tests {
             required_claim: None,
             require_amr: Vec::new(),
             trust_email_verified: true,
+            enable_signup: false,
+            merge_accounts_by_email: false,
             flows: std::sync::Arc::new(crate::auth_api::FlowStore::default()),
         };
         // (local only), (OIDC configured, discovery failed), (neither),
@@ -1845,21 +1802,20 @@ mod tests {
         use crate::{setup, Cli, Command, ConfigCmd};
         let cli = Cli::try_parse_from([
             "oms", "init", "--non-interactive", "--postgres", "docker",
-            "--admin-email", "ada@example.com", "--admin-name", "Ada", "--bind", "localhost:4000",
+            "--bind", "localhost:4000",
         ])
         .unwrap();
         match cli.command {
-            Some(Command::Init { non_interactive, postgres, admin_email, admin_name, bind, .. }) => {
+            Some(Command::Init { non_interactive, postgres, bind, .. }) => {
                 assert!(non_interactive);
                 assert_eq!(postgres, Some(setup::init::rules::DbSource::Docker));
-                assert_eq!(admin_email.as_deref(), Some("ada@example.com"));
-                assert_eq!(admin_name.as_deref(), Some("Ada"));
                 assert_eq!(bind.as_deref(), Some("localhost:4000"));
             }
             _ => panic!("not init"),
         }
         assert!(Cli::try_parse_from(["oms", "init", "--postgres", "kubernetes"]).is_err());
         assert!(Cli::try_parse_from(["oms", "init", "--admin-password", "twelve-chars-ok"]).is_err(), "init no longer takes a password");
+        assert!(Cli::try_parse_from(["oms", "init", "--admin-email", "ada@example.com"]).is_err(), "the first admin signs up in the cockpit");
     }
 
     #[test]
@@ -1870,8 +1826,7 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Config(ConfigCmd::Path))));
     }
     use super::bind_is_loopback;
-    use super::{admin_password_from_env, nothing_decrypted, resolve_admin_password, resolve_bind_addr, DEFAULT_BIND_ADDR};
-    use crate::config::FileConfig;
+    use super::{nothing_decrypted, resolve_bind_addr, DEFAULT_BIND_ADDR};
 
     /// The most consequential new behaviour in the credential-store plan,
     /// table-tested directly: refuse iff at least one stored credential is
@@ -1919,12 +1874,8 @@ mod tests {
         assert!(json.contains("FeedConnectionSummary"));
     }
 
-    /// Serialise env mutation: `admin_password_env_falls_through_to_token` shares
-    /// process-global env state with every other test in the binary.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// The defaults-are-fine-on-a-laptop case: these must accept the built-in
-    /// admin password, with or without a port.
+    /// Loopback binds, with or without a port.
     #[test]
     fn loopback_binds_are_recognised() {
         assert!(bind_is_loopback("localhost:3001"));
@@ -1996,41 +1947,6 @@ mod tests {
         assert_eq!(resolve_bind_addr(Some("0.0.0.0:1".into()), Some(&file)), "0.0.0.0:1");
         assert_eq!(resolve_bind_addr(None, Some(&file)), "1.2.3.4:9999");
         assert_eq!(resolve_bind_addr(None, None), DEFAULT_BIND_ADDR);
-    }
-
-    #[test]
-    fn admin_password_prefers_env_then_file() {
-        let file = crate::config::parse("[server]\nadmin_password = \"from-file\"\n").expect("parse");
-
-        assert_eq!(resolve_admin_password(Some("from-env".into()), Some(&file)).as_deref(), Some("from-env"));
-        assert_eq!(resolve_admin_password(None, Some(&file)).as_deref(), Some("from-file"));
-        assert_eq!(resolve_admin_password(None, Some(&FileConfig::default())), None);
-        assert_eq!(resolve_admin_password(None, None), None);
-    }
-
-    /// A blank `admin_password` in the file must not satisfy the off-loopback
-    /// refusal — it is treated the same as absent, not as a configured value.
-    #[test]
-    fn admin_password_blank_in_file_is_unconfigured() {
-        let file = crate::config::parse("[server]\nadmin_password = \"\"\n").expect("parse");
-        assert_eq!(resolve_admin_password(None, Some(&file)), None);
-    }
-
-    /// Regression: `OMS_ADMIN_PASSWORD=""` must fall through to `OMS_ADMIN_TOKEN`,
-    /// not swallow it. `Option::or_else` only fires on `None`, so the emptiness
-    /// filter on `OMS_ADMIN_PASSWORD` has to run before the `or_else`.
-    #[test]
-    fn admin_password_env_falls_through_to_token_when_password_is_empty() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("OMS_ADMIN_PASSWORD", "");
-        std::env::set_var("OMS_ADMIN_TOKEN", "from-token");
-
-        let result = admin_password_from_env();
-
-        std::env::remove_var("OMS_ADMIN_PASSWORD");
-        std::env::remove_var("OMS_ADMIN_TOKEN");
-
-        assert_eq!(result.as_deref(), Some("from-token"));
     }
 
     #[test]

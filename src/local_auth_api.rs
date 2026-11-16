@@ -1,5 +1,6 @@
-//! Local sign-in: invite enrolment with a password, email + password login,
-//! TOTP (enrol, confirm, verify, recovery codes), and logout-all.
+//! Local sign-in: sign-up (the first account becomes the admin), email +
+//! password login, password change, TOTP (enrol, confirm, verify, disable,
+//! recovery codes), and logout-all.
 //!
 //! Every route here answers with `Cache-Control: no-store` and
 //! `Referrer-Policy: no-referrer` (see `no_store`), and every POST is
@@ -17,12 +18,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{ConnectInfo, Extension, Path, State},
+    extract::{ConnectInfo, Extension, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use tokio::sync::OnceCell;
@@ -123,16 +124,14 @@ pub struct LocalAuth {
     /// TOTP secrets are sealed with it; without one, TOTP is unavailable.
     pub master_key: Option<Arc<MasterKey>>,
     pub local_enabled: bool,
-    pub oidc_enabled: bool,
 }
 
 impl LocalAuth {
-    pub fn new(master_key: Option<MasterKey>, local_enabled: bool, oidc_enabled: bool) -> Self {
+    pub fn new(master_key: Option<MasterKey>, local_enabled: bool) -> Self {
         Self {
             limiter: Arc::new(LoginLimiter::new(ACCOUNT_FAILURES_PER_WINDOW, IP_FAILURES_PER_WINDOW, LIMIT_WINDOW)),
             master_key: master_key.map(Arc::new),
             local_enabled,
-            oidc_enabled,
         }
     }
 }
@@ -195,8 +194,13 @@ async fn current_session(state: &AppState, headers: &HeaderMap) -> Result<Sessio
     Ok(record)
 }
 
+/// The current local session of an approved account: a PENDING one answers
+/// 403 `approval_pending`.
 async fn local_session(state: &AppState, headers: &HeaderMap) -> Result<SessionRecord, Response> {
     let s = current_session(state, headers).await?;
+    if s.pending {
+        return Err(crate::auth::approval_pending());
+    }
     if s.auth_method != AuthMethod::Local {
         return Err(fail(StatusCode::BAD_REQUEST, "not_a_local_session"));
     }
@@ -253,105 +257,74 @@ async fn record_db_failure(pool: &PgPool, principal_id: Uuid) -> Result<bool, sq
     .await
 }
 
-// ── invite preview ─────────────────────────────────────────────────────────
+// ── sign-up ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct InvitePreview {
-    pub valid: bool,
-    pub email_hint: Option<String>,
-    pub role: Option<String>,
-    pub portfolios: Vec<String>,
-    pub methods: Vec<String>,
-    pub expires_at: Option<DateTime<Utc>>,
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct NextStep {
+    /// `totp`, `totp_enroll` (only with `[auth.local].require_mfa`) or `done`.
+    pub next: &'static str,
 }
 
-/// What a valid, pending invite offers: masked email, role, portfolios and
-/// the enabled sign-in methods. Any other token gets `{valid:false}` with the
-/// same fields, after the same single query.
-#[utoipa::path(
-    get, path = "/auth/invite/{token}/preview", tag = "auth",
-    params(("token" = String, Path, description = "The invite link token")),
-    responses((status = 200, body = InvitePreview)),
-)]
-pub async fn preview(State(state): State<AppState>, Extension(la): Extension<LocalAuth>, Path(token): Path<String>) -> Response {
-    let row = sqlx::query(
-        "SELECT i.email, i.method, i.expires_at, r.role_code, \
-                COALESCE(array_agg(pf.code ORDER BY pf.code) FILTER (WHERE pf.code IS NOT NULL), '{}') AS portfolios \
-           FROM invite i JOIN principal p ON p.id = i.principal_id \
-           LEFT JOIN principal_role r ON r.principal_id = p.id \
-           LEFT JOIN principal_portfolio_grant g ON g.principal_id = p.id \
-           LEFT JOIN portfolio pf ON pf.id = g.portfolio_id \
-          WHERE i.token_hash = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL \
-            AND i.expires_at > now() AND p.status <> 'DISABLED' \
-          GROUP BY i.id, r.role_code",
-    )
-    .bind(sessions::hash_session_token(&token))
-    .fetch_optional(state.pool())
-    .await;
-    let row = match row {
-        Ok(row) => row,
-        Err(e) => return internal("invite preview", e),
-    };
-    let body = match row {
-        Some(r) => {
-            let method: String = r.get("method");
-            let mut methods = Vec::new();
-            if la.local_enabled && method != "oidc" {
-                methods.push("local".to_string());
-            }
-            if la.oidc_enabled && method != "local" {
-                methods.push("oidc".to_string());
-            }
-            InvitePreview {
-                valid: true,
-                email_hint: Some(crate::invites::mask_email(&r.get::<String, _>("email"))),
-                role: r.get("role_code"),
-                portfolios: r.get("portfolios"),
-                methods,
-                expires_at: Some(r.get("expires_at")),
-            }
-        }
-        None => InvitePreview { valid: false, email_hint: None, role: None, portfolios: vec![], methods: vec![], expires_at: None },
-    };
-    Json(body).into_response()
+/// What a local session must do next, given its credential and the policy.
+fn next_step(has_totp: bool, mfa_verified: bool, require_mfa: bool) -> &'static str {
+    if has_totp && !mfa_verified {
+        "totp"
+    } else if require_mfa && !has_totp {
+        "totp_enroll"
+    } else {
+        "done"
+    }
 }
 
-// ── enrolment ──────────────────────────────────────────────────────────────
+/// Whether a fresh password sign-in already satisfies the MFA gate: only
+/// when MFA is optional and the user has no TOTP to ask for.
+fn password_is_enough(require_mfa: bool, has_totp: bool) -> bool {
+    !require_mfa && !has_totp
+}
 
 #[derive(Deserialize, utoipa::ToSchema)]
-pub struct EnrollBody {
-    pub token: String,
+pub struct SignupBody {
+    pub name: String,
+    pub email: String,
     pub password: String,
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct NextStep {
-    /// `totp` or `totp_enroll`.
+pub struct SignupResponse {
+    /// `admin` (the first account), `user` or `pending`.
+    pub role: &'static str,
+    /// As on login: `totp_enroll` (only with `require_mfa`) or `done`.
     pub next: &'static str,
 }
 
-/// Claim an invite with a new local password: in one transaction the
-/// credential is written, the local identity linked, the user activated, the
-/// invite accepted and the claim audited. Then a session (MFA pending) is
-/// minted. Only for a pending `any`/`local` invite of a not-yet-active user
-/// with no local credential; any refusal leaves the invite pending.
+/// Create a local account and sign it in. The first account on a fresh
+/// install becomes the admin; later ones need `[auth].enable_signup` (403
+/// `signup_disabled` otherwise) and get `[auth].default_user_role`. The
+/// password policy applies. Rate-limited like login.
 #[utoipa::path(
-    post, path = "/auth/local/enroll", tag = "auth",
-    request_body = EnrollBody,
+    post, path = "/auth/local/signup", tag = "auth",
+    request_body = SignupBody,
     responses(
-        (status = 200, body = NextStep, description = "Enrolled; session cookie set"),
-        (status = 400, description = "Invalid invite or weak password"),
-        (status = 403, description = "Cross-origin request"),
+        (status = 200, body = SignupResponse, description = "Created; session cookie set"),
+        (status = 400, description = "weak_password, invalid_email or email_taken"),
+        (status = 403, description = "signup_disabled, or a cross-origin request"),
+        (status = 429, description = "too_many_attempts"),
     ),
 )]
-pub async fn enroll(
+pub async fn signup(
     State(state): State<AppState>,
-    Extension(_la): Extension<LocalAuth>,
+    Extension(la): Extension<LocalAuth>,
+    conn: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    Json(body): Json<EnrollBody>,
+    Json(body): Json<SignupBody>,
 ) -> Response {
     if let Err(r) = check_origin(&state, &headers) {
         return *r;
+    }
+    let account = format!("signup:{}", body.email.trim().to_lowercase());
+    let ip = client_ip(&conn);
+    if !la.limiter.try_acquire(&account, &ip) {
+        return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
     }
     if let Err(reason) = local_auth::check_password_policy(&body.password) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "weak_password", "reason": reason })))
@@ -361,79 +334,29 @@ pub async fn enroll(
         Ok(h) => h,
         Err(e) => return internal("hash_password", e),
     };
-    let principal_id = match claim_local(state.pool(), &body.token, &hash).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return fail(StatusCode::BAD_REQUEST, "invalid_invite"),
-        Err(e) => return internal("local enrol", e),
+    use crate::accounts::{AccountError, AccountRole};
+    let created = match crate::accounts::signup(state.pool(), &body.name, &body.email, &hash, state.signup).await {
+        Ok(c) => c,
+        Err(AccountError::SignupDisabled) => return fail(StatusCode::FORBIDDEN, "signup_disabled"),
+        Err(AccountError::EmailTaken) => return fail(StatusCode::BAD_REQUEST, "email_taken"),
+        Err(AccountError::BadEmail) => return fail(StatusCode::BAD_REQUEST, "invalid_email"),
+        Err(AccountError::Db(e)) => return internal("signup", e),
     };
+    la.limiter.refund(&account, &ip);
     drop_prior_session(&state, &headers).await;
+    let mfa = password_is_enough(state.require_mfa, false);
     let token = match sessions::create_session(
-        state.pool(), principal_id, AuthMethod::Local, false, &state.session_config.ttl, user_agent(&headers),
+        state.pool(), created.principal_id, AuthMethod::Local, mfa, &state.session_config.ttl, user_agent(&headers),
     )
     .await
     {
         Ok(t) => t,
         Err(e) => return internal("create_session", e),
     };
-    with_cookie(Json(NextStep { next: "totp_enroll" }).into_response(), session_cookie(&state, &token.plaintext))
-}
-
-/// The claim transaction. `Ok(None)` for every refusal (the transaction is
-/// dropped, so nothing changes). Locks the invite row like
-/// `invites::resolve_login`, so two simultaneous claims serialise and the
-/// second finds it accepted.
-async fn claim_local(pool: &PgPool, token: &str, password_hash: &str) -> Result<Option<Uuid>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let Some(row) = sqlx::query(
-        "SELECT i.id, i.principal_id, i.method, p.code \
-           FROM invite i JOIN principal p ON p.id = i.principal_id \
-          WHERE i.token_hash = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL \
-            AND i.expires_at > now() AND p.status = 'INVITED' AND p.principal_type = 'HUMAN' \
-            AND i.method IN ('any', 'local') \
-            AND NOT EXISTS (SELECT 1 FROM local_credential c WHERE c.principal_id = p.id) \
-          FOR UPDATE OF i",
-    )
-    .bind(sessions::hash_session_token(token))
-    .fetch_optional(&mut *tx)
-    .await?
-    else {
-        return Ok(None);
-    };
-    let invite_id: Uuid = row.get("id");
-    let principal_id: Uuid = row.get("principal_id");
-    let code: String = row.get("code");
-
-    sqlx::query("INSERT INTO local_credential (principal_id, password_hash) VALUES ($1, $2)")
-        .bind(principal_id)
-        .bind(password_hash)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO principal_identity (issuer, subject, principal_id, last_login_at) VALUES ($1, $2, $3, now())",
-    )
-    .bind(LOCAL_ISSUER)
-    .bind(principal_id.to_string())
-    .bind(principal_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query("UPDATE principal SET status = 'ACTIVE', updated_at = now() WHERE id = $1")
-        .bind(principal_id)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE invite SET accepted_at = now() WHERE id = $1")
-        .bind(invite_id)
-        .execute(&mut *tx)
-        .await?;
-    crate::invites::audit(
-        &mut tx,
-        &code,
-        "invite.accepted.local",
-        principal_id,
-        serde_json::json!({ "invite_id": invite_id, "issuer": LOCAL_ISSUER }),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Some(principal_id))
+    // A pending account can do nothing yet, TOTP enrolment included.
+    let next = if created.role == AccountRole::Pending { "done" } else { next_step(false, mfa, state.require_mfa) };
+    let res = Json(SignupResponse { role: created.role.as_str(), next }).into_response();
+    with_cookie(res, session_cookie(&state, &token.plaintext))
 }
 
 // ── login ──────────────────────────────────────────────────────────────────
@@ -444,8 +367,9 @@ pub struct LoginBody {
     pub password: String,
 }
 
-/// Email + password. Success mints a session with MFA pending and says which
-/// TOTP step comes next. Every failure is the same generic 401; over the
+/// Email + password. Success mints a
+/// session and says what comes next (see `NextStep`). MFA is pending when the
+/// user has TOTP or `[auth.local].require_mfa` is on. Every failure is the same generic 401; over the
 /// rate limit it is a generic 429.
 #[utoipa::path(
     post, path = "/auth/local/login", tag = "auth", operation_id = "local_login",
@@ -483,7 +407,7 @@ pub async fn login(
         "SELECT p.id, c.password_hash, c.totp_enrolled_at IS NOT NULL AS has_totp, \
                 COALESCE(c.locked_until > now(), false) AS locked \
            FROM principal p JOIN local_credential c ON c.principal_id = p.id \
-          WHERE lower(p.email) = $1 AND p.status = 'ACTIVE' AND p.principal_type = 'HUMAN' \
+          WHERE lower(p.email) = $1 AND p.status IN ('ACTIVE', 'PENDING') AND p.principal_type = 'HUMAN' \
           LIMIT 1",
     )
     .bind(&account)
@@ -520,15 +444,17 @@ pub async fn login(
         return internal("reset failed logins", e);
     }
     drop_prior_session(&state, &headers).await;
+    let has_totp: bool = row.get("has_totp");
+    let mfa = password_is_enough(state.require_mfa, has_totp);
     let token = match sessions::create_session(
-        state.pool(), principal_id, AuthMethod::Local, false, &state.session_config.ttl, user_agent(&headers),
+        state.pool(), principal_id, AuthMethod::Local, mfa, &state.session_config.ttl, user_agent(&headers),
     )
     .await
     {
         Ok(t) => t,
         Err(e) => return internal("create_session", e),
     };
-    let next = if row.get::<bool, _>("has_totp") { "totp" } else { "totp_enroll" };
+    let next = next_step(has_totp, mfa, state.require_mfa);
     with_cookie(Json(NextStep { next }).into_response(), session_cookie(&state, &token.plaintext))
 }
 
@@ -561,12 +487,6 @@ async fn rotate_verified(state: &AppState, session: &SessionRecord, headers: &He
         Ok(Some(token)) => {
             // the old session is revoked: its open sockets close now, not at the next tick
             state.event_bus().publish_auth_changed(session.principal_id);
-            // The legacy shared admin password stops once a named admin has
-            // proven they can sign in (password + TOTP). A failure here only
-            // delays the cutover to their next sign-in; it must not fail this one.
-            if let Err(e) = crate::admin_bootstrap::disable_legacy_after_mfa(state.pool(), session.principal_id).await {
-                tracing::error!(error = %e, "could not record the legacy admin cutover");
-            }
             with_cookie(res, session_cookie(state, &token.plaintext))
         }
         Ok(None) => fail(StatusCode::UNAUTHORIZED, "unauthenticated"),
@@ -868,9 +788,214 @@ async fn activate_totp(
             .execute(&mut *tx)
             .await?;
     }
-    crate::invites::audit(&mut tx, code, "local.totp_enrolled", principal_id, serde_json::json!({})).await?;
+    crate::accounts::audit(&mut tx, code, "local.totp_enrolled", principal_id, serde_json::json!({})).await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// Turn TOTP off for the current local session's user. Needs a valid current
+/// 6-digit code; clears the secret and the recovery codes; audited
+/// `local.totp_disabled`. Refused (409 `mfa_required_by_policy`) while
+/// `[auth.local].require_mfa` is on.
+#[utoipa::path(
+    post, path = "/auth/local/totp/disable", tag = "auth",
+    request_body = CodeBody,
+    responses(
+        (status = 204, description = "TOTP removed"),
+        (status = 401, description = "Wrong code or no session"),
+        (status = 409, description = "Not enrolled, or MFA is required by policy"),
+        (status = 429, description = "too_many_attempts"),
+    ),
+)]
+pub async fn totp_disable(
+    State(state): State<AppState>,
+    Extension(la): Extension<LocalAuth>,
+    conn: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(body): Json<CodeBody>,
+) -> Response {
+    if let Err(r) = check_origin(&state, &headers) {
+        return *r;
+    }
+    let session = match local_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if state.require_mfa {
+        return fail(StatusCode::CONFLICT, "mfa_required_by_policy");
+    }
+    let master = match master(&la) {
+        Ok(m) => m,
+        Err(r) => return *r,
+    };
+    let account = format!("p:{}", session.principal_id);
+    let ip = client_ip(&conn);
+    if !la.limiter.try_acquire(&account, &ip) {
+        return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
+    }
+    let row: Option<(Vec<u8>, Option<i64>, bool)> = match sqlx::query_as(
+        "SELECT totp_secret_enc, totp_last_step, COALESCE(locked_until > now(), false) \
+           FROM local_credential WHERE principal_id = $1 AND totp_enrolled_at IS NOT NULL",
+    )
+    .bind(session.principal_id)
+    .fetch_optional(state.pool())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal("load credential", e),
+    };
+    let Some((secret, last_step, locked)) = row else {
+        return fail(StatusCode::CONFLICT, "totp_not_enrolled");
+    };
+    let valid = !locked
+        && looks_like_totp(&body.code)
+        && local_auth::verify_totp(&secret, master, &body.code, last_step, Utc::now().timestamp()).is_ok();
+    if !valid {
+        return match record_db_failure(state.pool(), session.principal_id).await {
+            Ok(_) => fail(StatusCode::UNAUTHORIZED, "invalid_code"),
+            Err(e) => internal("record failed totp", e),
+        };
+    }
+    la.limiter.refund(&account, &ip);
+    match remove_totp(state.pool(), session.principal_id, &session.principal_code, &secret).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => fail(StatusCode::CONFLICT, "totp_not_enrolled"),
+        Err(e) => internal("disable totp", e),
+    }
+}
+
+/// Removes only `verified_secret`, the one the code was checked against.
+async fn remove_totp(pool: &PgPool, principal_id: Uuid, code: &str, verified_secret: &[u8]) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let removed = sqlx::query(
+        "UPDATE local_credential SET totp_secret_enc = NULL, totp_enrolled_at = NULL, totp_last_step = NULL, \
+                failed_attempts = 0, locked_until = NULL \
+          WHERE principal_id = $1 AND totp_enrolled_at IS NOT NULL AND totp_secret_enc = $2",
+    )
+    .bind(principal_id)
+    .bind(verified_secret)
+    .execute(&mut *tx)
+    .await?;
+    if removed.rows_affected() != 1 {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM recovery_code WHERE principal_id = $1").bind(principal_id).execute(&mut *tx).await?;
+    crate::accounts::audit(&mut tx, code, "local.totp_disabled", principal_id, serde_json::json!({})).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+// ── password change ────────────────────────────────────────────────────────
+
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct ChangePasswordBody {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// Change the current local session's password. The new one must pass the
+/// password policy (15 to 128 characters, not a common password) and differ
+/// from the current one. Rotates the session (the old token stops at once;
+/// MFA state carries over) and says what comes next (`totp`, `totp_enroll` or
+/// `done`). Audited `local.password_changed`.
+#[utoipa::path(
+    post, path = "/auth/local/password", tag = "auth",
+    request_body = ChangePasswordBody,
+    responses(
+        (status = 200, body = NextStep, description = "Changed; rotated session cookie set"),
+        (status = 400, description = "weak_password or same_password"),
+        (status = 401, description = "Wrong current password, or no session"),
+        (status = 429, description = "too_many_attempts"),
+    ),
+)]
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(la): Extension<LocalAuth>,
+    conn: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    Json(body): Json<ChangePasswordBody>,
+) -> Response {
+    if let Err(r) = check_origin(&state, &headers) {
+        return *r;
+    }
+    let session = match local_session(&state, &headers).await {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let account = format!("p:{}", session.principal_id);
+    let ip = client_ip(&conn);
+    if !la.limiter.try_acquire(&account, &ip) {
+        return fail(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts");
+    }
+    let row: (String, bool, bool) = match sqlx::query_as(
+        "SELECT password_hash, totp_enrolled_at IS NOT NULL, COALESCE(locked_until > now(), false) \
+           FROM local_credential WHERE principal_id = $1",
+    )
+    .bind(session.principal_id)
+    .fetch_one(state.pool())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return internal("load credential", e),
+    };
+    let (hash, has_totp, locked) = row;
+    let ok = body.current_password.chars().count() <= local_auth::MAX_PASSWORD_CHARS
+        && local_auth::verify_password(&hash, &body.current_password).await;
+    if locked || !ok {
+        if let Err(e) = record_db_failure(state.pool(), session.principal_id).await {
+            return internal("record failed password", e);
+        }
+        return invalid_credentials();
+    }
+    la.limiter.refund(&account, &ip);
+    if let Err(reason) = local_auth::check_password_policy(&body.new_password) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "weak_password", "reason": reason })))
+            .into_response();
+    }
+    if body.new_password == body.current_password {
+        return fail(StatusCode::BAD_REQUEST, "same_password");
+    }
+    let new_hash = match local_auth::hash_password(&body.new_password).await {
+        Ok(h) => h,
+        Err(e) => return internal("hash_password", e),
+    };
+    if let Err(e) = store_password(state.pool(), session.principal_id, &session.principal_code, &new_hash).await {
+        return internal("store password", e);
+    }
+    let mfa = session.mfa_verified_at.is_some();
+    let next = next_step(has_totp, mfa, state.require_mfa);
+    match sessions::rotate_session(
+        state.pool(),
+        session.id,
+        session.principal_id,
+        AuthMethod::Local,
+        mfa,
+        &state.session_config.ttl,
+        user_agent(&headers),
+    )
+    .await
+    {
+        Ok(Some(token)) => {
+            state.event_bus().publish_auth_changed(session.principal_id);
+            with_cookie(Json(NextStep { next }).into_response(), session_cookie(&state, &token.plaintext))
+        }
+        Ok(None) => fail(StatusCode::UNAUTHORIZED, "unauthenticated"),
+        Err(e) => internal("rotate_session", e),
+    }
+}
+
+async fn store_password(pool: &PgPool, principal_id: Uuid, code: &str, hash: &str) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE local_credential SET password_hash = $2, \
+                failed_attempts = 0, locked_until = NULL WHERE principal_id = $1",
+    )
+    .bind(principal_id)
+    .bind(hash)
+    .execute(&mut *tx)
+    .await?;
+    crate::accounts::audit(&mut tx, code, "local.password_changed", principal_id, serde_json::json!({})).await?;
+    tx.commit().await
 }
 
 // ── sign-in methods ───────────────────────────────────────────────────────
@@ -878,14 +1003,15 @@ async fn activate_totp(
 /// The sign-in methods the login page may offer. Unauthenticated.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AuthMethods {
-    /// Email + password (then TOTP).
+    /// Email + password (then TOTP, if the user has it).
     pub local: bool,
     /// The configured OIDC provider, reachable at boot.
     pub sso: bool,
     pub sso_label: &'static str,
-    /// The deprecated shared admin password still works (until the first
-    /// named admin signs in); it can only bootstrap that admin.
-    pub legacy_admin: bool,
+    /// The sign-up form may be shown (`[auth].enable_signup`, local on).
+    pub signup: bool,
+    /// No admin exists yet: the page offers "Create the admin account".
+    pub first_run: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -895,14 +1021,20 @@ pub struct EnabledMethods {
 }
 
 /// Which sign-in buttons to show. Only enabled methods are reported; a
-/// database error reports the shared admin password as off.
+/// database error reports `first_run` false (fail closed).
 #[utoipa::path(
     get, path = "/auth/methods", tag = "auth",
     responses((status = 200, body = AuthMethods)),
 )]
 pub async fn methods(State(state): State<AppState>, Extension(m): Extension<EnabledMethods>) -> Json<AuthMethods> {
-    let legacy_admin = crate::admin_bootstrap::legacy_admin_enabled(state.pool()).await.unwrap_or(false);
-    Json(AuthMethods { local: m.local, sso: m.sso, sso_label: "Sign in with SSO", legacy_admin })
+    let first_run = m.local && crate::accounts::first_run(state.pool()).await.unwrap_or(false);
+    Json(AuthMethods {
+        local: m.local,
+        sso: m.sso,
+        sso_label: "Sign in with SSO",
+        signup: m.local && state.signup.enabled,
+        first_run,
+    })
 }
 
 /// `GET /auth/methods`, mounted whatever is configured: with nothing on it
@@ -916,20 +1048,20 @@ pub fn methods_routes(local: bool, sso: bool) -> axum::Router<AppState> {
 
 // ── router ─────────────────────────────────────────────────────────────────
 
-/// The routes of this module. Preview and logout-all serve any sign-in
-/// method; the `/auth/local/*` routes only exist when local login is enabled.
+/// The routes of this module. Logout-all serves any sign-in method; the
+/// `/auth/local/*` routes only exist when local login is enabled.
 pub fn routes(la: LocalAuth) -> axum::Router<AppState> {
-    use axum::routing::{get, post};
-    let mut router = axum::Router::new()
-        .route("/auth/invite/:token/preview", get(preview))
-        .route("/auth/logout-all", post(logout_all));
+    use axum::routing::post;
+    let mut router = axum::Router::new().route("/auth/logout-all", post(logout_all));
     if la.local_enabled {
         router = router
-            .route("/auth/local/enroll", post(enroll))
+            .route("/auth/local/signup", post(signup))
             .route("/auth/local/login", post(login))
             .route("/auth/local/totp", post(totp))
             .route("/auth/local/totp/enroll", post(totp_enroll))
-            .route("/auth/local/totp/confirm", post(totp_confirm));
+            .route("/auth/local/totp/confirm", post(totp_confirm))
+            .route("/auth/local/totp/disable", post(totp_disable))
+            .route("/auth/local/password", post(change_password));
     }
     router.layer(Extension(la)).layer(axum::middleware::map_response(no_store))
 }
@@ -954,6 +1086,9 @@ pub async fn logout_all(State(state): State<AppState>, headers: HeaderMap) -> Re
         Ok(s) => s,
         Err(r) => return r,
     };
+    if session.pending {
+        return crate::auth::approval_pending();
+    }
     if let Err(e) = sessions::revoke_all_for_principal(state.pool(), session.principal_id).await {
         return internal("revoke_all_for_principal", e);
     }
@@ -980,7 +1115,6 @@ mod tests {
             limiter: Arc::new(LoginLimiter::new(account, ip, std::time::Duration::from_secs(900))),
             master_key: Some(Arc::new(key())),
             local_enabled: true,
-            oidc_enabled: false,
         }
     }
 
@@ -988,9 +1122,13 @@ mod tests {
         la_with(ACCOUNT_FAILURES_PER_WINDOW, IP_FAILURES_PER_WINDOW)
     }
 
+    /// Strict MFA (`require_mfa = true`), the mode these tests were written
+    /// for; the optional default is covered in `first_run_tests`.
     fn app(pool: PgPool) -> AppState {
         let mut st = crate::handlers::tests::test_app_state(pool);
         st.session_config.public_base_url = Some(ORIGIN.to_string());
+        st.require_mfa = true;
+        st.signup = crate::accounts::SignupPolicy { enabled: true, pending_by_default: false };
         st
     }
 
@@ -1021,23 +1159,13 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    async fn invite(pool: &PgPool, email: &str, method: &str) -> String {
-        let inv = crate::invites::create(pool, email, "trader", &[], "admin").await.unwrap();
-        sqlx::query("UPDATE invite SET method = $1 WHERE id = $2")
-            .bind(method)
-            .bind(inv.invite_id)
-            .execute(pool)
-            .await
-            .unwrap();
-        inv.token
-    }
-
-    async fn enroll_req(st: &AppState, la: &LocalAuth, token: &str, pw: &str) -> Response {
-        enroll(
+    async fn signup_req(st: &AppState, la: &LocalAuth, email: &str, pw: &str) -> Response {
+        signup(
             State(st.clone()),
             Extension(la.clone()),
+            ip(1),
             hdrs(None),
-            Json(EnrollBody { token: token.into(), password: pw.into() }),
+            Json(SignupBody { name: "Test".into(), email: email.into(), password: pw.into() }),
         )
         .await
     }
@@ -1066,8 +1194,8 @@ mod tests {
     /// Enrol `email` all the way: password, TOTP, confirm. Returns the
     /// otpauth URI, the recovery codes and the MFA-verified session cookie.
     async fn enrolled(st: &AppState, la: &LocalAuth, email: &str) -> (String, Vec<String>, String) {
-        let token = invite(st.pool(), email, "any").await;
-        let resp = enroll_req(st, la, &token, PASSWORD).await;
+        let resp = signup_req(st, la, email, PASSWORD).await;
+        assert_eq!(resp.status(), StatusCode::OK);
         let cookie = cookie_of(&resp).unwrap();
         let resp = totp_enroll(State(st.clone()), Extension(la.clone()), hdrs(Some(&cookie))).await;
         let uri = body(resp).await["otpauth_uri"].as_str().unwrap().to_string();
@@ -1101,7 +1229,7 @@ mod tests {
         use tower::Service;
         let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
         let mut svc = routes(la()).with_state(app(pool));
-        for (method, uri) in [("GET", "/auth/invite/abc/preview"), ("POST", "/auth/local/login"), ("POST", "/auth/logout-all")] {
+        for (method, uri) in [("POST", "/auth/local/signup"), ("POST", "/auth/local/login"), ("POST", "/auth/logout-all")] {
             let req = axum::http::Request::builder()
                 .method(method)
                 .uri(uri)
@@ -1124,14 +1252,13 @@ mod tests {
         (status, body(resp).await)
     }
 
-    /// Unauthenticated; reports the configured methods. With the database
-    /// unreachable the shared admin password is reported off (fail closed).
+    /// Unauthenticated; reports the configured methods, without a database.
     #[tokio::test]
     async fn methods_reports_configured_methods() {
         let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
         let (status, b) = methods_body(pool, true, false).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(b, serde_json::json!({ "local": true, "sso": false, "sso_label": "Sign in with SSO", "legacy_admin": false }));
+        assert_eq!(b, serde_json::json!({ "local": true, "sso": false, "sso_label": "Sign in with SSO", "signup": true, "first_run": false }));
     }
 
     fn sso_only_settings() -> crate::config::AuthSettings {
@@ -1147,8 +1274,8 @@ mod tests {
         use tower::Service;
         let s = sso_only_settings();
         let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
-        let mut svc = routes(LocalAuth::new(Some(key()), s.local_enabled, true)).with_state(app(pool));
-        for uri in ["/auth/local/login", "/auth/local/enroll"] {
+        let mut svc = routes(LocalAuth::new(Some(key()), s.local_enabled)).with_state(app(pool));
+        for uri in ["/auth/local/login", "/auth/local/signup"] {
             let req = axum::http::Request::builder()
                 .method("POST")
                 .uri(uri)
@@ -1170,16 +1297,15 @@ mod tests {
         assert_eq!(b["sso"], true);
     }
 
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn methods_reports_legacy_admin_setting() {
-        let pool = migrated_db().await;
-        sqlx::query("UPDATE system_setting SET value = 'true'::jsonb WHERE key = 'legacy_admin_enabled'").execute(&pool).await.unwrap();
-        let (_, b) = methods_body(pool.clone(), false, true).await;
-        assert_eq!(b, serde_json::json!({ "local": false, "sso": true, "sso_label": "Sign in with SSO", "legacy_admin": true }));
-        sqlx::query("UPDATE system_setting SET value = 'false'::jsonb WHERE key = 'legacy_admin_enabled'").execute(&pool).await.unwrap();
-        let (_, b) = methods_body(pool, false, true).await;
-        assert_eq!(b["legacy_admin"], false);
+    #[test]
+    fn next_step_follows_the_mfa_policy() {
+        assert_eq!(next_step(true, false, false), "totp");
+        assert_eq!(next_step(true, true, false), "done");
+        assert_eq!(next_step(false, false, true), "totp_enroll");
+        assert_eq!(next_step(false, true, false), "done");
+        assert!(password_is_enough(false, false));
+        assert!(!password_is_enough(false, true), "an enrolled TOTP is always asked for");
+        assert!(!password_is_enough(true, false));
     }
 
     #[test]
@@ -1198,80 +1324,6 @@ mod tests {
         let short = LoginLimiter::new(1, 1, std::time::Duration::from_millis(0));
         assert!(short.try_acquire("a", "1"));
         assert!(short.try_acquire("a", "1"), "an expired window no longer counts");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn enroll_sets_password_claims_invite_and_needs_totp() {
-        let pool = migrated_db().await;
-        let st = app(pool.clone());
-        let token = invite(&pool, "ann@fund.test", "local").await;
-        let resp = enroll_req(&st, &la(), &token, PASSWORD).await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let cookie = cookie_of(&resp).unwrap();
-        assert_eq!(body(resp).await, serde_json::json!({ "next": "totp_enroll" }));
-
-        let s = session_of(&pool, &cookie).await.expect("session");
-        assert_eq!(s.auth_method, crate::sessions::AuthMethod::Local);
-        assert!(s.mfa_verified_at.is_none());
-        let row = sqlx::query(
-            "SELECT p.status, i.accepted_at IS NOT NULL AS accepted, \
-                    (SELECT count(*) FROM principal_identity pi WHERE pi.principal_id = p.id \
-                       AND pi.issuer = 'urn:openoms:local' AND pi.subject = p.id::text) AS ident, \
-                    (SELECT count(*) FROM audit_event a WHERE a.target_principal_id = p.id \
-                       AND a.action = 'invite.accepted.local') AS audited, \
-                    (SELECT password_hash FROM local_credential c WHERE c.principal_id = p.id) AS hash \
-               FROM invite i JOIN principal p ON p.id = i.principal_id WHERE p.email = 'ann@fund.test'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row.get::<String, _>("status"), "ACTIVE");
-        assert!(row.get::<bool, _>("accepted"));
-        assert_eq!(row.get::<i64, _>("ident"), 1);
-        assert_eq!(row.get::<i64, _>("audited"), 1);
-        assert!(crate::local_auth::verify_password(&row.get::<String, _>("hash"), PASSWORD).await);
-
-        // The invite is spent.
-        let again = enroll_req(&st, &la(), &token, PASSWORD).await;
-        assert_eq!(again.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn enroll_refused_for_oidc_only_invite() {
-        let pool = migrated_db().await;
-        let st = app(pool.clone());
-        let token = invite(&pool, "bob@fund.test", "oidc").await;
-        let resp = enroll_req(&st, &la(), &token, PASSWORD).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(cookie_of(&resp).is_none());
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM local_credential").fetch_one(&pool).await.unwrap();
-        assert_eq!(n, 0);
-        let pending: bool = sqlx::query_scalar("SELECT accepted_at IS NULL FROM invite WHERE email = 'bob@fund.test'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(pending, "a refused claim must not consume the invite");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn enroll_refused_when_credential_exists() {
-        let pool = migrated_db().await;
-        let st = app(pool.clone());
-        let token = invite(&pool, "cy@fund.test", "any").await;
-        sqlx::query(
-            "INSERT INTO local_credential (principal_id, password_hash) \
-             SELECT principal_id, 'x' FROM invite WHERE email = 'cy@fund.test'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let resp = enroll_req(&st, &la(), &token, PASSWORD).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let hash: String = sqlx::query_scalar("SELECT password_hash FROM local_credential").fetch_one(&pool).await.unwrap();
-        assert_eq!(hash, "x", "an existing credential must not be overwritten");
     }
 
     #[tokio::test]
@@ -1398,43 +1450,6 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-    async fn preview_reveals_scope_only_for_valid_token() {
-        let pool = migrated_db().await;
-        let st = app(pool.clone());
-        let pf = Uuid::new_v4();
-        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, 'ALPHA', 'p', 'ACTIVE')")
-            .bind(pf)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let inv = crate::invites::create(&pool, "ivy@fund.test", "pm", &[(pf, true)], "admin").await.unwrap();
-        let mut l = la();
-        l.oidc_enabled = true;
-
-        let resp = preview(State(st.clone()), Extension(l.clone()), Path(inv.token.clone())).await;
-        let v = body(resp).await;
-        assert_eq!(v["valid"], true);
-        assert_eq!(v["role"], "pm");
-        assert_eq!(v["portfolios"], serde_json::json!(["ALPHA"]));
-        assert_eq!(v["methods"], serde_json::json!(["local", "oidc"]));
-        assert_eq!(v["email_hint"], "i…@fund.test");
-
-        let bad = body(preview(State(st.clone()), Extension(l.clone()), Path("nope".into())).await).await;
-        assert_eq!(bad["valid"], false);
-        assert!(bad["role"].is_null() && bad["portfolios"] == serde_json::json!([]));
-        let mut keys: Vec<_> = v.as_object().unwrap().keys().collect();
-        let mut bad_keys: Vec<_> = bad.as_object().unwrap().keys().collect();
-        keys.sort();
-        bad_keys.sort();
-        assert_eq!(keys, bad_keys, "same shape for valid and invalid tokens");
-
-        crate::invites::revoke(&pool, inv.invite_id, "admin").await.unwrap();
-        let revoked = body(preview(State(st), Extension(l), Path(inv.token)).await).await;
-        assert_eq!(revoked["valid"], false);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
     async fn logout_all_revokes_every_session() {
         let pool = migrated_db().await;
         let st = app(pool.clone());
@@ -1474,8 +1489,8 @@ mod tests {
         let pool = migrated_db().await;
         let st = app(pool.clone());
         let l = la();
-        let token = invite(&pool, "swap@fund.test", "any").await;
-        let cookie = cookie_of(&enroll_req(&st, &l, &token, PASSWORD).await).unwrap();
+        let token = "swap@fund.test".to_string();
+        let cookie = cookie_of(&signup_req(&st, &l, &token, PASSWORD).await).unwrap();
         totp_enroll(State(st.clone()), Extension(l.clone()), hdrs(Some(&cookie))).await;
         let pid = session_of(&pool, &cookie).await.unwrap().principal_id;
         // The code was checked against some other secret than the one now pending.
@@ -1512,7 +1527,7 @@ mod tests {
         assert_eq!(login_req(&st, &l, 1, "tl@fund.test", PASSWORD).await.status(), StatusCode::UNAUTHORIZED);
     }
 
-    async fn lock_state(pool: &PgPool, email: &str) -> (i32, Option<DateTime<Utc>>) {
+    async fn lock_state(pool: &PgPool, email: &str) -> (i32, Option<chrono::DateTime<Utc>>) {
         sqlx::query_as(
             "SELECT c.failed_attempts, c.locked_until FROM local_credential c JOIN principal p ON p.id = c.principal_id \
               WHERE p.email = $1",
@@ -1542,8 +1557,8 @@ mod tests {
         let pool = migrated_db().await;
         let st = app(pool.clone());
         let l = la_with(1000, 1000);
-        let token = invite(&pool, "cl@fund.test", "any").await;
-        let cookie = cookie_of(&enroll_req(&st, &l, &token, PASSWORD).await).unwrap();
+        let token = "cl@fund.test".to_string();
+        let cookie = cookie_of(&signup_req(&st, &l, &token, PASSWORD).await).unwrap();
         let uri = body(totp_enroll(State(st.clone()), Extension(l.clone()), hdrs(Some(&cookie))).await).await["otpauth_uri"]
             .as_str()
             .unwrap()
@@ -1571,8 +1586,8 @@ mod tests {
         let pool = migrated_db().await;
         let st = app(pool.clone());
         let l = la_with(1000, 1000);
-        let token = invite(&pool, "rs@fund.test", "any").await;
-        let cookie = cookie_of(&enroll_req(&st, &l, &token, PASSWORD).await).unwrap();
+        let token = "rs@fund.test".to_string();
+        let cookie = cookie_of(&signup_req(&st, &l, &token, PASSWORD).await).unwrap();
         let uri = body(totp_enroll(State(st.clone()), Extension(l.clone()), hdrs(Some(&cookie))).await).await["otpauth_uri"]
             .as_str()
             .unwrap()
@@ -1642,9 +1657,9 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let token = invite(&pool, "kim@fund.test", "any").await;
+        let token = "kim@fund.test".to_string();
         let mut bodies = String::new();
-        let r = enroll_req(&st, &l, &token, PASSWORD).await;
+        let r = signup_req(&st, &l, &token, PASSWORD).await;
         let cookie = cookie_of(&r).unwrap();
         bodies.push_str(&body(r).await.to_string());
         let r = totp_enroll(State(st.clone()), Extension(l.clone()), hdrs(Some(&cookie))).await;
@@ -1656,10 +1671,10 @@ mod tests {
             let r = login_req(&st, &l, 1, "kim@fund.test", pw).await;
             bodies.push_str(&body(r).await.to_string());
         }
-        bodies.push_str(&body(enroll_req(&st, &l, &token, PASSWORD).await).await.to_string());
+        bodies.push_str(&body(signup_req(&st, &l, &token, PASSWORD).await).await.to_string());
 
         let logs = String::from_utf8(cap.0.lock().unwrap().clone()).unwrap();
-        for (what, needle) in [("password", PASSWORD), ("totp secret", secret.as_str()), ("invite token", token.as_str()), ("session token", cookie.as_str())] {
+        for (what, needle) in [("password", PASSWORD), ("totp secret", secret.as_str()), ("session token", cookie.as_str())] {
             assert!(!bodies.contains(needle), "{what} leaked into a response body");
             assert!(!logs.contains(needle), "{what} leaked into the logs");
         }

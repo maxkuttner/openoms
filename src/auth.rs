@@ -29,8 +29,6 @@ pub struct AuthContext {
 pub enum AuthMethod {
     Oidc,
     Local,
-    /// The deprecated shared admin password (or a session minted from it).
-    LegacyAdmin,
     /// A machine credential: an API key, or a strategy's own session.
     ApiKey,
     /// The per-boot host token (`oms` CLI on the host), a machine credential.
@@ -42,7 +40,6 @@ impl AuthMethod {
         match self {
             AuthMethod::Oidc => "oidc",
             AuthMethod::Local => "local",
-            AuthMethod::LegacyAdmin => "legacy_admin",
             AuthMethod::ApiKey => "api_key",
             AuthMethod::HostCli => "host_cli",
         }
@@ -59,7 +56,6 @@ impl AuthContext {
         let auth_method = match record.auth_method {
             crate::sessions::AuthMethod::Oidc => AuthMethod::Oidc,
             crate::sessions::AuthMethod::Local => AuthMethod::Local,
-            crate::sessions::AuthMethod::LegacyAdmin => AuthMethod::LegacyAdmin,
         };
         AuthContext {
             principal_id: record.principal_id,
@@ -91,21 +87,64 @@ pub enum CredentialKind {
 /// here, so the cookie policy is computed once at boot (see `AppState`) and
 /// so the idle/absolute TTL is never silently hardcoded — a later task makes
 /// it configurable, and doing the derivation per call would ignore that.
+///
+/// The middlewares use `resolve`, which also says whether the session is held
+/// to a password change; this is its plain form, for tests.
+#[cfg(test)]
 pub async fn authenticate(
     pool: &sqlx::PgPool,
     headers: &axum::http::HeaderMap,
     session_config: &SessionConfig,
 ) -> Result<Option<(AuthContext, CredentialKind)>, Response> {
+    Ok(resolve(pool, headers, session_config).await?.map(|r| (r.ctx, r.kind)))
+}
+
+/// What `authenticate` found, plus whether the account is PENDING approval.
+struct Resolved {
+    ctx: AuthContext,
+    kind: CredentialKind,
+    pending: bool,
+}
+
+async fn resolve(
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    session_config: &SessionConfig,
+) -> Result<Option<Resolved>, Response> {
     if let Some(record) = authenticate_session(pool, headers, session_config).await? {
-        return Ok(Some((AuthContext::from_session(record), CredentialKind::Session)));
+        let pending = record.pending;
+        return Ok(Some(Resolved { ctx: AuthContext::from_session(record), kind: CredentialKind::Session, pending }));
     }
 
     let Ok((key_id, secret)) = extract_trading_credentials(headers) else {
         return Ok(None);
     };
-    Ok(verify_key(pool, &key_id, &secret).await?.map(|(principal_id, principal_code)| {
-        (AuthContext::machine(principal_id, principal_code), CredentialKind::ApiKey)
+    Ok(verify_key(pool, &key_id, &secret).await?.map(|(principal_id, principal_code)| Resolved {
+        ctx: AuthContext::machine(principal_id, principal_code),
+        kind: CredentialKind::ApiKey,
+        pending: false,
     }))
+}
+
+/// The JSON body of the 403 a PENDING account gets.
+pub const APPROVAL_PENDING_BODY: &str = r#"{"error":"approval_pending"}"#;
+
+/// The only route behind `auth_middleware` a PENDING account may call. The
+/// others it may use (`/auth/methods`, `/auth/logout`) carry no auth
+/// middleware at all.
+const PENDING_ALLOWED: &[&str] = &["/auth/me"];
+
+/// Whether a PENDING account must be refused `path` (with `approval_pending`).
+pub fn pending_blocks(pending: bool, path: &str) -> bool {
+    pending && !PENDING_ALLOWED.contains(&path)
+}
+
+pub fn approval_pending() -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(APPROVAL_PENDING_BODY.into())
+        .unwrap()
 }
 
 /// The session half of `authenticate`: the live session record behind the
@@ -154,11 +193,13 @@ pub async fn auth_middleware(
     mut req: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    let (ctx, kind) = authenticate(state.pool(), req.headers(), &state.session_config)
-        .await?
-        .ok_or_else(unauthorized)?;
+    let Resolved { ctx, kind, pending } =
+        resolve(state.pool(), req.headers(), &state.session_config).await?.ok_or_else(unauthorized)?;
 
     enforce_origin_for_session(kind, req.headers(), req.method(), &state.session_config)?;
+    if pending_blocks(pending, req.uri().path()) {
+        return Err(approval_pending());
+    }
 
     if let Some(code) = crate::strategies::stopped_strategy(&state.strategies().all(), ctx.principal_id) {
         return Err(axum::response::IntoResponse::into_response((StatusCode::FORBIDDEN, format!("strategy {code} is stopped"))));
@@ -249,17 +290,12 @@ pub async fn verify_key(
 /// origin check and, for a mutation, `authz::require_mfa`.
 /// API keys never open `/admin/*`.
 ///
-/// The legacy door: while `system_setting.legacy_admin_enabled` is true, the
-/// deprecated shared password is also accepted as `Bearer <password>`. It
-/// acts as the synthetic `legacy-admin`, which may read any admin route and
-/// create a named admin (`POST /admin/users/bootstrap-admin`), nothing else.
-/// Its `principal_id` is the nil UUID, which never exists in `principal`, so
-/// it can never satisfy a trading or authz check.
+/// A PENDING account gets 403 `approval_pending`.
 ///
 /// The host door: `Bearer <host token>` (written 0600 next to the config at
-/// boot) from a loopback peer acts as `host-cli` with full admin capability,
-/// before and after cutover. It is how `oms status` / `oms setup sync-broker`
-/// reach the server.
+/// boot) from a loopback peer acts as `host-cli` with full admin capability.
+/// It is how `oms status` / `oms setup sync-broker` reach the server. There
+/// is no other bearer: the old shared admin password is gone.
 pub async fn admin_middleware(
     State(state): State<AppState>,
     mut req: Request<Body>,
@@ -268,6 +304,9 @@ pub async fn admin_middleware(
     let pool = state.pool();
     if let Some(session) = authenticate_session(pool, req.headers(), &state.session_config).await? {
         enforce_origin_for_session(CredentialKind::Session, req.headers(), req.method(), &state.session_config)?;
+        if pending_blocks(session.pending, req.uri().path()) {
+            return Err(approval_pending());
+        }
         let is_admin = crate::admin_bootstrap::is_active_admin(pool, session.principal_id)
             .await
             .map_err(|_| service_unavailable())?;
@@ -281,31 +320,14 @@ pub async fn admin_middleware(
     }
 
     let token = extract_bearer_token(req.headers()).map_err(|_| unauthorized())?;
-    // The per-boot host token: loopback peers only, independent of the
-    // legacy flag; acts as `host-cli`.
+    // The per-boot host token: loopback peers only; acts as `host-cli`.
     let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0);
-    if crate::admin_bootstrap::host_token_ok(state.host_token_hash.as_deref(), &token, peer) {
-        let ctx = crate::admin_bootstrap::host_context();
-        admin_mfa_gate(req.method(), &ctx).map_err(axum::response::IntoResponse::into_response)?;
-        req.extensions_mut().insert(ctx);
-        return Ok(next.run(req).await);
-    }
-    let Some(password) = state.legacy_admin_password.as_deref() else {
-        return Err(unauthorized());
-    };
-    if !constant_time_eq(token.as_bytes(), password.as_bytes()) {
+    if !crate::admin_bootstrap::host_token_ok(state.host_token_hash.as_deref(), &token, peer) {
         return Err(unauthorized());
     }
-    let enabled = crate::admin_bootstrap::legacy_admin_enabled(pool).await.map_err(|_| service_unavailable())?;
-    if !enabled {
-        return Err(forbidden_because("the shared admin password is disabled; sign in as a named admin"));
-    }
-    if !crate::admin_bootstrap::legacy_may(req.method(), req.uri().path()) {
-        return Err(forbidden_because("create a named admin first"));
-    }
-    // Not passed through `admin_mfa_gate`: `legacy_may` already confines it to
-    // reads and the first-admin bootstrap, which must work before anyone has MFA.
-    req.extensions_mut().insert(crate::admin_bootstrap::legacy_context());
+    let ctx = crate::admin_bootstrap::host_context();
+    admin_mfa_gate(req.method(), &ctx).map_err(axum::response::IntoResponse::into_response)?;
+    req.extensions_mut().insert(ctx);
     Ok(next.run(req).await)
 }
 
@@ -368,13 +390,6 @@ fn extract_bearer_token(headers: &header::HeaderMap) -> Result<String, ()> {
     Ok(token.to_string())
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 fn unauthorized() -> Response {
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
@@ -411,9 +426,18 @@ mod tests {
     fn auth_method_names() {
         assert_eq!(AuthMethod::Local.as_str(), "local");
         assert_eq!(AuthMethod::Oidc.as_str(), "oidc");
-        assert_eq!(AuthMethod::LegacyAdmin.as_str(), "legacy_admin");
         assert_eq!(AuthMethod::ApiKey.as_str(), "api_key");
         assert_eq!(AuthMethod::HostCli.as_str(), "host_cli");
+    }
+
+    #[test]
+    fn pending_lets_only_me_through() {
+        assert!(!pending_blocks(false, "/orders/submit"));
+        assert!(!pending_blocks(true, "/auth/me"));
+        for path in ["/orders/submit", "/admin/users", "/portfolios", "/updates"] {
+            assert!(pending_blocks(true, path), "{path}");
+        }
+        assert_eq!(approval_pending().status(), StatusCode::FORBIDDEN);
     }
 
     use super::*;
