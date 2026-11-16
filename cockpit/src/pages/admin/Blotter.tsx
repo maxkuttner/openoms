@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { Group, Title, Table, Select, Loader, Text, Badge, Stack, Button, Tooltip, Drawer } from "@mantine/core";
-import { useList } from "../api/hooks";
-import { api } from "../api/client";
-import { InstrumentSelect } from "../components/InstrumentSelect";
-import { OrderTimeline } from "../components/OrderTimeline";
-import type { BlotterRow, Portfolio } from "../api/types";
+import { useList } from "../../api/hooks";
+import { api } from "../../api/client";
+import { InstrumentSelect } from "../../components/InstrumentSelect";
+import { OrderTimeline } from "../../components/OrderTimeline";
+import type { BlotterRow, Portfolio } from "../../api/types";
 
 const STATUSES = ["submitted", "routed", "partially_filled", "filled", "canceled", "rejected", "expired"].map(
   (s) => ({ value: s, label: s }),

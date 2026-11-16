@@ -1,4 +1,4 @@
-import { CrudResource } from "../components/CrudResource";
+import { CrudResource } from "../../components/CrudResource";
 
 const TRADING_STATE = [
   { value: "ACTIVE", label: "ACTIVE" },

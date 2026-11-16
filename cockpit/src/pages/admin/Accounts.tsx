@@ -1,5 +1,5 @@
-import { CrudResource } from "../components/CrudResource";
-import { statusOptions } from "../lifecycle";
+import { CrudResource } from "../../components/CrudResource";
+import { statusOptions } from "../../lifecycle";
 
 const STATUS = statusOptions("account");
 

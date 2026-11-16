@@ -1,5 +1,8 @@
 import { useState, type ReactNode } from "react";
-import { Button, Checkbox, Group, Modal, Paper, Stack, Switch, Text } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Switch } from "@/components/ui/switch";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { notifyError, notifyOk } from "../api/hooks";
@@ -63,87 +66,80 @@ export function useLifecycle<T extends Row>(rows: T[] | undefined, opts: Options
   const reactivate = (targets: T[]) => setStatus.mutate({ targets, status: "ACTIVE" });
 
   const switchControl = (
-    <Switch
-      label="Show inactive"
-      checked={showInactive}
-      onChange={(e) => {
-        setShowInactive(e.currentTarget.checked);
-        setSelected(new Set());
-      }}
-    />
+    <label className="flex items-center gap-2 text-foreground-2">
+      <Switch
+        checked={showInactive}
+        onCheckedChange={(on) => {
+          setShowInactive(on);
+          setSelected(new Set());
+        }}
+      />
+      Show inactive
+    </label>
   );
 
   const headerCheckbox = (
     <Checkbox
       aria-label="Select all"
-      checked={allPicked}
-      indeterminate={picked.length > 0 && !allPicked}
-      onChange={toggleAll}
+      checked={allPicked ? true : picked.length > 0 ? "indeterminate" : false}
+      onCheckedChange={toggleAll}
     />
   );
 
   const rowCheckbox = (r: T) => (
-    <Checkbox aria-label={`Select ${opts.label(r)}`} checked={selected.has(id(r))} onChange={() => toggle(r)} />
+    <Checkbox aria-label={`Select ${opts.label(r)}`} checked={selected.has(id(r))} onCheckedChange={() => toggle(r)} />
   );
 
   // Shown in place of Edit on an inactive row.
   const reactivateButton = (r: T) => (
-    <Button size="xs" variant="outline" loading={setStatus.isPending} onClick={() => reactivate([r])}>
+    <Button size="xs" variant="outline" disabled={setStatus.isPending} onClick={() => reactivate([r])}>
       Reactivate
     </Button>
   );
 
   const selectionBar: ReactNode =
     picked.length > 0 ? (
-      <Paper withBorder p="xs">
-        <Group justify="space-between">
-          <Text size="sm">{picked.length} selected</Text>
-          <Group gap="xs">
-            <Button size="xs" variant="default" onClick={() => setSelected(new Set())}>
-              Clear
+      <div className="flex items-center justify-between rounded-md border bg-card px-3 py-1.5">
+        <span>{picked.length} selected</span>
+        <div className="flex gap-2">
+          <Button size="xs" variant="outline" onClick={() => setSelected(new Set())}>Clear</Button>
+          {deactivating ? (
+            <Button size="xs" variant="destructive" onClick={() => setConfirming(picked.filter((r) => isActive(r.status)))}>
+              Deactivate {picked.filter((r) => isActive(r.status)).length}
             </Button>
-            {deactivating ? (
-              <Button size="xs" color="red" onClick={() => setConfirming(picked.filter((r) => isActive(r.status)))}>
-                Deactivate {picked.filter((r) => isActive(r.status)).length}
-              </Button>
-            ) : (
-              <Button size="xs" loading={setStatus.isPending} onClick={() => reactivate(picked)}>
-                Reactivate {picked.length}
-              </Button>
-            )}
-          </Group>
-        </Group>
-      </Paper>
+          ) : (
+            <Button size="xs" disabled={setStatus.isPending} onClick={() => reactivate(picked)}>
+              Reactivate {picked.length}
+            </Button>
+          )}
+        </div>
+      </div>
     ) : null;
 
   const confirmModal = (
-    <Modal opened={!!confirming} onClose={() => setConfirming(null)} title="Deactivate" centered>
-      <Stack>
-        <Text size="sm">
-          These are set to {INACTIVE[opts.resource]} and hidden. Their history stays; "Show inactive" brings them
-          back.
-        </Text>
-        <Stack gap={2}>
-          {(confirming ?? []).map((r) => (
-            <Text key={id(r)} size="sm" ff="monospace">
-              {opts.label(r)}
-            </Text>
-          ))}
-        </Stack>
-        <Group justify="flex-end">
-          <Button variant="default" onClick={() => setConfirming(null)}>
-            Cancel
-          </Button>
+    <Dialog open={!!confirming} onOpenChange={(o) => { if (!o) setConfirming(null); }}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Deactivate</DialogTitle>
+          <DialogDescription>
+            These are set to {INACTIVE[opts.resource]} and hidden. Their history stays; "Show inactive" brings them back.
+          </DialogDescription>
+        </DialogHeader>
+        <ul className="num flex flex-col gap-0.5">
+          {(confirming ?? []).map((r) => <li key={id(r)}>{opts.label(r)}</li>)}
+        </ul>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setConfirming(null)}>Cancel</Button>
           <Button
-            color="red"
-            loading={setStatus.isPending}
+            variant="destructive"
+            disabled={setStatus.isPending}
             onClick={() => confirming && setStatus.mutate({ targets: confirming, status: INACTIVE[opts.resource] })}
           >
             Deactivate {confirming?.length}
           </Button>
-        </Group>
-      </Stack>
-    </Modal>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 
   return {

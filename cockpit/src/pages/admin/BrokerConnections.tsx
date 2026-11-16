@@ -1,14 +1,14 @@
 import { useState } from "react";
 import { Button, Drawer, Stack } from "@mantine/core";
-import { CrudResource } from "../components/CrudResource";
-import { statusOptions } from "../lifecycle";
-import { api } from "../api/client";
-import { useList } from "../api/hooks";
-import { autoCode, environmentOptions, venueOptions, type Venue } from "../venues";
-import { CredentialsPanel } from "../components/CredentialsPanel";
-import { StreamHealthStrip } from "../components/StreamHealthStrip";
-import { UniverseStatus } from "../components/UniverseStatus";
-import type { BrokerConnection } from "../api/types";
+import { CrudResource } from "../../components/CrudResource";
+import { statusOptions } from "../../lifecycle";
+import { api } from "../../api/client";
+import { useList } from "../../api/hooks";
+import { autoCode, environmentOptions, venueOptions, type Venue } from "../../venues";
+import { CredentialsPanel } from "../../components/CredentialsPanel";
+import { StreamHealthStrip } from "../../components/StreamHealthStrip";
+import { UniverseStatus } from "../../components/UniverseStatus";
+import type { BrokerConnection } from "../../api/types";
 
 const STATUS = statusOptions("brokerConnection");
 

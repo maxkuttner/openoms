@@ -1,10 +1,10 @@
 import { useState } from "react";
 import { Badge, Button, Drawer, Group, Loader, Stack, Table, Text, Title } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
-import { api } from "../api/client";
-import { StreamHealthStrip } from "../components/StreamHealthStrip";
-import { CredentialsPanel } from "../components/CredentialsPanel";
-import type { FeedConnectionSummary, FeedSummary } from "../api/types";
+import { api } from "../../api/client";
+import { StreamHealthStrip } from "../../components/StreamHealthStrip";
+import { CredentialsPanel } from "../../components/CredentialsPanel";
+import type { FeedConnectionSummary, FeedSummary } from "../../api/types";
 
 // Market-data feeds — distinct from broker connections (execution). Shows live
 // feed stream health, the configured feed connections (where credentials are

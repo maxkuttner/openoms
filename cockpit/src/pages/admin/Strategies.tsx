@@ -1,11 +1,16 @@
 import { useEffect, useState } from "react";
-import { Badge, Button, Code, CopyButton, Group, Modal, MultiSelect, PasswordInput, Select, Stack, Text, Textarea } from "@mantine/core";
-import { CrudResource } from "../components/CrudResource";
-import { DeploymentPanel } from "../components/DeploymentPanel";
-import { api } from "../api/client";
-import { notifyError, notifyOk, useList } from "../api/hooks";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { CopyText, FormRow } from "../../components/common";
+import { MultiSelect, Select, TextField } from "../../components/form";
+import { Modal } from "../../components/overlay";
+import { Pill } from "../../components/status";
+import { CrudResource } from "../../components/CrudResource";
+import { DeploymentPanel } from "../../components/DeploymentPanel";
+import { api } from "../../api/client";
+import { notifyError, notifyOk, useList } from "../../api/hooks";
 import { useQueryClient } from "@tanstack/react-query";
-import { connectionEntries, isColocated, killLabel, reportSummary, savedAccounts, type ControlReport } from "../strategies";
+import { connectionEntries, isColocated, killLabel, reportSummary, savedAccounts, type ControlReport } from "../../strategies";
 
 const PATH = "/admin/strategies";
 
@@ -51,14 +56,9 @@ function HandoverForm({ strategy, users, onClose }: { strategy: Strategy; users:
       .catch(notifyError)
       .finally(() => qc.invalidateQueries({ queryKey: [PATH] }));
   return (
-    <Modal opened onClose={onClose} title={`Hand over — ${strategy.code}`} centered>
-      <Stack>
-        <Text fz="sm">Responsible now: {strategy.responsible ? userLabel(strategy.responsible) : "nobody"}</Text>
-        <Select label="New responsible user" data={activeUserOptions(users)} value={to} onChange={setTo} searchable />
-        <Group justify="flex-end">
-          <Button onClick={save} disabled={!to}>Hand over</Button>
-        </Group>
-      </Stack>
+    <Modal open onClose={onClose} title={`Hand over — ${strategy.code}`} footer={<Button onClick={save} disabled={!to}>Hand over</Button>}>
+      <p>Responsible now: {strategy.responsible ? userLabel(strategy.responsible) : "nobody"}</p>
+      <Select label="New responsible user" data={activeUserOptions(users)} value={to} onChange={setTo} />
     </Modal>
   );
 }
@@ -81,14 +81,11 @@ function FollowKeyForm({ code, onClose }: { code: string; onClose: () => void })
       .then(() => { notifyOk("Follow key stored"); onClose(); })
       .catch(notifyError);
   return (
-    <Modal opened onClose={onClose} title={`Follow key — ${code}`} centered>
-      <Stack>
-        <PasswordInput label="API key" value={apiKey} onChange={(e) => setApiKey(e.currentTarget.value)} />
-        <Textarea label="Private key (PEM)" autosize minRows={4} value={privateKey} onChange={(e) => setPrivateKey(e.currentTarget.value)} />
-        <Group justify="flex-end">
-          <Button onClick={save} disabled={!apiKey || !privateKey}>Save</Button>
-        </Group>
-      </Stack>
+    <Modal open onClose={onClose} title={`Follow key — ${code}`} footer={<Button onClick={save} disabled={!apiKey || !privateKey}>Save</Button>}>
+      <TextField label="API key" type="password" value={apiKey} onChange={setApiKey} />
+      <FormRow label="Private key (PEM)">
+        <Textarea className="num min-h-24 text-xs" value={privateKey} onChange={(e) => setPrivateKey(e.currentTarget.value)} />
+      </FormRow>
     </Modal>
   );
 }
@@ -98,14 +95,11 @@ type ConnectionRow = { code: string; broker_code: string };
 
 function Confirm({ title, body, onConfirm, onClose }: { title: string; body: string; onConfirm: () => void; onClose: () => void }) {
   return (
-    <Modal opened onClose={onClose} title={title} centered>
-      <Stack>
-        <Text>{body}</Text>
-        <Group justify="flex-end">
-          <Button variant="default" onClick={onClose}>Cancel</Button>
-          <Button color="red" onClick={() => { onConfirm(); onClose(); }}>{title}</Button>
-        </Group>
-      </Stack>
+    <Modal open onClose={onClose} title={title} footer={<>
+      <Button variant="outline" onClick={onClose}>Cancel</Button>
+      <Button variant="destructive" onClick={() => { onConfirm(); onClose(); }}>{title}</Button>
+    </>}>
+      <p>{body}</p>
     </Modal>
   );
 }
@@ -122,18 +116,13 @@ function ConnectionsEditor({ strategy, onClose }: { strategy: Strategy; onClose:
       .then(() => { notifyOk("Connections saved"); onClose(); })
       .catch(notifyError);
   return (
-    <Modal opened onClose={onClose} title={`Connections — ${strategy.code}`} centered>
-      <Stack>
-        <MultiSelect
-          label="Accounts"
-          data={accounts.map((a) => ({ value: a.id, label: `${a.code} (${a.broker_connection_code})` }))}
-          value={picked}
-          onChange={setPicked}
-        />
-        <Group justify="flex-end">
-          <Button onClick={save}>Save</Button>
-        </Group>
-      </Stack>
+    <Modal open onClose={onClose} title={`Connections — ${strategy.code}`} footer={<Button onClick={save}>Save</Button>}>
+      <MultiSelect
+        label="Accounts"
+        data={accounts.map((a) => ({ value: a.id, label: `${a.code} (${a.broker_connection_code})` }))}
+        value={picked}
+        onChange={setPicked}
+      />
     </Modal>
   );
 }
@@ -173,17 +162,18 @@ export function StrategiesPage() {
   const live = rows.filter((r) => r.session_live).length;
 
   return (
-    <Stack gap="lg">
-      <Group justify="flex-end">
+    <div className="flex flex-col gap-3">
+      <div className="flex justify-end">
         <Button
-          variant="light"
+          size="sm"
+          variant="secondary"
           onClick={() =>
             setConfirm({ title: "Restart FIX acceptor", body: `Logs out ${live} session(s).`, run: restart })
           }
         >
           Restart FIX acceptor
         </Button>
-      </Group>
+      </div>
       <CrudResource
         title="Strategies"
         path={PATH}
@@ -191,11 +181,11 @@ export function StrategiesPage() {
         editable
         deletable
         rowAction={(row: Strategy) => (
-          <Group gap={4} wrap="nowrap">
+          <div className="flex flex-nowrap gap-1">
             {killLabel(row.state) === "Kill" ? (
               <Button
                 size="xs"
-                color="red"
+                variant="destructive"
                 onClick={() =>
                   setConfirm({ title: "Kill", body: `Halt ${row.code}, cancel its open orders and log it out.`, run: () => control(row.code, "kill") })
                 }
@@ -203,12 +193,12 @@ export function StrategiesPage() {
                 Kill
               </Button>
             ) : (
-              <Button size="xs" variant="light" onClick={() => enable(row.code)}>Enable</Button>
+              <Button size="xs" variant="secondary" onClick={() => enable(row.code)}>Enable</Button>
             )}
             <Button
               size="xs"
-              variant="light"
-              color="orange"
+              variant="secondary"
+              className="text-warn"
               onClick={() =>
                 setConfirm({ title: "Flatten", body: `Kill ${row.code} and close every position it holds.`, run: () => control(row.code, "flatten") })
               }
@@ -216,17 +206,17 @@ export function StrategiesPage() {
               Flatten
             </Button>
             {isColocated(row) && (
-              <Button size="xs" variant="default" onClick={() => setRuntime(row.code)}>Runtime</Button>
+              <Button size="xs" variant="outline" onClick={() => setRuntime(row.code)}>Runtime</Button>
             )}
             {isColocated(row) && (
-              <Button size="xs" variant="default" onClick={() => setFollowKey(row.code)}>
+              <Button size="xs" variant="outline" onClick={() => setFollowKey(row.code)}>
                 {row.has_follow_credentials ? "Replace follow key" : "Follow key"}
               </Button>
             )}
-            <Button size="xs" variant="default" onClick={() => resetPassword(row.code)}>Reset password</Button>
-            <Button size="xs" variant="default" onClick={() => setEditing(row)}>Connections</Button>
-            <Button size="xs" variant="default" onClick={() => setHandover(row)}>Hand over</Button>
-          </Group>
+            <Button size="xs" variant="outline" onClick={() => resetPassword(row.code)}>Reset password</Button>
+            <Button size="xs" variant="outline" onClick={() => setEditing(row)}>Connections</Button>
+            <Button size="xs" variant="outline" onClick={() => setHandover(row)}>Hand over</Button>
+          </div>
         )}
         columns={[
           { key: "code", label: "Code" },
@@ -237,10 +227,10 @@ export function StrategiesPage() {
             key: "responsible",
             label: "Responsible",
             render: (r: Strategy) => (
-              <Group gap={4}>
-                <Text fz="sm">{r.responsible ? userLabel(r.responsible) : "—"}</Text>
-                {r.needs_responsible ? <Badge color="orange">needs a new responsible user</Badge> : null}
-              </Group>
+              <span className="flex items-center gap-1">
+                {r.responsible ? userLabel(r.responsible) : "—"}
+                {r.needs_responsible ? <Pill tone="warn">needs a new responsible user</Pill> : null}
+              </span>
             ),
           },
           { key: "rest_enabled", label: "REST", render: (r: Strategy) => (r.rest_enabled ? "on" : "off") },
@@ -249,10 +239,10 @@ export function StrategiesPage() {
             label: "Control link",
             render: (r: Strategy) =>
               isColocated(r) ? (
-                <Group gap={4}>
-                  <Badge color={r.link_connected ? "green" : "gray"}>{r.link_connected ? "connected" : "down"}</Badge>
-                  <Text fz="xs">limits {r.acked_limits_version}/{r.limits_version}</Text>
-                </Group>
+                <span className="flex items-center gap-1">
+                  <Pill tone={r.link_connected ? "buy" : "muted"}>{r.link_connected ? "connected" : "down"}</Pill>
+                  <span className="num text-xs">limits {r.acked_limits_version}/{r.limits_version}</span>
+                </span>
               ) : null,
           },
           {
@@ -264,16 +254,16 @@ export function StrategiesPage() {
             key: "alarm",
             label: "Alarm",
             render: (r: Strategy) => (
-              <Group gap={4}>
-                {r.fighting ? <Badge color="red">killed, still fighting</Badge> : r.alarm ? <Badge color="red">{r.alarm}</Badge> : null}
-                {r.kill_ack_late ? <Badge color="orange">kill not acknowledged</Badge> : null}
-              </Group>
+              <span className="flex items-center gap-1">
+                {r.fighting ? <Pill tone="sell">killed, still fighting</Pill> : r.alarm ? <Pill tone="sell">{r.alarm}</Pill> : null}
+                {r.kill_ack_late ? <Pill tone="warn">kill not acknowledged</Pill> : null}
+              </span>
             ),
           },
           {
             key: "session_live",
             label: "FIX session",
-            render: (r: Strategy) => <Badge color={r.session_live ? "green" : "gray"}>{r.session_live ? "logged on" : "down"}</Badge>,
+            render: (r: Strategy) => <Pill tone={r.session_live ? "buy" : "muted"}>{r.session_live ? "logged on" : "down"}</Pill>,
           },
           { key: "max_order_notional", label: "Max order notional" },
           { key: "price_band_pct", label: "Price band %" },
@@ -306,17 +296,10 @@ export function StrategiesPage() {
       {handover && <HandoverForm strategy={handover} users={users} onClose={() => setHandover(null)} />}
       {runtime && <DeploymentPanel code={runtime} onClose={() => setRuntime(null)} />}
       {password && (
-        <Modal opened onClose={() => setPassword(null)} title={`FIX password — ${password.code}`} centered>
-          <Stack>
-            <Code block>{password.value}</Code>
-            <Group justify="flex-end">
-              <CopyButton value={password.value}>
-                {({ copied, copy }) => <Button onClick={copy}>{copied ? "Copied" : "Copy"}</Button>}
-              </CopyButton>
-            </Group>
-          </Stack>
+        <Modal open onClose={() => setPassword(null)} title={`FIX password — ${password.code}`}>
+          <CopyText value={password.value} />
         </Modal>
       )}
-    </Stack>
+    </div>
   );
 }
