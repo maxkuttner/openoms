@@ -9,7 +9,7 @@ import { Frame } from "./login/Frame";
 import { Logo } from "./components/Logo";
 import { JobsIndicator } from "./components/JobsIndicator";
 import { LoginPage } from "./login/LoginPage";
-import { PendingScreen } from "./login/ChangePassword";
+import { ForcedPasswordChange, PendingScreen } from "./login/ChangePassword";
 import { AccountSettings } from "./login/AccountSettings";
 import { UsersPage } from "./pages/Users";
 import { SignInPage } from "./pages/SignIn";
@@ -124,7 +124,7 @@ function Console({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-type Status = "checking" | "admin" | "pending" | "forbidden" | "unavailable";
+type Status = "checking" | "admin" | "pending" | "change_password" | "forbidden" | "unavailable";
 
 /** Signed in, but without the admin capability. */
 function NoAccess() {
@@ -161,6 +161,7 @@ export function App() {
     );
   }
   if (status === "pending") return <PendingScreen />;
+  if (status === "change_password") return <ForcedPasswordChange onDone={() => window.location.reload()} />;
   if (status === "forbidden") return <NoAccess />;
   if (status === "unavailable") {
     return <Frame title="Admin console"><Text fz={13}>The OMS isn't responding. Try again.</Text></Frame>;

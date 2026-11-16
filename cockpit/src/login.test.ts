@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  accessMessage, authErrorMessage, isApprovalPending, isPendingAccount, loginMode, mfaPromptText, mfaStepFor, loginHref,
+  accessMessage, authErrorMessage, isApprovalPending, isPasswordChangeRequired, mustChangePassword, isPendingAccount, loginMode, mfaPromptText, mfaStepFor, loginHref,
   nextStepFromLoginResponse, safeReturnTo, secretFromOtpauth, twoStepSection, visibleMethods,
 } from "./login.ts";
 
@@ -16,6 +16,7 @@ test("only enabled sign-in methods are shown", () => {
 test("the login response names the next step", () => {
   assert.equal(nextStepFromLoginResponse({ next: "totp" }), "totp");
   assert.equal(nextStepFromLoginResponse({ next: "totp_enroll" }), "totp_enroll");
+  assert.equal(nextStepFromLoginResponse({ next: "change_password" }), "change_password");
   assert.equal(nextStepFromLoginResponse({ next: "done" }), "done");
   assert.equal(nextStepFromLoginResponse({ mfa_verified: true }), "done");
   assert.equal(nextStepFromLoginResponse(undefined), "done");
@@ -83,4 +84,13 @@ test("two-step sign-in settings show only for local accounts", () => {
   assert.equal(twoStepSection({ auth_method: "oidc", totp_enrolled: false }), "hidden");
   assert.equal(twoStepSection({ auth_method: "local" }), "enroll");
   assert.equal(twoStepSection(null), "hidden");
+});
+
+test("a host-CLI password gates the app until it is changed", () => {
+  assert.equal(mustChangePassword({ must_change_password: true }), true);
+  assert.equal(mustChangePassword({ must_change_password: false }), false);
+  assert.equal(mustChangePassword(null), false);
+  assert.equal(isPasswordChangeRequired(403, '{"error":"password_change_required"}'), true);
+  assert.equal(isPasswordChangeRequired(403, '{"error":"approval_pending"}'), false);
+  assert.equal(isPasswordChangeRequired(401, '{"error":"password_change_required"}'), false);
 });

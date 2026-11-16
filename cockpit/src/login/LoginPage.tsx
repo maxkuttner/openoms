@@ -3,6 +3,7 @@ import { Alert, Anchor, Button, Divider, Loader, PasswordInput, Stack, Text, Tex
 import { authApi, authErrorText, startSso } from "./api";
 import { Frame, inputStyles } from "./Frame";
 import { Totp, TotpEnroll } from "./Totp";
+import { ForcedPasswordChange } from "./ChangePassword";
 import { loginMode, nextStepFromLoginResponse, safeReturnTo, visibleMethods, type AuthMethods, type Step } from "../login";
 
 const MIN_LENGTH = 15;
@@ -82,6 +83,7 @@ export function LoginPage({ home }: { home: string }) {
     }
   }
 
+  if (step === "change_password") return <ForcedPasswordChange onDone={done} />;
   if (step === "totp") return <Frame title="Sign in"><Totp onDone={done} /></Frame>;
   if (step === "totp_enroll") return <Frame title="Sign in"><TotpEnroll onDone={done} /></Frame>;
 

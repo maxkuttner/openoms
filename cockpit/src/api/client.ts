@@ -4,7 +4,7 @@
 // Authentication is the session cookie, nothing else.
 
 import { COCKPIT_HOME } from "../login/api";
-import { isApprovalPending, loginHref } from "../login";
+import { isApprovalPending, isPasswordChangeRequired, loginHref } from "../login";
 
 // Dev runs behind Vite's proxy, which strips this prefix (see vite.config.ts).
 // A production bundle is served by the OMS itself at /cockpit/, so it is
@@ -77,15 +77,16 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 
 /**
  * Who may open the console: "admin", "pending" (account waiting for
- * approval), "forbidden" (signed in, but no admin capability),
+ * approval), "change_password" (on a host-CLI password), "forbidden" (signed in, but no admin capability),
  * "signed_out", or "unavailable" (server error). Does not redirect.
  */
-export async function consoleAccess(): Promise<"admin" | "pending" | "forbidden" | "signed_out" | "unavailable"> {
+export async function consoleAccess(): Promise<"admin" | "pending" | "change_password" | "forbidden" | "signed_out" | "unavailable"> {
   const res = await send("GET", "/admin/users");
   if (res.ok) return "admin";
   if (res.status === 403) {
     const text = await res.text().catch(() => "");
-    return isApprovalPending(res.status, text) ? "pending" : "forbidden";
+    if (isApprovalPending(res.status, text)) return "pending";
+    return isPasswordChangeRequired(res.status, text) ? "change_password" : "forbidden";
   }
   return res.status === 401 ? "signed_out" : "unavailable";
 }

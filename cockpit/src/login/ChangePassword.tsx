@@ -3,6 +3,7 @@ import { Button, PasswordInput, Stack, Text } from "@mantine/core";
 import { AuthError, authApi, authErrorText } from "./api";
 import { Frame, inputStyles } from "./Frame";
 import { nextStepFromLoginResponse, PENDING_MESSAGE, type Step } from "../login";
+import { Totp, TotpEnroll } from "./Totp";
 
 const MIN_LENGTH = 15;
 
@@ -55,6 +56,25 @@ export function PendingScreen() {
           Sign out
         </Button>
       </Stack>
+    </Frame>
+  );
+}
+
+/**
+ * The full-page "Choose a new password" screen for a session on a password
+ * the host CLI generated. Runs any second-factor step the change leads to,
+ * then calls `onDone`.
+ */
+export function ForcedPasswordChange({ onDone }: { onDone: () => void }) {
+  const [step, setStep] = useState<Step>("change_password");
+  if (step === "totp") return <Frame title="Sign in"><Totp onDone={onDone} /></Frame>;
+  if (step === "totp_enroll") return <Frame title="Authenticator"><TotpEnroll onDone={onDone} /></Frame>;
+  return (
+    <Frame title="Choose a new password">
+      <ChangePassword
+        prompt="This password was generated for you and must be changed. Choose your own (at least 15 characters) to continue."
+        onNext={(s) => (s === "done" ? onDone() : setStep(s))}
+      />
     </Frame>
   );
 }

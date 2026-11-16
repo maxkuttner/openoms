@@ -22,17 +22,32 @@ export function visibleMethods(m: AuthMethods): Method[] {
   return out;
 }
 
-export type Step = "totp" | "totp_enroll" | "done";
+export type Step = "change_password" | "totp" | "totp_enroll" | "done";
 
 /** The step after a password login, enrolment, password change or TOTP check. */
 export function nextStepFromLoginResponse(body: unknown): Step {
   const next = (body as { next?: unknown } | null | undefined)?.next;
-  return next === "totp" || next === "totp_enroll" ? next : "done";
+  return next === "change_password" || next === "totp" || next === "totp_enroll" ? next : "done";
 }
 
 /** `/auth/me` says the account is waiting for an admin's approval. */
 export function isPendingAccount(me: { role?: string } | null | undefined): boolean {
   return me?.role === "pending";
+}
+
+/** `/auth/me` says the session is on a host-CLI password it must change first. */
+export function mustChangePassword(me: { must_change_password?: boolean } | null | undefined): boolean {
+  return me?.must_change_password === true;
+}
+
+/** Is this response the 403 a session on a host-CLI password gets? */
+export function isPasswordChangeRequired(status: number, body: string): boolean {
+  if (status !== 403) return false;
+  try {
+    return JSON.parse(body)?.error === "password_change_required";
+  } catch {
+    return false;
+  }
 }
 
 /** Is this response the 403 a pending account gets everywhere? */

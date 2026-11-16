@@ -57,6 +57,7 @@ export type SessionInfo = {
   auth_method: string;
   /** `admin`, `user` or `pending`. */
   role?: string;
+  must_change_password?: boolean;
   totp_enrolled?: boolean;
 };
 

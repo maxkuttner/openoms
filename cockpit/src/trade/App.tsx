@@ -7,9 +7,9 @@ import { tradeApi, API_BASE, onMfaRequired } from "./api/client";
 import { MfaPrompt } from "../login/MfaPrompt";
 import { LoginPage } from "../login/LoginPage";
 import { TRADE_HOME } from "../login/api";
-import { PendingScreen } from "../login/ChangePassword";
+import { ForcedPasswordChange, PendingScreen } from "../login/ChangePassword";
 import { AccountSettings } from "../login/AccountSettings";
-import { isPendingAccount } from "../login";
+import { isPendingAccount, mustChangePassword } from "../login";
 import { TradePage } from "./pages/Trade";
 import { LiveUpdatesProvider, useLive } from "./api/liveUpdates";
 
@@ -68,6 +68,7 @@ export type Me = {
   auth_method: string;
   /** `admin`, `user` or `pending`. */
   role?: string;
+  must_change_password?: boolean;
   totp_enrolled?: boolean;
 };
 
@@ -88,6 +89,7 @@ function SignedInTradeApp() {
   if (me.isLoading) return <Loader />;
   if (me.error) return <Text c="red">Could not load your session.</Text>;
   if (isPendingAccount(me.data)) return <PendingScreen />;
+  if (mustChangePassword(me.data)) return <ForcedPasswordChange onDone={() => void me.refetch()} />;
 
   return (
     <LiveUpdatesProvider>
