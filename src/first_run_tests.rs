@@ -239,10 +239,8 @@ async fn first_signup_becomes_admin() {
 async fn concurrent_first_signups_create_exactly_one_admin() {
     let pool = migrated_db().await;
     let st = state(pool.clone(), false);
-    let emails: Vec<String> = (0..8).map(|_| email()).collect();
-    let handles: Vec<_> = emails
-        .iter()
-        .cloned()
+    let handles: Vec<_> = (0..8)
+        .map(|_| email())
         .map(|e| {
             let st = st.clone();
             tokio::spawn(async move { signup(&st, &e, PASSWORD).await.status() })
