@@ -34,6 +34,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin oms \
     && mkdir /config && chown oms:oms /config
 COPY --from=builder /src/target/release/oms /usr/local/bin/oms
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/oms-entrypoint
 # OMS_CONTAINER: `oms init` asks only the admin password (compose supplies the
 # database) and `oms update` defers to `docker compose pull`.
 ENV OMS_CONFIG=/config/oms.toml \
@@ -43,4 +44,5 @@ ENV OMS_CONFIG=/config/oms.toml \
 VOLUME /config
 EXPOSE 3001
 USER oms
-ENTRYPOINT ["oms"]
+# Sets the database up, then starts the server; any arguments go straight to oms.
+ENTRYPOINT ["/usr/local/bin/oms-entrypoint"]
