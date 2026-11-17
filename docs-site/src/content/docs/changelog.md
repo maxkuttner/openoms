@@ -5,6 +5,20 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.10.0 (2026-11-17)
+
+### Feat
+
+- run the Docker image from env vars alone (#48)
+- **ui**: one web app on shadcn/ui, replacing the cockpit and trader app (#46)
+- **auth**: named users, roles, local accounts with MFA and optional SSO (#30)
+- **fees**: book venue fees on fills (#28)
+
+### Fix
+
+- follow-ups from #46 that missed the merge (#49)
+- **reload**: apply REST Binance credentials without a restart (#29)
+
 ## v0.9.0 (2026-11-10)
 
 ### Feat
