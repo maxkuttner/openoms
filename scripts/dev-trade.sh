@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-docker compose --profile oidc up -d
+docker compose -f compose.dev.yaml --profile oidc up -d
 
 # First boot migrates Authentik's database and applies the `oms` blueprint, which can
 # take a couple of minutes. Discovery answering means the provider exists.

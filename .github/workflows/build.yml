@@ -197,6 +197,8 @@ jobs:
         working-directory: docs-site
       - run: npm run check
         working-directory: docs-site
-      # Published at /compose.yaml for the Docker install.
-      - name: compose.yaml is valid
-        run: POSTGRES_PASSWORD=ci docker compose -f docs-site/public/compose.yaml config -q
+      # The user install (served at openoms.dev/compose.yaml) and the dev stack.
+      - name: compose files are valid
+        run: |
+          POSTGRES_PASSWORD=ci docker compose -f compose.yaml config -q
+          docker compose -f compose.dev.yaml config -q

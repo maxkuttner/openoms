@@ -286,7 +286,7 @@ users open.
 
 ## Trying SSO locally
 
-The repository's `docker-compose.yml` has an optional Authentik provider, for development
+The repository's `compose.dev.yaml` has an optional Authentik provider, for development
 only:
 
 ```sh

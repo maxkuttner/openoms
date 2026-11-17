@@ -2,7 +2,8 @@ dist/
 node_modules/
 .astro/
 # Copied from the repo root at build time (scripts/copy-install.mjs) — the
-# root install.sh is canonical; never commit a second copy.
+# root install.sh and compose.yaml are canonical; never commit second copies.
 public/install.sh
+public/compose.yaml
 # docs/openapi.json + generated code samples (scripts/openapi-samples.mjs)
 .generated/

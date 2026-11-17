@@ -1,7 +1,8 @@
+# Development stack (compose.yaml next to this is the user install).
 # A Postgres for openoms to run against, so "have a database somewhere" stops
 # being the hardest step of the install.
 #
-#     docker compose up -d
+#     docker compose -f compose.dev.yaml up -d
 #     cargo run -- init      # press Enter through every prompt
 #
 # Postgres only. The OMS talks to Kafka if you configure it and degrades quietly
@@ -45,7 +46,7 @@ services:
   # secret `oms-dev-secret` is public, so the OMS refuses it unless the issuer
   # is on loopback: this fixture only works for local development.
   #
-  # Not part of the default `docker compose up -d` — it lives under the `oidc`
+  # Not part of the default `docker compose -f compose.dev.yaml up -d` — it lives under the `oidc`
   # profile, so it only starts when explicitly asked for and stays out of CI
   # and of every developer's normal Postgres-only loop:
   #
