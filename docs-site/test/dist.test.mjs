@@ -227,11 +227,15 @@ test("installation's Package Managers and Docker tabs give real commands", () =>
   const panels = html.split(/<div[^>]*role="tabpanel"/).slice(1, 5);
   const [, , pkg, docker] = panels;
   assert.ok(pkg.includes("brew install maxkuttner/tap/openoms"), "no Homebrew command");
-  assert.ok(docker.includes("docker compose run --rm oms init"), "no compose flow");
+  assert.ok(docker.includes("docker compose up -d"), "no compose flow");
+  assert.ok(docker.includes("OMS_MASTER_KEY"), "the master key is not generated into .env");
+  // The last panel runs on into the page; the text after the tabs may mention `oms init`.
+  const dockerTab = docker.split("The install script downloads")[0];
+  assert.ok(!dockerTab.includes("oms init"), "the Docker tab still needs oms init");
   assert.ok(docker.includes("compose.yaml"), "compose.yaml not linked");
   assert.ok(!docker.includes("To be implemented"), "Docker tab still says To be implemented");
   assert.ok(existsSync(join(DIST, "compose.yaml")), "compose.yaml is not published");
   // Re-running the block must not replace the password the Postgres volume already holds.
   assert.ok(docker.includes("[ -f .env ] ||"), ".env is overwritten on a re-run");
-  assert.ok(docker.includes("docker compose cp oms:/config/oms.toml"), "no way to back up the master key");
+  assert.ok(/Back up\s*<code[^>]*>\.env<\/code>/.test(dockerTab), "no instruction to back up .env (the master key)");
 });
