@@ -60,6 +60,18 @@ test("the app's colour tokens match the docs' brand colours", () => {
   }
 });
 
+// Env vars win over oms.toml. An install from before env-only setup keeps its
+// role password, master key and URL in oms.toml: the compose file must pass these
+// through only when set, never require or default them.
+test("compose.yaml never forces OMS_PASSWORD, OMS_MASTER_KEY or OMS_PUBLIC_BASE_URL", () => {
+  const compose = readFileSync(new URL("../public/compose.yaml", import.meta.url), "utf8");
+  for (const v of ["OMS_PASSWORD", "OMS_MASTER_KEY", "OMS_PUBLIC_BASE_URL"]) {
+    const line = compose.split("\n").find((l) => l.trim().startsWith(`${v}:`));
+    assert.ok(line, `compose.yaml does not pass ${v}`);
+    assert.ok(line.includes(`\${${v}:-}`), `${v} must be passed as \${${v}:-}: ${line.trim()}`);
+  }
+});
+
 test("the home page shows the supported brokers, not screenshots", () => {
   const html = readFileSync(join(DIST, "index.html"), "utf8");
   const strip = html.match(/<section class="brokers[ "][\s\S]*?<\/section>/)?.[0] ?? "";

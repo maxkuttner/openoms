@@ -91,8 +91,13 @@ signed up is the admin). See
   it and they are gone. The `.env` lines above never replace an existing file.
 - Reached at any other URL than `http://localhost:3001` (a domain, a reverse proxy,
   Tailscale)? Add `OMS_PUBLIC_BASE_URL=https://your.url` to `.env`, or sign-in is refused.
-- The database lives in the `openoms_oms-pgdata` volume. Installs from before this change
-  keep their `oms.toml` (with its master key) in `openoms_oms-config`; it still works.
+- The database lives in the `openoms_oms-pgdata` volume.
+- **Upgrading an install set up with the earlier one-off init step?** Its role password, master key and URL live in
+  `oms.toml` in the `openoms_oms-config` volume, and keep working with the new
+  `compose.yaml`. Do **not** add new `OMS_PASSWORD` or `OMS_MASTER_KEY` values to `.env`:
+  they override the file, so the server could no longer log in to its database or decrypt
+  stored broker credentials. To move them to `.env`, copy the values from `oms.toml`:
+  `docker compose exec oms cat /config/oms.toml`.
 
 </TabItem>
 </Tabs>
