@@ -22,7 +22,7 @@
 - **Never block the fill path:** publishing uses `broadcast::Sender::send` and ignores the "no receivers" error.
 - **Price lane:** latest wins. A subscriber that lags skips ahead (`RecvError::Lagged` → continue). The price lane must never be awaited by a producer.
 - **Positions** stay synchronous in the fill transaction (`positions::persist_fill`, `src/execution.rs:213`). Do not move them to a subscriber.
-- **DB tests:** mark them `#[ignore = "needs a live Postgres; run with --ignored"]` and run them against the shared dev DB at 100.80.233.3. Never create databases on it.
+- **DB tests:** mark them `#[ignore = "needs a live Postgres; run with --ignored"]` and run them against the shared dev DB. Never create databases on it.
 - **Don't commit the user's files:** `.gitignore`, `.ignore` and `docs/superpowers/plans/2026-09-28-options-search-chain-strategy.md` stay untouched.
 - **No compatibility shims:** the OMS is single-user and pre-release, so delete the doorbell types outright.
 - **Lane capacities (exact values):** order lane 1024, price lane 4096.

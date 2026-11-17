@@ -30,7 +30,7 @@ fee currency shows as a per-currency total.
 - Only venue-reported fees; no estimates or fee schedules.
 - `order_event` is append-only. Never update or delete it, including in tests.
 - DB tests are `#[ignore]` and seed their own data. Never run `--ignored`
-  locally against the shared dev DB at 100.80.233.3; use a throwaway Postgres
+  locally against the shared dev DB; use a throwaway Postgres
   as in HANDOFF.md.
 - Migrations are additive only. The next number is `0046` in
   `db/migrations/ods/oms/`.
