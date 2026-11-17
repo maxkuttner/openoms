@@ -37,7 +37,7 @@
 //! # [auth.oidc]
 //! # issuer = "https://idp.example.com/realms/oms"
 //! # client_id = "oms"
-//! # public_base_url = "https://oms.example.com"
+//! # public_base_url = "https://oms.example.com"   # or set OMS_PUBLIC_BASE_URL
 //! # scopes = ["openid", "profile", "email"]      # default shown
 //! # required_claim = "groups"                     # optional gate; needs both
 //! # required_claim_value = "oms-traders"           # halves to take effect
@@ -471,6 +471,15 @@ pub fn load() -> Option<&'static FileConfig> {
         .as_ref()
 }
 
+/// The public URL: `OMS_PUBLIC_BASE_URL` (trimmed, if not blank) wins over the
+/// file's `[auth].public_base_url`. Containers set it without an `oms.toml`.
+fn public_base_url_from(env: Option<&str>, file: Option<String>) -> Option<String> {
+    match env.map(str::trim) {
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => file,
+    }
+}
+
 impl FileConfig {
     /// The co-located strategies' control-link listener, or `None` when it is
     /// not configured. Same shape as the FIX acceptor's section.
@@ -529,7 +538,10 @@ impl FileConfig {
     pub fn auth_settings(&self) -> AuthSettings {
         let a = &self.auth;
         AuthSettings {
-            public_base_url: a.public_base_url.clone().or_else(|| a.oidc.public_base_url.clone()),
+            public_base_url: public_base_url_from(
+                std::env::var("OMS_PUBLIC_BASE_URL").ok().as_deref(),
+                a.public_base_url.clone().or_else(|| a.oidc.public_base_url.clone()),
+            ),
             policy: a.policy,
             local_enabled: a.local.enabled && a.policy != AuthPolicy::SsoOnly,
             require_mfa: a.local.require_mfa,
@@ -925,6 +937,30 @@ admin_password = "admin-pw"
         let cfg: FileConfig = toml::from_str("[server]\nbind_addr = \"localhost:3001\"\n").unwrap();
 
         assert!(cfg.oidc().is_none(), "absent configuration must not half-enable login");
+    }
+
+    #[test]
+    fn public_base_url_env_overrides_the_file() {
+        assert_eq!(
+            public_base_url_from(Some("https://oms.example.com"), Some("https://old.example".into())).as_deref(),
+            Some("https://oms.example.com")
+        );
+    }
+
+    #[test]
+    fn public_base_url_env_empty_or_blank_is_ignored() {
+        assert_eq!(public_base_url_from(Some(""), Some("https://f".into())).as_deref(), Some("https://f"));
+        assert_eq!(public_base_url_from(Some("   "), None), None);
+    }
+
+    #[test]
+    fn public_base_url_env_is_trimmed() {
+        assert_eq!(public_base_url_from(Some(" https://x/ "), None).as_deref(), Some("https://x/"));
+    }
+
+    #[test]
+    fn no_env_keeps_the_file_value() {
+        assert_eq!(public_base_url_from(None, Some("https://f".into())).as_deref(), Some("https://f"));
     }
 
     #[test]
