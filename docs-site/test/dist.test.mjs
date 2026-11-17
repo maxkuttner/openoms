@@ -60,6 +60,18 @@ test("the app's colour tokens match the docs' brand colours", () => {
   }
 });
 
+// Env vars win over oms.toml. An install from before env-only setup keeps its
+// role password, master key and URL in oms.toml: the compose file must pass these
+// through only when set, never require or default them.
+test("compose.yaml never forces OMS_PASSWORD, OMS_MASTER_KEY or OMS_PUBLIC_BASE_URL", () => {
+  const compose = readFileSync(new URL("../public/compose.yaml", import.meta.url), "utf8");
+  for (const v of ["OMS_PASSWORD", "OMS_MASTER_KEY", "OMS_PUBLIC_BASE_URL"]) {
+    const line = compose.split("\n").find((l) => l.trim().startsWith(`${v}:`));
+    assert.ok(line, `compose.yaml does not pass ${v}`);
+    assert.ok(line.includes(`\${${v}:-}`), `${v} must be passed as \${${v}:-}: ${line.trim()}`);
+  }
+});
+
 test("the home page shows the supported brokers, not screenshots", () => {
   const html = readFileSync(join(DIST, "index.html"), "utf8");
   const strip = html.match(/<section class="brokers[ "][\s\S]*?<\/section>/)?.[0] ?? "";
@@ -227,11 +239,15 @@ test("installation's Package Managers and Docker tabs give real commands", () =>
   const panels = html.split(/<div[^>]*role="tabpanel"/).slice(1, 5);
   const [, , pkg, docker] = panels;
   assert.ok(pkg.includes("brew install maxkuttner/tap/openoms"), "no Homebrew command");
-  assert.ok(docker.includes("docker compose run --rm oms init"), "no compose flow");
+  assert.ok(docker.includes("docker compose up -d"), "no compose flow");
+  assert.ok(docker.includes("OMS_MASTER_KEY"), "the master key is not generated into .env");
+  // The last panel runs on into the page; the text after the tabs may mention `oms init`.
+  const dockerTab = docker.split("The install script downloads")[0];
+  assert.ok(!dockerTab.includes("oms init"), "the Docker tab still needs oms init");
   assert.ok(docker.includes("compose.yaml"), "compose.yaml not linked");
   assert.ok(!docker.includes("To be implemented"), "Docker tab still says To be implemented");
   assert.ok(existsSync(join(DIST, "compose.yaml")), "compose.yaml is not published");
   // Re-running the block must not replace the password the Postgres volume already holds.
   assert.ok(docker.includes("[ -f .env ] ||"), ".env is overwritten on a re-run");
-  assert.ok(docker.includes("docker compose cp oms:/config/oms.toml"), "no way to back up the master key");
+  assert.ok(/Back up\s*<code[^>]*>\.env<\/code>/.test(dockerTab), "no instruction to back up .env (the master key)");
 });

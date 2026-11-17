@@ -69,8 +69,11 @@ Runs openoms and PostgreSQL 16 together with Docker Compose:
 ```sh
 mkdir openoms && cd openoms
 curl -fsSLO https://openoms.dev/compose.yaml
-[ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
-docker compose run --rm oms init
+[ -f .env ] || {
+  echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+  echo "OMS_PASSWORD=$(openssl rand -hex 24)"
+  echo "OMS_MASTER_KEY=base64:$(openssl rand -base64 32)"
+} > .env
 docker compose up -d
 ```
 
@@ -82,11 +85,19 @@ signed up is the admin). See
   `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
 - The web app is published on this machine only (`127.0.0.1:3001`). On a remote server,
   reach it through an SSH tunnel or Tailscale.
-- Data lives in two volumes: `openoms_oms-config` (`oms.toml` and its master key) and
-  `openoms_oms-pgdata` (the database). Keep `.env`: it holds the database superuser
-  password, and the `.env` line above never replaces an existing one.
-- Back up the master key once the server runs:
-  `docker compose cp oms:/config/oms.toml ./oms.toml.backup`.
+- Settings come from `.env`; nothing to set up by hand. The first start creates the database;
+  every later start applies pending migrations.
+- **Back up `.env`.** `OMS_MASTER_KEY` is the only key to stored broker credentials: lose
+  it and they are gone. The `.env` lines above never replace an existing file.
+- Reached at any other URL than `http://localhost:3001` (a domain, a reverse proxy,
+  Tailscale)? Add `OMS_PUBLIC_BASE_URL=https://your.url` to `.env`, or sign-in is refused.
+- The database lives in the `openoms_oms-pgdata` volume.
+- **Upgrading an install set up with the earlier one-off init step?** Its role password, master key and URL live in
+  `oms.toml` in the `openoms_oms-config` volume, and keep working with the new
+  `compose.yaml`. Do **not** add new `OMS_PASSWORD` or `OMS_MASTER_KEY` values to `.env`:
+  they override the file, so the server could no longer log in to its database or decrypt
+  stored broker credentials. To move them to `.env`, copy the values from `oms.toml`:
+  `docker compose exec oms cat /config/oms.toml`.
 
 </TabItem>
 </Tabs>

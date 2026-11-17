@@ -30,8 +30,9 @@ The Postgres the OMS stores everything in.
 | `database` | `--database` | `POSTGRES_DATABASE` | `ods` |
 | *(superuser password)* | `--password` | `POSTGRES_PASSWORD` | `postgres` |
 
-`username` is the **superuser** that `oms init`, `oms database migrate` and
-`oms database drop` connect as. Its password is never stored in `oms.toml` — that
+`username` is the **superuser** that `oms init`, `oms database setup`, `oms database migrate` and
+`oms database drop` connect as. `oms database setup` initializes a database that does not
+exist yet and migrates one that does; the Docker image runs it on every start. Its password is never stored in `oms.toml` — that
 credential can drop the database — so those commands prompt for it or take it from
 `--password` / `POSTGRES_PASSWORD`. The running server never uses the superuser.
 
@@ -71,7 +72,7 @@ Details and examples are on [Sign-in and users](/configuration/login/).
 
 | Key | Default |
 |---|---|
-| `public_base_url` | derived from a loopback bind; required otherwise |
+| `public_base_url` (env `OMS_PUBLIC_BASE_URL`, wins over the file) | derived from a loopback bind; required otherwise |
 | `enable_signup` | `true` |
 | `default_user_role` | `"pending"` |
 | `[auth.local] enabled` | `true` |

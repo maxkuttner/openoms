@@ -599,6 +599,12 @@ enum DatabaseCmd {
         #[arg(long)]
         resume: bool,
     },
+    /// Initialize the database if it does not exist, otherwise apply pending
+    /// migrations. For scripts and containers.
+    Setup {
+        #[command(flatten)]
+        db: DbArgs,
+    },
     /// Apply pending migrations to an existing database.
     Migrate {
         #[command(flatten)]
@@ -734,6 +740,7 @@ async fn main() {
                 DatabaseCmd::Init { db, oms_password, resume } => {
                     setup::database::init(db.into(), oms_password, resume).await
                 }
+                DatabaseCmd::Setup { db } => setup::database::setup(db.into()).await,
                 DatabaseCmd::Migrate { db } => setup::database::migrate(db.into()).await,
                 DatabaseCmd::Drop { db, yes } => setup::database::drop(db.into(), yes).await,
                 DatabaseCmd::Status { db } => setup::database::status(db.into()).await,
