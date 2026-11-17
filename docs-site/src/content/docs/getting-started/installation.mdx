@@ -68,7 +68,7 @@ Runs openoms and PostgreSQL 16 together with Docker Compose:
 
 ```sh
 mkdir openoms && cd openoms
-curl -fsSLO https://openoms.dev/compose.yaml
+curl -fsSLO https://github.com/maxkuttner/openoms/releases/latest/download/compose.yaml
 [ -f .env ] || {
   echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
   echo "OMS_PASSWORD=$(openssl rand -hex 24)"
@@ -81,7 +81,7 @@ Then open `http://localhost:3001/app/` and create the admin account (the first a
 signed up is the admin). See
 [Sign-in and users](/configuration/login/).
 
-- [compose.yaml](https://openoms.dev/compose.yaml) runs the
+- [compose.yaml](https://github.com/maxkuttner/openoms/releases/latest/download/compose.yaml) comes with each release and runs that release's
   `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
 - The web app is published on this machine only (`127.0.0.1:3001`). On a remote server,
   reach it through an SSH tunnel or Tailscale.
