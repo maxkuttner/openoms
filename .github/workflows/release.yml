@@ -129,6 +129,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       # Only the binaries: docker/build-push-action also uploads its own
       # *.dockerbuild build records as artifacts, which do not download as zips.
       - uses: actions/download-artifact@v4
@@ -144,6 +146,16 @@ jobs:
           rm -f ./*.sha256
           cat SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 2
+
+      # The install guide downloads compose.yaml from the latest release, pinned
+      # to this release's image (OMS_VERSION still overrides it). Not part of
+      # SHA256SUMS, which covers the binaries the installer and Homebrew verify.
+      - name: compose.yaml pinned to this release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed "s/\${OMS_VERSION:-latest}/\${OMS_VERSION:-$version}/" compose.yaml > dist/compose.yaml
+          grep -q "openoms:\${OMS_VERSION:-$version}" dist/compose.yaml \
+            || { echo "compose.yaml has no OMS_VERSION:-latest image line to pin"; exit 1; }
 
       - name: publish
         env:

@@ -249,6 +249,9 @@ test("installation's Package Managers and Docker tabs give real commands", () =>
   const dockerTab = docker.split("The install script downloads")[0];
   assert.ok(!dockerTab.includes("oms init"), "the Docker tab still needs oms init");
   assert.ok(docker.includes("compose.yaml"), "compose.yaml not linked");
+  // The file comes from the latest release, pinned to that release's image, not
+  // from main (which can be ahead of the release users install).
+  assert.ok(docker.includes("releases/latest/download/compose.yaml"), "compose.yaml is not downloaded from the latest release");
   assert.ok(!docker.includes("To be implemented"), "Docker tab still says To be implemented");
   assert.ok(existsSync(join(DIST, "compose.yaml")), "compose.yaml is not published");
   // Re-running the block must not replace the password the Postgres volume already holds.
