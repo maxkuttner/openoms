@@ -6,6 +6,8 @@ import { Separator } from "@/components/ui/separator";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { cn } from "@/lib/utils";
 import { ConfirmButton } from "../../components/ConfirmButton";
+import { ApiKeysBox } from "../../components/ApiKeysBox";
+import { userKeys } from "../../components/userKeys";
 import { CopyText, Notice, Spinner } from "../../components/common";
 import { MultiSelect, Select, TextField } from "../../components/form";
 import { Drawer, Modal } from "../../components/overlay";
@@ -158,7 +160,14 @@ export function UsersPage() {
       {approving && <ApproveModal user={approving} onClose={() => setApproving(null)} />}
 
       <Drawer open={!!keysFor} onClose={() => setKeysFor(null)} title={keysFor ? `${who(keysFor)} — API keys` : ""}>
-        {keysFor && <KeysSection userId={keysFor.principal_id} />}
+        {keysFor && (
+          <ApiKeysBox
+            key={keysFor.principal_id}
+            source={userKeys(keysFor.principal_id)}
+            idPrefix="drawer-key"
+            intro={<>Keys that act as {who(keysFor)}, with the portfolios their groups give them.</>}
+          />
+        )}
       </Drawer>
     </div>
   );
@@ -230,52 +239,5 @@ function EditAccessModal({ user, onClose }: { user: UserRow; onClose: () => void
       </>}>
       <GroupPicker value={groups} onChange={setGroups} />
     </Modal>
-  );
-}
-
-function KeysSection({ userId }: { userId: string }) {
-  const base = `${PATH}/${userId}/keys`;
-  const keys = useList<ApiKeyRecord>(base);
-  const [name, setName] = useState("");
-  const [created, setCreated] = useState<ApiKeyRecord | null>(null);
-  const register = useApiMutation((n: string) => api.post<ApiKeyRecord>(base, { name: n || null }), {
-    invalidate: [base], success: "Key created", onDone: (k) => { setName(""); setCreated(k as ApiKeyRecord); },
-  });
-  const revoke = useApiMutation((keyId: string) => api.del(`${base}/${keyId}`), { invalidate: [base], success: "Key revoked" });
-  return (
-    <div className="flex flex-col gap-3">
-      {created?.secret && (
-        <Notice tone="info" title="Copy this secret now — it is shown only once">
-          <CopyText value={`${created.key_id}:${created.secret}`} />
-        </Notice>
-      )}
-      <div className="flex items-end gap-2">
-        <TextField label="New key name (optional)" value={name} onChange={setName} />
-        <Button onClick={() => register.mutate(name)} disabled={register.isPending}>Register key</Button>
-      </div>
-      <Separator />
-      <div className="rounded-md border">
-        <Table>
-          <TableHeader><TableRow><TableHead>Key id</TableHead><TableHead>Name</TableHead><TableHead /></TableRow></TableHeader>
-          <TableBody>
-            {(keys.data ?? []).map((k) => (
-              <TableRow key={k.key_id}>
-                <TableCell className="num">{k.key_id}</TableCell>
-                <TableCell>{k.name ?? <span className="text-muted-foreground">—</span>}</TableCell>
-                <TableCell className="text-right">
-                  <ConfirmButton size="icon-xs" variant="ghost" className="text-sell" aria-label="Revoke key"
-                    title="Revoke key?" confirmLabel="Revoke" onConfirm={() => revoke.mutate(k.key_id)}>
-                    <X />
-                  </ConfirmButton>
-                </TableCell>
-              </TableRow>
-            ))}
-            {(keys.data ?? []).length === 0 && (
-              <TableRow><TableCell colSpan={3} className="text-center text-muted-foreground">No keys.</TableCell></TableRow>
-            )}
-          </TableBody>
-        </Table>
-      </div>
-    </div>
   );
 }
