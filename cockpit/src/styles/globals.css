@@ -64,9 +64,22 @@
   body {
     @apply bg-background text-foreground;
     }
+  /* Tailwind v4 leaves buttons on the default arrow; anything clickable shows the hand. */
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([data-disabled]),
+  [role="option"]:not([data-disabled]),
+  [role="tab"],
+  [role="switch"]:not(:disabled),
+  [role="checkbox"]:not(:disabled),
+  [cmdk-item]:not([data-disabled="true"]),
+  summary,
+  label:has(button, input[type="checkbox"]) {
+    cursor: pointer;
+  }
   html {
     @apply font-sans;
-    font-size: 13px;
+    font-size: 14px;
     }
 }
 @utility num {

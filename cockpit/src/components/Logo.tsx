@@ -6,8 +6,8 @@ export function DepthGlyph({ height = 24 }: { height?: number }) {
       <rect x="0" y="0" width="15.6" height="3" rx="1" fill="var(--buy)" />
       <rect x="0" y="5.5" width="22.1" height="3" rx="1" fill="var(--buy)" />
       <rect x="0" y="11" width="26" height="2" rx="1" fill="var(--border)" />
-      <rect x="0" y="15" width="18.7" height="3" rx="1" fill="var(--primary)" />
-      <rect x="0" y="20.5" width="23.4" height="3" rx="1" fill="var(--primary)" />
+      <rect x="0" y="15" width="18.7" height="3" rx="1" fill="var(--brand-amber)" />
+      <rect x="0" y="20.5" width="23.4" height="3" rx="1" fill="var(--brand-amber)" />
     </svg>
   );
 }

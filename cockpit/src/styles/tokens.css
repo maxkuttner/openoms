@@ -1,41 +1,52 @@
-/* The one list of OpenOMS colours (dark only). Every colour in src/ comes from here. */
+/* The one list of colours in the web app (dark only). Every colour in src/ comes
+   from here. The brand colours are the docs site's --oms-* tokens
+   (docs-site/src/styles/theme.css); a docs test keeps them equal. */
 :root {
-  --background: #111315;
-  --foreground: #d6d9dc;
-  --foreground-2: #a3a8ad;
-  --card: #0c0e10;
-  --card-foreground: #d6d9dc;
-  --popover: #16191c;
-  --popover-foreground: #d6d9dc;
-  --primary: #f2a93b;
-  --primary-foreground: #111111;
-  --secondary: #1d2125;
-  --secondary-foreground: #d6d9dc;
-  --muted: #1d2125;
-  --muted-foreground: #6c737a;
-  --accent: #1d2125;
-  --accent-foreground: #d6d9dc;
-  --destructive: #ef5350;
-  --border: #22262a;
-  --border-subtle: #1a1d20;
-  --input: #22262a;
-  --ring: #f2a93b;
-  --buy: #26a69a;
-  --sell: #ef5350;
-  --warn: #f2a93b;
+  /* Surfaces: docs black, surface, raised, border. */
+  --background: #13171d;
+  --card: #0d1014;
+  --sidebar: #0d1014;
+  --popover: #1d232c;
+  --accent: #1d232c;
+  --secondary: #1d232c;
+  --muted: #1d232c;
+  --border: #2a2f38;
+  --input: #2a2f38;
+  --border-subtle: #1d232c;
+
+  /* Text: brand ink, muted, faint. */
+  --foreground: #ededed;
+  --foreground-2: #a3a3a3;
+  --muted-foreground: #737373;
+  --card-foreground: #ededed;
+  --popover-foreground: #ededed;
+  --secondary-foreground: #ededed;
+  --accent-foreground: #ededed;
+
+  /* Brand: logo green is the accent (as on the docs site) and buy; logo amber
+     marks warnings and partial states; brand red is sell. */
+  --primary: #25b083;
+  --primary-foreground: #0d1014;
+  --ring: #25b083;
+  --warn: #ce9a3b;
+  --brand-amber: #ce9a3b; /* logo artwork only */
+  --buy: #25b083;
+  --sell: #db3440;
+  --destructive: #db3440;
+
   --radius: 5px;
-  --sidebar: #0c0e10;
-  --sidebar-foreground: #a3a8ad;
-  --sidebar-primary: #f2a93b;
-  --sidebar-primary-foreground: #111111;
-  --sidebar-accent: #1d2125;
-  --sidebar-accent-foreground: #d6d9dc;
-  --sidebar-border: #22262a;
-  --sidebar-ring: #f2a93b;
-  --chart-1: #f2a93b;
-  --chart-2: #26a69a;
-  --chart-3: #ef5350;
-  --chart-4: #a3a8ad;
-  --chart-5: #6c737a;
+
+  --sidebar-foreground: #a3a3a3;
+  --sidebar-primary: #25b083;
+  --sidebar-primary-foreground: #0d1014;
+  --sidebar-accent: #1d232c;
+  --sidebar-accent-foreground: #ededed;
+  --sidebar-border: #2a2f38;
+  --sidebar-ring: #25b083;
+  --chart-1: #25b083;
+  --chart-2: #ce9a3b;
+  --chart-3: #db3440;
+  --chart-4: #a3a3a3;
+  --chart-5: #737373;
   color-scheme: dark;
 }

@@ -38,6 +38,28 @@ test("phones can switch the theme on the landing page", () => {
   assert.equal(count("getting-started/index.html"), 2, "a docs page should keep its two: header and ☰ menu");
 });
 
+// The web app (cockpit/src/styles/tokens.css) draws its brand colours from the
+// docs' --oms-* tokens; CSS cannot import across the two builds, so this keeps
+// each shared colour equal.
+test("the app's colour tokens match the docs' brand colours", () => {
+  const app = readFileSync(new URL("../../cockpit/src/styles/tokens.css", import.meta.url), "utf8");
+  const css = readFileSync(new URL("../src/styles/theme.css", import.meta.url), "utf8");
+  const hex = (src, name) => src.match(new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`, "i"))?.[1]?.toLowerCase();
+  const pairs = {
+    "oms-black": ["sidebar", "card"],
+    "oms-surface": ["background"],
+    "oms-raised": ["accent", "popover"],
+    "oms-border": ["border", "input"],
+    "oms-green": ["buy", "primary", "ring"],
+    "oms-amber": ["warn", "brand-amber"],
+  };
+  for (const [docs, appNames] of Object.entries(pairs)) {
+    const want = hex(css, docs);
+    assert.ok(want, `theme.css has no --${docs}`);
+    for (const n of appNames) assert.equal(hex(app, n), want, `tokens.css --${n} differs from docs --${docs}`);
+  }
+});
+
 test("the home page shows the supported brokers, not screenshots", () => {
   const html = readFileSync(join(DIST, "index.html"), "utf8");
   const strip = html.match(/<section class="brokers[ "][\s\S]*?<\/section>/)?.[0] ?? "";

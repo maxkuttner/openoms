@@ -1,5 +1,5 @@
-/* The openoms brand colours for the docs site. The web app has its own dark
-   tokens (cockpit/src/styles/tokens.css). The landing page's glows
+/* The openoms brand colours. The web app (cockpit/src/styles/tokens.css) uses
+   the same values; a docs test keeps them equal. The landing page's glows
    (GrainBackground.astro) are glow-green and orange. */
 :root {
   --oms-black: #0d1014;

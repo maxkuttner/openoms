@@ -54,27 +54,29 @@ The work is a **feature-for-feature port**: every existing screen and behaviour 
 
 ## Visual tokens
 
-Defined as shadcn CSS variables in one stylesheet; the values below are the approved mockup.
+Defined as shadcn CSS variables in `cockpit/src/styles/tokens.css`. Revised after the click-through (owner's call): the colours are the docs site's brand tokens (`docs-site/src/styles/theme.css`), and a docs test keeps the shared ones equal.
 
-| Token | Value | Use |
-|---|---|---|
-| background | `#111315` | main area |
-| sidebar / panel | `#0c0e10` | sidebar, side panels (ticket) |
-| foreground | `#d6d9dc` | primary text |
-| foreground-2 | `#a3a8ad` | sidebar items, secondary text |
-| muted | `#6c737a` | labels, headers, hints |
-| border | `#22262a` | panel and input borders |
-| border-subtle | `#1a1d20` | table row separators |
-| hover / accent-bg | `#1d2125` | hover, active nav item, chips |
-| primary | `#f2a93b` on `#111` text | primary buttons, focus ring |
-| buy / positive | `#26a69a` | buy side, gains, live dot |
-| sell / negative | `#ef5350` | sell side, losses, destructive |
+| Token | Value | Source | Use |
+|---|---|---|---|
+| background | `#13171d` | docs surface | main area |
+| sidebar / card | `#0d1014` | docs black | sidebar, panels |
+| accent / popover | `#1d232c` | docs raised | hover, active nav, popovers |
+| border / input | `#2a2f38` | docs border | borders, inputs |
+| foreground | `#ededed` | brand ink | primary text |
+| foreground-2 | `#a3a3a3` | brand muted | secondary text |
+| muted-foreground | `#737373` | brand faint | labels, hints |
+| primary / ring | `#25b083` | docs green (the docs' accent) | buttons, focus, active tab |
+| buy | `#25b083` | docs green | buy side, gains, live dot |
+| sell / destructive | `#db3440` | brand red | sell side, losses, errors |
+| warn | `#ce9a3b` | logo amber | warnings, partial/loading states |
+| brand-amber | `#ce9a3b` | logo amber | logo artwork only |
 
-- Font: Inter 13px base; table headers 12px muted, weight 500.
+- Font: Inter 14px base (rem-based sizes scale with it); table text 14px, headers text-xs muted, weight 500.
 - Numbers: every numeric cell and numeric input uses `ui-monospace, SFMono-Regular, Menlo, monospace` with `tabular-nums`, right-aligned in tables.
 - Density: table rows ≈ 26px (5px vertical padding), top bar 38px, sidebar 190px.
 - Radius: 5px.
-- Reference mockup: `.superpowers/brainstorm/*/content/visual-style-v2.html` (not committed).
+- Clickable elements show the pointer cursor (Tailwind v4 leaves buttons on the arrow).
+- Reference mockup (layout and density; colours since revised): `.superpowers/brainstorm/*/content/visual-style-v2.html` (not committed).
 
 ## Shell (Open WebUI model)
 
