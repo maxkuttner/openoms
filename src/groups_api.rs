@@ -443,8 +443,13 @@ mod tests {
         let admin_pool = crate::authz_schema_tests::fresh_db().await;
         migrate::ensure_tracking(&admin_pool).await.unwrap();
         migrate::apply_matching(&admin_pool, |schema, f| schema != "oms" || f < "0064_").await.unwrap();
-        let pool = admin_pool.clone();
-        sqlx::query("SET search_path TO oms, public").execute(&pool).await.unwrap();
+        // Unqualified names (as in `allowed`) must resolve in `oms` on every pooled
+        // connection, not just the one a `SET search_path` happened to run on.
+        let name: String = sqlx::query_scalar("SELECT current_database()").fetch_one(&admin_pool).await.unwrap();
+        sqlx::query(&format!("ALTER DATABASE {name} SET search_path = oms, public")).execute(&admin_pool).await.unwrap();
+        let url = std::env::var("OMS_RELOAD_TEST_DATABASE_URL").unwrap();
+        let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+        let pool = sqlx::PgPool::connect_with(options.database(&name)).await.unwrap();
         let q = |sql: &'static str| sqlx::query(sql);
         let (pm, trader, viewer_ro) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         let (pf1, pf2) = (Uuid::new_v4(), Uuid::new_v4());
