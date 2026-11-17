@@ -79,6 +79,55 @@ jobs:
           COLO_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ods
         run: cargo test -- --ignored
 
+  database-setup:
+    name: database setup (init if absent, else migrate)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_USERNAME: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: ods
+      OMS_PASSWORD: setup-ci-role-password
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --quiet
+
+      - name: setup on an empty server initializes
+        run: |
+          out=$(cargo run --quiet -- database setup)
+          echo "$out"
+          echo "$out" | grep -q "initializing" || { echo "expected init"; exit 1; }
+
+      - name: setup a second time is a migrate no-op
+        run: |
+          out=$(cargo run --quiet -- database setup)
+          echo "$out"
+          echo "$out" | grep -q "applied 0 migration" || { echo "second setup was not a no-op"; exit 1; }
+
+      - name: status reports no pending migrations
+        run: cargo run --quiet -- database status | grep -q "0 pending"
+
+      - name: setup refuses a half-made install (role left, database gone)
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c 'DROP DATABASE ods WITH (FORCE)'
+          if cargo run --quiet -- database setup; then
+            echo "expected setup to refuse, but it succeeded"; exit 1
+          fi
+
   cockpit:
     name: cockpit bundle embeds and serves
     runs-on: ubuntu-22.04

@@ -102,6 +102,36 @@ pub async fn migrate(o: PostgresOverrides) -> Fallible {
     Ok(())
 }
 
+/// What `setup` does with what it finds.
+#[derive(Debug, PartialEq, Eq)]
+enum SetupAction {
+    Init,
+    Migrate,
+}
+
+/// Migrate when our database exists; otherwise initialize. A half-made install
+/// (roles but no database) goes to `init`, which refuses it with its own message.
+fn plan_setup(existing: &provision::Existing) -> SetupAction {
+    if existing.database { SetupAction::Migrate } else { SetupAction::Init }
+}
+
+/// Initialize the database if it does not exist, otherwise apply pending
+/// migrations. One idempotent verb for scripts and containers; `init` and
+/// `migrate` keep all their checks.
+pub async fn setup(o: PostgresOverrides) -> Fallible {
+    let existing = provision::inspect(&config::resolve(o.clone())).await?;
+    match plan_setup(&existing) {
+        SetupAction::Init => {
+            println!("database not found: initializing");
+            init(o, None, false).await
+        }
+        SetupAction::Migrate => {
+            println!("database found: migrating");
+            migrate(o).await
+        }
+    }
+}
+
 /// Destroy the database. Roles survive — they are cluster-wide and may own
 /// objects in other databases.
 ///
@@ -306,5 +336,25 @@ mod init_tests {
         let db_only = provision::Existing { roles: vec![], database: true };
         assert_eq!(plan_provisioning(true, &db_only), Ok(Provisioning::Partial { role: true, database: false }));
     }
-}
 
+    #[test]
+    fn setup_initialises_a_fresh_server() {
+        let e = provision::Existing { roles: vec![], database: false };
+        assert_eq!(plan_setup(&e), SetupAction::Init);
+    }
+
+    #[test]
+    fn setup_migrates_an_existing_database() {
+        let e = provision::Existing { roles: vec![provision::ROLE.into()], database: true };
+        assert_eq!(plan_setup(&e), SetupAction::Migrate);
+    }
+
+    /// Roles but no database: hand it to `init`, which (without `--resume`)
+    /// refuses with its own message rather than guessing.
+    #[test]
+    fn setup_hands_a_half_made_install_to_init_which_refuses() {
+        let e = provision::Existing { roles: vec![provision::ROLE.into()], database: false };
+        assert_eq!(plan_setup(&e), SetupAction::Init);
+        assert!(plan_provisioning(false, &e).is_err());
+    }
+}
