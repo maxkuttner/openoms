@@ -53,7 +53,7 @@ itself has not had yet.
 - A second hand-maintained list of venues or credential fields. Bybit is added to
   `src/venues.rs`, and the existing tests must then force the rest into line
   (`known_broker_codes`, the `BrokerCredentials` variant, the docs Credentials table).
-- Touching or creating databases on the shared dev Postgres (100.80.233.3) beyond what
+- Touching or creating databases on the shared dev Postgres beyond what
   the running dev OMS normally writes; DB tests stay `#[ignore]`.
 
 ## Constraints

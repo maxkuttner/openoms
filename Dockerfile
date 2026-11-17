@@ -2,7 +2,7 @@
 # for linux/amd64 and linux/arm64. Run it with compose: see
 # https://openoms.dev/getting-started/installation/
 #
-# Multi-stage like deploy/Dockerfile: the cockpit's dist is embedded into the binary
+# Multi-stage: the cockpit's dist is embedded into the binary
 # at compile time (src/cockpit.rs), so it must exist before `cargo build`.
 
 FROM node:22-bookworm-slim AS cockpit

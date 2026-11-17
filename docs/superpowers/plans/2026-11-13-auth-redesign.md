@@ -42,7 +42,7 @@
 - No default credentials. Remove the loopback `openoms-dev` default and the `OMS_ADMIN_AUTH_ENABLED=false` bypass. Refuse to boot when `OMS_OIDC_CLIENT_SECRET=oms-dev-secret` and the bind is not loopback (§9).
 - No mandatory Docker services for auth. Authentik stays only as an opt-in `--profile oidc` dev fixture (§9).
 - The word "principal" never appears in user-visible UI or docs prose.
-- DB tests run only against a throwaway Postgres. Always run `--ignored` with `--skip real_docker`, and never touch `oms-postgres`, `oms-keycloak` or 100.80.233.3.
+- DB tests run only against a throwaway Postgres. Always run `--ignored` with `--skip real_docker`, and never touch `oms-postgres`, `oms-keycloak` or the shared dev DB.
 - Commits use Conventional Commits, written via `git commit -F`, with files staged explicitly.
 
 ## Review Focus
