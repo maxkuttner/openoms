@@ -1,17 +1,20 @@
 import { useState } from "react";
-import { Anchor, Button, Group, Progress, Stack, Text, Tooltip } from "@mantine/core";
-import { notifications } from "@mantine/notifications";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
+import { notify } from "./notify";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
 import { IbkrImport } from "./IbkrImport";
 import { openTaskCenter, type UniverseStatus as Status } from "../api/jobs";
 
 const SYMBOL: Record<Status["state"], { sym: string; color: string; label: string }> = {
-  not_loaded: { sym: "○", color: "dimmed", label: "Not loaded" },
-  loading: { sym: "◐", color: "yellow", label: "Loading" },
-  loaded: { sym: "●", color: "green", label: "Loaded" },
-  partial: { sym: "◑", color: "amber", label: "Partial" },
-  failed: { sym: "✕", color: "red", label: "Failed" },
+  not_loaded: { sym: "○", color: "text-muted-foreground", label: "Not loaded" },
+  loading: { sym: "◐", color: "text-warn", label: "Loading" },
+  loaded: { sym: "●", color: "text-buy", label: "Loaded" },
+  partial: { sym: "◑", color: "text-warn", label: "Partial" },
+  failed: { sym: "✕", color: "text-sell", label: "Failed" },
 };
 
 const ACTION: Partial<Record<Status["state"], string>> = {
@@ -25,24 +28,16 @@ const ACTION: Partial<Record<Status["state"], string>> = {
 export async function loadUniverse(code: string): Promise<boolean> {
   try {
     await api.post(`/admin/broker-connections/${code}/universe/load`, {});
-    notifications.show({
-      color: "teal",
-      message: (
-        <>
-          Loading the instrument universe for {code} in the background.{" "}
-          <Anchor component="button" fz="sm" onClick={openTaskCenter}>
-            Open Jobs
-          </Anchor>
-        </>
-      ),
+    toast.success(`Loading the instrument universe for ${code} in the background.`, {
+      action: { label: "Open Jobs", onClick: openTaskCenter },
     });
     return true;
   } catch (err) {
     if (err instanceof ApiError && err.status === 409) {
-      notifications.show({ color: "yellow", message: "Already loading." });
+      notify({ color: "yellow", message: "Already loading." });
       openTaskCenter();
     } else {
-      notifications.show({ color: "red", message: err instanceof ApiError ? err.message : String(err) });
+      notify({ color: "red", message: err instanceof ApiError ? err.message : String(err) });
     }
     return false;
   }
@@ -65,7 +60,7 @@ export function UniverseStatus({ code, broker, environment }: { code: string; br
     queryKey: [`/admin/broker-connections/${code}/credentials`],
     queryFn: () => api.get<{ state: string }>(`/admin/broker-connections/${code}/credentials`),
   });
-  if (!data) return <Text fz="sm" c="dimmed">…</Text>;
+  if (!data) return <span className="text-muted-foreground">…</span>;
 
   const s = SYMBOL[data.state];
   const job = data.last_job;
@@ -81,53 +76,61 @@ export function UniverseStatus({ code, broker, environment }: { code: string; br
     }
   }
 
+  const button = (
+    <Button size="xs" variant="secondary" onClick={isIbkr ? () => setImporting(true) : run} disabled={!configured}>
+      {isIbkr ? "Import instruments" : action}
+    </Button>
+  );
+
   return (
-    <Group justify="space-between" wrap="nowrap" gap="sm">
-      <Stack gap={2}>
-        <Text fz="sm">
-          <Text span c={s.color}>{s.sym} {s.label}</Text>
-          {data.state === "loading" && total > 0 && ` — ${done.toLocaleString()} of ${total.toLocaleString()}`}
-          {data.count > 0 && data.state !== "loading" && ` — ${data.count.toLocaleString()} instruments`}
-        </Text>
-        {data.state === "loading" && total > 0 && <Progress value={(done / total) * 100} size="xs" w={180} />}
+    <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-col gap-0.5">
+        <span>
+          <span className={s.color}>{s.sym} {s.label}</span>
+          {data.state === "loading" && total > 0 && <span className="num"> — {done.toLocaleString()} of {total.toLocaleString()}</span>}
+          {data.count > 0 && data.state !== "loading" && <span className="num"> — {data.count.toLocaleString()} instruments</span>}
+        </span>
+        {data.state === "loading" && total > 0 && (
+          <div className="h-1 w-44 overflow-hidden rounded bg-accent">
+            <div className="h-full bg-buy" style={{ width: `${(done / total) * 100}%` }} />
+          </div>
+        )}
         {data.state === "loaded" && job?.finished_at && (
-          <Text fz="xs" c="dimmed">loaded {new Date(job.finished_at).toLocaleString()}</Text>
+          <span className="num text-xs text-muted-foreground">loaded {new Date(job.finished_at).toLocaleString()}</span>
         )}
         {data.reason && (
-          <Text fz="xs" c={data.state === "failed" ? "red" : "dimmed"} lineClamp={2} maw={360}>
+          <span className={cn("line-clamp-2 max-w-sm text-xs whitespace-normal", data.state === "failed" ? "text-sell" : "text-muted-foreground")}>
             {data.reason}
-          </Text>
+          </span>
         )}
-      </Stack>
-      {(isIbkr || action) && (
-        <Tooltip label="Add credentials first" disabled={configured}>
-          <Button
-            size="compact-xs"
-            variant="light"
-            onClick={isIbkr ? () => setImporting(true) : run}
-            disabled={!configured}
-          >
-            {isIbkr ? "Import instruments" : action}
-          </Button>
-        </Tooltip>
-      )}
+      </div>
+      {(isIbkr || action) &&
+        (configured ? (
+          button
+        ) : (
+          <Tooltip>
+            <TooltipTrigger asChild><span tabIndex={0}>{button}</span></TooltipTrigger>
+            <TooltipContent>Add credentials first</TooltipContent>
+          </Tooltip>
+        ))}
       {importing && isIbkr && (
         <IbkrImport
           envs={[environment!]}
           onClose={() => setImporting(false)}
           intro={
-            <Text size="sm">
+            <p>
               IBKR has no way to list every instrument, so the OMS adds the ones you trade. Upload a CSV
               with the columns symbol, exchange and currency, or conid (exchange as an IBKR code or a
               MIC, up to 1000 rows). Each row is looked up at IBKR and pinned by its conId; if a row
               matches several contracts you pick one. You can also search for single instruments.{" "}
-              <Anchor href="https://openoms.dev/integrations/interactive-brokers/#instruments" target="_blank" rel="noreferrer">
+              <a href="https://openoms.dev/integrations/interactive-brokers/#instruments" target="_blank" rel="noreferrer"
+                className="text-primary hover:underline">
                 Read the docs
-              </Anchor>
-            </Text>
+              </a>
+            </p>
           }
         />
       )}
-    </Group>
+    </div>
   );
 }

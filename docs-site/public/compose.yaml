@@ -5,7 +5,7 @@
 #   docker compose run --rm oms init
 #   docker compose up -d
 #
-# Then open http://localhost:3001/cockpit/ — published on this machine only.
+# Then open http://localhost:3001/app/ — published on this machine only.
 
 name: openoms
 

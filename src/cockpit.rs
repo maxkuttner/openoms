@@ -1,4 +1,4 @@
-//! The cockpit single-page app, compiled into the binary.
+//! The single-page app (trading and the Admin Panel), compiled into the binary.
 //!
 //! `include_dir!` rather than serving a directory off disk, so a released `oms`
 //! serves its own UI from wherever it was installed — no checkout, no npm, no
@@ -38,20 +38,19 @@ pub fn is_bundled() -> bool {
     DIST.get_file("index.html").is_some()
 }
 
-/// Resolve a path *relative to* its app's mount point to an embedded file.
-///
-/// `shell` is the fallback HTML filename for the app this path belongs to
-/// (`index.html` for `/cockpit/`, `trade.html` for `/trade/`) — both apps
-/// share the same asset tree, but each must fall back to its own shell.
+/// The app's HTML shell.
+const SHELL: &str = "index.html";
+
+/// Resolve a path *relative to* the app's mount point to an embedded file.
 ///
 /// A miss on a path with no file extension is a client-side route such as
-/// `/cockpit/orders`: only the SPA shell can answer it, so the shell is what a
+/// `/app/positions`: only the SPA shell can answer it, so the shell is what a
 /// reload of that URL must return. A miss on a path *with* an extension is a
 /// genuinely absent file and stays a 404 — serving HTML there would hand the
 /// browser an index.html labelled `application/javascript`.
-pub fn asset_for(shell: &str, path: &str) -> Option<Asset> {
+pub fn asset_for(path: &str) -> Option<Asset> {
     let rel = path.trim_start_matches('/');
-    let rel = if rel.is_empty() { shell } else { rel };
+    let rel = if rel.is_empty() { SHELL } else { rel };
 
     if let Some(file) = DIST.get_file(rel) {
         let cache_control = if rel.starts_with("assets/") { IMMUTABLE } else { NO_CACHE };
@@ -62,10 +61,9 @@ pub fn asset_for(shell: &str, path: &str) -> Option<Asset> {
         });
     }
 
-    // A miss with no extension is a client-side route; only the shell can answer
-    // it. Which shell depends on which app the URL belongs to.
+    // A miss with no extension is a client-side route; only the shell can answer it.
     if std::path::Path::new(rel).extension().is_none() {
-        let shell_file = DIST.get_file(shell)?;
+        let shell_file = DIST.get_file(SHELL)?;
         return Some(Asset {
             body: shell_file.contents(),
             content_type: "text/html".to_string(),
@@ -76,8 +74,8 @@ pub fn asset_for(shell: &str, path: &str) -> Option<Asset> {
     None
 }
 
-pub fn respond(shell: &str, path: &str) -> Response {
-    match asset_for(shell, path) {
+pub fn respond(path: &str) -> Response {
+    match asset_for(path) {
         Some(asset) => (
             StatusCode::OK,
             [
@@ -93,62 +91,33 @@ pub fn respond(shell: &str, path: &str) -> Response {
 }
 
 async fn redirect_to_slash() -> Redirect {
-    Redirect::temporary("/cockpit/")
+    Redirect::temporary("/app/")
 }
 
 async fn index() -> Response {
-    respond("index.html", "")
+    respond("")
 }
 
 async fn asset(UrlPath(path): UrlPath<String>) -> Response {
-    respond("index.html", &path)
+    respond(&path)
 }
 
-/// The shared asset tree. Both bundles emit into `dist/assets/`, and Vite's
-/// `base` points every generated URL at `/ui/`.
-async fn ui_asset(UrlPath(path): UrlPath<String>) -> Response {
-    respond("index.html", &path)
-}
-
-async fn redirect_to_trade_slash() -> Redirect {
-    Redirect::temporary("/trade/")
-}
-
-async fn trade_index() -> Response {
-    respond("trade.html", "")
-}
-
-async fn trade_asset(UrlPath(path): UrlPath<String>) -> Response {
-    respond("trade.html", &path)
-}
-
-/// Mounted outside the admin auth layer on purpose: the SPA shell has to load
-/// before there is a token to send, and these routes carry no data — only the
-/// static bundle. Authentication happens where it already did, on `/admin/*`.
+/// Mounted outside the auth layers on purpose: the SPA shell has to load
+/// before there is a session, and these routes carry no data — only the
+/// static bundle. The sign-in page is part of the app, and with no sign-in
+/// method enabled it says so (from `/auth/methods`). Authentication happens
+/// where it already did, on the API routes.
 pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
-        // Someone opening `localhost:3001` lands in the cockpit, not on a 404.
+        // Someone opening `localhost:3001` lands in the app, not on a 404.
         .route("/", get(redirect_to_slash))
-        .route("/ui/*path", get(ui_asset))
+        // `base: '/ui/'` in vite.config.ts puts every generated asset URL here.
+        .route("/ui/*path", get(asset))
         // axum's `*path` wildcard needs at least one character after the slash, so
-        // `/cockpit/` itself gets its own route.
-        .route("/cockpit", get(redirect_to_slash))
-        .route("/cockpit/", get(index))
-        .route("/cockpit/*path", get(asset))
-}
-
-/// The trader app's shell and assets. Kept as a *separate* router from
-/// `router()` so the caller can mount it only where the trade app can
-/// actually be used — see `main.rs`, which merges this inside the same
-/// `if oidc_settings.is_some()` gate as `/auth/me`: the trade app
-/// authenticates by session cookie only, and a session can only ever be
-/// minted by the OIDC callback, so with no `[auth.oidc]` configured `/trade/`
-/// would otherwise be a screen nobody could ever log into.
-pub fn trade_router<S: Clone + Send + Sync + 'static>() -> Router<S> {
-    Router::new()
-        .route("/trade", get(redirect_to_trade_slash))
-        .route("/trade/", get(trade_index))
-        .route("/trade/*path", get(trade_asset))
+        // `/app/` itself gets its own route.
+        .route("/app", get(redirect_to_slash))
+        .route("/app/", get(index))
+        .route("/app/*path", get(asset))
 }
 
 #[cfg(test)]
@@ -173,8 +142,8 @@ mod tests {
         if is_bundled() {
             return;
         }
-        assert!(asset_for("index.html", "").is_none());
-        let res = respond("index.html", "");
+        assert!(asset_for("").is_none());
+        let res = respond("");
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
@@ -183,10 +152,10 @@ mod tests {
         if !is_bundled() {
             return;
         }
-        let shell = asset_for("index.html", "").expect("index.html");
+        let shell = asset_for("").expect("index.html");
         assert!(shell.content_type.starts_with("text/html"));
         assert_eq!(shell.cache_control, NO_CACHE);
-        assert_eq!(respond("index.html", "").status(), StatusCode::OK);
+        assert_eq!(respond("").status(), StatusCode::OK);
     }
 
     #[test]
@@ -194,8 +163,8 @@ mod tests {
         if !is_bundled() {
             return;
         }
-        let shell = asset_for("index.html", "").unwrap();
-        let deep = asset_for("index.html", "orders").expect("client-side route must serve the shell");
+        let shell = asset_for("").unwrap();
+        let deep = asset_for("orders").expect("client-side route must serve the shell");
         assert_eq!(shell.body, deep.body);
     }
 
@@ -205,43 +174,8 @@ mod tests {
             return;
         }
         // Has an extension, so it is a real file request, not a client-side route.
-        assert!(asset_for("index.html", "assets/nope-00000000.js").is_none());
-        assert_eq!(respond("index.html", "assets/nope-00000000.js").status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn a_trade_deep_link_falls_back_to_the_trade_shell_not_the_cockpit_one() {
-        if !is_bundled() {
-            return; // source build: nothing embedded to serve
-        }
-        if DIST.get_file("trade.html").is_none() {
-            // Task 4 hasn't built trade.html yet — nothing to assert against.
-            return;
-        }
-        let cockpit = respond("index.html", "orders");
-        let trade = respond("trade.html", "orders");
-
-        assert_eq!(cockpit.status(), StatusCode::OK);
-        assert_eq!(trade.status(), StatusCode::OK);
-        // Both are HTML shells, but they must not be the SAME shell — serving the
-        // cockpit's bundle under /trade/ would load the admin app at the trader's
-        // URL, with the admin token attached.
-        assert_ne!(
-            body_bytes(cockpit).await,
-            body_bytes(trade).await,
-            "each app must fall back to its own shell"
-        );
-    }
-
-    #[test]
-    fn a_missing_asset_stays_missing_for_either_shell() {
-        if !is_bundled() {
-            return;
-        }
-        if DIST.get_file("trade.html").is_none() {
-            return;
-        }
-        assert_eq!(respond("trade.html", "assets/nope.js").status(), StatusCode::NOT_FOUND);
+        assert!(asset_for("assets/nope-00000000.js").is_none());
+        assert_eq!(respond("assets/nope-00000000.js").status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -256,16 +190,15 @@ mod tests {
             .next()
             .expect("at least one hashed asset");
         let name = first.path().to_string_lossy().to_string();
-        assert_eq!(asset_for("index.html", &name).unwrap().cache_control, IMMUTABLE);
+        assert_eq!(asset_for(&name).unwrap().cache_control, IMMUTABLE);
     }
 
     #[tokio::test]
     async fn the_bare_path_redirects_to_the_trailing_slash() {
-        // The SPA's asset URLs are relative to /cockpit/ (vite `base`), so without
-        // the trailing slash the browser resolves them one level too high.
+        // The router's basename is /app/; without the trailing slash it would not match.
         let res = redirect_to_slash().await.into_response();
         assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(res.headers()[header::LOCATION], "/cockpit/");
+        assert_eq!(res.headers()[header::LOCATION], "/app/");
     }
 
     #[tokio::test]
@@ -283,19 +216,15 @@ mod tests {
     }
 
     // The tests above call the handlers directly, which is cheap but bypasses
-    // axum's actual path matching — it would not have caught an overlap between
-    // the exact `/cockpit/` route and the `/cockpit/*path` wildcard, which is
-    // exactly the axum-0.7 hazard `router()`'s doc comment calls out. This test
+    // axum's actual path matching — it would not catch an overlap between the
+    // exact `/app/` route and the `/app/*path` wildcard. This test
     // binds a real listener and drives it with a real HTTP client so the route
     // table itself — not just the handler bodies — is under test.
     #[tokio::test]
     async fn the_router_dispatches_through_axums_real_route_table() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // Both routers, mounted together exactly as main.rs mounts them when
-        // OIDC is configured: `/ui/*path`, `/cockpit*` and `/trade*` share one
-        // route table, and an overlap between them would only ever show up here.
-        let app = router::<()>().merge(trade_router::<()>()).with_state(());
+        let app = router::<()>().with_state(());
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -305,88 +234,40 @@ mod tests {
             .build()
             .unwrap();
         let base = format!("http://{addr}");
-
-        // 0. The site root sends a browser to the cockpit rather than a 404.
-        let res = client.get(format!("{base}/")).send().await.unwrap();
-        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(res.headers()[reqwest::header::LOCATION], "/cockpit/");
-
-        // 1. The bare path is reached and redirects to the trailing slash.
-        let res = client.get(format!("{base}/cockpit")).send().await.unwrap();
-        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(res.headers()[reqwest::header::LOCATION], "/cockpit/");
-
         let expected = if is_bundled() { reqwest::StatusCode::OK } else { reqwest::StatusCode::NOT_FOUND };
 
-        // 2. The exact-match `/cockpit/` route wins over the `/cockpit/*path`
-        // wildcard (it would also match an empty capture, if axum let it).
-        let res = client.get(format!("{base}/cockpit/")).send().await.unwrap();
+        // 0. The site root sends a browser to the app rather than a 404.
+        let res = client.get(format!("{base}/")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[reqwest::header::LOCATION], "/app/");
+
+        // 1. The bare path redirects to the trailing slash.
+        let res = client.get(format!("{base}/app")).send().await.unwrap();
+        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(res.headers()[reqwest::header::LOCATION], "/app/");
+
+        // 2. The exact-match `/app/` route wins over the `/app/*path` wildcard.
+        let res = client.get(format!("{base}/app/")).send().await.unwrap();
         assert_eq!(res.status(), expected);
 
-        // 3. The wildcard resolves an extensionless, client-side deep link.
-        let res = client.get(format!("{base}/cockpit/orders")).send().await.unwrap();
+        // 3. A reload on a deep link serves the shell; the router takes it from there.
+        let res = client.get(format!("{base}/app/admin/broker-connections")).send().await.unwrap();
         assert_eq!(res.status(), expected);
 
-        // 4. An extensioned miss is a genuine 404 in both build states, never the
-        // shell fallback.
-        let res = client
-            .get(format!("{base}/cockpit/assets/nope-00000000.js"))
-            .send()
-            .await
-            .unwrap();
+        // 4. An extensioned miss is a genuine 404 in both build states.
+        let res = client.get(format!("{base}/app/assets/nope-00000000.js")).send().await.unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
 
-        // 5. The shared asset tree. `base: '/ui/'` puts every generated asset
-        // URL here, for BOTH bundles — if this route stopped dispatching, both
-        // apps would load a shell with no JavaScript behind it.
+        // 5. The asset tree: `base: '/ui/'` puts every generated asset URL here.
         let res = client.get(format!("{base}/ui/assets/nope-00000000.js")).send().await.unwrap();
         assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
         let res = client.get(format!("{base}/ui/some-route")).send().await.unwrap();
         assert_eq!(res.status(), expected);
 
-        // 6. The trade app's three routes, the same way round as the cockpit's:
-        // bare path redirects, the exact `/trade/` route wins over the
-        // `/trade/*path` wildcard, and a deep link falls back to the trade
-        // shell.
-        let res = client.get(format!("{base}/trade")).send().await.unwrap();
-        assert_eq!(res.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(res.headers()[reqwest::header::LOCATION], "/trade/");
-
-        let res = client.get(format!("{base}/trade/")).send().await.unwrap();
-        assert_eq!(res.status(), expected);
-
-        let res = client.get(format!("{base}/trade/positions")).send().await.unwrap();
-        assert_eq!(res.status(), expected);
-
-        let res = client
-            .get(format!("{base}/trade/assets/nope-00000000.js"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND);
-
-        // And the two shells are genuinely different documents — a `/trade/`
-        // that served the cockpit's index.html would load the admin app, with
-        // its localStorage admin token, at the trader's URL. Only checkable in
-        // a bundled build; in a source build both are the same 404 text.
-        if is_bundled() {
-            let cockpit_shell = client
-                .get(format!("{base}/cockpit/"))
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap();
-            let trade_shell = client
-                .get(format!("{base}/trade/"))
-                .send()
-                .await
-                .unwrap()
-                .text()
-                .await
-                .unwrap();
-            assert_ne!(cockpit_shell, trade_shell);
+        // 6. The two old apps are gone, not redirected (prerelease, no shims).
+        for old in ["/cockpit", "/cockpit/", "/cockpit/orders", "/trade", "/trade/", "/trade/positions"] {
+            let res = client.get(format!("{base}{old}")).send().await.unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::NOT_FOUND, "{old} must be gone");
         }
     }
 }

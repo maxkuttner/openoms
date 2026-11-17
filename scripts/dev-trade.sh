@@ -36,8 +36,7 @@ echo "waiting for vite..."
 until curl -sf http://localhost:5173 -o /dev/null; do sleep 1; done
 
 echo
-echo "trade app:  http://localhost:5173/trade.html  (sign in through the local Authentik test provider; invite yourself first)"
-echo "admin console: http://localhost:5173/"
+echo "app:  http://localhost:5173/  (sign in through the local Authentik test provider; admins find the Admin Panel in the user menu)"
 echo "local test provider (Authentik) admin: http://localhost:9000/if/admin/  (akadmin / admin)"
 echo "  the oms provider + application come from docker/authentik/blueprints/oms-dev.yaml;"
 echo "  oms.toml: [auth.oidc] issuer = \"http://localhost:9000/application/o/oms/\", client_id = \"oms\""
@@ -46,6 +45,6 @@ echo
 echo "OMS log: /tmp/oms-server.log · vite log: /tmp/cockpit-dev.log"
 echo "ctrl-c to stop the OMS and vite (postgres/authentik stay up)"
 
-open http://localhost:5173/trade.html 2>/dev/null || true
+open http://localhost:5173/ 2>/dev/null || true
 
 wait $OMS_PID $VITE_PID

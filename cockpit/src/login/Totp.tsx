@@ -1,22 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Alert, Anchor, Button, Code, CopyButton, Group, Stack, Text, TextInput } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { CopyText, FormRow, LinkButton, Notice } from "../components/common";
 import { authApi, authErrorText } from "./api";
-import { inputStyles } from "./Frame";
 import { secretFromOtpauth } from "../login";
-
-function CopyField({ label, value }: { label: string; value: string }) {
-  return (
-    <Stack gap={4}>
-      <Text fz={11} c="dimmed">{label}</Text>
-      <Group gap="xs" wrap="nowrap" align="flex-start">
-        <Code style={{ overflowWrap: "anywhere", flex: 1 }}>{value}</Code>
-        <CopyButton value={value}>
-          {({ copied, copy }) => <Button size="xs" variant="light" onClick={copy}>{copied ? "Copied" : "Copy"}</Button>}
-        </CopyButton>
-      </Group>
-    </Stack>
-  );
-}
 
 /** Check a TOTP code (or a recovery code) on the current session. */
 export function Totp({ prompt, onDone, onError }: { prompt?: string; onDone: () => void; onError?: (e: unknown) => void }) {
@@ -40,24 +27,16 @@ export function Totp({ prompt, onDone, onError }: { prompt?: string; onDone: () 
   }
 
   return (
-    <form onSubmit={(e) => { e.preventDefault(); void submit(); }}>
-      <Stack gap={12}>
-        <Text fz={13}>{prompt ?? "Enter the 6-digit code from your authenticator app."}</Text>
-        <TextInput
-          label={recovery ? "Recovery code" : "Code"}
-          value={code}
-          onChange={(e) => setCode(e.currentTarget.value)}
-          autoComplete="one-time-code"
-          inputMode={recovery ? "text" : "numeric"}
-          error={error}
-          data-autofocus
-          styles={inputStyles}
-        />
-        <Button type="submit" color="depth" loading={busy} fullWidth>Continue</Button>
-        <Anchor component="button" type="button" fz={12} onClick={() => { setRecovery(!recovery); setCode(""); setError(null); }}>
-          {recovery ? "Use your authenticator app" : "Use a recovery code"}
-        </Anchor>
-      </Stack>
+    <form onSubmit={(e) => { e.preventDefault(); void submit(); }} className="flex flex-col gap-3">
+      <p>{prompt ?? "Enter the 6-digit code from your authenticator app."}</p>
+      <FormRow label={recovery ? "Recovery code" : "Code"} error={error} htmlFor="totp-code">
+        <Input id="totp-code" className="num" value={code} onChange={(e) => setCode(e.currentTarget.value)}
+          autoComplete="one-time-code" inputMode={recovery ? "text" : "numeric"} autoFocus aria-invalid={!!error} />
+      </FormRow>
+      <Button type="submit" disabled={busy}>Continue</Button>
+      <LinkButton onClick={() => { setRecovery(!recovery); setCode(""); setError(null); }}>
+        {recovery ? "Use your authenticator app" : "Use a recovery code"}
+      </LinkButton>
     </form>
   );
 }
@@ -93,37 +72,30 @@ export function TotpEnroll({ onDone }: { onDone: () => void }) {
 
   if (codes) {
     return (
-      <Stack gap={12}>
-        <Text fz={13}>Save these recovery codes now. Each works once.</Text>
-        <CopyField label="Recovery codes" value={codes.join("\n")} />
-        <Button color="depth" fullWidth onClick={onDone}>Continue</Button>
-      </Stack>
+      <div className="flex flex-col gap-3">
+        <p>Save these recovery codes now. Each works once.</p>
+        <CopyText label="Recovery codes" value={codes.join("\n")} />
+        <Button onClick={onDone}>Continue</Button>
+      </div>
     );
   }
 
   const secret = uri ? secretFromOtpauth(uri) : null;
   return (
-    <form onSubmit={(e) => { e.preventDefault(); void confirm(); }}>
-      <Stack gap={12}>
-        <Text fz={13}>Scan this code with an authenticator app, then enter the 6-digit code.</Text>
-        {!uri && error && <Alert color="red">{error}</Alert>}
-        {uri && (
-          <>
-            <CopyField label="Setup link (otpauth)" value={uri} />
-            {secret && <CopyField label="Or type this key" value={secret} />}
-            <TextInput
-              label="Code"
-              value={code}
-              onChange={(e) => setCode(e.currentTarget.value)}
-              autoComplete="one-time-code"
-              inputMode="numeric"
-              error={error}
-              styles={inputStyles}
-            />
-            <Button type="submit" color="depth" loading={busy} fullWidth>Continue</Button>
-          </>
-        )}
-      </Stack>
+    <form onSubmit={(e) => { e.preventDefault(); void confirm(); }} className="flex flex-col gap-3">
+      <p>Scan this code with an authenticator app, then enter the 6-digit code.</p>
+      {!uri && error && <Notice>{error}</Notice>}
+      {uri && (
+        <>
+          <CopyText label="Setup link (otpauth)" value={uri} />
+          {secret && <CopyText label="Or type this key" value={secret} />}
+          <FormRow label="Code" error={error} htmlFor="totp-enroll-code">
+            <Input id="totp-enroll-code" className="num" value={code} onChange={(e) => setCode(e.currentTarget.value)}
+              autoComplete="one-time-code" inputMode="numeric" aria-invalid={!!error} />
+          </FormRow>
+          <Button type="submit" disabled={busy}>Continue</Button>
+        </>
+      )}
     </form>
   );
 }

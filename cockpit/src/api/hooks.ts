@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { notifications } from "@mantine/notifications";
 import { api, ApiError } from "./client";
+import { notify } from "../components/notify";
 
 export function useList<T>(path: string, enabled = true) {
   return useQuery<T[]>({ queryKey: [path], queryFn: () => api.get<T[]>(path), enabled });
@@ -8,11 +8,11 @@ export function useList<T>(path: string, enabled = true) {
 
 export function notifyError(err: unknown) {
   const msg = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
-  notifications.show({ color: "red", title: "Error", message: msg });
+  notify({ color: "red", title: "Error", message: msg });
 }
 
 export function notifyOk(message: string) {
-  notifications.show({ color: "green", message });
+  notify({ color: "green", message });
 }
 
 // Mutation that invalidates the given list paths and shows a toast on success/error.

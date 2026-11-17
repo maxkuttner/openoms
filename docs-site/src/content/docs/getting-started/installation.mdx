@@ -9,8 +9,8 @@ openoms ships as one `oms` binary. Install it with one command, or build it from
 
 ## Overview
 
-`oms` is a single executable: the server, the web cockpit and the command-line tool in one
-file. It needs no runtime, and the cockpit is embedded. Its only outside dependency is a
+`oms` is a single executable: the server, the web app and the command-line tool in one
+file. It needs no runtime, and the web app is embedded. Its only outside dependency is a
 PostgreSQL 16 database, which [`oms init`](/getting-started/) can start for you in
 Docker.
 
@@ -74,13 +74,13 @@ docker compose run --rm oms init
 docker compose up -d
 ```
 
-Then open `http://localhost:3001/cockpit/` and create the admin account (the first account
+Then open `http://localhost:3001/app/` and create the admin account (the first account
 signed up is the admin). See
 [Sign-in and users](/configuration/login/).
 
 - [compose.yaml](https://openoms.dev/compose.yaml) runs the
   `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
-- The cockpit is published on this machine only (`127.0.0.1:3001`). On a remote server,
+- The web app is published on this machine only (`127.0.0.1:3001`). On a remote server,
   reach it through an SSH tunnel or Tailscale.
 - Data lives in two volumes: `openoms_oms-config` (`oms.toml` and its master key) and
   `openoms_oms-pgdata` (the database). Keep `.env`: it holds the database superuser
@@ -118,16 +118,16 @@ export PATH="$HOME/.local/bin:$PATH"
 
 For any other platform. You need Rust (stable), cmake with a C++ compiler (the embedded
 FIX engine is C++), OpenSSL 3 (`brew install openssl@3` on macOS) and Node 22 for the
-cockpit.
+web app.
 
 ```sh
 git clone https://github.com/maxkuttner/openoms.git && cd openoms
-(cd cockpit && npm ci && npm run build)   # build the cockpit first: it is embedded
+(cd cockpit && npm ci && npm run build)   # build the web app first: it is embedded
 cargo build --release
 cp target/release/oms ~/.local/bin/
 ```
 
-A binary built without the cockpit bundle serves a 404 at `/cockpit/`.
+A binary built without the web app bundle serves a 404 at `/app/`.
 
 ## Upgrading
 

@@ -1,184 +1,65 @@
-import { useEffect, useState } from "react";
-import { AppShell, Box, Group, NavLink, Button, Center, Text, Loader, Anchor, Stack } from "@mantine/core";
-import { Routes, Route, NavLink as RouterNavLink, Navigate, useLocation } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { API_BASE, consoleAccess, goToLogin, onMfaRequired } from "./api/client";
-import { authApi, COCKPIT_HOME, TRADE_HOME } from "./login/api";
-import { MfaPrompt } from "./login/MfaPrompt";
-import { Frame } from "./login/Frame";
-import { Logo } from "./components/Logo";
-import { JobsIndicator } from "./components/JobsIndicator";
+import { Navigate, Route, Routes } from "react-router-dom";
+import { APP_HOME } from "./login/api";
 import { LoginPage } from "./login/LoginPage";
-import { ForcedPasswordChange, PendingScreen } from "./login/ChangePassword";
 import { AccountSettings } from "./login/AccountSettings";
-import { UsersPage } from "./pages/Users";
-import { GroupsPage } from "./pages/Groups";
-import { SignInPage } from "./pages/SignIn";
-import { SetupChecklist } from "./components/SetupChecklist";
-import { PortfoliosPage } from "./pages/Portfolios";
-import { AccountsPage } from "./pages/Accounts";
-import { BrokerConnectionsPage } from "./pages/BrokerConnections";
-import { RiskLimitsPage } from "./pages/RiskLimits";
-import { StrategiesPage } from "./pages/Strategies";
-import { BlotterPage } from "./pages/Blotter";
-import { InstrumentsPage } from "./pages/Instruments";
-import { DataFeedsPage } from "./pages/DataFeeds";
-import { ApiPage } from "./pages/Api";
-import { palette } from "./palette";
+import { AuthGate } from "./shell/AuthGate";
+import { Shell } from "./shell/Shell";
+import { AdminPanel } from "./shell/AdminPanel";
+import { useSession } from "./shell/session";
+import { TradePage } from "./pages/trading/Trade";
+import { PositionsPage } from "./pages/trading/Positions";
+import { AccessPage } from "./pages/trading/Access";
+import { UsersPage } from "./pages/admin/Users";
+import { GroupsPage } from "./pages/admin/Groups";
+import { SignInPage } from "./pages/admin/SignIn";
+import { ApiPage } from "./pages/admin/Api";
+import { PortfoliosPage } from "./pages/admin/Portfolios";
+import { AccountsPage } from "./pages/admin/Accounts";
+import { StrategiesPage } from "./pages/admin/Strategies";
+import { RiskLimitsPage } from "./pages/admin/RiskLimits";
+import { InstrumentsPage } from "./pages/admin/Instruments";
+import { BrokerConnectionsPage } from "./pages/admin/BrokerConnections";
+import { DataFeedsPage } from "./pages/admin/DataFeeds";
+import { BlotterPage } from "./pages/admin/Blotter";
 
-const NAV = [
-  { to: "/users", label: "Users" },
-  { to: "/groups", label: "Groups" },
-  { to: "/sign-in", label: "Sign-in" },
-  { to: "/tokens", label: "API" },
-  { to: "/portfolios", label: "Portfolios" },
-  { to: "/accounts", label: "Accounts" },
-  { to: "/broker-connections", label: "Broker connections" },
-  { to: "/data-feeds", label: "Data feeds" },
-  { to: "/risk-limits", label: "Risk limits" },
-  { to: "/strategies", label: "Strategies" },
-  { to: "/blotter", label: "Blotter" },
-  { to: "/instruments", label: "Instruments" },
-  { to: "/account", label: "Account" },
-];
-
-function ConnectionDot() {
-  const { data: ok } = useQuery({
-    queryKey: ["health"],
-    queryFn: async () => (await fetch(`${API_BASE}/health`)).ok,
-    refetchInterval: 10000,
-  });
-  return (
-    <Group gap={6}>
-      <span style={{ width: 7, height: 7, borderRadius: "50%", background: ok ? palette.buy : palette.red }} />
-      <Text fz={12} c={palette.muted}>{ok ? "connected" : "offline"}</Text>
-    </Group>
-  );
+function Trade() {
+  const { me } = useSession();
+  return <TradePage me={me} />;
 }
 
-/** Home: straight to Users. The setup checklist is a banner above every page
- *  (see Console) until all its steps are done, so it never vanishes on navigation. */
-function Home() {
-  return <Navigate to="/users" replace />;
+function Positions() {
+  const { me } = useSession();
+  return <PositionsPage me={me} />;
 }
 
-/** The authenticated console. */
-function Console({ onLogout }: { onLogout: () => void }) {
-  const { pathname } = useLocation();
-  return (
-    <AppShell header={{ height: 56 }} navbar={{ width: 220, breakpoint: "sm" }} padding="md">
-      <AppShell.Header style={{ background: palette.black, borderColor: palette.border }}>
-        <Group h="100%" px="md" justify="space-between">
-          <Logo />
-          <Group gap="md">
-            <JobsIndicator />
-            <ConnectionDot />
-            <Button variant="subtle" size="xs" color="gray" onClick={onLogout}>
-              Log out
-            </Button>
-          </Group>
-        </Group>
-      </AppShell.Header>
-      <AppShell.Navbar p="xs">
-        {NAV.map((n) => (
-          <NavLink
-            key={n.to}
-            component={RouterNavLink}
-            to={n.to}
-            label={n.label}
-            active={pathname.startsWith(n.to)}
-          />
-        ))}
-        <Group px="sm" py="xs">
-          {/* The docs live on the public site now — they are what someone reads *before*
-              installing, so they do not belong behind a login. */}
-          <Anchor
-            href="https://openoms.dev/"
-            target="_blank"
-            rel="noreferrer"
-            fz="sm"
-          >
-            Docs ↗
-          </Anchor>
-        </Group>
-      </AppShell.Navbar>
-      <AppShell.Main>
-        <Box mb="md">
-          <SetupChecklist />
-        </Box>
-        <Routes>
-          <Route path="/" element={<Home />} />
-          <Route path="/users" element={<UsersPage />} />
-          <Route path="/groups" element={<GroupsPage />} />
-          <Route path="/sign-in" element={<SignInPage />} />
-          <Route path="/tokens" element={<ApiPage />} />
-          <Route path="/portfolios" element={<PortfoliosPage />} />
-          <Route path="/accounts" element={<AccountsPage />} />
-          <Route path="/broker-connections" element={<BrokerConnectionsPage />} />
-          <Route path="/data-feeds" element={<DataFeedsPage />} />
-          <Route path="/risk-limits" element={<RiskLimitsPage />} />
-          <Route path="/strategies" element={<StrategiesPage />} />
-          <Route path="/blotter" element={<BlotterPage />} />
-          <Route path="/instruments" element={<InstrumentsPage />} />
-          <Route path="/account" element={<AccountSettings />} />
-        </Routes>
-      </AppShell.Main>
-    </AppShell>
-  );
-}
-
-type Status = "checking" | "admin" | "pending" | "change_password" | "forbidden" | "unavailable";
-
-/** Signed in, but without the admin capability. */
-function NoAccess() {
-  return (
-    <Frame title="Admin console">
-      <Stack gap={12}>
-        <Text fz={13}>You don't have access to the admin console.</Text>
-        <Anchor href={TRADE_HOME}>Open the trader app</Anchor>
-      </Stack>
-    </Frame>
-  );
-}
-
-/** Auth gate: the console needs a session holding the admin capability. */
+/** The whole app. Sign-in and the access page render without a session. */
 export function App() {
-  const { pathname } = useLocation();
-  const [status, setStatus] = useState<Status>("checking");
-  const onLoginPage = pathname === "/login";
-
-  useEffect(() => {
-    if (onLoginPage) return;
-    consoleAccess()
-      .catch(() => "unavailable" as const)
-      .then((a) => (a === "signed_out" ? goToLogin() : setStatus(a)));
-  }, [onLoginPage]);
-
-  if (onLoginPage) return <LoginPage home={COCKPIT_HOME} />;
-
-  if (status === "checking") {
-    return (
-      <Center h="100vh" bg={palette.black}>
-        <Loader />
-      </Center>
-    );
-  }
-  if (status === "pending") return <PendingScreen />;
-  if (status === "change_password") return <ForcedPasswordChange onDone={() => window.location.reload()} />;
-  if (status === "forbidden") return <NoAccess />;
-  if (status === "unavailable") {
-    return <Frame title="Admin console"><Text fz={13}>The OMS isn't responding. Try again.</Text></Frame>;
-  }
-
   return (
-    <>
-      <MfaPrompt register={onMfaRequired} />
-      <Console
-        onLogout={async () => {
-          await authApi.logout().catch(() => undefined);
-          goToLogin();
-        }}
-      />
-    </>
+    <Routes>
+      <Route path="/login" element={<LoginPage home={APP_HOME} />} />
+      <Route path="/access" element={<AccessPage />} />
+      <Route element={<AuthGate><Shell /></AuthGate>}>
+        <Route index element={<Trade />} />
+        <Route path="positions" element={<Positions />} />
+        <Route path="settings" element={<AccountSettings />} />
+        <Route path="admin" element={<AdminPanel />}>
+          <Route index element={<Navigate to="users" replace />} />
+          <Route path="users" element={<UsersPage />} />
+          <Route path="groups" element={<GroupsPage />} />
+          <Route path="sign-in" element={<SignInPage />} />
+          <Route path="api" element={<ApiPage />} />
+          <Route path="portfolios" element={<PortfoliosPage />} />
+          <Route path="accounts" element={<AccountsPage />} />
+          <Route path="strategies" element={<StrategiesPage />} />
+          <Route path="risk-limits" element={<RiskLimitsPage />} />
+          <Route path="instruments" element={<InstrumentsPage />} />
+          <Route path="broker-connections" element={<BrokerConnectionsPage />} />
+          <Route path="data-feeds" element={<DataFeedsPage />} />
+          <Route path="blotter" element={<BlotterPage />} />
+          <Route path="*" element={<Navigate to="users" replace />} />
+        </Route>
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
   );
 }

@@ -1,12 +1,12 @@
 ---
 title: Getting started
-description: Install the oms binary, let oms init set up the database and cockpit, start the server and log in.
+description: Install the oms binary, let oms init set up the database and web app, start the server and log in.
 ---
 
 import { Aside } from "@astrojs/starlight/components";
 
-openoms is a single `oms` binary: the server, the web cockpit and the command-line tool in
-one file. Follow the steps to go from installation to running managing the `openoms` cockpit.
+openoms is a single `oms` binary: the server, the web app and the command-line tool in
+one file. Follow the steps to go from installation to managing openoms in the web app.
 
 ## 1. Install
 
@@ -49,11 +49,11 @@ oms
 ```
 
 It logs what it found and listens where you told it. On a fresh install, expect a note that
-the instrument catalog is empty — the cockpit fills it in the next guide.
+the instrument catalog is empty — the Admin Panel fills it in the next guide.
 
-## 4. Open the cockpit
+## 4. Open the web app
 
-Open `http://localhost:3001/cockpit/` and **create the admin account** (name, email and a
+Open `http://localhost:3001/app/` and **create the admin account** (name, email and a
 password of at least 15 characters): on a fresh install the first account signed up is the
 admin. See [Sign-in and users](/configuration/login/). On a remote
 server, tunnel the port first:

@@ -1,33 +1,26 @@
-import { Group, Text } from "@mantine/core";
-import { palette } from "../palette";
-
 // The brand depth-ladder glyph: green "bids" over amber "asks".
 export function DepthGlyph({ height = 24 }: { height?: number }) {
   const w = (height * 26) / 24;
   return (
     <svg width={w} height={height} viewBox="0 0 26 24" aria-hidden role="presentation">
-      <rect x="0" y="0" width="15.6" height="3" rx="1" fill={palette.green} />
-      <rect x="0" y="5.5" width="22.1" height="3" rx="1" fill={palette.green} />
-      <rect x="0" y="11" width="26" height="2" rx="1" fill={palette.logoBar} />
-      <rect x="0" y="15" width="18.7" height="3" rx="1" fill={palette.amber} />
-      <rect x="0" y="20.5" width="23.4" height="3" rx="1" fill={palette.amber} />
+      <rect x="0" y="0" width="15.6" height="3" rx="1" fill="var(--buy)" />
+      <rect x="0" y="5.5" width="22.1" height="3" rx="1" fill="var(--buy)" />
+      <rect x="0" y="11" width="26" height="2" rx="1" fill="var(--border)" />
+      <rect x="0" y="15" width="18.7" height="3" rx="1" fill="var(--brand-amber)" />
+      <rect x="0" y="20.5" width="23.4" height="3" rx="1" fill="var(--brand-amber)" />
     </svg>
   );
 }
 
 // "openOMS" wordmark — muted "open", bold "OMS".
-export function Logo({ size = 22 }: { size?: number }) {
+export function Logo({ size = 15 }: { size?: number }) {
   return (
-    <Group gap={10} wrap="nowrap">
+    <span className="inline-flex items-center gap-2 whitespace-nowrap">
       <DepthGlyph height={size + 2} />
-      <Text component="span" fz={size} style={{ letterSpacing: -1, lineHeight: 1 }}>
-        <Text component="span" fw={400} c={palette.faint} inherit>
-          open
-        </Text>
-        <Text component="span" fw={800} c={palette.ink} inherit>
-          OMS
-        </Text>
-      </Text>
-    </Group>
+      <span style={{ fontSize: size, letterSpacing: -0.5, lineHeight: 1 }}>
+        <span className="font-normal text-muted-foreground">open</span>
+        <span className="font-semibold text-foreground">OMS</span>
+      </span>
+    </span>
   );
 }

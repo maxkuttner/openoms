@@ -24,7 +24,7 @@ been verified end to end with a real Coinbase account.
 | Order entry | REST: market and limit orders, cancel |
 | Executions | Coinbase's private user stream: fills, partial fills, cancels, rejects, expiries |
 | Instruments | Spot products (`BTC-USD`, `ETH-EUR`, …) |
-| Catalog | Broker connections → **Instrument universe** in the cockpit |
+| Catalog | Admin Panel → Connectivity → Broker connections → **Instrument universe** |
 | Prices | Coinbase's public ticker |
 
 ## Credentials

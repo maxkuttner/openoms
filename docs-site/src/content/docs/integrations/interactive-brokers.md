@@ -52,7 +52,7 @@ Each instrument is an IBKR contract, identified by its IBKR contract id (conId) 
 listed under its listing exchange's MIC, for example `XETR` for SAP. Orders always go
 out by conId.
 
-In the cockpit, open **Broker connections** and press **Import instruments** on the IBKR_TWS
+In the Admin Panel, open **Connectivity → Broker connections** and press **Import instruments** on the IBKR_TWS
 connection: choose a CSV file, check the preview, pick a contract for any ambiguous row,
 then save. The same dialog has a search for single instruments.
 
@@ -128,7 +128,7 @@ Commissions are booked as fees; see [Fees](/concepts/fees/).
 
 ## Credentials
 
-For the TWS API connection, in the cockpit's credentials drawer:
+For the TWS API connection, in the connection's credentials drawer:
 
 | Field | What it is | Default |
 | --- | --- | --- |
@@ -152,7 +152,7 @@ for instruments that already have one. Prefer the TWS API connection above.
 ### Credentials
 
 IBKR gives you the FIX session details when they enable FIX for your account. Create a
-broker connection in the cockpit with **Interactive Brokers** as the venue; its
+broker connection in the Admin Panel with **Interactive Brokers** as the venue; its
 credentials drawer asks for:
 
 | Field | What it is | Default |

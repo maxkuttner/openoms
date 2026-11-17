@@ -5,10 +5,8 @@ import { authErrorMessage, type AuthMethods } from "../login";
 
 export const API_BASE = import.meta.env.DEV ? "/api" : "";
 
-// Each app's router base. In dev both run on vite with no path split (see
-// main.tsx / trade/main.tsx).
-export const COCKPIT_HOME = import.meta.env.DEV ? "/" : "/cockpit/";
-export const TRADE_HOME = import.meta.env.DEV ? "/trade.html/" : "/trade/";
+// The app's router base. In dev it runs at vite's root.
+export const APP_HOME = import.meta.env.DEV ? "/" : "/app/";
 
 export class AuthError extends Error {
   constructor(public status: number, public code: string | null, public reason: string | null) {
@@ -58,14 +56,8 @@ export const authApi = {
 /** One of the signed-in user's API keys; `secret` only right after creation. */
 export type OwnKey = { key_id: string; name: string | null; created_at: string; secret?: string | null };
 
-/** The parts of `GET /auth/me` the sign-in screens care about. */
-export type SessionInfo = {
-  auth_method: string;
-  /** `admin`, `user` or `pending`. */
-  role?: string;
-  must_change_password?: boolean;
-  totp_enrolled?: boolean;
-};
+export type { SessionInfo } from "../access";
+import type { SessionInfo } from "../access";
 
 
 /** User-facing text for a failed sign-in call. */

@@ -1,7 +1,9 @@
 import { useState } from "react";
-import { Button, PasswordInput, Stack, Text } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { FormRow } from "../components/common";
 import { AuthError, authApi, authErrorText } from "./api";
-import { Frame, inputStyles } from "./Frame";
+import { Frame } from "./Frame";
 import { nextStepFromLoginResponse, PENDING_MESSAGE, type Step } from "../login";
 import { Totp, TotpEnroll } from "./Totp";
 
@@ -30,32 +32,35 @@ export function ChangePassword({ prompt, onNext }: { prompt?: string; onNext: (s
   }
 
   return (
-    <form onSubmit={(e) => { e.preventDefault(); void submit(); }}>
-      <Stack gap={12}>
-        <Text fz={13}>{prompt ?? "Choose a new password (at least 15 characters)."}</Text>
-        <PasswordInput label="Current password" value={current} onChange={(e) => setCurrent(e.currentTarget.value)}
-          autoComplete="current-password" data-autofocus styles={inputStyles} />
-        <PasswordInput label="New password" value={password} onChange={(e) => setPassword(e.currentTarget.value)}
-          autoComplete="new-password" styles={inputStyles} />
-        <PasswordInput label="New password again" value={again} onChange={(e) => setAgain(e.currentTarget.value)}
-          autoComplete="new-password" error={error} styles={inputStyles} />
-        <Button type="submit" color="depth" loading={busy} fullWidth>Change password</Button>
-      </Stack>
+    <form onSubmit={(e) => { e.preventDefault(); void submit(); }} className="flex flex-col gap-3">
+      <p>{prompt ?? "Choose a new password (at least 15 characters)."}</p>
+      <FormRow label="Current password" htmlFor="cp-current">
+        <Input id="cp-current" type="password" value={current} onChange={(e) => setCurrent(e.currentTarget.value)}
+          autoComplete="current-password" autoFocus />
+      </FormRow>
+      <FormRow label="New password" htmlFor="cp-new">
+        <Input id="cp-new" type="password" value={password} onChange={(e) => setPassword(e.currentTarget.value)} autoComplete="new-password" />
+      </FormRow>
+      <FormRow label="New password again" error={error} htmlFor="cp-again">
+        <Input id="cp-again" type="password" value={again} onChange={(e) => setAgain(e.currentTarget.value)}
+          autoComplete="new-password" aria-invalid={!!error} />
+      </FormRow>
+      <Button type="submit" disabled={busy}>Change password</Button>
     </form>
   );
 }
 
-/** What a pending account sees, in both apps, until an admin approves it. */
+/** What a pending account sees until an admin approves it. */
 export function PendingScreen() {
   return (
     <Frame title="Account pending">
-      <Stack gap={12}>
-        <Text fz={13}>{PENDING_MESSAGE}</Text>
-        <Button variant="default" fullWidth
+      <div className="flex flex-col gap-3">
+        <p>{PENDING_MESSAGE}</p>
+        <Button variant="outline"
           onClick={() => { void authApi.logout().catch(() => undefined).then(() => window.location.reload()); }}>
           Sign out
         </Button>
-      </Stack>
+      </div>
     </Frame>
   );
 }

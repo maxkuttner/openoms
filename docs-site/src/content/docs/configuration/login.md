@@ -3,8 +3,8 @@ title: Sign-in and users
 description: The first account becomes the admin, people sign up (and wait for approval) or are added by an admin, an authenticator app is optional, and single sign-on with your own identity provider can create or link accounts.
 ---
 
-Everyone signs in the same way, to the cockpit (`/cockpit/`) and to the trading app
-(`/trade/`): one session, one account per person. The OMS has its own accounts (a password
+Everyone signs in the same way, to the one app at `/app/` (trading, plus the Admin Panel for
+admins): one session, one account per person. The OMS has its own accounts (a password
 plus, optionally, an authenticator app), so a fresh install needs no identity provider, mail server or
 extra container. If your organisation has single sign-on (SSO), you can add it later, next
 to local accounts or instead of them.
@@ -104,7 +104,7 @@ machine credentials with their own scope. For SSO sessions see
 ## Groups and permissions
 
 The account role (admin / user / pending) says whether someone may use the OMS and the admin
-console. What a **user** may do with a portfolio comes from **groups**: on the cockpit's
+console. What a **user** may do with a portfolio comes from **groups**: on the Admin Panel's
 **Groups** page, a group has members and, per portfolio, an access level: **view**, **trade**
 or **manage**. Someone in several groups gets the highest level on each portfolio; no group
 with that portfolio means no access. The levels carry these permissions (view = Viewer,
@@ -156,7 +156,7 @@ OMS_OIDC_CLIENT_SECRET=...
 A `.env` next to `oms.toml` works (see
 [Config file locations](/configuration/file-locations/#env-files)). Register the redirect
 URI `{public_base_url}/auth/callback` with the provider (a confidential client, authorization
-code flow with PKCE), then restart the OMS. The cockpit's **Sign-in** page shows the issuer,
+code flow with PKCE), then restart the OMS. The Admin Panel's **People → Sign-in** page shows the issuer,
 whether discovery works (and why not) and the exact redirect URL.
 
 If the provider is unreachable, SSO stays off for that run and the error is logged. Local
@@ -266,9 +266,9 @@ docker exec <container> oms auth recover-admin --email you@example.com
 
 ## Upgrading from the shared admin password
 
-Earlier versions had one cockpit password (`[server].admin_password` or
+Earlier versions had one shared admin password (`[server].admin_password` or
 `OMS_ADMIN_PASSWORD`). It no longer works: the bearer is refused, and the setting is ignored
-with a warning at startup (delete it). If no admin exists yet, open the cockpit and **create
+with a warning at startup (delete it). If no admin exists yet, open the web app and **create
 the admin account**. If an admin already exists, sign in as them; if nobody can, use
 [`oms auth recover-admin`](#recover-an-admin-from-the-host).
 
@@ -297,7 +297,7 @@ It takes a minute or two on first start. Use `issuer = "http://localhost:9000/ap
 `client_id = "oms"`, `public_base_url = "http://localhost:3001"` and
 `OMS_OIDC_CLIENT_SECRET=oms-dev-secret`. The blueprint creates the provider; create a user
 in the Authentik admin UI (`http://localhost:9000/if/admin/`, `akadmin` / `admin`, dev only)
-and give it a verified email. `scripts/dev-trade.sh` does the setup for the trade app's dev
+and give it a verified email. `scripts/dev-trade.sh` does the setup for the web app's dev
 server.
 
 :::danger[Dev fixture only]

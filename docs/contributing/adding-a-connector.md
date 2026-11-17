@@ -7,10 +7,10 @@ A connector is one broker or venue the OMS can trade through. Its code lives in 
    - `alpaca/` for a broker with REST orders and an execution stream;
    - `ibkr/` for a FIX-only broker.
 
-   The manifest holds the venue's entry in the cockpit's connection form, its credential fields, its redaction rules and environments; the `Connector` implementation says how it connects, verifies a key, loads its instrument universe and supplies its public feed. A REST connector whose venue has a previous-close endpoint also hands back a `DailyStats` source from `connect`.
+   The manifest holds the venue's entry in the Admin Panel's connection form, its credential fields, its redaction rules and environments; the `Connector` implementation says how it connects, verifies a key, loads its instrument universe and supplies its public feed. A REST connector whose venue has a previous-close endpoint also hands back a `DailyStats` source from `connect`.
 
    The price side runs under the market data gateway (`crates/gateway/src/md/`): the connector only supplies the feed (its symbology and wire protocol), and `gateway::md` decides what it subscribes, runs the session and emits its quotes. A price-only vendor with no order side, like Databento OPRA, lives in `crates/gateway/src/md/` rather than under `connectors/`.
-2. **Two lines in `crates/gateway/src/connectors/mod.rs`**: `pub mod <name>;` and its entry in `all()`. The order in `all()` is the order the cockpit lists venues.
+2. **Two lines in `crates/gateway/src/connectors/mod.rs`**: `pub mod <name>;` and its entry in `all()`. The order in `all()` is the order the Admin Panel lists venues.
 3. **A migration** under `db/migrations/ods/oms/`: the venue row, and a `provider_feed_policy` row if its public feed marks instruments (see `0032_INSERT_OKX_FEED_POLICY.sql`).
 4. **A docs page** under `docs-site/src/content/docs/integrations/`. The manifest's `docs_url` points at it. What each credential field means and where to get it goes there, not in the UI.
 

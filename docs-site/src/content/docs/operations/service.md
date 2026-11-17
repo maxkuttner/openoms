@@ -74,7 +74,7 @@ Save it as `/etc/systemd/system/oms.service`, then
 ## Is it running?
 
 `oms status` shows what runs on this machine and where: the OMS and the addresses
-of its admin and trader UIs, then Postgres, the login provider, Kafka and each
+of its web app, then Postgres, the login provider, Kafka and each
 broker stream.
 
 ```sh
@@ -85,8 +85,7 @@ oms status
 config          /home/you/.config/oms/oms.toml
 
 OMS             up              http://localhost:3001
-  admin UI                      http://localhost:3001/cockpit/
-  trader UI                     http://localhost:3001/trade/
+  UI                            http://localhost:3001/app/
 Postgres        up              localhost:5432/ods
 Login (OIDC)    up              http://localhost:8090/realms/oms
 Kafka           not configured

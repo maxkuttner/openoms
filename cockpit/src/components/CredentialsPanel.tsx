@@ -1,22 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useForm } from "@mantine/form";
-import {
-  Accordion,
-  Alert,
-  Anchor,
-  Badge,
-  Button,
-  Checkbox,
-  Group,
-  Loader,
-  Modal,
-  PasswordInput,
-  Stack,
-  Text,
-  TextInput,
-  Textarea,
-} from "@mantine/core";
+import { ChevronRight } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Textarea } from "@/components/ui/textarea";
+import { FormRow, Notice, Spinner } from "./common";
+import { ConfirmButton } from "./ConfirmButton";
+import { TextField } from "./form";
+import { Modal } from "./overlay";
+import { Pill, type Tone } from "./status";
 import { api, ApiError } from "../api/client";
 import { notifyError, notifyOk, useList } from "../api/hooks";
 import { groupFields, initialValues, sectionStartsOpen, type Venue, type VenueField } from "../venues";
@@ -75,16 +67,16 @@ function describeReload(outcome: ConnectionOutcome | null): string {
   return `saved, but the connection did not come up: ${outcome.Failed}`;
 }
 
-function describeTest(tested: boolean, ok: boolean, message: string | null): { color: string; text: string } {
-  if (!tested) return { color: "gray", text: message ?? "not testable before save" };
-  if (ok) return { color: "green", text: "credential verified" };
-  return { color: "red", text: message ?? "credential test failed" };
+function describeTest(tested: boolean, ok: boolean, message: string | null): { tone: "info" | "success" | "error"; text: string } {
+  if (!tested) return { tone: "info", text: message ?? "not testable before save" };
+  if (ok) return { tone: "success", text: "credential verified" };
+  return { tone: "error", text: message ?? "credential test failed" };
 }
 
-const STATE_COLOR: Record<RedactedCredentials["state"], string> = {
-  configured: "green",
-  unconfigured: "gray",
-  error: "red",
+const STATE_TONE: Record<RedactedCredentials["state"], Tone> = {
+  configured: "buy",
+  unconfigured: "muted",
+  error: "sell",
 };
 
 export function CredentialsPanel({ kind, code, providerCode, environment = "PAPER" }: Props) {
@@ -108,22 +100,22 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
   // connection's instrument universe was never loaded.
   const [offerLoad, setOfferLoad] = useState(false);
 
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const setField = (name: string, value: string) => {
+    setValues((v) => ({ ...v, [name]: value }));
+    setErrors((e) => ({ ...e, [name]: "" }));
+  };
   // `required` on an input only renders an asterisk; enforcement is this
   // validator. It fires only when there is nothing stored to fall back on —
   // once a credential is configured, an empty field means "keep", which is
   // the whole point of the merge rule and must not be flagged as missing.
-  const form = useForm<Record<string, string>>({
-    initialValues: {},
-    validate: (values) =>
-      Object.fromEntries(
-        specs
-          .filter((spec) => spec.input !== "checkbox")
-          .map((spec) => [
-            spec.name,
-            isFreshRef.current && !(values[spec.name] ?? "").trim() ? "required" : null,
-          ]),
-      ),
-  });
+  const validate = (vals: Record<string, string>) =>
+    Object.fromEntries(
+      specs
+        .filter((spec) => spec.input !== "checkbox" && isFreshRef.current && !(vals[spec.name] ?? "").trim())
+        .map((spec) => [spec.name, "required"]),
+    );
   const [lastTest, setLastTest] = useState<TestResponse | null>(null);
   const [lastSave, setLastSave] = useState<SaveResponse | null>(null);
 
@@ -131,8 +123,8 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
   // `unconfigured` and (per parse_broker/parse_feed) `error` are both parsed
   // with `existing: None`, so both need every field filled in fresh.
   const isFresh = data?.state !== "configured";
-  // `form` is created before `isFresh` is in scope, and Mantine captures the
-  // validator once — a ref keeps it reading the current value.
+  // The validator above is declared before `isFresh` is in scope — a ref
+  // keeps it reading the current value.
   const isFreshRef = useRef(isFresh);
   isFreshRef.current = isFresh;
 
@@ -152,7 +144,8 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
     // applies only while nothing is stored, for the same reason.
     const init = initialValues(specs, isFresh ? environment : null, wireByName);
     setOpenSections(layout.sections.filter((sec) => sectionStartsOpen(sec.fields, init)).map((sec) => sec.name));
-    form.setValues(init);
+    setValues(init);
+    setErrors({});
     setLastTest(null);
     setLastSave(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -198,32 +191,21 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
     onError: notifyError,
   });
 
-  if (isLoading || venues.isLoading) return <Loader size="sm" />;
+  if (isLoading || venues.isLoading) return <Spinner />;
   if (isError || !data) {
-    return <Alert color="red">Failed to load credentials{error instanceof ApiError ? `: ${error.message}` : ""}</Alert>;
+    return <Notice>Failed to load credentials{error instanceof ApiError ? `: ${error.message}` : ""}</Notice>;
   }
   if (specs.length === 0) {
-    return (
-      <Alert color="red">
-        No credential fields known for {kind} "{providerCode}". For a broker, add it to src/venues.rs.
-      </Alert>
-    );
+    return <Notice>No credential fields known for {kind} "{providerCode}". For a broker, add it to src/venues.rs.</Notice>;
   }
 
   const renderField = (spec: VenueField) => {
-    const common = {
-      label: spec.label,
-      required: isFresh,
-      ...form.getInputProps(spec.name),
-    };
     if (spec.input === "checkbox") {
       return (
-        <Checkbox
-          key={spec.name}
-          label={spec.label}
-          checked={form.values[spec.name] === "true"}
-          onChange={(e) => form.setFieldValue(spec.name, e.currentTarget.checked ? "true" : "false")}
-        />
+        <label key={spec.name} className="flex items-center gap-2">
+          <Checkbox checked={values[spec.name] === "true"} onCheckedChange={(on) => setField(spec.name, on === true ? "true" : "false")} />
+          {spec.label}
+        </label>
       );
     }
     // A withheld field — secret or masked — shows what is installed
@@ -236,154 +218,118 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
         : spec.secret
           ? "leave blank to keep"
           : undefined;
+    const label = <>{spec.label}{isFresh && <span className="text-sell"> *</span>}</>;
     if (spec.input === "textarea") {
       return (
-        <Textarea
-          key={spec.name}
-          {...common}
-          placeholder={placeholder}
-          autosize
-          minRows={3}
-          styles={{ input: { fontFamily: "monospace" } }}
-        />
+        <FormRow key={spec.name} label={label} error={errors[spec.name]}>
+          <Textarea className="num min-h-20 text-xs" placeholder={placeholder} value={values[spec.name] ?? ""}
+            onChange={(e) => setField(spec.name, e.currentTarget.value)} aria-invalid={!!errors[spec.name]} />
+        </FormRow>
       );
     }
-    if (spec.secret) {
-      return <PasswordInput key={spec.name} {...common} placeholder={placeholder} />;
-    }
-    return <TextInput key={spec.name} {...common} />;
+    return (
+      <TextField key={spec.name} label={spec.label} required={isFresh} type={spec.secret ? "password" : "text"}
+        placeholder={spec.secret ? placeholder : undefined} value={values[spec.name] ?? ""}
+        onChange={(v) => setField(spec.name, v)} error={errors[spec.name]} autoComplete="off" />
+    );
   };
 
   const canTest = data.state === "configured";
   const canClear = data.state !== "unconfigured";
 
+  const submit = () => {
+    const errs = validate(values);
+    setErrors(errs);
+    if (Object.keys(errs).length === 0) saveMut.mutate(values);
+  };
+  const toggleSection = (name: string, open: boolean) =>
+    setOpenSections((s) => (open ? [...new Set([...s, name])] : s.filter((x) => x !== name)));
+
   return (
-    <Stack gap="sm">
-      <Group gap="xs">
-        <Badge color={STATE_COLOR[data.state]}>{data.state}</Badge>
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-2">
+        <Pill tone={STATE_TONE[data.state]}>{data.state}</Pill>
         {data.updated_at && (
-          <Text size="xs" c="dimmed">
-            credentials last saved {new Date(data.updated_at).toLocaleString()}
-          </Text>
+          <span className="num text-xs text-muted-foreground">credentials last saved {new Date(data.updated_at).toLocaleString()}</span>
         )}
-      </Group>
+      </div>
 
       {venue && (
-        <Text size="sm">
-          <Anchor href={venue.docs_url} target="_blank" rel="noreferrer">
-            Setup guide ↗
-          </Anchor>
+        <p>
+          <a href={venue.docs_url} target="_blank" rel="noreferrer" className="text-primary hover:underline">Setup guide ↗</a>
           {keysUrl && (
             <>
               {" · "}
-              <Anchor href={keysUrl} target="_blank" rel="noreferrer">
-                {venue.name} API keys ↗
-              </Anchor>
+              <a href={keysUrl} target="_blank" rel="noreferrer" className="text-primary hover:underline">{venue.name} API keys ↗</a>
             </>
           )}
-        </Text>
+        </p>
       )}
 
-      {data.state === "error" && (
-        <Alert color="red" title="Stored credential is unusable">
-          {data.message ?? "unknown error"}
-        </Alert>
-      )}
+      {data.state === "error" && <Notice title="Stored credential is unusable">{data.message ?? "unknown error"}</Notice>}
 
-      <form
-        onSubmit={form.onSubmit((vals) => {
-          saveMut.mutate(vals);
-        })}
-      >
-        <Stack gap="xs">
-          {layout.main.map(renderField)}
-          {layout.sections.length > 0 && (
-            <Accordion multiple variant="contained" value={openSections} onChange={setOpenSections}>
-              {layout.sections.map((sec) => (
-                <Accordion.Item key={sec.name} value={sec.name}>
-                  <Accordion.Control>{sec.name}</Accordion.Control>
-                  <Accordion.Panel>
-                    <Stack gap="xs">{sec.fields.map(renderField)}</Stack>
-                  </Accordion.Panel>
-                </Accordion.Item>
-              ))}
-            </Accordion>
-          )}
+      <form onSubmit={(e) => { e.preventDefault(); submit(); }} className="flex flex-col gap-2.5">
+        {layout.main.map(renderField)}
+        {layout.sections.map((sec) => (
+          <details key={sec.name} open={openSections.includes(sec.name)} className="group rounded-md border"
+            onToggle={(e) => toggleSection(sec.name, e.currentTarget.open)}>
+            <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 font-medium">
+              <ChevronRight className="size-3.5 transition-transform group-open:rotate-90" />
+              {sec.name}
+            </summary>
+            <div className="flex flex-col gap-2.5 px-3 pb-3">{sec.fields.map(renderField)}</div>
+          </details>
+        ))}
 
-          <Group justify="space-between">
-            <Group gap="xs">
-              {canTest && (
-                <Button
-                  type="button"
-                  variant="light"
-                  loading={testMut.isPending}
-                  onClick={() => testMut.mutate()}
-                >
-                  Test
-                </Button>
-              )}
-              {canClear && (
-                <Button
-                  type="button"
-                  variant="light"
-                  color="red"
-                  loading={clearMut.isPending}
-                  onClick={() => {
-                    if (confirm(`Clear the stored credential for ${code}? The connection will be disarmed.`)) {
-                      clearMut.mutate();
-                    }
-                  }}
-                >
-                  Clear
-                </Button>
-              )}
-            </Group>
-            <Button type="submit" loading={saveMut.isPending}>
-              Save
-            </Button>
-          </Group>
-        </Stack>
+        <div className="flex items-center justify-between">
+          <div className="flex gap-2">
+            {canTest && (
+              <Button type="button" variant="secondary" disabled={testMut.isPending} onClick={() => testMut.mutate()}>Test</Button>
+            )}
+            {canClear && (
+              <ConfirmButton variant="destructive" disabled={clearMut.isPending} title={`Clear the stored credential for ${code}?`}
+                description="The connection will be disarmed." confirmLabel="Clear" onConfirm={() => clearMut.mutate()}>
+                Clear
+              </ConfirmButton>
+            )}
+          </div>
+          <Button type="submit" disabled={saveMut.isPending}>Save</Button>
+        </div>
       </form>
 
       {lastTest && (
-        <Alert color={describeTest(lastTest.tested, lastTest.ok, lastTest.message).color} title="Test result">
+        <Notice tone={describeTest(lastTest.tested, lastTest.ok, lastTest.message).tone} title="Test result">
           {describeTest(lastTest.tested, lastTest.ok, lastTest.message).text}
-        </Alert>
+        </Notice>
       )}
 
       {lastSave && (
-        <Alert color="brand" title="Save result">
+        <Notice tone="info" title="Save result">
           {lastSave.tested ? "Credential verified. " : `Not tested before save (${lastSave.message}). `}
           {describeReload(lastSave.reload)}.
-        </Alert>
+        </Notice>
       )}
 
       {venue?.universe && (
-        <Modal opened={offerLoad} onClose={() => setOfferLoad(false)} title="Credentials saved ✓" centered>
-          <Stack>
-            <Text>Load {venue.name}'s instrument universe now?</Text>
-            <Text fz="sm" c="dimmed">
-              {venue.universe} — runs in the background.
-            </Text>
-            <Group justify="flex-end">
-              <Button variant="default" onClick={() => setOfferLoad(false)}>
-                Later
-              </Button>
-              <Button
-                onClick={async () => {
-                  setOfferLoad(false);
-                  if (await loadUniverse(code)) {
-                    qc.invalidateQueries({ queryKey: ["/admin/broker-connections", code, "universe"] });
-                    qc.invalidateQueries({ queryKey: ["/admin/jobs"] });
-                  }
-                }}
-              >
-                Load now
-              </Button>
-            </Group>
-          </Stack>
+        <Modal open={offerLoad} onClose={() => setOfferLoad(false)} title="Credentials saved ✓"
+          description={`${venue.universe} — runs in the background.`}
+          footer={<>
+            <Button variant="outline" onClick={() => setOfferLoad(false)}>Later</Button>
+            <Button
+              onClick={async () => {
+                setOfferLoad(false);
+                if (await loadUniverse(code)) {
+                  qc.invalidateQueries({ queryKey: ["/admin/broker-connections", code, "universe"] });
+                  qc.invalidateQueries({ queryKey: ["/admin/jobs"] });
+                }
+              }}
+            >
+              Load now
+            </Button>
+          </>}>
+          <p>Load {venue.name}'s instrument universe now?</p>
         </Modal>
       )}
-    </Stack>
+    </div>
   );
 }

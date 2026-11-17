@@ -1,7 +1,7 @@
 // Run with `npm test` (node --test; Node strips the types itself).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reconnectDelayMs, staleFor, updatesUrl, WATCHDOG_MS, type UiNotice } from "./trade/api/liveUpdatesCore.ts";
+import { reconnectDelayMs, staleFor, updatesUrl, WATCHDOG_MS, type UiNotice } from "./api/liveUpdatesCore.ts";
 
 const blotter = ["/orders", { portfolioId: "p", limit: 200 }];
 const followed = ["/orders", "o-1", "state"];

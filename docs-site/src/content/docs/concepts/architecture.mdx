@@ -23,8 +23,8 @@ runtime is shown separately under [Target architecture](#target-architecture).
 
 ## The order path
 
-1. An order arrives from the cockpit, the trader UI, or a strategy over FIX or
-   REST (path ①).
+1. An order arrives from the web app (`/app/`; admins also see its Admin Panel), or from a
+   strategy over FIX or REST (path ①).
 2. **Order API + Risk** checks it against the portfolio's limits and current
    positions, then stores it.
 3. The **order gateway** sends it to the venue through that venue's connector.

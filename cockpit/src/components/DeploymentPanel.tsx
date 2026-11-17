@@ -1,9 +1,26 @@
 import { useState } from "react";
-import { Badge, Button, Group, Modal, Stack, Table, Text, Textarea, Tooltip } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { FormRow } from "./common";
+import { Modal } from "./overlay";
+import { Pill, type Tone } from "./status";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { notifyError, notifyOk } from "../api/hooks";
-import { activeDeployment, deploymentHealth, type Deployment } from "../strategies";
+import { activeDeployment, deploymentHealth, type Deployment, type Health } from "../strategies";
+
+const HEALTH_TONE: Record<Health["color"], Tone> = { green: "buy", orange: "warn", red: "sell", gray: "muted" };
+
+/** A button with an explanatory tooltip. */
+function Tip({ tip, children }: { tip: string; children: React.ReactElement }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{children}</TooltipTrigger>
+      <TooltipContent className="max-w-xs">{tip}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 // A co-located strategy's runtime as the OMS last heard it, with the two
 // operator actions that only exist for it: approving the venue balances
@@ -36,52 +53,48 @@ export function DeploymentPanel({ code, onClose }: { code: string; onClose: () =
       .finally(refresh);
 
   return (
-    <Modal opened onClose={onClose} title={`Runtime — ${code}`} size="lg" centered>
+    <Modal open onClose={onClose} title={`Runtime — ${code}`} className="sm:max-w-lg">
       {!d ? (
-        <Text c="dimmed">{query.isLoading ? "Loading…" : "No active deployment. Register one through the admin API."}</Text>
+        <p className="text-muted-foreground">{query.isLoading ? "Loading…" : "No active deployment. Register one through the admin API."}</p>
       ) : (
-        <Stack>
-          <Group gap="xs">
-            {deploymentHealth(d).map((h) => (
-              <Tooltip key={h.label} label={h.detail} disabled={!h.detail} multiline w={360}>
-                <Badge color={h.color}>{h.label}</Badge>
-              </Tooltip>
-            ))}
-          </Group>
-          <Table withRowBorders={false} verticalSpacing={4}>
-            <Table.Tbody>
-              <Row label="Deployment" value={d.id} />
-              <Row label="Epoch" value={String(d.epoch)} />
-              <Row label="Policy" value={`${d.acked_policy_revision ?? "–"} acknowledged of ${d.policy_revision}`} />
-              {d.recovery_missing && <Row label="Recovery" value={d.recovery_missing} />}
-              {d.inventory_shortfall && <Row label="Shortfall" value={d.inventory_shortfall} />}
-            </Table.Tbody>
-          </Table>
-          <Group>
-            <Tooltip label="After a withdrawal, deposit or manual trade: take the venue's current balances as expected" multiline w={300}>
-              <Button variant="light" onClick={rebaseline}>Approve balances</Button>
-            </Tooltip>
-            <Tooltip label="The old runtime is verifiably stopped; let a replacement take over" multiline w={300}>
-              <Button variant="default" onClick={() => setStopping(true)}>Record verified stop</Button>
-            </Tooltip>
-          </Group>
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap gap-1.5">
+            {deploymentHealth(d).map((h) =>
+              h.detail ? (
+                <Tip key={h.label} tip={h.detail}><span><Pill tone={HEALTH_TONE[h.color]}>{h.label}</Pill></span></Tip>
+              ) : (
+                <Pill key={h.label} tone={HEALTH_TONE[h.color]}>{h.label}</Pill>
+              ),
+            )}
+          </div>
+          <dl className="grid grid-cols-[120px_1fr] gap-x-3 gap-y-1">
+            <Row label="Deployment" value={d.id} />
+            <Row label="Epoch" value={String(d.epoch)} />
+            <Row label="Policy" value={`${d.acked_policy_revision ?? "–"} acknowledged of ${d.policy_revision}`} />
+            {d.recovery_missing && <Row label="Recovery" value={d.recovery_missing} />}
+            {d.inventory_shortfall && <Row label="Shortfall" value={d.inventory_shortfall} />}
+          </dl>
+          <div className="flex gap-2">
+            <Tip tip="After a withdrawal, deposit or manual trade: take the venue's current balances as expected">
+              <Button variant="secondary" onClick={rebaseline}>Approve balances</Button>
+            </Tip>
+            <Tip tip="The old runtime is verifiably stopped; let a replacement take over">
+              <Button variant="outline" onClick={() => setStopping(true)}>Record verified stop</Button>
+            </Tip>
+          </div>
           {stopping && (
-            <Stack gap="xs">
-              <Textarea
-                label="How the stop was verified"
-                placeholder="e.g. process killed on host X, API key rotated"
-                value={evidence}
-                onChange={(e) => setEvidence(e.currentTarget.value)}
-                autosize
-                minRows={2}
-              />
-              <Group justify="flex-end">
-                <Button variant="default" onClick={() => setStopping(false)}>Cancel</Button>
-                <Button color="orange" disabled={!evidence.trim()} onClick={verifiedStop}>Record stop</Button>
-              </Group>
-            </Stack>
+            <div className="flex flex-col gap-2">
+              <FormRow label="How the stop was verified">
+                <Textarea placeholder="e.g. process killed on host X, API key rotated" value={evidence}
+                  onChange={(e) => setEvidence(e.currentTarget.value)} className="min-h-16" />
+              </FormRow>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" onClick={() => setStopping(false)}>Cancel</Button>
+                <Button className="bg-warn text-primary-foreground hover:bg-warn/90" disabled={!evidence.trim()} onClick={verifiedStop}>Record stop</Button>
+              </div>
+            </div>
           )}
-        </Stack>
+        </div>
       )}
     </Modal>
   );
@@ -89,9 +102,9 @@ export function DeploymentPanel({ code, onClose }: { code: string; onClose: () =
 
 function Row({ label, value }: { label: string; value: string }) {
   return (
-    <Table.Tr>
-      <Table.Td w={120}><Text size="sm" c="dimmed">{label}</Text></Table.Td>
-      <Table.Td><Text size="sm" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{value}</Text></Table.Td>
-    </Table.Tr>
+    <>
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="num text-xs break-all whitespace-pre-wrap">{value}</dd>
+    </>
   );
 }

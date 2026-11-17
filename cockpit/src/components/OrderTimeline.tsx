@@ -1,52 +1,37 @@
 import { useState } from "react";
-import { Timeline, Text, Group, Badge, Code, Loader, Stack, Anchor, Collapse } from "@mantine/core";
 import { useQuery } from "@tanstack/react-query";
 import type { OrderEvent } from "../api/types";
+import { cn } from "@/lib/utils";
+import { Spinner } from "./common";
+import { ORDER_STATUS_TONE, Pill } from "./status";
 
-/** Ties the dot colour to the status the event left the order in. */
-const STATUS_COLOR: Record<string, string> = {
-  filled: "green",
-  partially_filled: "teal",
-  routed: "brand",
-  submitted: "gray",
-  canceled: "amber",
-  rejected: "red",
-  expired: "yellow",
-  suspended: "grape",
-};
+const DOT: Record<string, string> = { buy: "bg-buy", sell: "bg-sell", warn: "bg-warn", info: "bg-foreground-2", muted: "bg-muted-foreground" };
 
 /** One event: what it did, who did it, when — and the stored record underneath. */
-function Entry({ event }: { event: OrderEvent }) {
+function Entry({ event, last }: { event: OrderEvent; last: boolean }) {
   const [open, setOpen] = useState(false);
   const occurred = new Date(event.occurred_at);
+  const tone = ORDER_STATUS_TONE[event.status_after ?? ""] ?? "muted";
 
   return (
-    <Timeline.Item
-      color={STATUS_COLOR[event.status_after ?? ""] ?? "gray"}
-      title={
-        <Group gap="xs">
-          <Text size="sm" fw={500}>{event.event_type}</Text>
-          {event.status_after && (
-            <Badge size="xs" variant="light" color={STATUS_COLOR[event.status_after] ?? "gray"}>
-              {event.status_after}
-            </Badge>
-          )}
-        </Group>
-      }
-    >
-      <Text size="sm">{event.summary}</Text>
-      <Text size="xs" c="dimmed" mt={2}>
+    <li className="relative pb-4 pl-6">
+      {!last && <span className="absolute top-3 left-[5px] h-full w-px bg-border" aria-hidden />}
+      <span className={cn("absolute top-1 left-0 size-[11px] rounded-full border-2 border-background", DOT[tone])} aria-hidden />
+      <div className="flex items-center gap-2">
+        <span className="font-medium">{event.event_type}</span>
+        {event.status_after && <Pill tone={tone}>{event.status_after}</Pill>}
+      </div>
+      <p>{event.summary}</p>
+      <p className="num mt-0.5 text-xs text-muted-foreground">
         {occurred.toLocaleString()} · {event.actor} · v{event.version}
-      </Text>
-      <Anchor component="button" type="button" size="xs" onClick={() => setOpen((o) => !o)} mt={4}>
+      </p>
+      <button type="button" onClick={() => setOpen((o) => !o)} className="mt-1 text-xs text-primary hover:underline">
         {open ? "hide" : "raw payload"}
-      </Anchor>
-      <Collapse in={open}>
-        <Code block mt={4} style={{ fontSize: 11 }}>
-          {JSON.stringify(event.payload, null, 2)}
-        </Code>
-      </Collapse>
-    </Timeline.Item>
+      </button>
+      {open && (
+        <pre className="num mt-1 overflow-x-auto rounded-md border bg-background p-2 text-[11px]">{JSON.stringify(event.payload, null, 2)}</pre>
+      )}
+    </li>
   );
 }
 
@@ -62,15 +47,15 @@ export function OrderTimeline({
   apiGet,
 }: {
   orderId: string;
-  // Base path for the orders resource. Defaults to the admin surface; the trade
-  // app passes "/orders" instead. The full events URL is `${eventsPath}/${orderId}/events`.
+  // Base path for the orders resource. Defaults to the admin surface; the trading
+  // screens pass "/orders" instead. The full events URL is `${eventsPath}/${orderId}/events`.
   eventsPath?: string;
   // Fetch function used for the request. REQUIRED, and deliberately so: there is
   // no default. A default of the cockpit's admin client (which attaches
   // Authorization: Bearer <admin token>) would be fail-open — one forgotten prop
   // on a trade-side usage would put the admin token on a trader request. Making
-  // it required turns that into a compile error instead. The cockpit passes
-  // `api.get`; the trade app passes `tradeApi.get`.
+  // it required turns that into a compile error instead. Both surfaces pass
+  // `api.get` (session cookie only); only the path differs.
   apiGet: (path: string) => Promise<unknown>;
 }) {
   const path = `${eventsPath}/${orderId}/events`;
@@ -79,19 +64,17 @@ export function OrderTimeline({
     queryFn: () => apiGet(path) as Promise<OrderEvent[]>,
   });
 
-  if (events.isLoading) return <Loader size="sm" />;
-  if (events.error) return <Text c="red" size="sm">Could not load the order's events.</Text>;
+  if (events.isLoading) return <Spinner />;
+  if (events.error) return <p className="text-sell">Could not load the order's events.</p>;
 
   const rows = events.data ?? [];
-  if (rows.length === 0) return <Text c="dimmed" size="sm">No events recorded.</Text>;
+  if (rows.length === 0) return <p className="text-muted-foreground">No events recorded.</p>;
 
   return (
-    <Stack gap="xs">
-      <Timeline active={rows.length - 1} bulletSize={16} lineWidth={2}>
-        {rows.map((e) => (
-          <Entry key={e.event_id} event={e} />
-        ))}
-      </Timeline>
-    </Stack>
+    <ol className="flex flex-col">
+      {rows.map((e, i) => (
+        <Entry key={e.event_id} event={e} last={i === rows.length - 1} />
+      ))}
+    </ol>
   );
 }

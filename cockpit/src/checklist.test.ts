@@ -13,7 +13,7 @@ test("checklistSteps lists the five steps in order with links", () => {
     "Add a user",
     "First order shows in the blotter",
   ]);
-  assert.deepEqual(steps.map((s) => s.to), ["/broker-connections", "/portfolios", "/sign-in", "/users", "/blotter"]);
+  assert.deepEqual(steps.map((s) => s.to), ["/admin/broker-connections", "/admin/portfolios", "/admin/sign-in", "/admin/users", "/admin/blotter"]);
   assert.ok(steps.every((s) => !s.done));
 });
 

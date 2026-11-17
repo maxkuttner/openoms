@@ -9,7 +9,7 @@ password, port or restart.
 
 ## Token
 
-On the cockpit's **API** page, create a trading token for the strategy. The token
+In the Admin Panel, on **People → API**, create a trading token for the strategy. The token
 belongs to the strategy, not to its responsible user, and orders sent with it are
 recorded as the strategy's, with the responsible user noted for audit. Send it as `Authorization: Bearer <token>`.
 

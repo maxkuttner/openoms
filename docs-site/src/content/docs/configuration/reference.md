@@ -5,7 +5,7 @@ description: Every setting in oms.toml, its environment variable and flag, and w
 
 `oms.toml` holds only what the OMS needs before it can reach its database — the
 connection, the secrets, the listen address. Everything else (brokers, accounts,
-portfolios, credentials, risk limits) lives in Postgres and is managed from the cockpit
+portfolios, credentials, risk limits) lives in Postgres and is managed from the web app's Admin Panel
 or the admin API.
 
 `oms init` writes the file for you. Every key is optional: a missing one falls through to
@@ -56,7 +56,7 @@ credential can drop the database — so those commands prompt for it or take it 
 |---|---|---|
 | `bind_addr` | `OMS_BIND_ADDR` | `localhost:3001` |
 
-- **`bind_addr`** — set by `oms init`'s "Listen on" question; where the HTTP server listens: the cockpit, the trading API and the
+- **`bind_addr`** — set by `oms init`'s "Listen on" question; where the HTTP server listens: the web app, the trading API and the
   admin API, all on one port. The default only accepts connections from the same machine.
   To serve other machines, bind to an address they can reach (`0.0.0.0:3001`), and put
   HTTPS in front (see [Sign-in and users](/configuration/login/#https-beyond-localhost)).
@@ -114,5 +114,5 @@ These have no `oms.toml` key.
 | `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug`. Default `info`. Logs go to stderr. |
 
 Broker and feed API keys are **not** environment variables — they are stored encrypted in
-the database. Enter them in the cockpit; `oms config import-env` imports them once from
+the database. Enter them in the Admin Panel; `oms config import-env` imports them once from
 the old variable names. See the [Integrations](/integrations/alpaca/) pages.

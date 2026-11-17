@@ -3,7 +3,8 @@
 //
 // Authentication is the session cookie, nothing else.
 
-import { COCKPIT_HOME } from "../login/api";
+import { APP_HOME } from "../login/api";
+import { accessFromMe, type AccessState, type SessionInfo } from "../access";
 import { isApprovalPending, isPasswordChangeRequired, loginHref } from "../login";
 
 // Dev runs behind Vite's proxy, which strips this prefix (see vite.config.ts).
@@ -30,8 +31,13 @@ export function onMfaRequired(prompt: MfaPrompt): () => void {
 }
 
 /** Send the browser to the sign-in page, coming back here afterwards. */
+let navigatingToLogin = false;
+
 export function goToLogin(): void {
-  window.location.href = loginHref(COCKPIT_HOME, window.location.pathname + window.location.search);
+  // Several requests can see the same 401; navigate once.
+  if (navigatingToLogin) return;
+  navigatingToLogin = true;
+  window.location.href = loginHref(APP_HOME, window.location.pathname + window.location.search);
 }
 
 function send(method: string, path: string, body?: unknown): Promise<Response> {
@@ -98,3 +104,22 @@ export const api = {
   patch: <T>(path: string, body: unknown) => request<T>("PATCH", path, body),
   del: (path: string) => request<void>("DELETE", path),
 };
+
+/** Where this browser session stands, and who it is. Does not redirect. */
+export async function sessionAccess(): Promise<{ state: AccessState; me: SessionInfo | null }> {
+  try {
+    const res = await send("GET", "/auth/me");
+    const text = await res.text().catch(() => "");
+    let me: SessionInfo | null = null;
+    if (res.ok) {
+      try {
+        me = text ? (JSON.parse(text) as SessionInfo) : null;
+      } catch {
+        me = null;
+      }
+    }
+    return { state: accessFromMe(res.status, me, text), me };
+  } catch {
+    return { state: "unavailable", me: null };
+  }
+}

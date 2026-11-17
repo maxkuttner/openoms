@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Button, Modal, Stack, Text } from "@mantine/core";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { AuthError, sessionAuthMethod, startSso } from "./api";
 import { Totp } from "./Totp";
 import { mfaPromptText, mfaStepFor, type MfaStep } from "../login";
@@ -35,20 +36,23 @@ export function MfaPrompt({ register }: { register: Register }) {
   const here = window.location.pathname + window.location.search;
 
   return (
-    <Modal opened={!!pending} onClose={() => finish(false)} title="Confirm" centered>
-      {step === "totp" && (
-        <Totp
-          prompt={mfaPromptText("totp")}
-          onDone={() => finish(true)}
-          onError={(e) => { if (e instanceof AuthError && mfaStepFor("local", e.code) === "sso") setStep("sso"); }}
-        />
-      )}
-      {step === "sso" && (
-        <Stack gap={12}>
-          <Text fz={13}>{mfaPromptText("sso")}</Text>
-          <Button color="depth" fullWidth onClick={() => startSso(here)}>Sign in with SSO</Button>
-        </Stack>
-      )}
-    </Modal>
+    <Dialog open={!!pending} onOpenChange={(open) => { if (!open) finish(false); }}>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader><DialogTitle>Confirm</DialogTitle></DialogHeader>
+        {step === "totp" && (
+          <Totp
+            prompt={mfaPromptText("totp")}
+            onDone={() => finish(true)}
+            onError={(e) => { if (e instanceof AuthError && mfaStepFor("local", e.code) === "sso") setStep("sso"); }}
+          />
+        )}
+        {step === "sso" && (
+          <div className="flex flex-col gap-3">
+            <p>{mfaPromptText("sso")}</p>
+            <Button onClick={() => startSso(here)}>Sign in with SSO</Button>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
   );
 }

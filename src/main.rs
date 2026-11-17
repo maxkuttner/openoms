@@ -1126,9 +1126,9 @@ fn build_app(
     // Session routes. A session can be minted by local login or by OIDC, so
     // these are mounted whenever either is enabled — and, for OIDC, whenever
     // it is merely *configured*: discovery failing (IdP down, secret unset)
-    // must not take `/auth/me`, `/auth/logout` or `/trade/` away from
-    // sessions that already exist. With neither enabled, the whole `/auth/*`
-    // and `/trade/*` surface 404s, except `/auth/methods`, which says so.
+    // must not take `/auth/me` or `/auth/logout` away from sessions that
+    // already exist. With neither enabled, the whole `/auth/*` surface 404s,
+    // except `/auth/methods`, which the app's sign-in page reads to say so.
     //
     // `/auth/me` requires authentication, so it carries `auth_middleware`;
     // `/auth/logout` reads the session cookie itself and is idempotent.
@@ -1146,7 +1146,7 @@ fn build_app(
             .route("/auth/keys/:key_id", axum::routing::delete(users_api::revoke_own_key))
             .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
         let logout_router = Router::new().route("/auth/logout", post(auth_api::logout));
-        app = app.merge(me_router).merge(logout_router).merge(cockpit::trade_router());
+        app = app.merge(me_router).merge(logout_router);
     }
 
     app
@@ -1763,7 +1763,7 @@ async fn serve() {
     let host_url = format!("http://{}", bind_addr);
     info!("OMS listening on {}", host_url);
     if cockpit::is_bundled() {
-        info!("Cockpit: {}/cockpit/", host_url);
+        info!("UI: {}/app/", host_url);
     }
     info!("Scalar UI: {}/scalar", host_url);
     info!("OpenAPI spec: {}/api-docs/openapi.json", host_url);

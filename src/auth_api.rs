@@ -371,7 +371,7 @@ fn db_error(context: &str, err: sqlx::Error) -> ApiError {
     get, path = "/auth/oidc/callback", tag = "auth",
     params(CallbackParams),
     responses(
-        (status = 303, description = "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /trade/access?reason=no_account)"),
+        (status = 303, description = "Login completed (session cookie set, redirects to the validated return_to), or refused (redirects to /app/access?reason=no_account)"),
         (status = 400, description = "Malformed callback, or a missing/expired/mismatched login flow"),
         (status = 401, description = "The provider rejected the login, or the exchanged token failed verification"),
         (status = 403, description = "The claim gate rejected the identity"),
@@ -633,7 +633,7 @@ fn claim_satisfies(claims: &serde_json::Value, claim_name: &str, required_value:
 }
 
 /// Where a login with no account lands.
-pub const NO_ACCOUNT_URL: &str = "/trade/access?reason=no_account";
+pub const NO_ACCOUNT_URL: &str = "/app/access?reason=no_account";
 
 #[cfg(test)]
 mod tests {
@@ -786,8 +786,8 @@ mod tests {
 
     #[test]
     fn a_relative_path_is_kept() {
-        assert_eq!(sanitize_return_to(Some("/trade/")), "/trade/");
-        assert_eq!(sanitize_return_to(Some("/trade/orders?status=filled")), "/trade/orders?status=filled");
+        assert_eq!(sanitize_return_to(Some("/app/")), "/app/");
+        assert_eq!(sanitize_return_to(Some("/app/admin/blotter?status=filled")), "/app/admin/blotter?status=filled");
     }
 
     #[test]
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn a_path_that_does_not_start_with_a_slash_is_refused() {
-        assert_eq!(sanitize_return_to(Some("trade/")), "/");
+        assert_eq!(sanitize_return_to(Some("app/")), "/");
         assert_eq!(sanitize_return_to(Some("javascript:alert(1)")), "/");
     }
 
@@ -828,12 +828,12 @@ mod tests {
     fn a_control_character_is_refused() {
         // A newline or tab can be used to smuggle a second header or confuse a
         // proxy; a legitimate path never contains one.
-        assert_eq!(sanitize_return_to(Some("/trade/\nSet-Cookie: x=1")), "/");
-        assert_eq!(sanitize_return_to(Some("/trade/\tfoo")), "/");
+        assert_eq!(sanitize_return_to(Some("/app/\nSet-Cookie: x=1")), "/");
+        assert_eq!(sanitize_return_to(Some("/app/\tfoo")), "/");
     }
 
     #[test]
     fn a_login_without_an_account_lands_on_the_access_page() {
-        assert_eq!(NO_ACCOUNT_URL, "/trade/access?reason=no_account");
+        assert_eq!(NO_ACCOUNT_URL, "/app/access?reason=no_account");
     }
 }

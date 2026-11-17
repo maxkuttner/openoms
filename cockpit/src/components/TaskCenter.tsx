@@ -1,17 +1,20 @@
 import { useState } from "react";
-import { Badge, Button, Code, Drawer, Group, Loader, Progress, Stack, Text, UnstyledButton } from "@mantine/core";
-import { notifications } from "@mantine/notifications";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import { Spinner } from "./common";
+import { notify } from "./notify";
+import { Drawer } from "./overlay";
+import { Pill } from "./status";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "../api/client";
 import {
   JOB_KIND_LABEL,
-  JOB_STATUS_COLOR,
+  JOB_STATUS_TONE,
   formatDuration,
   summarize,
   type JobDetail,
   type JobRecord,
 } from "../api/jobs";
-import { palette } from "../palette";
 
 function JobLog({ id }: { id: string }) {
   const { data, isLoading } = useQuery<JobDetail>({
@@ -19,12 +22,12 @@ function JobLog({ id }: { id: string }) {
     queryFn: () => api.get<JobDetail>(`/admin/jobs/${id}`),
     refetchInterval: (q) => (q.state.data && ["queued", "running"].includes(q.state.data.job.status) ? 2000 : false),
   });
-  if (isLoading) return <Loader size="xs" />;
-  if (!data?.log.length) return <Text fz="xs" c="dimmed">No log lines.</Text>;
+  if (isLoading) return <Spinner />;
+  if (!data?.log.length) return <p className="text-xs text-muted-foreground">No log lines.</p>;
   return (
-    <Code block fz={11} style={{ maxHeight: 220, overflow: "auto" }}>
+    <pre className="num max-h-56 overflow-auto rounded-md border bg-background p-2 text-[11px]">
       {data.log.map((l) => `${new Date(l.at).toLocaleTimeString()} ${l.level.toUpperCase().padEnd(5)} ${l.message}`).join("\n")}
-    </Code>
+    </pre>
   );
 }
 
@@ -42,62 +45,52 @@ function JobRow({ job }: { job: JobRecord }) {
       await api.post(`/admin/broker-connections/${job.subject}/universe/load`, {});
       queryClient.invalidateQueries({ queryKey: ["/admin/jobs"] });
     } catch (err) {
-      notifications.show({ color: "red", message: err instanceof ApiError ? err.message : String(err) });
+      notify({ color: "red", message: err instanceof ApiError ? err.message : String(err) });
     }
   }
 
   return (
-    <Stack gap={4} py={8} style={{ borderBottom: `1px solid ${palette.border}` }}>
-      <UnstyledButton onClick={() => setOpen((o) => !o)}>
-        <Group justify="space-between" wrap="nowrap">
-          <Stack gap={0}>
-            <Text fz="sm" fw={600}>
-              {JOB_KIND_LABEL[job.kind] ?? job.kind}
-              {job.subject ? ` · ${job.subject}` : ""}
-            </Text>
-            <Text fz="xs" c="dimmed">
-              {new Date(job.created_at).toLocaleString()} · {job.started_by}
-              {job.started_at ? ` · ${formatDuration(job)}` : ""}
-            </Text>
-          </Stack>
-          <Badge color={JOB_STATUS_COLOR[job.status]} variant="light">
-            {job.status}
-          </Badge>
-        </Group>
-      </UnstyledButton>
+    <div className="flex flex-col gap-1 border-b py-2">
+      <button type="button" onClick={() => setOpen((o) => !o)} className="flex items-center justify-between gap-2 text-left">
+        <span className="flex flex-col">
+          <span className="font-semibold">
+            {JOB_KIND_LABEL[job.kind] ?? job.kind}
+            {job.subject ? ` · ${job.subject}` : ""}
+          </span>
+          <span className="num text-xs text-muted-foreground">
+            {new Date(job.created_at).toLocaleString()} · {job.started_by}
+            {job.started_at ? ` · ${formatDuration(job)}` : ""}
+          </span>
+        </span>
+        <Pill tone={JOB_STATUS_TONE[job.status]}>{job.status}</Pill>
+      </button>
       {job.status === "running" && total > 0 && (
-        <Group gap="xs" wrap="nowrap">
-          <Progress value={pct} size="sm" style={{ flex: 1 }} />
-          <Text fz="xs" c="dimmed">
+        <div className="flex items-center gap-2">
+          <div className="h-1.5 flex-1 overflow-hidden rounded bg-accent">
+            <div className="h-full bg-buy" style={{ width: `${pct}%` }} />
+          </div>
+          <span className="num text-xs text-muted-foreground">
             {(job.progress_done ?? 0).toLocaleString()} / {total.toLocaleString()}
-          </Text>
-        </Group>
+          </span>
+        </div>
       )}
       {summarize(job) && (
-        <Text fz="xs" c={job.status === "failed" ? "red" : "dimmed"}>
-          {summarize(job)}
-        </Text>
+        <p className={cn("text-xs", job.status === "failed" ? "text-sell" : "text-muted-foreground")}>{summarize(job)}</p>
       )}
       {canRunAgain && (
-        <Group>
-          <Button size="compact-xs" variant="light" onClick={runAgain}>
-            Run again
-          </Button>
-        </Group>
+        <Button size="xs" variant="secondary" className="self-start" onClick={runAgain}>Run again</Button>
       )}
       {open && <JobLog id={job.id} />}
-    </Stack>
+    </div>
   );
 }
 
 /** Recent background jobs, newest first: status, progress, outcome, and each job's log. */
 export function TaskCenter({ opened, onClose, jobs }: { opened: boolean; onClose: () => void; jobs: JobRecord[] }) {
   return (
-    <Drawer opened={opened} onClose={onClose} position="right" size="md" title="Jobs">
+    <Drawer open={opened} onClose={onClose} title="Jobs" className="sm:max-w-md">
       {jobs.length === 0 ? (
-        <Text c="dimmed" fz="sm">
-          No background jobs yet.
-        </Text>
+        <p className="text-muted-foreground">No background jobs yet.</p>
       ) : (
         jobs.map((j) => <JobRow key={j.id} job={j} />)
       )}

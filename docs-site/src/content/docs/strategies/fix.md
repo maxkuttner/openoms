@@ -4,7 +4,7 @@ description: Connect a strategy or algo to the OMS over FIX 4.4 and trade throug
 ---
 
 A strategy or algo can send orders to the OMS over FIX. Every order goes through the
-same pre-trade checks as an order from the cockpit, is booked by the same order engine,
+same pre-trade checks as an order from the web app, is booked by the same order engine,
 and shows up in the blotter under the strategy's portfolio. The OMS can stop the strategy
 at any time without its cooperation.
 
@@ -13,11 +13,11 @@ co-located server instead (not covered here).
 
 ## Set up a strategy
 
-On the cockpit's **Strategies** page, create a strategy:
+In the Admin Panel, on **Trading setup → Strategies**, create a strategy:
 
 | Field | What it is |
 |---|---|
-| Portfolio | The portfolio the strategy trades. Only the strategy trades it: the cockpit can view it, kill and flatten, but not place orders on it. |
+| Portfolio | The portfolio the strategy trades. Only the strategy trades it: the Admin Panel can view it, kill and flatten, but not place orders on it. |
 | Responsible user | The active user accountable for the strategy. Required, shown on the Strategies page, and changed only by an audited **Handover**. If that user is disabled the strategy is flagged and cannot be started until you pick another. |
 | SenderCompID / TargetCompID | The strategy's session identity. The strategy sends with this SenderCompID to this TargetCompID. |
 | Allowed IP addresses | Optional. Comma-separated exact addresses the strategy may connect from; empty means any. |
@@ -81,7 +81,7 @@ Example, a limit buy of 0.01 BTC on Binance:
 
 ## Pre-trade checks
 
-Every check a cockpit order gets, plus the strategy's own:
+Every check an order from the web app gets, plus the strategy's own:
 
 - **State.** A killed strategy can place nothing; a flattened one only orders that reduce
   a position.
@@ -101,10 +101,10 @@ for example `risk check failed [max_order_notional]: …`.
 
 ## Kill, flatten and disconnects
 
-- **Kill** (cockpit): the strategy is halted, its REST token stops working, every open
+- **Kill** (Admin Panel): the strategy is halted, its REST token stops working, every open
   order is cancelled through the OMS's own connections, and its session is logged out.
   Logons are refused until **Enable**. Positions are left as they are.
-- **Flatten** (cockpit): everything Kill does, but the strategy may still reduce; then
+- **Flatten** (Admin Panel): everything Kill does, but the strategy may still reduce; then
   every position is closed with a limit order at the edge of the price band
   (good till cancelled). Positions with no live price are skipped and listed.
 - **When your session ends** — logout, a dropped connection, missed heartbeats, or an OMS
