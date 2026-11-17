@@ -195,6 +195,31 @@ jobs:
           [ "$got" = "${GITHUB_REF_NAME#v}" ] || {
             echo "image reports $got, tag is $GITHUB_REF_NAME"; exit 1; }
 
+      # The published compose file runs the image from env vars alone: the start
+      # script sets the database up (init, then migrate on every later start)
+      # and refuses to run without a master key.
+      - name: the image starts from env vars alone
+        run: |
+          docker network create smoke
+          docker run -d --name pg --network smoke -e POSTGRES_PASSWORD=pw postgres:16
+          # The image's first start runs a temporary server, then the real one: wait for the second.
+          until [ "$(docker logs pg 2>&1 | grep -c 'ready to accept connections')" -ge 2 ]; do sleep 1; done
+          key="base64:$(openssl rand -base64 32)"
+          docker run -d --name oms --network smoke -p 127.0.0.1:3001:3001 \
+            -e POSTGRES_HOST=pg -e POSTGRES_PASSWORD=pw -e OMS_PASSWORD=smoke-role-pw \
+            -e OMS_MASTER_KEY="$key" -e OMS_PUBLIC_BASE_URL=http://localhost:3001 openoms:ci
+          healthy() {
+            for _ in $(seq 60); do curl -fsS http://127.0.0.1:3001/health && return 0; sleep 2; done
+            docker logs oms; return 1
+          }
+          healthy
+          docker restart oms
+          healthy
+          docker logs oms 2>&1 | grep -q "applied 0 migration" || { docker logs oms; exit 1; }
+          if docker run --rm -e POSTGRES_PASSWORD=pw openoms:ci; then
+            echo "the image started without a master key"; exit 1
+          fi
+
       - name: push the per-arch tag
         run: |
           ref="ghcr.io/maxkuttner/openoms:${GITHUB_REF_NAME#v}-${{ matrix.arch }}"
