@@ -89,10 +89,12 @@ jobs:
           docker compose run --rm oms init --non-interactive
           docker compose up -d
 
-      - name: the cockpit answers on 127.0.0.1:3001
+      # `/` redirects to the web app on every release (/cockpit/ before the
+      # merge into one app, /app/ after), so this holds across the change.
+      - name: the web app answers on 127.0.0.1:3001
         run: |
           for _ in $(seq 60); do
-            curl -fsS -o /dev/null http://127.0.0.1:3001/cockpit/ && exit 0
+            curl -fsSL -o /dev/null http://127.0.0.1:3001/ && exit 0
             sleep 2
           done
           cd openoms && docker compose logs oms
