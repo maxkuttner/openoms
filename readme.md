@@ -38,7 +38,7 @@ Prebuilt binaries cover macOS (Apple Silicon) and Linux (x86_64, OpenSSL 3).
 
 ```sh
 git clone git@github.com:maxkuttner/openoms.git && cd openoms
-docker compose up -d                          # a local Postgres 16
+docker compose -f compose.dev.yaml up -d      # a local Postgres 16
 (cd cockpit && npm ci && npm run build)       # the cockpit bundle the binary embeds
 cargo run -- init                             # press Enter through the prompts; password `postgres`
 cargo run                                     # the OMS on localhost:3001

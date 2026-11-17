@@ -18,6 +18,10 @@ function htmlFiles(dir) {
   });
 }
 
+test("compose.yaml in dist is byte-identical to the repo copy", () => {
+  assert.deepEqual(readFileSync(join(DIST, "compose.yaml")), readFileSync(new URL("../../compose.yaml", import.meta.url)));
+});
+
 test("install.sh in dist is byte-identical to the repo copy", () => {
   const built = readFileSync(join(DIST, "install.sh"));
   const repo = readFileSync(new URL("../../install.sh", import.meta.url));
@@ -64,7 +68,7 @@ test("the app's colour tokens match the docs' brand colours", () => {
 // role password, master key and URL in oms.toml: the compose file must pass these
 // through only when set, never require or default them.
 test("compose.yaml never forces OMS_PASSWORD, OMS_MASTER_KEY or OMS_PUBLIC_BASE_URL", () => {
-  const compose = readFileSync(new URL("../public/compose.yaml", import.meta.url), "utf8");
+  const compose = readFileSync(new URL("../../compose.yaml", import.meta.url), "utf8");
   for (const v of ["OMS_PASSWORD", "OMS_MASTER_KEY", "OMS_PUBLIC_BASE_URL"]) {
     const line = compose.split("\n").find((l) => l.trim().startsWith(`${v}:`));
     assert.ok(line, `compose.yaml does not pass ${v}`);

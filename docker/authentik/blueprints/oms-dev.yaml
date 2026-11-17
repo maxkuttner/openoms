@@ -1,5 +1,5 @@
 # Dev blueprint: the `oms` OAuth2/OpenID provider and application, so the local
-# Authentik fixture (root docker-compose.yml, profile `oidc`) needs no console
+# Authentik fixture (root compose.dev.yaml, profile `oidc`) needs no console
 # clicking. LOCAL DEV ONLY: the client secret below is public, and the OMS
 # refuses `oms-dev-secret` unless the issuer is on loopback. For anything real,
 # use your own identity provider.
