@@ -18,7 +18,7 @@ been verified end to end with a real OKX account.
 | Order entry | REST: market and limit orders (GTC, IOC, FOK), cancel |
 | Executions | OKX's private orders stream: fills, partial fills, cancels |
 | Instruments | Spot pairs |
-| Catalog | Broker connections → **Instrument universe** in the cockpit |
+| Catalog | Admin Panel → Connectivity → Broker connections → **Instrument universe** |
 | Prices | OKX's public tickers, for OKX pairs |
 
 ## Credentials

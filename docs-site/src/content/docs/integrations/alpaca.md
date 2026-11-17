@@ -13,7 +13,7 @@ options, REST order entry and a streaming execution feed.
 | Order entry | REST |
 | Executions | Alpaca's trade-updates stream: fills, partial fills, cancels, rejects |
 | Instruments | US equities and ETFs; US equity options for the underlyings you choose |
-| Catalog | Broker connections → **Instrument universe** in the cockpit |
+| Catalog | Admin Panel → Connectivity → Broker connections → **Instrument universe** |
 | Prices | Not from Alpaca — see [Limits](#limits) |
 
 ## Credentials
@@ -28,7 +28,7 @@ with these fields:
 
 Paper and live accounts have separate keys.
 
-Enter them in the cockpit under **Broker connections → alpaca-paper → Credentials**
+Enter them in the Admin Panel under **Connectivity → Broker connections → alpaca-paper → Credentials**
 (**Test**, then **Save**). They are stored encrypted with your
 [master key](/operations/master-key-and-backups/), never in a file. Apply them to a
 running server without a restart:

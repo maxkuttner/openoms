@@ -66,6 +66,6 @@ order. A lower total books a negative correction.
 
 ## Where fees show
 
-In the trade app, the orders blotter has a **Fees** column (per currency, joined
+In the web app, the orders blotter on **Trade** has a **Fees** column (per currency, joined
 with ` · `, empty when none) and the positions table has an **Other fees** column.
 The API returns `fees` on each order and `other_fees` on each position.

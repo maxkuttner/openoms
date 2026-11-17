@@ -20,7 +20,7 @@ The trader requests a co-located strategy; an admin sets it up:
 2. Create two API keys on it, neither allowed to withdraw:
    - **the strategy's trading key**, restricted to the co-located server's IP, given to the trader;
    - **the OMS's follow key**, read and trade (to cancel), restricted to the OMS server's IP.
-3. In the cockpit, on **Strategies**, create the strategy with mode **Co-located**:
+3. In the Admin Panel, on **Trading setup → Strategies**, create the strategy with mode **Co-located**:
    - the followed account's environment, the dead man's switch seconds (default 5) and
      the max orders per second;
    - its limits;
@@ -176,7 +176,7 @@ strategy, deployment and the reference market maker.
 
    Save the API key Binance shows in `api-key` in the same folder.
 2. From a checkout: `scripts/colo-demo.sh up`, then `scripts/colo-demo.sh mm`.
-   The cockpit runs at `http://127.0.0.1:3021/app/`; sign in as the admin
+   The web app runs at `http://127.0.0.1:3021/app/`; sign in as the admin
    described in [Sign-in and users](/configuration/login/).
 3. `scripts/colo-demo.sh down` stops everything and deletes the demo.
 

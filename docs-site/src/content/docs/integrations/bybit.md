@@ -19,7 +19,7 @@ been verified end to end with a real Bybit account.
 | Order entry | REST: market and limit orders, cancel |
 | Executions | Bybit's private order and execution stream: fills, partial fills, cancels, rejects |
 | Instruments | Spot pairs |
-| Catalog | Broker connections → **Instrument universe** in the cockpit |
+| Catalog | Admin Panel → Connectivity → Broker connections → **Instrument universe** |
 | Prices | Bybit's public spot book; also a backup source for Binance pairs |
 
 ## Credentials

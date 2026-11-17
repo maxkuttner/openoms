@@ -74,7 +74,7 @@ Save it as `/etc/systemd/system/oms.service`, then
 ## Is it running?
 
 `oms status` shows what runs on this machine and where: the OMS and the addresses
-of its admin and trader UIs, then Postgres, the login provider, Kafka and each
+of its web app, then Postgres, the login provider, Kafka and each
 broker stream.
 
 ```sh

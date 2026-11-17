@@ -17,7 +17,7 @@ You need a Databento account with live OPRA access, which is a paid subscription
 
 ## Credentials
 
-One API key. Enter it in the cockpit under **Data feeds → databento-opra →
+One API key. Enter it in the Admin Panel under **Connectivity → Data feeds → databento-opra →
 Credentials** (**Test**, then **Save**), then reload:
 
 ```sh

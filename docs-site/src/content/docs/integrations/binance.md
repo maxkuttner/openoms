@@ -18,7 +18,7 @@ testnet, is still to come.
 | Order entry | REST (default) or FIX |
 | Executions | The user-data stream (REST) or FIX execution reports |
 | Instruments | Spot pairs |
-| Catalog | Broker connections → **Instrument universe** in the cockpit |
+| Catalog | Admin Panel → Connectivity → Broker connections → **Instrument universe** |
 | Prices | Binance's public spot book; [Bybit](/integrations/bybit/)'s as backup |
 
 ## Credentials
