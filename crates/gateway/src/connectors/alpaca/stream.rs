@@ -1,84 +1,61 @@
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
-use std::sync::Arc;
-
-use crate::connectors::alpaca::adapter::AlpacaAdapter;
-use crate::contract::VenueReport;
-use crate::contract::{EngineHandle, ExecEvent};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
+use crate::venue_event::{VenueEvent as VEvent, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
-/// Ping + missed-fill sweep cadence; see the Binance stream for the rationale.
+/// Ping cadence; a dead socket then surfaces, and the reconnect's `Connected`
+/// makes the reconciler pull the gap.
 const HEARTBEAT_SECS: u64 = 30;
 
 struct AlpacaSession {
-    environment: &'static str,
     ws_url: &'static str,
     api_key: String,
     api_secret: String,
-    adapter: Arc<AlpacaAdapter>,
     health: StreamHandle,
-    engine: EngineHandle,
+    tx: mpsc::Sender<VEvent>,
 }
 
 #[async_trait::async_trait]
 impl Session for AlpacaSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(
-            self.environment,
-            self.ws_url,
-            &self.api_key,
-            &self.api_secret,
-            &self.adapter,
-            &self.health,
-            &self.engine,
-        )
-        .await
+        let result = connect_and_run(self.ws_url, &self.api_key, &self.api_secret, &self.health, &self.tx).await;
+        let _ = self.tx.send(VEvent::Disconnected).await;
+        result
     }
 }
 
+/// Venue events only: the reconciler books every fill (exactly once, through
+/// ingest) and pulls what the stream missed.
 pub async fn run(
     environment: &'static str,
     api_key: String,
     api_secret: String,
-    adapter: Arc<AlpacaAdapter>,
     health: StreamHandle,
-    engine: EngineHandle,
+    tx: mpsc::Sender<VEvent>,
 ) {
     info!(env = environment, "starting Alpaca trade-update stream");
-    engine.reconcile("ALPACA", environment, "alpaca", adapter.clone()).await;
-
     let ws_url = if environment == "LIVE" {
         "wss://api.alpaca.markets/stream"
     } else {
         "wss://paper-api.alpaca.markets/stream"
     };
-
     let name: &'static str = if environment == "LIVE" { "ALPACA/LIVE" } else { "ALPACA/PAPER" };
-    let session = AlpacaSession {
-        environment,
-        ws_url,
-        api_key,
-        api_secret,
-        adapter,
-        health: health.clone(),
-        engine,
-    };
+    let session = AlpacaSession { ws_url, api_key, api_secret, health: health.clone(), tx };
     supervise(name, health, session).await
 }
 
 async fn connect_and_run(
-    environment: &'static str,
     ws_url: &str,
     api_key: &str,
     api_secret: &str,
-    adapter: &Arc<AlpacaAdapter>,
     health: &StreamHandle,
-    engine: &EngineHandle,
+    tx: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(ws_url).await?;
     info!("Alpaca stream connected url={ws_url}");
@@ -104,7 +81,6 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Ping(Vec::new())).await?;
-                engine.reconcile("ALPACA", environment, "alpaca", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -147,10 +123,15 @@ async fn connect_and_run(
             "listening" => {
                 info!("Alpaca stream subscribed to trade_updates");
                 health.set_live();
+                if tx.send(VEvent::Connected).await.is_err() {
+                    return Ok(());
+                }
             }
             "trade_updates" => {
-                if let Err(e) = handle_trade_update(data, engine).await {
-                    error!(error = %e, "Alpaca stream: error processing trade update");
+                for event in venue_events(data) {
+                    if tx.send(event).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
             other => {
@@ -162,94 +143,116 @@ async fn connect_and_run(
     Ok(())
 }
 
-async fn handle_trade_update(
-    data: &serde_json::Value,
-    engine: &EngineHandle,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let event = data["event"].as_str().unwrap_or("unknown");
+/// What one `trade_updates` frame means: a fill is a `Fill` (execution id,
+/// qty and price of this execution) plus the order's state with its cumulative
+/// quantity; lifecycle events are order states only. Whoever placed the order,
+/// its client id is carried as-is. One key is one account, which ingest resolves
+/// by the connection alone.
+pub(crate) fn venue_events(data: &serde_json::Value) -> Vec<VEvent> {
+    let event = data["event"].as_str().unwrap_or("");
     let order = &data["order"];
-    let client_order_id = order["client_order_id"].as_str().unwrap_or("");
-
-    info!(event, client_order_id, "alpaca trade update received");
-
-    let report = match event {
-        "fill" | "partial_fill" => {
-            let fill_qty: f64 = data["qty"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            let fill_price: f64 = data["price"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.0);
-            let execution_id = data["execution_id"]
-                .as_str()
-                .unwrap_or(client_order_id)
-                .to_string();
-
-            VenueReport::Fill {
-                execution_id,
-                fill_qty,
-                fill_price,
-                venue: "ALPACA".to_string(),
-            }
-        }
-        "rejected" => {
-            let reason = order["status"].as_str().unwrap_or("rejected").to_string();
-            VenueReport::Reject {
-                reason,
-                venue: Some("ALPACA".to_string()),
-            }
-        }
-        "canceled" => VenueReport::Canceled {
-            reason: None,
-            venue: Some("ALPACA".to_string()),
-        },
-        "expired" | "pending_new" | "new" | "accepted" | "done_for_day" => {
-            return Ok(());
-        }
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok());
+    let time = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    let status = match event {
+        "new" | "accepted" | "partial_fill" => VenueOrderStatus::Working,
+        "fill" => VenueOrderStatus::Filled,
+        "canceled" => VenueOrderStatus::Canceled,
+        "expired" => VenueOrderStatus::Expired,
+        "rejected" => VenueOrderStatus::Rejected { reason: order["status"].as_str().unwrap_or("rejected").to_string() },
         other => {
             info!(event = other, "Alpaca stream: unhandled event type, skipping");
-            return Ok(());
+            return Vec::new();
         }
     };
-
-    let order_id = match Uuid::parse_str(client_order_id) {
-        Ok(id) => id,
-        Err(_) => {
-            warn!(client_order_id, "Alpaca stream: client_order_id is not a valid UUID, skipping");
-            return Ok(());
+    let venue_order_id = order["id"].as_str().unwrap_or("").to_string();
+    let client_order_id = order["client_order_id"].as_str().filter(|c| !c.is_empty()).map(str::to_string);
+    let symbol = order["symbol"].as_str().unwrap_or("").to_string();
+    let buy = order["side"].as_str() == Some("buy");
+    let ts = time(&data["timestamp"]);
+    let mut out = Vec::new();
+    if matches!(event, "fill" | "partial_fill") {
+        match (data["execution_id"].as_str(), num(&data["qty"]), num(&data["price"])) {
+            (Some(exec_id), Some(qty), Some(price)) => out.push(VEvent::Fill(VenueFill {
+                exec_id: exec_id.to_string(),
+                venue_order_id: venue_order_id.clone(),
+                client_order_id: client_order_id.clone(),
+                account_ref: String::new(),
+                symbol: symbol.clone(),
+                buy,
+                qty,
+                price,
+                fee: None,
+                executed_at: ts,
+            })),
+            _ => warn!(?data, "Alpaca stream: fill without execution id, qty or price"),
         }
-    };
-
-    engine.exec(ExecEvent::from_report(order_id, "ALPACA", "alpaca", report)).await;
-    Ok(())
+    }
+    let order_type = order["type"].as_str().unwrap_or("").to_string();
+    out.push(VEvent::Order(VenueOrderUpdate {
+        venue_order_id,
+        client_order_id,
+        account_ref: String::new(),
+        symbol,
+        buy,
+        limit_px: if order_type == "market" { None } else { num(&order["limit_price"]) },
+        order_type,
+        qty: num(&order["qty"]).unwrap_or(0.0),
+        status,
+        cum_qty: num(&order["filled_qty"]).unwrap_or(0.0),
+        ts,
+    }));
+    out
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{EngineHandle, ExecKind, ExecSource, GatewayMsg};
 
-    #[tokio::test]
-    async fn alpaca_fill_frame_becomes_fill_event() {
-        let order_id = Uuid::new_v4();
-        let data = serde_json::json!({
-            "event": "partial_fill",
-            "qty": "2",
-            "price": "101.5",
-            "execution_id": "ex-1",
-            "order": { "client_order_id": order_id.to_string(), "status": "partially_filled" },
-        });
-        let (engine, mut rx) = EngineHandle::new();
+    fn update(event: &str, order_status: &str, filled: &str) -> serde_json::Value {
+        serde_json::json!({
+            "event": event, "qty": "2", "price": "101.5", "execution_id": "ex-1", "timestamp": "2026-11-18T14:30:00.123456Z",
+            "order": { "id": "ord-1", "client_order_id": "c-1", "symbol": "AAPL", "side": "buy", "type": "limit",
+                       "qty": "5", "limit_price": "101.5", "filled_qty": filled, "status": order_status },
+        })
+    }
 
-        handle_trade_update(&data, &engine).await.unwrap();
+    #[test]
+    fn trade_update_fill_maps_to_venue_fill() {
+        let events = venue_events(&update("partial_fill", "partially_filled", "2"));
+        let VEvent::Fill(f) = &events[0] else { panic!("a fill first") };
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy), ("ex-1", "ord-1", "AAPL", true));
+        assert_eq!((f.qty, f.price, f.fee.clone(), f.account_ref.as_str()), (2.0, 101.5, None, ""));
+        assert_eq!(f.client_order_id.as_deref(), Some("c-1"));
+        assert!(f.executed_at.is_some());
+        let VEvent::Order(o) = &events[1] else { panic!("then the order") };
+        assert_eq!((o.status.clone(), o.cum_qty, o.qty, o.limit_px), (VenueOrderStatus::Working, 2.0, 5.0, Some(101.5)));
+        let done = venue_events(&update("fill", "filled", "5"));
+        let VEvent::Order(o) = &done[1] else { panic!() };
+        assert_eq!((o.status.clone(), o.cum_qty), (VenueOrderStatus::Filled, 5.0));
+    }
 
-        let Some(GatewayMsg::Exec(ev)) = rx.try_recv().ok() else { panic!("an exec event") };
-        assert_eq!(ev.order_id, order_id);
-        assert_eq!(ev.actor, "alpaca");
-        assert_eq!(ev.source, ExecSource::Session);
-        assert_eq!(ev.kind, ExecKind::Fill { execution_id: "ex-1".into(), qty: 2.0, price: 101.5 });
+    #[test]
+    fn dashboard_order_without_uuid_is_kept() {
+        let mut data = update("fill", "filled", "5");
+        data["order"]["client_order_id"] = serde_json::json!("e8c1f0ab-not-ours-web");
+        let events = venue_events(&data);
+        let VEvent::Fill(f) = &events[0] else { panic!() };
+        assert_eq!(f.client_order_id.as_deref(), Some("e8c1f0ab-not-ours-web"));
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn lifecycle_events_map_to_order_status() {
+        let st = |e: &str, s: &str| match &venue_events(&update(e, s, "0"))[..] {
+            [VEvent::Order(o)] => o.status.clone(),
+            other => panic!("one order update, got {other:?}"),
+        };
+        assert_eq!(st("new", "new"), VenueOrderStatus::Working);
+        assert_eq!(st("accepted", "accepted"), VenueOrderStatus::Working);
+        assert_eq!(st("canceled", "canceled"), VenueOrderStatus::Canceled);
+        assert_eq!(st("expired", "expired"), VenueOrderStatus::Expired);
+        assert!(matches!(st("rejected", "rejected"), VenueOrderStatus::Rejected { .. }));
+        assert!(venue_events(&update("pending_new", "pending_new", "0")).is_empty());
+        assert!(venue_events(&update("done_for_day", "done_for_day", "0")).is_empty());
     }
 }

@@ -41,13 +41,15 @@ impl Connector for Alpaca {
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
         let c: crate::connectors::alpaca::adapter::AlpacaCredentials = typed(creds, MANIFEST.credential_kind)?;
         let adapter = Arc::new(crate::connectors::alpaca::adapter::AlpacaAdapter::new(c.key.clone(), c.secret.clone(), env));
-        let stream_adapter = adapter.clone();
+        // Venue events only: the reconciler books every fill (exactly once,
+        // through ingest) and pulls what the stream missed.
         Ok(Connected {
-            source: None, venue_stream: None,
             daily_stats: Some(adapter.clone()),
+            source: Some(adapter.clone()),
             adapter,
-            exec_stream: Some(Arc::new(move |health, engine| {
-                Box::pin(crate::connectors::alpaca::stream::run(env, c.key.clone(), c.secret.clone(), stream_adapter.clone(), health, engine))
+            exec_stream: None,
+            venue_stream: Some(Arc::new(move |health, tx| {
+                Box::pin(crate::connectors::alpaca::stream::run(env, c.key.clone(), c.secret.clone(), health, tx))
             })),
         })
     }
