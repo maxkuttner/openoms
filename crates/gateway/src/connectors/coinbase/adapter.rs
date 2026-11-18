@@ -400,33 +400,50 @@ pub(crate) struct FillsRows {
     pub fills: Vec<VenueFill>,
     /// The newest row seen (by trade time) and its trade id, filtered or not.
     pub newest: Option<(DateTime<Utc>, String)>,
-    /// A row was the cursor's own trade: everything beyond it was seen before.
-    pub found_stop: bool,
+    /// Every timed row is older than the resume threshold.
+    pub all_older: bool,
+    /// The rows are in ascending time order (first before last).
+    pub ascending: bool,
 }
 
-/// Rows of `orders/historical/fills` as fills. Rows executed before `since` are
-/// dropped; a row missing a field is warned about and skipped. `stop_at` is the
-/// cursor's trade id. A fill's `size` is in base units unless `size_in_quote`.
-/// Fills have no client order id: they join their order by `order_id`. The
-/// commission is in the product's quote currency.
-pub(crate) fn fills_rows(body: &serde_json::Value, account_ref: &str, since: DateTime<Utc>, stop_at: Option<&str>) -> FillsRows {
+impl FillsRows {
+    /// Nothing further back can be new: the page is entirely behind the
+    /// cursor's margin and rows run newest first. An ascending page proves
+    /// nothing about the pages after it, so it never stops the walk.
+    pub fn stop(&self) -> bool {
+        self.all_older && !self.ascending
+    }
+}
+
+/// How far behind its newest trade a resume reads, for fills Coinbase indexes late.
+const RESUME_MARGIN_MS: i64 = 30 * 60 * 1000;
+
+/// The resume cursor: `"{trade_time_ms}:{trade_id}"` of the newest fill seen.
+pub(crate) fn parse_cursor(c: &Cursor) -> Option<(DateTime<Utc>, String)> {
+    let (ms, id) = c.0.split_once(':')?;
+    Some((chrono::TimeZone::timestamp_millis_opt(&Utc, ms.parse().ok()?).single()?, id.to_string()))
+}
+
+/// Rows of `orders/historical/fills` as fills. Rows executed before `since`, or
+/// before `threshold` (the cursor's time less the resume margin), are dropped;
+/// a row missing a field is warned about and skipped. A fill's `size` is in base
+/// units unless `size_in_quote`. Fills have no client order id: they join their
+/// order by `order_id`. The commission is in the product's quote currency.
+pub(crate) fn fills_rows(body: &serde_json::Value, account_ref: &str, since: DateTime<Utc>, threshold: Option<DateTime<Utc>>) -> FillsRows {
     let mut out = FillsRows::default();
-    for d in body["fills"].as_array().map(Vec::as_slice).unwrap_or_default() {
+    let rows = body["fills"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let times: Vec<DateTime<Utc>> = rows.iter().filter_map(|d| d["trade_time"].as_str().and_then(|s| s.parse().ok())).collect();
+    out.ascending = times.len() >= 2 && times.first() < times.last();
+    out.all_older = threshold.is_some_and(|t| !times.is_empty() && times.iter().all(|at| *at < t));
+    for d in rows {
         let trade_id = d["trade_id"].as_str().unwrap_or("");
         let at = d["trade_time"].as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
-        if !trade_id.is_empty() {
-            // Newest first: the cursor's trade and everything after it were seen.
-            if stop_at == Some(trade_id) {
-                out.found_stop = true;
-                break;
-            }
-            if let Some(at) = at {
-                if out.newest.as_ref().is_none_or(|(n, _)| at > *n) {
-                    out.newest = Some((at, trade_id.to_string()));
-                }
+        if let (false, Some(at)) = (trade_id.is_empty(), at) {
+            if out.newest.as_ref().is_none_or(|(n, _)| at > *n) {
+                out.newest = Some((at, trade_id.to_string()));
             }
         }
-        if at.is_some_and(|at| at < since) {
+        if at.is_some_and(|at| at < since || threshold.is_some_and(|t| at < t)) {
             continue;
         }
         match fill_of(d, trade_id, at, account_ref) {
@@ -468,31 +485,39 @@ fn fill_of(d: &serde_json::Value, trade_id: &str, at: Option<DateTime<Utc>>, acc
     })
 }
 
-/// A whole walk as one pull page: the cursor is the newest trade seen, and
-/// nothing is left to page. Nothing seen keeps the reconciler's cursor.
+/// A whole walk as one pull page: the cursor is the newest trade seen
+/// (`"{time_ms}:{trade_id}"`), and nothing is left to page. Nothing seen keeps
+/// the reconciler's cursor.
 pub(crate) fn pull_result(pages: Vec<FillsRows>) -> PullPage {
-    let newest = pages.iter().filter_map(|p| p.newest.clone()).max_by_key(|(at, _)| *at).map(|(_, id)| id).unwrap_or_default();
+    let newest = pages
+        .iter()
+        .filter_map(|p| p.newest.clone())
+        .max_by_key(|(at, _)| *at)
+        .map(|(at, id)| format!("{}:{id}", at.timestamp_millis()))
+        .unwrap_or_default();
     PullPage { fills: pages.into_iter().flat_map(|p| p.fills).collect(), next: Cursor(newest), more: false }
 }
 
 #[async_trait::async_trait]
 impl ExecutionSource for CoinbaseAdapter {
-    /// Pages `orders/historical/fills` with the API's own cursor, whole, until
-    /// the cursor's trade (`from`) turns up or the history ends. The API cursor
-    /// walks into the past, so it cannot be resumed from; the resume token is
-    /// instead the newest trade id seen, and one call returns everything new.
+    /// Pages `orders/historical/fills` (newest first, asked for explicitly) with
+    /// the API's own cursor, whole, until a page lies entirely 30 minutes behind
+    /// the resume cursor's trade time, or the history ends. The API cursor walks
+    /// into the past, so it cannot be resumed from; the resume token is instead
+    /// the newest trade's time and id, and one call returns everything new.
+    /// Re-reads within the margin are exec-id duplicates.
     async fn fills_since(
         &self,
         account_ref: &str,
-        _scope: &str,
+        scope: &str,
         from: Option<&Cursor>,
         since: DateTime<Utc>,
     ) -> Result<PullPage, BrokerError> {
-        let stop_at = from.map(|c| c.0.as_str()).filter(|c| !c.is_empty());
+        let threshold = from.and_then(parse_cursor).map(|(at, _)| at - chrono::Duration::milliseconds(RESUME_MARGIN_MS));
         let mut pages = Vec::new();
         let mut api_cursor = String::new();
         for _ in 0..MAX_PAGES {
-            let mut query = format!("limit={FILLS_LIMIT}");
+            let mut query = format!("limit={FILLS_LIMIT}&sort_by=TRADE_TIME");
             if since > DateTime::<Utc>::MIN_UTC {
                 query.push_str(&format!("&start_sequence_timestamp={}", urlencoding_minimal(&since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))));
             }
@@ -500,16 +525,19 @@ impl ExecutionSource for CoinbaseAdapter {
                 query.push_str(&format!("&cursor={}", urlencoding_minimal(&api_cursor)));
             }
             let body = self.get("/orders/historical/fills", &query, true).await?;
-            let page = fills_rows(&body, account_ref, since, stop_at);
+            let page = fills_rows(&body, account_ref, since, threshold);
             let rows = body["fills"].as_array().map_or(0, Vec::len);
-            let stopped = page.found_stop;
+            let stopped = page.stop();
             pages.push(page);
             api_cursor = body["cursor"].as_str().unwrap_or("").to_string();
             if stopped || api_cursor.is_empty() || rows == 0 {
                 return Ok(pull_result(pages));
             }
         }
-        Err(BrokerError::Network(format!("Coinbase fills: more than {MAX_PAGES} pages in one pull")))
+        Err(BrokerError::Network(format!(
+            "Coinbase fills pull for scope \"{scope}\" read more than {MAX_PAGES} pages without reaching its bound; \
+             this scope stalls until that is resolved (a shorter gap, or a manual EOD sweep)"
+        )))
     }
 
     /// `GET /orders/historical/batch?order_status=OPEN`, following the cursor.
@@ -692,20 +720,60 @@ mod tests {
         assert_eq!(rows.fills[1].qty, 32.5 / 65000.0);
         assert_eq!(rows.newest.as_ref().map(|n| n.1.as_str()), Some("t-300"));
         let page = pull_result(vec![rows]);
-        assert_eq!((page.next, page.more, page.fills.len()), (Cursor("t-300".into()), false, 2));
+        let t300: DateTime<Utc> = "2026-11-03T12:00:03.500Z".parse().unwrap();
+        assert_eq!((page.next, page.more, page.fills.len()), (Cursor(format!("{}:t-300", t300.timestamp_millis())), false, 2));
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
     }
 
     #[test]
-    fn the_walk_stops_at_the_cursors_trade_and_since_drops_old_rows_on_every_page() {
-        let stop = fills_rows(&fills_body(), "", DateTime::<Utc>::MIN_UTC, Some("t-200"));
-        assert!(stop.found_stop);
-        assert_eq!(stop.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-300"]);
-        let recent = fills_rows(&fills_body(), "", "2026-11-03T12:00:03Z".parse().unwrap(), None);
+    fn the_walk_stops_on_a_page_entirely_behind_the_cursor_margin_and_since_drops_old_rows() {
+        // Threshold 12:00:02.5: only t-300 is at or after it, so the rest are dropped; the page is not all older.
+        let page = fills_rows(&fills_body(), "", DateTime::<Utc>::MIN_UTC, Some(at("2026-11-03T12:00:02.500Z")));
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-300"]);
+        assert!(!page.stop());
+        let behind = fills_rows(&fills_body(), "", DateTime::<Utc>::MIN_UTC, Some(at("2026-11-03T12:30:00Z")));
+        assert!(behind.fills.is_empty() && behind.stop());
+        let recent = fills_rows(&fills_body(), "", at("2026-11-03T12:00:03Z"), None);
         assert_eq!(recent.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-300"]);
-        assert!(!recent.found_stop, "the walk goes on: rows are not trusted to be ordered");
+        assert!(!recent.stop());
         // Nothing seen: the cursor is left to the reconciler.
         let none = fills_rows(&serde_json::json!({ "fills": [] }), "", DateTime::<Utc>::MIN_UTC, None);
         assert_eq!(pull_result(vec![none]), PullPage { fills: vec![], next: Cursor(String::new()), more: false });
+    }
+
+    fn row(id: &str, t: &str) -> serde_json::Value {
+        serde_json::json!({ "trade_id": id, "order_id": "o", "trade_time": t, "price": "1", "size": "1", "commission": "0", "product_id": "BTC-USD", "side": "BUY" })
+    }
+
+    #[test]
+    fn coinbase_ascending_rows_do_not_lose_new_fills() {
+        // Oldest first: page 1 is entirely behind the cursor, yet the new fill is on page 2.
+        let threshold = Some(at("2026-11-03T12:00:00Z") - chrono::Duration::milliseconds(RESUME_MARGIN_MS));
+        let page1 = fills_rows(&serde_json::json!({ "fills": [row("a", "2026-11-03T10:00:00Z"), row("b", "2026-11-03T10:05:00Z")] }), "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert!(page1.ascending && page1.all_older);
+        assert!(!page1.stop(), "an ascending page never ends the walk");
+        let page2 = fills_rows(&serde_json::json!({ "fills": [row("c", "2026-11-03T11:59:00Z"), row("new", "2026-11-03T12:05:00Z")] }), "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert_eq!(page2.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["c", "new"]);
+        let page = pull_result(vec![page1, page2]);
+        assert_eq!(page.next, Cursor(format!("{}:new", at("2026-11-03T12:05:00Z").timestamp_millis())));
+        // And a descending page of old rows does end it.
+        let desc = fills_rows(&serde_json::json!({ "fills": [row("b", "2026-11-03T10:05:00Z"), row("a", "2026-11-03T10:00:00Z")] }), "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert!(desc.stop());
+    }
+
+    #[test]
+    fn coinbase_late_indexed_older_fill_within_margin_is_pulled() {
+        // The cursor's trade is at 12:00; a fill stamped 11:50 only now appeared.
+        let (cursor_at, id) = parse_cursor(&Cursor(format!("{}:t-1", at("2026-11-03T12:00:00Z").timestamp_millis()))).unwrap();
+        assert_eq!(id, "t-1");
+        let threshold = Some(cursor_at - chrono::Duration::milliseconds(RESUME_MARGIN_MS));
+        let body = serde_json::json!({ "fills": [row("t-2", "2026-11-03T12:01:00Z"), row("t-1", "2026-11-03T12:00:00Z"), row("late", "2026-11-03T11:50:00Z"), row("old", "2026-11-03T11:00:00Z")] });
+        let page = fills_rows(&body, "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-2", "t-1", "late"]);
+        assert!(!page.stop());
     }
 
     #[test]
