@@ -8,13 +8,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
-use tracing::{debug, info};
+use chrono::{DateTime, Utc};
+use tracing::{debug, info, warn};
 
 use crate::adapter::{BrokerAdapter, BrokerError, BrokerOrderRequest, BrokerOrderResponse};
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 use crate::md::daily_stats::DailyStats;
+use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
-use super::client::{ContractQuery, OrderKind, Side, Tif, TwsClient, TwsContract, TwsError, TwsOrder, TwsOrderState};
+use super::client::{ContractQuery, OrderKind, Side, Tif, TwsClient, TwsContract, TwsError, TwsEvent, TwsExecution, TwsOrder, TwsOrderState};
+
+/// How far back `reqExecutions` reaches.
+const MAX_HISTORY_DAYS: i64 = 7;
 
 /// The connected client, once there is one.
 pub type ClientSlot = Arc<RwLock<Option<Arc<dyn TwsClient>>>>;
@@ -77,11 +82,21 @@ pub struct IbkrTwsAdapter {
     refs: Mutex<HashMap<i32, String>>,
     /// IBKR ids whose reject `submit_order` already returned: the streamed copy is not booked again.
     rejected_on_submit: Mutex<HashSet<i32>>,
+    /// Orders this adapter placed, as an order state, for a reject that
+    /// arrives before IBKR reports the order back.
+    placed: Mutex<HashMap<i32, VenueOrderUpdate>>,
 }
 
 impl IbkrTwsAdapter {
     pub fn new(client: ClientSlot) -> Self {
-        Self { client, contracts: Mutex::default(), symbols: Mutex::default(), refs: Mutex::default(), rejected_on_submit: Mutex::default() }
+        Self {
+            client,
+            contracts: Mutex::default(),
+            symbols: Mutex::default(),
+            refs: Mutex::default(),
+            rejected_on_submit: Mutex::default(),
+            placed: Mutex::default(),
+        }
     }
 
     /// The connected client, or the transient error to return.
@@ -96,6 +111,20 @@ impl IbkrTwsAdapter {
     /// The OMS order id for an IBKR order id, when known.
     pub fn order_ref(&self, order_id: i32) -> Option<String> {
         self.refs.lock().unwrap().get(&order_id).cloned()
+    }
+
+    /// The client order id an IBKR event names: its order ref (an OMS order's
+    /// UUID, or whatever another client set), else the ref learned for the id.
+    pub(crate) fn client_ref(&self, order_id: i32, order_ref: &str) -> Option<String> {
+        if !order_ref.is_empty() {
+            return Some(order_ref.to_string());
+        }
+        self.order_ref(order_id).filter(|r| !r.is_empty())
+    }
+
+    /// The order state of an order this adapter placed.
+    pub(crate) fn placed(&self, order_id: i32) -> Option<VenueOrderUpdate> {
+        self.placed.lock().unwrap().get(&order_id).cloned()
     }
 
     pub(crate) fn rejected_on_submit(&self, order_id: i32) -> bool {
@@ -203,6 +232,18 @@ impl BrokerAdapter for IbkrTwsAdapter {
             account: req.external_account_ref.clone(),
         };
         self.refs.lock().unwrap().insert(order_id, req.order_id.clone());
+        let state = TwsOrderState {
+            status: "PendingSubmit".into(),
+            filled: 0.0,
+            remaining: order.qty,
+            avg_fill_price: 0.0,
+            symbol: contract.symbol.clone(),
+            perm_id: 0,
+            order: order.clone(),
+        };
+        let mut placed = order_update(order_id, &state);
+        placed.client_order_id = Some(req.order_id.clone());
+        self.placed.lock().unwrap().insert(order_id, placed);
         info!(order_id, con_id, order_ref = %req.order_id, "placing IBKR order");
         client.place(&order).await.map_err(|e| {
             let e = broker_error(e);
@@ -244,11 +285,203 @@ impl BrokerAdapter for IbkrTwsAdapter {
         let client = self.client()?;
         let all = self.all_orders(client.as_ref()).await?;
         let by_ref = all.iter().find(|(_, r, _)| !client_order_id.is_empty() && r == client_order_id);
+        // An adopted order's id is IBKR's permId; an OMS order's the API order id.
+        let by_perm = || external_order_id.parse::<i64>().ok().and_then(|p| all.iter().find(|(_, _, s)| s.perm_id != 0 && s.perm_id == p));
         let by_id = || external_order_id.parse::<i32>().ok().and_then(|id| all.iter().find(|(i, _, _)| *i == id));
         let (_, _, s) = by_ref
+            .or_else(by_perm)
             .or_else(by_id)
             .ok_or_else(|| BrokerError::NoSuchOrder(format!("IBKR has no order {client_order_id} / {external_order_id}")))?;
         Ok(BrokerOrderState { outcome: outcome(&s.status), executed_qty: s.filled, avg_px: s.avg_fill_price })
+    }
+}
+
+/// `<base>.NN` -> `<base>`; IBKR revises a fill by bumping the last segment.
+pub(crate) fn exec_base(exec_id: &str) -> &str {
+    exec_id.rsplit_once('.').map_or(exec_id, |(base, _)| base)
+}
+
+/// The `.NN` revision of an exec id (hex), 0 without one.
+fn exec_rev(exec_id: &str) -> u64 {
+    exec_id.rsplit_once('.').and_then(|(_, r)| u64::from_str_radix(r, 16).ok()).unwrap_or(0)
+}
+
+/// IBKR's permId when known (stable across client ids), else the API order id.
+fn venue_order_id(perm_id: i64, order_id: i32) -> String {
+    if perm_id != 0 { perm_id.to_string() } else { order_id.to_string() }
+}
+
+/// A commission as a fee: `None` for TWS's "no figure yet" (`f64::MAX`) and for zero.
+pub(crate) fn commission_fee(amount: f64, currency: String) -> Option<(f64, String)> {
+    (amount != 0.0 && amount.is_finite() && amount.abs() < 1e300).then_some((amount, currency))
+}
+
+/// What to say when a corrected execution changes a fill already booked
+/// (amending it is out of scope); `None` when qty and price agree.
+pub(crate) fn correction_warning(base: &str, booked: (f64, f64), corrected: (f64, f64)) -> Option<String> {
+    let differs = |a: f64, b: f64| (a - b).abs() > 1e-9;
+    (differs(booked.0, corrected.0) || differs(booked.1, corrected.1)).then(|| {
+        format!(
+            "IBKR corrected execution {base}: qty {} -> {}, price {} -> {}; the booked fill is NOT amended",
+            booked.0, corrected.0, booked.1, corrected.1
+        )
+    })
+}
+
+/// One execution as a fill under its exec base id, or the field it lacks.
+pub(crate) fn fill_from_exec(e: &TwsExecution, client_order_id: Option<String>) -> Result<VenueFill, &'static str> {
+    let missing = if e.exec_id.is_empty() {
+        Some("execId")
+    } else if e.account.is_empty() {
+        Some("acctNumber")
+    } else if e.symbol.is_empty() {
+        Some("symbol")
+    } else if !(e.qty.is_finite() && e.qty > 0.0) {
+        Some("shares")
+    } else if !(e.price.is_finite() && e.price > 0.0) {
+        Some("price")
+    } else {
+        None
+    };
+    if let Some(m) = missing {
+        return Err(m);
+    }
+    Ok(VenueFill {
+        exec_id: exec_base(&e.exec_id).to_string(),
+        venue_order_id: venue_order_id(e.perm_id, e.order_id),
+        client_order_id,
+        account_ref: e.account.clone(),
+        symbol: e.symbol.clone(),
+        buy: e.buy,
+        qty: e.qty,
+        price: e.price,
+        fee: None,
+        executed_at: Some(e.time),
+    })
+}
+
+fn venue_status(status: &str) -> VenueOrderStatus {
+    match status {
+        "Filled" => VenueOrderStatus::Filled,
+        "Cancelled" | "ApiCancelled" => VenueOrderStatus::Canceled,
+        "Inactive" => VenueOrderStatus::Rejected { reason: "IBKR order inactive".into() },
+        _ => VenueOrderStatus::Working,
+    }
+}
+
+/// One IBKR order state as a venue order update; the caller sets `client_order_id`.
+pub(crate) fn order_update(order_id: i32, st: &TwsOrderState) -> VenueOrderUpdate {
+    let (order_type, limit_px) = match st.order.order_type {
+        OrderKind::Mkt => ("market", None),
+        OrderKind::Lmt(px) => ("limit", Some(px)),
+    };
+    VenueOrderUpdate {
+        venue_order_id: venue_order_id(st.perm_id, order_id),
+        client_order_id: (!st.order.order_ref.is_empty()).then(|| st.order.order_ref.clone()),
+        account_ref: st.order.account.clone(),
+        symbol: st.symbol.clone(),
+        buy: st.order.action == Side::Buy,
+        order_type: order_type.into(),
+        qty: st.order.qty,
+        limit_px,
+        status: venue_status(&st.status),
+        cum_qty: st.filled,
+        ts: None,
+    }
+}
+
+/// `reqExecutions` rows of `account` as fills: one per exec base (its highest
+/// revision, so a corrected fill dedupes against the original), each with its
+/// commission when IBKR reported one, none executed before `since`.
+pub(crate) fn fills_from_executions(
+    rows: Vec<TwsEvent>,
+    account: &str,
+    since: DateTime<Utc>,
+    client_ref: impl Fn(i32, &str) -> Option<String>,
+) -> Vec<VenueFill> {
+    let mut fees: HashMap<String, (f64, String)> = HashMap::new();
+    // (full exec id, fill) per base, in first-seen order.
+    let mut kept: Vec<(String, VenueFill)> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        let e = match row {
+            TwsEvent::Commission { exec_id, amount, currency } => {
+                if let Some(f) = commission_fee(amount, currency) {
+                    fees.insert(exec_id, f);
+                }
+                continue;
+            }
+            TwsEvent::Execution(e) if e.account == account => e,
+            _ => continue,
+        };
+        let fill = match fill_from_exec(&e, client_ref(e.order_id, &e.order_ref)) {
+            Ok(f) => f,
+            Err(missing) => {
+                warn!(exec_id = %e.exec_id, missing, "IBKR pulled execution skipped: field missing");
+                continue;
+            }
+        };
+        match index.get(&fill.exec_id) {
+            None => {
+                index.insert(fill.exec_id.clone(), kept.len());
+                kept.push((e.exec_id.clone(), fill));
+            }
+            Some(&i) => {
+                let (prev_id, prev) = &kept[i];
+                if let Some(w) = correction_warning(&fill.exec_id, (prev.qty, prev.price), (fill.qty, fill.price)) {
+                    warn!(exec_id = %e.exec_id, "{w}");
+                }
+                if exec_rev(&e.exec_id) > exec_rev(prev_id) {
+                    kept[i] = (e.exec_id.clone(), fill);
+                }
+            }
+        }
+    }
+    kept.into_iter()
+        .filter(|(_, f)| f.executed_at.map_or(true, |t| t >= since))
+        .map(|(id, mut f)| {
+            f.fee = fees.get(&id).cloned().or_else(|| {
+                fees.iter().find(|(k, _)| exec_base(k) == f.exec_id).map(|(_, v)| v.clone())
+            });
+            f
+        })
+        .collect()
+}
+
+#[async_trait::async_trait]
+impl ExecutionSource for IbkrTwsAdapter {
+    /// `reqExecutions` filtered by account and time: IBKR serves the last ~7
+    /// days in one response with no paging, so this is one page and no cursor
+    /// (ingest dedupes the overlap on exec id).
+    async fn fills_since(&self, account_ref: &str, _scope: &str, _from: Option<&Cursor>, since: DateTime<Utc>) -> Result<PullPage, BrokerError> {
+        let client = self.client()?;
+        let window = since.max(Utc::now() - chrono::Duration::days(MAX_HISTORY_DAYS));
+        let rows = client.executions(account_ref, window).await.map_err(broker_error)?;
+        let fills = fills_from_executions(rows, account_ref, since, |id, r| self.client_ref(id, r));
+        Ok(PullPage { fills, next: Cursor(String::new()), more: false })
+    }
+
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        let client = self.client()?;
+        let open = client.open_orders().await.map_err(broker_error)?;
+        self.learn(&open);
+        Ok(open
+            .iter()
+            .filter(|(_, _, s)| s.order.account == account_ref)
+            .map(|(id, r, s)| {
+                let mut u = order_update(*id, s);
+                u.client_order_id = self.client_ref(*id, r);
+                u
+            })
+            .collect())
+    }
+
+    async fn scopes(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(vec![String::new()])
+    }
+
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 120, max_history: Some(chrono::Duration::days(MAX_HISTORY_DAYS)), per_symbol: false }
     }
 }
 
@@ -275,6 +508,7 @@ impl DailyStats for IbkrTwsAdapter {
 pub(crate) mod tests {
     use super::super::client::FakeTws;
     use super::*;
+    use uuid::Uuid;
 
     pub(crate) fn aapl() -> TwsContract {
         TwsContract {
@@ -379,6 +613,7 @@ pub(crate) mod tests {
             remaining: 0.0,
             avg_fill_price: 190.0,
             symbol: "AAPL".into(),
+            perm_id: 0,
             order: TwsOrder {
                 order_id: 5,
                 con_id: 265598,
@@ -426,5 +661,111 @@ pub(crate) mod tests {
         ] {
             assert_eq!(map_error(code, ""), class, "code {code}");
         }
+    }
+
+    fn ex(exec_id: &str, account: &str, qty: f64, price: f64, mins_ago: i64) -> TwsEvent {
+        TwsEvent::Execution(TwsExecution {
+            exec_id: exec_id.into(),
+            order_id: 42,
+            perm_id: 555,
+            order_ref: "".into(),
+            account: account.into(),
+            symbol: "AAPL".into(),
+            buy: false,
+            qty,
+            price,
+            time: Utc::now() - chrono::Duration::minutes(mins_ago),
+        })
+    }
+
+    #[test]
+    fn corrected_execution_dedupes_to_one_fill_by_base_id() {
+        let rows = vec![
+            ex("0000e0d5.6551a1b2.01.01", "U1", 3.0, 190.0, 5),
+            ex("0000e0d5.6551a1b2.01.02", "U1", 3.0, 190.0, 5),
+            TwsEvent::Commission { exec_id: "0000e0d5.6551a1b2.01.02".into(), amount: 1.5, currency: "USD".into() },
+        ];
+        let fills = fills_from_executions(rows, "U1", DateTime::<Utc>::MIN_UTC, |_, _| None);
+        assert_eq!(fills.len(), 1);
+        // The base id: the same id the stream sent the original under.
+        assert_eq!(fills[0].exec_id, "0000e0d5.6551a1b2.01");
+        assert_eq!((fills[0].venue_order_id.as_str(), fills[0].account_ref.as_str()), ("555", "U1"));
+        assert_eq!(fills[0].fee, Some((1.5, "USD".to_string())));
+    }
+
+    #[test]
+    fn correction_with_changed_qty_warns() {
+        let w = correction_warning("b", (3.0, 190.0), (2.0, 190.0)).expect("a changed qty warns");
+        assert!(w.contains("qty 3 -> 2") && w.contains("NOT amended"), "{w}");
+        assert!(correction_warning("b", (3.0, 190.0), (3.0, 191.0)).is_some());
+        assert_eq!(correction_warning("b", (3.0, 190.0), (3.0, 190.0)), None);
+        // The pull keeps the highest revision's figures.
+        let rows = vec![ex("b.02", "U1", 2.0, 190.0, 1), ex("b.01", "U1", 3.0, 190.0, 1)];
+        let fills = fills_from_executions(rows, "U1", DateTime::<Utc>::MIN_UTC, |_, _| None);
+        assert_eq!((fills.len(), fills[0].qty), (1, 2.0));
+    }
+
+    #[tokio::test]
+    async fn fills_since_pulls_one_account_and_drops_older_fills() {
+        let (fake, adapter) = rig();
+        let id = Uuid::new_v4();
+        adapter.learn(&[(42, id.to_string(), sample_state(42, &id.to_string()))]);
+        fake.executions.lock().unwrap().extend([
+            ex("new.01", "U1", 1.0, 10.0, 1),
+            ex("old.01", "U1", 1.0, 10.0, 60),
+            ex("other.01", "U2", 1.0, 10.0, 1),
+            ex("", "U1", 1.0, 10.0, 1),
+        ]);
+        let page = adapter.fills_since("U1", "", None, Utc::now() - chrono::Duration::minutes(30)).await.unwrap();
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["new"]);
+        assert_eq!(page.fills[0].client_order_id.as_deref(), Some(id.to_string().as_str()));
+        assert_eq!((page.more, page.next.clone()), (false, Cursor(String::new())));
+        let h = adapter.hints();
+        assert_eq!((h.intraday_secs, h.max_history, h.per_symbol), (120, Some(chrono::Duration::days(7)), false));
+        assert_eq!(adapter.scopes("U1").await.unwrap(), vec![String::new()]);
+    }
+
+    fn sample_state(id: i32, order_ref: &str) -> TwsOrderState {
+        TwsOrderState {
+            status: "Submitted".into(),
+            filled: 1.0,
+            remaining: 9.0,
+            avg_fill_price: 10.0,
+            symbol: "AAPL".into(),
+            perm_id: 4242,
+            order: TwsOrder {
+                order_id: id,
+                con_id: 265598,
+                exchange: "SMART".into(),
+                primary_exchange: "NASDAQ".into(),
+                currency: "USD".into(),
+                action: Side::Sell,
+                qty: 10.0,
+                order_type: OrderKind::Mkt,
+                tif: Tif::Day,
+                order_ref: order_ref.into(),
+                account: "U1".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn open_order_snapshot_is_per_account() {
+        let (fake, adapter) = rig();
+        let mut other = sample_state(8, "");
+        other.order.account = "U2".into();
+        fake.open.lock().unwrap().extend([(7, "x".to_string(), sample_state(7, "x")), (8, String::new(), other)]);
+        let snap = adapter.open_order_snapshot("U1").await.unwrap();
+        assert_eq!(snap.len(), 1);
+        assert_eq!((snap[0].venue_order_id.as_str(), snap[0].client_order_id.as_deref(), snap[0].cum_qty), ("4242", Some("x"), 1.0));
+        assert_eq!((snap[0].buy, snap[0].order_type.as_str(), snap[0].status.clone()), (false, "market", VenueOrderStatus::Working));
+    }
+
+    #[tokio::test]
+    async fn order_status_finds_an_adopted_order_by_perm_id() {
+        let (fake, adapter) = rig();
+        fake.completed.lock().unwrap().push((-3, String::new(), sample_state(-3, "")));
+        let s = adapter.order_status("4242", "4242", "AAPL").await.unwrap();
+        assert_eq!(s.executed_qty, 1.0);
     }
 }

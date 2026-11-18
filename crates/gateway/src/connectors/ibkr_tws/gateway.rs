@@ -529,6 +529,7 @@ mod tests {
         IbkrTwsCredentials {
             username: "trader1".into(),
             password: "s3cret-pw".into(),
+            master_client_id: 0,
         }
     }
 
@@ -566,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn a_container_with_an_old_login_is_replaced() {
         let d = dir("relogin");
-        let old = IbkrTwsCredentials { username: "trader1".into(), password: "old-pw".into() };
+        let old = IbkrTwsCredentials { username: "trader1".into(), password: "old-pw".into(), master_client_id: 0 };
         let fake = Arc::new(FakeDocker {
             existing: Some(running(Some(creds_tag(&d, &old).unwrap()))),
             ..Default::default()

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::future::BoxFuture;
+use serde::Deserialize;
 
 use crate::connectors::RegistrationDeps;
 use crate::credentials::BrokerCredentials;
@@ -51,6 +52,22 @@ pub(crate) fn set_live_client(connection_code: &str, client: Option<Arc<dyn clie
 pub struct IbkrTwsCredentials {
     pub username: String,
     pub password: String,
+    /// The TWS API client id the OMS connects as. 0, the master client id
+    /// (default), also sees orders typed into TWS, so they are adopted.
+    #[serde(default, deserialize_with = "client_id")]
+    pub master_client_id: i32,
+}
+
+/// A client id stored as a number or as the form's text (empty = 0).
+fn client_id<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Number(n) => n.as_i64().and_then(|n| i32::try_from(n).ok()).ok_or_else(|| D::Error::custom("master_client_id out of range")),
+        serde_json::Value::String(s) if s.trim().is_empty() => Ok(0),
+        serde_json::Value::String(s) => s.trim().parse().map_err(|_| D::Error::custom(format!("master_client_id is not a number: {s}"))),
+        serde_json::Value::Null => Ok(0),
+        other => Err(D::Error::custom(format!("master_client_id is not a number: {other}"))),
+    }
 }
 
 static MANIFEST: Manifest = Manifest {
@@ -58,7 +75,7 @@ static MANIFEST: Manifest = Manifest {
     credential_kind: "IbkrTws",
     venue,
     field_types: &[],
-    redaction: &[("username", Clear), ("password", Hidden)],
+    redaction: &[("username", Clear), ("password", Hidden), ("master_client_id", Clear)],
     live_only: false,
     universe: false,
     quotes: QuoteScope::NonCrypto,
@@ -82,11 +99,14 @@ impl Connector for IbkrTws {
         let slot: adapter::ClientSlot = Arc::new(RwLock::new(None));
         let adapter = Arc::new(adapter::IbkrTwsAdapter::new(slot.clone()));
         let stream_adapter = adapter.clone();
+        // Venue events only: the reconciler books every fill (exactly once,
+        // through ingest) and pulls what the stream missed.
         Ok(Connected {
-            source: None, venue_stream: None,
+            source: Some(adapter.clone()),
+            exec_stream: None,
             daily_stats: Some(adapter.clone()),
             adapter,
-            exec_stream: Some(Arc::new(move |health, engine| {
+            venue_stream: Some(Arc::new(move |health, tx| {
                 let gw = stream::Gateway {
                     docker: Arc::new(gateway::DockerCli),
                     code: format!("{}-{env}", MANIFEST.code),
@@ -94,7 +114,7 @@ impl Connector for IbkrTws {
                     creds: creds.clone(),
                     state_dir: state_dir.clone(),
                 };
-                let ctx = stream::Ctx { adapter: stream_adapter.clone(), health, engine, env };
+                let ctx = stream::Ctx { adapter: stream_adapter.clone(), health, tx };
                 Box::pin(stream::supervise(gw, slot.clone(), ctx))
             })),
         })
@@ -136,6 +156,25 @@ fn venue() -> Venue {
             Some("https://www.interactivebrokers.com/portal/"),
             Some("https://www.interactivebrokers.com/portal/"),
         ),
-        fields: vec![field("username", "IBKR username"), field("password", "Password").secret()],
+        fields: vec![
+            field("username", "IBKR username"),
+            field("password", "Password").secret(),
+            field("master_client_id", "Master API client id (0 sees orders entered in TWS)").prefill("0", "0"),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_id_comes_from_credentials() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<IbkrTwsCredentials>(v).map(|c| c.master_client_id);
+        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p"})).unwrap(), 0, "default: master");
+        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": 7})).unwrap(), 7);
+        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": "12"})).unwrap(), 12);
+        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": ""})).unwrap(), 0);
+        assert!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": "x"})).is_err());
     }
 }

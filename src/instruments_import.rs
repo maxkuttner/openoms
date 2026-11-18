@@ -580,7 +580,7 @@ mod tests {
         async fn cancel(&self, _: i32) -> Result<(), TwsError> { unimplemented!() }
         async fn open_orders(&self) -> Result<Vec<(i32, String, gateway::connectors::ibkr_tws::client::TwsOrderState)>, TwsError> { unimplemented!() }
         async fn completed_orders(&self) -> Result<Vec<(i32, String, gateway::connectors::ibkr_tws::client::TwsOrderState)>, TwsError> { unimplemented!() }
-        async fn executions_today(&self) -> Result<Vec<gateway::connectors::ibkr_tws::client::TwsEvent>, TwsError> { unimplemented!() }
+        async fn executions(&self, _: &str, _: chrono::DateTime<chrono::Utc>) -> Result<Vec<gateway::connectors::ibkr_tws::client::TwsEvent>, TwsError> { unimplemented!() }
         async fn matching_symbols(&self, _: &str) -> Result<Vec<TwsContract>, TwsError> { unimplemented!() }
         async fn prev_close(&self, _: i64) -> Result<Option<f64>, TwsError> { unimplemented!() }
         async fn managed_accounts(&self) -> Result<Vec<String>, TwsError> { unimplemented!() }

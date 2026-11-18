@@ -270,6 +270,15 @@
         "section": null,
         "paper": null,
         "live": null
+      },
+      {
+        "name": "master_client_id",
+        "label": "Master API client id (0 sees orders entered in TWS)",
+        "secret": false,
+        "input": "text",
+        "section": null,
+        "paper": "0",
+        "live": "0"
       }
     ]
   },
