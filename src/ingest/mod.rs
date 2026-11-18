@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod decide;
 
 #[cfg(test)]

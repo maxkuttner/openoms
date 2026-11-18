@@ -76,16 +76,12 @@ where
     unreachable!()
 }
 
-async fn apply_once(
-    pool: &PgPool,
+/// The order's current state as `order_state` holds it, or `None` when there is
+/// no such order.
+pub(crate) async fn load_state(
+    conn: &mut sqlx::PgConnection,
     order_id: Uuid,
-    report: ExecutionReport,
-    actor: &str,
-    bus: Option<&EventBus>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let event_store = OrderEventStore::new(pool.clone());
-    let mut tx = pool.begin().await?;
-
+) -> Result<Option<OrderAggregateState>, Box<dyn std::error::Error + Send + Sync>> {
     let row = sqlx::query(
         r#"
         SELECT
@@ -102,25 +98,9 @@ async fn apply_once(
         "#,
     )
     .bind(order_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
-
-    let row = match row {
-        Some(r) => r,
-        // TODO: If the OMS is supposed to act as a projection for colocated quoting engines,
-        //  trading algorithms, etc., we should be able to handle the case where the order is
-        //  not found in the DB.
-        None => {
-            warn!(order_id = %order_id, "execution: order not found in DB, skipping");
-            return Ok(());
-        }
-    };
-
-    let current_status: &str = row.get("status");
-    if matches!(current_status, "filled" | "rejected" | "canceled" | "expired") {
-        warn!(order_id = %order_id, status = current_status, "execution: order already in terminal state, skipping duplicate event");
-        return Ok(());
-    }
+    let Some(row) = row else { return Ok(None) };
 
     // Reuse parse helpers from handlers — map errors to strings for the boxed error type
     let side = parse_order_side(row.get("side")).map_err(|e| e.message.clone())?;
@@ -151,6 +131,34 @@ async fn apply_once(
         resume_to_status,
         version: row.get("version"),
     };
+    Ok(Some(state))
+}
+
+async fn apply_once(
+    pool: &PgPool,
+    order_id: Uuid,
+    report: ExecutionReport,
+    actor: &str,
+    bus: Option<&EventBus>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let event_store = OrderEventStore::new(pool.clone());
+    let mut tx = pool.begin().await?;
+
+    let state = match load_state(&mut tx, order_id).await? {
+        Some(s) => s,
+        // TODO: If the OMS is supposed to act as a projection for colocated quoting engines,
+        //  trading algorithms, etc., we should be able to handle the case where the order is
+        //  not found in the DB.
+        None => {
+            warn!(order_id = %order_id, "execution: order not found in DB, skipping");
+            return Ok(());
+        }
+    };
+
+    if state.status.is_terminal() {
+        warn!(order_id = %order_id, status = state.status.as_str(), "execution: order already in terminal state, skipping duplicate event");
+        return Ok(());
+    }
 
     let expected_version = state.version;
     let aggregate = OrderAggregate::from_state(state);

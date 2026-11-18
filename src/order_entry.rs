@@ -33,7 +33,8 @@ pub enum Origin {
     Api,
     Fix { cl_ord_id: String },
     Flatten,
-    /// A co-located strategy's fill the OMS only follows.
+    /// Any order the OMS did not place: adopted from a venue's report (a
+    /// manual or third-party order, or a co-located strategy's fill).
     External,
 }
 

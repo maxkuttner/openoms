@@ -95,8 +95,14 @@ pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, engine: EngineHandle, pool:
             GatewayMsg::Exec(ev) => {
                 guarded(ev.order_id, apply_exec(&pool, &bus, &ev)).await;
             }
-            GatewayMsg::Venue { connection, .. } => {
-                debug!(connection = %connection, "order engine: venue event ignored until the engine handles them");
+            GatewayMsg::Venue { connection, event } => {
+                guarded(Uuid::nil(), async {
+                    match crate::ingest::apply::ingest(&pool, &bus, &connection, event, None).await {
+                        Ok(decision) => debug!(connection = %connection, ?decision, "order engine: venue event applied"),
+                        Err(e) => error!(connection = %connection, error = %e, "order engine: venue event not applied"),
+                    }
+                })
+                .await;
             }
             GatewayMsg::Reconcile { broker_code, environment, actor, adapter } => {
                 // per connection, not per broker: PAPER and LIVE (or Binance WS and
