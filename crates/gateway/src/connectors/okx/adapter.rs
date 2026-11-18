@@ -438,7 +438,9 @@ pub(crate) fn parse_open_order_snapshot(data: &serde_json::Value, account_ref: &
 const FILLS_PATH: &str = "/api/v5/trade/fills";
 const FILLS_HISTORY_PATH: &str = "/api/v5/trade/fills-history";
 const RECENT_DAYS: i64 = 3;
-const MAX_HISTORY_DAYS: i64 = 365;
+/// What `/trade/fills-history` holds (about 3 months); a year would need the
+/// async `/trade/fills-archive`. The sweep reports the window it obtained.
+const MAX_HISTORY_DAYS: i64 = 90;
 /// Pages one call may walk (100 rows each) before it gives up rather than
 /// advance its cursor past rows it did not read.
 const MAX_PAGES: usize = 1000;
@@ -494,6 +496,19 @@ pub(crate) fn pull_result(pages: Vec<FillsRows>) -> PullPage {
     PullPage { fills: pages.into_iter().flat_map(|p| p.fills).collect(), next: Cursor(next), more: false }
 }
 
+/// Where a scan starts: `(fills-history first, effective since, begin param)`.
+/// A resume (`since` = MIN_UTC) starts on the recent `/trade/fills` with no
+/// `begin`; it falls into history only if its cursor is not reached there. Only
+/// a real `since` older than 3 days starts on `/trade/fills-history`, bounded to
+/// what that endpoint holds.
+pub(crate) fn scan_plan(since: DateTime<Utc>, now: DateTime<Utc>) -> (bool, DateTime<Utc>, Option<i64>) {
+    if since == DateTime::<Utc>::MIN_UTC {
+        return (false, since, None);
+    }
+    let since = since.max(now - chrono::Duration::days(MAX_HISTORY_DAYS));
+    (since < now - chrono::Duration::days(RECENT_DAYS), since, Some(since.timestamp_millis()))
+}
+
 #[async_trait::async_trait]
 impl ExecutionSource for OkxAdapter {
     /// Walks fills newest to oldest with `after=<billId>` until the cursor's
@@ -504,19 +519,21 @@ impl ExecutionSource for OkxAdapter {
     async fn fills_since(
         &self,
         account_ref: &str,
-        _scope: &str,
+        scope: &str,
         from: Option<&Cursor>,
         since: DateTime<Utc>,
     ) -> Result<PullPage, BrokerError> {
         let after_bill = from.and_then(|c| c.0.parse::<u128>().ok());
         let now = Utc::now();
-        let since = since.max(now - chrono::Duration::days(MAX_HISTORY_DAYS));
-        let mut history = since < now - chrono::Duration::days(RECENT_DAYS);
+        let (mut history, since, begin) = scan_plan(since, now);
         let mut paging: Option<String> = None;
         let mut pages = Vec::new();
         for _ in 0..MAX_PAGES {
             let path = if history { FILLS_HISTORY_PATH } else { FILLS_PATH };
-            let mut query = format!("{path}?instType=SPOT&limit={PAGE_LIMIT}&begin={}", since.timestamp_millis());
+            let mut query = format!("{path}?instType=SPOT&limit={PAGE_LIMIT}");
+            if let Some(begin) = begin {
+                query.push_str(&format!("&begin={begin}"));
+            }
             if let Some(oldest) = &paging {
                 query.push_str(&format!("&after={oldest}"));
             }
@@ -538,7 +555,10 @@ impl ExecutionSource for OkxAdapter {
             }
             paging = oldest.or(paging);
         }
-        Err(BrokerError::Network(format!("OKX fills: more than {MAX_PAGES} pages in one pull")))
+        Err(BrokerError::Network(format!(
+            "OKX fills pull for scope \"{scope}\" read more than {MAX_PAGES} pages without reaching its bound; \
+             this scope stalls until that is resolved (a shorter gap, or a manual EOD sweep)"
+        )))
     }
 
     /// `GET /api/v5/trade/orders-pending`: every open spot order, paging back by `after=<ordId>`.
@@ -775,7 +795,26 @@ mod tests {
     }
 
     #[test]
-    fn open_order_snapshot_maps_working_orders_and_hints_are_one_year() {
+    fn okx_resume_uses_recent_endpoint_without_begin() {
+        let now = ms(1_700_000_000_000);
+        assert_eq!(scan_plan(DateTime::<Utc>::MIN_UTC, now), (false, DateTime::<Utc>::MIN_UTC, None));
+        let recent = now - chrono::Duration::hours(1);
+        assert_eq!(scan_plan(recent, now), (false, recent, Some(recent.timestamp_millis())));
+        let old = now - chrono::Duration::days(10);
+        assert_eq!(scan_plan(old, now), (true, old, Some(old.timestamp_millis())));
+        let ancient = now - chrono::Duration::days(500);
+        let (history, eff, begin) = scan_plan(ancient, now);
+        assert_eq!((history, eff, begin), (true, now - chrono::Duration::days(90), Some((now - chrono::Duration::days(90)).timestamp_millis())));
+    }
+
+    #[test]
+    fn okx_max_history_is_90_days() {
+        let a = OkxAdapter::new("k".into(), "s".into(), "p".into(), "PAPER");
+        assert_eq!(ExecutionSource::hints(&a).max_history, Some(chrono::Duration::days(90)));
+    }
+
+    #[test]
+    fn open_order_snapshot_maps_working_orders_and_hints_are_90_days() {
         let snap = parse_open_order_snapshot(&sample("orders_pending"), "acct");
         assert_eq!(snap.len(), 2);
         let o = &snap[0];
@@ -784,7 +823,7 @@ mod tests {
         assert_eq!((snap[1].client_order_id.clone(), snap[1].buy), (None, false));
         assert_eq!(
             ExecutionSource::hints(&OkxAdapter::new("k".into(), "s".into(), "p".into(), "PAPER")),
-            PullHints { intraday_secs: 60, max_history: Some(chrono::Duration::days(365)), per_symbol: false }
+            PullHints { intraday_secs: 60, max_history: Some(chrono::Duration::days(90)), per_symbol: false }
         );
     }
 
