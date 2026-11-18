@@ -109,6 +109,10 @@ pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, engine: EngineHandle, pool:
                         res.map(|i| gateway::contract::IngestOutcome {
                             fill_gap: i.fill_gap,
                             duplicate: i.decision == crate::ingest::decide::Decision::Duplicate,
+                            broken: matches!(
+                                i.decision,
+                                crate::ingest::decide::Decision::Break(_) | crate::ingest::decide::Decision::AttachToBreak
+                            ),
                         })
                         .map_err(|e| e.to_string()),
                     );

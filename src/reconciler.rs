@@ -30,8 +30,8 @@
 //! The instrument provider (from `Connector::universe_provider`) rides along on
 //! every `GatewayMsg::Venue` this sends, so the engine keeps no per-connection map.
 
-// `pull_now`, `sweep` and the plain `spawn` are for the EOD sweep (Task 6) and
-// the connectors moved onto venue events; nothing calls them yet.
+// `pull_now`, the plain `spawn` and the registry lookup are for the connectors
+// moved onto venue events (Task 7); nothing calls them yet.
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,14 +53,21 @@ use uuid::Uuid;
 const SINCE_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
 
 /// What an EOD sweep pulled.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SweepReport {
-    pub fills: usize,
-    pub duplicates: usize,
-    pub failed: usize,
-    pub fill_gaps: usize,
-    /// `(account_ref, scope, error)` for every pull the venue refused.
-    pub errors: Vec<(String, String, String)>,
+    /// What the lookback asked for.
+    pub requested_from: DateTime<Utc>,
+    /// What the venue serves: `requested_from`, or later when the venue's
+    /// history is shorter.
+    pub obtained_from: DateTime<Utc>,
+    pub booked: u32,
+    pub duplicates: u32,
+    /// Fills recorded as breaks (not booked).
+    pub breaks: u32,
+    /// Fills whose ingest errored.
+    pub failed: u32,
+    /// Accounts or scopes the venue refused, as text.
+    pub errors: Vec<String>,
 }
 
 pub struct Reconciler {
@@ -96,10 +103,42 @@ impl ReconcilerHandle {
         self.inner.trigger.notify_one();
     }
 
-    /// Pull every fill since `since`, cursors untouched (EOD sweep).
-    pub async fn sweep(&self, since: DateTime<Utc>) -> SweepReport {
-        self.inner.sweep(since).await
+    /// EOD sweep: pull every fill from `now - lookback` (clamped to the venue's
+    /// history), cursors untouched.
+    pub async fn sweep(&self, lookback: chrono::Duration) -> SweepReport {
+        self.inner.sweep(Utc::now(), lookback).await
     }
+
+    pub(crate) async fn sweep_at(&self, now: DateTime<Utc>, lookback: chrono::Duration) -> SweepReport {
+        self.inner.sweep(now, lookback).await
+    }
+
+    fn downgrade(&self) -> WeakHandle {
+        WeakHandle { inner: Arc::downgrade(&self.inner), tasks: Arc::downgrade(&self._tasks) }
+    }
+}
+
+/// A handle that does not keep the reconciler alive.
+struct WeakHandle {
+    inner: std::sync::Weak<Reconciler>,
+    tasks: std::sync::Weak<Tasks>,
+}
+
+/// Reconcilers by connection, so a scheduled job can reach the current one
+/// without holding a handle of its own: a held handle would keep the tasks
+/// running past a stream restart. Entries are weak, replaced when a connection
+/// respawns, and dead once the stream (the only owner) is gone.
+static LIVE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, WeakHandle>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The running reconciler of `connection`, if any. Hold the result only briefly.
+pub fn live(connection: &str) -> Option<ReconcilerHandle> {
+    let mut live = LIVE.lock().unwrap();
+    let up = live.get(connection).and_then(|w| Some(ReconcilerHandle { inner: w.inner.upgrade()?, _tasks: w.tasks.upgrade()? }));
+    if up.is_none() {
+        live.remove(connection);
+    }
+    up
 }
 
 /// Start a reconciler without an adapter (no synthetic closes) or instrument provider.
@@ -124,6 +163,7 @@ pub fn spawn_with(
     adapter: Option<Arc<dyn BrokerAdapter>>,
     instruments: Option<Arc<dyn InstrumentProvider>>,
 ) -> ReconcilerHandle {
+    let name = connection.clone();
     let inner = Arc::new(Reconciler { connection, source, engine, pool, adapter, instruments, trigger: Notify::new() });
     let mut set = JoinSet::new();
 
@@ -177,7 +217,9 @@ pub fn spawn_with(
         debug!(connection = %r.connection, "reconciler: stream sink closed");
     });
 
-    ReconcilerHandle { inner, _tasks: Arc::new(Tasks(std::sync::Mutex::new(set))) }
+    let handle = ReconcilerHandle { inner, _tasks: Arc::new(Tasks(std::sync::Mutex::new(set))) };
+    LIVE.lock().unwrap().insert(name, handle.downgrade());
+    handle
 }
 
 impl Reconciler {
@@ -289,6 +331,10 @@ impl Reconciler {
             if !page.more {
                 return Ok(());
             }
+            if page.next.0.is_empty() {
+                warn!(connection = %self.connection, account = account_ref, scope, "reconciler: venue says more but gave no cursor; stopping this scope");
+                return Ok(());
+            }
             from = Some(page.next);
         }
     }
@@ -369,12 +415,17 @@ impl Reconciler {
         Ok(())
     }
 
-    async fn sweep(&self, since: DateTime<Utc>) -> SweepReport {
-        let mut report = SweepReport::default();
+    async fn sweep(&self, now: DateTime<Utc>, lookback: chrono::Duration) -> SweepReport {
+        let requested_from = now - lookback;
+        let obtained_from = match self.source.hints().max_history {
+            Some(max) => requested_from.max(now - max),
+            None => requested_from,
+        };
+        let mut report = SweepReport { requested_from, obtained_from, booked: 0, duplicates: 0, breaks: 0, failed: 0, errors: vec![] };
         let accounts = match self.accounts().await {
             Ok(a) => a,
             Err(e) => {
-                report.errors.push((String::new(), String::new(), e.to_string()));
+                report.errors.push(format!("accounts: {e}"));
                 return report;
             }
         };
@@ -382,31 +433,33 @@ impl Reconciler {
             let scopes = match self.source.scopes(&account_ref).await {
                 Ok(s) => s,
                 Err(e) => {
-                    report.errors.push((account_ref.clone(), String::new(), e.to_string()));
+                    report.errors.push(format!("{account_ref}: scopes: {e}"));
                     continue;
                 }
             };
             for scope in scopes {
                 let mut from: Option<Cursor> = None;
                 loop {
-                    let page = match self.source.fills_since(&account_ref, &scope, from.as_ref(), since).await {
+                    let page = match self.source.fills_since(&account_ref, &scope, from.as_ref(), obtained_from).await {
                         Ok(p) => p,
                         Err(e) => {
-                            report.errors.push((account_ref.clone(), scope.clone(), e.to_string()));
+                            report.errors.push(format!("{account_ref} {scope}: {e}"));
                             break;
                         }
                     };
                     for fill in page.fills {
-                        report.fills += 1;
                         match self.ingest(VenueEvent::Fill(fill)).await {
-                            Ok(out) => {
-                                report.duplicates += out.duplicate as usize;
-                                report.fill_gaps += out.fill_gap as usize;
-                            }
+                            Ok(out) if out.duplicate => report.duplicates += 1,
+                            Ok(out) if out.broken => report.breaks += 1,
+                            Ok(_) => report.booked += 1,
                             Err(_) => report.failed += 1,
                         }
                     }
                     if !page.more {
+                        break;
+                    }
+                    if page.next.0.is_empty() {
+                        warn!(connection = %self.connection, account = %account_ref, scope, "reconciler: sweep: venue says more but gave no cursor; stopping this scope");
                         break;
                     }
                     from = Some(page.next);

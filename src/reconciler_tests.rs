@@ -23,6 +23,7 @@ struct FakeSource {
     scopes_calls: Mutex<usize>,
     /// When set, `scopes` waits for a permit (to hold a pull open).
     gate: Option<Semaphore>,
+    max_history: Option<chrono::Duration>,
 }
 
 #[async_trait::async_trait]
@@ -48,7 +49,7 @@ impl ExecutionSource for FakeSource {
         Ok(vec![String::new()])
     }
     fn hints(&self) -> PullHints {
-        PullHints { intraday_secs: 3600, max_history: None, per_symbol: false }
+        PullHints { intraday_secs: 3600, max_history: self.max_history, per_symbol: false }
     }
 }
 
@@ -270,4 +271,93 @@ async fn empty_next_cursor_does_not_slide_since() {
     assert_eq!(cursor(&w).await.as_deref(), Some(""));
     let want = before - chrono::Duration::seconds(60);
     assert_eq!(*source.sinces.lock().unwrap(), [want, want]);
+}
+
+fn dup(_: &VenueEvent) -> Result<IngestOutcome, String> {
+    Ok(IngestOutcome { duplicate: true, ..Default::default() })
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn eod_sweep_clamps_to_venue_max_history() {
+    let w = world().await;
+    let source = Arc::new(FakeSource { max_history: Some(chrono::Duration::days(7)), ..Default::default() });
+    let (engine, _) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    let now = Utc::now();
+    let r = h.sweep_at(now, chrono::Duration::days(30)).await;
+    assert_eq!(r.requested_from, now - chrono::Duration::days(30));
+    assert_eq!(r.obtained_from, now - chrono::Duration::days(7));
+    assert_eq!(*source.sinces.lock().unwrap(), [now - chrono::Duration::days(7)]);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn eod_sweep_counts_duplicates_not_rebooks() {
+    let w = world().await;
+    let source = Arc::new(FakeSource { pages: Mutex::new(vec![page(&["e1"], "", false)]), ..Default::default() });
+    let (engine, _) = fake_engine(dup);
+    let (h, _tx) = start(&w, source, engine);
+    let r = h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert_eq!((r.booked, r.duplicates, r.breaks), (0, 1, 0));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn eod_sweep_counts_booked_and_breaks_and_leaves_cursors_alone() {
+    let w = world().await;
+    set_cursor(&w, "keep").await;
+    let source = Arc::new(FakeSource {
+        pages: Mutex::new(vec![page(&["e1", "e2", "e3"], "p2", true), page(&["e4"], "p3", false)]),
+        ..Default::default()
+    });
+    let (engine, _) = fake_engine(|e| match e {
+        VenueEvent::Fill(f) if f.exec_id == "e2" => Ok(IngestOutcome { broken: true, ..Default::default() }),
+        VenueEvent::Fill(f) if f.exec_id == "e3" => Ok(IngestOutcome { duplicate: true, ..Default::default() }),
+        _ => Ok(IngestOutcome::default()),
+    });
+    let (h, _tx) = start(&w, source.clone(), engine);
+    let r = h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert_eq!((r.booked, r.duplicates, r.breaks, r.failed), (2, 1, 1, 0));
+    assert_eq!(*source.calls.lock().unwrap(), [None, Some("p2".to_string())]);
+    assert_eq!(cursor(&w).await.as_deref(), Some("keep"));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn eod_sweep_stops_on_more_with_empty_next() {
+    let w = world().await;
+    let source = Arc::new(FakeSource { pages: Mutex::new(vec![page(&["e1"], "", true), page(&["e2"], "", true)]), ..Default::default() });
+    let (engine, _) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    let r = h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert_eq!(r.booked, 1);
+    assert_eq!(source.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn eod_sweep_intraday_pull_stops_on_more_with_empty_next() {
+    let w = world().await;
+    set_cursor(&w, "c").await;
+    let source = Arc::new(FakeSource { pages: Mutex::new(vec![page(&["e1"], "", true), page(&["e2"], "", true)]), ..Default::default() });
+    let (engine, _) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    eventually(|| !source.calls.lock().unwrap().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(source.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn eod_sweep_registry_does_not_keep_a_reconciler_alive() {
+    let w = world().await;
+    let (engine, _) = fake_engine(ok);
+    let (_tx, rx) = mpsc::channel(1);
+    // Its own connection name: the shared CONN is respawned by parallel tests.
+    let h = spawn("registry-test".into(), Arc::new(FakeSource::default()), rx, engine, w.pool.clone());
+    assert!(super::live("registry-test").is_some());
+    drop(h);
+    assert!(super::live("registry-test").is_none());
 }

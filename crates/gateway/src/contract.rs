@@ -98,6 +98,8 @@ pub struct IngestOutcome {
     pub fill_gap: bool,
     /// Already booked; nothing was written.
     pub duplicate: bool,
+    /// Not booked: recorded as a break for a person to resolve.
+    pub broken: bool,
 }
 
 /// Where the engine answers a `GatewayMsg::Venue`; `Err` is the ingest error, as text.

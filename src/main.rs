@@ -1602,6 +1602,7 @@ async fn serve() {
     // supervised: `stream_supervisor` exists to reconnect streams, and treats a clean
     // return as a disconnect to back off from — wrong shape for a periodic job.
     tokio::spawn(expiry::run(state.pool().clone()));
+    tokio::spawn(jobs::eod_sweep::run(state.pool().clone()));
 
     // Re-resolve imported IBKR instruments daily at 06:00 UTC while a TWS session is live.
     tokio::spawn(instruments_import::run_nightly(state.pool().clone()));
