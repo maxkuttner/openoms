@@ -123,7 +123,7 @@ async fn migration_seeds_venue_fill_from_existing_fills() {
 
 #[tokio::test]
 #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-async fn migration_drops_per_trade_external_orders_sharing_a_venue_order() {
+async fn legacy_colo_per_trade_rows_survive_and_are_seeded() {
     let pool = fresh_db().await;
     migrate::ensure_tracking(&pool).await.unwrap();
     migrate::apply_matching(&pool, |schema, file| schema != "oms" || file < RECON_MIGRATION)
@@ -133,29 +133,27 @@ async fn migration_drops_per_trade_external_orders_sharing_a_venue_order() {
     let b = seed_base(&pool).await;
     let trade_a = seed_order(&pool, &b, "shared").await;
     let trade_b = seed_order(&pool, &b, "shared").await;
-    let kept = seed_order(&pool, &b, "alone").await;
-    sqlx::query("UPDATE oms.order_state SET origin = 'EXTERNAL' WHERE order_id = ANY($1)")
-        .bind(vec![trade_a, trade_b, kept])
+    sqlx::query("UPDATE oms.order_state SET origin = 'EXTERNAL', venue_trade_id = 100 WHERE order_id = ANY($1)")
+        .bind(vec![trade_a, trade_b])
         .execute(&pool).await.unwrap();
-    for order in [trade_a, trade_b, kept] {
+    for (order, exec) in [(trade_a, "t-1"), (trade_b, "t-2")] {
         sqlx::query(
             "INSERT INTO oms.order_event (order_id, version, event_id, event_type, payload_json) \
-             VALUES ($1, 1, $2, 'order_filled', '{}')",
+             VALUES ($1, 1, $2, 'order_filled', jsonb_build_object('payload', jsonb_build_object('execution_id', $3::text)))",
         )
-        .bind(order).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+        .bind(order).bind(Uuid::new_v4()).bind(exec).execute(&pool).await.unwrap();
     }
 
     migrate::apply_all(&pool).await.unwrap();
 
-    let orders: Vec<Uuid> = sqlx::query_scalar("SELECT order_id FROM oms.order_state WHERE broker_connection_code = $1")
-        .bind(&b.connection).fetch_all(&pool).await.unwrap();
-    assert_eq!(orders, vec![kept]);
-    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM oms.order_event WHERE order_id = ANY($1)")
-        .bind(vec![trade_a, trade_b, kept]).fetch_one(&pool).await.unwrap();
-    assert_eq!(events, 1);
-    // The append-only guard is back on.
-    let delete = sqlx::query("DELETE FROM oms.order_event WHERE order_id = $1").bind(kept).execute(&pool).await;
-    assert!(delete.is_err());
+    let orders: i64 = sqlx::query_scalar("SELECT count(*) FROM oms.order_state WHERE broker_connection_code = $1")
+        .bind(&b.connection).fetch_one(&pool).await.unwrap();
+    assert_eq!(orders, 2);
+    let fills: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT exec_id, order_id FROM oms.venue_fill WHERE broker_connection_code = $1 ORDER BY exec_id",
+    )
+    .bind(&b.connection).fetch_all(&pool).await.unwrap();
+    assert_eq!(fills, vec![("t-1".to_string(), trade_a), ("t-2".to_string(), trade_b)]);
 }
 
 #[tokio::test]

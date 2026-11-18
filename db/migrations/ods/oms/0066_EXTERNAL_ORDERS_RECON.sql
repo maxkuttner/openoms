@@ -63,32 +63,14 @@ CREATE TABLE recon_break (
 CREATE UNIQUE INDEX recon_break_one_open
     ON recon_break (broker_connection_code, account_id, venue_order_id) WHERE status = 'open';
 
--- The colo ingest booked one EXTERNAL order per venue trade, so several rows can
--- share one venue order id and would violate the unique index below. Prerelease:
--- drop those per-trade rows with their events (order_event is append-only, so its
--- guards are lifted for the delete); the EOD sweep re-adopts them as one order.
-ALTER TABLE order_event DISABLE TRIGGER order_event_no_delete;
-CREATE TEMP TABLE _colo_dup_orders ON COMMIT DROP AS
-    SELECT order_id FROM order_state
-    WHERE origin = 'EXTERNAL'
-      AND external_order_id IS NOT NULL
-      AND (broker_connection_code, account_id, external_order_id) IN (
-          SELECT broker_connection_code, account_id, external_order_id
-          FROM order_state
-          WHERE external_order_id IS NOT NULL
-          GROUP BY 1, 2, 3
-          HAVING count(*) > 1);
-DELETE FROM order_fee WHERE order_id IN (SELECT order_id FROM _colo_dup_orders);
-DELETE FROM allocation WHERE order_id IN (SELECT order_id FROM _colo_dup_orders);
-DELETE FROM kafka_outbox WHERE global_position IN
-    (SELECT global_position FROM order_event WHERE order_id IN (SELECT order_id FROM _colo_dup_orders));
-DELETE FROM order_event WHERE order_id IN (SELECT order_id FROM _colo_dup_orders);
-DELETE FROM order_state WHERE order_id IN (SELECT order_id FROM _colo_dup_orders);
-ALTER TABLE order_event ENABLE TRIGGER order_event_no_delete;
-
+-- Legacy colo ingest booked one EXTERNAL order per venue trade, so several rows
+-- can share one venue order id. They are left in place (positions already count
+-- them) and excluded from the index via venue_trade_id, which only colo sets.
+-- Their fills are seeded into venue_fill below, so a later sweep sees their
+-- exec_ids as duplicates and books nothing twice.
 CREATE UNIQUE INDEX order_state_venue_order
     ON order_state (broker_connection_code, account_id, external_order_id)
-    WHERE external_order_id IS NOT NULL;
+    WHERE external_order_id IS NOT NULL AND venue_trade_id IS NULL;
 
 -- Seed the ledger from fills already booked, so a re-read of the venue's
 -- executions does not book them twice.
