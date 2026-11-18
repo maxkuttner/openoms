@@ -31,6 +31,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: false,
     price_band_exempt: false,
     per_currency_notional: false,
+    multi_account: false,
 };
 
 impl Connector for Okx {
@@ -43,6 +44,7 @@ impl Connector for Okx {
         let adapter = Arc::new(crate::connectors::okx::adapter::OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, env));
         let stream_adapter = adapter.clone();
         Ok(Connected {
+            source: None,
             daily_stats: Some(adapter.clone()),
             adapter,
             exec_stream: Some(Arc::new(move |health, engine| {

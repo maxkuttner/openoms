@@ -78,6 +78,9 @@ pub struct Manifest {
     /// is dropped, and only a limit set in the instrument's own currency
     /// applies. Every other venue refuses such an order.
     pub per_currency_notional: bool,
+    /// One credential reaches several venue accounts (IBKR), so every venue
+    /// event names the account it belongs to.
+    pub multi_account: bool,
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential
@@ -116,6 +119,8 @@ pub struct Connected {
     /// Its previous-close source for the market-data side; `None` when the
     /// connection has no snapshot endpoint (FIX).
     pub daily_stats: Option<Arc<dyn DailyStats>>,
+    /// Pull side of execution reconciliation; `None` until a connector has one.
+    pub source: Option<Arc<dyn crate::venue_event::ExecutionSource>>,
 }
 
 pub trait Connector: Send + Sync {
@@ -208,6 +213,14 @@ pub fn by_credential_kind(kind: &str) -> Option<&'static dyn Connector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_multi_account_only_ibkr() {
+        for c in all() {
+            let m = c.manifest();
+            assert_eq!(m.multi_account, matches!(m.code, "IBKR" | "IBKR_TWS"), "{}", m.code);
+        }
+    }
 
     /// `GET /admin/venues` drives the cockpit's connection form; moving each
     /// venue's description into its connector must not change one byte of it.

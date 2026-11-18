@@ -95,6 +95,9 @@ pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, engine: EngineHandle, pool:
             GatewayMsg::Exec(ev) => {
                 guarded(ev.order_id, apply_exec(&pool, &bus, &ev)).await;
             }
+            GatewayMsg::Venue { connection, .. } => {
+                debug!(connection = %connection, "order engine: venue event ignored until the engine handles them");
+            }
             GatewayMsg::Reconcile { broker_code, environment, actor, adapter } => {
                 // per connection, not per broker: PAPER and LIVE (or Binance WS and
                 // FIX) share a broker code but are separate sessions

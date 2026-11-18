@@ -31,6 +31,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: false,
     price_band_exempt: false,
     per_currency_notional: false,
+    multi_account: false,
 };
 
 impl Connector for Coinbase {
@@ -45,6 +46,7 @@ impl Connector for Coinbase {
         let adapter = Arc::new(adapter);
         let stream_adapter = adapter.clone();
         Ok(Connected {
+            source: None,
             daily_stats: Some(adapter.clone()),
             adapter,
             exec_stream: Some(Arc::new(move |health, engine| {

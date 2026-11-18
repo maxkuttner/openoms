@@ -49,6 +49,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: true,
     price_band_exempt: false,
     per_currency_notional: false,
+    multi_account: false,
 };
 
 impl Connector for Binance {
@@ -75,7 +76,7 @@ impl Connector for Binance {
             Transport::Fix => {
                 let adapter = start_binance(env, creds, &deps.stream_health, deps.engine.clone())
                     .ok_or_else(|| "Binance FIX session could not start".to_string())?;
-                Ok(Connected { adapter, exec_stream: None, daily_stats: None })
+                Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None })
             }
             #[cfg(not(feature = "fix"))]
             Transport::Fix => {
@@ -89,6 +90,7 @@ impl Connector for Binance {
                 let adapter = Arc::new(adapter);
                 let stream_adapter = adapter.clone();
                 Ok(Connected {
+            source: None,
                     daily_stats: Some(adapter.clone()),
                     adapter,
                     exec_stream: Some(Arc::new(move |health, engine| {

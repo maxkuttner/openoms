@@ -37,6 +37,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: true,
     price_band_exempt: false,
     per_currency_notional: false,
+    multi_account: true,
 };
 
 impl Connector for Ibkr {
@@ -48,7 +49,7 @@ impl Connector for Ibkr {
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
         let adapter = start_ibkr(env, creds, &deps.stream_health, deps.engine.clone())
             .ok_or_else(|| "IBKR FIX session could not start".to_string())?;
-        Ok(Connected { adapter, exec_stream: None, daily_stats: None })
+        Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None })
     }
 
     fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {

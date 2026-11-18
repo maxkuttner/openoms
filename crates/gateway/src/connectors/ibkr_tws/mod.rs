@@ -66,6 +66,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: false,
     price_band_exempt: true,
     per_currency_notional: true,
+    multi_account: true,
 };
 
 impl Connector for IbkrTws {
@@ -82,6 +83,7 @@ impl Connector for IbkrTws {
         let adapter = Arc::new(adapter::IbkrTwsAdapter::new(slot.clone()));
         let stream_adapter = adapter.clone();
         Ok(Connected {
+            source: None,
             daily_stats: Some(adapter.clone()),
             adapter,
             exec_stream: Some(Arc::new(move |health, engine| {

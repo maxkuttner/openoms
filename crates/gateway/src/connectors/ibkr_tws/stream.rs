@@ -586,6 +586,7 @@ mod tests {
             match m {
                 GatewayMsg::Exec(e) => execs.push(e),
                 GatewayMsg::Reconcile { .. } => recons += 1,
+                GatewayMsg::Venue { .. } => {}
             }
         }
         (execs, recons)

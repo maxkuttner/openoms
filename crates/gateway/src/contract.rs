@@ -14,6 +14,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::adapter::BrokerAdapter;
+use crate::venue_event::VenueEvent;
 
 /// Connectors wait (rather than drop) once this many messages are queued: a
 /// stalled engine slows the streams down, it never loses a fill.
@@ -79,6 +80,8 @@ pub enum GatewayMsg {
     /// Carries the adapter because the diff asks the broker about each order it
     /// resolves, not just for one snapshot.
     Reconcile { broker_code: &'static str, environment: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter> },
+    /// What a venue connection reported, by connection code.
+    Venue { connection: String, event: VenueEvent },
 }
 
 /// What a followed venue account (a co-located strategy's) did. The OMS did
@@ -138,6 +141,12 @@ impl EngineHandle {
         let order_id = ev.order_id;
         if self.0.send(GatewayMsg::Exec(ev)).await.is_err() {
             error!(order_id = %order_id, "order engine is gone; execution event not booked");
+        }
+    }
+
+    pub async fn venue(&self, connection: &str, event: VenueEvent) {
+        if self.0.send(GatewayMsg::Venue { connection: connection.to_string(), event }).await.is_err() {
+            error!(connection, "order engine is gone; venue event dropped");
         }
     }
 
