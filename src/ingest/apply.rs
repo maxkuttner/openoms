@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use gateway::adapter::InstrumentProvider;
-use gateway::venue_event::{VenueEvent, VenueOrderStatus, VenueOrderUpdate};
+use gateway::venue_event::{VenueEvent, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
 use super::adopt;
 use super::decide::{decide, BreakKind, ConnPolicy, Decision, KnownOrder, Lookup, Policy, Rule};
@@ -100,6 +100,31 @@ pub async fn ingest(
     event: VenueEvent,
     instruments: Option<&dyn InstrumentProvider>,
 ) -> Result<Ingested, IngestError> {
+    ingest_as(pool, bus, connection, event, instruments, None).await
+}
+
+/// `ingest`, with an unknown order adopted into `portfolio` whatever the
+/// connection's policy, rules and open breaks say: how a person resolves a
+/// break. Events of orders the OMS already has apply as usual.
+pub async fn ingest_with_portfolio(
+    pool: &PgPool,
+    bus: &EventBus,
+    connection: &str,
+    event: VenueEvent,
+    instruments: Option<&dyn InstrumentProvider>,
+    portfolio: Uuid,
+) -> Result<Ingested, IngestError> {
+    ingest_as(pool, bus, connection, event, instruments, Some(portfolio)).await
+}
+
+async fn ingest_as(
+    pool: &PgPool,
+    bus: &EventBus,
+    connection: &str,
+    event: VenueEvent,
+    instruments: Option<&dyn InstrumentProvider>,
+    forced: Option<Uuid>,
+) -> Result<Ingested, IngestError> {
     let account_ref = match &event {
         VenueEvent::Fill(f) => f.account_ref.clone(),
         VenueEvent::Order(o) => o.account_ref.clone(),
@@ -111,10 +136,13 @@ pub async fn ingest(
         VenueEvent::Connected | VenueEvent::Disconnected => return Ok(Ingested::plain(Decision::Ignore)),
     };
     let account = resolve_account(pool, connection, &account_ref).await?;
-    let policy = load_policy(pool, connection).await?;
+    let policy = match forced {
+        Some(portfolio) => ConnPolicy { policy: Policy::Adopt, default_portfolio: Some(portfolio), rules: Vec::new() },
+        None => load_policy(pool, connection).await?,
+    };
     let broker = broker_code(pool, connection).await?;
     for attempt in 1..=MAX_ATTEMPTS {
-        match attempt_once(pool, connection, &broker, account, &event, &policy, instruments).await? {
+        match attempt_once(pool, connection, &broker, account, &event, &policy, instruments, forced.is_some()).await? {
             Attempt::Done(decision, booked) => {
                 if let Some(b) = booked {
                     publish(bus, &b);
@@ -294,6 +322,7 @@ pub async fn load_lookup(
     Ok(Lookup { by_client_uuid, by_venue_id, fill_seen, open_break })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn attempt_once(
     pool: &PgPool,
     connection: &str,
@@ -302,6 +331,7 @@ async fn attempt_once(
     event: &VenueEvent,
     policy: &ConnPolicy,
     instruments: Option<&dyn InstrumentProvider>,
+    forced: bool,
 ) -> Result<Attempt, IngestError> {
     let (venue_order_id, _, _) = ids(event);
     let mut tx = pool.begin().await?;
@@ -310,7 +340,11 @@ async fn attempt_once(
         .bind(format!("venue-order/{connection}/{account}/{venue_order_id}"))
         .execute(&mut *tx)
         .await?;
-    let lookup = load_lookup(&mut tx, connection, account, event).await?;
+    let mut lookup = load_lookup(&mut tx, connection, account, event).await?;
+    if forced {
+        // the open break being resolved must not swallow its own events
+        lookup.open_break = false;
+    }
     let decision = decide(event, account, &lookup, policy);
     debug!(connection, venue_order_id, ?decision, "ingest: decided");
     let ctx = Ctx { pool, connection, broker, account };
@@ -668,10 +702,72 @@ fn event_json(event: &VenueEvent) -> serde_json::Value {
         VenueEvent::Order(o) => json!({
             "type": "order", "venue_order_id": o.venue_order_id, "client_order_id": o.client_order_id,
             "account_ref": o.account_ref, "symbol": o.symbol, "buy": o.buy, "order_type": o.order_type,
-            "qty": o.qty, "limit_px": o.limit_px, "status": format!("{:?}", o.status), "cum_qty": o.cum_qty,
-            "ts": o.ts,
+            "qty": o.qty, "limit_px": o.limit_px, "status": status_name(&o.status),
+            "reject_reason": match &o.status { VenueOrderStatus::Rejected { reason } => Some(reason.as_str()), _ => None },
+            "cum_qty": o.cum_qty, "ts": o.ts,
         }),
         _ => json!({}),
+    }
+}
+
+fn status_name(status: &VenueOrderStatus) -> &'static str {
+    match status {
+        VenueOrderStatus::Working => "working",
+        VenueOrderStatus::Filled => "filled",
+        VenueOrderStatus::Canceled => "canceled",
+        VenueOrderStatus::Rejected { .. } => "rejected",
+        VenueOrderStatus::Expired => "expired",
+    }
+}
+
+/// The event a break stored (`event_json`), for replay; `None` when it is not
+/// one a break holds.
+pub fn event_from_json(v: &serde_json::Value) -> Option<VenueEvent> {
+    let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let num = |k: &str| v.get(k).and_then(|x| x.as_f64());
+    let time = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    match v.get("type")?.as_str()? {
+        "fill" => Some(VenueEvent::Fill(VenueFill {
+            exec_id: text("exec_id")?,
+            venue_order_id: text("venue_order_id")?,
+            client_order_id: text("client_order_id"),
+            account_ref: text("account_ref")?,
+            symbol: text("symbol")?,
+            buy: v.get("buy")?.as_bool()?,
+            qty: num("qty")?,
+            price: num("price")?,
+            fee: v
+                .get("fee")
+                .filter(|f| !f.is_null())
+                .and_then(|f| Some((f.get("amount")?.as_f64()?, f.get("currency")?.as_str()?.to_string()))),
+            executed_at: time("executed_at"),
+        })),
+        "order" => Some(VenueEvent::Order(VenueOrderUpdate {
+            venue_order_id: text("venue_order_id")?,
+            client_order_id: text("client_order_id"),
+            account_ref: text("account_ref")?,
+            symbol: text("symbol")?,
+            buy: v.get("buy")?.as_bool()?,
+            order_type: text("order_type")?,
+            qty: num("qty")?,
+            limit_px: num("limit_px"),
+            status: match v.get("status")?.as_str()? {
+                "working" => VenueOrderStatus::Working,
+                "filled" => VenueOrderStatus::Filled,
+                "canceled" => VenueOrderStatus::Canceled,
+                "expired" => VenueOrderStatus::Expired,
+                "rejected" => VenueOrderStatus::Rejected { reason: text("reject_reason").unwrap_or_default() },
+                _ => return None,
+            },
+            cum_qty: num("cum_qty")?,
+            ts: time("ts"),
+        })),
+        _ => None,
     }
 }
 

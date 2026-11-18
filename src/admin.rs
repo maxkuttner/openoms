@@ -466,8 +466,8 @@ pub async fn create_broker_connection(
 
 /// The venues a broker connection can point at, with their credential fields:
 /// the cockpit builds its create form and credentials drawer from this.
-pub async fn list_venues() -> Json<Vec<gateway::venue::Venue>> {
-    Json(crate::venues::venues())
+pub async fn list_venues() -> Json<Vec<crate::venues::VenueListing>> {
+    Json(crate::venues::venue_listing())
 }
 
 /// Live health of the broker/exchange WebSocket streams (in-memory, ephemeral).
@@ -2286,6 +2286,11 @@ pub struct AdminError {
 impl AdminError {
     pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self { status, message: message.into() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
     }
 
     pub(crate) fn not_found(resource: &str) -> Self {

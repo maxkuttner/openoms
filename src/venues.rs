@@ -21,6 +21,27 @@ pub fn environment_allowed(broker_code: &str, environment: &str) -> bool {
         .is_some_and(|v| v.environments.iter().any(|e| e.code == environment))
 }
 
+/// A venue as `GET /admin/venues` lists it: its connector's entry plus what the
+/// cockpit needs to know about its accounts.
+#[derive(serde::Serialize)]
+pub struct VenueListing {
+    #[serde(flatten)]
+    pub venue: Venue,
+    /// One credential reaches several venue accounts (IBKR): the cockpit offers
+    /// per-account attribution rules for it.
+    pub multi_account: bool,
+}
+
+pub fn venue_listing() -> Vec<VenueListing> {
+    gateway::connectors::all()
+        .iter()
+        .map(|c| {
+            let m = c.manifest();
+            VenueListing { venue: (m.venue)(), multi_account: m.multi_account }
+        })
+        .collect()
+}
+
 pub fn venues() -> Vec<Venue> {
     gateway::connectors::all().iter().map(|c| (c.manifest().venue)()).collect()
 }

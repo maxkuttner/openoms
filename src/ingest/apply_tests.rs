@@ -313,3 +313,30 @@ async fn fee_on_redelivered_fill_is_booked_once_even_if_first_attempt_missed_it(
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
     assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 1);
 }
+
+#[test]
+fn events_round_trip_through_a_break() {
+    let at = Some(chrono::DateTime::parse_from_rfc3339("2026-11-18T10:00:00Z").unwrap().with_timezone(&chrono::Utc));
+    let mut f = fill("e1", "v1", Some("c-1"), 1.5);
+    if let VenueEvent::Fill(x) = &mut f {
+        x.fee = Some((0.25, "USDT".into()));
+        x.executed_at = at;
+    }
+    let mut o = order("v1", 5.0, 1.5, VenueOrderStatus::Rejected { reason: "nope".into() });
+    if let VenueEvent::Order(x) = &mut o {
+        x.ts = at;
+    }
+    let all = [
+        f,
+        o,
+        order("v1", 5.0, 0.0, VenueOrderStatus::Working),
+        order("v1", 5.0, 5.0, VenueOrderStatus::Filled),
+        order("v1", 5.0, 0.0, VenueOrderStatus::Canceled),
+        order("v1", 5.0, 0.0, VenueOrderStatus::Expired),
+    ];
+    for event in all {
+        let json = super::event_json(&event);
+        assert_eq!(super::event_from_json(&json), Some(event), "{json}");
+    }
+    assert_eq!(super::event_from_json(&serde_json::json!({"type": "mystery"})), None);
+}

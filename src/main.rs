@@ -13,6 +13,7 @@ mod positions;
 mod fees;
 mod ingest;
 mod reconciler;
+mod recon_admin_api;
 mod symbology_resolver;
 mod setup;
 mod sessions;
@@ -1032,6 +1033,22 @@ fn build_app(
         .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
         .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
         .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
+        .route(
+            "/admin/broker-connections/:code/recon",
+            axum::routing::patch(recon_admin_api::patch_recon),
+        )
+        .route(
+            "/admin/broker-connections/:code/attribution-rules",
+            get(recon_admin_api::list_rules).post(recon_admin_api::create_rule),
+        )
+        .route(
+            "/admin/broker-connections/:code/attribution-rules/:id",
+            axum::routing::put(recon_admin_api::update_rule).delete(recon_admin_api::delete_rule),
+        )
+        .route("/admin/broker-connections/:code/sweep", post(recon_admin_api::sweep))
+        .route("/admin/recon-breaks", get(recon_admin_api::list_breaks))
+        .route("/admin/recon-breaks/:id/adopt", post(recon_admin_api::adopt_break))
+        .route("/admin/recon-breaks/:id/dismiss", post(recon_admin_api::dismiss_break))
         .route("/admin/jobs", get(jobs::api::list_jobs))
         .route("/admin/jobs/:id", get(jobs::api::get_job))
         .route("/admin/feed-connections", get(admin::list_feed_connections))
