@@ -12,6 +12,7 @@ mod risk_engine;
 mod positions;
 mod fees;
 mod recon_orders;
+mod ingest;
 mod symbology_resolver;
 mod setup;
 mod sessions;
