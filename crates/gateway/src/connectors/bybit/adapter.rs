@@ -19,7 +19,10 @@ use hmac::{Hmac, Mac};
 use reqwest::Client;
 use sha2::Sha256;
 
-use tracing::info;
+use chrono::{DateTime, TimeZone, Utc};
+use tracing::{info, warn};
+
+use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
 use crate::adapter::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
 use crate::md::daily_stats::DailyStats;
@@ -128,6 +131,9 @@ async fn read(resp: Result<reqwest::Response, reqwest::Error>) -> Result<serde_j
     let resp = resp.map_err(|e| BrokerError::Network(e.to_string()))?;
     let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+    if status == 429 || status >= 500 {
+        return Err(crate::adapter::http_failure(status, text));
+    }
     parse_body(status, &text)
 }
 
@@ -321,6 +327,235 @@ pub(crate) fn parse_prev_prices(result: &serde_json::Value, wanted: &[String]) -
         .collect()
 }
 
+/// Quote coins Bybit spot lists; the base is what precedes the quote in the
+/// symbol (a pushed execution has no instrument lookup).
+const QUOTES: &[&str] = &["USDT", "USDC", "USDE", "FDUSD", "DAI", "EUR", "BRL", "TRY", "BTC", "ETH", "MNT"];
+
+fn base_quote(symbol: &str) -> Option<(&str, &str)> {
+    QUOTES.iter().filter_map(|q| symbol.strip_suffix(q).filter(|b| !b.is_empty()).map(|b| (b, *q))).next()
+}
+
+/// The fee of one execution row, the same from the stream and from
+/// `/v5/execution/list`. `execFee` is positive when charged and negative for a
+/// maker rebate, the OMS sign. Its currency is `feeCurrency` when the row has
+/// it; otherwise Bybit spot's rule, a buy pays in the base coin and a sell in
+/// the quote coin. A zero fee is none.
+pub(crate) fn fee_of(d: &serde_json::Value, exec_id: &str) -> Option<(f64, String)> {
+    let amount: f64 = d["execFee"].as_str()?.parse().ok()?;
+    if amount == 0.0 {
+        return None;
+    }
+    let currency = match d["feeCurrency"].as_str().filter(|c| !c.is_empty()) {
+        Some(c) => c.to_string(),
+        None => {
+            let symbol = d["symbol"].as_str().unwrap_or("");
+            let side = d["side"].as_str().unwrap_or("");
+            match base_quote(symbol).map(|(base, quote)| if side == "Buy" { base } else { quote }.to_string()) {
+                Some(c) => c,
+                None => {
+                    warn!(%symbol, %exec_id, fee = amount, "Bybit: fee currency unresolved, fee not booked");
+                    return None;
+                }
+            }
+        }
+    };
+    Some((amount, currency))
+}
+
+fn time_ms(v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    v.as_str().and_then(|s| s.parse::<i64>().ok()).and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+}
+
+/// One execution row (private `execution` push or `/v5/execution/list`) as a
+/// fill. `Err` names what is missing; rows that are not trades (`execType`
+/// other than `Trade`) are `Ok(None)`.
+pub(crate) fn fill_from_row(d: &serde_json::Value, account_ref: &str) -> Result<Option<VenueFill>, &'static str> {
+    if d["execType"].as_str() != Some("Trade") {
+        return Ok(None);
+    }
+    let exec_id = d["execId"].as_str().filter(|e| !e.is_empty()).ok_or("execId")?;
+    let venue_order_id = d["orderId"].as_str().filter(|e| !e.is_empty()).ok_or("orderId")?;
+    let qty = num(&d["execQty"]).ok_or("execQty")?;
+    let price = num(&d["execPrice"]).ok_or("execPrice")?;
+    let buy = match d["side"].as_str() {
+        Some("Buy") => true,
+        Some("Sell") => false,
+        _ => return Err("side"),
+    };
+    Ok(Some(VenueFill {
+        exec_id: exec_id.to_string(),
+        venue_order_id: venue_order_id.to_string(),
+        client_order_id: d["orderLinkId"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
+        account_ref: account_ref.to_string(),
+        symbol: d["symbol"].as_str().unwrap_or("").to_string(),
+        buy,
+        qty,
+        price,
+        fee: fee_of(d, exec_id),
+        executed_at: time_ms(&d["execTime"]),
+    }))
+}
+
+/// `orderStatus` as the venue's view of an order; `None` for a status the OMS
+/// does not know (the caller warns).
+pub(crate) fn venue_status(d: &serde_json::Value) -> Option<VenueOrderStatus> {
+    Some(match d["orderStatus"].as_str()? {
+        "New" | "PartiallyFilled" | "Untriggered" => VenueOrderStatus::Working,
+        "Filled" => VenueOrderStatus::Filled,
+        "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => VenueOrderStatus::Canceled,
+        "Rejected" => VenueOrderStatus::Rejected {
+            reason: d["rejectReason"].as_str().filter(|r| !r.is_empty() && *r != "EC_NoError").unwrap_or("Rejected").to_string(),
+        },
+        _ => return None,
+    })
+}
+
+/// One order row (private `order` push or `/v5/order/realtime`) as the venue's
+/// view of the order.
+pub(crate) fn order_update_from_row(d: &serde_json::Value, account_ref: &str) -> Option<VenueOrderUpdate> {
+    let order_type = d["orderType"].as_str().unwrap_or("").to_string();
+    Some(VenueOrderUpdate {
+        venue_order_id: d["orderId"].as_str().filter(|i| !i.is_empty())?.to_string(),
+        client_order_id: d["orderLinkId"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
+        account_ref: account_ref.to_string(),
+        symbol: d["symbol"].as_str().unwrap_or("").to_string(),
+        buy: d["side"].as_str() == Some("Buy"),
+        limit_px: if order_type == "Market" { None } else { num(&d["price"]).filter(|p| *p != 0.0) },
+        order_type,
+        qty: num(&d["qty"]).unwrap_or(0.0),
+        status: venue_status(d)?,
+        cum_qty: num(&d["cumExecQty"]).unwrap_or(0.0),
+        ts: time_ms(&d["updatedTime"]),
+    })
+}
+
+/// `/v5/order/realtime` rows as the venue's view of each open order.
+pub(crate) fn parse_open_order_snapshot(result: &serde_json::Value, account_ref: &str) -> Vec<VenueOrderUpdate> {
+    result["list"].as_array().into_iter().flatten().filter_map(|o| order_update_from_row(o, account_ref)).collect()
+}
+
+/// `/v5/execution/list` serves one window of at most 7 days per query, so the
+/// pull walks windows; the cursor is the window's start plus the venue's own
+/// page token (which only holds under the same window): `"{start_ms}:{token}"`.
+pub(crate) const WINDOW_MS: i64 = 7 * 86_400_000;
+/// Bybit serves two years of executions.
+const MAX_HISTORY_DAYS: i64 = 730;
+/// Where a pull that ended on its last window resumes: a margin before its
+/// newest row, so a late-indexed execution stamped a little earlier is still
+/// seen (re-reads are exec-id duplicates).
+pub(crate) const LATE_MARGIN_MS: i64 = 600_000;
+const EXECUTIONS_LIMIT: usize = 100;
+/// Most empty windows one call skips (two years of them).
+const MAX_EMPTY_HOPS: usize = 110;
+
+pub(crate) fn parse_cursor(from: Option<&Cursor>) -> Option<(i64, String)> {
+    let (start, token) = from?.0.split_once(':')?;
+    Some((start.parse().ok()?, token.to_string()))
+}
+
+fn format_cursor(start_ms: i64, token: &str) -> Cursor {
+    Cursor(format!("{start_ms}:{token}"))
+}
+
+/// Start of a scan with no cursor: `since`, but never before the venue's history.
+pub(crate) fn first_window_start(since: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    since.max(now - chrono::Duration::days(MAX_HISTORY_DAYS)).timestamp_millis()
+}
+
+pub(crate) struct ExecutionsPage {
+    pub page: PullPage,
+    /// Rows the venue returned, before any filtering.
+    pub raw_rows: usize,
+}
+
+/// One `/v5/execution/list` result as a pull page for the window starting at
+/// `start_ms`. Rows before `since` are dropped on every page; a row missing a
+/// field is warned about and skipped. `more` and the cursor come from the raw
+/// page: the venue's token while it has one, then the next window until `now`.
+pub(crate) fn executions_page(result: &serde_json::Value, account_ref: &str, since: DateTime<Utc>, start_ms: i64, now_ms: i64) -> ExecutionsPage {
+    let rows = result["list"].as_array().cloned().unwrap_or_default();
+    let mut fills = Vec::new();
+    for d in &rows {
+        match fill_from_row(d, account_ref) {
+            Ok(Some(f)) if f.executed_at.is_none_or(|at| at >= since) => fills.push(f),
+            Ok(_) => {}
+            Err(missing) => warn!(exec_id = d["execId"].as_str().unwrap_or(""), missing, "Bybit executions: row skipped"),
+        }
+    }
+    let token = result["nextPageCursor"].as_str().unwrap_or("");
+    let last_window = start_ms + WINDOW_MS >= now_ms;
+    let (next, more) = if !token.is_empty() {
+        (format_cursor(start_ms, token), true)
+    } else if !last_window {
+        (format_cursor(start_ms + WINDOW_MS, ""), true)
+    } else {
+        let newest = rows.iter().filter_map(|d| time_ms(&d["execTime"])).map(|t| t.timestamp_millis()).max();
+        (newest.map_or(Cursor(String::new()), |t| format_cursor((t - LATE_MARGIN_MS).max(start_ms), "")), false)
+    };
+    ExecutionsPage { page: PullPage { fills, next, more }, raw_rows: rows.len() }
+}
+
+#[async_trait::async_trait]
+impl ExecutionSource for BybitAdapter {
+    async fn fills_since(
+        &self,
+        account_ref: &str,
+        _scope: &str,
+        from: Option<&Cursor>,
+        since: DateTime<Utc>,
+    ) -> Result<PullPage, BrokerError> {
+        let now = Utc::now();
+        let (mut start_ms, mut token) = parse_cursor(from).unwrap_or_else(|| (first_window_start(since, now), String::new()));
+        for _ in 0..MAX_EMPTY_HOPS {
+            let end_ms = (start_ms + WINDOW_MS).min(now.timestamp_millis());
+            let mut query = format!("category=spot&limit={EXECUTIONS_LIMIT}&startTime={start_ms}&endTime={end_ms}");
+            if !token.is_empty() {
+                query.push_str(&format!("&cursor={token}"));
+            }
+            let result = self.get("/v5/execution/list", &query, true).await?;
+            let page = executions_page(&result, account_ref, since, start_ms, now.timestamp_millis());
+            // An empty window in the middle of history: try the next one rather than
+            // hand the reconciler an empty page with more to come.
+            if page.raw_rows == 0 && page.page.more {
+                if let Some((next_start, _)) = parse_cursor(Some(&page.page.next)) {
+                    start_ms = next_start;
+                    token = String::new();
+                    continue;
+                }
+            }
+            return Ok(page.page);
+        }
+        // Two years of empty windows walked: nothing to report, and nothing to resume.
+        Ok(PullPage { fills: Vec::new(), next: Cursor(String::new()), more: false })
+    }
+
+    /// `GET /v5/order/realtime`: every open spot order, following the page cursor.
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        let mut out = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let mut query = "category=spot&limit=50&openOnly=0".to_string();
+            if !cursor.is_empty() {
+                query.push_str(&format!("&cursor={cursor}"));
+            }
+            let result = self.get("/v5/order/realtime", &query, true).await?;
+            out.extend(parse_open_order_snapshot(&result, account_ref));
+            cursor = result["nextPageCursor"].as_str().unwrap_or("").to_string();
+            if cursor.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+
+    async fn scopes(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(vec![String::new()])
+    }
+
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 60, max_history: Some(chrono::Duration::days(MAX_HISTORY_DAYS)), per_symbol: false }
+    }
+}
+
 #[async_trait::async_trait]
 impl BrokerAdapter for BybitAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
@@ -394,6 +629,7 @@ impl InstrumentProvider for BybitAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::venue_event::VenueEvent as VEvent;
 
     #[test]
     fn a_server_timeout_or_unreadable_answer_is_not_a_rejection() {
@@ -556,5 +792,112 @@ mod tests {
         assert!(btc.is_tradeable);
         // A pair whose status is not "Trading" is listed but not tradeable.
         assert!(!list.iter().find(|i| i.broker_symbol == "HALTUSDT").unwrap().is_tradeable);
+    }
+
+    // --- execution pull ---
+
+    fn exec_list() -> serde_json::Value {
+        envelope(serde_json::from_str(include_str!("testdata/execution_list.json")).unwrap()).unwrap()
+    }
+
+    const T0: i64 = 1_700_000_000_000;
+
+    fn ms(v: i64) -> DateTime<Utc> {
+        Utc.timestamp_millis_opt(v).unwrap()
+    }
+
+    #[test]
+    fn bybit_fill_without_oms_id_is_kept() {
+        let page = executions_page(&exec_list(), "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000);
+        // The second row was placed in the Bybit app: no orderLinkId, still a fill.
+        let f = page.page.fills.iter().find(|f| f.exec_id == "2100000000007764999").expect("kept");
+        assert_eq!(f.client_order_id, None);
+        assert_eq!((f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("1820000000000000009", "BTCUSDT", false, 0.002, 65010.0));
+    }
+
+    #[test]
+    fn bybit_pull_page_maps_and_cursors() {
+        let page = executions_page(&exec_list(), "acct", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
+        // The third row has no execQty: skipped (and warned), the other two map.
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["2100000000007764263", "2100000000007764999"]);
+        let f = &page.fills[0];
+        assert_eq!(f.account_ref, "acct");
+        assert_eq!(f.client_order_id.as_deref(), Some("3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b"));
+        assert_eq!(f.fee, Some((0.000001, "BTC".to_string())));
+        assert_eq!(f.executed_at, Some(ms(T0)));
+        assert_eq!(page.fills[1].fee, Some((-0.01, "USDT".to_string())), "a maker rebate stays negative");
+        // The venue's own token continues the page, tied to its window start.
+        assert_eq!(page.next, Cursor(format!("{T0}:page2tokenabc%3A1700000100000%2C1")));
+        assert!(page.more);
+    }
+
+    #[test]
+    fn a_window_with_no_token_hops_to_the_next_window_or_ends_at_now() {
+        let mut result = exec_list();
+        result["nextPageCursor"] = serde_json::json!("");
+        // Window 1 of several: the next call starts where this window ended.
+        let mid = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0, T0 + 3 * WINDOW_MS).page;
+        assert_eq!((mid.next, mid.more), (Cursor(format!("{}:", T0 + WINDOW_MS)), true));
+        // The last window: resume a margin before the newest row (never before the window start).
+        let last = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
+        assert_eq!((last.next, last.more), (Cursor(format!("{T0}:")), false));
+        let late = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0 - 2 * LATE_MARGIN_MS, T0 + 1000).page;
+        assert_eq!(late.next, Cursor(format!("{}:", T0 + 60_000 - LATE_MARGIN_MS)));
+        // An empty window moves nothing and says so.
+        let empty = serde_json::json!({ "list": [], "nextPageCursor": "" });
+        let p = executions_page(&empty, "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
+        assert_eq!((p.next, p.more, p.fills.len()), (Cursor(String::new()), false, 0));
+    }
+
+    #[test]
+    fn since_filters_every_page_and_the_cursor_still_moves() {
+        let page = executions_page(&exec_list(), "", ms(T0 + 40_000), T0, T0 + 1000).page;
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["2100000000007764999"]);
+        assert!(page.more, "from the raw page, not the filtered count");
+    }
+
+    #[test]
+    fn the_cursor_names_its_window_and_the_first_window_is_capped_at_two_years() {
+        assert_eq!(parse_cursor(Some(&Cursor(format!("{T0}:abc%3A1")))), Some((T0, "abc%3A1".to_string())));
+        assert_eq!(parse_cursor(Some(&Cursor(format!("{T0}:")))), Some((T0, String::new())));
+        assert_eq!(parse_cursor(None), None);
+        let now = ms(T0 * 2);
+        assert_eq!(first_window_start(DateTime::<Utc>::MIN_UTC, now), T0 * 2 - 730 * 86_400_000);
+        assert_eq!(first_window_start(ms(T0 * 2 - 1000), now), T0 * 2 - 1000);
+    }
+
+    #[test]
+    fn bybit_stream_and_pull_produce_the_same_exec_id_for_one_fill() {
+        let msg: serde_json::Value = serde_json::from_str(include_str!("testdata/ws_execution.json")).unwrap();
+        let VEvent::Fill(s) = &crate::connectors::bybit::stream::venue_events(&msg)[0] else { panic!("a fill") };
+        let row = serde_json::json!({ "execId": "2100000000007764263", "orderId": "1820000000000000002", "symbol": "BTCUSDT", "side": "Buy",
+            "execQty": "0.001", "execPrice": "65000", "execType": "Trade", "execTime": "1700000000000", "execFee": "0.000001", "feeCurrency": "BTC" });
+        let p = executions_page(&serde_json::json!({ "list": [row], "nextPageCursor": "" }), "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
+        assert_eq!(s.exec_id, p.fills[0].exec_id);
+        assert_eq!(s.exec_id, "2100000000007764263");
+        assert_eq!(s.fee, p.fills[0].fee, "the fee is the same too: one helper for both paths");
+    }
+
+    #[test]
+    fn fee_currency_is_quote_on_sell_base_on_buy_and_fee_currency_wins() {
+        let fee = |v: serde_json::Value| fee_of(&v, "x");
+        assert_eq!(fee(serde_json::json!({"symbol": "BTCUSDT", "side": "Sell", "execFee": "0.065"})), Some((0.065, "USDT".to_string())));
+        assert_eq!(fee(serde_json::json!({"symbol": "BTCUSDT", "side": "Buy", "execFee": "0.5", "feeCurrency": "MNT"})), Some((0.5, "MNT".to_string())));
+        assert_eq!(fee(serde_json::json!({"symbol": "BTCUSDT", "side": "Buy", "execFee": "0.5"})), Some((0.5, "BTC".to_string())));
+        assert_eq!(fee(serde_json::json!({"symbol": "BTCUSDT", "side": "Buy", "execFee": "0"})), None);
+        assert_eq!(fee(serde_json::json!({"symbol": "FOOBAR", "side": "Buy", "execFee": "0.5"})), None);
+    }
+
+    #[test]
+    fn open_order_snapshot_maps_working_orders_and_hints_are_two_years() {
+        let snap = parse_open_order_snapshot(&sample("open_orders"), "acct");
+        assert_eq!(snap.len(), 1);
+        let o = &snap[0];
+        assert_eq!((o.venue_order_id.as_str(), o.account_ref.as_str(), o.buy, o.qty, o.limit_px, o.cum_qty), ("1820000000000000001", "acct", true, 0.001, Some(30000.0), 0.0005));
+        assert_eq!(o.status, VenueOrderStatus::Working);
+        assert_eq!(
+            ExecutionSource::hints(&BybitAdapter::new("k".into(), "s".into(), "PAPER")),
+            PullHints { intraday_secs: 60, max_history: Some(chrono::Duration::days(730)), per_symbol: false }
+        );
     }
 }

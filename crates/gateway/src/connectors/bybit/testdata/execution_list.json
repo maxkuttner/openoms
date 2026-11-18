@@ -1,0 +1,5 @@
+{"retCode":0,"retMsg":"OK","result":{"category":"spot","nextPageCursor":"page2tokenabc%3A1700000100000%2C1","list":[
+ {"symbol":"BTCUSDT","orderType":"Market","orderLinkId":"3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b","orderId":"1820000000000000002","execTime":"1700000000000","feeCurrency":"BTC","feeRate":"0.001","execPrice":"65000","orderQty":"0.001","orderPrice":"","execValue":"65","execType":"Trade","side":"Buy","leavesQty":"0","isMaker":false,"execFee":"0.000001","execQty":"0.001","execId":"2100000000007764263"},
+ {"symbol":"BTCUSDT","orderType":"Limit","orderLinkId":"","orderId":"1820000000000000009","execTime":"1700000050000","feeCurrency":"USDT","execPrice":"65010","orderQty":"0.002","orderPrice":"65010","execType":"Trade","side":"Sell","isMaker":true,"execFee":"-0.01","execQty":"0.002","execId":"2100000000007764999","leavesQty":"0"},
+ {"symbol":"BTCUSDT","orderId":"1820000000000000010","execTime":"1700000060000","execPrice":"65000","execType":"Trade","side":"Buy","execFee":"0","execId":"2100000000007765000"}
+]},"retExtInfo":{},"time":1700000100000}
