@@ -1,8 +1,7 @@
 //! Co-located strategies (path ②): they trade their venue directly; the OMS
-//! follows their account, books their fills, controls them over the control
-//! link and can kill them without their help.
+//! follows their account (its fills book through ingest, see `follow`),
+//! controls them over the control link and can kill them without their help.
 
-pub mod booking;
 pub mod control;
 pub mod deployment;
 pub mod follow;
@@ -21,7 +20,7 @@ use tracing::{error, info, warn};
 use gateway::connectors::binance::adapter::BinanceAdapter;
 use colo_link::proto::{FromStrategy, ToStrategy};
 use colo_link::v2::{FromRuntimeEnvelope, ToRuntime, ToRuntimeEnvelope, PROTOCOL_VERSION};
-use gateway::contract::{FollowEvent, FollowHandle};
+use gateway::venue_event::{VenueEvent, VenueOrderStatus};
 
 use crate::app_state::AppState;
 
@@ -33,6 +32,16 @@ pub struct OpenOrder {
     pub buy: bool,
     pub qty: f64,
     pub price: f64,
+}
+
+/// What one venue event on a followed account means to the co-located
+/// runtime: an order appeared, one closed, or a fill.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccountEvent {
+    Opened { venue_order_id: String, symbol: String },
+    /// `"canceled"`, `"rejected"`, `"expired"` or `"filled"`.
+    Closed { venue_order_id: String, outcome: &'static str },
+    Filled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,8 +56,6 @@ enum Flow {
 pub struct Runtime {
     pub open: HashMap<String, OpenOrder>,
     flow: VecDeque<(Instant, Flow)>,
-    /// Every pair seen on the account, for gap recon.
-    pub seen_symbols: std::collections::BTreeSet<String>,
 }
 
 /// Placed / cancelled / rejected orders in the last minute.
@@ -60,33 +67,53 @@ pub struct FlowCounts {
 }
 
 impl Runtime {
-    /// Track the open set and the order flow from one follow event.
-    pub fn apply(&mut self, event: &FollowEvent, now: Instant) {
-        match event {
-            FollowEvent::Opened { venue_order_id, client_order_id, symbol, buy, qty, price } => {
-                self.seen_symbols.insert(symbol.clone());
-                self.open.insert(
-                    venue_order_id.clone(),
-                    OpenOrder { client_order_id: client_order_id.clone(), symbol: symbol.clone(), buy: *buy, qty: *qty, price: *price },
-                );
-                self.flow.push_back((now, Flow::Placed));
-            }
-            FollowEvent::Closed { venue_order_id, outcome } => {
-                self.open.remove(venue_order_id);
-                match *outcome {
-                    "canceled" | "expired" => self.flow.push_back((now, Flow::Cancelled)),
-                    "rejected" => self.flow.push_back((now, Flow::Rejected)),
-                    _ => {}
+    /// Track the open set and the order flow from one venue event on the
+    /// account; what it meant, if anything. An order is placed the first
+    /// time it is seen working.
+    pub fn apply(&mut self, event: &VenueEvent, now: Instant) -> Option<AccountEvent> {
+        let meant = match event {
+            VenueEvent::Order(o) => {
+                let outcome = match &o.status {
+                    VenueOrderStatus::Working => None,
+                    VenueOrderStatus::Filled => Some("filled"),
+                    VenueOrderStatus::Canceled => Some("canceled"),
+                    VenueOrderStatus::Expired => Some("expired"),
+                    VenueOrderStatus::Rejected { .. } => Some("rejected"),
+                };
+                match outcome {
+                    None if self.open.contains_key(&o.venue_order_id) => None,
+                    None => {
+                        self.open.insert(
+                            o.venue_order_id.clone(),
+                            OpenOrder {
+                                client_order_id: o.client_order_id.clone().unwrap_or_default(),
+                                symbol: o.symbol.clone(),
+                                buy: o.buy,
+                                qty: o.qty,
+                                price: o.limit_px.unwrap_or(0.0),
+                            },
+                        );
+                        self.flow.push_back((now, Flow::Placed));
+                        Some(AccountEvent::Opened { venue_order_id: o.venue_order_id.clone(), symbol: o.symbol.clone() })
+                    }
+                    Some(outcome) => {
+                        self.open.remove(&o.venue_order_id);
+                        match outcome {
+                            "canceled" | "expired" => self.flow.push_back((now, Flow::Cancelled)),
+                            "rejected" => self.flow.push_back((now, Flow::Rejected)),
+                            _ => {}
+                        }
+                        Some(AccountEvent::Closed { venue_order_id: o.venue_order_id.clone(), outcome })
+                    }
                 }
             }
-            FollowEvent::Fill(fill) => {
-                self.seen_symbols.insert(fill.symbol.clone());
-            }
-            FollowEvent::Connected => {}
-        }
+            VenueEvent::Fill(_) => Some(AccountEvent::Filled),
+            VenueEvent::Fee { .. } | VenueEvent::Connected | VenueEvent::Disconnected => None,
+        };
         while self.flow.front().is_some_and(|(t, _)| now.duration_since(*t) > Duration::from_secs(60)) {
             self.flow.pop_front();
         }
+        meant
     }
 
     /// Orders placed within `window` of now.
@@ -157,8 +184,8 @@ pub struct LinkStatus {
 /// streams report to. Cheap to clone.
 #[derive(Clone)]
 pub struct ColoHub {
-    follow: FollowHandle,
-    rx: Arc<Mutex<Option<mpsc::Receiver<(String, FollowEvent)>>>>,
+    follow: mpsc::Sender<(String, VenueEvent)>,
+    rx: Arc<Mutex<Option<mpsc::Receiver<(String, VenueEvent)>>>>,
     pub(crate) runtimes: Arc<Mutex<HashMap<String, Runtime>>>,
     pub(crate) adapters: Arc<Mutex<HashMap<String, Arc<BinanceAdapter>>>>,
     /// Strategies whose account is followed, with their follow key's fingerprint.
@@ -198,7 +225,7 @@ impl Default for ColoHub {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel(4096);
         Self {
-            follow: FollowHandle(tx),
+            follow: tx,
             rx: Arc::new(Mutex::new(Some(rx))),
             runtimes: Arc::default(),
             adapters: Arc::default(),
@@ -219,8 +246,11 @@ impl Default for ColoHub {
 }
 
 impl ColoHub {
-    pub fn follow_handle(&self) -> FollowHandle {
-        self.follow.clone()
+    /// What a strategy's follow stream saw on its account.
+    pub(crate) async fn observe(&self, code: &str, event: VenueEvent) {
+        if self.follow.send((code.to_string(), event)).await.is_err() {
+            error!(strategy = code, "co-located: follow sink is gone; event dropped");
+        }
     }
 
     /// Register the deployment's control socket. Bootstrap was already sent
@@ -414,36 +444,31 @@ impl ColoHub {
         let Some(mut rx) = self.rx.lock().unwrap().take() else { return };
         let mut workers = Workers::default();
         while let Some((code, event)) = rx.recv().await {
-            self.runtimes.lock().unwrap().entry(code.clone()).or_default().apply(&event, Instant::now());
-            workers.send(&code, event, |code, events| {
+            let meant = self.runtimes.lock().unwrap().entry(code.clone()).or_default().apply(&event, Instant::now());
+            workers.send(&code, (meant, event), |code, events| {
                 tokio::spawn(self.clone().work(state.clone(), code.to_string(), events));
             });
         }
         info!("co-located: follow sink closed");
     }
 
-    /// One strategy's events, in order.
-    async fn work(self, state: AppState, code: String, mut events: mpsc::UnboundedReceiver<FollowEvent>) {
-        while let Some(event) = events.recv().await {
+    /// One strategy's events, in order: the kill fight and alarms, and the
+    /// colo trade ledger. Booking is the follow reconciler's (ingest).
+    async fn work(self, state: AppState, code: String, mut events: mpsc::UnboundedReceiver<(Option<AccountEvent>, VenueEvent)>) {
+        while let Some((meant, event)) = events.recv().await {
             let (Some(strategy), Some(adapter)) = (state.strategies().by_code(&code), self.adapter(&code)) else {
                 warn!(strategy = %code, "co-located: event for a strategy with no follow adapter");
                 continue;
             };
-            control::on_event(&state, &self, &strategy, &adapter, &event).await;
-            match event {
-                FollowEvent::Fill(fill) => {
-                    if let Ok(Some(identity)) = ingest::identity_for_strategy(state.pool(), &strategy.code).await {
-                        if let Err(e) = ingest::observe_external_fill(&state, &identity, &fill).await {
-                            warn!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not recorded in the durable ledger");
-                        }
+            if let Some(meant) = &meant {
+                control::on_event(&state, &self, &strategy, &adapter, meant).await;
+            }
+            if let VenueEvent::Fill(fill) = event {
+                if let Ok(Some(identity)) = ingest::identity_for_strategy(state.pool(), &strategy.code).await {
+                    if let Err(e) = ingest::observe_external_fill(&state, &identity, &fill).await {
+                        warn!(strategy = %code, trade = %fill.exec_id, error = %e, "co-located: fill not recorded in the durable ledger");
                     }
-                    match booking::book_fill(&state, &strategy, &adapter, &fill).await {
-                        Ok(_) => {}
-                        Err(e) => error!(strategy = %code, trade = %fill.trade_id, error = %e, "co-located: fill not booked; recon retries on the next reconnect"),
-                    }
-                },
-                FollowEvent::Connected => follow::fill_gap(&state, &self, &strategy, &adapter).await,
-                FollowEvent::Opened { .. } | FollowEvent::Closed { .. } => {}
+                }
             }
         }
     }
@@ -453,8 +478,20 @@ impl ColoHub {
 mod tests {
     use super::*;
 
-    fn opened(id: &str) -> FollowEvent {
-        FollowEvent::Opened { venue_order_id: id.into(), client_order_id: "mm1-q-1".into(), symbol: "BTCUSDT".into(), buy: true, qty: 1.0, price: 100.0 }
+    fn order(id: &str, status: VenueOrderStatus) -> VenueEvent {
+        VenueEvent::Order(gateway::venue_event::VenueOrderUpdate {
+            venue_order_id: id.into(),
+            client_order_id: Some("mm1-q-1".into()),
+            account_ref: "sub".into(),
+            symbol: "BTCUSDT".into(),
+            buy: true,
+            order_type: "LIMIT".into(),
+            qty: 1.0,
+            limit_px: Some(100.0),
+            status,
+            cum_qty: 0.0,
+            ts: None,
+        })
     }
 
     #[test]
@@ -483,9 +520,16 @@ mod tests {
     fn opened_and_closed_orders_track_the_open_set_and_counts() {
         let t0 = Instant::now();
         let mut r = Runtime::default();
-        r.apply(&opened("1"), t0);
-        r.apply(&opened("2"), t0);
-        r.apply(&FollowEvent::Closed { venue_order_id: "1".into(), outcome: "canceled" }, t0);
+        assert_eq!(
+            r.apply(&order("1", VenueOrderStatus::Working), t0),
+            Some(AccountEvent::Opened { venue_order_id: "1".into(), symbol: "BTCUSDT".into() })
+        );
+        r.apply(&order("2", VenueOrderStatus::Working), t0);
+        assert_eq!(r.apply(&order("2", VenueOrderStatus::Working), t0), None, "a partial fill is not a new order");
+        assert_eq!(
+            r.apply(&order("1", VenueOrderStatus::Canceled), t0),
+            Some(AccountEvent::Closed { venue_order_id: "1".into(), outcome: "canceled" })
+        );
         assert_eq!(r.open.len(), 1);
         assert_eq!(r.counts(t0), FlowCounts { placed: 2, cancelled: 1, rejected: 0 });
         assert_eq!(r.counts(t0 + Duration::from_secs(61)), FlowCounts::default());

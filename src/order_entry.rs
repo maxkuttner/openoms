@@ -9,7 +9,6 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use gateway::adapter::{BrokerError, BrokerOrderRequest};
-use gateway::contract::{ExecEvent, ExecKind, ExecSource};
 
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
@@ -432,17 +431,8 @@ fn venue_rules(broker_code: &str) -> risk::VenueRules {
     })
 }
 
-async fn book_reject(state: &AppState, order_id: Uuid, broker_code: &str, reason: String) {
-    state
-        .engine()
-        .exec(ExecEvent {
-            order_id,
-            venue: broker_code.to_string(),
-            actor: "oms",
-            source: ExecSource::Session,
-            kind: ExecKind::Rejected { reason },
-        })
-        .await;
+async fn book_reject(state: &AppState, order_id: Uuid, reason: String) {
+    state.engine().reject(order_id, reason, "oms").await;
 }
 
 /// What a cancel did: asked the broker (it confirms on the execution stream),
@@ -833,7 +823,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         Some(a) => a,
         None => {
             warn!(broker_code = %broker_code, environment = %environment, "no adapter registered — order rejected");
-            book_reject(state, order_id, &broker_code, format!("no adapter configured for {broker_code}/{environment}")).await;
+            book_reject(state, order_id, format!("no adapter configured for {broker_code}/{environment}")).await;
             return Err(ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: format!("no adapter configured for {broker_code}/{environment}"),
@@ -859,7 +849,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         Err(err) => match route_failure(&err) {
             RouteFailure::Rejected(msg) => {
                 warn!(broker_code = %broker_code, error = %msg, "broker rejected order");
-                book_reject(state, order_id, &broker_code, msg.clone()).await;
+                book_reject(state, order_id, msg.clone()).await;
                 return Err(ApiError {
                     status: StatusCode::BAD_GATEWAY,
                     message: format!("broker rejected order: {msg}"),

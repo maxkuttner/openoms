@@ -10,7 +10,7 @@ use tracing::{error, warn};
 use colo_link::proto::{Position, ToStrategy};
 use gateway::adapter::BrokerAdapter;
 use gateway::connectors::binance::adapter::BinanceAdapter;
-use gateway::contract::FollowEvent;
+use super::AccountEvent;
 
 use super::ColoHub;
 use crate::app_state::AppState;
@@ -49,9 +49,9 @@ pub fn kill_ack_late(kill: Option<(Instant, bool)>, now: Instant) -> bool {
     kill.is_some_and(|(sent, acked)| !acked && now.saturating_duration_since(sent) > ACK_KILL_WITHIN)
 }
 
-pub fn fight(killed: bool, event: &FollowEvent) -> Option<(String, String)> {
+pub fn fight(killed: bool, event: &AccountEvent) -> Option<(String, String)> {
     match event {
-        FollowEvent::Opened { venue_order_id, symbol, .. } if killed => Some((venue_order_id.clone(), symbol.clone())),
+        AccountEvent::Opened { venue_order_id, symbol } if killed => Some((venue_order_id.clone(), symbol.clone())),
         _ => None,
     }
 }
@@ -238,9 +238,9 @@ pub async fn enable(state: &AppState, strategy: &Strategy) {
     state.colo().push(&strategy.code, ToStrategy::Resume);
 }
 
-/// Per follow event: fight a killed strategy's new orders, and keep the
+/// Per account event: fight a killed strategy's new orders, and keep the
 /// alarms current.
-pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adapter: &std::sync::Arc<BinanceAdapter>, event: &FollowEvent) {
+pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adapter: &std::sync::Arc<BinanceAdapter>, event: &AccountEvent) {
     let killed = strategy.state == TradingState::Halted;
     if let Some((venue_order_id, symbol)) = fight(killed, event) {
         hub.fighting.lock().unwrap().insert(strategy.code.clone(), Instant::now());
@@ -257,7 +257,7 @@ pub async fn on_event(state: &AppState, hub: &ColoHub, strategy: &Strategy, adap
         }
         return;
     }
-    if killed || !matches!(event, FollowEvent::Opened { .. } | FollowEvent::Fill(_)) {
+    if killed || !matches!(event, AccountEvent::Opened { .. } | AccountEvent::Filled) {
         return;
     }
     let link = hub.link_status(&strategy.code);
@@ -302,12 +302,10 @@ fn reason_is_unmonitored(hub: &ColoHub, code: &str) -> bool {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use gateway::contract::FollowEvent;
-
     use super::*;
 
-    fn opened(id: &str) -> FollowEvent {
-        FollowEvent::Opened { venue_order_id: id.into(), client_order_id: "mm1-q-1".into(), symbol: "BTCUSDT".into(), buy: true, qty: 1.0, price: 100.0 }
+    fn opened(id: &str) -> AccountEvent {
+        AccountEvent::Opened { venue_order_id: id.into(), symbol: "BTCUSDT".into() }
     }
 
     #[test]
@@ -357,7 +355,7 @@ mod tests {
     fn a_killed_strategys_new_order_is_cancelled_on_sight() {
         assert_eq!(fight(true, &opened("9")), Some(("9".to_string(), "BTCUSDT".to_string())));
         assert_eq!(fight(false, &opened("9")), None);
-        assert_eq!(fight(true, &FollowEvent::Connected), None);
+        assert_eq!(fight(true, &AccountEvent::Filled), None);
     }
 
     #[test]

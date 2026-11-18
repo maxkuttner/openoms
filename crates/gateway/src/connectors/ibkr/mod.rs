@@ -55,7 +55,6 @@ impl Connector for Ibkr {
         Ok(Connected {
             source: Some(adapter.clone()),
             adapter,
-            exec_stream: None,
             daily_stats: None,
             venue_stream: Some(venue_stream),
         })

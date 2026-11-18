@@ -4,7 +4,7 @@
 //! - **Stream:** events from the connection's [`VenueStream`] sink are forwarded
 //!   to the engine in order. `Connected` triggers a pull instead.
 //! - **Intraday pull:** on `Connected`, on a timer (`broker_connection.intraday_poll_secs`,
-//!   else `hints().intraday_secs`) and on [`ReconcilerHandle::pull_now`]. For each
+//!   else `hints().intraday_secs`) and, in tests, on `ReconcilerHandle::pull_now`. For each
 //!   account of the connection × `scopes()`, fills are paged from the stored
 //!   `recon_cursor`. Each fill is ingested and **awaited**; the cursor advances only
 //!   once a whole page is booked, so a failure re-pulls that page next time
@@ -19,13 +19,18 @@
 //!   with `from = None, since = updated_at - 60s`; a non-empty returned cursor is
 //!   stored, an empty one leaves the row (and its stamp) untouched.
 //!
-//! **Double-booking guard (transition):** a connector still on the old
-//! `ExecEvent` session path books its OMS orders' fills without writing
-//! `venue_fill`, so pulling the same fills through ingest would book them twice.
-//! A reconciler is therefore started only for a connection whose `Connected`
-//! has both `source` and `venue_stream` (see `reload::build_registry`): Binance
-//! REST first. Each connector switches to venue events only, and
-//! sets both, in one step.
+//! **Accounts:** a connection's reconciler covers its accounts except those a
+//! co-located strategy's follow covers ([`Accounts::Unfollowed`]). A follow
+//! is a reconciler of its own on the same connection code, scoped to the one
+//! account ([`Accounts::Only`]), pulling with the strategy's follow key: the
+//! connection's key cannot see a sub-account's trades, and pulling with it
+//! for the sub-account would book the main account's trades there. An account
+//! counts as followed while its COLOCATED strategy has a follow credential,
+//! even when that follow failed to start (it is then pulled by nobody).
+//!
+//! **Account ref:** a stream event without one (Binance's user-data stream,
+//! which does not know it) gets the ref of the reconciler's only account;
+//! with several, it is left empty and ingest refuses it (unknown account).
 //!
 //! **FIX:** the session's QuickFIX callbacks emit the venue events; its
 //! `VenueStream` drains them into this reconciler's sink like any other
@@ -73,8 +78,42 @@ pub struct SweepReport {
     pub errors: Vec<String>,
 }
 
+impl SweepReport {
+    /// Two sweeps of one connection (its own and a follow's) as one.
+    pub fn merge(mut self, other: SweepReport) -> SweepReport {
+        self.obtained_from = self.obtained_from.max(other.obtained_from);
+        self.booked += other.booked;
+        self.duplicates += other.duplicates;
+        self.breaks += other.breaks;
+        self.failed += other.failed;
+        self.errors.extend(other.errors);
+        self
+    }
+}
+
+/// Which of the connection's accounts a reconciler covers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Accounts {
+    /// Every account of the connection that no co-located follow covers.
+    Unfollowed,
+    /// One account, followed with its own key.
+    Only(Uuid),
+}
+
+impl Accounts {
+    /// The reconciler's name in the live registry: the connection code, or
+    /// `"<connection>#<account id>"` for a follow.
+    pub fn key(&self, connection: &str) -> String {
+        match self {
+            Self::Unfollowed => connection.to_string(),
+            Self::Only(id) => format!("{connection}#{id}"),
+        }
+    }
+}
+
 pub struct Reconciler {
     connection: String,
+    scope: Accounts,
     source: Arc<dyn ExecutionSource>,
     engine: EngineHandle,
     pool: PgPool,
@@ -102,7 +141,7 @@ pub struct ReconcilerHandle {
 
 impl ReconcilerHandle {
     /// Pull now, or once more after the pull already running.
-    #[cfg_attr(not(test), allow(dead_code))] // no production trigger yet
+    #[cfg(test)]
     pub fn pull_now(&self) {
         self.inner.trigger.notify_one();
     }
@@ -136,14 +175,22 @@ struct WeakHandle {
 static LIVE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, WeakHandle>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// The running reconciler of `connection`, if any. Hold the result only briefly.
-pub fn live(connection: &str) -> Option<ReconcilerHandle> {
+/// The running reconciler under `key` ([`Accounts::key`]), if any. Hold the result only briefly.
+pub fn live(key: &str) -> Option<ReconcilerHandle> {
     let mut live = LIVE.lock().unwrap();
-    let up = live.get(connection).and_then(|w| Some(ReconcilerHandle { inner: w.inner.upgrade()?, _tasks: w.tasks.upgrade()? }));
+    let up = live.get(key).and_then(|w| Some(ReconcilerHandle { inner: w.inner.upgrade()?, _tasks: w.tasks.upgrade()? }));
     if up.is_none() {
-        live.remove(connection);
+        live.remove(key);
     }
     up
+}
+
+/// Every running reconciler of `connection`: its own and its follows'.
+pub fn live_all(connection: &str) -> Vec<ReconcilerHandle> {
+    let follow = format!("{connection}#");
+    let keys: Vec<String> =
+        LIVE.lock().unwrap().keys().filter(|k| *k == connection || k.starts_with(&follow)).cloned().collect();
+    keys.iter().filter_map(|k| live(k)).collect()
 }
 
 /// Start a reconciler without an adapter (no synthetic closes) or instrument provider.
@@ -155,11 +202,12 @@ pub fn spawn(
     engine: EngineHandle,
     pool: PgPool,
 ) -> ReconcilerHandle {
-    spawn_with(connection, source, events, engine, pool, None, None)
+    spawn_with(connection, source, events, engine, pool, None, None, Accounts::Unfollowed)
 }
 
 /// `adapter` answers `order_status` for OMS orders gone from the snapshot;
-/// `instruments` resolves symbols ingest does not know.
+/// `instruments` resolves symbols ingest does not know; `scope` picks the accounts.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_with(
     connection: String,
     source: Arc<dyn ExecutionSource>,
@@ -168,9 +216,10 @@ pub fn spawn_with(
     pool: PgPool,
     adapter: Option<Arc<dyn BrokerAdapter>>,
     instruments: Option<Arc<dyn InstrumentProvider>>,
+    scope: Accounts,
 ) -> ReconcilerHandle {
-    let name = connection.clone();
-    let inner = Arc::new(Reconciler { connection, source, engine, pool, adapter, instruments, trigger: Notify::new() });
+    let name = scope.key(&connection);
+    let inner = Arc::new(Reconciler { connection, scope, source, engine, pool, adapter, instruments, trigger: Notify::new() });
     let mut set = JoinSet::new();
 
     let r = inner.clone();
@@ -203,12 +252,13 @@ pub fn spawn_with(
 
     let r = inner.clone();
     set.spawn(async move {
-        while let Some(event) = events.recv().await {
+        while let Some(mut event) = events.recv().await {
             if matches!(event, VenueEvent::Connected) {
                 info!(connection = %r.connection, "reconciler: stream connected, pulling");
                 r.trigger.notify_one();
                 continue;
             }
+            r.stamp_account(&mut event).await;
             // Stream order is kept by the engine's queue; the reply is only
             // watched for a gap, off this loop.
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -242,14 +292,56 @@ impl Reconciler {
         configured.map(|s| s as u64).unwrap_or_else(|| self.source.hints().intraday_secs)
     }
 
+    /// The accounts this reconciler covers (see [`Accounts`]).
     async fn accounts(&self) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
-        sqlx::query_as(
-            "SELECT id, external_account_ref FROM account \
-             WHERE broker_connection_code = $1 AND external_account_ref IS NOT NULL ORDER BY code",
-        )
-        .bind(&self.connection)
-        .fetch_all(&self.pool)
-        .await
+        match self.scope {
+            Accounts::Unfollowed => {
+                sqlx::query_as(
+                    "SELECT a.id, a.external_account_ref FROM account a \
+                     WHERE a.broker_connection_code = $1 AND a.external_account_ref IS NOT NULL \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM strategy_connection sc JOIN strategy s ON s.code = sc.strategy_code \
+                         WHERE sc.account_id = a.id AND s.mode = 'COLOCATED' \
+                           AND s.follow_credentials IS NOT NULL AND s.follow_environment IS NOT NULL) \
+                     ORDER BY a.code",
+                )
+                .bind(&self.connection)
+                .fetch_all(&self.pool)
+                .await
+            }
+            Accounts::Only(id) => {
+                sqlx::query_as(
+                    "SELECT id, external_account_ref FROM account \
+                     WHERE broker_connection_code = $1 AND id = $2 AND external_account_ref IS NOT NULL",
+                )
+                .bind(&self.connection)
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+    }
+
+    /// Give a stream event without an account ref the ref of this
+    /// reconciler's only account; with none or several, leave it empty.
+    async fn stamp_account(&self, event: &mut VenueEvent) {
+        let slot = match event {
+            VenueEvent::Fill(f) => &mut f.account_ref,
+            VenueEvent::Order(o) => &mut o.account_ref,
+            VenueEvent::Fee { account_ref, .. } => account_ref,
+            VenueEvent::Connected | VenueEvent::Disconnected => return,
+        };
+        if !slot.is_empty() {
+            return;
+        }
+        match self.accounts().await {
+            Ok(accounts) => {
+                if let [(_, account_ref)] = accounts.as_slice() {
+                    *slot = account_ref.clone();
+                }
+            }
+            Err(e) => warn!(connection = %self.connection, error = %e, "reconciler: accounts unreadable, event left without an account"),
+        }
     }
 
     /// The scopes to pull for one account: the venue's own, plus — when the

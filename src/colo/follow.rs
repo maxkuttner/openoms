@@ -1,5 +1,9 @@
 //! Follow streams: one per co-located strategy, on its venue account, with the
-//! OMS's follow-only key; and filling a stream's gap from the trade history.
+//! OMS's follow-only key. Each is a reconciler of the account's connection
+//! scoped to that one account (`reconciler::Accounts::Only`): its venue events
+//! book through ingest like any connection's, and its pulls fill the gaps.
+//! The same events also feed the co-located runtime state (open orders,
+//! order flow, the kill fight) and the colo trade ledger.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -11,9 +15,11 @@ use tracing::{error, info, warn};
 use gateway::connectors::binance::adapter::BinanceAdapter;
 use gateway::stream_health::StreamKind;
 
-use super::{booking, ColoHub};
+use gateway::adapter::{BrokerAdapter, InstrumentProvider};
+use gateway::venue_event::{ExecutionSource, VenueEvent};
+
 use crate::app_state::AppState;
-use crate::strategies::Strategy;
+use crate::reconciler::Accounts;
 
 #[derive(Deserialize)]
 struct FollowKey {
@@ -100,10 +106,20 @@ pub async fn sync_follows(state: &AppState) {
                 continue;
             }
         };
+        let account = match followed_account(state, &code).await {
+            Ok(Some(account)) => account,
+            Ok(None) => {
+                error!(strategy = %code, "co-located: the strategy has no BINANCE account; not followed");
+                continue;
+            }
+            Err(e) => {
+                error!(strategy = %code, error = %e, "co-located: account unreadable; not followed");
+                continue;
+            }
+        };
         state.colo().set_adapter(&code, adapter.clone());
         let health = state.stream_health().handle(&stream_code(&code), environment, StreamKind::Execution);
-        let (sink, follow_code) = (state.colo().follow_handle(), code.clone());
-        let handle = tokio::spawn(gateway::connectors::binance::stream::follow(environment, follow_code, adapter, health, sink));
+        let handle = tokio::spawn(follow(state.clone(), code.clone(), environment, adapter, account, health));
         state.streams().abort_and_remove(&stream_code(&code)).await;
         state.streams().insert(stream_code(&code), handle);
         running.insert(code.clone(), fingerprint(env, sealed));
@@ -111,86 +127,76 @@ pub async fn sync_follows(state: &AppState) {
     }
 }
 
-/// How far back gap recon looks: Binance's trade history answers 24 hours
-/// per start time.
-pub const DAY_MS: i64 = 24 * 3_600_000;
-
-/// Where gap recon starts: a day back, but never before following began.
-pub fn recon_start(follow_since_ms: Option<i64>, now_ms: i64) -> i64 {
-    follow_since_ms.map_or(now_ms - DAY_MS, |since| since.max(now_ms - DAY_MS))
+/// The account a strategy's follow covers: its BINANCE account, with the
+/// connection it belongs to.
+#[derive(Debug, Clone)]
+struct FollowedAccount {
+    id: uuid::Uuid,
+    external_ref: String,
+    connection: String,
 }
 
-/// The next page's first trade id after a full page.
-pub fn next_page(page_len: usize, last_trade_id: Option<i64>) -> Option<i64> {
-    (page_len >= 1000).then_some(last_trade_id?).map(|id| id + 1)
-}
-
-/// Every pair gap recon asks about: booked, open now, or seen on the account.
-pub fn recon_symbols(
-    booked: impl IntoIterator<Item = String>,
-    open: impl IntoIterator<Item = String>,
-    seen: impl IntoIterator<Item = String>,
-) -> std::collections::BTreeSet<String> {
-    booked.into_iter().chain(open).chain(seen).collect()
-}
-
-/// After a (re)connect: book every trade of the last day (since following
-/// began) on every pair the account has touched. Booking skips what is
-/// already booked, so a fill that failed earlier is retried here too.
-pub async fn fill_gap(state: &AppState, hub: &ColoHub, strategy: &Strategy, adapter: &BinanceAdapter) {
-    use gateway::adapter::BrokerAdapter;
-    let open = adapter.open_orders().await.unwrap_or_default();
-    let seen = {
-        let mut runtimes = hub.runtimes.lock().unwrap();
-        let runtime = runtimes.entry(strategy.code.clone()).or_default();
-        runtime.open.retain(|venue_id, _| open.iter().any(|o| &o.venue_order_id == venue_id));
-        runtime.seen_symbols.iter().cloned().collect::<Vec<_>>()
-    };
-    let booked = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT bi.broker_symbol FROM order_state os \
-         JOIN broker_instrument bi ON bi.instrument_id = os.instrument_id::bigint AND bi.broker_code = 'BINANCE' \
-         WHERE os.account_id = $1 AND os.origin = 'EXTERNAL'",
+async fn followed_account(state: &AppState, code: &str) -> Result<Option<FollowedAccount>, sqlx::Error> {
+    let row: Option<(uuid::Uuid, Option<String>, String)> = sqlx::query_as(
+        "SELECT a.id, a.external_account_ref, a.broker_connection_code FROM strategy_connection sc \
+         JOIN account a ON a.id = sc.account_id \
+         WHERE sc.strategy_code = $1 AND sc.broker_code = 'BINANCE'",
     )
-    .bind(strategy.connections.get("BINANCE").copied().unwrap_or_default())
-    .fetch_all(state.pool())
-    .await
-    .unwrap_or_default();
-    let since: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("SELECT follow_since FROM strategy WHERE code = $1")
-        .bind(&strategy.code)
-        .fetch_optional(state.pool())
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-    let start = recon_start(since.map(|t| t.timestamp_millis()), chrono::Utc::now().timestamp_millis());
-    let symbols = recon_symbols(booked, open.into_iter().map(|o| o.symbol), seen);
-    let mut booked_now = 0usize;
-    for symbol in symbols {
-        let mut from: Option<i64> = None;
-        loop {
-            let page = match adapter.my_trades(&symbol, from, Some(start)).await {
-                Ok(page) => page,
-                Err(e) => {
-                    warn!(strategy = %strategy.code, %symbol, error = %e, "co-located: trade history unavailable; gap not filled");
-                    break;
-                }
-            };
-            let last = page.last().and_then(|f| f.trade_id.parse::<i64>().ok());
-            for fill in &page {
-                match booking::book_fill(state, strategy, adapter, fill).await {
-                    Ok(booking::Booked::New) => booked_now += 1,
-                    Ok(booking::Booked::AlreadyBooked) => {}
-                    Err(e) => error!(strategy = %strategy.code, trade = %fill.trade_id, error = %e, "co-located: gap fill not booked; retried at the next reconnect"),
-                }
-            }
-            match next_page(page.len(), last) {
-                Some(next) => from = Some(next),
-                None => break,
+    .bind(code)
+    .fetch_optional(state.pool())
+    .await?;
+    Ok(row.and_then(|(id, external_ref, connection)| {
+        Some(FollowedAccount { id, external_ref: external_ref.filter(|r| !r.is_empty())?, connection })
+    }))
+}
+
+/// One follow, for as long as the stream registry keeps it: the account's
+/// user-data stream, teed to the co-located runtime and to a reconciler of
+/// the account's connection scoped to this account. Every event carries the
+/// account's ref, so ingest books it on the sub-account, never the
+/// connection's main account.
+async fn follow(
+    state: AppState,
+    code: String,
+    environment: &'static str,
+    adapter: Arc<BinanceAdapter>,
+    account: FollowedAccount,
+    health: gateway::stream_health::StreamHandle,
+) {
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
+    let (recon_tx, recon_rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
+    let reconciler = crate::reconciler::spawn_with(
+        account.connection.clone(),
+        adapter.clone() as Arc<dyn ExecutionSource>,
+        recon_rx,
+        state.engine().clone(),
+        state.pool().clone(),
+        Some(adapter.clone() as Arc<dyn BrokerAdapter>),
+        Some(adapter.clone() as Arc<dyn InstrumentProvider>),
+        Accounts::Only(account.id),
+    );
+    let stream = gateway::connectors::binance::stream::run(environment, adapter, health, stream_tx);
+    let hub = state.colo().clone();
+    let tee = async move {
+        let _reconciler = reconciler;
+        while let Some(mut event) = stream_rx.recv().await {
+            set_account_ref(&mut event, &account.external_ref);
+            hub.observe(&code, event.clone()).await;
+            if recon_tx.send(event).await.is_err() {
+                break;
             }
         }
-    }
-    if booked_now > 0 {
-        info!(strategy = %strategy.code, booked_now, "co-located: gap filled from the trade history");
+    };
+    tokio::join!(stream, tee);
+}
+
+/// Stamp a follow event with the followed account's ref.
+fn set_account_ref(event: &mut VenueEvent, account_ref: &str) {
+    match event {
+        VenueEvent::Fill(f) => f.account_ref = account_ref.to_string(),
+        VenueEvent::Order(o) => o.account_ref = account_ref.to_string(),
+        VenueEvent::Fee { account_ref: r, .. } => *r = account_ref.to_string(),
+        VenueEvent::Connected | VenueEvent::Disconnected => {}
     }
 }
 
@@ -208,23 +214,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recon_looks_back_a_day_but_never_before_following_began() {
-        let now = 10 * DAY_MS;
-        assert_eq!(recon_start(None, now), now - DAY_MS);
-        assert_eq!(recon_start(Some(now - 3_600_000), now), now - 3_600_000);
-        assert_eq!(recon_start(Some(now - 5 * DAY_MS), now), now - DAY_MS);
-    }
-
-    #[test]
-    fn the_trade_history_is_paged_until_a_short_page() {
-        assert_eq!(next_page(1000, Some(41_999)), Some(42_000));
-        assert_eq!(next_page(999, Some(41_999)), None);
-        assert_eq!(next_page(1000, None), None);
-    }
-
-    #[test]
-    fn recon_covers_every_pair_seen_not_only_booked_ones() {
-        let symbols = recon_symbols(["BTCUSDT".to_string()], ["ETHBTC".to_string()], ["SOLUSDT".to_string(), "BTCUSDT".to_string()]);
-        assert_eq!(symbols.into_iter().collect::<Vec<_>>(), ["BTCUSDT", "ETHBTC", "SOLUSDT"]);
+    fn every_follow_event_carries_the_followed_account() {
+        use gateway::venue_event::{VenueFill, VenueOrderStatus, VenueOrderUpdate};
+        let mut fill = VenueEvent::Fill(VenueFill {
+            exec_id: "1".into(), venue_order_id: "9".into(), client_order_id: None, account_ref: String::new(),
+            symbol: "BTCUSDT".into(), buy: true, qty: 1.0, price: 1.0, fee: None, executed_at: None,
+        });
+        let mut order = VenueEvent::Order(VenueOrderUpdate {
+            venue_order_id: "9".into(), client_order_id: None, account_ref: String::new(), symbol: "BTCUSDT".into(),
+            buy: true, order_type: "LIMIT".into(), qty: 1.0, limit_px: None, status: VenueOrderStatus::Working, cum_qty: 0.0, ts: None,
+        });
+        super::set_account_ref(&mut fill, "sub-1");
+        super::set_account_ref(&mut order, "sub-1");
+        assert!(matches!(fill, VenueEvent::Fill(f) if f.account_ref == "sub-1"));
+        assert!(matches!(order, VenueEvent::Order(o) if o.account_ref == "sub-1"));
     }
 }

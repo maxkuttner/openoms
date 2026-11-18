@@ -264,58 +264,9 @@ async fn book_once(
     Ok(FeeBooked::Booked)
 }
 
-/// Sum of the fees booked on `order_id` in `currency` (exact match).
-pub async fn booked_fee_total(pool: &PgPool, order_id: Uuid, currency: &str) -> Result<f64, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT COALESCE(SUM(amount), 0)::double precision FROM order_fee \
-         WHERE order_id = $1 AND currency = $2",
-    )
-    .bind(order_id)
-    .bind(currency)
-    .fetch_one(pool)
-    .await
-}
-
-/// The fee to book to bring `booked` up to a venue-reported running `total`, or
-/// `None` when they already agree. The id names the step (booked -> total), so a repeated
-/// step dedupes, a corrected total books its own difference, and a total that
-/// returns to an earlier value after a correction is not deduped against it.
-pub fn fee_delta(order_id: Uuid, venue: &str, booked: f64, total: f64, currency: &str) -> Option<FeeCharge> {
-    if (total - booked).abs() < 1e-12 {
-        return None;
-    }
-    Some(FeeCharge {
-        fee_id: format!("{venue}-{order_id}-{currency}-{booked}->{total}"),
-        execution_id: None,
-        amount: total - booked,
-        currency: currency.to_string(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn approx(a: f64, b: f64) { assert!((a - b).abs() < 1e-9, "{a} != {b}"); }
-    #[test] fn fee_delta_books_the_increase() {
-        let f = fee_delta(Uuid::nil(), "COINBASE", 0.5, 0.8, "USD").unwrap();
-        approx(f.amount, 0.3);
-        assert_eq!(f.currency, "USD");
-    }
-    #[test] fn a_repeated_total_books_nothing() { assert!(fee_delta(Uuid::nil(), "COINBASE", 0.8, 0.8, "USD").is_none()); }
-    #[test] fn a_lower_total_books_a_negative_correction() {
-        approx(fee_delta(Uuid::nil(), "OKX", 0.8, 0.6, "USDT").unwrap().amount, -0.2);
-    }
-    #[test] fn the_fee_id_names_the_total_reached() {
-        let id = Uuid::nil();
-        assert_eq!(fee_delta(id, "OKX", 0.0, 0.6, "USDT").unwrap().fee_id, format!("OKX-{id}-USDT-0->0.6"));
-    }
-    #[test] fn a_total_returning_after_a_correction_books_again() {
-        let id = Uuid::nil();
-        let a = fee_delta(id, "OKX", 0.0, 0.6, "USDT").unwrap().fee_id;
-        let b = fee_delta(id, "OKX", 0.4, 0.6, "USDT").unwrap().fee_id;
-        assert_ne!(a, b);
-    }
 
     #[test] fn usdt_fee_on_btcusdt_is_quote() { assert_eq!(fee_effect("USDT", "BTCUSDT", "CRYPTO", "USDT"), FeeEffect::Quote); }
     #[test] fn btc_fee_on_btcusdt_is_base() { assert_eq!(fee_effect("btc", "BTCUSDT", "CRYPTO", "USDT"), FeeEffect::Base); }
@@ -488,19 +439,6 @@ mod tests {
             let other = other.unwrap();
             // The quote-currency fee hits realized P&L, so only BNB is "other".
             assert_eq!(other[&instrument_id], vec![FeeAmount { currency: "BNB".into(), amount: 0.5 }]);
-        }
-
-        #[tokio::test]
-        #[ignore = "needs a live Postgres; run with --ignored"]
-        async fn booked_fee_total_sums_one_currency() {
-            let pool = test_pool().await;
-            let (order_id, _, _) = seeded_order(&pool, 0).await;
-            for f in [charge("u1", 1.5, "USD"), charge("u2", 2.25, "USD"), charge("n1", 9.0, "BNB")] {
-                book_fee(&pool, None, order_id, f, "test").await.unwrap();
-            }
-            let total = booked_fee_total(&pool, order_id, "USD").await;
-            remove_seeded(&pool, order_id).await;
-            assert_eq!(total.unwrap(), 3.75);
         }
     }
 }

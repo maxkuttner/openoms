@@ -137,9 +137,8 @@ pub trait BrokerAdapter: Send + Sync {
     /// (e.g. Binance) that scope cancels by symbol; ignored by those that don't
     /// (e.g. Alpaca).
     async fn cancel_order(&self, external_order_id: &str, symbol: &str) -> Result<(), BrokerError>;
-    /// The broker's currently-open orders — the snapshot side of order
-    /// reconciliation (the OMS's `recon_orders`). Adapters that don't support it
-    /// return `NotConfigured` (the default) and are skipped.
+    /// The broker's currently-open orders. Adapters that don't support it
+    /// return `NotConfigured` (the default).
     async fn open_orders(&self) -> Result<Vec<crate::contract::BrokerOpenOrder>, BrokerError> {
         Err(BrokerError::NotConfigured(
             "open-order snapshot not supported by this adapter".to_string(),

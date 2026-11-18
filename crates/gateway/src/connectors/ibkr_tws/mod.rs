@@ -107,7 +107,6 @@ impl Connector for IbkrTws {
         // through ingest) and pulls what the stream missed.
         Ok(Connected {
             source: Some(adapter.clone()),
-            exec_stream: None,
             daily_stats: Some(adapter.clone()),
             adapter,
             venue_stream: Some(Arc::new(move |health, tx| {

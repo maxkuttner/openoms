@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 
 use gateway::adapter::{BrokerAdapter, BrokerRegistry};
 use gateway::adapter::InstrumentProvider;
-use gateway::connectors::{self, ExecStream, RegistrationDeps, VenueStream};
+use gateway::connectors::{self, RegistrationDeps, VenueStream};
 use gateway::venue_event::{ExecutionSource, VenueEvent};
 use sqlx::PgPool;
 use gateway::md::daily_stats::DailyStatsRegistry;
@@ -105,8 +105,6 @@ pub struct ExecStreamStart {
 
 /// How a connection's events reach the engine.
 pub enum StreamStart {
-    /// The old path: the stream sends `ExecEvent`s to the engine itself.
-    Engine(ExecStream),
     /// Venue events into the connection's reconciler, which also pulls from
     /// `source` (see `crate::reconciler` on why only this path gets one).
     /// Without a source (e.g. Binance FIX whose REST reader failed to build)
@@ -249,22 +247,13 @@ pub async fn build_registry(
                                     if let Some(source) = connected.daily_stats {
                                         daily_stats.register(m.code, env_name, source);
                                     }
-                                    // A reconciler only with the venue-event stream: one beside an
-                                    // ExecEvent stream would book the session's fills twice. A
-                                    // venue stream without a source feeds ingest directly.
-                                    let start = match (connected.source, connected.venue_stream, connected.exec_stream) {
-                                        (source, Some(stream), None) => Some(StreamStart::Venue {
-                                            connection: conn.code.clone(),
-                                            stream,
-                                            source,
-                                            instruments: connector.universe_provider(env_name, creds).ok().map(Arc::from),
-                                        }),
-                                        (Some(_), _, exec) => {
-                                            error!(code = %conn.code, "connection has a pull source without a venue-event-only stream; reconciler not started");
-                                            exec.map(StreamStart::Engine)
-                                        }
-                                        (None, _, exec) => exec.map(StreamStart::Engine),
-                                    };
+                                    // A venue stream without a source feeds ingest directly.
+                                    let start = connected.venue_stream.map(|stream| StreamStart::Venue {
+                                        connection: conn.code.clone(),
+                                        stream,
+                                        source: connected.source,
+                                        instruments: connector.universe_provider(env_name, creds).ok().map(Arc::from),
+                                    });
                                     if let Some(start) = start {
                                         exec_streams.push(ExecStreamStart { code: m.code, env: env_name, adapter: connected.adapter, start });
                                     }
@@ -360,7 +349,6 @@ pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDe
         health.set_connecting();
     }
     let handle = match &stream.start {
-        StreamStart::Engine(start) => tokio::spawn(start(health, deps.engine.clone())),
         StreamStart::Venue { connection, stream: start, source: None, instruments } => {
             let (tx, mut rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
             let run = start(health, tx);
@@ -386,6 +374,7 @@ pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDe
                 pool.clone(),
                 Some(stream.adapter.clone()),
                 instruments.clone(),
+                crate::reconciler::Accounts::Unfollowed,
             );
             let run = start(health, tx);
             tokio::spawn(async move {

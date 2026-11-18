@@ -238,7 +238,7 @@ async fn working_order_missing_from_snapshot_is_resolved() {
     .execute(&w.pool).await.unwrap();
     let (engine, seen) = fake_engine(ok);
     let (_tx, rx) = mpsc::channel(16);
-    let h = spawn_with(CONN.into(), Arc::new(FakeSource::default()), rx, engine, w.pool.clone(), Some(Arc::new(ClosedAtVenue)), None);
+    let h = spawn_with(CONN.into(), Arc::new(FakeSource::default()), rx, engine, w.pool.clone(), Some(Arc::new(ClosedAtVenue)), None, super::Accounts::Unfollowed);
     h.pull_now();
     eventually(|| seen.lock().unwrap().iter().any(|e| matches!(e, VenueEvent::Order(_)))).await;
     let events = seen.lock().unwrap().clone();
@@ -410,4 +410,89 @@ async fn per_symbol_scopes_add_the_accounts_order_symbols() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(scopes().await, ["BTCUSDT", "ETHUSDT"]);
+}
+
+/// A sub-account on `CONN` that a co-located strategy follows with its own key.
+async fn followed_subaccount(w: &World) -> Uuid {
+    let code = crate::strategies::test_support::seed_strategy(&w.pool).await;
+    let sub = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) \
+         VALUES ($1, 'SUB', $2, 'sub', 'ACTIVE')",
+    )
+    .bind(sub).bind(CONN).execute(&w.pool).await.unwrap();
+    sqlx::query(
+        "UPDATE strategy SET mode = 'COLOCATED', follow_environment = 'PAPER', follow_credentials = '\\x00'::bytea WHERE code = $1",
+    )
+    .bind(&code).execute(&w.pool).await.unwrap();
+    sqlx::query("INSERT INTO strategy_connection (strategy_code, broker_code, account_id) VALUES ($1, 'BINANCE', $2)")
+        .bind(&code).bind(sub).execute(&w.pool).await.unwrap();
+    sub
+}
+
+/// The accounts with a recon cursor on `CONN`, main account last.
+async fn cursor_accounts(w: &World) -> Vec<Uuid> {
+    sqlx::query_scalar("SELECT account_id FROM recon_cursor WHERE broker_connection_code = $1 ORDER BY account_id = $2")
+        .bind(CONN).bind(w.account).fetch_all(&w.pool).await.unwrap()
+}
+
+/// The connection's key cannot see a followed sub-account's trades, and its
+/// fills would be tagged with the sub-account: only the follow pulls it.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn main_reconciler_skips_followed_accounts() {
+    let w = world().await;
+    let sub = followed_subaccount(&w).await;
+    let (engine, _) = fake_engine(ok);
+    let (main, _tx) = start(&w, Arc::new(FakeSource::default()), engine.clone());
+    main.pull_now();
+    for _ in 0..500 {
+        if !cursor_accounts(&w).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(cursor_accounts(&w).await, [w.account], "the main reconciler pulls only the unfollowed account");
+
+    // The follow's reconciler covers the sub-account alone.
+    let (_ftx, frx) = mpsc::channel(16);
+    let follow = spawn_with(CONN.into(), Arc::new(FakeSource::default()), frx, engine, w.pool.clone(), None, None, super::Accounts::Only(sub));
+    follow.pull_now();
+    for _ in 0..500 {
+        if cursor_accounts(&w).await.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(cursor_accounts(&w).await, [sub, w.account]);
+    // Other tests share `CONN` in the live registry; the follow is there by its own key.
+    assert!(super::live(&super::Accounts::Only(sub).key(CONN)).is_some());
+    assert!(super::live_all(CONN).len() >= 2, "the EOD sweep finds the connection's reconciler and its follow's");
+    drop((main, follow));
+}
+
+/// With a followed sub-account on the connection, a main-stream fill without
+/// an account ref (Binance's user-data stream) books on the main account; and
+/// ingest alone refuses to guess between two accounts.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn binance_main_stream_fills_resolve_to_main_account_with_followed_subaccounts_present() {
+    let w = world().await;
+    followed_subaccount(&w).await;
+    let mut unlabelled = fill("e-main");
+    unlabelled.account_ref = String::new();
+
+    let refused = crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Fill(unlabelled.clone()), None).await;
+    assert!(
+        matches!(refused, Err(crate::ingest::apply::IngestError::UnknownAccount { .. })),
+        "two accounts on the connection: ingest does not pick one"
+    );
+
+    let (engine, seen) = fake_engine(ok);
+    let (_h, tx) = start(&w, Arc::new(FakeSource::default()), engine);
+    tx.send(VenueEvent::Fill(unlabelled)).await.unwrap();
+    eventually(|| !fill_ids(&seen).is_empty()).await;
+    let stamped = seen.lock().unwrap().iter().find_map(|e| if let VenueEvent::Fill(f) = e { Some(f.account_ref.clone()) } else { None });
+    assert_eq!(stamped.as_deref(), Some("acc"), "the stream's fill carries the main account's ref");
 }

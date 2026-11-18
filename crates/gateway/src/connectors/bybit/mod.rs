@@ -47,7 +47,6 @@ impl Connector for Bybit {
         // through ingest) and pulls what the stream missed.
         Ok(Connected {
             source: Some(adapter.clone()),
-            exec_stream: None,
             venue_stream: Some(Arc::new(move |health, tx| {
                 Box::pin(crate::connectors::bybit::stream::run(env, stream_adapter.clone(), health, tx))
             })),

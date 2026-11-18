@@ -11,7 +11,6 @@ mod instruments_import;
 mod risk_engine;
 mod positions;
 mod fees;
-mod recon_orders;
 mod ingest;
 mod reconciler;
 mod symbology_resolver;
@@ -1391,7 +1390,7 @@ async fn serve() {
     // events instead of writing to the database (see `order_engine.rs`). Started
     // before any connector, though its channel would buffer either way.
     let (engine, engine_rx) = gateway::contract::EngineHandle::new();
-    tokio::spawn(order_engine::run(engine_rx, engine.clone(), pool.clone(), event_bus.clone()));
+    tokio::spawn(order_engine::run(engine_rx, pool.clone(), event_bus.clone()));
 
     // The market data gateway, and the one receiver of every quote it emits.
     // Created here, ahead of `AppState`, for the same reason: a runtime reload

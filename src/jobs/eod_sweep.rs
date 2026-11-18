@@ -64,11 +64,20 @@ fn next_run(now: DateTime<Utc>) -> DateTime<Utc> {
     if today > now { today } else { today + Duration::days(1) }
 }
 
-/// Sweep one connection now. `None` when it has no live reconciler.
+/// Sweep one connection now: its own reconciler and its co-located follows',
+/// as one report. `None` when it has no live reconciler.
 pub async fn run_connection(pool: &PgPool, connection: &str, lookback: Lookback) -> Option<SweepReport> {
-    let handle = crate::reconciler::live(connection)?;
-    let report = handle.sweep(lookback.duration()).await;
-    drop(handle);
+    let handles = crate::reconciler::live_all(connection);
+    let mut report: Option<SweepReport> = None;
+    for handle in handles {
+        let one = handle.sweep(lookback.duration()).await;
+        drop(handle);
+        report = Some(match report {
+            None => one,
+            Some(sum) => sum.merge(one),
+        });
+    }
+    let report = report?;
     info!(connection, ?report, "eod sweep");
     match serde_json::to_value(&report) {
         Ok(result) => {

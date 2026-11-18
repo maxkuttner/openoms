@@ -54,7 +54,6 @@ impl Connector for Alpaca {
             daily_stats: Some(adapter.clone()),
             source: Some(adapter.clone()),
             adapter,
-            exec_stream: None,
             venue_stream: Some(Arc::new(move |health, tx| {
                 Box::pin(crate::connectors::alpaca::stream::run(env, c.key.clone(), c.secret.clone(), health, tx))
             })),

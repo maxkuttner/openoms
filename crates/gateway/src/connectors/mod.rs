@@ -93,12 +93,8 @@ pub struct RegistrationDeps {
     pub engine: EngineHandle,
 }
 
-/// Starts one execution stream; called again on every restart.
-pub type ExecStream = Arc<dyn Fn(StreamHandle, EngineHandle) -> BoxFuture<'static, ()> + Send + Sync>;
-
 /// Starts one venue-event stream; called again on every restart. Its events go
-/// to the connection's reconciler, not straight to the engine. Replaces
-/// [`ExecStream`] connector by connector; the two never run for one connection.
+/// to the connection's reconciler, not straight to the engine.
 pub type VenueStream =
     Arc<dyn Fn(StreamHandle, tokio::sync::mpsc::Sender<crate::venue_event::VenueEvent>) -> BoxFuture<'static, ()> + Send + Sync>;
 
@@ -119,16 +115,12 @@ pub struct PublicFeed {
 /// What connecting one configured connection produced.
 pub struct Connected {
     pub adapter: Arc<dyn BrokerAdapter>,
-    /// The old `ExecEvent` execution stream; `None` on every venue-event
-    /// connector (FIX included: its session delivers through `venue_stream`).
-    pub exec_stream: Option<ExecStream>,
     /// Its previous-close source for the market-data side; `None` when the
     /// connection has no snapshot endpoint (FIX).
     pub daily_stats: Option<Arc<dyn DailyStats>>,
     /// Pull side of execution reconciliation; `None` until a connector has one.
     pub source: Option<Arc<dyn crate::venue_event::ExecutionSource>>,
-    /// The sink-based stream that goes with `source`; `None` until a connector
-    /// is moved off `exec_stream`.
+    /// The sink-based stream that goes with `source`.
     pub venue_stream: Option<VenueStream>,
 }
 

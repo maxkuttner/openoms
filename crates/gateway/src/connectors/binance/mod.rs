@@ -79,7 +79,6 @@ impl Connector for Binance {
                 // `fix::TRADE_ID`). Without REST: stream only, nothing pulled.
                 Ok(Connected {
                     adapter,
-                    exec_stream: None,
                     daily_stats: None,
                     source: source.map(|s| s as Arc<dyn crate::venue_event::ExecutionSource>),
                     venue_stream: Some(venue_stream),
@@ -102,7 +101,6 @@ impl Connector for Binance {
                     daily_stats: Some(adapter.clone()),
                     source: Some(adapter.clone()),
                     adapter,
-                    exec_stream: None,
                     venue_stream: Some(Arc::new(move |health, tx| {
                         Box::pin(crate::connectors::binance::stream::run(env, stream_adapter.clone(), health, tx))
                     })),

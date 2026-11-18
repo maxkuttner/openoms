@@ -21,19 +21,16 @@ use tracing::{info, warn};
 
 use crate::connectors::binance::adapter::BinanceAdapter;
 use crate::connectors::binance::runtime::{
-    health_event, parse_raw_order, parse_raw_trade, runtime_events,
+    health_event, runtime_events,
 };
-use crate::contract::{ExecKind, ExternalFill, FollowEvent, FollowHandle};
 use crate::runtime::{
-    AccountIdentity, RuntimeOrderState, StreamState, TradeProvenance, VenueEvent,
+    AccountIdentity, StreamState, TradeProvenance, VenueEvent,
 };
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 use crate::venue_event::{VenueEvent as VEvent, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-
-const VENUE: &str = "BINANCE";
 
 /// How often to ping the socket. A stalled user-data subscription (fills stop
 /// arriving without a Close frame) is otherwise invisible; the ping surfaces a
@@ -43,25 +40,14 @@ const HEARTBEAT_SECS: u64 = 30;
 struct BinanceSession {
     adapter: Arc<BinanceAdapter>,
     health: StreamHandle,
-    sink: Sink,
-}
-
-/// Where an account stream reports: the OMS's own account sends venue events
-/// to its connection's reconciler; a followed account (a co-located
-/// strategy's) reports everything to the follow sink.
-#[derive(Clone)]
-enum Sink {
-    Own(mpsc::Sender<VEvent>),
-    Follow { handle: FollowHandle, strategy: String },
+    sink: mpsc::Sender<VEvent>,
 }
 
 #[async_trait::async_trait]
 impl Session for BinanceSession {
     async fn run_once(&mut self) -> StreamResult {
         let result = connect_and_run(&self.adapter, &self.health, &self.sink).await;
-        if let Sink::Own(tx) = &self.sink {
-            let _ = tx.send(VEvent::Disconnected).await;
-        }
+        let _ = self.sink.send(VEvent::Disconnected).await;
         result
     }
 }
@@ -80,78 +66,10 @@ pub async fn run(
     let session = BinanceSession {
         adapter,
         health: health.clone(),
-        sink: Sink::Own(tx),
+        sink: tx,
     };
     let name: &'static str = if environment == "LIVE" { "BINANCE/LIVE" } else { "BINANCE/PAPER" };
     supervise(name, health, session).await
-}
-
-/// Follow a co-located strategy's account with the OMS's own (follow-only)
-/// key: every order and fill on it goes to `sink`, whoever placed it.
-pub async fn follow(
-    environment: &'static str,
-    strategy_code: String,
-    adapter: Arc<BinanceAdapter>,
-    health: StreamHandle,
-    sink: FollowHandle,
-) {
-    info!(env = environment, strategy = %strategy_code, "following a co-located strategy's Binance account");
-    let session = BinanceSession {
-        adapter,
-        health: health.clone(),
-        sink: Sink::Follow { handle: sink, strategy: strategy_code },
-    };
-    supervise("BINANCE/FOLLOW", health, session).await
-}
-
-/// What one `executionReport` on a followed account means. The trade/order
-/// normalization is the same code the runtime path uses.
-pub(crate) fn follow_events(event: &serde_json::Value) -> Vec<FollowEvent> {
-    let closed = |outcome: &'static str| FollowEvent::Closed {
-        venue_order_id: event["i"]
-            .as_i64()
-            .map(|i| i.to_string())
-            .or_else(|| event["i"].as_str().map(str::to_string))
-            .unwrap_or_default(),
-        outcome,
-    };
-    match event["x"].as_str().unwrap_or("") {
-        "NEW" => parse_raw_order(event, RuntimeOrderState::New)
-            .map(|order| {
-                vec![FollowEvent::Opened {
-                    venue_order_id: order.venue_order_id,
-                    client_order_id: order.client_order_id,
-                    symbol: order.symbol,
-                    buy: order.side == crate::runtime::Side::Buy,
-                    qty: order.original_quantity,
-                    price: order.limit_price.unwrap_or(0.0),
-                }]
-            })
-            .unwrap_or_default(),
-        "TRADE" => {
-            let Some(trade) = parse_raw_trade(event) else { return Vec::new() };
-            let mut out = vec![FollowEvent::Fill(ExternalFill {
-                trade_id: trade.trade_id,
-                venue_order_id: trade.venue_order_id,
-                client_order_id: trade.client_order_id,
-                symbol: trade.symbol,
-                buy: trade.side == crate::runtime::Side::Buy,
-                qty: trade.quantity,
-                price: trade.price,
-                fee_amount: trade.fee.as_ref().map(|f| f.amount),
-                fee_currency: trade.fee.as_ref().map(|f| f.currency.clone()),
-                executed_at: Some(trade.executed_at),
-            })];
-            if event["X"].as_str() == Some("FILLED") {
-                out.push(closed("filled"));
-            }
-            out
-        }
-        "CANCELED" => vec![closed("canceled")],
-        "REJECTED" => vec![closed("rejected")],
-        "EXPIRED" => vec![closed("expired")],
-        _ => Vec::new(),
-    }
 }
 
 /// Runtime push stream: health, orders and fees reach `tx`. Reconnects forever
@@ -290,7 +208,7 @@ async fn wait_ack(
 async fn connect_and_run(
     adapter: &Arc<BinanceAdapter>,
     health: &StreamHandle,
-    sink: &Sink,
+    sink: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.ws_url()).await?;
     info!("Binance WS-API connected");
@@ -339,18 +257,9 @@ async fn connect_and_run(
         // Pushed user-data event: {"subscriptionId":N,"event":{...}}
         if v.get("event").is_some() {
             if v["event"]["e"].as_str() == Some("executionReport") {
-                match sink {
-                    Sink::Own(tx) => {
-                        for event in venue_events(&v["event"]) {
-                            if tx.send(event).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Sink::Follow { handle, strategy } => {
-                        for event in follow_events(&v["event"]) {
-                            handle.send(strategy, event).await;
-                        }
+                for event in venue_events(&v["event"]) {
+                    if sink.send(event).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -372,16 +281,10 @@ async fn connect_and_run(
                 if v["status"].as_i64() == Some(200) {
                     info!("Binance WS-API subscribed to user-data stream");
                     health.set_live();
-                    match sink {
-                        // The reconciler pulls fills and the open-order snapshot
-                        // for whatever happened while the stream was down.
-                        Sink::Own(tx) => {
-                            if tx.send(VEvent::Connected).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                        // A followed account fills its gap from the trade history.
-                        Sink::Follow { handle, strategy } => handle.send(strategy, FollowEvent::Connected).await,
+                    // The reconciler pulls fills and the open-order snapshot
+                    // for whatever happened while the stream was down.
+                    if sink.send(VEvent::Connected).await.is_err() {
+                        return Ok(());
                     }
                 } else {
                     return Err(format!("userDataStream.subscribe failed: {}", v).into());
@@ -396,8 +299,8 @@ async fn connect_and_run(
 /// What one `executionReport` on the OMS's own account means, whoever placed
 /// the order: a `TRADE` is a fill (its commission `n`/`N` rides along), and
 /// every report is also the order's current state. The stream does not know
-/// the account's reference; one Binance key is one account, which ingest
-/// resolves by the connection alone.
+/// the account's reference: the connection's reconciler stamps it (its only
+/// account), and a co-located follow sets its sub-account's.
 pub(crate) fn venue_events(event: &serde_json::Value) -> Vec<VEvent> {
     let mut out = Vec::new();
     // On a cancel, Binance puts the cancel-request's id in `c` and the original
@@ -463,63 +366,10 @@ pub(crate) fn venue_events(event: &serde_json::Value) -> Vec<VEvent> {
     out
 }
 
-/// `ExecKind::Fee` for one Binance trade; `None` for a zero commission.
-pub fn fee_kind(trade_id: &str, amount: f64, currency: &str) -> Option<ExecKind> {
-    (amount != 0.0 && !currency.is_empty()).then(|| ExecKind::Fee {
-        fee_id: format!("{VENUE}-{trade_id}"),
-        execution_id: Some(trade_id.to_string()),
-        amount,
-        currency: currency.to_string(),
-    })
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use crate::contract::{ExternalFill, FollowEvent};
-
-    #[test]
-    fn a_trade_event_on_any_client_id_is_a_follow_fill() {
-        let event = serde_json::json!({
-            "e": "executionReport", "x": "TRADE", "X": "PARTIALLY_FILLED", "c": "mm1-q-000001",
-            "s": "BTCUSDT", "S": "BUY", "i": 9001, "l": "0.25", "L": "64000.5", "t": 77,
-        });
-        assert_eq!(
-            follow_events(&event),
-            vec![FollowEvent::Fill(ExternalFill {
-                trade_id: "77".into(), venue_order_id: "9001".into(), client_order_id: "mm1-q-000001".into(),
-                symbol: "BTCUSDT".into(), buy: true, qty: 0.25, price: 64000.5,
-                fee_amount: None, fee_currency: None, executed_at: Some(Utc.timestamp_millis_opt(0).unwrap()),
-            })]
-        );
-        let last = serde_json::json!({
-            "e": "executionReport", "x": "TRADE", "X": "FILLED", "c": "mm1-q-000001",
-            "s": "BTCUSDT", "S": "SELL", "i": 9001, "l": "0.75", "L": "64000.5", "t": 78,
-        });
-        let events = follow_events(&last);
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[1], FollowEvent::Closed { venue_order_id: "9001".into(), outcome: "filled" });
-    }
-
-    #[test]
-    fn new_and_cancel_events_open_and_close() {
-        let new = serde_json::json!({
-            "e": "executionReport", "x": "NEW", "c": "mm1-q-000002", "s": "BTCUSDT", "S": "SELL",
-            "i": 9002, "q": "0.5", "p": "64100",
-        });
-        assert_eq!(
-            follow_events(&new),
-            vec![FollowEvent::Opened {
-                venue_order_id: "9002".into(), client_order_id: "mm1-q-000002".into(), symbol: "BTCUSDT".into(),
-                buy: false, qty: 0.5, price: 64100.0,
-            }]
-        );
-        let cancel = serde_json::json!({ "e": "executionReport", "x": "CANCELED", "c": "x", "C": "mm1-q-000002", "i": 9002 });
-        assert_eq!(follow_events(&cancel), vec![FollowEvent::Closed { venue_order_id: "9002".into(), outcome: "canceled" }]);
-    }
-
     use crate::venue_event::{VenueEvent as VEvent, VenueFill, VenueOrderStatus};
 
     #[test]
