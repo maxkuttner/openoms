@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use gateway::connectors::binance::adapter::BinanceAdapter;
 use colo_link::proto::{FromStrategy, ToStrategy};
@@ -247,9 +247,10 @@ impl Default for ColoHub {
 
 impl ColoHub {
     /// What a strategy's follow stream saw on its account.
-    pub(crate) async fn observe(&self, code: &str, event: VenueEvent) {
-        if self.follow.send((code.to_string(), event)).await.is_err() {
-            error!(strategy = code, "co-located: follow sink is gone; event dropped");
+    /// Never waits: a full or closed sink drops the event with a warning.
+    pub(crate) fn observe(&self, code: &str, event: VenueEvent) {
+        if let Err(e) = self.follow.try_send((code.to_string(), event)) {
+            warn!(strategy = code, error = %e, "co-located: runtime view behind; follow event dropped");
         }
     }
 

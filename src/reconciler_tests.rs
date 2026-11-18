@@ -26,11 +26,16 @@ struct FakeSource {
     max_history: Option<chrono::Duration>,
     /// Pull per symbol, with these as the venue's own scopes.
     venue_symbols: Option<Vec<String>>,
+    /// What `held_assets` answers.
+    held: Vec<String>,
+    /// The scope of each `fills_since` call.
+    pulled_scopes: Mutex<Vec<String>>,
 }
 
 #[async_trait::async_trait]
 impl ExecutionSource for FakeSource {
-    async fn fills_since(&self, _: &str, _: &str, from: Option<&Cursor>, since: DateTime<Utc>) -> Result<PullPage, BrokerError> {
+    async fn fills_since(&self, _: &str, scope: &str, from: Option<&Cursor>, since: DateTime<Utc>) -> Result<PullPage, BrokerError> {
+        self.pulled_scopes.lock().unwrap().push(scope.to_string());
         self.sinces.lock().unwrap().push(since);
         self.calls.lock().unwrap().push(from.map(|c| c.0.clone()));
         let mut pages = self.pages.lock().unwrap();
@@ -49,6 +54,9 @@ impl ExecutionSource for FakeSource {
             g.acquire().await.unwrap().forget();
         }
         Ok(self.venue_symbols.clone().unwrap_or_else(|| vec![String::new()]))
+    }
+    async fn held_assets(&self, _: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(self.held.clone())
     }
     fn hints(&self) -> PullHints {
         PullHints { intraday_secs: 3600, max_history: self.max_history, per_symbol: self.venue_symbols.is_some() }
@@ -468,7 +476,10 @@ async fn main_reconciler_skips_followed_accounts() {
     assert_eq!(cursor_accounts(&w).await, [sub, w.account]);
     // Other tests share `CONN` in the live registry; the follow is there by its own key.
     assert!(super::live(&super::Accounts::Only(sub).key(CONN)).is_some());
-    assert!(super::live_all(CONN).len() >= 2, "the EOD sweep finds the connection's reconciler and its follow's");
+    assert!(
+        super::live_all(CONN).iter().any(|h| Arc::ptr_eq(&h.inner, &follow.inner)),
+        "the EOD sweep finds the follow's reconciler under its connection"
+    );
     drop((main, follow));
 }
 
@@ -495,4 +506,24 @@ async fn binance_main_stream_fills_resolve_to_main_account_with_followed_subacco
     eventually(|| !fill_ids(&seen).is_empty()).await;
     let stamped = seen.lock().unwrap().iter().find_map(|e| if let VenueEvent::Fill(f) = e { Some(f.account_ref.clone()) } else { None });
     assert_eq!(stamped.as_deref(), Some("acc"), "the stream's fill carries the main account's ref");
+}
+
+/// A pair traded entirely during an outage (no open order, no OMS order) is
+/// found from the account's balance of its base asset.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn sweep_discovers_symbol_from_nonzero_balance() {
+    let w = world().await;
+    let source = Arc::new(FakeSource { venue_symbols: Some(vec![]), held: vec!["BTC".into()], ..Default::default() });
+    let (engine, _) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert_eq!(*source.pulled_scopes.lock().unwrap(), ["BTCUSDT"]);
+
+    // Without the balance, nothing points at the pair.
+    let blind = Arc::new(FakeSource { venue_symbols: Some(vec![]), ..Default::default() });
+    let (engine, _) = fake_engine(ok);
+    let (h, _tx) = start(&w, blind.clone(), engine);
+    h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert!(blind.pulled_scopes.lock().unwrap().is_empty());
 }

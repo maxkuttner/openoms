@@ -120,6 +120,8 @@ pub struct Reconciler {
     adapter: Option<Arc<dyn BrokerAdapter>>,
     instruments: Option<Arc<dyn InstrumentProvider>>,
     trigger: Notify,
+    /// The next pull also discovers pairs from the account's balances (set on `Connected`).
+    discover: AtomicBool,
 }
 
 /// Stops the reconciler's tasks when the last handle goes.
@@ -219,7 +221,7 @@ pub fn spawn_with(
     scope: Accounts,
 ) -> ReconcilerHandle {
     let name = scope.key(&connection);
-    let inner = Arc::new(Reconciler { connection, scope, source, engine, pool, adapter, instruments, trigger: Notify::new() });
+    let inner = Arc::new(Reconciler { connection, scope, source, engine, pool, adapter, instruments, trigger: Notify::new(), discover: AtomicBool::new(false) });
     let mut set = JoinSet::new();
 
     let r = inner.clone();
@@ -255,6 +257,7 @@ pub fn spawn_with(
         while let Some(mut event) = events.recv().await {
             if matches!(event, VenueEvent::Connected) {
                 info!(connection = %r.connection, "reconciler: stream connected, pulling");
+                r.discover.store(true, Ordering::Relaxed);
                 r.trigger.notify_one();
                 continue;
             }
@@ -335,11 +338,15 @@ impl Reconciler {
             return;
         }
         match self.accounts().await {
-            Ok(accounts) => {
-                if let [(_, account_ref)] = accounts.as_slice() {
-                    *slot = account_ref.clone();
-                }
-            }
+            Ok(accounts) => match accounts.as_slice() {
+                [(_, account_ref)] => *slot = account_ref.clone(),
+                [] => {}
+                several => warn!(
+                    connection = %self.connection,
+                    accounts = several.len(),
+                    "reconciler: stream event without an account ref and several accounts to pick from; ingest will refuse it"
+                ),
+            },
             Err(e) => warn!(connection = %self.connection, error = %e, "reconciler: accounts unreadable, event left without an account"),
         }
     }
@@ -347,8 +354,12 @@ impl Reconciler {
     /// The scopes to pull for one account: the venue's own, plus — when the
     /// venue pulls per symbol — every symbol the OMS has orders on for the
     /// account (the venue only knows its open orders' symbols; a filled or
-    /// cancelled order's symbol would otherwise never be pulled).
-    async fn scopes(&self, account_id: Uuid, account_ref: &str) -> Result<Vec<String>, String> {
+    /// cancelled order's symbol would otherwise never be pulled). With
+    /// `discover` (on reconnect and in the EOD sweep), also every catalog pair
+    /// whose base asset the account holds, so a pair traded entirely while the
+    /// stream was down is found. Not found: a never-seen pair bought and sold
+    /// back to zero during an outage (no balance, no order, no open order).
+    async fn scopes(&self, account_id: Uuid, account_ref: &str, discover: bool) -> Result<Vec<String>, String> {
         let mut scopes: std::collections::BTreeSet<String> =
             self.source.scopes(account_ref).await.map_err(|e| e.to_string())?.into_iter().collect();
         if self.source.hints().per_symbol {
@@ -364,6 +375,25 @@ impl Reconciler {
             .await
             .map_err(|e| e.to_string())?;
             scopes.extend(booked);
+            if discover {
+                let held = self.source.held_assets(account_ref).await.map_err(|e| e.to_string())?;
+                if !held.is_empty() {
+                    let found: Vec<String> = sqlx::query_scalar(
+                        "SELECT DISTINCT bi.broker_symbol FROM broker_connection bc \
+                         JOIN broker_instrument bi ON bi.broker_code = bc.broker_code \
+                         JOIN instrument i ON i.id = bi.instrument_id \
+                         WHERE bc.code = $1 AND length(bi.broker_symbol) > length(i.currency) \
+                           AND right(bi.broker_symbol, length(i.currency)) = i.currency \
+                           AND left(bi.broker_symbol, length(bi.broker_symbol) - length(i.currency)) = ANY($2)",
+                    )
+                    .bind(&self.connection)
+                    .bind(&held)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    scopes.extend(found);
+                }
+            }
         }
         Ok(scopes.into_iter().collect())
     }
@@ -382,8 +412,9 @@ impl Reconciler {
             }
         };
         let gap = Arc::new(AtomicBool::new(false));
+        let discover = self.discover.swap(false, Ordering::Relaxed);
         for (account_id, account_ref) in accounts {
-            match self.scopes(account_id, &account_ref).await {
+            match self.scopes(account_id, &account_ref, discover).await {
                 Ok(scopes) => {
                     for scope in scopes {
                         if let Err(e) = self.pull_scope(account_id, &account_ref, &scope, &gap).await {
@@ -554,7 +585,7 @@ impl Reconciler {
             }
         };
         for (account_id, account_ref) in accounts {
-            let scopes = match self.scopes(account_id, &account_ref).await {
+            let scopes = match self.scopes(account_id, &account_ref, true).await {
                 Ok(s) => s,
                 Err(e) => {
                     report.errors.push(format!("{account_ref}: scopes: {e}"));

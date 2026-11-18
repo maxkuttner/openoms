@@ -97,5 +97,12 @@ pub trait ExecutionSource: Send + Sync {
     async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError>;
     /// `[""]` unless `hints().per_symbol`.
     async fn scopes(&self, account_ref: &str) -> Result<Vec<String>, BrokerError>;
+    /// Assets the account holds a non-zero balance of, so a per-symbol venue's
+    /// caller can discover pairs it has no order on (a pair traded entirely
+    /// while the stream was down). Costly on some venues: call it on reconnect
+    /// and in the EOD sweep, not on every intraday pull. Empty by default.
+    async fn held_assets(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(Vec::new())
+    }
     fn hints(&self) -> PullHints;
 }

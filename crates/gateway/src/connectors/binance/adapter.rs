@@ -632,9 +632,32 @@ impl ExecutionSource for BinanceAdapter {
         Ok(open_order_symbols(&self.open_order_snapshot(account_ref).await?))
     }
 
+    /// GET /api/v3/account (weight 20): assets with free + locked above zero.
+    async fn held_assets(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        let resp = self.signed(Method::GET, "/api/v3/account", &[("omitZeroBalances", "true".to_string())]).await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(nonzero_assets(&body))
+    }
+
     fn hints(&self) -> PullHints {
         PullHints { intraday_secs: 60, max_history: None, per_symbol: true }
     }
+}
+
+/// The assets of `/api/v3/account` `balances` whose free + locked is above zero.
+pub(crate) fn nonzero_assets(body: &serde_json::Value) -> Vec<String> {
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    body["balances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| num(&b["free"]) + num(&b["locked"]) > 0.0)
+        .filter_map(|b| b["asset"].as_str().map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]
@@ -648,6 +671,16 @@ mod tests {
         assert_eq!(super::decimal(1e-9), "0");
     }
     use super::*;
+
+    #[test]
+    fn held_assets_are_the_nonzero_balances() {
+        let body = serde_json::json!({ "balances": [
+            { "asset": "BTC", "free": "0.5", "locked": "0" },
+            { "asset": "ETH", "free": "0", "locked": "1.2" },
+            { "asset": "BNB", "free": "0.00000000", "locked": "0.00000000" },
+        ]});
+        assert_eq!(nonzero_assets(&body), ["BTC", "ETH"]);
+    }
 
     #[test]
     fn my_trades_page_maps_to_venue_fills_with_next_cursor() {

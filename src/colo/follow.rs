@@ -181,10 +181,12 @@ async fn follow(
         let _reconciler = reconciler;
         while let Some(mut event) = stream_rx.recv().await {
             set_account_ref(&mut event, &account.external_ref);
-            hub.observe(&code, event.clone()).await;
+            // Booking first; the runtime view must never hold it up.
+            let observed = event.clone();
             if recon_tx.send(event).await.is_err() {
                 break;
             }
+            hub.observe(&code, observed);
         }
     };
     tokio::join!(stream, tee);

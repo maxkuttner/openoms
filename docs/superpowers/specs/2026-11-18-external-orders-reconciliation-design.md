@@ -231,6 +231,19 @@ Adopted orders are cancelable from the OMS by venue order id via the existing
 - `src/recon_orders.rs` diff → reconciler + ingest.
 - Per-connector unknown-order handling (`unknown_order`, UUID-or-skip).
 
+## Known gaps
+
+- **Per-symbol venues (Binance): an unseen pair's round trip.** Pulls are per
+  symbol. The scopes are the account's open-order symbols, the symbols the OMS
+  has orders on for the account, and (on reconnect and in the EOD sweep) every
+  catalog pair whose base asset the account holds a non-zero balance of. A
+  pair the OMS has never seen, bought and sold back to zero entirely while
+  the stream was down, leaves no open order, no OMS order and no balance, so
+  no pull finds its fills.
+- **One Binance sub-account per environment** (`broker_connection` is
+  `UNIQUE (broker_code, environment)`): co-located sub-accounts share the main
+  connection and are pulled by their own follow reconciler.
+
 ## Left to the builder
 
 - Exact Rust module layout and trait names.
