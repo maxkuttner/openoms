@@ -1035,7 +1035,7 @@ fn build_app(
         .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
         .route(
             "/admin/broker-connections/:code/recon",
-            axum::routing::patch(recon_admin_api::patch_recon),
+            get(recon_admin_api::get_recon).patch(recon_admin_api::patch_recon),
         )
         .route(
             "/admin/broker-connections/:code/attribution-rules",

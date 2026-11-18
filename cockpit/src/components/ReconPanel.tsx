@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "../api/client";
@@ -6,7 +7,7 @@ import { useApiMutation, useList } from "../api/hooks";
 import { lookbackOptions, policyOptions, reconPatch, showAccounts, sweepSummary, errorText, type SweepReport } from "../recon";
 import type { Venue } from "../venues";
 import type { Account, BrokerConnection, Portfolio } from "../api/types";
-import { Notice, Section } from "./common";
+import { Notice, Section, Spinner } from "./common";
 import { ConfirmButton } from "./ConfirmButton";
 import { NumberInput, Select, TextField } from "./form";
 
@@ -41,66 +42,73 @@ export function ReconPanel({ connection, venues }: { connection: BrokerConnectio
 }
 
 function SettingsSection({ code }: { code: string }) {
+  const path = `/admin/broker-connections/${code}/recon`;
   const portfolios = useList<Portfolio>("/admin/portfolios").data ?? [];
+  const current = useQuery<Settings>({ queryKey: [path], queryFn: () => api.get<Settings>(path) });
+  // null = untouched: the form shows the stored value until the user picks one.
   const [portfolio, setPortfolio] = useState<string | null>(null);
   const [policy, setPolicy] = useState<string | null>(null);
   const [lookback, setLookback] = useState<string | null>(null);
-  const [secs, setSecs] = useState<number | string>("");
-  const [saved, setSaved] = useState<Settings | null>(null);
+  const [secs, setSecs] = useState<number | string | null>(null);
+  const stored = current.data;
+  const shown = {
+    portfolio: portfolio ?? stored?.default_portfolio_id ?? null,
+    policy: policy ?? stored?.external_policy ?? null,
+    lookback: lookback ?? stored?.eod_lookback ?? null,
+    secs: secs ?? stored?.intraday_poll_secs ?? "",
+  };
 
-  const patch = reconPatch({ default_portfolio_id: portfolio, external_policy: policy, eod_lookback: lookback, intraday_poll_secs: String(secs) });
-  const save = useApiMutation(() => api.patch<Settings>(`/admin/broker-connections/${code}/recon`, patch), {
-    invalidate: [],
+  const patch = reconPatch({ default_portfolio_id: portfolio, external_policy: policy, eod_lookback: lookback, intraday_poll_secs: secs === null ? "" : String(secs) });
+  const save = useApiMutation(() => api.patch<Settings>(path, patch), {
+    invalidate: [path],
     success: "Reconciliation settings saved",
-    onDone: (r) => setSaved(r as Settings),
+    onDone: () => {
+      setPortfolio(null);
+      setPolicy(null);
+      setLookback(null);
+      setSecs(null);
+    },
   });
 
+  if (current.isLoading) return <Spinner />;
+  if (current.isError) return <Notice title="Could not load settings">{errorText(current.error)}</Notice>;
   return (
     <Section title="Settings">
       <Select
         label="Default book"
         description="Where adopted external orders book when no rule matches."
         data={portfolios.map((p) => ({ value: p.id, label: p.code }))}
-        value={portfolio}
+        value={shown.portfolio}
         onChange={setPortfolio}
-        placeholder="Leave unchanged"
+        placeholder="None set"
       />
       <Select
         label="External orders"
         description="What to do with venue orders that did not come from the OMS."
         data={policyOptions()}
-        value={policy}
+        value={shown.policy}
         onChange={setPolicy}
-        placeholder="Leave unchanged"
       />
       <Select
         label="EOD lookback"
         description="How far back the nightly sweep reads. The venue may cap its history; a sweep reports what it obtained."
         data={lookbackOptions()}
-        value={lookback}
+        value={shown.lookback}
         onChange={setLookback}
-        placeholder="Leave unchanged"
       />
       <NumberInput
         label="Intraday poll (seconds)"
-        description="Blank leaves the setting as it is."
+        description="Blank means the adapter's own interval. Once set it cannot be cleared."
         min={1}
         step={1}
-        value={secs}
+        value={shown.secs}
         onChange={setSecs}
       />
-      <p className="text-xs text-muted-foreground">Only the fields you fill in are changed; a setting cannot be cleared once set.</p>
       <div>
         <Button size="sm" disabled={Object.keys(patch).length === 0 || save.isPending} onClick={() => save.mutate(undefined)}>
           Save
         </Button>
       </div>
-      {saved && (
-        <Notice tone="success" title="Now in effect">
-          {saved.external_policy} · lookback {saved.eod_lookback} · poll {saved.intraday_poll_secs ?? "adapter default"} · book{" "}
-          {portfolios.find((p) => p.id === saved.default_portfolio_id)?.code ?? "none"}
-        </Notice>
-      )}
     </Section>
   );
 }

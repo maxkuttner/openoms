@@ -82,6 +82,18 @@ fn parse_lookback(text: &str) -> Result<Lookback, AdminError> {
     text.parse::<Lookback>().map_err(bad_request)
 }
 
+pub async fn get_recon(State(state): State<AppState>, Path(code): Path<String>) -> ApiResult<ReconSettings> {
+    sqlx::query_as::<_, ReconSettings>(
+        "SELECT code, default_portfolio_id, external_policy, eod_lookback, intraday_poll_secs FROM broker_connection WHERE code = $1",
+    )
+    .bind(&code)
+    .fetch_optional(state.pool())
+    .await
+    .map_err(map_db_error)?
+    .map(Json)
+    .ok_or_else(|| AdminError::not_found("broker_connection"))
+}
+
 pub async fn patch_recon(
     State(state): State<AppState>,
     Path(code): Path<String>,
@@ -577,6 +589,28 @@ mod tests {
         let e = bad(ReconPatch { default_portfolio_id: Some(Uuid::new_v4()), ..Default::default() }).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::NOT_FOUND);
         let e = patch_recon(State(st), Path("nope".into()), Json(ReconPatch::default())).await.unwrap_err();
+        assert_eq!(e.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn get_recon_settings_returns_current_values() {
+        let w = world().await;
+        let st = test_app_state(w.pool.clone());
+        let other = other_portfolio(&w).await;
+        patch_recon(
+            State(st.clone()),
+            Path(CONN.into()),
+            Json(ReconPatch { default_portfolio_id: Some(other), eod_lookback: Some("5y".into()), intraday_poll_secs: Some(45), ..Default::default() }),
+        )
+        .await
+        .unwrap();
+        let Json(s) = get_recon(State(st.clone()), Path(CONN.into())).await.unwrap();
+        assert_eq!(
+            (s.code.as_str(), s.default_portfolio_id, s.external_policy.as_str(), s.eod_lookback.as_str(), s.intraday_poll_secs),
+            (CONN, Some(other), "adopt", "5y", Some(45))
+        );
+        let e = get_recon(State(st), Path("nope".into())).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::NOT_FOUND);
     }
 

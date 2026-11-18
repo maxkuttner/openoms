@@ -528,6 +528,7 @@ mod tests {
         let id = Uuid::new_v4();
         let body = Some(serde_json::json!({}));
         let routes = [
+            ("GET", "/admin/broker-connections/x/recon".to_string()),
             ("PATCH", "/admin/broker-connections/x/recon".to_string()),
             ("GET", "/admin/broker-connections/x/attribution-rules".to_string()),
             ("POST", "/admin/broker-connections/x/attribution-rules".to_string()),
