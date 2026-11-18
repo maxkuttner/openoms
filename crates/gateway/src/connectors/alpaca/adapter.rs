@@ -532,16 +532,26 @@ pub(crate) fn activities_page(body: &serde_json::Value, account_ref: &str, limit
             if executed_at.is_some_and(|at| at < since) {
                 return None;
             }
-            let order_id = r["order_id"].as_str()?;
+            let id = r["id"].as_str().unwrap_or("?");
+            let skip = |field: &str| {
+                warn!(activity = id, field, "Alpaca activities: FILL row skipped, required field missing or malformed");
+                None
+            };
+            let Some(order_id) = r["order_id"].as_str().filter(|o| !o.is_empty()) else { return skip("order_id") };
+            let Some(cum) = num(&r["cum_qty"]) else { return skip("cum_qty") };
+            let Some(symbol) = r["symbol"].as_str() else { return skip("symbol") };
+            let Some(side) = r["side"].as_str() else { return skip("side") };
+            let Some(qty) = num(&r["qty"]) else { return skip("qty") };
+            let Some(price) = num(&r["price"]) else { return skip("price") };
             Some(VenueFill {
-                exec_id: super::fill_exec_id(order_id, num(&r["cum_qty"])?),
+                exec_id: super::fill_exec_id(order_id, cum),
                 venue_order_id: order_id.to_string(),
                 client_order_id: None,
                 account_ref: account_ref.to_string(),
-                symbol: r["symbol"].as_str()?.to_string(),
-                buy: r["side"].as_str()? == "buy",
-                qty: num(&r["qty"])?,
-                price: num(&r["price"])?,
+                symbol: symbol.to_string(),
+                buy: side == "buy",
+                qty,
+                price,
                 fee: None,
                 executed_at,
             })
@@ -727,6 +737,19 @@ mod tests {
         // An empty page gives no cursor, so the reconciler keeps its stamp.
         let empty = activities_page(&serde_json::json!([]), "", 100, since);
         assert!(empty.fills.is_empty() && empty.next == Cursor(String::new()) && !empty.more);
+    }
+
+    #[test]
+    fn pull_row_missing_order_id_is_skipped_with_a_warning() {
+        let body = serde_json::json!([
+            { "id": "a1", "order_id": "", "cum_qty": "1", "qty": "1", "price": "10", "side": "buy", "symbol": "AAPL" },
+            { "id": "a2", "cum_qty": "1", "qty": "1", "price": "10", "side": "buy", "symbol": "AAPL" },
+            { "id": "a3", "order_id": "o", "cum_qty": "1", "qty": "1", "price": "10", "side": "buy", "symbol": "AAPL" },
+        ]);
+        let page = activities_page(&body, "", 100, chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        assert_eq!(page.fills.len(), 1);
+        assert_eq!(page.fills[0].exec_id, "o:1");
+        assert_eq!(page.next, Cursor("a3".into()));
     }
 
     #[test]
