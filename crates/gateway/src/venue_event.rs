@@ -80,6 +80,13 @@ pub struct PullHints {
 
 #[async_trait]
 pub trait ExecutionSource: Send + Sync {
+    /// One page of fills after `from` (from the start of the scope's history
+    /// when `None`). The source always drops fills executed before `since`,
+    /// on every page. The caller picks the window: a scan started with no
+    /// cursor (first pull, EOD sweep) passes the same anchored `since` on all
+    /// its pages; a pull resuming from an established cursor passes
+    /// `DateTime::<Utc>::MIN_UTC`, since everything after the cursor is new
+    /// (including late-indexed trades stamped earlier).
     async fn fills_since(
         &self,
         account_ref: &str,

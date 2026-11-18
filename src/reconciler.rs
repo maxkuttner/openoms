@@ -328,7 +328,9 @@ impl Reconciler {
             info!(connection = %self.connection, account = account_ref, scope, "reconciler: cursor started at now");
             return Ok(());
         };
-        let since = since - SINCE_MARGIN;
+        // A scan from no cursor keeps one anchored `since` on every page; one
+        // resuming from a cursor filters nothing (all after it is new).
+        let since = if cursor.is_empty() { since - SINCE_MARGIN } else { DateTime::<Utc>::MIN_UTC };
         let mut from = (!cursor.is_empty()).then_some(Cursor(cursor));
         loop {
             let page = self.source.fills_since(account_ref, scope, from.as_ref(), since).await.map_err(|e| e.to_string())?;

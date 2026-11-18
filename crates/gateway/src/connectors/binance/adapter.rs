@@ -553,16 +553,16 @@ pub(crate) fn from_id(from: Option<&Cursor>) -> i64 {
 
 /// `myTrades` rows as a pull page: the next cursor is the last trade id (empty
 /// when there were none), and a full page (`limit` rows) means there may be
-/// more. `since`, given when paging from the oldest trade, drops the rows
-/// executed before it; the cursor still moves past them.
-pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: usize, since: Option<DateTime<Utc>>) -> PullPage {
+/// more. Rows executed before `since` are dropped (on every page); the
+/// cursor still moves past them.
+pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: usize, since: DateTime<Utc>) -> PullPage {
     let rows = body.as_array().map(Vec::len).unwrap_or(0);
     let all = parse_my_trades(body);
     let next = Cursor(all.last().map(|t| t.trade_id.clone()).unwrap_or_default());
     let fills = all
         .into_iter()
-        .filter(|t| match (since, t.executed_at) {
-            (Some(since), Some(at)) => at >= since,
+        .filter(|t| match t.executed_at {
+            Some(at) => at >= since,
             _ => true,
         })
         .map(|t| VenueFill {
@@ -632,7 +632,7 @@ impl ExecutionSource for BinanceAdapter {
             ("fromId", from_id(from).to_string()),
         ];
         let body = self.my_trades_query(&params).await?;
-        Ok(trades_page(&body, account_ref, MY_TRADES_LIMIT, from.is_none().then_some(since)))
+        Ok(trades_page(&body, account_ref, MY_TRADES_LIMIT, since))
     }
 
     async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
@@ -675,7 +675,7 @@ mod tests {
             { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0.01", "commissionAsset": "BNB" },
             { "symbol": "BTCUSDT", "id": 502, "orderId": 9003, "price": "64010", "qty": "0.1", "isBuyer": false, "commission": "0", "commissionAsset": "USDT" },
         ]);
-        let page = trades_page(&body, "acct-1", 1000, None);
+        let page = trades_page(&body, "acct-1", 1000, DateTime::<Utc>::MIN_UTC);
         assert_eq!(page.fills.len(), 2);
         let f = &page.fills[0];
         assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.account_ref.as_str(), f.symbol.as_str()), ("501", "9001", "acct-1", "BTCUSDT"));
@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(page.fills[1].fee, None);
         assert_eq!(page.next, crate::venue_event::Cursor("502".into()));
         assert!(!page.more, "a short page is the last");
-        let full = trades_page(&body, "acct-1", 2, None);
+        let full = trades_page(&body, "acct-1", 2, DateTime::<Utc>::MIN_UTC);
         assert!(full.more, "a full page asks for the next");
     }
 
@@ -701,19 +701,40 @@ mod tests {
             { "symbol": "X", "id": 1, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": 1000i64 },
             { "symbol": "X", "id": 2, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": 3000i64 },
         ]);
-        let page = trades_page(&body, "a", 1000, Some(Utc.timestamp_millis_opt(2000).unwrap()));
+        let page = trades_page(&body, "a", 1000, Utc.timestamp_millis_opt(2000).unwrap());
         assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["2"]);
         assert_eq!(page.next.0, "2");
         // Only old trades: none booked, but the cursor still moves past them.
-        let page = trades_page(&body, "a", 1000, Some(Utc.timestamp_millis_opt(9000).unwrap()));
+        let page = trades_page(&body, "a", 1000, Utc.timestamp_millis_opt(9000).unwrap());
         assert!(page.fills.is_empty());
         assert_eq!(page.next.0, "2");
     }
 
     #[test]
     fn empty_symbol_costs_one_call_and_leaves_cursor_empty() {
-        let page = trades_page(&serde_json::json!([]), "a", 1000, Some(Utc::now()));
+        let page = trades_page(&serde_json::json!([]), "a", 1000, Utc::now());
         assert_eq!(page, PullPage { fills: vec![], next: crate::venue_event::Cursor(String::new()), more: false });
+    }
+
+    #[test]
+    fn since_filter_applies_on_every_page_of_an_anchored_scan() {
+        // A two-page history (limit 2), every row older than `since` except id 4.
+        let row = |id: i64, ms: i64| serde_json::json!({ "symbol": "X", "id": id, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": ms });
+        let history = [row(1, 100), row(2, 200), row(3, 300), row(4, 5000)];
+        let since = Utc.timestamp_millis_opt(1000).unwrap();
+        let mut from: Option<crate::venue_event::Cursor> = None;
+        let mut booked = vec![];
+        loop {
+            let start = from_id(from.as_ref()) as usize;
+            let body = serde_json::Value::Array(history.iter().filter(|r| r["id"].as_i64().unwrap() as usize >= start).take(2).cloned().collect());
+            let page = trades_page(&body, "a", 2, since);
+            booked.extend(page.fills.iter().map(|f| f.exec_id.clone()));
+            if !page.more {
+                break;
+            }
+            from = Some(page.next);
+        }
+        assert_eq!(booked, ["4"], "old rows on page 2 are dropped too");
     }
 
     #[test]

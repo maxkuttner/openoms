@@ -364,6 +364,22 @@ async fn eod_sweep_registry_does_not_keep_a_reconciler_alive() {
     assert!(super::live("registry-test").is_none());
 }
 
+/// Everything after an established cursor is new, even a late-indexed trade
+/// stamped before the cursor's time: no `since` filter on any page.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn cursor_resume_pull_passes_no_since_filter() {
+    let w = world().await;
+    set_cursor(&w, "c0").await;
+    let pages = vec![page(&["e1"], "c1", true), page(&["e2"], "c2", false)];
+    let source = Arc::new(FakeSource { pages: Mutex::new(pages), ..Default::default() });
+    let (engine, seen) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    eventually(|| fill_ids(&seen).len() == 2).await;
+    assert_eq!(*source.sinces.lock().unwrap(), [DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MIN_UTC]);
+}
+
 /// A per-symbol venue only knows its open orders' symbols; the OMS adds the
 /// symbols it has orders on for the account, so a filled order's symbol is pulled.
 #[tokio::test]
