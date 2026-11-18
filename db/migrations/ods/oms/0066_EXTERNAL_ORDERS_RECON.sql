@@ -7,6 +7,9 @@ ALTER TABLE broker_connection
     ADD COLUMN external_policy TEXT NOT NULL DEFAULT 'adopt',
     ADD COLUMN eod_lookback TEXT NOT NULL DEFAULT '1w',
     ADD COLUMN intraday_poll_secs INT,                    -- NULL = the adapter's own hint
+    -- Pulls and sweeps drop fills executed before this: set below for a connection
+    -- whose pre-upgrade fills cannot all be re-keyed to today's exec ids.
+    ADD COLUMN recon_not_before TIMESTAMPTZ,
     ADD CONSTRAINT broker_connection_external_policy_check CHECK (external_policy IN ('adopt','break')),
     ADD CONSTRAINT broker_connection_eod_lookback_check CHECK (eod_lookback IN ('1d','1w','1m','1y','5y','10y'));
 
@@ -19,6 +22,9 @@ CREATE TABLE attribution_rule (
     client_id_prefix       TEXT,
     portfolio_id           UUID NOT NULL REFERENCES portfolio(id),
     priority               INT NOT NULL,
+    -- Who manages the rule: NULL for a person (API/cockpit), 'colo:<strategy>'
+    -- for the rule a co-located registration sets. Registration touches only its own.
+    owner                  TEXT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
     CHECK (account_id IS NOT NULL OR client_id_prefix IS NOT NULL)
 );
@@ -73,11 +79,48 @@ CREATE UNIQUE INDEX order_state_venue_order
     WHERE external_order_id IS NOT NULL AND venue_trade_id IS NULL;
 
 -- Seed the ledger from fills already booked, so a re-read of the venue's
--- executions does not book them twice.
-INSERT INTO venue_fill (broker_connection_code, account_id, exec_id, order_id, booked_at)
-SELECT o.broker_connection_code, o.account_id, e.payload_json->'payload'->>'execution_id', o.order_id, e.created_at
+-- executions does not book them twice. The ids are re-keyed to what today's
+-- ingest paths report:
+--   IBKR_TWS        execId without its trailing `.NN` revision
+--   ALPACA          "{order id}:{cum qty after the fill}"
+--   BINANCE, OKX    "{symbol}:{trade id}:{B|S}" (trade ids are per symbol)
+--   others          unchanged
+CREATE TEMP TABLE legacy_fill ON COMMIT DROP AS
+SELECT o.broker_connection_code, o.account_id, o.order_id, e.created_at, bc.broker_code,
+       e.payload_json->'payload'->>'execution_id' AS old_id,
+       CASE bc.broker_code
+         WHEN 'IBKR_TWS' THEN regexp_replace(e.payload_json->'payload'->>'execution_id', '\.[^.]*$', '')
+         WHEN 'ALPACA' THEN
+           CASE WHEN o.external_order_id IS NOT NULL AND jsonb_typeof(e.payload_json->'payload'->'cum_qty') = 'number'
+                THEN o.external_order_id || ':' || trim_scale((e.payload_json->'payload'->>'cum_qty')::numeric)::text END
+         WHEN 'BINANCE' THEN sym.broker_symbol || ':' || (e.payload_json->'payload'->>'execution_id') || ':'
+                             || CASE WHEN upper(o.side) = 'BUY' THEN 'B' ELSE 'S' END
+         WHEN 'OKX' THEN sym.broker_symbol || ':' || (e.payload_json->'payload'->>'execution_id') || ':'
+                         || CASE WHEN upper(o.side) = 'BUY' THEN 'B' ELSE 'S' END
+         ELSE e.payload_json->'payload'->>'execution_id'
+       END AS new_id
 FROM order_event e
 JOIN order_state o ON o.order_id = e.order_id
+JOIN broker_connection bc ON bc.code = o.broker_connection_code
+LEFT JOIN LATERAL (
+    SELECT bi.broker_symbol FROM public.broker_instrument bi
+    WHERE bi.broker_code = bc.broker_code AND bi.instrument_id::text = o.instrument_id
+    ORDER BY bi.broker_symbol LIMIT 1
+) sym ON true
 WHERE e.event_type IN ('order_partially_filled', 'order_filled')
-  AND e.payload_json->'payload'->>'execution_id' IS NOT NULL
+  AND e.payload_json->'payload'->>'execution_id' IS NOT NULL;
+
+INSERT INTO venue_fill (broker_connection_code, account_id, exec_id, order_id, booked_at)
+SELECT broker_connection_code, account_id, COALESCE(new_id, old_id), order_id, created_at
+FROM legacy_fill
 ON CONFLICT DO NOTHING;
+
+-- Where a legacy id cannot be re-keyed (Binance FIX keyed fills on ExecID(17),
+-- indistinguishable from a trade id; a fill whose symbol or cum qty is unknown),
+-- a re-read would book it again: the connection's pulls ignore anything
+-- executed before the upgrade.
+UPDATE broker_connection bc SET recon_not_before = now()
+WHERE EXISTS (
+    SELECT 1 FROM legacy_fill l
+    WHERE l.broker_connection_code = bc.code AND (l.broker_code = 'BINANCE' OR l.new_id IS NULL)
+);

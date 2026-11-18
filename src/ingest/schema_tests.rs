@@ -17,6 +17,10 @@ struct Base {
 
 /// A connection, account, portfolio and principal, using only pre-0066 columns.
 async fn seed_base(pool: &PgPool) -> Base {
+    seed_base_for(pool, "BINANCE").await
+}
+
+async fn seed_base_for(pool: &PgPool, broker: &str) -> Base {
     let suffix = Uuid::new_v4().simple().to_string();
     let base = Base {
         connection: format!("conn-{suffix}"),
@@ -24,8 +28,8 @@ async fn seed_base(pool: &PgPool) -> Base {
         portfolio: Uuid::new_v4(),
         principal: Uuid::new_v4(),
     };
-    sqlx::query("INSERT INTO oms.broker_connection (code, broker_code, environment) VALUES ($1, 'BINANCE', 'PAPER')")
-        .bind(&base.connection).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO oms.broker_connection (code, broker_code, environment) VALUES ($1, $2, 'PAPER')")
+        .bind(&base.connection).bind(broker).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO oms.portfolio (id, code, name, status) VALUES ($1, $2, 'p', 'ACTIVE')")
         .bind(base.portfolio).bind(format!("pf-{suffix}")).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO oms.principal (id, code, principal_type, status) VALUES ($1, $2, 'STRATEGY', 'ACTIVE')")
@@ -211,4 +215,100 @@ async fn connection_recon_settings_default_and_validate() {
     .bind(Uuid::new_v4()).bind(&b.connection).bind(b.portfolio)
     .execute(&pool).await;
     assert!(rule.is_err(), "a rule needs an account or a client-id prefix");
+}
+
+/// One legacy fill: an order on `instrument` (`side`) with venue id `ext`, and a
+/// fill event carrying `execution_id` and `cum_qty` (as JSON numbers are stored).
+async fn legacy_fill(pool: &PgPool, b: &Base, instrument: &str, side: &str, ext: &str, fills: &[(&str, &str)]) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO oms.order_state (order_id, client_order_id, principal_id, portfolio_id, account_id, \
+         broker_connection_code, instrument_id, side, order_type, time_in_force, original_qty, leaves_qty, \
+         cum_qty, status, external_order_id, version) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'MARKET', 'GTC', 1, 0, 1, 'FILLED', $9, 1)",
+    )
+    .bind(id).bind(format!("c-{id}")).bind(b.principal).bind(b.portfolio).bind(b.account)
+    .bind(&b.connection).bind(instrument).bind(side).bind(ext)
+    .execute(pool).await.unwrap();
+    for (version, (exec, cum)) in fills.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO oms.order_event (order_id, version, event_id, event_type, payload_json) \
+             VALUES ($1, $2, $3, 'order_partially_filled', jsonb_build_object('payload', \
+                 jsonb_build_object('execution_id', $4::text, 'cum_qty', $5::text::jsonb)))",
+        )
+        .bind(id).bind(version as i64 + 1).bind(Uuid::new_v4()).bind(exec).bind(cum)
+        .execute(pool).await.unwrap();
+    }
+    id
+}
+
+async fn seeded_ids(pool: &PgPool, b: &Base) -> Vec<String> {
+    sqlx::query_scalar("SELECT exec_id FROM oms.venue_fill WHERE broker_connection_code = $1 ORDER BY exec_id")
+        .bind(&b.connection).fetch_all(pool).await.unwrap()
+}
+
+async fn not_before(pool: &PgPool, b: &Base) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT recon_not_before FROM oms.broker_connection WHERE code = $1")
+        .bind(&b.connection).fetch_one(pool).await.unwrap()
+}
+
+/// The ledger is seeded with the ids today's ingest paths report, so the first
+/// sweep after the upgrade sees legacy fills as duplicates; where an id cannot
+/// be re-keyed, the connection gets a `recon_not_before` watermark.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn legacy_seed_matches_new_exec_ids() {
+    let pool = fresh_db().await;
+    migrate::ensure_tracking(&pool).await.unwrap();
+    migrate::apply_matching(&pool, |schema, file| schema != "oms" || file < RECON_MIGRATION)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO public.currency (code, name) VALUES ('USDT', 'Tether') ON CONFLICT DO NOTHING")
+        .execute(&pool).await.unwrap();
+    let venue: String = sqlx::query_scalar("SELECT code FROM public.venue ORDER BY code LIMIT 1").fetch_one(&pool).await.unwrap();
+    let instrument = |symbol: &'static str| {
+        let pool = pool.clone();
+        let venue = venue.clone();
+        async move {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO public.instrument (symbol, venue, name, asset_class, instrument_class, currency, status, price_precision, price_increment) \
+                 VALUES ($1, $2, $1, 'CRYPTO', 'SPOT', 'USDT', 'ACTIVE', 2, 0.01) RETURNING id",
+            )
+            .bind(symbol).bind(&venue).fetch_one(&pool).await.unwrap();
+            id
+        }
+    };
+    let btc = instrument("BTCUSDT").await;
+    let eth = instrument("ETH-USDT").await;
+    for (broker, id, sym) in [("BINANCE", btc, "BTCUSDT"), ("OKX", eth, "ETH-USDT")] {
+        sqlx::query("INSERT INTO public.broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, $3, true)")
+            .bind(id).bind(broker).bind(sym).execute(&pool).await.unwrap();
+    }
+
+    let binance = seed_base_for(&pool, "BINANCE").await;
+    legacy_fill(&pool, &binance, &btc.to_string(), "BUY", "9001", &[("501", "0.5")]).await;
+    let okx = seed_base_for(&pool, "OKX").await;
+    legacy_fill(&pool, &okx, &eth.to_string(), "SELL", "o1", &[("42", "1")]).await;
+    let tws = seed_base_for(&pool, "IBKR_TWS").await;
+    legacy_fill(&pool, &tws, "1", "BUY", "7", &[("0000e0d5.6578c1a2.01.01", "100")]).await;
+    let alpaca = seed_base_for(&pool, "ALPACA").await;
+    legacy_fill(&pool, &alpaca, "1", "BUY", "alp-1", &[("6f1d-uuid-a", "0.5"), ("6f1d-uuid-b", "10.0")]).await;
+    let coinbase = seed_base_for(&pool, "COINBASE").await;
+    legacy_fill(&pool, &coinbase, "1", "BUY", "cb-1", &[("b7c4e2a0-trade", "1")]).await;
+
+    migrate::apply_all(&pool).await.unwrap();
+
+    assert_eq!(seeded_ids(&pool, &binance).await, [gateway::connectors::binance::fill_exec_id("BTCUSDT", "501", true)]);
+    assert_eq!(seeded_ids(&pool, &okx).await, ["ETH-USDT:42:S"]);
+    assert_eq!(seeded_ids(&pool, &tws).await, ["0000e0d5.6578c1a2.01"]);
+    // Alpaca's key is "{order id}:{cum}" with cum printed as Rust prints an f64.
+    assert_eq!(seeded_ids(&pool, &alpaca).await, [format!("alp-1:{}", 0.5f64), format!("alp-1:{}", 10.0f64)]);
+    assert_eq!(seeded_ids(&pool, &coinbase).await, ["b7c4e2a0-trade"]);
+
+    // Binance FIX keyed fills on ExecID(17), which cannot be told from a trade
+    // id: its connection is watermarked; the re-keyed venues are not.
+    assert!(not_before(&pool, &binance).await.is_some());
+    for b in [&okx, &tws, &alpaca, &coinbase] {
+        assert_eq!(not_before(&pool, b).await, None, "{}", b.connection);
+    }
 }

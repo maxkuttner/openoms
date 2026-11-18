@@ -13,7 +13,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
-use super::{record_finished, JobKind};
+use super::{record_outcome, JobKind};
 use crate::reconciler::SweepReport;
 
 /// UTC time of day the sweep runs.
@@ -81,13 +81,31 @@ pub async fn run_connection(pool: &PgPool, connection: &str, lookback: Lookback)
     info!(connection, ?report, "eod sweep");
     match serde_json::to_value(&report) {
         Ok(result) => {
-            if let Err(e) = record_finished(pool, JobKind::EodSweep, Some(connection), "system", result).await {
+            let error = failure(&report);
+            if let Some(err) = &error {
+                warn!(connection, error = %err, "eod sweep failed");
+            }
+            if let Err(e) = record_outcome(pool, JobKind::EodSweep, Some(connection), "system", result, error.as_deref()).await {
                 error!(connection, error = %e, "could not record the eod sweep as a job");
             }
         }
         Err(e) => error!(connection, error = %e, "eod sweep report not serializable"),
     }
     Some(report)
+}
+
+/// A sweep that booked nothing and hit failures or errors failed; its error is
+/// every error text (the report keeps them too). One that booked something
+/// succeeded, with its errors in the report.
+pub(crate) fn failure(report: &SweepReport) -> Option<String> {
+    if report.booked > 0 || (report.failed == 0 && report.errors.is_empty()) {
+        return None;
+    }
+    Some(if report.errors.is_empty() {
+        format!("{} fills failed to ingest", report.failed)
+    } else {
+        report.errors.join("; ")
+    })
 }
 
 /// Sweep every active connection that has a reconciler.
@@ -133,6 +151,21 @@ mod tests {
         }
         assert!("2w".parse::<Lookback>().is_err());
         assert!("".parse::<Lookback>().is_err());
+    }
+
+    #[test]
+    fn a_sweep_with_only_failures_is_a_failed_job_with_its_errors() {
+        let at = Utc.with_ymd_and_hms(2026, 11, 18, 0, 15, 0).unwrap();
+        let mut r = SweepReport { requested_from: at, obtained_from: at, booked: 0, duplicates: 3, breaks: 0, failed: 1, errors: vec!["a BTCUSDT: fill x: boom".into()] };
+        assert_eq!(failure(&r).as_deref(), Some("a BTCUSDT: fill x: boom"));
+        r.errors.clear();
+        assert_eq!(failure(&r).as_deref(), Some("1 fills failed to ingest"));
+        r.booked = 1;
+        assert_eq!(failure(&r), None, "booked something: succeeded");
+        r = SweepReport { booked: 0, failed: 0, errors: vec!["a: scopes: down".into()], ..r };
+        assert!(failure(&r).is_some(), "a venue error with nothing booked fails");
+        r.errors.clear();
+        assert_eq!(failure(&r), None, "a clean empty sweep succeeds");
     }
 
     #[test]

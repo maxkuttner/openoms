@@ -690,7 +690,7 @@ fn break_kind(kind: BreakKind) -> &'static str {
     }
 }
 
-fn event_json(event: &VenueEvent) -> serde_json::Value {
+pub(crate) fn event_json(event: &VenueEvent) -> serde_json::Value {
     match event {
         VenueEvent::Fill(f) => json!({
             "type": "fill", "exec_id": f.exec_id, "venue_order_id": f.venue_order_id,

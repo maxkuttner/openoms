@@ -14,8 +14,13 @@
 //!   fills: ingest flags a fill gap and the gap triggers another pull.
 //! - **Triggers coalesce:** one pull runs at a time; any number of triggers while
 //!   it runs queue exactly one rerun.
-//! - **Cursors:** a missing cursor is created empty, stamped "now", and history
-//!   is skipped (history comes only from the EOD sweep). An empty cursor pulls
+//! - **Cursors:** a missing cursor on an account that has none yet is created
+//!   empty, stamped "now", and history is skipped (history comes only from the
+//!   EOD sweep). A missing cursor on an account that already has cursors (a pair
+//!   found on reconnect, or newly traded) is stamped with the account's oldest
+//!   cursor stamp and pulled from there at once.
+//! - **Watermark:** fills executed before `broker_connection.recon_not_before`
+//!   are dropped by pulls and sweeps (pre-upgrade fills the ledger could not re-key). An empty cursor pulls
 //!   with `from = None, since = updated_at - 60s`; a non-empty returned cursor is
 //!   stored, an empty one leaves the row (and its stamp) untouched.
 //!
@@ -122,7 +127,13 @@ pub struct Reconciler {
     trigger: Notify,
     /// The next pull also discovers pairs from the account's balances (set on `Connected`).
     discover: AtomicBool,
+    /// Consecutive ingest failures of one exec id, per (account, scope).
+    failures: std::sync::Mutex<std::collections::HashMap<(Uuid, String), (String, u32)>>,
 }
+
+/// After this many consecutive failures of one fill, the fill is recorded as an
+/// `ingest_error` break and the scope moves past it.
+const MAX_FILL_FAILURES: u32 = 3;
 
 /// Stops the reconciler's tasks when the last handle goes.
 struct Tasks(std::sync::Mutex<JoinSet<()>>);
@@ -221,7 +232,7 @@ pub fn spawn_with(
     scope: Accounts,
 ) -> ReconcilerHandle {
     let name = scope.key(&connection);
-    let inner = Arc::new(Reconciler { connection, scope, source, engine, pool, adapter, instruments, trigger: Notify::new(), discover: AtomicBool::new(false) });
+    let inner = Arc::new(Reconciler { connection, scope, source, engine, pool, adapter, instruments, trigger: Notify::new(), discover: AtomicBool::new(false), failures: Default::default() });
     let mut set = JoinSet::new();
 
     let r = inner.clone();
@@ -268,8 +279,10 @@ pub fn spawn_with(
             r.engine.venue_send(&r.connection, event, r.instruments.clone(), Some(tx)).await;
             let watcher = r.clone();
             tokio::spawn(async move {
-                if let Ok(Ok(IngestOutcome { fill_gap: true, .. })) = rx.await {
-                    watcher.trigger.notify_one();
+                match rx.await {
+                    Ok(Ok(IngestOutcome { fill_gap: true, .. })) => watcher.trigger.notify_one(),
+                    Ok(Err(e)) => warn!(connection = %watcher.connection, error = %e, "reconciler: stream event not ingested; the next pull retries it"),
+                    _ => {}
                 }
             });
         }
@@ -407,6 +420,60 @@ impl Reconciler {
         Ok(scopes.into_iter().collect())
     }
 
+    /// `broker_connection.recon_not_before`: fills executed before it are not
+    /// pulled (pre-upgrade fills whose ids the ledger could not re-key).
+    async fn not_before(&self) -> Result<Option<DateTime<Utc>>, String> {
+        sqlx::query_scalar::<_, Option<DateTime<Utc>>>("SELECT recon_not_before FROM broker_connection WHERE code = $1")
+            .bind(&self.connection)
+            .fetch_optional(&self.pool)
+            .await
+            .map(Option::flatten)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Count one failure of `exec_id` in a scope; `true` once it has failed
+    /// [`MAX_FILL_FAILURES`] times in a row (the count is then reset).
+    fn note_failure(&self, account_id: Uuid, scope: &str, exec_id: &str) -> bool {
+        let mut map = self.failures.lock().unwrap();
+        let entry = map.entry((account_id, scope.to_string())).or_insert_with(|| (exec_id.to_string(), 0));
+        if entry.0 != exec_id {
+            *entry = (exec_id.to_string(), 0);
+        }
+        entry.1 += 1;
+        if entry.1 >= MAX_FILL_FAILURES {
+            map.remove(&(account_id, scope.to_string()));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_failures(&self, account_id: Uuid, scope: &str) {
+        self.failures.lock().unwrap().remove(&(account_id, scope.to_string()));
+    }
+
+    /// Record a fill that keeps failing to ingest as an `ingest_error` break, so
+    /// a person sees it and the scope is not wedged on it.
+    async fn record_ingest_error(&self, account_id: Uuid, fill: &gateway::venue_event::VenueFill, error: &str) -> Result<(), String> {
+        let mut event = crate::ingest::apply::event_json(&VenueEvent::Fill(fill.clone()));
+        event["error"] = serde_json::Value::String(error.to_string());
+        sqlx::query(
+            "INSERT INTO recon_break (id, broker_connection_code, account_id, venue_order_id, kind, events_json) \
+             VALUES ($1, $2, $3, $4, 'ingest_error', jsonb_build_array($5::jsonb)) \
+             ON CONFLICT (broker_connection_code, account_id, venue_order_id) WHERE status = 'open' \
+             DO UPDATE SET events_json = recon_break.events_json || EXCLUDED.events_json",
+        )
+        .bind(Uuid::new_v4())
+        .bind(&self.connection)
+        .bind(account_id)
+        .bind(&fill.venue_order_id)
+        .bind(event)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+    }
+
     async fn ingest(&self, event: VenueEvent) -> Result<IngestOutcome, String> {
         self.engine.venue_ack(&self.connection, event, self.instruments.clone()).await
     }
@@ -451,21 +518,45 @@ impl Reconciler {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
-        let Some((cursor, since)) = row else {
-            // A new account starts now; its history is the EOD sweep's job.
-            sqlx::query(
-                "INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor) \
-                 VALUES ($1, $2, $3, '') ON CONFLICT DO NOTHING",
-            )
-            .bind(&self.connection)
-            .bind(account_id)
-            .bind(scope)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?;
-            info!(connection = %self.connection, account = account_ref, scope, "reconciler: cursor started at now");
-            return Ok(());
+        let (cursor, since) = match row {
+            Some(row) => row,
+            None => {
+                // A new scope on an account already pulled (a pair found by
+                // balance discovery, or newly traded) starts where the account's
+                // oldest cursor stands, so fills from an outage are pulled now;
+                // a brand-new account starts now (its history is the EOD sweep's).
+                let watermark: Option<DateTime<Utc>> = sqlx::query_scalar(
+                    "SELECT min(updated_at) FROM recon_cursor WHERE broker_connection_code = $1 AND account_id = $2",
+                )
+                .bind(&self.connection)
+                .bind(account_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                sqlx::query(
+                    "INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor, updated_at) \
+                     VALUES ($1, $2, $3, '', COALESCE($4, now())) ON CONFLICT DO NOTHING",
+                )
+                .bind(&self.connection)
+                .bind(account_id)
+                .bind(scope)
+                .bind(watermark)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+                match watermark {
+                    Some(at) => {
+                        info!(connection = %self.connection, account = account_ref, scope, since = %at, "reconciler: new scope starts at the account's watermark");
+                        (String::new(), at)
+                    }
+                    None => {
+                        info!(connection = %self.connection, account = account_ref, scope, "reconciler: cursor started at now");
+                        return Ok(());
+                    }
+                }
+            }
         };
+        let not_before = self.not_before().await?;
         // A scan from no cursor keeps one anchored `since` on every page; one
         // resuming from a cursor filters nothing (all after it is new).
         let since = if cursor.is_empty() { since - SINCE_MARGIN } else { DateTime::<Utc>::MIN_UTC };
@@ -473,12 +564,28 @@ impl Reconciler {
         loop {
             let page = self.source.fills_since(account_ref, scope, from.as_ref(), since).await.map_err(|e| e.to_string())?;
             for fill in page.fills {
+                if before(&fill, not_before) {
+                    continue;
+                }
                 let exec_id = fill.exec_id.clone();
-                let out = self.ingest(VenueEvent::Fill(fill)).await.map_err(|e| format!("fill {exec_id}: {e}"))?;
+                let out = match self.ingest(VenueEvent::Fill(fill.clone())).await {
+                    Ok(out) => out,
+                    Err(e) => {
+                        warn!(connection = %self.connection, account = account_ref, scope, exec_id, error = %e, "reconciler: fill not ingested");
+                        if !self.note_failure(account_id, scope, &exec_id) {
+                            return Err(format!("fill {exec_id}: {e}"));
+                        }
+                        // Persistently failing: a break for a person, and move on.
+                        self.record_ingest_error(account_id, &fill, &e).await?;
+                        error!(connection = %self.connection, account = account_ref, scope, exec_id, error = %e, "reconciler: fill failed {MAX_FILL_FAILURES} times; recorded as an ingest_error break and skipped");
+                        continue;
+                    }
+                };
                 if out.fill_gap {
                     gap.store(true, Ordering::Relaxed);
                 }
             }
+            self.clear_failures(account_id, scope);
             // An empty `next` keeps the row as is: moving its stamp would slide
             // `since` past fills the venue publishes late.
             sqlx::query(
@@ -593,6 +700,13 @@ impl Reconciler {
                 return report;
             }
         };
+        let not_before = match self.not_before().await {
+            Ok(n) => n,
+            Err(e) => {
+                report.errors.push(format!("recon_not_before: {e}"));
+                return report;
+            }
+        };
         for (account_id, account_ref) in accounts {
             let scopes = match self.scopes(account_id, &account_ref, true).await {
                 Ok(s) => s,
@@ -612,11 +726,19 @@ impl Reconciler {
                         }
                     };
                     for fill in page.fills {
+                        if before(&fill, not_before) {
+                            continue;
+                        }
+                        let exec_id = fill.exec_id.clone();
                         match self.ingest(VenueEvent::Fill(fill)).await {
                             Ok(out) if out.duplicate => report.duplicates += 1,
                             Ok(out) if out.broken => report.breaks += 1,
                             Ok(_) => report.booked += 1,
-                            Err(_) => report.failed += 1,
+                            Err(e) => {
+                                warn!(connection = %self.connection, account = %account_ref, scope, exec_id, error = %e, "reconciler: sweep: fill not ingested");
+                                report.failed += 1;
+                                report.errors.push(format!("{account_ref} {scope}: fill {exec_id}: {e}"));
+                            }
                         }
                     }
                     if !page.more {
@@ -632,6 +754,12 @@ impl Reconciler {
         }
         report
     }
+}
+
+/// A fill executed before the connection's `recon_not_before` (one with no
+/// execution time is kept).
+fn before(fill: &gateway::venue_event::VenueFill, not_before: Option<DateTime<Utc>>) -> bool {
+    matches!((fill.executed_at, not_before), (Some(at), Some(nb)) if at < nb)
 }
 
 #[cfg(test)]

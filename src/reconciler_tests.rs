@@ -569,3 +569,112 @@ async fn held_assets_failure_keeps_existing_scopes_and_retries_discovery() {
     assert!(r.errors.is_empty());
     assert_eq!(*source.pulled_scopes.lock().unwrap(), ["ETHUSDT"]);
 }
+
+/// A pair found on reconnect (balance discovery) on an account that already
+/// has cursors is pulled at once from the account's oldest cursor stamp, not
+/// started at now (which would leave the outage's fills to the EOD sweep).
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn reconnect_discovered_symbol_pulls_since_account_watermark() {
+    let w = world().await;
+    let stamp = Utc::now() - chrono::Duration::hours(3);
+    sqlx::query("INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor, updated_at) VALUES ($1, $2, 'ETHUSDT', 'c0', $3)")
+        .bind(CONN).bind(w.account).bind(stamp).execute(&w.pool).await.unwrap();
+    let source = Arc::new(FakeSource {
+        venue_symbols: Some(vec!["ETHUSDT".into()]),
+        held: vec!["BTC".into()],
+        ..Default::default()
+    });
+    let (engine, _) = fake_engine(ok);
+    let (_h, tx) = start(&w, source.clone(), engine);
+    tx.send(VenueEvent::Connected).await.unwrap();
+    eventually(|| source.pulled_scopes.lock().unwrap().contains(&"BTCUSDT".to_string())).await;
+    let scopes = source.pulled_scopes.lock().unwrap().clone();
+    let i = scopes.iter().position(|s| s == "BTCUSDT").unwrap();
+    assert_eq!(source.calls.lock().unwrap()[i], None, "no cursor yet");
+    assert_eq!(
+        source.sinces.lock().unwrap()[i].timestamp_micros(),
+        (stamp - super::SINCE_MARGIN).timestamp_micros()
+    );
+    let saved: DateTime<Utc> = sqlx::query_scalar("SELECT updated_at FROM recon_cursor WHERE broker_connection_code = $1 AND account_id = $2 AND scope = 'BTCUSDT'")
+        .bind(CONN).bind(w.account).fetch_one(&w.pool).await.unwrap();
+    assert_eq!(saved.timestamp_micros(), stamp.timestamp_micros());
+}
+
+/// Pre-upgrade fills on a connection with a `recon_not_before` watermark are
+/// not re-read by pulls or sweeps (their legacy ids could not be re-keyed).
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn watermark_blocks_pre_upgrade_refetch() {
+    let w = world().await;
+    let upgrade = Utc::now() - chrono::Duration::hours(1);
+    sqlx::query("UPDATE broker_connection SET recon_not_before = $2 WHERE code = $1")
+        .bind(CONN).bind(upgrade).execute(&w.pool).await.unwrap();
+    let at = |f: VenueFill, t: DateTime<Utc>| VenueFill { executed_at: Some(t), ..f };
+    let fills = || vec![at(fill("old"), upgrade - chrono::Duration::minutes(5)), at(fill("new"), upgrade + chrono::Duration::minutes(5))];
+    set_cursor(&w, "c0").await;
+    let source = Arc::new(FakeSource {
+        pages: Mutex::new(vec![
+            PullPage { fills: fills(), next: Cursor("c1".into()), more: false },
+            PullPage { fills: fills(), next: Cursor(String::new()), more: false },
+        ]),
+        ..Default::default()
+    });
+    let (engine, seen) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    eventually(|| !fill_ids(&seen).is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fill_ids(&seen), ["new"]);
+    let r = h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert_eq!((r.booked, r.failed), (1, 0));
+    assert_eq!(fill_ids(&seen), ["new", "new"], "the sweep drops the pre-upgrade fill too");
+}
+
+/// A fill that fails ingest on every pull becomes an `ingest_error` break on its
+/// third failure and the scope moves past it.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn persistently_failing_fill_becomes_ingest_error_break_and_scope_advances() {
+    let w = world().await;
+    set_cursor(&w, "c0").await;
+    let pages = (0..3).map(|_| page(&["bad", "good"], "c1", false)).collect();
+    let source = Arc::new(FakeSource { pages: Mutex::new(pages), ..Default::default() });
+    let (engine, seen) = fake_engine(|e| match e {
+        VenueEvent::Fill(f) if f.exec_id == "bad" => Err("poisoned".into()),
+        _ => Ok(IngestOutcome::default()),
+    });
+    let (h, _tx) = start(&w, source.clone(), engine);
+    for n in 1..=3 {
+        h.pull_now();
+        eventually(|| fill_ids(&seen).iter().filter(|e| *e == "bad").count() == n).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if n < 3 {
+            assert_eq!(cursor(&w).await.as_deref(), Some("c0"), "pull {n}: wedged on the failure");
+        }
+    }
+    eventually(|| fill_ids(&seen).contains(&"good".to_string())).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(cursor(&w).await.as_deref(), Some("c1"));
+    let (kind, events): (String, serde_json::Value) = sqlx::query_as(
+        "SELECT kind, events_json FROM recon_break WHERE broker_connection_code = $1 AND account_id = $2 AND venue_order_id = 'v1' AND status = 'open'",
+    )
+    .bind(CONN).bind(w.account).fetch_one(&w.pool).await.unwrap();
+    assert_eq!(kind, "ingest_error");
+    assert_eq!((events[0]["exec_id"].as_str(), events[0]["error"].as_str()), (Some("bad"), Some("poisoned")));
+}
+
+/// A sweep keeps the text of each failed ingest in its report.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn eod_sweep_reports_failed_ingest_errors() {
+    let w = world().await;
+    let source = Arc::new(FakeSource { pages: Mutex::new(vec![page(&["e1"], "", false)]), ..Default::default() });
+    let (engine, _) = fake_engine(|_| Err("db down".into()));
+    let (h, _tx) = start(&w, source, engine);
+    let r = h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert_eq!((r.booked, r.failed), (0, 1));
+    assert_eq!(r.errors.len(), 1);
+    assert!(r.errors[0].contains("e1") && r.errors[0].contains("db down"), "{:?}", r.errors);
+    assert!(crate::jobs::eod_sweep::failure(&r).is_some());
+}

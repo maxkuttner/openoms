@@ -239,7 +239,15 @@ Adopted orders are cancelable from the OMS by venue order id via the existing
   catalog pair whose base asset the account holds a non-zero balance of. A
   pair the OMS has never seen, bought and sold back to zero entirely while
   the stream was down, leaves no open order, no OMS order and no balance, so
-  no pull finds its fills.
+  no pull finds its fills. A pair that is found (by balance discovery on
+  reconnect, or newly traded) on an account that already has cursors is
+  pulled at once from the account's oldest cursor stamp, not from "now".
+- **Pre-upgrade Binance fills are not re-read.** Migration 0066 re-keys legacy
+  ledger ids to today's formats where it can (IBKR TWS, Alpaca, OKX, Binance
+  REST); Binance FIX keyed fills on `ExecID`(17), which is indistinguishable
+  from a trade id, so Binance connections with legacy fills (and any
+  connection with an id that could not be re-keyed) get
+  `recon_not_before` = upgrade time and pulls/sweeps drop older fills.
 - **One Binance sub-account per environment** (`broker_connection` is
   `UNIQUE (broker_code, environment)`): co-located sub-accounts share the main
   connection and are pulled by their own follow reconciler.
