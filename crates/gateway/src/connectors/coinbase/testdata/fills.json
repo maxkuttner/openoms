@@ -1,0 +1,5 @@
+{"fills":[
+{"entry_id":"e3","trade_id":"t-300","order_id":"99999999-0000-4000-8000-000000000009","trade_time":"2026-11-03T12:00:03.500Z","trade_type":"FILL","price":"65020","size":"1","commission":"0.5","product_id":"BTC-USD","sequence_timestamp":"2026-11-03T12:00:03.600Z","liquidity_indicator":"MAKER","size_in_quote":false,"user_id":"u","side":"SELL"},
+{"entry_id":"e2","trade_id":"t-200","order_id":"11111111-2222-4333-8444-555555555555","trade_time":"2026-11-03T12:00:02Z","trade_type":"FILL","price":"65000","size":"32.5","commission":"0.13","product_id":"BTC-USD","sequence_timestamp":"2026-11-03T12:00:02.100Z","liquidity_indicator":"TAKER","size_in_quote":true,"user_id":"u","side":"BUY"},
+{"entry_id":"e1","trade_id":"t-100","order_id":"11111111-2222-4333-8444-555555555555","trade_time":"2026-11-03T12:00:01Z","trade_type":"FILL","price":"65000","commission":"0","product_id":"BTC-USD","sequence_timestamp":"2026-11-03T12:00:01.100Z","liquidity_indicator":"TAKER","size_in_quote":false,"user_id":"u","side":"BUY"}
+],"cursor":"next-page-token"}

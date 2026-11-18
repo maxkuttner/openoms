@@ -1,59 +1,48 @@
-//! Coinbase Advanced Trade private user stream — real-time order updates,
-//! mirroring the Bybit and Binance streams (no polling).
+//! Coinbase Advanced Trade private user stream: real-time order state as venue
+//! events.
 //!
 //! Connect `wss://advanced-trade-ws-user.coinbase.com` and, within 5 seconds,
 //! subscribe to `user` (orders) and `heartbeats` (keeps an idle connection open),
-//! each with a fresh JWT. Coinbase reports **cumulative** order state —
-//! `cumulative_quantity` and `avg_price` — not one message per fill. A fill is
-//! therefore "Coinbase cumulative − what the OMS has booked", priced against
-//! the OMS's booked average ([`crate::contract::ExecKind::Cumulative`]), so
-//! a repeated, replayed or reordered update books nothing and needs no memory of
-//! earlier messages; the execution path has no execution-id dedupe to lean on. A terminal status goes through
-//! [`crate::contract::ExecKind::Terminal`]: book what's missing, then close.
+//! each with a fresh JWT. Coinbase reports **cumulative** order state
+//! (`cumulative_quantity`, `avg_price`), with no trade id and no per-fill size,
+//! so the stream emits no fills: any id or size derived from it would differ from
+//! the `trade_id` of `orders/historical/fills`, and one fill would be booked
+//! twice. Every order entry is an order update instead; when its cumulative
+//! quantity is ahead of what the OMS booked, ingest reports a fill gap and the
+//! reconciler pulls the fills by `trade_id`.
 
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::time::Duration;
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use crate::connectors::coinbase::adapter::{order_outcome, CoinbaseAdapter};
-use crate::contract::{EngineHandle, ExecEvent, ExecKind, ExecSource};
-use crate::contract::BrokerOrderState;
+use crate::connectors::coinbase::adapter::{order_update_from_push, CoinbaseAdapter};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
+use crate::venue_event::VenueEvent as VEvent;
 
-const VENUE: &str = "COINBASE";
 const WS_URL: &str = "wss://advanced-trade-ws-user.coinbase.com";
 
-/// How often to sweep for missed terminal states; the `heartbeats` channel keeps
-/// the socket itself alive.
-const RECONCILE_SECS: u64 = 20;
-
 struct CoinbaseSession {
-    environment: &'static str,
     adapter: Arc<CoinbaseAdapter>,
     health: StreamHandle,
-    engine: EngineHandle,
+    tx: mpsc::Sender<VEvent>,
 }
 
 #[async_trait::async_trait]
 impl Session for CoinbaseSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(self.environment, &self.adapter, &self.health, &self.engine).await
+        let result = connect_and_run(&self.adapter, &self.health, &self.tx).await;
+        let _ = self.tx.send(VEvent::Disconnected).await;
+        result
     }
 }
 
-pub async fn run(
-    environment: &'static str,
-    adapter: Arc<CoinbaseAdapter>,
-    health: StreamHandle,
-    engine: EngineHandle,
-) {
+pub async fn run(environment: &'static str, adapter: Arc<CoinbaseAdapter>, health: StreamHandle, tx: mpsc::Sender<VEvent>) {
     info!(env = environment, "starting Coinbase user stream");
-    let session = CoinbaseSession { environment, adapter, health: health.clone(), engine };
+    let session = CoinbaseSession { adapter, health: health.clone(), tx };
     supervise("COINBASE/LIVE", health, session).await
 }
 
@@ -64,90 +53,32 @@ pub(crate) fn subscribe_messages(adapter: &CoinbaseAdapter) -> [serde_json::Valu
     })
 }
 
-/// What one order entry means for its OMS order.
-#[derive(Debug)]
-pub(crate) enum Update {
-    /// Still working, with something filled: book what the OMS hasn't yet.
-    Progress { cum: f64, avg: f64 },
-    /// Finished: book what's missing, then close.
-    Terminal(BrokerOrderState),
-}
-
-/// The updates one `user` message carries, by OMS order id. Orders the OMS
-/// didn't place (no UUID `client_order_id`) and open orders with nothing filled
-/// are skipped.
-pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
+/// The order states one `user` message carries, whoever placed the orders
+/// (a client id is carried as-is). One Coinbase key is one account, which ingest
+/// resolves by the connection alone.
+pub(crate) fn venue_events(msg: &serde_json::Value) -> Vec<VEvent> {
     if msg["channel"].as_str() != Some("user") {
         return Vec::new();
     }
-    let events = msg["events"].as_array().cloned().unwrap_or_default();
-    events
-        .iter()
-        .flat_map(|e| e["orders"].as_array().cloned().unwrap_or_default())
+    msg["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|e| e["orders"].as_array().into_iter().flatten())
         .filter_map(|o| {
-            let id = Uuid::parse_str(o["client_order_id"].as_str()?).ok()?;
-            let num = |k: &str| o[k].as_str().and_then(|s| s.parse::<f64>().ok());
-            let cum = num("cumulative_quantity").unwrap_or(0.0);
-            let avg = num("avg_price").unwrap_or(0.0);
-            let status = o["status"].as_str()?;
-            let update = match status {
-                "FILLED" | "CANCELLED" | "EXPIRED" | "FAILED" => Update::Terminal(BrokerOrderState {
-                    outcome: order_outcome(status),
-                    executed_qty: cum,
-                    avg_px: avg,
-                }),
-                _ if cum > 0.0 => Update::Progress { cum, avg },
-                _ => return None,
-            };
-            Some((id, update))
+            let update = order_update_from_push(o, "");
+            if update.is_none() {
+                warn!(?o, "Coinbase WS: order entry with unknown status or no order_id");
+            }
+            update.map(VEvent::Order)
         })
         .collect()
-}
-
-/// The running `total_fees` each order entry reports, by OMS order id, in the
-/// product's quote currency (`BTC-USD` -> `USD`). Zero sends nothing.
-pub(crate) fn fee_totals(msg: &serde_json::Value) -> Vec<(Uuid, f64, String)> {
-    if msg["channel"].as_str() != Some("user") {
-        return Vec::new();
-    }
-    let events = msg["events"].as_array().cloned().unwrap_or_default();
-    events
-        .iter()
-        .flat_map(|e| e["orders"].as_array().cloned().unwrap_or_default())
-        .filter_map(|o| {
-            let id = Uuid::parse_str(o["client_order_id"].as_str()?).ok()?;
-            let total: f64 = o["total_fees"].as_str()?.parse().ok()?;
-            let quote = o["product_id"].as_str()?.rsplit_once('-')?.1;
-            (total != 0.0 && !quote.is_empty()).then(|| (id, total, quote.to_string()))
-        })
-        .collect()
-}
-
-fn fee_event(order_id: Uuid, total: f64, currency: String) -> ExecEvent {
-    ExecEvent {
-        order_id,
-        venue: VENUE.to_string(),
-        actor: "coinbase",
-        source: ExecSource::Session,
-        kind: ExecKind::FeeTotal { total, currency },
-    }
-}
-
-/// What one parsed update tells the order engine: cumulative progress books
-/// only what the OMS is missing, so a repeated update books nothing.
-fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
-    let kind = match update {
-        Update::Progress { cum, avg } => ExecKind::Cumulative { cum_qty: cum, avg_px: avg },
-        Update::Terminal(st) => ExecKind::Terminal(st),
-    };
-    ExecEvent { order_id, venue: VENUE.to_string(), actor: "coinbase", source: ExecSource::Session, kind }
 }
 
 async fn connect_and_run(
-    environment: &'static str,
     adapter: &Arc<CoinbaseAdapter>,
     health: &StreamHandle,
-    engine: &EngineHandle,
+    tx: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(WS_URL).await?;
     info!("Coinbase user WS connected");
@@ -157,29 +88,18 @@ async fn connect_and_run(
     }
 
     let mut live = false;
-    let mut sweep = tokio::time::interval(Duration::from_secs(RECONCILE_SECS));
-    sweep.tick().await; // consume the immediate first tick
-
-    loop {
-        let text = tokio::select! {
-            _ = sweep.tick() => {
-                engine.reconcile(VENUE, environment, "coinbase", adapter.clone()).await;
-                continue;
-            }
-            msg = ws.next() => {
-                let Some(msg) = msg else { break };
-                health.record_event();
-                match msg? {
-                    Message::Text(t) => t,
-                    Message::Binary(b) => match String::from_utf8(b) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    },
-                    Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
-                    Message::Close(_) => break,
-                    _ => continue,
-                }
-            }
+    // The `heartbeats` channel keeps the socket alive, so nothing else wakes the loop.
+    while let Some(msg) = ws.next().await {
+        health.record_event();
+        let text = match msg? {
+            Message::Text(t) => t,
+            Message::Binary(b) => match String::from_utf8(b) {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Message::Ping(p) => { ws.send(Message::Pong(p)).await?; continue; }
+            Message::Close(_) => break,
+            _ => continue,
         };
 
         let v: serde_json::Value = match serde_json::from_str(&text) {
@@ -197,13 +117,15 @@ async fn connect_and_run(
             info!("Coinbase user stream live");
             health.set_live();
             live = true;
-            engine.reconcile(VENUE, environment, "coinbase", adapter.clone()).await;
+            // The reconciler pulls fills and the open-order snapshot for the outage.
+            if tx.send(VEvent::Connected).await.is_err() {
+                return Ok(());
+            }
         }
-        for (order_id, update) in updates(&v) {
-            engine.exec(exec_event(order_id, update)).await;
-        }
-        for (order_id, total, currency) in fee_totals(&v) {
-            engine.exec(fee_event(order_id, total, currency)).await;
+        for event in venue_events(&v) {
+            if tx.send(event).await.is_err() {
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -212,21 +134,9 @@ async fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::BrokerOrderOutcome;
+    use crate::venue_event::VenueOrderStatus;
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
-
-    #[test]
-    fn coinbase_progress_becomes_cumulative_event() {
-        let (order_id, update) = updates(&sample("partial"))
-            .into_iter()
-            .find(|(_, u)| matches!(u, Update::Progress { .. }))
-            .expect("the sample carries one");
-        let ev = exec_event(order_id, update);
-        assert_eq!(ev.order_id, order_id);
-        assert_eq!(ev.actor, "coinbase");
-        assert!(matches!(ev.kind, crate::contract::ExecKind::Cumulative { .. }), "{:?}", ev.kind);
-    }
 
     fn sample(name: &str) -> serde_json::Value {
         let text = match name {
@@ -236,6 +146,16 @@ mod tests {
             other => panic!("no sample {other}"),
         };
         serde_json::from_str(text).unwrap()
+    }
+
+    fn orders(msg: &serde_json::Value) -> Vec<crate::venue_event::VenueOrderUpdate> {
+        venue_events(msg)
+            .into_iter()
+            .map(|e| match e {
+                VEvent::Order(o) => o,
+                other => panic!("only order states, got {other:?}"),
+            })
+            .collect()
     }
 
     fn adapter() -> CoinbaseAdapter {
@@ -264,60 +184,39 @@ mod tests {
     }
 
     #[test]
-    fn a_partial_fill_is_progress_with_cumulative_and_average() {
-        let u = updates(&sample("partial"));
-        assert_eq!(u.len(), 1);
-        assert_eq!(u[0].0.to_string(), ORDER_ID);
-        assert!(matches!(u[0].1, Update::Progress { cum, avg } if cum == 0.0005 && avg == 65000.0), "{:?}", u[0].1);
+    fn a_partial_fill_is_the_orders_cumulative_state_and_never_a_fill() {
+        let o = orders(&sample("partial"));
+        assert_eq!(o.len(), 1);
+        assert_eq!((o[0].venue_order_id.as_str(), o[0].client_order_id.as_deref(), o[0].symbol.as_str(), o[0].buy), ("1", Some(ORDER_ID), "BTC-USD", true));
+        assert_eq!((o[0].status.clone(), o[0].cum_qty, o[0].qty), (VenueOrderStatus::Working, 0.0005, 0.001));
     }
 
     #[test]
-    fn an_open_order_with_nothing_filled_is_not_an_update() {
-        // The snapshot's own order has cumulative 0; the other was placed outside the OMS.
-        assert!(updates(&sample("snapshot")).is_empty());
+    fn coinbase_fill_without_oms_id_is_kept() {
+        // The snapshot's second order was placed in the Coinbase app: its own client id is carried.
+        let o = orders(&sample("snapshot"));
+        assert_eq!(o.len(), 2);
+        assert_eq!((o[1].client_order_id.as_deref(), o[1].cum_qty), (Some("placed-in-the-coinbase-app"), 0.5));
     }
 
     #[test]
-    fn filled_cancelled_expired_failed_are_terminal() {
-        let u = updates(&sample("terminal"));
-        let outcomes: Vec<_> = u
-            .iter()
-            .map(|(_, up)| match up {
-                Update::Terminal(st) => (st.outcome, st.executed_qty),
-                other => panic!("{other:?}"),
-            })
-            .collect();
+    fn every_status_maps_to_an_order_state() {
+        let o = orders(&sample("terminal"));
+        let st: Vec<_> = o.iter().map(|o| (o.status.clone(), o.cum_qty)).collect();
         assert_eq!(
-            outcomes,
+            st,
             [
-                (BrokerOrderOutcome::Filled, 0.001),
-                (BrokerOrderOutcome::Canceled, 0.0),
-                (BrokerOrderOutcome::Canceled, 0.0002),
-                (BrokerOrderOutcome::Rejected, 0.0),
+                (VenueOrderStatus::Filled, 0.001),
+                (VenueOrderStatus::Canceled, 0.0),
+                (VenueOrderStatus::Expired, 0.0002),
+                (VenueOrderStatus::Rejected { reason: "INSUFFICIENT_FUNDS".into() }, 0.0),
             ]
         );
     }
 
     #[test]
-    fn a_non_uuid_client_order_id_is_ignored() {
-        let mut msg = sample("partial");
-        msg["events"][0]["orders"][0]["client_order_id"] = "placed-in-the-coinbase-app".into();
-        assert!(updates(&msg).is_empty());
-    }
-
-    #[test]
-    fn coinbase_update_sends_fee_total_in_quote() {
-        let mut msg = sample("partial");
-        msg["events"][0]["orders"][0]["total_fees"] = "0.13".into();
-        let t = fee_totals(&msg);
-        assert_eq!(t.len(), 1);
-        let ev = fee_event(t[0].0, t[0].1, t[0].2.clone());
-        assert_eq!(t[0].0.to_string(), ORDER_ID);
-        assert!(matches!(&ev.kind, ExecKind::FeeTotal { total, currency } if *total == 0.13 && currency == "USD"), "{:?}", ev.kind);
-    }
-
-    #[test]
-    fn coinbase_zero_total_fees_sends_nothing() {
-        assert!(fee_totals(&sample("partial")).is_empty());
+    fn other_channels_are_ignored() {
+        let v = serde_json::from_str(include_str!("testdata/ws_ticker.json")).unwrap();
+        assert!(venue_events(&v).is_empty());
     }
 }
