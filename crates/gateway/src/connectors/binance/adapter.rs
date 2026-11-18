@@ -544,36 +544,27 @@ pub(crate) fn parse_my_trades(body: &serde_json::Value) -> Vec<crate::contract::
 
 /// Most rows one `myTrades` call returns.
 const MY_TRADES_LIMIT: usize = 1000;
-/// Widest `startTime`..`endTime` span `myTrades` accepts.
-const DAY_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// What one `myTrades` call asks for, from the reconciler's cursor.
-///
-/// The cursor is a trade id (continue after it) or `@<ms>`: the start of the
-/// next time window to scan, used until a pull has seen its first trade
-/// (`myTrades` serves at most 24h per `startTime`/`endTime` call).
-#[derive(Debug, PartialEq)]
-pub(crate) enum TradesQuery {
-    FromId(i64),
-    Window { start: i64, end: i64 },
-}
-
-pub(crate) fn trades_query(from: Option<&Cursor>, since: DateTime<Utc>, now: DateTime<Utc>) -> TradesQuery {
-    let window = |start: i64| TradesQuery::Window { start, end: (start + DAY_MS).min(now.timestamp_millis()) };
-    let from_since = || window(since.timestamp_millis());
-    match from.map(|c| c.0.as_str()) {
-        Some(c) if c.starts_with('@') => c[1..].parse().map(window).unwrap_or_else(|_| from_since()),
-        Some(c) => c.parse::<i64>().map(|id| TradesQuery::FromId(id + 1)).unwrap_or_else(|_| from_since()),
-        None => from_since(),
-    }
+/// The `fromId` of the next `myTrades` call: after the cursor's trade id, or
+/// the symbol's oldest trade when there is no cursor yet (paging by id costs
+/// one call per 1000 trades, where scanning time windows costs one per day).
+pub(crate) fn from_id(from: Option<&Cursor>) -> i64 {
+    from.and_then(|c| c.0.parse::<i64>().ok()).map_or(0, |id| id + 1)
 }
 
 /// `myTrades` rows as a pull page: the next cursor is the last trade id (empty
-/// when there were none), and a full page (`limit` rows) means there may be more.
-pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: usize) -> PullPage {
+/// when there were none), and a full page (`limit` rows) means there may be
+/// more. `since`, given when paging from the oldest trade, drops the rows
+/// executed before it; the cursor still moves past them.
+pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: usize, since: Option<DateTime<Utc>>) -> PullPage {
     let rows = body.as_array().map(Vec::len).unwrap_or(0);
-    let fills: Vec<VenueFill> = parse_my_trades(body)
+    let all = parse_my_trades(body);
+    let next = Cursor(all.last().map(|t| t.trade_id.clone()).unwrap_or_default());
+    let fills = all
         .into_iter()
+        .filter(|t| match (since, t.executed_at) {
+            (Some(since), Some(at)) => at >= since,
+            _ => true,
+        })
         .map(|t| VenueFill {
             exec_id: t.trade_id,
             venue_order_id: t.venue_order_id,
@@ -590,22 +581,7 @@ pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: us
             executed_at: t.executed_at,
         })
         .collect();
-    let next = Cursor(fills.last().map(|f| f.exec_id.clone()).unwrap_or_default());
     PullPage { fills, next, more: rows >= limit }
-}
-
-/// A time window's rows: with trades, continue by trade id from the last one
-/// (which also covers a window cut short at the row limit); empty, move on to
-/// the window ending at `end`, until that reaches `now`.
-pub(crate) fn window_page(body: &serde_json::Value, account_ref: &str, _start: i64, end: i64, now: DateTime<Utc>) -> PullPage {
-    let mut page = trades_page(body, account_ref, MY_TRADES_LIMIT);
-    if page.fills.is_empty() {
-        page.next = Cursor(format!("@{end}"));
-        page.more = end < now.timestamp_millis();
-    } else {
-        page.more = true;
-    }
-    page
 }
 
 /// `GET /api/v3/openOrders` as the venue's view of each open order.
@@ -650,28 +626,20 @@ impl ExecutionSource for BinanceAdapter {
         from: Option<&Cursor>,
         since: DateTime<Utc>,
     ) -> Result<PullPage, BrokerError> {
-        let now = Utc::now();
-        let mut params = vec![("symbol", scope.to_string()), ("limit", MY_TRADES_LIMIT.to_string())];
-        match trades_query(from, since, now) {
-            TradesQuery::FromId(id) => {
-                params.push(("fromId", id.to_string()));
-                Ok(trades_page(&self.my_trades_query(&params).await?, account_ref, MY_TRADES_LIMIT))
-            }
-            TradesQuery::Window { start, end } if end <= start => {
-                Ok(PullPage { fills: vec![], next: Cursor(String::new()), more: false })
-            }
-            TradesQuery::Window { start, end } => {
-                params.push(("startTime", start.to_string()));
-                params.push(("endTime", end.to_string()));
-                Ok(window_page(&self.my_trades_query(&params).await?, account_ref, start, end, now))
-            }
-        }
+        let params = vec![
+            ("symbol", scope.to_string()),
+            ("limit", MY_TRADES_LIMIT.to_string()),
+            ("fromId", from_id(from).to_string()),
+        ];
+        let body = self.my_trades_query(&params).await?;
+        Ok(trades_page(&body, account_ref, MY_TRADES_LIMIT, from.is_none().then_some(since)))
     }
 
     async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
         let resp = self.signed(Method::GET, "/api/v3/openOrders", &[]).await?;
         if !resp.status().is_success() {
-            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
         }
         let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
         Ok(parse_open_order_snapshot(&body, account_ref))
@@ -707,7 +675,7 @@ mod tests {
             { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0.01", "commissionAsset": "BNB" },
             { "symbol": "BTCUSDT", "id": 502, "orderId": 9003, "price": "64010", "qty": "0.1", "isBuyer": false, "commission": "0", "commissionAsset": "USDT" },
         ]);
-        let page = trades_page(&body, "acct-1", 1000);
+        let page = trades_page(&body, "acct-1", 1000, None);
         assert_eq!(page.fills.len(), 2);
         let f = &page.fills[0];
         assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.account_ref.as_str(), f.symbol.as_str()), ("501", "9001", "acct-1", "BTCUSDT"));
@@ -716,28 +684,36 @@ mod tests {
         assert_eq!(page.fills[1].fee, None);
         assert_eq!(page.next, crate::venue_event::Cursor("502".into()));
         assert!(!page.more, "a short page is the last");
-        let full = trades_page(&body, "acct-1", 2);
+        let full = trades_page(&body, "acct-1", 2, None);
         assert!(full.more, "a full page asks for the next");
     }
 
     #[test]
-    fn a_trade_id_cursor_pages_by_from_id_and_a_time_cursor_by_window() {
-        use crate::venue_event::Cursor;
-        let now = Utc.timestamp_millis_opt(10 * DAY_MS).unwrap();
-        let since = Utc.timestamp_millis_opt(DAY_MS).unwrap();
-        assert_eq!(trades_query(Some(&Cursor("502".into())), since, now), TradesQuery::FromId(503));
-        assert_eq!(trades_query(None, since, now), TradesQuery::Window { start: DAY_MS, end: 2 * DAY_MS });
-        assert_eq!(trades_query(Some(&Cursor(format!("@{}", 9 * DAY_MS + 5))), since, now), TradesQuery::Window { start: 9 * DAY_MS + 5, end: 10 * DAY_MS });
-        // An empty window moves a time cursor on; it is the last page once it reaches now.
-        let empty = serde_json::json!([]);
-        let page = window_page(&empty, "a", DAY_MS, 2 * DAY_MS, now);
-        assert_eq!((page.next.0.as_str(), page.more), ("@172800000", true));
-        let page = window_page(&empty, "a", 9 * DAY_MS, 10 * DAY_MS, now);
-        assert!(!page.more);
-        // A window with trades continues from the last trade id.
-        let one = serde_json::json!([{ "symbol": "X", "id": 7, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true }]);
-        let page = window_page(&one, "a", DAY_MS, 2 * DAY_MS, now);
-        assert_eq!((page.next.0.as_str(), page.more), ("7", true));
+    fn a_trade_id_cursor_pages_from_the_next_id() {
+        // `fromId` is inclusive, so the cursor's own trade is not pulled again.
+        assert_eq!(from_id(Some(&crate::venue_event::Cursor("502".into()))), 503);
+    }
+
+    #[test]
+    fn no_cursor_starts_from_id_zero_and_filters_by_since() {
+        assert_eq!(from_id(None), 0);
+        let body = serde_json::json!([
+            { "symbol": "X", "id": 1, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": 1000i64 },
+            { "symbol": "X", "id": 2, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": 3000i64 },
+        ]);
+        let page = trades_page(&body, "a", 1000, Some(Utc.timestamp_millis_opt(2000).unwrap()));
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["2"]);
+        assert_eq!(page.next.0, "2");
+        // Only old trades: none booked, but the cursor still moves past them.
+        let page = trades_page(&body, "a", 1000, Some(Utc.timestamp_millis_opt(9000).unwrap()));
+        assert!(page.fills.is_empty());
+        assert_eq!(page.next.0, "2");
+    }
+
+    #[test]
+    fn empty_symbol_costs_one_call_and_leaves_cursor_empty() {
+        let page = trades_page(&serde_json::json!([]), "a", 1000, Some(Utc::now()));
+        assert_eq!(page, PullPage { fills: vec![], next: crate::venue_event::Cursor(String::new()), more: false });
     }
 
     #[test]
