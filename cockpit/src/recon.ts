@@ -47,6 +47,18 @@ export function reconPatch(form: ReconForm): Record<string, string | number> {
   return patch;
 }
 
+// A new rule's priority: low precedence, so it does not silently outrank others.
+export const DEFAULT_RULE_PRIORITY = 100;
+
+// The rule form's priority as the API takes it, or null when it is not a
+// whole number >= 0. A blank field must not save: Number("") is 0, the
+// highest precedence.
+export function rulePriority(value: number | string): number | null {
+  if (typeof value === "string" && value.trim() === "") return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 export type SweepReport = {
   requested_from: string;
   obtained_from: string;

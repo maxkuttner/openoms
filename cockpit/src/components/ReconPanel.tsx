@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "../api/client";
 import { useApiMutation, useList } from "../api/hooks";
-import { lookbackOptions, policyOptions, reconPatch, showAccounts, sweepSummary, errorText, type SweepReport } from "../recon";
+import { DEFAULT_RULE_PRIORITY, lookbackOptions, policyOptions, reconPatch, rulePriority, showAccounts, sweepSummary, errorText, type SweepReport } from "../recon";
 import type { Venue } from "../venues";
 import type { Account, BrokerConnection, Portfolio } from "../api/types";
 import { Notice, Section, Spinner } from "./common";
@@ -166,7 +166,7 @@ function RulesSection({ connection, multiAccount }: { connection: BrokerConnecti
   const [account, setAccount] = useState<string | null>(null);
   const [prefix, setPrefix] = useState("");
   const [portfolio, setPortfolio] = useState<string | null>(null);
-  const [priority, setPriority] = useState<number | string>(100);
+  const [priority, setPriority] = useState<number | string>(DEFAULT_RULE_PRIORITY);
   const [error, setError] = useState<string | null>(null);
 
   const open = (r: Rule | null) => {
@@ -174,10 +174,10 @@ function RulesSection({ connection, multiAccount }: { connection: BrokerConnecti
     setAccount(r?.account_id ?? null);
     setPrefix(r?.client_id_prefix ?? "");
     setPortfolio(r?.portfolio_id ?? null);
-    setPriority(r?.priority ?? 100);
+    setPriority(r?.priority ?? DEFAULT_RULE_PRIORITY);
     setError(null);
   };
-  const body = { account_id: account, client_id_prefix: prefix || null, portfolio_id: portfolio, priority: Number(priority) };
+  const body = { account_id: account, client_id_prefix: prefix || null, portfolio_id: portfolio, priority: rulePriority(priority) };
   const save = useApiMutation(() => (editing ? api.put(`${base}/${editing}`, body) : api.post(base, body)), {
     invalidate: [base],
     success: "Rule saved",
@@ -246,7 +246,7 @@ function RulesSection({ connection, multiAccount }: { connection: BrokerConnecti
           <div className="flex gap-2">
             <Button
               size="sm"
-              disabled={!portfolio || save.isPending}
+              disabled={!portfolio || rulePriority(priority) === null || save.isPending}
               onClick={() => save.mutate(undefined, { onError: (e) => setError(errorText(e)) })}
             >
               Save rule

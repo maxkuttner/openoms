@@ -1,7 +1,17 @@
 // Run with `npm test` (node --test; Node strips the types itself).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { adoptBreak, dismissBreak, errorText, lookbackOptions, openBreakCount, reconPatch, showAccounts, sweepSummary } from "./recon.ts";
+import { adoptBreak, dismissBreak, errorText, lookbackOptions, openBreakCount, reconPatch, rulePriority, DEFAULT_RULE_PRIORITY, showAccounts, sweepSummary } from "./recon.ts";
+
+test("blank_rule_priority_cannot_save", () => {
+  assert.equal(rulePriority(""), null, "blank is not 0 (highest precedence)");
+  assert.equal(rulePriority("  "), null);
+  assert.equal(rulePriority(-1), null);
+  assert.equal(rulePriority("1.5"), null);
+  assert.equal(rulePriority("7"), 7);
+  assert.equal(rulePriority(0), 0);
+  assert.equal(DEFAULT_RULE_PRIORITY, 100);
+});
 
 test("lookback_select_offers_six_values", () => {
   assert.deepEqual(lookbackOptions().map((o) => o.value), ["1d", "1w", "1m", "1y", "5y", "10y"]);

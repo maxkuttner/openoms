@@ -184,6 +184,9 @@ async fn insert_broker(pool: &PgPool, code: &str, kind: &str) {
 async fn reload_http_lifecycle_against_postgres() {
     let url = std::env::var("OMS_RELOAD_TEST_DATABASE_URL")
         .expect("set OMS_RELOAD_TEST_DATABASE_URL to an explicit disposable Postgres server");
+    // The expectations below are for Binance over REST; pin it so a `.env`
+    // that other tests load (dotenvy searches parent dirs) cannot switch it to FIX.
+    std::env::set_var("BINANCE_PAPER_TRANSPORT", "rest");
     let options: PgConnectOptions = url.parse().unwrap();
     let admin = PgPool::connect_with(options.clone()).await.unwrap();
     let name = format!("oms_reload_{}", uuid::Uuid::new_v4().simple());
