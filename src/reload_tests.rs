@@ -92,7 +92,7 @@ impl FakeStreams {
 
 #[async_trait::async_trait]
 impl ReloadStreams for FakeStreams {
-    async fn exec(&self, stream: reload::ExecStreamStart, _: &RegistrationDeps, streams: &StreamRegistry) {
+    async fn exec(&self, stream: reload::ExecStreamStart, _: &RegistrationDeps, streams: &StreamRegistry, _: &sqlx::PgPool) {
         // the reload-overlap test pauses the Alpaca start; the others never wait
         if stream.code == "ALPACA" {
             let gate = self.gate.lock().unwrap().take();

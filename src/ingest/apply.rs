@@ -711,4 +711,4 @@ async fn record_break(
 
 #[cfg(test)]
 #[path = "apply_tests.rs"]
-mod tests;
+pub(crate) mod tests;

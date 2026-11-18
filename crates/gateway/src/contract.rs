@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 use uuid::Uuid;
 
-use crate::adapter::BrokerAdapter;
+use crate::adapter::{BrokerAdapter, InstrumentProvider};
 use crate::venue_event::VenueEvent;
 
 /// Connectors wait (rather than drop) once this many messages are queued: a
@@ -80,9 +80,28 @@ pub enum GatewayMsg {
     /// Carries the adapter because the diff asks the broker about each order it
     /// resolves, not just for one snapshot.
     Reconcile { broker_code: &'static str, environment: &'static str, actor: &'static str, adapter: Arc<dyn BrokerAdapter> },
-    /// What a venue connection reported, by connection code.
-    Venue { connection: String, event: VenueEvent },
+    /// What a venue connection reported, by connection code. `instruments`
+    /// lets ingest resolve a symbol the OMS does not know yet; `reply`, when
+    /// set, gets the outcome once the event is applied (pulls wait on it).
+    Venue {
+        connection: String,
+        event: VenueEvent,
+        instruments: Option<Arc<dyn InstrumentProvider>>,
+        reply: Option<VenueReply>,
+    },
 }
+
+/// What ingesting one venue event came to, as far as the sender cares.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct IngestOutcome {
+    /// The venue reports more executed than the OMS has booked: pull the fills.
+    pub fill_gap: bool,
+    /// Already booked; nothing was written.
+    pub duplicate: bool,
+}
+
+/// Where the engine answers a `GatewayMsg::Venue`; `Err` is the ingest error, as text.
+pub type VenueReply = oneshot::Sender<Result<IngestOutcome, String>>;
 
 /// What a followed venue account (a co-located strategy's) did. The OMS did
 /// not place these orders; it only watches them, books their fills, and may
@@ -144,10 +163,34 @@ impl EngineHandle {
         }
     }
 
+    /// Fire and forget: nobody hears how it went.
     pub async fn venue(&self, connection: &str, event: VenueEvent) {
-        if self.0.send(GatewayMsg::Venue { connection: connection.to_string(), event }).await.is_err() {
+        self.venue_send(connection, event, None, None).await;
+    }
+
+    pub async fn venue_send(
+        &self,
+        connection: &str,
+        event: VenueEvent,
+        instruments: Option<Arc<dyn InstrumentProvider>>,
+        reply: Option<VenueReply>,
+    ) {
+        let msg = GatewayMsg::Venue { connection: connection.to_string(), event, instruments, reply };
+        if self.0.send(msg).await.is_err() {
             error!(connection, "order engine is gone; venue event dropped");
         }
+    }
+
+    /// Apply one event and wait until it is booked (or failed).
+    pub async fn venue_ack(
+        &self,
+        connection: &str,
+        event: VenueEvent,
+        instruments: Option<Arc<dyn InstrumentProvider>>,
+    ) -> Result<IngestOutcome, String> {
+        let (tx, rx) = oneshot::channel();
+        self.venue_send(connection, event, instruments, Some(tx)).await;
+        rx.await.unwrap_or_else(|_| Err("order engine dropped the venue event".into()))
     }
 
     /// Reconcile one connection (`broker_code` in `environment`) through `adapter`.

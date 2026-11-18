@@ -11,17 +11,17 @@ use crate::authz_schema_tests::migrated_db;
 use crate::event_bus::EventBus;
 use crate::ingest::decide::{BreakKind, Decision};
 
-const CONN: &str = "BIN-TEST";
+pub(crate) const CONN: &str = "BIN-TEST";
 
-struct World {
-    pool: PgPool,
-    bus: EventBus,
-    portfolio: Uuid,
-    account: Uuid,
-    instrument: i64,
+pub(crate) struct World {
+    pub(crate) pool: PgPool,
+    pub(crate) bus: EventBus,
+    pub(crate) portfolio: Uuid,
+    pub(crate) account: Uuid,
+    pub(crate) instrument: i64,
 }
 
-async fn world() -> World {
+pub(crate) async fn world() -> World {
     let pool = migrated_db().await;
     let portfolio = Uuid::new_v4();
     let account = Uuid::new_v4();

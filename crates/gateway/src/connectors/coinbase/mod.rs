@@ -46,7 +46,7 @@ impl Connector for Coinbase {
         let adapter = Arc::new(adapter);
         let stream_adapter = adapter.clone();
         Ok(Connected {
-            source: None,
+            source: None, venue_stream: None,
             daily_stats: Some(adapter.clone()),
             adapter,
             exec_stream: Some(Arc::new(move |health, engine| {

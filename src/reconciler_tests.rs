@@ -1,0 +1,246 @@
+//! Reconciler tests: a `FakeSource`, a fake engine that answers each venue
+//! event, and a freshly migrated database (`OMS_RELOAD_TEST_DATABASE_URL`).
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use gateway::adapter::{BrokerAdapter, BrokerError};
+use gateway::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState, EngineHandle, GatewayMsg, IngestOutcome};
+use gateway::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueEvent, VenueFill, VenueOrderStatus, VenueOrderUpdate};
+use tokio::sync::{mpsc, Semaphore};
+use uuid::Uuid;
+
+use super::{spawn, spawn_with, ReconcilerHandle};
+use crate::ingest::apply::tests::{world, World, CONN};
+
+#[derive(Default)]
+struct FakeSource {
+    pages: Mutex<Vec<PullPage>>,
+    /// `from` of each `fills_since` call.
+    calls: Mutex<Vec<Option<String>>>,
+    scopes_calls: Mutex<usize>,
+    /// When set, `scopes` waits for a permit (to hold a pull open).
+    gate: Option<Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl ExecutionSource for FakeSource {
+    async fn fills_since(&self, _: &str, _: &str, from: Option<&Cursor>, _: DateTime<Utc>) -> Result<PullPage, BrokerError> {
+        self.calls.lock().unwrap().push(from.map(|c| c.0.clone()));
+        let mut pages = self.pages.lock().unwrap();
+        Ok(if pages.is_empty() {
+            PullPage { fills: vec![], next: Cursor(from.map(|c| c.0.clone()).unwrap_or_default()), more: false }
+        } else {
+            pages.remove(0)
+        })
+    }
+    async fn open_order_snapshot(&self, _: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        Ok(vec![])
+    }
+    async fn scopes(&self, _: &str) -> Result<Vec<String>, BrokerError> {
+        *self.scopes_calls.lock().unwrap() += 1;
+        if let Some(g) = &self.gate {
+            g.acquire().await.unwrap().forget();
+        }
+        Ok(vec![String::new()])
+    }
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 3600, max_history: None, per_symbol: false }
+    }
+}
+
+/// Reports the order canceled with 2 executed.
+struct ClosedAtVenue;
+
+#[async_trait::async_trait]
+impl BrokerAdapter for ClosedAtVenue {
+    async fn submit_order(&self, _: &gateway::adapter::BrokerOrderRequest) -> Result<gateway::adapter::BrokerOrderResponse, BrokerError> {
+        unreachable!()
+    }
+    async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
+        unreachable!()
+    }
+    async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
+        Ok(vec![])
+    }
+    async fn order_status(&self, _: &str, _: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
+        Ok(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 2.0, avg_px: 100.0 })
+    }
+}
+
+type Seen = Arc<Mutex<Vec<VenueEvent>>>;
+
+/// An engine that records each venue event and answers it with `answer`.
+fn fake_engine(answer: impl Fn(&VenueEvent) -> Result<IngestOutcome, String> + Send + 'static) -> (EngineHandle, Seen) {
+    let (engine, mut rx) = EngineHandle::new();
+    let seen: Seen = Arc::default();
+    let s = seen.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if let GatewayMsg::Venue { event, reply, .. } = msg {
+                let out = answer(&event);
+                s.lock().unwrap().push(event);
+                if let Some(r) = reply {
+                    let _ = r.send(out);
+                }
+            }
+        }
+    });
+    (engine, seen)
+}
+
+fn ok(_: &VenueEvent) -> Result<IngestOutcome, String> {
+    Ok(IngestOutcome::default())
+}
+
+fn fill(exec: &str) -> VenueFill {
+    VenueFill {
+        exec_id: exec.into(),
+        venue_order_id: "v1".into(),
+        client_order_id: None,
+        account_ref: "acc".into(),
+        symbol: "BTCUSDT".into(),
+        buy: true,
+        qty: 1.0,
+        price: 100.0,
+        fee: None,
+        executed_at: None,
+    }
+}
+
+fn page(execs: &[&str], next: &str, more: bool) -> PullPage {
+    PullPage { fills: execs.iter().map(|e| fill(e)).collect(), next: Cursor(next.into()), more }
+}
+
+fn start(w: &World, source: Arc<FakeSource>, engine: EngineHandle) -> (ReconcilerHandle, mpsc::Sender<VenueEvent>) {
+    let (tx, rx) = mpsc::channel(16);
+    (spawn(CONN.into(), source, rx, engine, w.pool.clone()), tx)
+}
+
+async fn set_cursor(w: &World, cursor: &str) {
+    sqlx::query("INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor) VALUES ($1, $2, '', $3)")
+        .bind(CONN).bind(w.account).bind(cursor).execute(&w.pool).await.unwrap();
+}
+
+async fn cursor(w: &World) -> Option<String> {
+    sqlx::query_scalar("SELECT cursor FROM recon_cursor WHERE broker_connection_code = $1 AND account_id = $2")
+        .bind(CONN).bind(w.account).fetch_optional(&w.pool).await.unwrap()
+}
+
+async fn eventually(mut check: impl FnMut() -> bool) {
+    for _ in 0..500 {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("condition not reached");
+}
+
+fn fill_ids(seen: &Seen) -> Vec<String> {
+    seen.lock().unwrap().iter().filter_map(|e| if let VenueEvent::Fill(f) = e { Some(f.exec_id.clone()) } else { None }).collect()
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn new_account_starts_cursor_at_now_without_history() {
+    let w = world().await;
+    let source = Arc::new(FakeSource { pages: Mutex::new(vec![page(&["old"], "c1", false)]), ..Default::default() });
+    let (engine, seen) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    for _ in 0..500 {
+        if cursor(&w).await.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(cursor(&w).await.as_deref(), Some(""));
+    assert!(source.calls.lock().unwrap().is_empty(), "no history pulled");
+    assert!(fill_ids(&seen).is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn pages_until_more_is_false_and_saves_last_cursor() {
+    let w = world().await;
+    set_cursor(&w, "c0").await;
+    let pages = vec![page(&["e1", "e2"], "c1", true), page(&["e3"], "c2", false)];
+    let source = Arc::new(FakeSource { pages: Mutex::new(pages), ..Default::default() });
+    let (engine, seen) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    eventually(|| fill_ids(&seen).len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(cursor(&w).await.as_deref(), Some("c2"));
+    assert_eq!(fill_ids(&seen), ["e1", "e2", "e3"]);
+    assert_eq!(*source.calls.lock().unwrap(), [Some("c0".to_string()), Some("c1".to_string())]);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn cursor_not_advanced_when_ingest_fails() {
+    let w = world().await;
+    set_cursor(&w, "c0").await;
+    let pages = vec![page(&["e1"], "c1", true), page(&["e2", "e3"], "c2", false)];
+    let source = Arc::new(FakeSource { pages: Mutex::new(pages), ..Default::default() });
+    let (engine, seen) = fake_engine(|e| match e {
+        VenueEvent::Fill(f) if f.exec_id == "e2" => Err("db down".into()),
+        _ => Ok(IngestOutcome::default()),
+    });
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    eventually(|| fill_ids(&seen).contains(&"e2".to_string())).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(cursor(&w).await.as_deref(), Some("c1"));
+    assert!(!fill_ids(&seen).contains(&"e3".to_string()), "page abandoned at the failure");
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn triggers_while_busy_coalesce_into_one_rerun() {
+    let w = world().await;
+    set_cursor(&w, "c0").await;
+    let source = Arc::new(FakeSource { gate: Some(Semaphore::new(0)), ..Default::default() });
+    let (engine, _) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    eventually(|| *source.scopes_calls.lock().unwrap() == 1).await;
+    h.pull_now();
+    h.pull_now();
+    h.pull_now();
+    source.gate.as_ref().unwrap().add_permits(10);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(*source.scopes_calls.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn working_order_missing_from_snapshot_is_resolved() {
+    let w = world().await;
+    set_cursor(&w, "c0").await;
+    let principal: Uuid = sqlx::query_scalar("SELECT id FROM principal").fetch_one(&w.pool).await.unwrap();
+    let order_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO order_state (order_id, client_order_id, principal_id, portfolio_id, account_id, \
+         broker_connection_code, instrument_id, side, order_type, time_in_force, limit_price, original_qty, \
+         leaves_qty, cum_qty, status, version, origin, external_order_id) \
+         VALUES ($1, 'mine', $2, $3, $4, $5, $6, 'buy', 'limit', 'gtc', 100, 5, 5, 0, 'routed', 0, 'API', 'v-oms')",
+    )
+    .bind(order_id).bind(principal).bind(w.portfolio).bind(w.account).bind(CONN).bind(w.instrument.to_string())
+    .execute(&w.pool).await.unwrap();
+    let (engine, seen) = fake_engine(ok);
+    let (_tx, rx) = mpsc::channel(16);
+    let h = spawn_with(CONN.into(), Arc::new(FakeSource::default()), rx, engine, w.pool.clone(), Some(Arc::new(ClosedAtVenue)), None);
+    h.pull_now();
+    eventually(|| seen.lock().unwrap().iter().any(|e| matches!(e, VenueEvent::Order(_)))).await;
+    let events = seen.lock().unwrap().clone();
+    let [VenueEvent::Order(o)] = events.as_slice() else { panic!("one order update, got {events:?}") };
+    assert_eq!(o.client_order_id.as_deref(), Some(order_id.to_string().as_str()));
+    assert_eq!(o.venue_order_id, "v-oms");
+    assert_eq!(o.symbol, "BTCUSDT");
+    assert_eq!(o.status, VenueOrderStatus::Canceled);
+    assert_eq!((o.qty, o.cum_qty, o.buy), (5.0, 2.0, true));
+}

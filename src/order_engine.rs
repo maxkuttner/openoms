@@ -95,14 +95,28 @@ pub async fn run(mut rx: mpsc::Receiver<GatewayMsg>, engine: EngineHandle, pool:
             GatewayMsg::Exec(ev) => {
                 guarded(ev.order_id, apply_exec(&pool, &bus, &ev)).await;
             }
-            GatewayMsg::Venue { connection, event } => {
+            GatewayMsg::Venue { connection, event, instruments, reply } => {
+                // The provider rides on the message (the reconciler owns one per
+                // connection), so the engine keeps no per-connection state.
+                let mut outcome = None;
                 guarded(Uuid::nil(), async {
-                    match crate::ingest::apply::ingest(&pool, &bus, &connection, event, None).await {
-                        Ok(decision) => debug!(connection = %connection, ?decision, "order engine: venue event applied"),
+                    let res = crate::ingest::apply::ingest(&pool, &bus, &connection, event, instruments.as_deref()).await;
+                    match &res {
+                        Ok(ingested) => debug!(connection = %connection, ?ingested, "order engine: venue event applied"),
                         Err(e) => error!(connection = %connection, error = %e, "order engine: venue event not applied"),
                     }
+                    outcome = Some(
+                        res.map(|i| gateway::contract::IngestOutcome {
+                            fill_gap: i.fill_gap,
+                            duplicate: i.decision == crate::ingest::decide::Decision::Duplicate,
+                        })
+                        .map_err(|e| e.to_string()),
+                    );
                 })
                 .await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(outcome.unwrap_or_else(|| Err("ingest panicked".into())));
+                }
             }
             GatewayMsg::Reconcile { broker_code, environment, actor, adapter } => {
                 // per connection, not per broker: PAPER and LIVE (or Binance WS and

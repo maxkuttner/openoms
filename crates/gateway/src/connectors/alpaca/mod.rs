@@ -43,7 +43,7 @@ impl Connector for Alpaca {
         let adapter = Arc::new(crate::connectors::alpaca::adapter::AlpacaAdapter::new(c.key.clone(), c.secret.clone(), env));
         let stream_adapter = adapter.clone();
         Ok(Connected {
-            source: None,
+            source: None, venue_stream: None,
             daily_stats: Some(adapter.clone()),
             adapter,
             exec_stream: Some(Arc::new(move |health, engine| {

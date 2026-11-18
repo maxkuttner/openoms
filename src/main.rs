@@ -13,6 +13,7 @@ mod positions;
 mod fees;
 mod recon_orders;
 mod ingest;
+mod reconciler;
 mod symbology_resolver;
 mod setup;
 mod sessions;
@@ -1561,7 +1562,7 @@ async fn serve() {
     // that task rather than leave fills arriving against a credential orders no
     // longer route on.
     for stream in &exec_streams {
-        reload::restart_exec_stream(stream, &registration_deps, state.streams()).await;
+        reload::restart_exec_stream(stream, &registration_deps, state.streams(), state.pool()).await;
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside

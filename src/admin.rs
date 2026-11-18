@@ -1207,7 +1207,7 @@ async fn apply_reload(
     // or an unreadable credential whose adapter survived — is not in
     // `exec_streams` and keeps its running stream.
     for stream in exec_streams {
-        streams.exec(stream, &deps, state.streams()).await;
+        streams.exec(stream, &deps, state.streams(), state.pool()).await;
     }
 
     // Reconcile known execution tasks against the resulting registry, not just

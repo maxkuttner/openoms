@@ -96,6 +96,12 @@ pub struct RegistrationDeps {
 /// Starts one execution stream; called again on every restart.
 pub type ExecStream = Arc<dyn Fn(StreamHandle, EngineHandle) -> BoxFuture<'static, ()> + Send + Sync>;
 
+/// Starts one venue-event stream; called again on every restart. Its events go
+/// to the connection's reconciler, not straight to the engine. Replaces
+/// [`ExecStream`] connector by connector; the two never run for one connection.
+pub type VenueStream =
+    Arc<dyn Fn(StreamHandle, tokio::sync::mpsc::Sender<crate::venue_event::VenueEvent>) -> BoxFuture<'static, ()> + Send + Sync>;
+
 /// A live quote source the OMS drives: it knows what it can price and how to stream it.
 pub trait QuoteSource: LiveQuoteFeed + FeedSymbology {}
 impl<T: LiveQuoteFeed + FeedSymbology> QuoteSource for T {}
@@ -121,6 +127,9 @@ pub struct Connected {
     pub daily_stats: Option<Arc<dyn DailyStats>>,
     /// Pull side of execution reconciliation; `None` until a connector has one.
     pub source: Option<Arc<dyn crate::venue_event::ExecutionSource>>,
+    /// The sink-based stream that goes with `source`; `None` until a connector
+    /// is moved off `exec_stream`.
+    pub venue_stream: Option<VenueStream>,
 }
 
 pub trait Connector: Send + Sync {

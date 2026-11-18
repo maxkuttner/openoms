@@ -76,7 +76,7 @@ impl Connector for Binance {
             Transport::Fix => {
                 let adapter = start_binance(env, creds, &deps.stream_health, deps.engine.clone())
                     .ok_or_else(|| "Binance FIX session could not start".to_string())?;
-                Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None })
+                Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None, venue_stream: None })
             }
             #[cfg(not(feature = "fix"))]
             Transport::Fix => {
@@ -90,7 +90,7 @@ impl Connector for Binance {
                 let adapter = Arc::new(adapter);
                 let stream_adapter = adapter.clone();
                 Ok(Connected {
-            source: None,
+            source: None, venue_stream: None,
                     daily_stats: Some(adapter.clone()),
                     adapter,
                     exec_stream: Some(Arc::new(move |health, engine| {

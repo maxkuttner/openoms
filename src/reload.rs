@@ -12,7 +12,10 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use gateway::adapter::{BrokerAdapter, BrokerRegistry};
-use gateway::connectors::{self, ExecStream, RegistrationDeps};
+use gateway::adapter::InstrumentProvider;
+use gateway::connectors::{self, ExecStream, RegistrationDeps, VenueStream};
+use gateway::venue_event::ExecutionSource;
+use sqlx::PgPool;
 use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::app_state::{AppState, StreamRegistry};
 use gateway::credentials::BrokerCredentials;
@@ -97,7 +100,21 @@ pub struct ExecStreamStart {
     pub env: &'static str,
     /// The adapter the stream books against — the one just registered.
     pub adapter: Arc<dyn BrokerAdapter>,
-    pub start: ExecStream,
+    pub start: StreamStart,
+}
+
+/// How a connection's events reach the engine.
+pub enum StreamStart {
+    /// The old path: the stream sends `ExecEvent`s to the engine itself.
+    Engine(ExecStream),
+    /// Venue events into the connection's reconciler, which also pulls from
+    /// `source` (see `crate::reconciler` on why only this path gets one).
+    Venue {
+        connection: String,
+        stream: VenueStream,
+        source: Arc<dyn ExecutionSource>,
+        instruments: Option<Arc<dyn InstrumentProvider>>,
+    },
 }
 
 /// Turn every broker connection into an entry in a fresh `BrokerRegistry`.
@@ -230,7 +247,22 @@ pub async fn build_registry(
                                     if let Some(source) = connected.daily_stats {
                                         daily_stats.register(m.code, env_name, source);
                                     }
-                                    if let Some(start) = connected.exec_stream {
+                                    // A reconciler only with the venue-event stream: one beside an
+                                    // ExecEvent stream would book the session's fills twice.
+                                    let start = match (connected.source, connected.venue_stream, connected.exec_stream) {
+                                        (Some(source), Some(stream), None) => Some(StreamStart::Venue {
+                                            connection: conn.code.clone(),
+                                            stream,
+                                            source,
+                                            instruments: connector.universe_provider(env_name, creds).ok().map(Arc::from),
+                                        }),
+                                        (Some(_), _, exec) => {
+                                            error!(code = %conn.code, "connection has a pull source without a venue-event-only stream; reconciler not started");
+                                            exec.map(StreamStart::Engine)
+                                        }
+                                        (None, _, exec) => exec.map(StreamStart::Engine),
+                                    };
+                                    if let Some(start) = start {
                                         exec_streams.push(ExecStreamStart { code: m.code, env: env_name, adapter: connected.adapter, start });
                                     }
                                     info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered {}/{env_name} adapter", m.code);
@@ -285,7 +317,7 @@ pub(crate) use gateway::connectors::exec_stream_code;
 /// are substituted with controlled tasks.
 #[async_trait::async_trait]
 pub(crate) trait ReloadStreams: Send + Sync + 'static {
-    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry);
+    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry, pool: &PgPool);
 
     async fn databento(&self, api_key: String, state: &AppState);
 }
@@ -294,8 +326,8 @@ pub(crate) struct LiveReloadStreams;
 
 #[async_trait::async_trait]
 impl ReloadStreams for LiveReloadStreams {
-    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry) {
-        restart_exec_stream(&stream, deps, streams).await;
+    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry, pool: &PgPool) {
+        restart_exec_stream(&stream, deps, streams, pool).await;
     }
 
     async fn databento(&self, api_key: String, state: &AppState) {
@@ -312,12 +344,34 @@ impl ReloadStreams for LiveReloadStreams {
 /// would leave fills landing against an adapter the registry no longer routes
 /// orders through. Aborting first (rather than only inserting) is what makes
 /// boot — where nothing runs yet — the same call as a reload.
-pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry) {
+///
+/// A venue-event stream runs with its reconciler inside the same task, so
+/// stopping the stream (abort under `exec_stream_code`) stops the reconciler.
+pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry, pool: &PgPool) {
     let code = exec_stream_code(stream.code, stream.env);
     streams.abort_and_remove(&code).await;
     let health = deps.stream_health.handle(stream.code, stream.env, StreamKind::Execution);
     health.set_connecting();
-    let handle = tokio::spawn((stream.start)(health, deps.engine.clone()));
+    let handle = match &stream.start {
+        StreamStart::Engine(start) => tokio::spawn(start(health, deps.engine.clone())),
+        StreamStart::Venue { connection, stream: start, source, instruments } => {
+            let (tx, rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
+            let reconciler = crate::reconciler::spawn_with(
+                connection.clone(),
+                source.clone(),
+                rx,
+                deps.engine.clone(),
+                pool.clone(),
+                Some(stream.adapter.clone()),
+                instruments.clone(),
+            );
+            let run = start(health, tx);
+            tokio::spawn(async move {
+                let _reconciler = reconciler;
+                run.await;
+            })
+        }
+    };
     streams.insert(code, handle);
 }
 
