@@ -28,6 +28,9 @@ struct FakeSource {
     venue_symbols: Option<Vec<String>>,
     /// What `held_assets` answers.
     held: Vec<String>,
+    /// `held_assets` calls that fail before it answers.
+    held_failures: Mutex<usize>,
+    held_calls: Mutex<usize>,
     /// The scope of each `fills_since` call.
     pulled_scopes: Mutex<Vec<String>>,
 }
@@ -56,6 +59,12 @@ impl ExecutionSource for FakeSource {
         Ok(self.venue_symbols.clone().unwrap_or_else(|| vec![String::new()]))
     }
     async fn held_assets(&self, _: &str) -> Result<Vec<String>, BrokerError> {
+        *self.held_calls.lock().unwrap() += 1;
+        let mut failures = self.held_failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(BrokerError::Network("418 I'm a teapot".into()));
+        }
         Ok(self.held.clone())
     }
     fn hints(&self) -> PullHints {
@@ -526,4 +535,37 @@ async fn sweep_discovers_symbol_from_nonzero_balance() {
     let (h, _tx) = start(&w, blind.clone(), engine);
     h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
     assert!(blind.pulled_scopes.lock().unwrap().is_empty());
+}
+
+/// A failed balance read must not cost the known scopes, and discovery is
+/// retried on the next pull instead of waiting for the EOD sweep.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn held_assets_failure_keeps_existing_scopes_and_retries_discovery() {
+    let w = world().await;
+    sqlx::query("INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor) VALUES ($1, $2, 'ETHUSDT', 'c0'), ($1, $2, 'BTCUSDT', 'c0')")
+        .bind(CONN).bind(w.account).execute(&w.pool).await.unwrap();
+    let source = Arc::new(FakeSource {
+        venue_symbols: Some(vec!["ETHUSDT".into()]),
+        held: vec!["BTC".into()],
+        held_failures: Mutex::new(1),
+        ..Default::default()
+    });
+    let (engine, _) = fake_engine(ok);
+    let (h, tx) = start(&w, source.clone(), engine);
+    tx.send(VenueEvent::Connected).await.unwrap();
+    eventually(|| *source.held_calls.lock().unwrap() == 1 && !source.pulled_scopes.lock().unwrap().is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(*source.pulled_scopes.lock().unwrap(), ["ETHUSDT"], "the known scope is pulled despite the failure");
+
+    h.pull_now();
+    eventually(|| source.pulled_scopes.lock().unwrap().contains(&"BTCUSDT".to_string())).await;
+    assert_eq!(*source.held_calls.lock().unwrap(), 2, "discovery retried on the next pull");
+
+    // EOD sweep: same, the account is not skipped.
+    *source.held_failures.lock().unwrap() = 1;
+    source.pulled_scopes.lock().unwrap().clear();
+    let r = h.sweep_at(Utc::now(), chrono::Duration::days(1)).await;
+    assert!(r.errors.is_empty());
+    assert_eq!(*source.pulled_scopes.lock().unwrap(), ["ETHUSDT"]);
 }

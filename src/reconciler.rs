@@ -376,7 +376,16 @@ impl Reconciler {
             .map_err(|e| e.to_string())?;
             scopes.extend(booked);
             if discover {
-                let held = self.source.held_assets(account_ref).await.map_err(|e| e.to_string())?;
+                // A failed balance read costs only the discovery, retried on
+                // the next pull; the known scopes are still pulled.
+                let held = match self.source.held_assets(account_ref).await {
+                    Ok(held) => held,
+                    Err(e) => {
+                        warn!(connection = %self.connection, account = account_ref, error = %e, "reconciler: balances unavailable; pair discovery retried next pull");
+                        self.discover.store(true, Ordering::Relaxed);
+                        Vec::new()
+                    }
+                };
                 if !held.is_empty() {
                     let found: Vec<String> = sqlx::query_scalar(
                         "SELECT DISTINCT bi.broker_symbol FROM broker_connection bc \
