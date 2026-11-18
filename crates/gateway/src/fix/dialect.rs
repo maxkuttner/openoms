@@ -1,14 +1,15 @@
 //! The per-broker seam. QuickFIX owns the session; a `FixDialect` owns the
 //! parts that differ between venues: the FIX version, the Logon auth fields, how
 //! an order maps onto `NewOrderSingle`/`OrderCancelRequest`, and how an inbound
-//! `ExecutionReport` (35=8) maps back to our internal [`VenueReport`].
+//! `ExecutionReport` (35=8) maps back to [`VenueEvent`]s.
 
+use chrono::{DateTime, NaiveDateTime, Utc};
 use quickfix::{FieldMap, Message};
-use uuid::Uuid;
+use tracing::warn;
 
 use crate::adapter::{BrokerError, BrokerOrderRequest};
-use crate::contract::VenueReport;
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
+use crate::venue_event::{VenueEvent, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
 /// FIX field tags used across dialects. Named so the message-building code reads
 /// like the spec rather than a wall of integers. A few are kept for completeness
@@ -16,6 +17,14 @@ use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 #[allow(dead_code)]
 pub mod tag {
     pub const MSG_TYPE: i32 = 35;
+    pub const MSG_SEQ_NUM: i32 = 34;
+    pub const ACCOUNT: i32 = 1;
+    pub const COMMISSION: i32 = 12;
+    pub const COMM_TYPE: i32 = 13;
+    pub const CURRENCY: i32 = 15;
+    pub const COMM_CURRENCY: i32 = 479;
+    pub const MISC_FEE_AMT: i32 = 137;
+    pub const MISC_FEE_CURR: i32 = 138;
     pub const CL_ORD_ID: i32 = 11;
     pub const ORIG_CL_ORD_ID: i32 = 41;
     pub const ORDER_ID: i32 = 37;
@@ -50,22 +59,21 @@ pub mod tag {
     pub const LAST_RPT_REQUESTED: i32 = 912;
 }
 
-/// A parsed inbound `ExecutionReport` (35=8), addressed to one of our orders.
+/// A parsed inbound `ExecutionReport` (35=8).
 pub struct ParsedExecReport {
-    /// Our order UUID, taken from `ClOrdID`(11) (or `OrigClOrdID`(41) on cancels).
-    pub order_id: Uuid,
-    /// The broker's own order id from `OrderID`(37), when present. Populated on
-    /// the ack so `submit_order` can return it as the external order id.
+    /// `OrigClOrdID`(41) on cancels, else `ClOrdID`(11), as sent — not required
+    /// to be one of our UUIDs (ingest matches by venue order id or adopts).
+    pub client_order_id: Option<String>,
+    /// The broker's own order id from `OrderID`(37), when present. Returned by
+    /// `submit_order` as the external order id.
     pub external_order_id: Option<String>,
     /// True for the first ack of a new order (`ExecType=0` New), which resolves a
-    /// pending `submit_order` rather than moving order state.
+    /// pending `submit_order`.
     pub is_ack: bool,
-    /// The normalized report to apply, if this message changes OMS state. `None`
-    /// for a pure ack (New) that only resolves the submit oneshot.
-    pub report: Option<VenueReport>,
-    /// A reject reason, when `ExecType`/`OrdStatus` say the order was rejected —
-    /// used to fail a pending `submit_order`.
+    /// A reject reason, when `ExecType`=8 — used to fail a pending `submit_order`.
     pub reject_reason: Option<String>,
+    /// What the report says about the order and its executions, for ingest.
+    pub events: Vec<VenueEvent>,
 }
 
 /// The venue-specific half of a FIX connection. `Send + Sync` so it can be shared
@@ -74,8 +82,7 @@ pub trait FixDialect: Send + Sync {
     /// FIX version string for the session, e.g. `"FIX.4.2"` / `"FIX.4.4"`.
     fn begin_string(&self) -> &'static str;
 
-    /// The venue this dialect trades, as it appears in `VenueReport.venue`
-    /// and the broker registry key (`"IBKR"` / `"BINANCE"`).
+    /// The venue this dialect trades: the broker registry key (`"IBKR"` / `"BINANCE"`).
     fn venue(&self) -> &'static str;
 
     /// Add broker-specific auth fields to an outgoing Logon (35=A). Called from
@@ -89,9 +96,9 @@ pub trait FixDialect: Send + Sync {
     /// Build an `OrderCancelRequest` (35=F) for a resting order.
     fn build_cancel(&self, external_order_id: &str, symbol: &str) -> Result<Message, BrokerError>;
 
-    /// Map an inbound `ExecutionReport` (35=8) to our internal report. Returns
-    /// `None` when the message isn't an execution report or its `ClOrdID` isn't a
-    /// UUID we issued. Most dialects delegate to [`parse_standard_exec_report`].
+    /// Map an inbound `ExecutionReport` (35=8) to venue events. Returns `None`
+    /// when the message isn't an execution report. Most dialects delegate to
+    /// [`parse_standard_exec_report`].
     fn parse_execution_report(&self, msg: &Message) -> Option<ParsedExecReport>;
 
     /// Build an `Order Mass Status Request` (35=AF) for the snapshot side of order
@@ -220,7 +227,7 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use crate::adapter::BrokerOrderRequest;
-    use crate::contract::VenueReport;
+    use crate::venue_event::{VenueEvent, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
     pub(crate) fn order(order_id: &Uuid, order_type: &str, limit: Option<f64>) -> BrokerOrderRequest {
         BrokerOrderRequest {
@@ -246,6 +253,14 @@ pub(crate) mod tests {
         m
     }
 
+    fn fill_of(p: &ParsedExecReport) -> &VenueFill {
+        p.events.iter().find_map(|e| match e { VenueEvent::Fill(f) => Some(f), _ => None }).expect("fill")
+    }
+
+    fn order_of(p: &ParsedExecReport) -> &VenueOrderUpdate {
+        p.events.iter().find_map(|e| match e { VenueEvent::Order(o) => Some(o), _ => None }).expect("order")
+    }
+
     #[test]
     fn parses_new_ack() {
         let id = Uuid::new_v4();
@@ -253,12 +268,20 @@ pub(crate) mod tests {
             (tag::CL_ORD_ID, &id.to_string()),
             (tag::ORDER_ID, "BROKER-99"),
             (tag::EXEC_TYPE, "0"),
+            (tag::ORD_STATUS, "0"),
+            (tag::SYMBOL, "BTCUSDT"),
+            (tag::SIDE, "1"),
+            (tag::ORDER_QTY, "1.5"),
+            (tag::ORD_TYPE, "2"),
+            (tag::PRICE, "100"),
         ]);
-        let p = parse_standard_exec_report(&msg, "BINANCE").unwrap();
-        assert_eq!(p.order_id, id);
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
+        assert_eq!(p.client_order_id.as_deref(), Some(id.to_string().as_str()));
         assert!(p.is_ack);
-        assert!(p.report.is_none());
         assert_eq!(p.external_order_id.as_deref(), Some("BROKER-99"));
+        let o = order_of(&p);
+        assert_eq!(o.status, VenueOrderStatus::Working);
+        assert_eq!((o.symbol.as_str(), o.buy, o.qty, o.limit_px, o.order_type.as_str()), ("BTCUSDT", true, 1.5, Some(100.0), "limit"));
     }
 
     #[test]
@@ -267,22 +290,50 @@ pub(crate) mod tests {
         for exec_type in ["F", "2", "1"] {
             let msg = exec_report(&[
                 (tag::CL_ORD_ID, &id.to_string()),
+                (tag::ORDER_ID, "9001"),
+                (tag::ACCOUNT, "U123"),
                 (tag::EXEC_TYPE, exec_type),
+                (tag::ORD_STATUS, "1"),
+                (tag::SYMBOL, "AAPL"),
+                (tag::SIDE, "2"),
                 (tag::LAST_QTY, "0.5"),
                 (tag::LAST_PX, "100.25"),
+                (tag::CUM_QTY, "0.5"),
                 (tag::EXEC_ID, "E-1"),
+                (tag::COMMISSION, "1.25"),
+                (tag::CURRENCY, "USD"),
             ]);
-            let p = parse_standard_exec_report(&msg, "BINANCE").unwrap();
-            match p.report {
-                Some(VenueReport::Fill { fill_qty, fill_price, execution_id, venue }) => {
-                    assert_eq!(fill_qty, 0.5);
-                    assert_eq!(fill_price, 100.25);
-                    assert_eq!(execution_id, "E-1");
-                    assert_eq!(venue, "BINANCE");
-                }
-                other => panic!("exec_type {exec_type}: expected Fill, got {other:?}"),
-            }
+            let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
+            let f = fill_of(&p);
+            assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.account_ref.as_str()), ("E-1", "9001", "U123"), "{exec_type}");
+            assert_eq!((f.qty, f.price, f.buy, f.symbol.as_str()), (0.5, 100.25, false, "AAPL"));
+            assert_eq!(f.fee, Some((1.25, "USD".into())));
+            assert_eq!(order_of(&p).cum_qty, 0.5);
         }
+    }
+
+    #[test]
+    fn fill_without_exec_id_books_no_fill() {
+        let msg = exec_report(&[(tag::CL_ORD_ID, "x"), (tag::ORDER_ID, "1"), (tag::EXEC_TYPE, "F"), (tag::LAST_QTY, "1"), (tag::LAST_PX, "2")]);
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
+        assert!(!p.events.iter().any(|e| matches!(e, VenueEvent::Fill(_))));
+    }
+
+    #[test]
+    fn exec_report_with_non_uuid_clordid_is_kept() {
+        let msg = exec_report(&[
+            (tag::CL_ORD_ID, "manual-42"),
+            (tag::ORDER_ID, "777"),
+            (tag::EXEC_TYPE, "F"),
+            (tag::ORD_STATUS, "2"),
+            (tag::LAST_QTY, "1"),
+            (tag::LAST_PX, "10"),
+            (tag::EXEC_ID, "X-1"),
+        ]);
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).expect("kept");
+        assert_eq!(fill_of(&p).client_order_id.as_deref(), Some("manual-42"));
+        assert_eq!(order_of(&p).status, VenueOrderStatus::Filled);
+        assert_eq!(fill_of(&p).account_ref, "");
     }
 
     #[test]
@@ -290,12 +341,14 @@ pub(crate) mod tests {
         let id = Uuid::new_v4();
         let msg = exec_report(&[
             (tag::CL_ORD_ID, &id.to_string()),
+            (tag::ORDER_ID, "0"),
             (tag::EXEC_TYPE, "8"),
+            (tag::ORD_STATUS, "8"),
             (tag::TEXT, "insufficient balance"),
         ]);
-        let p = parse_standard_exec_report(&msg, "IBKR").unwrap();
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
         assert_eq!(p.reject_reason.as_deref(), Some("insufficient balance"));
-        assert!(matches!(p.report, Some(VenueReport::Reject { .. })));
+        assert_eq!(order_of(&p).status, VenueOrderStatus::Rejected { reason: "insufficient balance".into() });
     }
 
     #[test]
@@ -304,11 +357,20 @@ pub(crate) mod tests {
         let msg = exec_report(&[
             (tag::ORIG_CL_ORD_ID, &orig.to_string()),
             (tag::CL_ORD_ID, "cxl-BROKER-99"), // the cancel's own id, not a UUID
+            (tag::ORDER_ID, "BROKER-99"),
             (tag::EXEC_TYPE, "4"),
+            (tag::ORD_STATUS, "4"),
         ]);
-        let p = parse_standard_exec_report(&msg, "BINANCE").unwrap();
-        assert_eq!(p.order_id, orig, "must key on the original order, not the cancel id");
-        assert!(matches!(p.report, Some(VenueReport::Canceled { .. })));
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
+        assert_eq!(p.client_order_id.as_deref(), Some(orig.to_string().as_str()));
+        assert_eq!(order_of(&p).status, VenueOrderStatus::Canceled);
+    }
+
+    #[test]
+    fn expired_maps_to_expired() {
+        let msg = exec_report(&[(tag::CL_ORD_ID, "a"), (tag::ORDER_ID, "1"), (tag::EXEC_TYPE, "C"), (tag::ORD_STATUS, "C")]);
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
+        assert_eq!(order_of(&p).status, VenueOrderStatus::Expired);
     }
 
     #[test]
@@ -316,7 +378,7 @@ pub(crate) mod tests {
         // A heartbeat (35=0) is not an execution report.
         let mut m = Message::new();
         m.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "0")).unwrap();
-        assert!(parse_standard_exec_report(&m, "IBKR").is_none());
+        assert!(parse_standard_exec_report(&m, tag::EXEC_ID).is_none());
     }
 
     #[test]
@@ -400,76 +462,130 @@ pub fn transact_time() -> String {
     chrono::Utc::now().format("%Y%m%d-%H:%M:%S%.3f").to_string()
 }
 
-/// Parse a standard FIX `ExecutionReport` (35=8). The field tags used here —
+/// Set `Account`(1) from `external_account_ref`, omitted when empty.
+pub fn set_account(msg: &mut Message, req: &BrokerOrderRequest) -> Result<(), BrokerError> {
+    if req.external_account_ref.is_empty() {
+        return Ok(());
+    }
+    msg.set_field(tag::ACCOUNT, req.external_account_ref.as_str())
+        .map_err(|e| BrokerError::Network(format!("set Account: {e}")))
+}
+
+/// FIX `UTCTimestamp`, with or without milliseconds.
+fn fix_time(s: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(s, "%Y%m%d-%H:%M:%S%.f").ok().map(|t| t.and_utc())
+}
+
+/// Parse a standard FIX `ExecutionReport` (35=8) into venue events. The tags —
 /// `ExecType`(150), `OrdStatus`(39), `LastQty`(32)/`LastPx`(31), `OrderID`(37),
-/// `ExecID`(17) — are common to FIX 4.2 and 4.4, so both dialects share this. The
-/// only version wrinkle is `ExecType`: 4.2 fills report `1`/`2`, 4.4 reports `F`.
-pub fn parse_standard_exec_report(msg: &Message, venue: &str) -> Option<ParsedExecReport> {
-    // Only execution reports; MsgType lives in the header.
+/// `CumQty`(14), `Account`(1) — are common to FIX 4.2 and 4.4, so both dialects
+/// share this; 4.2 fills report `ExecType` `1`/`2`, 4.4 reports `F`.
+///
+/// `exec_id_tag` names the tag a fill is keyed on: `ExecID`(17) by default,
+/// Binance's `TradeID`(1003) so FIX and REST agree on one id per trade.
+///
+/// A fill missing its id, `OrderID`, qty or price is not booked, and an order
+/// update missing `OrderID` is not sent; both are warned with `MsgSeqNum`.
+pub fn parse_standard_exec_report(msg: &Message, exec_id_tag: i32) -> Option<ParsedExecReport> {
     if msg.with_header(|h| h.get_field(tag::MSG_TYPE)).as_deref() != Some("8") {
         return None;
     }
+    let field = |t: i32| msg.get_field(t).filter(|s| !s.is_empty());
+    let num = |t: i32| field(t).and_then(|s| s.parse::<f64>().ok());
+    let seq = msg.with_header(|h| h.get_field(tag::MSG_SEQ_NUM));
 
     // Prefer OrigClOrdID (present on cancel reports) so a cancel keys on the
-    // original order, matching the WS execution path.
-    let cl = msg
-        .get_field(tag::ORIG_CL_ORD_ID)
-        .filter(|s| !s.is_empty())
-        .or_else(|| msg.get_field(tag::CL_ORD_ID))?;
-    let order_id = Uuid::parse_str(&cl).ok()?;
-
-    let exec_type = msg.get_field(tag::EXEC_TYPE).unwrap_or_default();
-    let external_order_id = msg.get_field(tag::ORDER_ID).filter(|s| !s.is_empty());
+    // original order, not the cancel request's own id.
+    let client_order_id = field(tag::ORIG_CL_ORD_ID).or_else(|| field(tag::CL_ORD_ID));
+    let exec_type = field(tag::EXEC_TYPE).unwrap_or_default();
+    let external_order_id = field(tag::ORDER_ID);
+    let account_ref = field(tag::ACCOUNT).unwrap_or_default();
+    let symbol = field(tag::SYMBOL).unwrap_or_default();
+    let buy = field(tag::SIDE).as_deref() == Some("1");
+    let ts = field(tag::TRANSACT_TIME).as_deref().and_then(fix_time);
+    let exec_id = field(exec_id_tag);
+    let text = field(tag::TEXT).or_else(|| field(tag::ORD_REJ_REASON));
 
     let mut out = ParsedExecReport {
-        order_id,
+        client_order_id: client_order_id.clone(),
         external_order_id: external_order_id.clone(),
-        is_ack: false,
-        report: None,
-        reject_reason: None,
+        is_ack: exec_type == "0",
+        reject_reason: (exec_type == "8").then(|| text.clone().unwrap_or_else(|| "rejected".to_string())),
+        events: Vec::new(),
     };
 
-    match exec_type.as_str() {
-        // New — the ack a submit_order is waiting for. No OMS state change.
-        "0" => {
-            out.is_ack = true;
+    if matches!(exec_type.as_str(), "1" | "2" | "F") {
+        match (&exec_id, &external_order_id, num(tag::LAST_QTY), num(tag::LAST_PX)) {
+            (Some(exec_id), Some(venue_order_id), Some(qty), Some(price)) => {
+                let fee = match (num(tag::COMMISSION), field(tag::COMM_CURRENCY).or_else(|| field(tag::CURRENCY))) {
+                    (Some(a), Some(c)) if a != 0.0 => Some((a, c)),
+                    _ => match (num(tag::MISC_FEE_AMT), field(tag::MISC_FEE_CURR)) {
+                        (Some(a), Some(c)) if a != 0.0 => Some((a, c)),
+                        _ => None,
+                    },
+                };
+                out.events.push(VenueEvent::Fill(VenueFill {
+                    exec_id: exec_id.clone(),
+                    venue_order_id: venue_order_id.clone(),
+                    client_order_id: client_order_id.clone(),
+                    account_ref: account_ref.clone(),
+                    symbol: symbol.clone(),
+                    buy,
+                    qty,
+                    price,
+                    fee,
+                    executed_at: ts,
+                }));
+            }
+            (id, oid, qty, px) => {
+                let missing: Vec<i32> = [
+                    (id.is_none(), exec_id_tag),
+                    (oid.is_none(), tag::ORDER_ID),
+                    (qty.is_none(), tag::LAST_QTY),
+                    (px.is_none(), tag::LAST_PX),
+                ]
+                .into_iter()
+                .filter_map(|(m, t)| m.then_some(t))
+                .collect();
+                warn!(msg_seq_num = ?seq, exec_id = ?field(tag::EXEC_ID), ?missing, "FIX: fill report missing tags, not booked");
+            }
         }
-        // Fill / partial fill. 4.2: 1=partial, 2=fill; 4.4: F=Trade.
-        "1" | "2" | "F" => {
-            let fill_qty = msg.get_field(tag::LAST_QTY).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let fill_price = msg.get_field(tag::LAST_PX).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-            let execution_id = msg
-                .get_field(tag::EXEC_ID)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| cl.clone());
-            out.report = Some(VenueReport::Fill {
-                execution_id,
-                fill_qty,
-                fill_price,
-                venue: venue.to_string(),
-            });
+    }
+
+    let status = match field(tag::ORD_STATUS).as_deref() {
+        Some("0") | Some("1") => Some(VenueOrderStatus::Working),
+        Some("2") => Some(VenueOrderStatus::Filled),
+        Some("4") => Some(VenueOrderStatus::Canceled),
+        Some("8") => Some(VenueOrderStatus::Rejected { reason: text.unwrap_or_else(|| "rejected".to_string()) }),
+        Some("C") => Some(VenueOrderStatus::Expired),
+        // Pending states (6/A/E) and the like: no order update.
+        Some(_) => None,
+        None => {
+            warn!(msg_seq_num = ?seq, exec_id = ?field(tag::EXEC_ID), missing = tag::ORD_STATUS, "FIX: execution report without OrdStatus, no order update");
+            None
         }
-        // Canceled.
-        "4" => {
-            out.report = Some(VenueReport::Canceled {
-                reason: msg.get_field(tag::TEXT),
-                venue: Some(venue.to_string()),
-            });
+    };
+    if let Some(status) = status {
+        match &external_order_id {
+            Some(venue_order_id) => out.events.push(VenueEvent::Order(VenueOrderUpdate {
+                venue_order_id: venue_order_id.clone(),
+                client_order_id,
+                account_ref,
+                symbol,
+                buy,
+                order_type: match field(tag::ORD_TYPE).as_deref() {
+                    Some("1") => "market".to_string(),
+                    Some("2") => "limit".to_string(),
+                    other => other.unwrap_or_default().to_string(),
+                },
+                qty: num(tag::ORDER_QTY).unwrap_or(0.0),
+                limit_px: num(tag::PRICE).filter(|p| *p != 0.0),
+                status,
+                cum_qty: num(tag::CUM_QTY).unwrap_or(0.0),
+                ts,
+            })),
+            None => warn!(msg_seq_num = ?seq, exec_id = ?field(tag::EXEC_ID), missing = tag::ORDER_ID, "FIX: execution report without OrderID, no order update"),
         }
-        // Rejected — also fails a pending submit_order.
-        "8" => {
-            let reason = msg
-                .get_field(tag::TEXT)
-                .or_else(|| msg.get_field(tag::ORD_REJ_REASON))
-                .unwrap_or_else(|| "rejected".to_string());
-            out.reject_reason = Some(reason.clone());
-            out.report = Some(VenueReport::Reject {
-                reason,
-                venue: Some(venue.to_string()),
-            });
-        }
-        // Everything else (Replaced, PendingCancel, …) — no OMS state change.
-        _ => {}
     }
 
     Some(out)

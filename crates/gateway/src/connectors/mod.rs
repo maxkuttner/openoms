@@ -119,8 +119,8 @@ pub struct PublicFeed {
 /// What connecting one configured connection produced.
 pub struct Connected {
     pub adapter: Arc<dyn BrokerAdapter>,
-    /// The execution stream to (re)start for it; `None` when the session that
-    /// routes orders also delivers fills (FIX).
+    /// The old `ExecEvent` execution stream; `None` on every venue-event
+    /// connector (FIX included: its session delivers through `venue_stream`).
     pub exec_stream: Option<ExecStream>,
     /// Its previous-close source for the market-data side; `None` when the
     /// connection has no snapshot endpoint (FIX).

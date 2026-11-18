@@ -13,7 +13,6 @@ use tracing::{error, info};
 use crate::fix::adapter::FixBrokerAdapter;
 use crate::fix::dialect::FixDialect;
 use crate::fix::{start_session, FixConfig};
-use crate::contract::EngineHandle;
 use crate::stream_health::StreamHealthRegistry;
 
 use super::Connected;
@@ -45,11 +44,14 @@ impl Connector for Ibkr {
         &MANIFEST
     }
 
-    /// FIX-only: the session both routes orders and delivers execution reports.
+    /// FIX-only: the session both routes orders and delivers execution reports,
+    /// as venue events. No pull source: this FIX gateway offers no execution
+    /// history query, so a fill missed while the session was down (ResetOnLogon=Y,
+    /// memory store: no resend) is not recovered; the events go straight to ingest.
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
-        let adapter = start_ibkr(env, creds, &deps.stream_health, deps.engine.clone())
+        let (adapter, venue_stream) = start_ibkr(env, creds, &deps.stream_health)
             .ok_or_else(|| "IBKR FIX session could not start".to_string())?;
-        Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None, venue_stream: None })
+        Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None, venue_stream: Some(venue_stream) })
     }
 
     fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
@@ -89,8 +91,7 @@ fn start_ibkr(
     env_name: &'static str,
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
-    engine: EngineHandle,
-) -> Option<Arc<FixBrokerAdapter>> {
+) -> Option<(Arc<FixBrokerAdapter>, super::VenueStream)> {
     let parsed = match creds.kind.as_str() {
         IbkrFixCredentials::KIND => creds.parse::<IbkrFixCredentials>().ok(),
         _ => None,
@@ -111,8 +112,7 @@ fn start_ibkr(
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("IBKR", env_name);
     let dialect: Arc<dyn FixDialect> = Arc::new(IbkrDialect::new(password.clone()));
-    // IBKR uses the native FIX 35=AF/35=H recon path (no REST delegate).
-    match start_session(env_name, dialect, cfg, "ibkr", health, engine, None) {
+    match start_session(dialect, cfg, health) {
         Ok(a) => { info!(env = env_name, "registered IBKR FIX adapter"); Some(a) }
         Err(e) => { error!(env = env_name, error = %e, "IBKR FIX session not started"); None }
     }
@@ -121,12 +121,6 @@ fn start_ibkr(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// An engine nothing drains — safe here because every test below hits a
-    /// guard that returns `None` before the network or QuickFIX are touched.
-    fn idle_engine() -> EngineHandle {
-        EngineHandle::new().0
-    }
 
     fn alpaca_cred() -> BrokerCredentials {
         BrokerCredentials::from_typed("Alpaca", &crate::connectors::alpaca::adapter::AlpacaCredentials { key: "k".into(), secret: "s".into() })
@@ -140,7 +134,7 @@ mod tests {
     #[tokio::test]
     async fn start_ibkr_refuses_a_non_ibkr_credential() {
         let health = StreamHealthRegistry::new();
-        let result = start_ibkr("PAPER", &alpaca_cred(), &health, idle_engine());
+        let result = start_ibkr("PAPER", &alpaca_cred(), &health);
         assert!(result.is_none());
     }
 }

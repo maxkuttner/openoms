@@ -18,13 +18,11 @@ use crate::connectors::binance::fix::BinanceDialect;
 use tracing::{error, info};
 
 #[cfg(feature = "fix")]
-use crate::fix::adapter::FixBrokerAdapter;
 #[cfg(feature = "fix")]
 use crate::fix::dialect::FixDialect;
 #[cfg(feature = "fix")]
 use crate::fix::{start_session, FixConfig};
 #[cfg(feature = "fix")]
-use crate::contract::EngineHandle;
 #[cfg(feature = "fix")]
 use crate::stream_health::StreamHealthRegistry;
 
@@ -74,11 +72,18 @@ impl Connector for Binance {
         match Transport::from_env(&format!("BINANCE_{env}"), Transport::Rest) {
             #[cfg(feature = "fix")]
             Transport::Fix => {
-                let adapter = start_binance(env, creds, &deps.stream_health, deps.engine.clone())
+                let (adapter, source, venue_stream) = start_binance(env, creds, &deps.stream_health)
                     .ok_or_else(|| "Binance FIX session could not start".to_string())?;
-                // The FIX session still books through `ExecEvent`s, so no pull
-                // source (and no reconciler) until it emits venue events too.
-                Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None, venue_stream: None })
+                // Venue events from the session; the same credential's REST API
+                // pulls what it missed (fills key on the trade id on both, see
+                // `fix::TRADE_ID`). Without REST: stream only, nothing pulled.
+                Ok(Connected {
+                    adapter,
+                    exec_stream: None,
+                    daily_stats: None,
+                    source: source.map(|s| s as Arc<dyn crate::venue_event::ExecutionSource>),
+                    venue_stream: Some(venue_stream),
+                })
             }
             #[cfg(not(feature = "fix"))]
             Transport::Fix => {
@@ -158,8 +163,11 @@ fn start_binance(
     env_name: &'static str,
     creds: &crate::credentials::BrokerCredentials,
     stream_health: &StreamHealthRegistry,
-    engine: EngineHandle,
-) -> Option<Arc<FixBrokerAdapter>> {
+) -> Option<(
+    Arc<dyn crate::adapter::BrokerAdapter>,
+    Option<Arc<crate::connectors::binance::adapter::BinanceAdapter>>,
+    super::VenueStream,
+)> {
     let parsed = match creds.kind.as_str() {
         crate::connectors::binance::adapter::BinanceCredentials::KIND => {
             creds.parse::<crate::connectors::binance::adapter::BinanceCredentials>().ok()
@@ -191,17 +199,16 @@ fn start_binance(
         Ok(d) => Arc::new(d) as Arc<dyn FixDialect>,
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX dialect init failed"); return None; }
     };
-    // Binance Spot FIX has no open-orders / order-status message, so route the
-    // order-reconciliation reads through the same credential's REST API. Orders still
-    // go over FIX; only the recon snapshot/status reads use REST.
-    let read_delegate: Option<Arc<dyn crate::adapter::BrokerAdapter>> =
-        match crate::connectors::binance::adapter::BinanceAdapter::new(api_key.clone(), private_key, env_name) {
-            Ok(a) => Some(Arc::new(a)),
-            Err(e) => {
-                error!(env = env_name, error = %e, "Binance FIX: REST recon delegate init failed; recon disabled");
-                None
-            }
-        };
+    // Binance Spot FIX has no open-orders / order-status message nor trade
+    // history, so the same credential's REST API answers those reads and is the
+    // pull source. Orders still go over FIX.
+    let rest = match crate::connectors::binance::adapter::BinanceAdapter::new(api_key.clone(), private_key, env_name) {
+        Ok(a) => Some(Arc::new(a)),
+        Err(e) => {
+            error!(env = env_name, error = %e, "Binance FIX: REST reader init failed; no pulls or status reads");
+            None
+        }
+    };
     let cfg = FixConfig {
         host: host.clone(),
         port: *port,
@@ -212,8 +219,15 @@ fn start_binance(
     };
     // Seed the health entry only now that we know the session is configured.
     let health = stream_health.fix_handle("BINANCE", env_name);
-    match start_session(env_name, dialect, cfg, "binance", health, engine, read_delegate) {
-        Ok(a) => { info!(env = env_name, "registered BINANCE FIX adapter"); Some(a) }
+    match start_session(dialect, cfg, health) {
+        Ok((fix, stream)) => {
+            info!(env = env_name, "registered BINANCE FIX adapter");
+            let adapter: Arc<dyn crate::adapter::BrokerAdapter> = match &rest {
+                Some(reader) => Arc::new(crate::adapter::SplitAdapter { writer: fix, reader: reader.clone() }),
+                None => fix,
+            };
+            Some((adapter, rest, stream))
+        }
         Err(e) => { error!(env = env_name, error = %e, "Binance FIX session not started"); None }
     }
 }
@@ -221,12 +235,6 @@ fn start_binance(
 #[cfg(all(test, feature = "fix"))]
 mod tests {
     use super::*;
-
-    /// An engine nothing drains — safe here because every test below hits a
-    /// guard that returns `None` before the network or QuickFIX are touched.
-    fn idle_engine() -> EngineHandle {
-        EngineHandle::new().0
-    }
 
     fn ibkr_cred() -> BrokerCredentials {
         BrokerCredentials::from_typed("IbkrFix", &crate::connectors::ibkr::fix::IbkrFixCredentials {
@@ -244,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn start_binance_refuses_a_non_binance_credential() {
         let health = StreamHealthRegistry::new();
-        let result = start_binance("PAPER", &ibkr_cred(), &health, idle_engine());
+        let result = start_binance("PAPER", &ibkr_cred(), &health);
         assert!(result.is_none());
     }
 
@@ -263,7 +271,7 @@ mod tests {
             api_key: "k".into(),
             private_key: "pem".into(),
         });
-        let result = start_binance("PAPER", &creds, &health, idle_engine());
+        let result = start_binance("PAPER", &creds, &health);
         assert!(result.is_none());
     }
 }

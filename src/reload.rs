@@ -14,7 +14,7 @@ use tracing::{error, info, warn};
 use gateway::adapter::{BrokerAdapter, BrokerRegistry};
 use gateway::adapter::InstrumentProvider;
 use gateway::connectors::{self, ExecStream, RegistrationDeps, VenueStream};
-use gateway::venue_event::ExecutionSource;
+use gateway::venue_event::{ExecutionSource, VenueEvent};
 use sqlx::PgPool;
 use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::app_state::{AppState, StreamRegistry};
@@ -109,10 +109,12 @@ pub enum StreamStart {
     Engine(ExecStream),
     /// Venue events into the connection's reconciler, which also pulls from
     /// `source` (see `crate::reconciler` on why only this path gets one).
+    /// Without a source (IBKR FIX) the events go straight to ingest and nothing
+    /// is pulled: a fill gap there has nothing to heal it.
     Venue {
         connection: String,
         stream: VenueStream,
-        source: Arc<dyn ExecutionSource>,
+        source: Option<Arc<dyn ExecutionSource>>,
         instruments: Option<Arc<dyn InstrumentProvider>>,
     },
 }
@@ -248,9 +250,10 @@ pub async fn build_registry(
                                         daily_stats.register(m.code, env_name, source);
                                     }
                                     // A reconciler only with the venue-event stream: one beside an
-                                    // ExecEvent stream would book the session's fills twice.
+                                    // ExecEvent stream would book the session's fills twice. A
+                                    // venue stream without a source (IBKR FIX) feeds ingest directly.
                                     let start = match (connected.source, connected.venue_stream, connected.exec_stream) {
-                                        (Some(source), Some(stream), None) => Some(StreamStart::Venue {
+                                        (source, Some(stream), None) => Some(StreamStart::Venue {
                                             connection: conn.code.clone(),
                                             stream,
                                             source,
@@ -354,7 +357,22 @@ pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDe
     health.set_connecting();
     let handle = match &stream.start {
         StreamStart::Engine(start) => tokio::spawn(start(health, deps.engine.clone())),
-        StreamStart::Venue { connection, stream: start, source, instruments } => {
+        StreamStart::Venue { connection, stream: start, source: None, instruments } => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
+            let run = start(health, tx);
+            let (engine, connection, instruments) = (deps.engine.clone(), connection.clone(), instruments.clone());
+            tokio::spawn(async move {
+                let forward = async move {
+                    while let Some(event) = rx.recv().await {
+                        if !matches!(event, VenueEvent::Connected | VenueEvent::Disconnected) {
+                            engine.venue_send(&connection, event, instruments.clone(), None).await;
+                        }
+                    }
+                };
+                tokio::join!(run, forward);
+            })
+        }
+        StreamStart::Venue { connection, stream: start, source: Some(source), instruments } => {
             let (tx, rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
             let reconciler = crate::reconciler::spawn_with(
                 connection.clone(),
@@ -434,6 +452,43 @@ mod tests {
         assert_eq!(exec_stream_code("BYBIT", "PAPER"), "bybit-paper:exec");
         assert_eq!(exec_stream_code("COINBASE", "LIVE"), "coinbase-live:exec");
         assert_eq!(exec_stream_code("OKX", "PAPER"), "okx-paper:exec");
+    }
+
+    /// IBKR FIX: no pull source, so the session's venue events go straight to
+    /// ingest (reply-less); `Connected`/`Disconnected` are not ingested.
+    #[tokio::test]
+    async fn sourceless_venue_stream_forwards_events_to_ingest() {
+        let (engine, mut engine_rx) = gateway::contract::EngineHandle::new();
+        let deps = RegistrationDeps { stream_health: StreamHealthRegistry::new(), engine };
+        let fill = gateway::venue_event::VenueFill {
+            exec_id: "E-1".into(), venue_order_id: "9".into(), client_order_id: Some("manual".into()),
+            account_ref: "U1".into(), symbol: "AAPL".into(), buy: true, qty: 1.0, price: 2.0, fee: None, executed_at: None,
+        };
+        let sent = fill.clone();
+        let stream: VenueStream = Arc::new(move |_h, tx| {
+            let f = sent.clone();
+            Box::pin(async move {
+                let _ = tx.send(VenueEvent::Connected).await;
+                let _ = tx.send(VenueEvent::Fill(f)).await;
+            })
+        });
+        let start = ExecStreamStart {
+            code: "IBKR",
+            env: "PAPER",
+            adapter: Arc::new(AlpacaAdapter::new("k".into(), "s".into(), "PAPER")),
+            start: StreamStart::Venue { connection: "ibkr-paper".into(), stream, source: None, instruments: None },
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://x@localhost/x").unwrap();
+        restart_exec_stream(&start, &deps, &StreamRegistry::new(), &pool).await;
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), engine_rx.recv()).await.unwrap().unwrap();
+        match msg {
+            gateway::contract::GatewayMsg::Venue { connection, event, reply, .. } => {
+                assert_eq!(connection, "ibkr-paper");
+                assert_eq!(event, VenueEvent::Fill(fill));
+                assert!(reply.is_none());
+            }
+            _ => panic!("expected a venue event"),
+        }
     }
 
     #[tokio::test]
