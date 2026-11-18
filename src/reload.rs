@@ -109,8 +109,8 @@ pub enum StreamStart {
     Engine(ExecStream),
     /// Venue events into the connection's reconciler, which also pulls from
     /// `source` (see `crate::reconciler` on why only this path gets one).
-    /// Without a source (IBKR FIX) the events go straight to ingest and nothing
-    /// is pulled: a fill gap there has nothing to heal it.
+    /// Without a source (e.g. Binance FIX whose REST reader failed to build)
+    /// the events go straight to ingest and nothing is pulled.
     Venue {
         connection: String,
         stream: VenueStream,
@@ -251,7 +251,7 @@ pub async fn build_registry(
                                     }
                                     // A reconciler only with the venue-event stream: one beside an
                                     // ExecEvent stream would book the session's fills twice. A
-                                    // venue stream without a source (IBKR FIX) feeds ingest directly.
+                                    // venue stream without a source feeds ingest directly.
                                     let start = match (connected.source, connected.venue_stream, connected.exec_stream) {
                                         (source, Some(stream), None) => Some(StreamStart::Venue {
                                             connection: conn.code.clone(),
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(exec_stream_code("OKX", "PAPER"), "okx-paper:exec");
     }
 
-    /// IBKR FIX: no pull source, so the session's venue events go straight to
+    /// A venue stream with no pull source: the events go straight to
     /// ingest (reply-less); `Connected`/`Disconnected` are not ingested.
     #[tokio::test]
     async fn sourceless_venue_stream_forwards_events_to_ingest() {

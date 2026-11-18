@@ -159,6 +159,16 @@ pub struct StatusReport {
     /// `OrdStatus`(39): `0`=New `1`=PartiallyFilled `2`=Filled `4`=Canceled
     /// `8`=Rejected `C`=Expired.
     pub ord_status: String,
+    /// `Account`(1), empty when absent.
+    pub account: String,
+    /// `Side`(54)=1.
+    pub buy: bool,
+    /// `OrderQty`(38).
+    pub qty: f64,
+    /// `OrdType`(40) as `market`/`limit` (else the raw value).
+    pub order_type: String,
+    /// `Price`(44), when non-zero.
+    pub limit_px: Option<f64>,
     /// `LastRptRequested`(912)=Y — the final report of a mass-status batch.
     pub last_rpt_requested: bool,
     /// `TotNumReports`(911)=0 — the venue's "no open orders" empty-batch reply.
@@ -182,6 +192,27 @@ impl StatusReport {
             venue_order_id: self.venue_order_id.clone(),
             symbol: self.symbol.clone(),
             executed_qty: self.cum_qty,
+        })
+    }
+
+    /// As a venue order update for the reconciler's open-order snapshot. `None`
+    /// when terminal, unidentified (no `OrderID`) or of an unknown status.
+    pub fn to_venue_update(&self) -> Option<VenueOrderUpdate> {
+        if self.is_terminal() || self.venue_order_id.is_empty() || !matches!(self.ord_status.as_str(), "0" | "1") {
+            return None;
+        }
+        Some(VenueOrderUpdate {
+            venue_order_id: self.venue_order_id.clone(),
+            client_order_id: Some(self.client_order_id.clone()).filter(|c| !c.is_empty()),
+            account_ref: self.account.clone(),
+            symbol: self.symbol.clone(),
+            buy: self.buy,
+            order_type: self.order_type.clone(),
+            qty: self.qty,
+            limit_px: self.limit_px,
+            status: VenueOrderStatus::Working,
+            cum_qty: self.cum_qty,
+            ts: None,
         })
     }
 
@@ -215,9 +246,32 @@ pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
         cum_qty: msg.get_field(tag::CUM_QTY).and_then(|s| s.parse().ok()).unwrap_or(0.0),
         avg_px: msg.get_field(tag::AVG_PX).and_then(|s| s.parse().ok()).unwrap_or(0.0),
         ord_status: msg.get_field(tag::ORD_STATUS).unwrap_or_default(),
+        account: msg.get_field(tag::ACCOUNT).unwrap_or_default(),
+        buy: msg.get_field(tag::SIDE).as_deref() == Some("1"),
+        qty: msg.get_field(tag::ORDER_QTY).and_then(|s| s.parse().ok()).unwrap_or(0.0),
+        order_type: ord_type_name(msg.get_field(tag::ORD_TYPE).as_deref()),
+        limit_px: msg.get_field(tag::PRICE).and_then(|s| s.parse::<f64>().ok()).filter(|p| *p != 0.0),
         last_rpt_requested: msg.get_field(tag::LAST_RPT_REQUESTED).as_deref() == Some("Y"),
         empty_batch: msg.get_field(tag::TOT_NUM_REPORTS).and_then(|s| s.parse::<i64>().ok()) == Some(0),
     })
+}
+
+/// A mass-status batch as the open-order snapshot of `account_ref` (every
+/// account when empty; a report without `Account`(1) counts for any account).
+pub fn snapshot_updates(batch: &[StatusReport], account_ref: &str) -> Vec<VenueOrderUpdate> {
+    batch
+        .iter()
+        .filter(|r| account_ref.is_empty() || r.account.is_empty() || r.account == account_ref)
+        .filter_map(StatusReport::to_venue_update)
+        .collect()
+}
+
+fn ord_type_name(v: Option<&str>) -> String {
+    match v {
+        Some("1") => "market".to_string(),
+        Some("2") => "limit".to_string(),
+        other => other.unwrap_or_default().to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +467,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ibkr_fix_snapshot_maps_mass_status_to_order_updates() {
+        let report = |cl: &str, oid: &str, status: &str, acct: &str| {
+            parse_order_status_report(&exec_report(&[
+                (tag::MASS_STATUS_REQ_ID, "req-1"),
+                (tag::CL_ORD_ID, cl),
+                (tag::ORDER_ID, oid),
+                (tag::ACCOUNT, acct),
+                (tag::EXEC_TYPE, "I"),
+                (tag::ORD_STATUS, status),
+                (tag::SYMBOL, "AAPL"),
+                (tag::SIDE, "2"),
+                (tag::ORDER_QTY, "10"),
+                (tag::ORD_TYPE, "2"),
+                (tag::PRICE, "150.5"),
+                (tag::CUM_QTY, "4"),
+            ]))
+            .unwrap()
+        };
+        let batch = vec![
+            report("manual-1", "701", "1", "U1"),
+            report("x", "702", "2", "U1"), // terminal: not an open order
+            report("y", "703", "0", "U2"), // other account
+        ];
+        let snap = snapshot_updates(&batch, "U1");
+        assert_eq!(snap.len(), 1);
+        let o = &snap[0];
+        assert_eq!((o.venue_order_id.as_str(), o.client_order_id.as_deref(), o.account_ref.as_str()), ("701", Some("manual-1"), "U1"));
+        assert_eq!((o.status.clone(), o.cum_qty, o.qty, o.buy, o.limit_px), (VenueOrderStatus::Working, 4.0, 10.0, false, Some(150.5)));
+        assert_eq!(o.order_type, "limit");
+        // An empty account ref takes every account's open orders.
+        assert_eq!(snapshot_updates(&batch, "").len(), 2);
+    }
+
+    #[test]
     fn terminal_status_is_not_an_open_order() {
         let id = Uuid::new_v4();
         let msg = exec_report(&[
@@ -573,11 +661,7 @@ pub fn parse_standard_exec_report(msg: &Message, exec_id_tag: i32) -> Option<Par
                 account_ref,
                 symbol,
                 buy,
-                order_type: match field(tag::ORD_TYPE).as_deref() {
-                    Some("1") => "market".to_string(),
-                    Some("2") => "limit".to_string(),
-                    other => other.unwrap_or_default().to_string(),
-                },
+                order_type: ord_type_name(field(tag::ORD_TYPE).as_deref()),
                 qty: num(tag::ORDER_QTY).unwrap_or(0.0),
                 limit_px: num(tag::PRICE).filter(|p| *p != 0.0),
                 status,

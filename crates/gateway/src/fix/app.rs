@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::fix::dialect::{parse_order_status_report, tag, FixDialect, StatusReport};
-use crate::contract::{BrokerOpenOrder, BrokerOrderState};
+use crate::contract::BrokerOrderState;
 use crate::stream_health::StreamHandle;
 use crate::venue_event::VenueEvent;
 
@@ -31,8 +31,8 @@ pub type PendingAcks = Arc<Mutex<HashMap<String, oneshot::Sender<AckResult>>>>;
 /// `acc` on the callback thread until the batch's final report, then `tx` delivers
 /// them to the awaiting adapter.
 pub struct SnapshotWaiter {
-    pub acc: Vec<BrokerOpenOrder>,
-    pub tx: oneshot::Sender<Vec<BrokerOpenOrder>>,
+    pub acc: Vec<StatusReport>,
+    pub tx: oneshot::Sender<Vec<StatusReport>>,
 }
 
 /// MassStatusReqID → the mass-status collector for an `open_orders` call.
@@ -86,8 +86,8 @@ impl FixApplication {
         let Some(reqid) = sr.mass_status_req_id.clone() else { return };
         let Ok(mut map) = self.snapshots.lock() else { return };
         if let Some(w) = map.get_mut(&reqid) {
-            if let Some(open) = sr.to_open_order() {
-                w.acc.push(open);
+            if !sr.empty_batch {
+                w.acc.push(sr.clone());
             }
         }
         if sr.last_rpt_requested || sr.empty_batch {

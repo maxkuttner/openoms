@@ -45,13 +45,20 @@ impl Connector for Ibkr {
     }
 
     /// FIX-only: the session both routes orders and delivers execution reports,
-    /// as venue events. No pull source: this FIX gateway offers no execution
-    /// history query, so a fill missed while the session was down (ResetOnLogon=Y,
-    /// memory store: no resend) is not recovered; the events go straight to ingest.
+    /// as venue events. The FIX adapter is its own pull source: no execution
+    /// history (empty pulls), but the 35=AF open-order snapshot on every
+    /// (re)logon and timer, so orders closed during an outage (ResetOnLogon=Y,
+    /// memory store: no resend) are resolved and their fill gap shows.
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, deps: &RegistrationDeps) -> Result<Connected, String> {
         let (adapter, venue_stream) = start_ibkr(env, creds, &deps.stream_health)
             .ok_or_else(|| "IBKR FIX session could not start".to_string())?;
-        Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None, venue_stream: Some(venue_stream) })
+        Ok(Connected {
+            source: Some(adapter.clone()),
+            adapter,
+            exec_stream: None,
+            daily_stats: None,
+            venue_stream: Some(venue_stream),
+        })
     }
 
     fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {

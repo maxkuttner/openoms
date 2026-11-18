@@ -30,8 +30,8 @@
 //! **FIX:** the session's QuickFIX callbacks emit the venue events; its
 //! `VenueStream` drains them into this reconciler's sink like any other
 //! stream, and `Connected` is sent on every (re)logon. Binance FIX pulls from
-//! the same credential's REST API; IBKR FIX has no source and runs no
-//! reconciler (`reload` forwards its events to ingest directly).
+//! the same credential's REST API; IBKR FIX's source is the FIX adapter itself
+//! (empty pulls, 35=AF open-order snapshot).
 //!
 //! The instrument provider (from `Connector::universe_provider`) rides along on
 //! every `GatewayMsg::Venue` this sends, so the engine keeps no per-connection map.
