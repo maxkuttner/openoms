@@ -443,18 +443,23 @@ const MAX_HISTORY_DAYS: i64 = 730;
 /// Where a pull that ended on its last window resumes: a margin before its
 /// newest row, so a late-indexed execution stamped a little earlier is still
 /// seen (re-reads are exec-id duplicates).
-pub(crate) const LATE_MARGIN_MS: i64 = 600_000;
+pub(crate) const LATE_MARGIN_MS: i64 = 1_800_000;
 const EXECUTIONS_LIMIT: usize = 100;
 /// Most empty windows one call skips (two years of them).
 const MAX_EMPTY_HOPS: usize = 110;
 
-pub(crate) fn parse_cursor(from: Option<&Cursor>) -> Option<(i64, String)> {
-    let (start, token) = from?.0.split_once(':')?;
-    Some((start.parse().ok()?, token.to_string()))
+/// `"{start_ms}:{newest_ms}:{token}"`: the window's start, the newest row time
+/// seen in it so far (rows come newest first, so its first page has it), and
+/// the venue's page token (only valid under the same window).
+pub(crate) fn parse_cursor(from: Option<&Cursor>) -> Option<(i64, i64, String)> {
+    let mut parts = from?.0.splitn(3, ':');
+    let start = parts.next()?.parse().ok()?;
+    let newest = parts.next()?.parse().ok()?;
+    Some((start, newest, parts.next()?.to_string()))
 }
 
-fn format_cursor(start_ms: i64, token: &str) -> Cursor {
-    Cursor(format!("{start_ms}:{token}"))
+fn format_cursor(start_ms: i64, newest_ms: i64, token: &str) -> Cursor {
+    Cursor(format!("{start_ms}:{newest_ms}:{token}"))
 }
 
 /// Start of a scan with no cursor: `since`, but never before the venue's history.
@@ -472,7 +477,7 @@ pub(crate) struct ExecutionsPage {
 /// `start_ms`. Rows before `since` are dropped on every page; a row missing a
 /// field is warned about and skipped. `more` and the cursor come from the raw
 /// page: the venue's token while it has one, then the next window until `now`.
-pub(crate) fn executions_page(result: &serde_json::Value, account_ref: &str, since: DateTime<Utc>, start_ms: i64, now_ms: i64) -> ExecutionsPage {
+pub(crate) fn executions_page(result: &serde_json::Value, account_ref: &str, since: DateTime<Utc>, start_ms: i64, carried_newest_ms: i64, now_ms: i64) -> ExecutionsPage {
     let rows = result["list"].as_array().cloned().unwrap_or_default();
     let mut fills = Vec::new();
     for d in &rows {
@@ -484,13 +489,18 @@ pub(crate) fn executions_page(result: &serde_json::Value, account_ref: &str, sin
     }
     let token = result["nextPageCursor"].as_str().unwrap_or("");
     let last_window = start_ms + WINDOW_MS >= now_ms;
+    // `carried_newest_ms` is the newest row time of the window's earlier pages (0 on the first).
+    let newest = rows.iter().filter_map(|d| time_ms(&d["execTime"])).map(|t| t.timestamp_millis()).fold(carried_newest_ms, i64::max);
     let (next, more) = if !token.is_empty() {
-        (format_cursor(start_ms, token), true)
+        (format_cursor(start_ms, newest, token), true)
     } else if !last_window {
-        (format_cursor(start_ms + WINDOW_MS, ""), true)
+        (format_cursor(start_ms + WINDOW_MS, 0, ""), true)
+    } else if newest > 0 {
+        // Resume a margin before the window's newest row (from its first page), never before its start.
+        let from = (newest - LATE_MARGIN_MS).max(start_ms);
+        (format_cursor(from, from, ""), false)
     } else {
-        let newest = rows.iter().filter_map(|d| time_ms(&d["execTime"])).map(|t| t.timestamp_millis()).max();
-        (newest.map_or(Cursor(String::new()), |t| format_cursor((t - LATE_MARGIN_MS).max(start_ms), "")), false)
+        (Cursor(String::new()), false)
     };
     ExecutionsPage { page: PullPage { fills, next, more }, raw_rows: rows.len() }
 }
@@ -505,7 +515,8 @@ impl ExecutionSource for BybitAdapter {
         since: DateTime<Utc>,
     ) -> Result<PullPage, BrokerError> {
         let now = Utc::now();
-        let (mut start_ms, mut token) = parse_cursor(from).unwrap_or_else(|| (first_window_start(since, now), String::new()));
+        let (mut start_ms, mut newest_ms, mut token) =
+            parse_cursor(from).unwrap_or_else(|| (first_window_start(since, now), 0, String::new()));
         for _ in 0..MAX_EMPTY_HOPS {
             let end_ms = (start_ms + WINDOW_MS).min(now.timestamp_millis());
             let mut query = format!("category=spot&limit={EXECUTIONS_LIMIT}&startTime={start_ms}&endTime={end_ms}");
@@ -513,12 +524,13 @@ impl ExecutionSource for BybitAdapter {
                 query.push_str(&format!("&cursor={token}"));
             }
             let result = self.get("/v5/execution/list", &query, true).await?;
-            let page = executions_page(&result, account_ref, since, start_ms, now.timestamp_millis());
+            let page = executions_page(&result, account_ref, since, start_ms, newest_ms, now.timestamp_millis());
             // An empty window in the middle of history: try the next one rather than
             // hand the reconciler an empty page with more to come.
             if page.raw_rows == 0 && page.page.more {
-                if let Some((next_start, _)) = parse_cursor(Some(&page.page.next)) {
+                if let Some((next_start, _, _)) = parse_cursor(Some(&page.page.next)) {
                     start_ms = next_start;
+                    newest_ms = 0;
                     token = String::new();
                     continue;
                 }
@@ -808,7 +820,7 @@ mod tests {
 
     #[test]
     fn bybit_fill_without_oms_id_is_kept() {
-        let page = executions_page(&exec_list(), "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000);
+        let page = executions_page(&exec_list(), "", DateTime::<Utc>::MIN_UTC, T0, 0, T0 + 1000);
         // The second row was placed in the Bybit app: no orderLinkId, still a fill.
         let f = page.page.fills.iter().find(|f| f.exec_id == "2100000000007764999").expect("kept");
         assert_eq!(f.client_order_id, None);
@@ -817,7 +829,7 @@ mod tests {
 
     #[test]
     fn bybit_pull_page_maps_and_cursors() {
-        let page = executions_page(&exec_list(), "acct", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
+        let page = executions_page(&exec_list(), "acct", DateTime::<Utc>::MIN_UTC, T0, 0, T0 + 1000).page;
         // The third row has no execQty: skipped (and warned), the other two map.
         assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["2100000000007764263", "2100000000007764999"]);
         let f = &page.fills[0];
@@ -827,7 +839,7 @@ mod tests {
         assert_eq!(f.executed_at, Some(ms(T0)));
         assert_eq!(page.fills[1].fee, Some((-0.01, "USDT".to_string())), "a maker rebate stays negative");
         // The venue's own token continues the page, tied to its window start.
-        assert_eq!(page.next, Cursor(format!("{T0}:page2tokenabc%3A1700000100000%2C1")));
+        assert_eq!(page.next, Cursor(format!("{T0}:{}:page2tokenabc%3A1700000100000%2C1", T0 + 60_000)));
         assert!(page.more);
     }
 
@@ -836,30 +848,47 @@ mod tests {
         let mut result = exec_list();
         result["nextPageCursor"] = serde_json::json!("");
         // Window 1 of several: the next call starts where this window ended.
-        let mid = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0, T0 + 3 * WINDOW_MS).page;
-        assert_eq!((mid.next, mid.more), (Cursor(format!("{}:", T0 + WINDOW_MS)), true));
+        let mid = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0, 0, T0 + 3 * WINDOW_MS).page;
+        assert_eq!((mid.next, mid.more), (Cursor(format!("{}:0:", T0 + WINDOW_MS)), true));
         // The last window: resume a margin before the newest row (never before the window start).
-        let last = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
-        assert_eq!((last.next, last.more), (Cursor(format!("{T0}:")), false));
-        let late = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0 - 2 * LATE_MARGIN_MS, T0 + 1000).page;
-        assert_eq!(late.next, Cursor(format!("{}:", T0 + 60_000 - LATE_MARGIN_MS)));
+        let last = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0, 0, T0 + 1000).page;
+        assert_eq!((last.next, last.more), (Cursor(format!("{T0}:{T0}:")), false));
+        let late = executions_page(&result, "", DateTime::<Utc>::MIN_UTC, T0 - 2 * LATE_MARGIN_MS, 0, T0 + 1000).page;
+        let from = T0 + 60_000 - LATE_MARGIN_MS;
+        assert_eq!(late.next, Cursor(format!("{from}:{from}:")));
         // An empty window moves nothing and says so.
         let empty = serde_json::json!({ "list": [], "nextPageCursor": "" });
-        let p = executions_page(&empty, "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
+        let p = executions_page(&empty, "", DateTime::<Utc>::MIN_UTC, T0, 0, T0 + 1000).page;
         assert_eq!((p.next, p.more, p.fills.len()), (Cursor(String::new()), false, 0));
     }
 
     #[test]
+    fn bybit_multi_page_last_window_cursor_tracks_newest_row() {
+        // Rows come newest first: page 1 holds the newest, the final page the oldest.
+        let row = |id: &str, t: i64| serde_json::json!({ "execId": id, "orderId": "o", "symbol": "BTCUSDT", "side": "Buy", "execQty": "1", "execPrice": "1", "execType": "Trade", "execTime": t.to_string() });
+        let day = 86_400_000;
+        let (newest, oldest) = (T0 + 6 * day, T0 + day);
+        let now = T0 + 7 * day;
+        let first = executions_page(&serde_json::json!({ "list": [row("a", newest)], "nextPageCursor": "tok" }), "", DateTime::<Utc>::MIN_UTC, T0, 0, now);
+        assert_eq!(first.page.next, Cursor(format!("{T0}:{newest}:tok")));
+        let (start, carried, _) = parse_cursor(Some(&first.page.next)).unwrap();
+        let last = executions_page(&serde_json::json!({ "list": [row("z", oldest)], "nextPageCursor": "" }), "", DateTime::<Utc>::MIN_UTC, start, carried, now).page;
+        let from = newest - LATE_MARGIN_MS;
+        assert_eq!((last.next, last.more), (Cursor(format!("{from}:{from}:")), false));
+        assert_eq!(LATE_MARGIN_MS, 30 * 60 * 1000);
+    }
+
+    #[test]
     fn since_filters_every_page_and_the_cursor_still_moves() {
-        let page = executions_page(&exec_list(), "", ms(T0 + 40_000), T0, T0 + 1000).page;
+        let page = executions_page(&exec_list(), "", ms(T0 + 40_000), T0, 0, T0 + 1000).page;
         assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["2100000000007764999"]);
         assert!(page.more, "from the raw page, not the filtered count");
     }
 
     #[test]
     fn the_cursor_names_its_window_and_the_first_window_is_capped_at_two_years() {
-        assert_eq!(parse_cursor(Some(&Cursor(format!("{T0}:abc%3A1")))), Some((T0, "abc%3A1".to_string())));
-        assert_eq!(parse_cursor(Some(&Cursor(format!("{T0}:")))), Some((T0, String::new())));
+        assert_eq!(parse_cursor(Some(&Cursor(format!("{T0}:77:abc%3A1")))), Some((T0, 77, "abc%3A1".to_string())));
+        assert_eq!(parse_cursor(Some(&Cursor(format!("{T0}:0:")))), Some((T0, 0, String::new())));
         assert_eq!(parse_cursor(None), None);
         let now = ms(T0 * 2);
         assert_eq!(first_window_start(DateTime::<Utc>::MIN_UTC, now), T0 * 2 - 730 * 86_400_000);
@@ -872,7 +901,7 @@ mod tests {
         let VEvent::Fill(s) = &crate::connectors::bybit::stream::venue_events(&msg)[0] else { panic!("a fill") };
         let row = serde_json::json!({ "execId": "2100000000007764263", "orderId": "1820000000000000002", "symbol": "BTCUSDT", "side": "Buy",
             "execQty": "0.001", "execPrice": "65000", "execType": "Trade", "execTime": "1700000000000", "execFee": "0.000001", "feeCurrency": "BTC" });
-        let p = executions_page(&serde_json::json!({ "list": [row], "nextPageCursor": "" }), "", DateTime::<Utc>::MIN_UTC, T0, T0 + 1000).page;
+        let p = executions_page(&serde_json::json!({ "list": [row], "nextPageCursor": "" }), "", DateTime::<Utc>::MIN_UTC, T0, 0, T0 + 1000).page;
         assert_eq!(s.exec_id, p.fills[0].exec_id);
         assert_eq!(s.exec_id, "2100000000007764263");
         assert_eq!(s.fee, p.fills[0].fee, "the fee is the same too: one helper for both paths");
