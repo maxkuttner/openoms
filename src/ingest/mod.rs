@@ -1,3 +1,4 @@
+mod adopt;
 pub mod apply;
 pub mod decide;
 

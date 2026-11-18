@@ -11,16 +11,17 @@ use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use gateway::adapter::{BrokerInstrument, InstrumentProvider};
-use gateway::venue_event::{VenueEvent, VenueFill, VenueOrderStatus, VenueOrderUpdate};
+use gateway::adapter::InstrumentProvider;
+use gateway::venue_event::{VenueEvent, VenueOrderStatus, VenueOrderUpdate};
 
+use super::adopt;
 use super::decide::{decide, BreakKind, ConnPolicy, Decision, KnownOrder, Lookup, Policy, Rule};
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::{
-    ExecutionReport, ExpireOrder, OrderCommand, ReceiveExecutionReport, ReplaceOrder, RouteOrder, SubmitOrder,
+    ExecutionReport, ExpireOrder, OrderCommand, ReceiveExecutionReport, ReplaceOrder,
 };
 use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload};
-use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
+use crate::domain::orders::state::{OrderAggregateState, OrderStatus};
 use crate::event_bus::{publish_appended, EventBus, OrderLaneEvent};
 use crate::event_store::{AppendResult, EventStoreError, NewOrderEvent, OrderEventStore};
 use crate::execution::load_state;
@@ -75,24 +76,38 @@ struct Booked {
     fee: Option<FeeCharge>,
 }
 
-/// Apply one venue event of `connection`. Returns what was decided; a
-/// `Duplicate` wrote nothing.
+/// What `ingest` did with one event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ingested {
+    pub decision: Decision,
+    /// The venue reports more executed on the order than the OMS has booked:
+    /// its missing fills need pulling (they book with their own exec ids).
+    pub fill_gap: bool,
+}
+
+impl Ingested {
+    fn plain(decision: Decision) -> Self {
+        Ingested { decision, fill_gap: false }
+    }
+}
+
+/// Apply one venue event of `connection`. A `Duplicate` wrote nothing.
 pub async fn ingest(
     pool: &PgPool,
     bus: &EventBus,
     connection: &str,
     event: VenueEvent,
     instruments: Option<&dyn InstrumentProvider>,
-) -> Result<Decision, IngestError> {
+) -> Result<Ingested, IngestError> {
     let account_ref = match &event {
         VenueEvent::Fill(f) => f.account_ref.clone(),
         VenueEvent::Order(o) => o.account_ref.clone(),
         VenueEvent::Fee { exec_id, account_ref, amount, currency } => {
             let account = resolve_account(pool, connection, account_ref).await?;
             ingest_fee(pool, bus, connection, account, exec_id, *amount, currency).await?;
-            return Ok(Decision::Ignore);
+            return Ok(Ingested::plain(Decision::Ignore));
         }
-        VenueEvent::Connected | VenueEvent::Disconnected => return Ok(Decision::Ignore),
+        VenueEvent::Connected | VenueEvent::Disconnected => return Ok(Ingested::plain(Decision::Ignore)),
     };
     let account = resolve_account(pool, connection, &account_ref).await?;
     let policy = load_policy(pool, connection).await?;
@@ -106,7 +121,11 @@ pub async fn ingest(
                         book_fill_fee(pool, bus, b.order_id, fee, connection).await;
                     }
                 }
-                return Ok(decision);
+                let fill_gap = match &event {
+                    VenueEvent::Order(o) => fill_gap(pool, connection, account, o).await?,
+                    _ => false,
+                };
+                return Ok(Ingested { decision, fill_gap });
             }
             Attempt::Retry => {
                 warn!(connection, attempt, "ingest: order version moved, retrying");
@@ -115,6 +134,23 @@ pub async fn ingest(
         }
     }
     Err(IngestError::Other(format!("ingest: gave up after {MAX_ATTEMPTS} version conflicts")))
+}
+
+/// Whether the venue's cum for the order is ahead of what the OMS booked on it.
+async fn fill_gap(pool: &PgPool, connection: &str, account: Uuid, o: &VenueOrderUpdate) -> Result<bool, IngestError> {
+    let by_client = o.client_order_id.as_deref().and_then(|c| Uuid::parse_str(c).ok());
+    let booked: Option<f64> = sqlx::query_scalar(
+        "SELECT cum_qty::float8 FROM order_state WHERE broker_connection_code = $1 \
+         AND (order_id = $4 OR (account_id = $2 AND external_order_id = $3 AND venue_trade_id IS NULL)) \
+         ORDER BY order_id = $4 DESC NULLS LAST LIMIT 1",
+    )
+    .bind(connection)
+    .bind(account)
+    .bind(&o.venue_order_id)
+    .bind(by_client)
+    .fetch_optional(pool)
+    .await?;
+    Ok(booked.is_some_and(|cum| o.cum_qty > cum + EPS))
 }
 
 fn actor(connection: &str) -> String {
@@ -282,7 +318,7 @@ async fn attempt_once(
             Attempt::Done(decision.clone(), None)
         }
         Decision::Adopt { portfolio_id } => {
-            let instrument = match ensure_instrument(pool, broker, instruments, symbol(event)).await? {
+            let instrument = match adopt::ensure_instrument(pool, broker, instruments, symbol(event)).await? {
                 Some(id) => id,
                 None => {
                     let kind = BreakKind::UnknownInstrument;
@@ -291,7 +327,7 @@ async fn attempt_once(
                     return Ok(Attempt::Done(Decision::Break(kind), None));
                 }
             };
-            let Some(principal) = adopting_principal(&mut tx, *portfolio_id).await? else {
+            let Some(principal) = adopt::owner(&mut tx, *portfolio_id).await? else {
                 warn!(connection, %portfolio_id, "ingest: no principal to own an adopted order");
                 let kind = BreakKind::NoBook;
                 record_break(&mut tx, &ctx, venue_order_id, Some(kind), event).await?;
@@ -299,8 +335,8 @@ async fn attempt_once(
                 return Ok(Attempt::Done(Decision::Break(kind), None));
             };
             let order_id = Uuid::new_v4();
-            let mut commands = adopt_commands(order_id, *portfolio_id, account, instrument, broker, event);
-            commands.extend(event_commands(order_id, broker, event, 0.0, None));
+            let mut commands = adopt::commands(order_id, *portfolio_id, account, instrument, broker, event);
+            commands.extend(event_commands(order_id, broker, event));
             book(&mut tx, &ctx, order_id, None, commands, Some(principal), event).await?.attempt(decision.clone())
         }
         Decision::Apply { order_id } | Decision::Grow { order_id, .. } => {
@@ -331,8 +367,7 @@ async fn attempt_once(
                 })),
                 _ => {}
             }
-            let (cum, avg) = (state.cum_qty, state.avg_px);
-            commands.extend(event_commands(order_id, broker, event, cum, avg));
+            commands.extend(event_commands(order_id, broker, event));
             if commands.is_empty() {
                 return Ok(Attempt::Done(decision, None));
             }
@@ -387,11 +422,11 @@ fn symbol(event: &VenueEvent) -> &str {
     }
 }
 
-/// The order's state-machine commands for one event, given what is booked.
-/// A closing status first books the quantity the OMS is missing (as
-/// `reports_for` does for a terminal snapshot); a working update books nothing,
-/// since its fills arrive on their own.
-fn event_commands(order_id: Uuid, venue: &str, event: &VenueEvent, booked_cum: f64, booked_avg: Option<f64>) -> Vec<OrderCommand> {
+/// The order's state-machine commands for one event. An order update only
+/// moves status: fills book only from fill events, with their exec ids, so a
+/// venue cum ahead of the books is a gap for a pull to close, never a
+/// synthetic fill.
+fn event_commands(order_id: Uuid, venue: &str, event: &VenueEvent) -> Vec<OrderCommand> {
     let report = |report| {
         OrderCommand::ReceiveExecutionReport(ReceiveExecutionReport { order_id: order_id.to_string(), report })
     };
@@ -403,22 +438,7 @@ fn event_commands(order_id: Uuid, venue: &str, event: &VenueEvent, booked_cum: f
             venue: venue.into(),
         })],
         VenueEvent::Order(o) => {
-            if o.status == VenueOrderStatus::Working {
-                return Vec::new();
-            }
             let mut out = Vec::new();
-            let missing = o.cum_qty - booked_cum;
-            if missing > EPS {
-                match o.limit_px.or(booked_avg) {
-                    Some(price) => out.push(report(ExecutionReport::Fill {
-                        execution_id: format!("{venue}-close-{order_id}-{}", o.cum_qty),
-                        fill_qty: missing,
-                        fill_price: price,
-                        venue: venue.into(),
-                    })),
-                    None => warn!(%order_id, missing, "ingest: no price for the quantity missing at close; not booked"),
-                }
-            }
             match &o.status {
                 VenueOrderStatus::Canceled => {
                     out.push(report(ExecutionReport::Canceled { reason: None, venue: Some(venue.into()) }))
@@ -435,63 +455,6 @@ fn event_commands(order_id: Uuid, venue: &str, event: &VenueEvent, booked_cum: f
         }
         _ => Vec::new(),
     }
-}
-
-/// Submit and route an order the OMS did not place, sized by what the venue
-/// has reported so far: the update's quantity, or the fill's.
-fn adopt_commands(
-    order_id: Uuid,
-    portfolio_id: Uuid,
-    account: Uuid,
-    instrument: i64,
-    venue: &str,
-    event: &VenueEvent,
-) -> Vec<OrderCommand> {
-    let (client, venue_order_id, buy, order_type, limit, qty) = match event {
-        VenueEvent::Fill(VenueFill { client_order_id, venue_order_id, buy, price, qty, .. }) => {
-            (client_order_id, venue_order_id, *buy, OrderType::Limit, Some(*price), *qty)
-        }
-        VenueEvent::Order(VenueOrderUpdate { client_order_id, venue_order_id, buy, order_type, limit_px, qty, .. }) => {
-            let ty = if order_type.eq_ignore_ascii_case("market") { OrderType::Market } else { OrderType::Limit };
-            (client_order_id, venue_order_id, *buy, ty, if ty == OrderType::Market { None } else { *limit_px }, *qty)
-        }
-        _ => unreachable!("only orders and fills are adopted"),
-    };
-    vec![
-        OrderCommand::SubmitOrder(SubmitOrder {
-            order_id: order_id.to_string(),
-            client_order_id: client.clone().unwrap_or_else(|| venue_order_id.clone()),
-            portfolio_id: portfolio_id.to_string(),
-            account_id: account.to_string(),
-            instrument_id: instrument.to_string(),
-            side: if buy { OrderSide::Buy } else { OrderSide::Sell },
-            order_type,
-            time_in_force: TimeInForce::Gtc,
-            limit_price: limit,
-            quantity: qty,
-        }),
-        OrderCommand::RouteOrder(RouteOrder {
-            order_id: order_id.to_string(),
-            venue: venue.into(),
-            external_order_id: venue_order_id.clone(),
-        }),
-    ]
-}
-
-/// Who an adopted order belongs to: the book's strategy, else someone who may
-/// trade the book, else the first administrator.
-async fn adopting_principal(conn: &mut PgConnection, portfolio_id: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT id FROM ( \
-            SELECT principal_id AS id, 1 AS rank, now() AS at FROM strategy WHERE portfolio_id = $1 \
-            UNION ALL SELECT principal_id, 2, created_at FROM principal_portfolio_grant \
-                WHERE portfolio_id = $1 AND can_trade \
-            UNION ALL SELECT principal_id, 3, granted_at FROM principal_admin \
-         ) c ORDER BY rank, at LIMIT 1",
-    )
-    .bind(portfolio_id)
-    .fetch_optional(conn)
-    .await
 }
 
 /// Decide and apply `commands` to the order (a new one when `base` is `None`),
@@ -522,21 +485,20 @@ async fn book(
     let mut events: Vec<OrderDomainEvent> = Vec::new();
     for command in commands {
         let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor.clone() };
-        let decided = aggregate
+        let mut decided = aggregate
             .decide(command, metadata)
             .map_err(|r| IngestError::Other(format!("order {order_id}: {}", r.message)))?;
-        for e in &decided {
+        for e in &mut decided {
+            // a late fill on a canceled/expired/rejected order books, but the
+            // order stays closed, in its events as in order_state
+            if let Some(prev) = was.filter(|s| s.is_terminal() && *s != OrderStatus::Filled) {
+                e.status_after = prev;
+            }
             aggregate.apply(e).map_err(|r| IngestError::Other(r.message))?;
         }
         events.extend(decided);
     }
-    let mut state = aggregate.state.ok_or_else(|| IngestError::Other("no order state".into()))?;
-    // a late fill on a canceled/expired/rejected order books, but does not reopen it
-    if let Some(prev) = was.filter(|s| s.is_terminal() && *s != OrderStatus::Filled) {
-        if state.status != OrderStatus::Filled {
-            state.status = prev;
-        }
-    }
+    let state = aggregate.state.ok_or_else(|| IngestError::Other("no order state".into()))?;
 
     match principal {
         Some(principal) => {
@@ -737,55 +699,6 @@ async fn record_break(
     .await?;
     warn!(connection = ctx.connection, venue_order_id, ?kind, "ingest: recorded in a break");
     Ok(())
-}
-
-/// One instrument as a catalog provider, to add a symbol the catalog lacks.
-struct OneInstrument(std::sync::Mutex<Option<BrokerInstrument>>);
-
-#[async_trait::async_trait]
-impl InstrumentProvider for OneInstrument {
-    async fn list_instruments(&self, _: &[String]) -> Result<Vec<BrokerInstrument>, gateway::adapter::BrokerError> {
-        Ok(self.0.lock().unwrap().take().into_iter().collect())
-    }
-}
-
-struct Quiet;
-
-impl crate::setup::brokers::LoadProgress for Quiet {
-    fn progress(&self, _: i64, _: i64) {}
-    fn log(&self, _: &str, _: &str) {}
-}
-
-async fn instrument_id(pool: &PgPool, broker: &str, symbol: &str) -> Result<Option<i64>, sqlx::Error> {
-    sqlx::query_scalar("SELECT instrument_id FROM broker_instrument WHERE broker_symbol = $1 AND broker_code = $2")
-        .bind(symbol)
-        .bind(broker)
-        .fetch_optional(pool)
-        .await
-}
-
-/// The catalog's instrument for the broker's `symbol`, added from the broker's
-/// own catalog when missing. `None` when the broker does not list it (or there
-/// is no catalog to ask).
-pub async fn ensure_instrument(
-    pool: &PgPool,
-    broker: &str,
-    provider: Option<&dyn InstrumentProvider>,
-    symbol: &str,
-) -> Result<Option<i64>, IngestError> {
-    if let Some(id) = instrument_id(pool, broker, symbol).await? {
-        return Ok(Some(id));
-    }
-    let Some(provider) = provider else { return Ok(None) };
-    let listed = provider.list_instruments(&[]).await.map_err(|e| IngestError::Other(e.to_string()))?;
-    let Some(found) = listed.into_iter().find(|i| i.broker_symbol == symbol) else { return Ok(None) };
-    let Some(b) = crate::setup::brokers::Broker::by_code(broker) else { return Ok(None) };
-    let opts = crate::setup::brokers::LoadOptions { no_enrich: true, allow_skips: true, underlyings: Vec::new() };
-    crate::setup::brokers::load_universe(pool, b, &OneInstrument(std::sync::Mutex::new(Some(found))), &opts, &Quiet)
-        .await
-        .map_err(|e| IngestError::Other(e.to_string()))?;
-    info!(broker, symbol, "ingest: added an instrument the catalog did not have");
-    Ok(instrument_id(pool, broker, symbol).await?)
 }
 
 #[cfg(test)]
