@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::admin::{map_db_error, AdminError};
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
-use crate::ingest::apply::{event_from_json, ingest_with_portfolio};
+use crate::ingest::apply::{event_from_json, ingest_with_portfolio, IngestError};
 use crate::ingest::decide::Decision;
 use crate::jobs::eod_sweep::{run_connection, Lookback};
 use crate::reconciler::SweepReport;
@@ -253,9 +253,15 @@ pub struct SweepBody {
 pub async fn sweep(
     State(state): State<AppState>,
     Path(code): Path<String>,
-    body: Option<Json<SweepBody>>,
+    body: Result<Json<SweepBody>, axum::extract::rejection::JsonRejection>,
 ) -> ApiResult<SweepReport> {
-    let requested = body.and_then(|Json(b)| b.lookback);
+    use axum::extract::rejection::JsonRejection;
+    let requested = match body {
+        Ok(Json(b)) => b.lookback,
+        // no body at all means the defaults; a body that is there must be valid
+        Err(JsonRejection::MissingJsonContentType(_)) => None,
+        Err(e) => return Err(bad_request(format!("invalid body: {e}"))),
+    };
     let requested = requested.as_deref().map(parse_lookback).transpose()?;
     let configured: Option<String> = sqlx::query_scalar("SELECT eod_lookback FROM broker_connection WHERE code = $1")
         .bind(&code)
@@ -328,19 +334,31 @@ async fn open_break(pool: &PgPool, id: Uuid) -> Result<ReconBreak, AdminError> {
 }
 
 /// Close an open break as `status`; a concurrent resolution loses with 409.
-async fn close_break(pool: &PgPool, id: Uuid, status: &str, by: Option<Uuid>) -> Result<ReconBreak, AdminError> {
+/// `None` when it is no longer open, or (with `events`) when it holds other
+/// than that many events: one arrived since the caller read it.
+async fn close_break(
+    pool: &PgPool,
+    id: Uuid,
+    status: &str,
+    by: Option<Uuid>,
+    events: Option<i32>,
+) -> Result<Option<ReconBreak>, AdminError> {
     sqlx::query_as::<_, ReconBreak>(&format!(
         "UPDATE recon_break SET status = $2, resolved_at = now(), resolved_by = $3 \
-         WHERE id = $1 AND status = 'open' RETURNING {BREAK_COLUMNS}"
+         WHERE id = $1 AND status = 'open' AND ($4::int IS NULL OR jsonb_array_length(events_json) = $4) \
+         RETURNING {BREAK_COLUMNS}"
     ))
     .bind(id)
     .bind(status)
     .bind(by)
+    .bind(events)
     .fetch_optional(pool)
     .await
-    .map_err(map_db_error)?
-    .ok_or_else(|| conflict("the break was resolved by someone else"))
+    .map_err(map_db_error)
 }
+
+/// How often an adopt re-reads a break that keeps collecting events.
+const ADOPT_ROUNDS: usize = 5;
 
 #[derive(Debug, Deserialize)]
 pub struct AdoptBody {
@@ -351,43 +369,69 @@ pub struct AdoptBody {
 /// in its own transaction (fills dedupe on their exec id), so when one cannot
 /// book, the earlier ones stay booked, the break stays open and the call can be
 /// repeated once the cause is fixed.
+///
+/// The stream keeps appending to an open break, so the break closes only if it
+/// still holds exactly the events that were booked; otherwise the new ones are
+/// read and booked too (up to `ADOPT_ROUNDS` times, then 409).
 pub async fn adopt_break(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
     Json(body): Json<AdoptBody>,
 ) -> ApiResult<ReconBreak> {
-    let found = open_break(state.pool(), id).await?;
-    require_portfolio(state.pool(), body.portfolio_id).await?;
-    let events = found
-        .events
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|e| {
-            event_from_json(e)
-                .ok_or_else(|| AdminError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("unreadable event in the break: {e}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    for event in events {
-        let done = ingest_with_portfolio(
-            state.pool(),
-            state.event_bus(),
-            &found.broker_connection_code,
-            event,
-            None,
-            body.portfolio_id,
-        )
-        .await
-        .map_err(|e| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("could not book the break: {e}")))?;
-        if let Decision::Break(kind) = done.decision {
-            return Err(AdminError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("the break cannot be booked: {kind:?}; it stays open"),
-            ));
+    adopt(&state, &auth, id, body.portfolio_id, None).await.map(Json)
+}
+
+/// A one-shot step run after the first replay, before the break closes: lets a
+/// test play the stream's part.
+type Between = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Caller-fixable ingest failures are the caller's to see (422); a database
+/// failure is ours.
+fn ingest_error(e: IngestError) -> AdminError {
+    let status = match e {
+        IngestError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        IngestError::UnknownAccount { .. } | IngestError::Other(_) => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    AdminError::new(status, format!("could not book the break: {e}"))
+}
+
+async fn adopt(state: &AppState, auth: &AuthContext, id: Uuid, portfolio: Uuid, mut between: Option<Between>) -> Result<ReconBreak, AdminError> {
+    require_portfolio(state.pool(), portfolio).await?;
+    let mut booked = 0usize;
+    for _ in 0..ADOPT_ROUNDS {
+        let found = open_break(state.pool(), id).await?;
+        let events = found
+            .events
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|e| {
+                event_from_json(e)
+                    .ok_or_else(|| AdminError::new(StatusCode::UNPROCESSABLE_ENTITY, format!("unreadable event in the break: {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let total = events.len();
+        for event in events.into_iter().skip(booked) {
+            let done = ingest_with_portfolio(state.pool(), state.event_bus(), &found.broker_connection_code, event, None, portfolio)
+                .await
+                .map_err(ingest_error)?;
+            if let Decision::Break(kind) = done.decision {
+                return Err(AdminError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("the break cannot be booked: {kind:?}; it stays open"),
+                ));
+            }
+        }
+        booked = total;
+        if let Some(step) = between.take() {
+            step.await;
+        }
+        if let Some(closed) = close_break(state.pool(), id, "resolved", principal_of(auth), Some(total as i32)).await? {
+            return Ok(closed);
         }
     }
-    Ok(Json(close_break(state.pool(), id, "resolved", principal_of(&auth)).await?))
+    Err(conflict("the break kept collecting events; adopt again"))
 }
 
 /// Close the break without booking anything.
@@ -397,7 +441,10 @@ pub async fn dismiss_break(
     Path(id): Path<Uuid>,
 ) -> ApiResult<ReconBreak> {
     open_break(state.pool(), id).await?;
-    Ok(Json(close_break(state.pool(), id, "dismissed", principal_of(&auth)).await?))
+    close_break(state.pool(), id, "dismissed", principal_of(&auth), None)
+        .await?
+        .map(Json)
+        .ok_or_else(|| conflict("the break was resolved by someone else"))
 }
 
 #[cfg(test)]
@@ -542,10 +589,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.status(), StatusCode::BAD_REQUEST);
-        let e = sweep(State(st.clone()), Path(CONN.into()), Some(Json(SweepBody { lookback: Some("2d".into()) }))).await.unwrap_err();
+        let e = sweep(State(st.clone()), Path(CONN.into()), Ok(Json(SweepBody { lookback: Some("2d".into()) }))).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::BAD_REQUEST);
         // valid but no live reconciler in a test process
-        let e = sweep(State(st), Path(CONN.into()), Some(Json(SweepBody { lookback: Some("1w".into()) }))).await.unwrap_err();
+        let e = sweep(State(st), Path(CONN.into()), Ok(Json(SweepBody { lookback: Some("1w".into()) }))).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::CONFLICT);
     }
 
@@ -604,6 +651,64 @@ mod tests {
         assert_eq!(status, "open");
         let orders: i64 = sqlx::query_scalar("SELECT count(*) FROM order_state").fetch_one(&w.pool).await.unwrap();
         assert_eq!(orders, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn adopt_books_events_attached_during_replay() {
+        let w = world().await;
+        let st = test_app_state(w.pool.clone());
+        let auth = principal(&w, None).await;
+        let id = break_with_two_events(&w).await;
+        // the stream attaches a third fill after the snapshot, before the close
+        let pool = w.pool.clone();
+        let late = async move {
+            let fill = serde_json::json!({
+                "type": "fill", "exec_id": "e3", "venue_order_id": "v1", "client_order_id": null,
+                "account_ref": "acc", "symbol": "BTCUSDT", "buy": true, "qty": 4.0, "price": 100.0,
+                "fee": null, "executed_at": null,
+            });
+            sqlx::query("UPDATE recon_break SET events_json = events_json || jsonb_build_array($2::jsonb) WHERE id = $1")
+                .bind(id).bind(fill).execute(&pool).await.unwrap();
+        };
+        let done = adopt(&st, &auth, id, w.portfolio, Some(Box::pin(late))).await.unwrap();
+        assert_eq!((done.status.as_str(), done.events.as_array().unwrap().len()), ("resolved", 3));
+        let (cum, fills): (f64, i64) = sqlx::query_as("SELECT (SELECT cum_qty::float8 FROM order_state), (SELECT count(*) FROM venue_fill)")
+            .fetch_one(&w.pool).await.unwrap();
+        assert_eq!((cum, fills), (7.0, 3));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn adopting_a_break_of_an_unknown_account_is_422() {
+        let w = world().await;
+        let st = test_app_state(w.pool.clone());
+        let auth = principal(&w, None).await;
+        let id = break_with_two_events(&w).await;
+        sqlx::query(
+            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) VALUES ($1, 'ACC2', $2, 'acc2', 'ACTIVE')",
+        )
+        .bind(Uuid::new_v4()).bind(CONN).execute(&w.pool).await.unwrap();
+        sqlx::query("UPDATE recon_break SET events_json = replace(events_json::text, '\"acc\"', '\"zzz\"')::jsonb")
+            .execute(&w.pool).await.unwrap();
+        let e = adopt_break(State(st), Extension(auth), Path(id), Json(AdoptBody { portfolio_id: w.portfolio })).await.unwrap_err();
+        assert_eq!(e.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_sweep_body_is_400_and_no_body_is_the_default() {
+        use axum::extract::FromRequest;
+        let req = |ct: Option<&str>, body: &str| {
+            let mut b = axum::http::Request::builder().method("POST").uri("/");
+            if let Some(ct) = ct {
+                b = b.header("content-type", ct);
+            }
+            b.body(axum::body::Body::from(body.to_string())).unwrap()
+        };
+        let bad = Json::<SweepBody>::from_request(req(Some("application/json"), "{nope"), &()).await;
+        assert!(bad.is_err());
+        let none = Json::<SweepBody>::from_request(req(None, ""), &()).await;
+        assert!(matches!(none, Err(axum::extract::rejection::JsonRejection::MissingJsonContentType(_))));
     }
 
     #[tokio::test]
