@@ -21,6 +21,7 @@ import { InstrumentsPage } from "./pages/admin/Instruments";
 import { BrokerConnectionsPage } from "./pages/admin/BrokerConnections";
 import { DataFeedsPage } from "./pages/admin/DataFeeds";
 import { BlotterPage } from "./pages/admin/Blotter";
+import { BreaksPage } from "./pages/admin/Breaks";
 
 function Trade() {
   const { me } = useSession();
@@ -56,6 +57,7 @@ export function App() {
           <Route path="broker-connections" element={<BrokerConnectionsPage />} />
           <Route path="data-feeds" element={<DataFeedsPage />} />
           <Route path="blotter" element={<BlotterPage />} />
+          <Route path="breaks" element={<BreaksPage />} />
           <Route path="*" element={<Navigate to="users" replace />} />
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

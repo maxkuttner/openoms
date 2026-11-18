@@ -30,7 +30,7 @@ export const ADMIN_TABS: AdminTab[] = [
     ],
   },
   { id: "connectivity", title: "Connectivity", pages: [admin("broker-connections", "Broker connections"), admin("data-feeds", "Data feeds")] },
-  { id: "monitoring", title: "Monitoring", pages: [admin("blotter", "Blotter")] },
+  { id: "monitoring", title: "Monitoring", pages: [admin("blotter", "Blotter"), admin("breaks", "Breaks")] },
 ];
 
 const isAdminPath = (path: string) => path === "/admin" || path.startsWith("/admin/");
