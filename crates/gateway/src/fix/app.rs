@@ -15,7 +15,6 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::fix::dialect::{parse_order_status_report, tag, FixDialect, StatusReport};
-use crate::contract::BrokerOrderState;
 use crate::stream_health::StreamHandle;
 use crate::venue_event::VenueEvent;
 
@@ -39,7 +38,7 @@ pub struct SnapshotWaiter {
 pub type PendingSnapshots = Arc<Mutex<HashMap<String, SnapshotWaiter>>>;
 
 /// ClOrdID → the oneshot an `order_status` (35=H) call is blocked on.
-pub type PendingStatus = Arc<Mutex<HashMap<String, oneshot::Sender<BrokerOrderState>>>>;
+pub type PendingStatus = Arc<Mutex<HashMap<String, oneshot::Sender<StatusReport>>>>;
 
 /// Bridges one broker's QuickFIX session to the OMS. One instance per session.
 pub struct FixApplication {
@@ -105,7 +104,7 @@ impl FixApplication {
         }
         let Ok(mut map) = self.statuses.lock() else { return false };
         if let Some(tx) = map.remove(&sr.client_order_id) {
-            let _ = tx.send(sr.to_order_state());
+            let _ = tx.send(sr.clone());
             true
         } else {
             false

@@ -354,7 +354,11 @@ pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDe
     let code = exec_stream_code(stream.code, stream.env);
     streams.abort_and_remove(&code).await;
     let health = deps.stream_health.handle(stream.code, stream.env, StreamKind::Execution);
-    health.set_connecting();
+    // A FIX session owns its entry and may already be live (its logon can
+    // precede this); only a stream task we start here begins as connecting.
+    if !health.is_fix_session() {
+        health.set_connecting();
+    }
     let handle = match &stream.start {
         StreamStart::Engine(start) => tokio::spawn(start(health, deps.engine.clone())),
         StreamStart::Venue { connection, stream: start, source: None, instruments } => {
@@ -489,6 +493,25 @@ mod tests {
             }
             _ => panic!("expected a venue event"),
         }
+    }
+
+    /// A FIX session owns its health entry (live on logon, which may come
+    /// before its venue stream starts): starting the stream must not reset it.
+    #[tokio::test]
+    async fn starting_a_fix_venue_stream_keeps_the_session_live() {
+        let deps = stub_deps();
+        deps.stream_health.fix_handle("IBKR", "PAPER").set_live();
+        let stream: VenueStream = Arc::new(|_h, _tx| Box::pin(async {}));
+        let start = ExecStreamStart {
+            code: "IBKR",
+            env: "PAPER",
+            adapter: Arc::new(AlpacaAdapter::new("k".into(), "s".into(), "PAPER")),
+            start: StreamStart::Venue { connection: "ibkr-paper".into(), stream, source: None, instruments: None },
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://x@localhost/x").unwrap();
+        restart_exec_stream(&start, &deps, &StreamRegistry::new(), &pool).await;
+        let h = deps.stream_health.snapshot().into_iter().find(|h| h.broker_code == "IBKR").unwrap();
+        assert!(matches!(h.state, gateway::stream_health::StreamState::Live));
     }
 
     #[tokio::test]

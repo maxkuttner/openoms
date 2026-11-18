@@ -18,6 +18,7 @@ use crate::venue_event::{VenueEvent, VenueFill, VenueOrderStatus, VenueOrderUpda
 pub mod tag {
     pub const MSG_TYPE: i32 = 35;
     pub const MSG_SEQ_NUM: i32 = 34;
+    pub const EXEC_TRANS_TYPE: i32 = 20;
     pub const ACCOUNT: i32 = 1;
     pub const COMMISSION: i32 = 12;
     pub const COMM_TYPE: i32 = 13;
@@ -169,6 +170,10 @@ pub struct StatusReport {
     pub order_type: String,
     /// `Price`(44), when non-zero.
     pub limit_px: Option<f64>,
+    /// `Text`(58).
+    pub text: Option<String>,
+    /// `OrdRejReason`(103); `5` = unknown order.
+    pub ord_rej_reason: Option<String>,
     /// `LastRptRequested`(912)=Y — the final report of a mass-status batch.
     pub last_rpt_requested: bool,
     /// `TotNumReports`(911)=0 — the venue's "no open orders" empty-batch reply.
@@ -241,12 +246,14 @@ pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
     Some(StatusReport {
         mass_status_req_id: msg.get_field(tag::MASS_STATUS_REQ_ID).filter(|s| !s.is_empty()),
         client_order_id: msg.get_field(tag::CL_ORD_ID).unwrap_or_default(),
-        venue_order_id: msg.get_field(37).unwrap_or_default(),
+        venue_order_id: order_id_field(msg).unwrap_or_default(),
         symbol: msg.get_field(tag::SYMBOL).unwrap_or_default(),
         cum_qty: msg.get_field(tag::CUM_QTY).and_then(|s| s.parse().ok()).unwrap_or(0.0),
         avg_px: msg.get_field(tag::AVG_PX).and_then(|s| s.parse().ok()).unwrap_or(0.0),
         ord_status: msg.get_field(tag::ORD_STATUS).unwrap_or_default(),
         account: msg.get_field(tag::ACCOUNT).unwrap_or_default(),
+        text: msg.get_field(tag::TEXT).filter(|s| !s.is_empty()),
+        ord_rej_reason: msg.get_field(tag::ORD_REJ_REASON).filter(|s| !s.is_empty()),
         buy: msg.get_field(tag::SIDE).as_deref() == Some("1"),
         qty: msg.get_field(tag::ORDER_QTY).and_then(|s| s.parse().ok()).unwrap_or(0.0),
         order_type: ord_type_name(msg.get_field(tag::ORD_TYPE).as_deref()),
@@ -264,6 +271,31 @@ pub fn snapshot_updates(batch: &[StatusReport], account_ref: &str) -> Vec<VenueO
         .filter(|r| account_ref.is_empty() || r.account.is_empty() || r.account == account_ref)
         .filter_map(StatusReport::to_venue_update)
         .collect()
+}
+
+/// `OrderID`(37), with the placeholders venues send for "no order" (`0`,
+/// `NONE`) treated as absent.
+fn order_id_field(msg: &Message) -> Option<String> {
+    msg.get_field(tag::ORDER_ID).filter(|s| !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("NONE"))
+}
+
+/// The answer to a 35=H for the order known at the venue as `external_order_id`.
+/// A reject (OrdStatus 8) is trusted only when it names that very order and is
+/// not the venue's "unknown order" answer (OrdRejReason 5, or such a Text):
+/// IBKR answers 35=H for an order it doesn't know (other session, day or client)
+/// with OrdStatus 8, which would otherwise close a live or filled order.
+pub fn order_state_from_status_reply(sr: &StatusReport, external_order_id: &str) -> Result<BrokerOrderState, BrokerError> {
+    if sr.ord_status == "8" {
+        let unknown_text = sr.text.as_deref().is_some_and(|t| t.to_ascii_lowercase().contains("unknown"));
+        let same_order = !external_order_id.is_empty() && sr.venue_order_id == external_order_id;
+        if !same_order || sr.ord_rej_reason.as_deref() == Some("5") || unknown_text {
+            return Err(BrokerError::Network(format!(
+                "order status unresolved: venue does not know order {external_order_id} (OrderID {:?}, reason {:?}, text {:?})",
+                sr.venue_order_id, sr.ord_rej_reason, sr.text
+            )));
+        }
+    }
+    Ok(sr.to_order_state())
 }
 
 fn ord_type_name(v: Option<&str>) -> String {
@@ -395,7 +427,7 @@ pub(crate) mod tests {
         let id = Uuid::new_v4();
         let msg = exec_report(&[
             (tag::CL_ORD_ID, &id.to_string()),
-            (tag::ORDER_ID, "0"),
+            (tag::ORDER_ID, "555"),
             (tag::EXEC_TYPE, "8"),
             (tag::ORD_STATUS, "8"),
             (tag::TEXT, "insufficient balance"),
@@ -500,6 +532,54 @@ pub(crate) mod tests {
         assert_eq!(snapshot_updates(&batch, "").len(), 2);
     }
 
+    fn status_reply(fields: &[(i32, &str)]) -> StatusReport {
+        let mut all = vec![(tag::CL_ORD_ID, "c-1"), (tag::EXEC_TYPE, "I")];
+        all.extend_from_slice(fields);
+        parse_order_status_report(&exec_report(&all)).unwrap()
+    }
+
+    #[test]
+    fn unknown_order_status_reply_does_not_close_the_order() {
+        // IBKR answers 35=H for an order it doesn't know with OrdStatus=8.
+        let unknown = status_reply(&[(tag::ORDER_ID, "0"), (tag::ORD_STATUS, "8"), (tag::ORD_REJ_REASON, "5")]);
+        assert!(order_state_from_status_reply(&unknown, "701").is_err());
+        let other = status_reply(&[(tag::ORDER_ID, "999"), (tag::ORD_STATUS, "8")]);
+        assert!(order_state_from_status_reply(&other, "701").is_err());
+        let text = status_reply(&[(tag::ORDER_ID, "701"), (tag::ORD_STATUS, "8"), (tag::TEXT, "Unknown order")]);
+        assert!(order_state_from_status_reply(&text, "701").is_err());
+        // A real reject of this very order is trusted.
+        let real = status_reply(&[(tag::ORDER_ID, "701"), (tag::ORD_STATUS, "8"), (tag::TEXT, "margin")]);
+        assert_eq!(order_state_from_status_reply(&real, "701").unwrap().outcome, BrokerOrderOutcome::Rejected);
+        // Non-reject statuses pass through.
+        let filled = status_reply(&[(tag::ORDER_ID, "701"), (tag::ORD_STATUS, "2"), (tag::CUM_QTY, "3")]);
+        assert_eq!(order_state_from_status_reply(&filled, "701").unwrap().outcome, BrokerOrderOutcome::Filled);
+    }
+
+    #[test]
+    fn fix_trade_bust_is_not_booked_as_a_fill() {
+        let base = [
+            (tag::CL_ORD_ID, "c"), (tag::ORDER_ID, "1"), (tag::EXEC_ID, "E"), (tag::LAST_QTY, "1"), (tag::LAST_PX, "2"), (tag::ORD_STATUS, "1"),
+        ];
+        for extra in [[(tag::EXEC_TYPE, "2"), (tag::EXEC_TRANS_TYPE, "1")], [(tag::EXEC_TYPE, "2"), (tag::EXEC_TRANS_TYPE, "2")], [(tag::EXEC_TYPE, "H"), (tag::EXEC_TRANS_TYPE, "0")], [(tag::EXEC_TYPE, "G"), (tag::EXEC_TRANS_TYPE, "0")]] {
+            let mut f = base.to_vec();
+            f.extend_from_slice(&extra);
+            let p = parse_standard_exec_report(&exec_report(&f), tag::EXEC_ID).unwrap();
+            assert!(!p.events.iter().any(|e| matches!(e, VenueEvent::Fill(_))), "{extra:?}");
+        }
+        let mut f = base.to_vec();
+        f.extend_from_slice(&[(tag::EXEC_TYPE, "2"), (tag::EXEC_TRANS_TYPE, "0")]);
+        assert!(parse_standard_exec_report(&exec_report(&f), tag::EXEC_ID).unwrap().events.iter().any(|e| matches!(e, VenueEvent::Fill(_))));
+    }
+
+    #[test]
+    fn placeholder_order_id_is_absent() {
+        for oid in ["0", "NONE"] {
+            let p = parse_standard_exec_report(&exec_report(&[(tag::CL_ORD_ID, "c"), (tag::ORDER_ID, oid), (tag::EXEC_TYPE, "8"), (tag::ORD_STATUS, "8")]), tag::EXEC_ID).unwrap();
+            assert_eq!(p.external_order_id, None);
+            assert!(p.events.is_empty());
+        }
+    }
+
     #[test]
     fn terminal_status_is_not_an_open_order() {
         let id = Uuid::new_v4();
@@ -586,7 +666,7 @@ pub fn parse_standard_exec_report(msg: &Message, exec_id_tag: i32) -> Option<Par
     // original order, not the cancel request's own id.
     let client_order_id = field(tag::ORIG_CL_ORD_ID).or_else(|| field(tag::CL_ORD_ID));
     let exec_type = field(tag::EXEC_TYPE).unwrap_or_default();
-    let external_order_id = field(tag::ORDER_ID);
+    let external_order_id = order_id_field(msg);
     let account_ref = field(tag::ACCOUNT).unwrap_or_default();
     let symbol = field(tag::SYMBOL).unwrap_or_default();
     let buy = field(tag::SIDE).as_deref() == Some("1");
@@ -602,7 +682,13 @@ pub fn parse_standard_exec_report(msg: &Message, exec_id_tag: i32) -> Option<Par
         events: Vec::new(),
     };
 
-    if matches!(exec_type.as_str(), "1" | "2" | "F") {
+    // A bust/correction (4.2 ExecTransType 1/2; 4.4 ExecType H/G) is not a new
+    // fill; busts are not modelled, so it is warned and not booked.
+    let trans = field(tag::EXEC_TRANS_TYPE);
+    let is_bust = matches!(exec_type.as_str(), "G" | "H") || trans.as_deref().is_some_and(|t| t != "0");
+    if is_bust {
+        warn!(msg_seq_num = ?seq, exec_id = ?field(tag::EXEC_ID), exec_type, exec_trans_type = ?trans, "FIX: trade bust/correction not booked");
+    } else if matches!(exec_type.as_str(), "1" | "2" | "F") {
         match (&exec_id, &external_order_id, num(tag::LAST_QTY), num(tag::LAST_PX)) {
             (Some(exec_id), Some(venue_order_id), Some(qty), Some(price)) => {
                 let fee = match (num(tag::COMMISSION), field(tag::COMM_CURRENCY).or_else(|| field(tag::CURRENCY))) {

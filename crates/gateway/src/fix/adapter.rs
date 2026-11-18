@@ -18,7 +18,7 @@ use crate::adapter::{
     BrokerAdapter, BrokerError, BrokerOrderRequest, BrokerOrderResponse,
 };
 use crate::fix::app::{PendingAcks, PendingSnapshots, PendingStatus, SnapshotWaiter};
-use crate::fix::dialect::{snapshot_updates, tag, FixDialect, StatusReport};
+use crate::fix::dialect::{order_state_from_status_reply, snapshot_updates, tag, FixDialect, StatusReport};
 use crate::contract::{BrokerOpenOrder, BrokerOrderState};
 
 use std::sync::Arc;
@@ -212,7 +212,7 @@ impl BrokerAdapter for FixBrokerAdapter {
             .dialect
             .build_order_status_request(client_order_id, external_order_id, symbol)
             .and_then(|m| self.send(m));
-        await_correlated_reply(
+        let reply = await_correlated_reply(
             rx,
             sent,
             STATUS_TIMEOUT,
@@ -221,7 +221,8 @@ impl BrokerAdapter for FixBrokerAdapter {
                 self.statuses.lock().ok().and_then(|mut m| m.remove(client_order_id));
             },
         )
-        .await
+        .await?;
+        order_state_from_status_reply(&reply, external_order_id)
     }
 }
 
