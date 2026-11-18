@@ -388,7 +388,7 @@ pub(crate) fn fill_of(
         _ => return Err("side"),
     };
     Ok(VenueFill {
-        exec_id: trade_id.to_string(),
+        exec_id: super::fill_exec_id(d["instId"].as_str().unwrap_or(""), trade_id, buy),
         venue_order_id: venue_order_id.to_string(),
         client_order_id: venue_client_id(d["clOrdId"].as_str().unwrap_or("")),
         account_ref: account_ref.to_string(),
@@ -741,11 +741,11 @@ mod tests {
     fn okx_fill_without_oms_id_is_kept() {
         let page = fills_rows(&fills_data(), "", DateTime::<Utc>::MIN_UTC, None);
         // The newest row was placed in the OKX app: its clOrdId is not an OMS id, and it is still a fill.
-        let f = page.fills.iter().find(|f| f.exec_id == "123456791").expect("kept");
+        let f = page.fills.iter().find(|f| f.exec_id == "BTC-USDT:123456791:B").expect("kept");
         assert_eq!(f.client_order_id.as_deref(), Some("manual1"));
         assert_eq!((f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("312269865356374099", "BTC-USDT", true, 1.0, 65000.0));
         // The OMS's own order reads back as its UUID.
-        let ours = page.fills.iter().find(|f| f.exec_id == "123456790").unwrap();
+        let ours = page.fills.iter().find(|f| f.exec_id == "BTC-USDT:123456790:S").unwrap();
         assert_eq!(ours.client_order_id.as_deref(), Some("3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b"));
     }
 
@@ -753,7 +753,7 @@ mod tests {
     fn okx_pull_page_maps_and_cursors() {
         let page = fills_rows(&fills_data(), "acct", DateTime::<Utc>::MIN_UTC, None);
         // The oldest row has no fillSz: skipped (and warned); the other two map.
-        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["123456791", "123456790"]);
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["BTC-USDT:123456791:B", "BTC-USDT:123456790:S"]);
         let f = &page.fills[0];
         assert_eq!((f.account_ref.as_str(), f.executed_at), ("acct", Some(ms(1700000060000))));
         assert_eq!(f.fee, Some((0.001, "BTC".to_string())), "OKX reports a charge as negative; the OMS books it positive");
@@ -768,15 +768,31 @@ mod tests {
     #[test]
     fn a_cursor_stops_the_walk_at_its_bill_and_since_stops_it_at_old_rows() {
         let after = fills_rows(&fills_data(), "", DateTime::<Utc>::MIN_UTC, Some(900000000000000002));
-        assert_eq!(after.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["123456791"]);
+        assert_eq!(after.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["BTC-USDT:123456791:B"]);
         assert!(after.done);
         let recent = fills_rows(&fills_data(), "", ms(1700000055000), None);
-        assert_eq!(recent.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["123456791"]);
+        assert_eq!(recent.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["BTC-USDT:123456791:B"]);
         assert!(recent.done);
         // Nothing new: no cursor to move.
         let none = fills_rows(&fills_data(), "", DateTime::<Utc>::MIN_UTC, Some(900000000000000003));
         assert!(none.fills.is_empty() && none.newest_bill.is_none());
         assert_eq!(pull_result(vec![none]), PullPage { fills: vec![], next: Cursor(String::new()), more: false });
+    }
+
+    #[test]
+    fn two_symbols_sharing_a_trade_id_both_book() {
+        let row = |inst: &str, side: &str, bill: &str| serde_json::json!({ "instId": inst, "tradeId": "42", "ordId": "1", "billId": bill,
+            "fillPx": "1", "fillSz": "1", "side": side, "ts": "1700000000000" });
+        let p = fills_rows(&serde_json::json!([row("BTC-USDT", "buy", "3"), row("ETH-USDT", "buy", "2")]), "", DateTime::<Utc>::MIN_UTC, None);
+        assert_ne!(p.fills[0].exec_id, p.fills[1].exec_id);
+    }
+
+    #[test]
+    fn self_trade_both_sides_book() {
+        let row = |side: &str, bill: &str| serde_json::json!({ "instId": "BTC-USDT", "tradeId": "42", "ordId": "1", "billId": bill,
+            "fillPx": "1", "fillSz": "1", "side": side, "ts": "1700000000000" });
+        let p = fills_rows(&serde_json::json!([row("buy", "3"), row("sell", "2")]), "", DateTime::<Utc>::MIN_UTC, None);
+        assert_eq!((p.fills[0].exec_id.as_str(), p.fills[1].exec_id.as_str()), ("BTC-USDT:42:B", "BTC-USDT:42:S"));
     }
 
     #[test]
@@ -790,7 +806,7 @@ mod tests {
             "fillPx": "65000", "fillSz": "0.0004", "side": "buy", "feeCcy": "USDT", "fee": "-0.026", "ts": "1700000000000" });
         let p = fills_rows(&serde_json::json!([row]), "", DateTime::<Utc>::MIN_UTC, None);
         assert_eq!(s.exec_id, p.fills[0].exec_id);
-        assert_eq!(s.exec_id, "123456789");
+        assert_eq!(s.exec_id, "BTC-USDT:123456789:B");
         assert_eq!(s, &p.fills[0], "the whole fill is the same from both paths");
     }
 

@@ -519,7 +519,7 @@ pub(crate) fn parse_my_trades(body: &serde_json::Value, account_ref: &str) -> Ve
         .flatten()
         .filter_map(|t| {
             Some(VenueFill {
-                exec_id: t["id"].as_i64()?.to_string(),
+                exec_id: super::fill_exec_id(t["symbol"].as_str()?, &t["id"].as_i64()?.to_string(), t["isBuyer"].as_bool()?),
                 venue_order_id: t["orderId"].as_i64()?.to_string(),
                 client_order_id: None,
                 account_ref: account_ref.to_string(),
@@ -553,7 +553,13 @@ pub(crate) fn from_id(from: Option<&Cursor>) -> i64 {
 pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: usize, since: DateTime<Utc>) -> PullPage {
     let rows = body.as_array().map(Vec::len).unwrap_or(0);
     let all = parse_my_trades(body, account_ref);
-    let next = Cursor(all.last().map(|t| t.exec_id.clone()).unwrap_or_default());
+    // The cursor is the raw trade id (`fromId`), not the prefixed exec id.
+    let next = Cursor(
+        body.as_array()
+            .and_then(|a| a.iter().rev().find_map(|t| t["id"].as_i64()))
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+    );
     let fills = all
         .into_iter()
         .filter(|t| match t.executed_at {
@@ -691,7 +697,7 @@ mod tests {
         let page = trades_page(&body, "acct-1", 1000, DateTime::<Utc>::MIN_UTC);
         assert_eq!(page.fills.len(), 2);
         let f = &page.fills[0];
-        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.account_ref.as_str(), f.symbol.as_str()), ("501", "9001", "acct-1", "BTCUSDT"));
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.account_ref.as_str(), f.symbol.as_str()), ("BTCUSDT:501:B", "9001", "acct-1", "BTCUSDT"));
         assert_eq!((f.buy, f.qty, f.price, f.client_order_id.clone()), (true, 0.25, 64000.5, None));
         assert_eq!(f.fee, Some((0.01, "BNB".into())));
         assert_eq!(page.fills[1].fee, None);
@@ -715,7 +721,7 @@ mod tests {
             { "symbol": "X", "id": 2, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": 3000i64 },
         ]);
         let page = trades_page(&body, "a", 1000, Utc.timestamp_millis_opt(2000).unwrap());
-        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["2"]);
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["X:2:B"]);
         assert_eq!(page.next.0, "2");
         // Only old trades: none booked, but the cursor still moves past them.
         let page = trades_page(&body, "a", 1000, Utc.timestamp_millis_opt(9000).unwrap());
@@ -747,7 +753,7 @@ mod tests {
             }
             from = Some(page.next);
         }
-        assert_eq!(booked, ["4"], "old rows on page 2 are dropped too");
+        assert_eq!(booked, ["X:4:B"], "old rows on page 2 are dropped too");
     }
 
     #[test]
@@ -775,6 +781,30 @@ mod tests {
     }
 
     #[test]
+    fn two_symbols_sharing_a_trade_id_both_book() {
+        // Binance trade ids are per symbol: id 501 on BTCUSDT and on ETHUSDT are two fills.
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "id": 501, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true },
+            { "symbol": "ETHUSDT", "id": 501, "orderId": 2, "price": "1", "qty": "1", "isBuyer": true },
+        ]);
+        let page = trades_page(&body, "a", 1000, DateTime::<Utc>::MIN_UTC);
+        let ids: std::collections::HashSet<_> = page.fills.iter().map(|f| f.exec_id.clone()).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_eq!(page.next.0, "501", "the cursor stays the raw trade id");
+    }
+
+    #[test]
+    fn self_trade_both_sides_book() {
+        // A self-trade: both sides carry the same trade id on one account.
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "id": 7, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true },
+            { "symbol": "BTCUSDT", "id": 7, "orderId": 2, "price": "1", "qty": "1", "isBuyer": false },
+        ]);
+        let fills = parse_my_trades(&body, "a");
+        assert_ne!(fills[0].exec_id, fills[1].exec_id);
+    }
+
+    #[test]
     fn my_trades_parse_into_venue_fills() {
         let body = serde_json::json!([
             { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0.01", "commissionAsset": "BNB" },
@@ -782,7 +812,7 @@ mod tests {
         ]);
         let fills = parse_my_trades(&body, "acct-1");
         assert_eq!(fills.len(), 2);
-        assert_eq!((fills[0].exec_id.as_str(), fills[0].venue_order_id.as_str(), fills[0].buy, fills[0].qty), ("501", "9001", true, 0.25));
+        assert_eq!((fills[0].exec_id.as_str(), fills[0].venue_order_id.as_str(), fills[0].buy, fills[0].qty), ("BTCUSDT:501:B", "9001", true, 0.25));
         assert!(!fills[1].buy);
         assert_eq!(fills[0].fee, Some((0.01, "BNB".into())));
         assert_eq!(fills[0].account_ref, "acct-1");

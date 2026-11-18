@@ -318,7 +318,7 @@ pub(crate) fn venue_events(event: &serde_json::Value) -> Vec<VEvent> {
     if exec_type == "TRADE" {
         if let (Some(trade_id), Some(qty), Some(price)) = (event["t"].as_i64(), num("l"), num("L")) {
             out.push(VEvent::Fill(VenueFill {
-                exec_id: trade_id.to_string(),
+                exec_id: super::fill_exec_id(&symbol, &trade_id.to_string(), buy),
                 venue_order_id: venue_order_id.clone(),
                 client_order_id: client_order_id.clone(),
                 account_ref: String::new(),
@@ -383,7 +383,7 @@ mod tests {
         assert_eq!(
             events[0],
             VEvent::Fill(VenueFill {
-                exec_id: "77".into(), venue_order_id: "9001".into(), client_order_id: Some("mm1-q-000001".into()),
+                exec_id: "BTCUSDT:77:B".into(), venue_order_id: "9001".into(), client_order_id: Some("mm1-q-000001".into()),
                 account_ref: String::new(), symbol: "BTCUSDT".into(), buy: true, qty: 0.5, price: 64000.1,
                 fee: Some((0.01, "BNB".into())),
                 executed_at: Some(Utc.timestamp_millis_opt(1700000000000).unwrap()),

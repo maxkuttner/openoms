@@ -209,7 +209,7 @@ mod tests {
         // Three entries (one placed outside the OMS), each a fill and a state.
         assert_eq!(events.len(), 6);
         let VEvent::Fill(f) = &events[0] else { panic!("a fill first") };
-        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("123456789", "312269865356374016", "BTC-USDT", true, 0.0004, 65000.0));
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("BTC-USDT:123456789:B", "312269865356374016", "BTC-USDT", true, 0.0004, 65000.0));
         assert_eq!((f.client_order_id.as_deref(), f.account_ref.as_str(), f.fee.clone()), (Some(ORDER_ID), "", None));
         let VEvent::Order(o) = &events[1] else { panic!("then the order") };
         assert_eq!((o.status.clone(), o.cum_qty, o.qty, o.limit_px, o.buy), (VenueOrderStatus::Working, 0.0004, 0.001, None, true));
@@ -221,7 +221,7 @@ mod tests {
     fn okx_fill_without_oms_id_is_kept() {
         let events = venue_events(&sample("ws_orders_fill"));
         let VEvent::Fill(f) = &events[4] else { panic!("the app's fill") };
-        assert_eq!((f.exec_id.as_str(), f.client_order_id.as_deref()), ("123456791", Some("manual1")));
+        assert_eq!((f.exec_id.as_str(), f.client_order_id.as_deref()), ("BTC-USDT:123456791:B", Some("manual1")));
     }
 
     #[test]
@@ -241,7 +241,7 @@ mod tests {
         let states: Vec<_> = events.iter().filter_map(|e| match e { VEvent::Order(o) => Some(o.status.clone()), _ => None }).collect();
         assert_eq!(states, [VenueOrderStatus::Working, VenueOrderStatus::Canceled, VenueOrderStatus::Canceled]);
         let fills: Vec<_> = events.iter().filter_map(|e| match e { VEvent::Fill(f) => Some(f.exec_id.as_str()), _ => None }).collect();
-        assert_eq!(fills, ["123456700"], "live and a plain cancel carry no trade");
+        assert_eq!(fills, ["BTC-USDT:123456700:B"], "live and a plain cancel carry no trade");
     }
 
     #[test]

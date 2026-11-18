@@ -34,6 +34,23 @@ use super::{Connector, FieldType, Manifest, QuoteScope};
 
 pub struct Binance;
 
+/// The dedup key of one Binance fill, the same from the user-data stream, the
+/// `myTrades` pull and FIX: Binance trade ids are per symbol, and on a
+/// self-trade both sides share one, so the key is `{symbol}:{trade_id}:{B|S}`.
+pub fn fill_exec_id(symbol: &str, trade_id: &str, buy: bool) -> String {
+    format!("{symbol}:{trade_id}:{}", if buy { "B" } else { "S" })
+}
+
+/// The raw venue trade id inside a [`fill_exec_id`] key (the key itself when
+/// it is not one).
+pub fn trade_id_of(exec_id: &str) -> &str {
+    let mut parts = exec_id.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(_), Some(id), Some("B" | "S"), None) => id,
+        _ => exec_id,
+    }
+}
+
 static MANIFEST: Manifest = Manifest {
     code: "BINANCE",
     credential_kind: "BinanceFix",

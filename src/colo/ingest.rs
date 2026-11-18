@@ -250,7 +250,7 @@ pub async fn drain_inbox(
             // The OMS order and its fill book through ingest, once: the
             // follow stream and pulls report the same trade id and dedupe.
             let fill = VenueFill {
-                exec_id: trade.key.trade_id.clone(),
+                exec_id: gateway::connectors::binance::fill_exec_id(&trade.key.symbol, &trade.key.trade_id, trade.side == Side::Buy),
                 venue_order_id: trade.venue_order_id.clone(),
                 client_order_id: Some(trade.client_order_id.clone()).filter(|c| !c.is_empty()),
                 account_ref: identity.external_account_ref.clone(),
@@ -671,7 +671,7 @@ pub fn trade_from_external(
             account_id: identity.account_id,
             environment: identity.environment.clone(),
             symbol: fill.symbol.clone(),
-            trade_id: fill.exec_id.clone(),
+            trade_id: gateway::connectors::binance::trade_id_of(&fill.exec_id).to_string(),
         },
         venue_order_id: fill.venue_order_id.clone(),
         client_order_id: fill.client_order_id.clone().unwrap_or_default(),
@@ -745,7 +745,7 @@ mod tests {
 
     fn fill() -> VenueFill {
         VenueFill {
-            exec_id: "7".into(),
+            exec_id: "BTCUSDT:7:B".into(),
             venue_order_id: "9".into(),
             client_order_id: Some("c".into()),
             account_ref: "sub".into(),

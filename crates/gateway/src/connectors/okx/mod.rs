@@ -18,6 +18,13 @@ use super::{Connector, Manifest, QuoteScope};
 
 pub struct Okx;
 
+/// The dedup key of one OKX fill, the same from the orders stream and the
+/// fills pull: `tradeId` is per instrument, and on a self-trade both sides
+/// share one, so the key is `{instId}:{tradeId}:{B|S}`.
+pub(crate) fn fill_exec_id(inst_id: &str, trade_id: &str, buy: bool) -> String {
+    format!("{inst_id}:{trade_id}:{}", if buy { "B" } else { "S" })
+}
+
 static MANIFEST: Manifest = Manifest {
     code: "OKX",
     credential_kind: "Okx",

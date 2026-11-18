@@ -118,7 +118,13 @@ impl FixDialect for BinanceDialect {
     }
 
     fn parse_execution_report(&self, msg: &Message) -> Option<ParsedExecReport> {
-        parse_standard_exec_report(msg, TRADE_ID)
+        let mut parsed = parse_standard_exec_report(msg, TRADE_ID)?;
+        for e in &mut parsed.events {
+            if let crate::venue_event::VenueEvent::Fill(f) = e {
+                f.exec_id = super::fill_exec_id(&f.symbol, &f.exec_id, f.buy);
+            }
+        }
+        Some(parsed)
     }
 }
 
@@ -155,6 +161,12 @@ mod tests {
         let body = serde_json::json!([{ "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0", "commissionAsset": "BNB" }]);
         let rest = crate::connectors::binance::adapter::trades_page(&body, "", 1000, chrono::DateTime::<chrono::Utc>::MIN_UTC);
         assert_eq!(fix_fill.exec_id, rest.fills[0].exec_id);
+        assert_eq!(fix_fill.exec_id, "BTCUSDT:501:B");
+        let ws = serde_json::json!({ "e": "executionReport", "x": "TRADE", "X": "FILLED", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+            "i": 9001, "q": "0.25", "z": "0.25", "l": "0.25", "L": "64000.5", "t": 501, "T": 1700000000000i64 });
+        let ws_fill = crate::connectors::binance::stream::venue_events(&ws).into_iter()
+            .find_map(|e| match e { crate::venue_event::VenueEvent::Fill(f) => Some(f), _ => None }).unwrap();
+        assert_eq!(ws_fill.exec_id, fix_fill.exec_id, "stream, REST and FIX share one key");
         assert_eq!(fix_fill.venue_order_id, rest.fills[0].venue_order_id);
     }
 
