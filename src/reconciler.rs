@@ -16,8 +16,8 @@
 //!   it runs queue exactly one rerun.
 //! - **Cursors:** a missing cursor is created empty, stamped "now", and history
 //!   is skipped (history comes only from the EOD sweep). An empty cursor pulls
-//!   with `from = None, since = updated_at`; the venue's returned cursor is stored
-//!   after that, so venues must return a non-empty one.
+//!   with `from = None, since = updated_at - 60s`; a non-empty returned cursor is
+//!   stored, an empty one leaves the row (and its stamp) untouched.
 //!
 //! **Double-booking guard (transition):** a connector still on the old
 //! `ExecEvent` session path books its OMS orders' fills without writing
@@ -47,6 +47,10 @@ use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+/// How far before an empty cursor's stamp a pull reaches back, against clock
+/// skew between us and the venue; overlap is free (ingest dedupes).
+const SINCE_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
 
 /// What an EOD sweep pulled.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -258,6 +262,7 @@ impl Reconciler {
             info!(connection = %self.connection, account = account_ref, scope, "reconciler: cursor started at now");
             return Ok(());
         };
+        let since = since - SINCE_MARGIN;
         let mut from = (!cursor.is_empty()).then_some(Cursor(cursor));
         loop {
             let page = self.source.fills_since(account_ref, scope, from.as_ref(), since).await.map_err(|e| e.to_string())?;
@@ -268,9 +273,11 @@ impl Reconciler {
                     gap.store(true, Ordering::Relaxed);
                 }
             }
+            // An empty `next` keeps the row as is: moving its stamp would slide
+            // `since` past fills the venue publishes late.
             sqlx::query(
                 "UPDATE recon_cursor SET cursor = $4, updated_at = now() \
-                 WHERE broker_connection_code = $1 AND account_id = $2 AND scope = $3",
+                 WHERE broker_connection_code = $1 AND account_id = $2 AND scope = $3 AND $4 <> ''",
             )
             .bind(&self.connection)
             .bind(account_id)

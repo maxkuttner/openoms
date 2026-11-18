@@ -19,6 +19,7 @@ struct FakeSource {
     pages: Mutex<Vec<PullPage>>,
     /// `from` of each `fills_since` call.
     calls: Mutex<Vec<Option<String>>>,
+    sinces: Mutex<Vec<DateTime<Utc>>>,
     scopes_calls: Mutex<usize>,
     /// When set, `scopes` waits for a permit (to hold a pull open).
     gate: Option<Semaphore>,
@@ -26,7 +27,8 @@ struct FakeSource {
 
 #[async_trait::async_trait]
 impl ExecutionSource for FakeSource {
-    async fn fills_since(&self, _: &str, _: &str, from: Option<&Cursor>, _: DateTime<Utc>) -> Result<PullPage, BrokerError> {
+    async fn fills_since(&self, _: &str, _: &str, from: Option<&Cursor>, since: DateTime<Utc>) -> Result<PullPage, BrokerError> {
+        self.sinces.lock().unwrap().push(since);
         self.calls.lock().unwrap().push(from.map(|c| c.0.clone()));
         let mut pages = self.pages.lock().unwrap();
         Ok(if pages.is_empty() {
@@ -243,4 +245,29 @@ async fn working_order_missing_from_snapshot_is_resolved() {
     assert_eq!(o.symbol, "BTCUSDT");
     assert_eq!(o.status, VenueOrderStatus::Canceled);
     assert_eq!((o.qty, o.cum_qty, o.buy), (5.0, 2.0, true));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn empty_next_cursor_does_not_slide_since() {
+    let w = world().await;
+    set_cursor(&w, "").await;
+    let stamp = |w: &World| {
+        let pool = w.pool.clone();
+        async move { sqlx::query_scalar::<_, DateTime<Utc>>("SELECT updated_at FROM recon_cursor").fetch_one(&pool).await.unwrap() }
+    };
+    let before = stamp(&w).await;
+    let source = Arc::new(FakeSource { pages: Mutex::new(vec![page(&["e1"], "", false), page(&[], "", false)]), ..Default::default() });
+    let (engine, _) = fake_engine(ok);
+    let (h, _tx) = start(&w, source.clone(), engine);
+    h.pull_now();
+    eventually(|| source.sinces.lock().unwrap().len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    h.pull_now();
+    eventually(|| source.sinces.lock().unwrap().len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(stamp(&w).await, before);
+    assert_eq!(cursor(&w).await.as_deref(), Some(""));
+    let want = before - chrono::Duration::seconds(60);
+    assert_eq!(*source.sinces.lock().unwrap(), [want, want]);
 }
