@@ -82,6 +82,7 @@ pub struct Ingested {
     pub decision: Decision,
     /// The venue reports more executed on the order than the OMS has booked:
     /// its missing fills need pulling (they book with their own exec ids).
+    /// Advisory: read after the commit, outside the venue-order lock.
     pub fill_gap: bool,
 }
 
@@ -119,6 +120,13 @@ pub async fn ingest(
                     publish(bus, &b);
                     if let Some(fee) = b.fee {
                         book_fill_fee(pool, bus, b.order_id, fee, connection).await;
+                    }
+                }
+                // The fee books after the fill commits; if that step was lost,
+                // a redelivered fill brings it again (fee_id dedupes).
+                if let (Decision::Duplicate, VenueEvent::Fill(f)) = (&decision, &event) {
+                    if let Some((amount, ccy)) = &f.fee {
+                        ingest_fee(pool, bus, connection, account, &f.exec_id, *amount, ccy).await?;
                     }
                 }
                 let fill_gap = match &event {
@@ -356,8 +364,8 @@ async fn attempt_once(
                     tx.commit().await?;
                     return Ok(Attempt::Done(Decision::Break(kind), None));
                 }
-                // nothing more to learn from a closed order's status
-                (VenueEvent::Order(_), Decision::Apply { .. }) if terminal => {
+                // a closed order's status is final; only a filled external order may grow
+                (VenueEvent::Order(_), d) if terminal && !(reopenable && matches!(d, Decision::Grow { .. })) => {
                     return Ok(Attempt::Done(decision, None));
                 }
                 (_, Decision::Grow { new_qty, .. }) => commands.push(OrderCommand::ReplaceOrder(ReplaceOrder {

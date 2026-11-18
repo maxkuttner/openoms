@@ -280,3 +280,36 @@ async fn unlisted_symbol_is_unknown_instrument_break() {
     assert_eq!(kind, "unknown_instrument");
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_state").await, 0);
 }
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn order_update_grow_on_canceled_order_is_noop() {
+    let w = world().await;
+    order_with_one_fill(&w).await;
+    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 1.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    let events = count(&w.pool, "SELECT count(*) FROM order_event").await;
+    ingest(&w.pool, &w.bus, CONN, order("v1", 8.0, 1.0, VenueOrderStatus::Working), None).await.unwrap();
+    let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
+    assert_eq!((qty, cum, status.as_str()), (5.0, 1.0, "canceled"));
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM order_event").await, events);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn fee_on_redelivered_fill_is_booked_once_even_if_first_attempt_missed_it() {
+    let w = world().await;
+    let mut ev = fill("e1", "v1", None, 1.0);
+    if let VenueEvent::Fill(f) = &mut ev {
+        f.fee = Some((0.1, "USDT".into()));
+    }
+    ingest(&w.pool, &w.bus, CONN, ev.clone(), None).await.unwrap();
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
+    // the post-commit fee step was lost
+    sqlx::query("DELETE FROM order_fee").execute(&w.pool).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, CONN, ev.clone(), None).await.unwrap().decision;
+    assert_eq!(d, Decision::Duplicate);
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
+    ingest(&w.pool, &w.bus, CONN, ev, None).await.unwrap();
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 1);
+}
