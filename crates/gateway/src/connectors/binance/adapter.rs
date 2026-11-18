@@ -11,7 +11,10 @@
 //! balances report and reconciliation matches on.
 
 use base64::Engine;
-use chrono::{TimeZone, Utc};
+use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
+
+use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 use dataprovider::{Identifiers, InstrumentDef};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
@@ -189,12 +192,16 @@ impl BinanceAdapter {
     /// Raw `myTrades` rows, so the runtime path can retain fees and original
     /// timestamps the follow path does not need.
     pub(crate) async fn my_trades_body(&self, symbol: &str, from_trade_id: Option<i64>, start_time_ms: Option<i64>) -> Result<serde_json::Value, BrokerError> {
-        let mut params = vec![("symbol", symbol.to_string()), ("limit", "1000".to_string())];
+        let mut params = vec![("symbol", symbol.to_string()), ("limit", MY_TRADES_LIMIT.to_string())];
         match (from_trade_id, start_time_ms) {
             (Some(from), _) => params.push(("fromId", from.to_string())),
             (None, Some(start)) => params.push(("startTime", start.to_string())),
             (None, None) => {}
         }
+        self.my_trades_query(&params).await
+    }
+
+    async fn my_trades_query(&self, params: &[(&'static str, String)]) -> Result<serde_json::Value, BrokerError> {
         let resp = self.signed(Method::GET, "/api/v3/myTrades", &params).await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -535,6 +542,153 @@ pub(crate) fn parse_my_trades(body: &serde_json::Value) -> Vec<crate::contract::
         .collect()
 }
 
+/// Most rows one `myTrades` call returns.
+const MY_TRADES_LIMIT: usize = 1000;
+/// Widest `startTime`..`endTime` span `myTrades` accepts.
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// What one `myTrades` call asks for, from the reconciler's cursor.
+///
+/// The cursor is a trade id (continue after it) or `@<ms>`: the start of the
+/// next time window to scan, used until a pull has seen its first trade
+/// (`myTrades` serves at most 24h per `startTime`/`endTime` call).
+#[derive(Debug, PartialEq)]
+pub(crate) enum TradesQuery {
+    FromId(i64),
+    Window { start: i64, end: i64 },
+}
+
+pub(crate) fn trades_query(from: Option<&Cursor>, since: DateTime<Utc>, now: DateTime<Utc>) -> TradesQuery {
+    let window = |start: i64| TradesQuery::Window { start, end: (start + DAY_MS).min(now.timestamp_millis()) };
+    let from_since = || window(since.timestamp_millis());
+    match from.map(|c| c.0.as_str()) {
+        Some(c) if c.starts_with('@') => c[1..].parse().map(window).unwrap_or_else(|_| from_since()),
+        Some(c) => c.parse::<i64>().map(|id| TradesQuery::FromId(id + 1)).unwrap_or_else(|_| from_since()),
+        None => from_since(),
+    }
+}
+
+/// `myTrades` rows as a pull page: the next cursor is the last trade id (empty
+/// when there were none), and a full page (`limit` rows) means there may be more.
+pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: usize) -> PullPage {
+    let rows = body.as_array().map(Vec::len).unwrap_or(0);
+    let fills: Vec<VenueFill> = parse_my_trades(body)
+        .into_iter()
+        .map(|t| VenueFill {
+            exec_id: t.trade_id,
+            venue_order_id: t.venue_order_id,
+            client_order_id: None,
+            account_ref: account_ref.to_string(),
+            symbol: t.symbol,
+            buy: t.buy,
+            qty: t.qty,
+            price: t.price,
+            fee: match (t.fee_amount, t.fee_currency) {
+                (Some(a), Some(c)) if a != 0.0 && !c.is_empty() => Some((a, c)),
+                _ => None,
+            },
+            executed_at: t.executed_at,
+        })
+        .collect();
+    let next = Cursor(fills.last().map(|f| f.exec_id.clone()).unwrap_or_default());
+    PullPage { fills, next, more: rows >= limit }
+}
+
+/// A time window's rows: with trades, continue by trade id from the last one
+/// (which also covers a window cut short at the row limit); empty, move on to
+/// the window ending at `end`, until that reaches `now`.
+pub(crate) fn window_page(body: &serde_json::Value, account_ref: &str, _start: i64, end: i64, now: DateTime<Utc>) -> PullPage {
+    let mut page = trades_page(body, account_ref, MY_TRADES_LIMIT);
+    if page.fills.is_empty() {
+        page.next = Cursor(format!("@{end}"));
+        page.more = end < now.timestamp_millis();
+    } else {
+        page.more = true;
+    }
+    page
+}
+
+/// `GET /api/v3/openOrders` as the venue's view of each open order.
+pub(crate) fn parse_open_order_snapshot(body: &serde_json::Value, account_ref: &str) -> Vec<VenueOrderUpdate> {
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok());
+    body.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let order_type = o["type"].as_str().unwrap_or("").to_string();
+            Some(VenueOrderUpdate {
+                venue_order_id: o["orderId"].as_i64()?.to_string(),
+                client_order_id: o["clientOrderId"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
+                account_ref: account_ref.to_string(),
+                symbol: o["symbol"].as_str()?.to_string(),
+                buy: o["side"].as_str()? == "BUY",
+                limit_px: if order_type == "MARKET" { None } else { num(&o["price"]).filter(|p| *p != 0.0) },
+                order_type,
+                qty: num(&o["origQty"])?,
+                status: VenueOrderStatus::Working,
+                cum_qty: num(&o["executedQty"]).unwrap_or(0.0),
+                ts: o["time"].as_i64().and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
+            })
+        })
+        .collect()
+}
+
+/// The distinct symbols of `open`, sorted.
+pub(crate) fn open_order_symbols(open: &[VenueOrderUpdate]) -> Vec<String> {
+    open.iter().map(|o| o.symbol.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+}
+
+/// Binance serves executions one symbol at a time (`myTrades`), so a scope is
+/// a symbol. One API key is one account, so `account_ref` is only echoed into
+/// what is returned.
+#[async_trait]
+impl ExecutionSource for BinanceAdapter {
+    async fn fills_since(
+        &self,
+        account_ref: &str,
+        scope: &str,
+        from: Option<&Cursor>,
+        since: DateTime<Utc>,
+    ) -> Result<PullPage, BrokerError> {
+        let now = Utc::now();
+        let mut params = vec![("symbol", scope.to_string()), ("limit", MY_TRADES_LIMIT.to_string())];
+        match trades_query(from, since, now) {
+            TradesQuery::FromId(id) => {
+                params.push(("fromId", id.to_string()));
+                Ok(trades_page(&self.my_trades_query(&params).await?, account_ref, MY_TRADES_LIMIT))
+            }
+            TradesQuery::Window { start, end } if end <= start => {
+                Ok(PullPage { fills: vec![], next: Cursor(String::new()), more: false })
+            }
+            TradesQuery::Window { start, end } => {
+                params.push(("startTime", start.to_string()));
+                params.push(("endTime", end.to_string()));
+                Ok(window_page(&self.my_trades_query(&params).await?, account_ref, start, end, now))
+            }
+        }
+    }
+
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        let resp = self.signed(Method::GET, "/api/v3/openOrders", &[]).await?;
+        if !resp.status().is_success() {
+            return Err(BrokerError::BrokerRejected(resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_open_order_snapshot(&body, account_ref))
+    }
+
+    /// The symbols of the account's open orders. The OMS adds the symbols it
+    /// has orders on for the account, since it holds them and this crate has
+    /// no database (see the OMS reconciler's `scopes`).
+    async fn scopes(&self, account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(open_order_symbols(&self.open_order_snapshot(account_ref).await?))
+    }
+
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 60, max_history: None, per_symbol: true }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -546,6 +700,69 @@ mod tests {
         assert_eq!(super::decimal(1e-9), "0");
     }
     use super::*;
+
+    #[test]
+    fn my_trades_page_maps_to_venue_fills_with_next_cursor() {
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0.01", "commissionAsset": "BNB" },
+            { "symbol": "BTCUSDT", "id": 502, "orderId": 9003, "price": "64010", "qty": "0.1", "isBuyer": false, "commission": "0", "commissionAsset": "USDT" },
+        ]);
+        let page = trades_page(&body, "acct-1", 1000);
+        assert_eq!(page.fills.len(), 2);
+        let f = &page.fills[0];
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.account_ref.as_str(), f.symbol.as_str()), ("501", "9001", "acct-1", "BTCUSDT"));
+        assert_eq!((f.buy, f.qty, f.price, f.client_order_id.clone()), (true, 0.25, 64000.5, None));
+        assert_eq!(f.fee, Some((0.01, "BNB".into())));
+        assert_eq!(page.fills[1].fee, None);
+        assert_eq!(page.next, crate::venue_event::Cursor("502".into()));
+        assert!(!page.more, "a short page is the last");
+        let full = trades_page(&body, "acct-1", 2);
+        assert!(full.more, "a full page asks for the next");
+    }
+
+    #[test]
+    fn a_trade_id_cursor_pages_by_from_id_and_a_time_cursor_by_window() {
+        use crate::venue_event::Cursor;
+        let now = Utc.timestamp_millis_opt(10 * DAY_MS).unwrap();
+        let since = Utc.timestamp_millis_opt(DAY_MS).unwrap();
+        assert_eq!(trades_query(Some(&Cursor("502".into())), since, now), TradesQuery::FromId(503));
+        assert_eq!(trades_query(None, since, now), TradesQuery::Window { start: DAY_MS, end: 2 * DAY_MS });
+        assert_eq!(trades_query(Some(&Cursor(format!("@{}", 9 * DAY_MS + 5))), since, now), TradesQuery::Window { start: 9 * DAY_MS + 5, end: 10 * DAY_MS });
+        // An empty window moves a time cursor on; it is the last page once it reaches now.
+        let empty = serde_json::json!([]);
+        let page = window_page(&empty, "a", DAY_MS, 2 * DAY_MS, now);
+        assert_eq!((page.next.0.as_str(), page.more), ("@172800000", true));
+        let page = window_page(&empty, "a", 9 * DAY_MS, 10 * DAY_MS, now);
+        assert!(!page.more);
+        // A window with trades continues from the last trade id.
+        let one = serde_json::json!([{ "symbol": "X", "id": 7, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true }]);
+        let page = window_page(&one, "a", DAY_MS, 2 * DAY_MS, now);
+        assert_eq!((page.next.0.as_str(), page.more), ("7", true));
+    }
+
+    #[test]
+    fn open_orders_snapshot_maps_to_working_updates() {
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "orderId": 9001, "clientOrderId": "mm1", "side": "SELL", "type": "LIMIT", "origQty": "1.5", "price": "64000", "executedQty": "0.5", "time": 1700000000000i64 },
+        ]);
+        let snap = parse_open_order_snapshot(&body, "acct-1");
+        assert_eq!(snap.len(), 1);
+        let o = &snap[0];
+        assert_eq!((o.venue_order_id.as_str(), o.client_order_id.as_deref(), o.account_ref.as_str(), o.buy), ("9001", Some("mm1"), "acct-1", false));
+        assert_eq!((o.qty, o.limit_px, o.cum_qty, o.status.clone()), (1.5, Some(64000.0), 0.5, crate::venue_event::VenueOrderStatus::Working));
+    }
+
+    #[test]
+    fn scopes_are_open_order_symbols_and_hints_are_per_symbol() {
+        let body = serde_json::json!([
+            { "symbol": "ETHUSDT", "orderId": 1, "clientOrderId": "a", "side": "BUY", "type": "LIMIT", "origQty": "1", "price": "1", "executedQty": "0" },
+            { "symbol": "BTCUSDT", "orderId": 2, "clientOrderId": "b", "side": "BUY", "type": "LIMIT", "origQty": "1", "price": "1", "executedQty": "0" },
+            { "symbol": "ETHUSDT", "orderId": 3, "clientOrderId": "c", "side": "BUY", "type": "LIMIT", "origQty": "1", "price": "1", "executedQty": "0" },
+        ]);
+        assert_eq!(open_order_symbols(&parse_open_order_snapshot(&body, "")), vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
+        let a = BinanceAdapter::new("k".into(), "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAGvAMHEDQzczRRSN2T3AYeEUyaWSwA6GXlSZ2hjM8TC\n-----END PRIVATE KEY-----\n", "PAPER").unwrap();
+        assert_eq!(crate::venue_event::ExecutionSource::hints(&a), crate::venue_event::PullHints { intraday_secs: 60, max_history: None, per_symbol: true });
+    }
 
     #[test]
     fn my_trades_parse_into_external_fills() {

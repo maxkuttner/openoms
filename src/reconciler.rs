@@ -23,16 +23,13 @@
 //! `ExecEvent` session path books its OMS orders' fills without writing
 //! `venue_fill`, so pulling the same fills through ingest would book them twice.
 //! A reconciler is therefore started only for a connection whose `Connected`
-//! has both `source` and `venue_stream` (see `reload::build_registry`); no
-//! connector sets them yet. Each connector switches to venue events only, and
+//! has both `source` and `venue_stream` (see `reload::build_registry`): Binance
+//! REST first. Each connector switches to venue events only, and
 //! sets both, in one step.
 //!
 //! The instrument provider (from `Connector::universe_provider`) rides along on
 //! every `GatewayMsg::Venue` this sends, so the engine keeps no per-connection map.
 
-// `pull_now`, the plain `spawn` and the registry lookup are for the connectors
-// moved onto venue events (Task 7); nothing calls them yet.
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -99,6 +96,7 @@ pub struct ReconcilerHandle {
 
 impl ReconcilerHandle {
     /// Pull now, or once more after the pull already running.
+    #[cfg_attr(not(test), allow(dead_code))] // no production trigger yet
     pub fn pull_now(&self) {
         self.inner.trigger.notify_one();
     }
@@ -109,6 +107,7 @@ impl ReconcilerHandle {
         self.inner.sweep(Utc::now(), lookback).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn sweep_at(&self, now: DateTime<Utc>, lookback: chrono::Duration) -> SweepReport {
         self.inner.sweep(now, lookback).await
     }
@@ -142,6 +141,7 @@ pub fn live(connection: &str) -> Option<ReconcilerHandle> {
 }
 
 /// Start a reconciler without an adapter (no synthetic closes) or instrument provider.
+#[cfg(test)]
 pub fn spawn(
     connection: String,
     source: Arc<dyn ExecutionSource>,
@@ -246,6 +246,30 @@ impl Reconciler {
         .await
     }
 
+    /// The scopes to pull for one account: the venue's own, plus — when the
+    /// venue pulls per symbol — every symbol the OMS has orders on for the
+    /// account (the venue only knows its open orders' symbols; a filled or
+    /// cancelled order's symbol would otherwise never be pulled).
+    async fn scopes(&self, account_id: Uuid, account_ref: &str) -> Result<Vec<String>, String> {
+        let mut scopes: std::collections::BTreeSet<String> =
+            self.source.scopes(account_ref).await.map_err(|e| e.to_string())?.into_iter().collect();
+        if self.source.hints().per_symbol {
+            let booked: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT bi.broker_symbol FROM order_state os \
+                 JOIN broker_connection bc ON bc.code = $1 \
+                 JOIN broker_instrument bi ON bi.instrument_id::text = os.instrument_id AND bi.broker_code = bc.broker_code \
+                 WHERE os.account_id = $2",
+            )
+            .bind(&self.connection)
+            .bind(account_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            scopes.extend(booked);
+        }
+        Ok(scopes.into_iter().collect())
+    }
+
     async fn ingest(&self, event: VenueEvent) -> Result<IngestOutcome, String> {
         self.engine.venue_ack(&self.connection, event, self.instruments.clone()).await
     }
@@ -261,7 +285,7 @@ impl Reconciler {
         };
         let gap = Arc::new(AtomicBool::new(false));
         for (account_id, account_ref) in accounts {
-            match self.source.scopes(&account_ref).await {
+            match self.scopes(account_id, &account_ref).await {
                 Ok(scopes) => {
                     for scope in scopes {
                         if let Err(e) = self.pull_scope(account_id, &account_ref, &scope, &gap).await {
@@ -429,8 +453,8 @@ impl Reconciler {
                 return report;
             }
         };
-        for (_, account_ref) in accounts {
-            let scopes = match self.source.scopes(&account_ref).await {
+        for (account_id, account_ref) in accounts {
+            let scopes = match self.scopes(account_id, &account_ref).await {
                 Ok(s) => s,
                 Err(e) => {
                     report.errors.push(format!("{account_ref}: scopes: {e}"));

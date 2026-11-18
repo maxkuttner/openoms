@@ -76,6 +76,8 @@ impl Connector for Binance {
             Transport::Fix => {
                 let adapter = start_binance(env, creds, &deps.stream_health, deps.engine.clone())
                     .ok_or_else(|| "Binance FIX session could not start".to_string())?;
+                // The FIX session still books through `ExecEvent`s, so no pull
+                // source (and no reconciler) until it emits venue events too.
                 Ok(Connected { adapter, exec_stream: None, daily_stats: None, source: None, venue_stream: None })
             }
             #[cfg(not(feature = "fix"))]
@@ -89,12 +91,15 @@ impl Connector for Binance {
                     .map_err(|e| format!("Binance adapter not registered: {e}"))?;
                 let adapter = Arc::new(adapter);
                 let stream_adapter = adapter.clone();
+                // Venue events only: the reconciler books every fill (exactly once,
+                // through ingest) and pulls what the stream missed.
                 Ok(Connected {
-            source: None, venue_stream: None,
                     daily_stats: Some(adapter.clone()),
+                    source: Some(adapter.clone()),
                     adapter,
-                    exec_stream: Some(Arc::new(move |health, engine| {
-                        Box::pin(crate::connectors::binance::stream::run(env, stream_adapter.clone(), health, engine))
+                    exec_stream: None,
+                    venue_stream: Some(Arc::new(move |health, tx| {
+                        Box::pin(crate::connectors::binance::stream::run(env, stream_adapter.clone(), health, tx))
                     })),
                 })
             }

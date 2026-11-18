@@ -24,6 +24,8 @@ struct FakeSource {
     /// When set, `scopes` waits for a permit (to hold a pull open).
     gate: Option<Semaphore>,
     max_history: Option<chrono::Duration>,
+    /// Pull per symbol, with these as the venue's own scopes.
+    venue_symbols: Option<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -46,10 +48,10 @@ impl ExecutionSource for FakeSource {
         if let Some(g) = &self.gate {
             g.acquire().await.unwrap().forget();
         }
-        Ok(vec![String::new()])
+        Ok(self.venue_symbols.clone().unwrap_or_else(|| vec![String::new()]))
     }
     fn hints(&self) -> PullHints {
-        PullHints { intraday_secs: 3600, max_history: self.max_history, per_symbol: false }
+        PullHints { intraday_secs: 3600, max_history: self.max_history, per_symbol: self.venue_symbols.is_some() }
     }
 }
 
@@ -360,4 +362,36 @@ async fn eod_sweep_registry_does_not_keep_a_reconciler_alive() {
     assert!(super::live("registry-test").is_some());
     drop(h);
     assert!(super::live("registry-test").is_none());
+}
+
+/// A per-symbol venue only knows its open orders' symbols; the OMS adds the
+/// symbols it has orders on for the account, so a filled order's symbol is pulled.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn per_symbol_scopes_add_the_accounts_order_symbols() {
+    let w = world().await;
+    let principal: Uuid = sqlx::query_scalar("SELECT id FROM principal").fetch_one(&w.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO order_state (order_id, client_order_id, principal_id, portfolio_id, account_id, \
+         broker_connection_code, instrument_id, side, order_type, time_in_force, limit_price, original_qty, \
+         leaves_qty, cum_qty, status, version, origin) \
+         VALUES ($1, 'mine', $2, $3, $4, $5, $6, 'buy', 'limit', 'gtc', 100, 5, 0, 5, 'filled', 0, 'API')",
+    )
+    .bind(Uuid::new_v4()).bind(principal).bind(w.portfolio).bind(w.account).bind(CONN).bind(w.instrument.to_string())
+    .execute(&w.pool).await.unwrap();
+    let source = Arc::new(FakeSource { venue_symbols: Some(vec!["ETHUSDT".into()]), ..Default::default() });
+    let (engine, _seen) = fake_engine(ok);
+    let (h, _tx) = start(&w, source, engine);
+    h.pull_now();
+    let scopes = || async {
+        sqlx::query_scalar::<_, String>("SELECT scope FROM recon_cursor WHERE account_id = $1 ORDER BY scope")
+            .bind(w.account).fetch_all(&w.pool).await.unwrap()
+    };
+    for _ in 0..500 {
+        if scopes().await.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(scopes().await, ["BTCUSDT", "ETHUSDT"]);
 }
