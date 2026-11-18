@@ -501,6 +501,9 @@ const ACTIVITIES_PAGE: usize = 100;
 
 /// `GET /v2/account/activities` parameters: ascending from the cursor (the last
 /// activity id, as `page_token`) when there is one, else from `since`.
+/// Assumes `page_token` is exclusive (the page starts after that activity). If
+/// the boundary fill were re-served it is harmless: its exec id (order id plus
+/// cumulative quantity) matches the one already booked, so ingest dedups it.
 pub(crate) fn activities_query(from: Option<&Cursor>, since: DateTime<Utc>) -> Vec<(&'static str, String)> {
     let mut q = vec![
         ("activity_types", "FILL".to_string()),
@@ -529,9 +532,10 @@ pub(crate) fn activities_page(body: &serde_json::Value, account_ref: &str, limit
             if executed_at.is_some_and(|at| at < since) {
                 return None;
             }
+            let order_id = r["order_id"].as_str()?;
             Some(VenueFill {
-                exec_id: r["id"].as_str()?.to_string(),
-                venue_order_id: r["order_id"].as_str().unwrap_or_default().to_string(),
+                exec_id: super::fill_exec_id(order_id, num(&r["cum_qty"])?),
+                venue_order_id: order_id.to_string(),
                 client_order_id: None,
                 account_ref: account_ref.to_string(),
                 symbol: r["symbol"].as_str()?.to_string(),
@@ -702,14 +706,14 @@ mod tests {
     fn activities_page_maps_and_cursors() {
         let body = serde_json::json!([
             { "id": "20261118143000000::a", "activity_type": "FILL", "transaction_time": "2026-11-18T14:30:00.5Z", "type": "fill",
-              "price": "101.5", "qty": "2", "side": "buy", "symbol": "AAPL", "order_id": "ord-1" },
+              "price": "101.5", "qty": "2", "side": "buy", "symbol": "AAPL", "order_id": "ord-1", "cum_qty": "2" },
             { "id": "20261118143100000::b", "activity_type": "FILL", "transaction_time": "2026-11-18T14:31:00Z", "type": "partial_fill",
-              "price": "50", "qty": "1", "side": "sell", "symbol": "MSFT", "order_id": "ord-2" },
+              "price": "50", "qty": "1", "side": "sell", "symbol": "MSFT", "order_id": "ord-2", "cum_qty": "1" },
         ]);
         let page = activities_page(&body, "", 2, chrono::DateTime::<chrono::Utc>::MIN_UTC);
         assert_eq!(page.fills.len(), 2);
         let f = &page.fills[0];
-        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("20261118143000000::a", "ord-1", "AAPL", true, 2.0, 101.5));
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("ord-1:2", "ord-1", "AAPL", true, 2.0, 101.5));
         assert_eq!((f.fee.clone(), f.client_order_id.clone()), (None, None));
         assert!(!page.fills[1].buy);
         assert_eq!(page.next, Cursor("20261118143100000::b".into()));

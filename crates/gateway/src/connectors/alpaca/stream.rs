@@ -158,7 +158,7 @@ pub(crate) fn venue_events(data: &serde_json::Value) -> Vec<VEvent> {
         "fill" => VenueOrderStatus::Filled,
         "canceled" => VenueOrderStatus::Canceled,
         "expired" => VenueOrderStatus::Expired,
-        "rejected" => VenueOrderStatus::Rejected { reason: order["status"].as_str().unwrap_or("rejected").to_string() },
+        "rejected" => VenueOrderStatus::Rejected { reason: data["reason"].as_str().or(order["reject_reason"].as_str()).or(order["status"].as_str()).unwrap_or("rejected").to_string() },
         other => {
             info!(event = other, "Alpaca stream: unhandled event type, skipping");
             return Vec::new();
@@ -171,9 +171,9 @@ pub(crate) fn venue_events(data: &serde_json::Value) -> Vec<VEvent> {
     let ts = time(&data["timestamp"]);
     let mut out = Vec::new();
     if matches!(event, "fill" | "partial_fill") {
-        match (data["execution_id"].as_str(), num(&data["qty"]), num(&data["price"])) {
-            (Some(exec_id), Some(qty), Some(price)) => out.push(VEvent::Fill(VenueFill {
-                exec_id: exec_id.to_string(),
+        match (num(&order["filled_qty"]), num(&data["qty"]), num(&data["price"])) {
+            (Some(cum), Some(qty), Some(price)) if !venue_order_id.is_empty() => out.push(VEvent::Fill(VenueFill {
+                exec_id: super::fill_exec_id(&venue_order_id, cum),
                 venue_order_id: venue_order_id.clone(),
                 client_order_id: client_order_id.clone(),
                 account_ref: String::new(),
@@ -184,7 +184,7 @@ pub(crate) fn venue_events(data: &serde_json::Value) -> Vec<VEvent> {
                 fee: None,
                 executed_at: ts,
             })),
-            _ => warn!(?data, "Alpaca stream: fill without execution id, qty or price"),
+            _ => warn!(?data, "Alpaca stream: fill without order id, cumulative qty, qty or price"),
         }
     }
     let order_type = order["type"].as_str().unwrap_or("").to_string();
@@ -210,7 +210,7 @@ mod tests {
 
     fn update(event: &str, order_status: &str, filled: &str) -> serde_json::Value {
         serde_json::json!({
-            "event": event, "qty": "2", "price": "101.5", "execution_id": "ex-1", "timestamp": "2026-11-18T14:30:00.123456Z",
+            "event": event, "qty": "2", "price": "101.5", "timestamp": "2026-11-18T14:30:00.123456Z",
             "order": { "id": "ord-1", "client_order_id": "c-1", "symbol": "AAPL", "side": "buy", "type": "limit",
                        "qty": "5", "limit_price": "101.5", "filled_qty": filled, "status": order_status },
         })
@@ -220,7 +220,7 @@ mod tests {
     fn trade_update_fill_maps_to_venue_fill() {
         let events = venue_events(&update("partial_fill", "partially_filled", "2"));
         let VEvent::Fill(f) = &events[0] else { panic!("a fill first") };
-        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy), ("ex-1", "ord-1", "AAPL", true));
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy), ("ord-1:2", "ord-1", "AAPL", true));
         assert_eq!((f.qty, f.price, f.fee.clone(), f.account_ref.as_str()), (2.0, 101.5, None, ""));
         assert_eq!(f.client_order_id.as_deref(), Some("c-1"));
         assert!(f.executed_at.is_some());
@@ -254,5 +254,16 @@ mod tests {
         assert!(matches!(st("rejected", "rejected"), VenueOrderStatus::Rejected { .. }));
         assert!(venue_events(&update("pending_new", "pending_new", "0")).is_empty());
         assert!(venue_events(&update("done_for_day", "done_for_day", "0")).is_empty());
+    }
+
+    #[test]
+    fn stream_and_pull_produce_the_same_exec_id_for_one_fill() {
+        let VEvent::Fill(s) = &venue_events(&update("partial_fill", "partially_filled", "10.000"))[0] else { panic!() };
+        let activity = serde_json::json!([{ "id": "20261118143000000::x", "order_id": "ord-1", "cum_qty": "10", "qty": "2", "price": "101.5",
+            "side": "buy", "symbol": "AAPL", "transaction_time": "2026-11-18T14:30:00Z" }]);
+        let p = crate::connectors::alpaca::adapter::activities_page(&activity, "", 100, chrono::DateTime::<Utc>::MIN_UTC);
+        assert_eq!(s.exec_id, p.fills[0].exec_id);
+        assert_eq!(s.exec_id, "ord-1:10");
+        assert_eq!(super::super::fill_exec_id("o", 10.0), super::super::fill_exec_id("o", "10.0".parse().unwrap()));
     }
 }

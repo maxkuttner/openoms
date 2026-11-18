@@ -17,6 +17,13 @@ use super::{Connector, Manifest, QuoteScope};
 
 pub struct Alpaca;
 
+/// The dedup key of one fill, the same from the stream and from the activities
+/// pull: the order's id plus its cumulative filled quantity after the fill.
+/// Parsed and printed as a number so "10" and "10.000" are one key.
+pub(crate) fn fill_exec_id(order_id: &str, cum_qty: f64) -> String {
+    format!("{order_id}:{cum_qty}")
+}
+
 static MANIFEST: Manifest = Manifest {
     code: "ALPACA",
     credential_kind: "Alpaca",
