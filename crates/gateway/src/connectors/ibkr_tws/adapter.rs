@@ -85,6 +85,8 @@ pub struct IbkrTwsAdapter {
     /// Orders this adapter placed, as an order state, for a reject that
     /// arrives before IBKR reports the order back.
     placed: Mutex<HashMap<i32, VenueOrderUpdate>>,
+    /// Exec bases whose changed correction was already warned about; repeat pulls only debug-log it.
+    warned_corrections: Mutex<HashSet<String>>,
 }
 
 impl IbkrTwsAdapter {
@@ -96,6 +98,7 @@ impl IbkrTwsAdapter {
             refs: Mutex::default(),
             rejected_on_submit: Mutex::default(),
             placed: Mutex::default(),
+            warned_corrections: Mutex::default(),
         }
     }
 
@@ -255,11 +258,25 @@ impl BrokerAdapter for IbkrTwsAdapter {
         Ok(BrokerOrderResponse { external_order_id: order_id.to_string() })
     }
 
+    /// The id is an OMS order's API order id, or (adopted / from the stream)
+    /// an IBKR permId. It is resolved to an orderId this client may cancel
+    /// first; an unresolved permId is never sent as an orderId.
     async fn cancel_order(&self, external_order_id: &str, _symbol: &str) -> Result<(), BrokerError> {
         let client = self.client()?;
-        let id: i32 = external_order_id
-            .parse()
-            .map_err(|_| BrokerError::NoSuchOrder(format!("not an IBKR order id: {external_order_id}")))?;
+        let open = client.open_orders().await.map_err(broker_error)?;
+        self.learn(&open);
+        let by_perm = external_order_id
+            .parse::<i64>()
+            .ok()
+            .and_then(|p| open.iter().find(|(_, _, s)| s.perm_id != 0 && s.perm_id == p))
+            .map(|(id, _, _)| *id);
+        let own = || external_order_id.parse::<i32>().ok().filter(|id| self.order_ref(*id).is_some() || self.placed(*id).is_some());
+        let id = by_perm.or_else(own).ok_or_else(|| {
+            BrokerError::NoSuchOrder(format!(
+                "IBKR order {external_order_id} is not an open order this API client can cancel \
+                 (orders of other API clients cannot be cancelled by the OMS)"
+            ))
+        })?;
         client.cancel(id).await.map_err(broker_error)
     }
 
@@ -398,6 +415,7 @@ pub(crate) fn fills_from_executions(
     account: &str,
     since: DateTime<Utc>,
     client_ref: impl Fn(i32, &str) -> Option<String>,
+    warned: &mut HashSet<String>,
 ) -> Vec<VenueFill> {
     let mut fees: HashMap<String, (f64, String)> = HashMap::new();
     // (full exec id, fill) per base, in first-seen order.
@@ -429,7 +447,11 @@ pub(crate) fn fills_from_executions(
             Some(&i) => {
                 let (prev_id, prev) = &kept[i];
                 if let Some(w) = correction_warning(&fill.exec_id, (prev.qty, prev.price), (fill.qty, fill.price)) {
-                    warn!(exec_id = %e.exec_id, "{w}");
+                    if warned.insert(fill.exec_id.clone()) {
+                        warn!(exec_id = %e.exec_id, "{w}");
+                    } else {
+                        debug!(exec_id = %e.exec_id, "{w}");
+                    }
                 }
                 if exec_rev(&e.exec_id) > exec_rev(prev_id) {
                     kept[i] = (e.exec_id.clone(), fill);
@@ -457,7 +479,9 @@ impl ExecutionSource for IbkrTwsAdapter {
         let client = self.client()?;
         let window = since.max(Utc::now() - chrono::Duration::days(MAX_HISTORY_DAYS));
         let rows = client.executions(account_ref, window).await.map_err(broker_error)?;
-        let fills = fills_from_executions(rows, account_ref, since, |id, r| self.client_ref(id, r));
+        let mut warned = std::mem::take(&mut *self.warned_corrections.lock().unwrap());
+        let fills = fills_from_executions(rows, account_ref, since, |id, r| self.client_ref(id, r), &mut warned);
+        self.warned_corrections.lock().unwrap().extend(warned);
         Ok(PullPage { fills, next: Cursor(String::new()), more: false })
     }
 
@@ -685,7 +709,7 @@ pub(crate) mod tests {
             ex("0000e0d5.6551a1b2.01.02", "U1", 3.0, 190.0, 5),
             TwsEvent::Commission { exec_id: "0000e0d5.6551a1b2.01.02".into(), amount: 1.5, currency: "USD".into() },
         ];
-        let fills = fills_from_executions(rows, "U1", DateTime::<Utc>::MIN_UTC, |_, _| None);
+        let fills = fills_from_executions(rows, "U1", DateTime::<Utc>::MIN_UTC, |_, _| None, &mut HashSet::new());
         assert_eq!(fills.len(), 1);
         // The base id: the same id the stream sent the original under.
         assert_eq!(fills[0].exec_id, "0000e0d5.6551a1b2.01");
@@ -700,9 +724,14 @@ pub(crate) mod tests {
         assert!(correction_warning("b", (3.0, 190.0), (3.0, 191.0)).is_some());
         assert_eq!(correction_warning("b", (3.0, 190.0), (3.0, 190.0)), None);
         // The pull keeps the highest revision's figures.
-        let rows = vec![ex("b.02", "U1", 2.0, 190.0, 1), ex("b.01", "U1", 3.0, 190.0, 1)];
-        let fills = fills_from_executions(rows, "U1", DateTime::<Utc>::MIN_UTC, |_, _| None);
+        let rows = || vec![ex("b.02", "U1", 2.0, 190.0, 1), ex("b.01", "U1", 3.0, 190.0, 1)];
+        let mut warned = HashSet::new();
+        let fills = fills_from_executions(rows(), "U1", DateTime::<Utc>::MIN_UTC, |_, _| None, &mut warned);
         assert_eq!((fills.len(), fills[0].qty), (1, 2.0));
+        // Warned once per base: a repeat pull only debug-logs it.
+        assert!(warned.contains("b"));
+        fills_from_executions(rows(), "U1", DateTime::<Utc>::MIN_UTC, |_, _| None, &mut warned);
+        assert_eq!(warned.len(), 1);
     }
 
     #[tokio::test]
@@ -759,6 +788,28 @@ pub(crate) mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!((snap[0].venue_order_id.as_str(), snap[0].client_order_id.as_deref(), snap[0].cum_qty), ("4242", Some("x"), 1.0));
         assert_eq!((snap[0].buy, snap[0].order_type.as_str(), snap[0].status.clone()), (false, "market", VenueOrderStatus::Working));
+    }
+
+    #[tokio::test]
+    async fn cancel_by_perm_id_resolves_to_order_id() {
+        let (fake, adapter) = rig();
+        fake.open.lock().unwrap().push((-3, String::new(), sample_state(-3, "")));
+        adapter.cancel_order("4242", "AAPL").await.unwrap();
+        assert_eq!(*fake.cancelled.lock().unwrap(), vec![-3]);
+        // An OMS order's own API order id still cancels directly.
+        let id = adapter.submit_order(&req(Some("265598"))).await.unwrap().external_order_id;
+        adapter.cancel_order(&id, "AAPL").await.unwrap();
+        assert_eq!(*fake.cancelled.lock().unwrap(), vec![-3, id.parse::<i32>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_perm_id_is_no_such_order_not_a_blind_cancel() {
+        let (fake, adapter) = rig();
+        // 77 could be an unrelated orderId at IBKR: it must not be sent.
+        for id in ["987654321", "77"] {
+            assert!(matches!(adapter.cancel_order(id, "AAPL").await, Err(BrokerError::NoSuchOrder(_))), "{id}");
+        }
+        assert!(fake.cancelled.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -3,10 +3,18 @@
 //! [`supervise`] keeps IB Gateway running and connected (Docker, then the TWS
 //! API), swaps the client into the adapter's slot and runs [`run`] on it. [`run`]
 //! turns the client's events into venue events for the reconciler: every
-//! execution (OMS, other API client or typed into TWS) is a fill carrying its
-//! IBKR account number, every `openOrder`/`orderStatus` an order state, every
-//! commission report a fee. After each (re)connect it sends `Connected`, so the
-//! reconciler pulls what the stream missed (`reqExecutions`) and the open orders.
+//! execution it is shown is a fill carrying its IBKR account number, every
+//! `openOrder`/`orderStatus` an order state, every commission report a fee.
+//! What it is shown: the OMS's own orders (this client id), and, as client 0
+//! (`reqAutoOpenOrders(true)`), orders typed into TWS. Other API clients'
+//! orders and executions stream only to the client whose id is IB Gateway's
+//! "Master API client ID" setting, which the OMS does not configure. After
+//! each (re)connect it sends `Connected`, so the reconciler pulls what the
+//! stream missed (`reqExecutions`) and the open orders.
+//!
+//! `VenueEvent::Connected` doubles as the stream's "pull now" request: the
+//! reconciler answers every `Connected` with a pull, which is what a
+//! corrected execution, a 1101/1102 reconnect and a lagged event channel need.
 //!
 //! Fills go out under the exec id's base (`<base>` of `<base>.NN`), the same
 //! id the pull uses: IBKR corrects a fill by bumping `.NN`, and a correction
@@ -81,7 +89,8 @@ pub fn handle(ev: TwsEvent, adapter: &IbkrTwsAdapter, seen: &mut Seen) -> Vec<Ve
                     if let Some(w) = correction_warning(&base, (*qty, *price), (e.qty, e.price)) {
                         warn!(exec_id = %e.exec_id, "{w}");
                     }
-                    warn!(exec_id = %e.exec_id, "IBKR corrected an execution; pulling");
+                    warn!(exec_id = %e.exec_id, "IBKR corrected an execution; no new fill, requesting a pull");
+                    // `Connected` = "pull now" for the reconciler (see module doc).
                     vec![VenueEvent::Connected]
                 }
             }

@@ -52,8 +52,12 @@ pub(crate) fn set_live_client(connection_code: &str, client: Option<Arc<dyn clie
 pub struct IbkrTwsCredentials {
     pub username: String,
     pub password: String,
-    /// The TWS API client id the OMS connects as. 0, the master client id
-    /// (default), also sees orders typed into TWS, so they are adopted.
+    /// The TWS API client id the OMS connects as (default 0). Client 0 with
+    /// `reqAutoOpenOrders(true)` also sees orders typed into TWS, so they are
+    /// adopted. Orders and executions of *other API clients* reach only the
+    /// client whose id equals IB Gateway's "Master API client ID" setting
+    /// (Configure > API > Settings), which the OMS does not set: set it there
+    /// by hand to this value to see them.
     #[serde(default, deserialize_with = "client_id")]
     pub master_client_id: i32,
 }
@@ -159,7 +163,7 @@ fn venue() -> Venue {
         fields: vec![
             field("username", "IBKR username"),
             field("password", "Password").secret(),
-            field("master_client_id", "Master API client id (0 sees orders entered in TWS)").prefill("0", "0"),
+            field("master_client_id", "API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value)").prefill("0", "0"),
         ],
     }
 }
