@@ -42,6 +42,9 @@ Fills are de-duplicated, so overlapping windows never book a fill twice.
 | IBKR (TWS) | About 7 days of executions |
 | IBKR (FIX) | No fill history; open-order snapshot only |
 | OKX | 90 days |
+| Bybit | 2 years |
+| Alpaca | No cap |
+| Coinbase | No cap |
 | Binance | Per symbol. Pairs are discovered from open orders, orders booked in the OMS, and non-zero balances |
 
 ## Breaks
@@ -52,6 +55,9 @@ instrument. Open the breaks page and either:
 
 - **Adopt** it into a book. The order and its fills are booked there.
 - **Dismiss** it. Nothing is booked.
+
+An unknown-instrument break can only be adopted once the instrument resolves;
+until then adopting returns an error and the break stays open.
 
 If a break grows (more fills arrive), adopting re-reads it first.
 
@@ -70,7 +76,8 @@ second connection.
 
 Set **Master API client ID** in the IB Gateway or TWS API settings to the
 connection's `master_client_id` (default 0). Without it, TWS does not report
-orders placed by other API clients, and they are never seen.
+orders placed by other API clients, and they are never seen. Client id 0 also
+sees orders entered manually in TWS.
 
 Upgrading: IBKR orders still working under the old client id 1 become invisible.
 Cancel them and place them again.

@@ -5,16 +5,6 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
-## Unreleased
-
-### Feat
-
-- **recon**: orders placed outside the OMS are adopted into a book (attribution rules, connection default book) or raised as breaks; real-time stream, intraday pull and end-of-day sweep on every connector; multi-account IBKR; see [Reconciliation](/concepts/reconciliation/)
-
-### Upgrade notes
-
-- IBKR: set "Master API client ID" in the IB Gateway/TWS API settings to the connection's `master_client_id` (default 0). IBKR orders still working under the old client id 1 are no longer visible: cancel and re-place them.
-
 ## v0.11.0 (2026-11-17)
 
 ### Feat
