@@ -11,9 +11,10 @@ use crate::authz_schema_tests::migrated_db;
 use crate::event_bus::EventBus;
 use crate::ingest::decide::{BreakKind, Decision};
 
-pub(crate) const CONN: &str = "BIN-TEST";
-
 pub(crate) struct World {
+    /// This world's own connection code: the live reconciler registry is
+    /// process-global, so tests sharing one code pull each other's reconcilers.
+    pub(crate) conn: String,
     pub(crate) pool: PgPool,
     pub(crate) bus: EventBus,
     pub(crate) portfolio: Uuid,
@@ -23,6 +24,7 @@ pub(crate) struct World {
 
 pub(crate) async fn world() -> World {
     let pool = migrated_db().await;
+    let conn = format!("BIN-TEST-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let portfolio = Uuid::new_v4();
     let account = Uuid::new_v4();
     let principal = Uuid::new_v4();
@@ -32,12 +34,12 @@ pub(crate) async fn world() -> World {
         "INSERT INTO broker_connection (code, broker_code, environment, status, default_portfolio_id) \
          VALUES ($1, 'BINANCE', 'PAPER', 'ACTIVE', $2)",
     )
-    .bind(CONN).bind(portfolio).execute(&pool).await.unwrap();
+    .bind(&conn).bind(portfolio).execute(&pool).await.unwrap();
     sqlx::query(
         "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) \
          VALUES ($1, 'ACC', $2, 'acc', 'ACTIVE')",
     )
-    .bind(account).bind(CONN).execute(&pool).await.unwrap();
+    .bind(account).bind(&conn).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, 'admin', 'HUMAN', 'ACTIVE')")
         .bind(principal).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO principal_admin (principal_id, granted_by) VALUES ($1, 'test')")
@@ -54,7 +56,7 @@ pub(crate) async fn world() -> World {
     .bind(venue).fetch_one(&pool).await.unwrap();
     sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol) VALUES ($1, 'BINANCE', 'BTCUSDT')")
         .bind(instrument).execute(&pool).await.unwrap();
-    World { pool, bus: EventBus::new(), portfolio, account, instrument }
+    World { conn, pool, bus: EventBus::new(), portfolio, account, instrument }
 }
 
 fn fill(exec: &str, venue_order: &str, client: Option<&str>, qty: f64) -> VenueEvent {
@@ -117,7 +119,7 @@ async fn position(w: &World) -> f64 {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn external_fill_adopts_into_default_book() {
     let w = world().await;
-    let d = ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None).await.unwrap().decision;
+    let d = ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 2.0), None).await.unwrap().decision;
     assert_eq!(d, Decision::Adopt { portfolio_id: w.portfolio });
     let (_, origin, portfolio, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((origin.as_str(), portfolio, qty, cum, status.as_str()), ("EXTERNAL", w.portfolio, 2.0, 2.0, "filled"));
@@ -126,7 +128,7 @@ async fn external_fill_adopts_into_default_book() {
     assert_eq!(position(&w).await, 2.0);
     assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 1);
     let actor: String = sqlx::query_scalar("SELECT DISTINCT actor FROM order_event").fetch_one(&w.pool).await.unwrap();
-    assert_eq!(actor, format!("ingest:{CONN}"));
+    assert_eq!(actor, format!("ingest:{}", w.conn));
 }
 
 #[tokio::test]
@@ -134,8 +136,8 @@ async fn external_fill_adopts_into_default_book() {
 async fn concurrent_stream_and_pull_book_once() {
     let w = world().await;
     let (a, b) = tokio::join!(
-        ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None),
-        ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None),
+        ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 2.0), None),
+        ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 2.0), None),
     );
     let mut ds = [a.unwrap().decision, b.unwrap().decision];
     ds.sort_by_key(|d| matches!(d, Decision::Duplicate));
@@ -151,8 +153,8 @@ async fn concurrent_stream_and_pull_book_once() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn fill_first_then_update_grows_qty() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 2.0, VenueOrderStatus::Working), None).await.unwrap().decision;
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 2.0), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 2.0, VenueOrderStatus::Working), None).await.unwrap().decision;
     assert!(matches!(d, Decision::Grow { new_qty, .. } if new_qty == 5.0));
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (5.0, 2.0, "partially_filled"));
@@ -172,9 +174,9 @@ async fn oms_order_fill_by_client_uuid_books() {
          leaves_qty, cum_qty, status, version, origin) \
          VALUES ($1, 'mine', $2, $3, $4, $5, $6, 'buy', 'limit', 'gtc', 100, 5, 5, 0, 'routed', 0, 'API')",
     )
-    .bind(order_id).bind(principal).bind(w.portfolio).bind(w.account).bind(CONN).bind(w.instrument.to_string())
+    .bind(order_id).bind(principal).bind(w.portfolio).bind(w.account).bind(&w.conn).bind(w.instrument.to_string())
     .execute(&w.pool).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, fill("e1", "v-oms", Some(&order_id.to_string()), 2.0), None).await.unwrap().decision;
+    let d = ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v-oms", Some(&order_id.to_string()), 2.0), None).await.unwrap().decision;
     assert_eq!(d, Decision::Apply { order_id });
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_state").await, 1);
     let (id, origin, _, _, cum, status) = only_order(&w.pool).await;
@@ -184,8 +186,8 @@ async fn oms_order_fill_by_client_uuid_books() {
 
 /// An adopted order of 5 with one fill of 1 booked.
 async fn order_with_one_fill(w: &World) {
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 1.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 1.0), None).await.unwrap();
 }
 
 #[tokio::test]
@@ -193,7 +195,7 @@ async fn order_with_one_fill(w: &World) {
 async fn canceled_update_with_gap_closes_and_flags_gap_without_booking() {
     let w = world().await;
     order_with_one_fill(&w).await;
-    let done = ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 3.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    let done = ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 3.0, VenueOrderStatus::Canceled), None).await.unwrap();
     assert!(done.fill_gap);
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (5.0, 1.0, "canceled"));
@@ -206,8 +208,8 @@ async fn canceled_update_with_gap_closes_and_flags_gap_without_booking() {
 async fn late_fill_on_closed_order_books_and_keeps_terminal_status() {
     let w = world().await;
     order_with_one_fill(&w).await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 3.0, VenueOrderStatus::Canceled), None).await.unwrap();
-    let done = ingest(&w.pool, &w.bus, CONN, fill("e2", "v1", None, 2.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 3.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    let done = ingest(&w.pool, &w.bus, &w.conn, fill("e2", "v1", None, 2.0), None).await.unwrap();
     assert!(matches!(done.decision, Decision::Apply { .. }));
     let (order_id, _, _, _, cum, status) = only_order(&w.pool).await;
     assert_eq!((cum, status.as_str()), (3.0, "canceled"));
@@ -218,7 +220,7 @@ async fn late_fill_on_closed_order_books_and_keeps_terminal_status() {
     .bind(order_id).fetch_one(&w.pool).await.unwrap();
     assert_eq!(after, "canceled");
     // nothing left to pull
-    let done = ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 3.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    let done = ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 3.0, VenueOrderStatus::Canceled), None).await.unwrap();
     assert!(!done.fill_gap);
 }
 
@@ -227,13 +229,13 @@ async fn late_fill_on_closed_order_books_and_keeps_terminal_status() {
 async fn break_collects_later_events() {
     let w = world().await;
     sqlx::query("UPDATE broker_connection SET external_policy = 'break' WHERE code = $1")
-        .bind(CONN).execute(&w.pool).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 1.0), None).await.unwrap().decision;
+        .bind(&w.conn).execute(&w.pool).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 1.0), None).await.unwrap().decision;
     assert_eq!(d, Decision::Break(BreakKind::PolicyBreak));
-    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 1.0, VenueOrderStatus::Canceled), None).await.unwrap().decision;
+    let d = ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 1.0, VenueOrderStatus::Canceled), None).await.unwrap().decision;
     assert_eq!(d, Decision::AttachToBreak);
     // the same fill again adds nothing
-    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 1.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 1.0), None).await.unwrap();
     let (kind, n): (String, i32) = sqlx::query_as(
         "SELECT kind, jsonb_array_length(events_json) FROM recon_break WHERE status = 'open'",
     )
@@ -247,10 +249,10 @@ async fn break_collects_later_events() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn late_fee_books_once() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 1.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 1.0), None).await.unwrap();
     let fee = || VenueEvent::Fee { exec_id: "e1".into(), account_ref: "acc".into(), amount: 0.1, currency: "USDT".into() };
-    ingest(&w.pool, &w.bus, CONN, fee(), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, fee(), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fee(), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fee(), None).await.unwrap();
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
     let fee_id: String = sqlx::query_scalar("SELECT fee_id FROM order_fee").fetch_one(&w.pool).await.unwrap();
     assert_eq!(fee_id, "BINANCE-e1");
@@ -274,7 +276,7 @@ async fn unlisted_symbol_is_unknown_instrument_break() {
     if let VenueEvent::Fill(f) = &mut ev {
         f.symbol = "ETHUSDT".into();
     }
-    let d = ingest(&w.pool, &w.bus, CONN, ev, Some(&EmptyListing)).await.unwrap().decision;
+    let d = ingest(&w.pool, &w.bus, &w.conn, ev, Some(&EmptyListing)).await.unwrap().decision;
     assert_eq!(d, Decision::Break(BreakKind::UnknownInstrument));
     let kind: String = sqlx::query_scalar("SELECT kind FROM recon_break WHERE status = 'open'")
         .fetch_one(&w.pool).await.unwrap();
@@ -287,9 +289,9 @@ async fn unlisted_symbol_is_unknown_instrument_break() {
 async fn order_update_grow_on_canceled_order_is_noop() {
     let w = world().await;
     order_with_one_fill(&w).await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 1.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 1.0, VenueOrderStatus::Canceled), None).await.unwrap();
     let events = count(&w.pool, "SELECT count(*) FROM order_event").await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 8.0, 1.0, VenueOrderStatus::Working), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 8.0, 1.0, VenueOrderStatus::Working), None).await.unwrap();
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (5.0, 1.0, "canceled"));
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_event").await, events);
@@ -303,14 +305,14 @@ async fn fee_on_redelivered_fill_is_booked_once_even_if_first_attempt_missed_it(
     if let VenueEvent::Fill(f) = &mut ev {
         f.fee = Some((0.1, "USDT".into()));
     }
-    ingest(&w.pool, &w.bus, CONN, ev.clone(), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, ev.clone(), None).await.unwrap();
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
     // the post-commit fee step was lost
     sqlx::query("DELETE FROM order_fee").execute(&w.pool).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, ev.clone(), None).await.unwrap().decision;
+    let d = ingest(&w.pool, &w.bus, &w.conn, ev.clone(), None).await.unwrap().decision;
     assert_eq!(d, Decision::Duplicate);
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
-    ingest(&w.pool, &w.bus, CONN, ev, None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, ev, None).await.unwrap();
     assert_eq!(count(&w.pool, "SELECT count(*) FROM order_fee").await, 1);
     assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 1);
 }
@@ -412,10 +414,10 @@ async fn fill_event_stores_venue_execution_time() {
     let t1 = "2026-11-01T09:05:00Z";
     let t2 = "2026-11-01T09:06:00Z";
     let working = timed_order("v1", 5.0, 0.0, VenueOrderStatus::Working, Some(t0), Some(created));
-    ingest(&w.pool, &w.bus, CONN, working, None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, timed_fill("e1", "v1", 2.0, Some(t1)), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, working, None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, timed_fill("e1", "v1", 2.0, Some(t1)), None).await.unwrap();
     let canceled = timed_order("v1", 5.0, 2.0, VenueOrderStatus::Canceled, Some(t2), None);
-    ingest(&w.pool, &w.bus, CONN, canceled, None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, canceled, None).await.unwrap();
     assert_eq!(
         events(&w.pool).await,
         vec![
@@ -433,8 +435,8 @@ async fn fill_event_stores_venue_execution_time() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn status_update_without_venue_time_has_null_occurred_at() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 0.0, VenueOrderStatus::Canceled), None).await.unwrap();
     let ev = events(&w.pool).await;
     let got: Vec<(&str, Option<Ts>)> = ev.iter().map(|e| (e.0.as_str(), e.1)).collect();
     assert_eq!(got, vec![("order_observed", None), ("order_canceled", None)]);
@@ -444,8 +446,8 @@ async fn status_update_without_venue_time_has_null_occurred_at() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn missing_execution_time_is_estimated_and_not_late() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, timed_fill("e1", "v1", 1.0, Some("2026-11-01T09:05:00Z")), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, timed_fill("e2", "v1", 1.0, None), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, timed_fill("e1", "v1", 1.0, Some("2026-11-01T09:05:00Z")), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, timed_fill("e2", "v1", 1.0, None), None).await.unwrap();
     let (occurred, booked, estimated): (Option<Ts>, Ts, Option<bool>) = sqlx::query_as(
         "SELECT occurred_at, created_at, (payload_json->>'trade_time_estimated')::bool FROM order_event \
          WHERE payload_json->'payload'->>'execution_id' = 'e2'",
@@ -468,16 +470,16 @@ async fn missing_execution_time_is_estimated_and_not_late() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn observed_filled_order_then_fills_books_once() {
     let w = world().await;
-    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
     assert!(matches!(d.decision, Decision::Adopt { .. }));
     assert!(d.fill_gap);
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (10.0, 0.0, "filled"));
     assert_eq!(order_times(&w.pool).await.2, Some(10.0));
     assert_eq!(position(&w).await, 0.0);
-    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 4.0), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, fill("e2", "v1", None, 6.0), None).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 4.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 4.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e2", "v1", None, 6.0), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 4.0), None).await.unwrap();
     assert_eq!(d.decision, Decision::Duplicate);
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (10.0, 10.0, "filled"));
@@ -485,7 +487,7 @@ async fn observed_filled_order_then_fills_books_once() {
     assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 2);
     let types: Vec<String> = events(&w.pool).await.into_iter().map(|e| e.0).collect();
     assert_eq!(types, ["order_observed", "order_partially_filled", "order_filled"]);
-    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
     assert!(!d.fill_gap);
 }
 
@@ -493,8 +495,8 @@ async fn observed_filled_order_then_fills_books_once() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn late_partial_fill_on_observed_filled_order_keeps_filled_status() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 2.0), None).await.unwrap();
     let (_, _, _, _, cum, status) = only_order(&w.pool).await;
     assert_eq!((cum, status.as_str()), (2.0, "filled"));
     let ev = events(&w.pool).await;
@@ -506,15 +508,15 @@ async fn late_partial_fill_on_observed_filled_order_keeps_filled_status() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn observed_filled_order_grown_by_update_stays_filled() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 12.0, 12.0, VenueOrderStatus::Filled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, order("v1", 12.0, 12.0, VenueOrderStatus::Filled), None).await.unwrap();
     assert!(matches!(d.decision, Decision::Grow { new_qty, .. } if new_qty == 12.0));
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (12.0, 0.0, "filled"));
     assert!(events(&w.pool).await.iter().all(|e| e.3 == "filled"));
     assert_eq!(order_times(&w.pool).await.2, Some(12.0));
     // a stale update never lowers the venue's cum
-    ingest(&w.pool, &w.bus, CONN, order("v1", 12.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 12.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
     assert_eq!(order_times(&w.pool).await.2, Some(12.0));
 }
 
@@ -522,8 +524,8 @@ async fn observed_filled_order_grown_by_update_stays_filled() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn observed_working_order_grown_by_canceled_update_closes_canceled() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 8.0, 0.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, order("v1", 8.0, 0.0, VenueOrderStatus::Canceled), None).await.unwrap();
     assert!(matches!(d.decision, Decision::Grow { new_qty, .. } if new_qty == 8.0));
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (8.0, 0.0, "canceled"));
@@ -533,9 +535,9 @@ async fn observed_working_order_grown_by_canceled_update_closes_canceled() {
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn observed_filled_order_grown_by_canceled_update_closes_canceled() {
     let w = world().await;
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None).await.unwrap();
-    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 8.0, 2.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 2.0), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, &w.conn, order("v1", 8.0, 2.0, VenueOrderStatus::Canceled), None).await.unwrap();
     assert!(matches!(d.decision, Decision::Grow { new_qty, .. } if new_qty == 8.0));
     let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
     assert_eq!((qty, cum, status.as_str()), (8.0, 2.0, "canceled"));
@@ -549,24 +551,24 @@ async fn venue_created_at_is_set_once() {
     let w = world().await;
     let first = "2026-11-01T09:00:00Z";
     // a first sighting without a create time (FIX), then one with it (REST)
-    ingest(&w.pool, &w.bus, CONN, timed_order("v1", 5.0, 0.0, VenueOrderStatus::Working, None, None), None)
+    ingest(&w.pool, &w.bus, &w.conn, timed_order("v1", 5.0, 0.0, VenueOrderStatus::Working, None, None), None)
         .await
         .unwrap();
     assert_eq!(order_times(&w.pool).await.1, None);
     let with_time = timed_order("v1", 5.0, 1.0, VenueOrderStatus::Working, None, Some(first));
-    ingest(&w.pool, &w.bus, CONN, with_time, None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, with_time, None).await.unwrap();
     assert_eq!(order_times(&w.pool).await.1, Some(at(first)));
     assert_eq!(order_times(&w.pool).await.2, Some(1.0));
     // a different create time later never overwrites it
     let other = timed_order("v1", 5.0, 2.0, VenueOrderStatus::Working, None, Some("2026-11-02T00:00:00Z"));
-    ingest(&w.pool, &w.bus, CONN, other, None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, other, None).await.unwrap();
     assert_eq!(order_times(&w.pool).await.1, Some(at(first)));
     assert_eq!(order_times(&w.pool).await.2, Some(2.0));
     // known from the first sighting, then a different one with a status change
     let v2 = timed_order("v2", 5.0, 0.0, VenueOrderStatus::Working, None, Some(first));
-    ingest(&w.pool, &w.bus, CONN, v2, None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, v2, None).await.unwrap();
     let v2 = timed_order("v2", 5.0, 0.0, VenueOrderStatus::Canceled, None, Some("2026-11-03T00:00:00Z"));
-    ingest(&w.pool, &w.bus, CONN, v2, None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, v2, None).await.unwrap();
     let (created, status): (Option<Ts>, String) =
         sqlx::query_as("SELECT venue_created_at, status FROM order_state WHERE external_order_id = 'v2'")
             .fetch_one(&w.pool)
@@ -580,14 +582,14 @@ async fn venue_created_at_is_set_once() {
 async fn last_trade_at_tracks_latest_fill() {
     let w = world().await;
     let (early, late, later) = ("2026-11-01T09:00:00Z", "2026-11-01T10:00:00Z", "2026-11-01T11:00:00Z");
-    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
-    ingest(&w.pool, &w.bus, CONN, timed_fill("e1", "v1", 1.0, Some(late)), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, timed_fill("e1", "v1", 1.0, Some(late)), None).await.unwrap();
     assert_eq!(order_times(&w.pool).await.0, Some(at(late)));
     // an older fill arriving later does not move it back
-    ingest(&w.pool, &w.bus, CONN, timed_fill("e2", "v1", 1.0, Some(early)), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, timed_fill("e2", "v1", 1.0, Some(early)), None).await.unwrap();
     assert_eq!(order_times(&w.pool).await.0, Some(at(late)));
     assert_eq!(position_last_trade(&w).await, Some(at(late)));
-    ingest(&w.pool, &w.bus, CONN, timed_fill("e3", "v1", 1.0, Some(later)), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, timed_fill("e3", "v1", 1.0, Some(later)), None).await.unwrap();
     assert_eq!(order_times(&w.pool).await.0, Some(at(later)));
     assert_eq!(position_last_trade(&w).await, Some(at(later)));
     assert_eq!(position(&w).await, 3.0);

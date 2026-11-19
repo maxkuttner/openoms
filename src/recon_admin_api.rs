@@ -472,7 +472,7 @@ mod tests {
 
     use crate::auth::{AuthContext, AuthMethod};
     use crate::handlers::tests::test_app_state;
-    use crate::ingest::apply::tests::{world, World, CONN};
+    use crate::ingest::apply::tests::{world, World};
 
     async fn principal(w: &World, role: Option<&str>) -> AuthContext {
         let id = Uuid::new_v4();
@@ -517,14 +517,14 @@ mod tests {
     async fn rule_without_account_or_prefix_is_400() {
         let w = world().await;
         let st = test_app_state(w.pool.clone());
-        let err = create_rule(State(st.clone()), Path(CONN.into()), Json(rule_body(None, None, w.portfolio))).await.unwrap_err();
+        let err = create_rule(State(st.clone()), Path(w.conn.clone()), Json(rule_body(None, None, w.portfolio))).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
-        let err = create_rule(State(st.clone()), Path(CONN.into()), Json(rule_body(None, Some(""), w.portfolio))).await.unwrap_err();
+        let err = create_rule(State(st.clone()), Path(w.conn.clone()), Json(rule_body(None, Some(""), w.portfolio))).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
         // unknown portfolio / account are 404
-        let err = create_rule(State(st.clone()), Path(CONN.into()), Json(rule_body(None, Some("x-"), Uuid::new_v4()))).await.unwrap_err();
+        let err = create_rule(State(st.clone()), Path(w.conn.clone()), Json(rule_body(None, Some("x-"), Uuid::new_v4()))).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
-        let err = create_rule(State(st), Path(CONN.into()), Json(rule_body(Some(Uuid::new_v4()), None, w.portfolio))).await.unwrap_err();
+        let err = create_rule(State(st), Path(w.conn.clone()), Json(rule_body(Some(Uuid::new_v4()), None, w.portfolio))).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
     }
 
@@ -535,22 +535,22 @@ mod tests {
         let st = test_app_state(w.pool.clone());
         let other = other_portfolio(&w).await;
         let (status, Json(created)) =
-            create_rule(State(st.clone()), Path(CONN.into()), Json(rule_body(None, Some("alpha-"), w.portfolio))).await.unwrap();
+            create_rule(State(st.clone()), Path(w.conn.clone()), Json(rule_body(None, Some("alpha-"), w.portfolio))).await.unwrap();
         assert_eq!(status, StatusCode::CREATED);
-        let Json(listed) = list_rules(State(st.clone()), Path(CONN.into())).await.unwrap();
+        let Json(listed) = list_rules(State(st.clone()), Path(w.conn.clone())).await.unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!((listed[0].id, listed[0].client_id_prefix.as_deref(), listed[0].priority), (created.id, Some("alpha-"), 5));
         let Json(updated) = update_rule(
             State(st.clone()),
-            Path((CONN.into(), created.id)),
+            Path((w.conn.clone(), created.id)),
             Json(RuleBody { priority: 1, ..rule_body(Some(w.account), None, other) }),
         )
         .await
         .unwrap();
         assert_eq!((updated.account_id, updated.client_id_prefix, updated.portfolio_id, updated.priority), (Some(w.account), None, other, 1));
-        let gone = delete_rule(State(st.clone()), Path((CONN.into(), created.id))).await.unwrap();
+        let gone = delete_rule(State(st.clone()), Path((w.conn.clone(), created.id))).await.unwrap();
         assert_eq!(gone, StatusCode::NO_CONTENT);
-        let err = delete_rule(State(st), Path((CONN.into(), created.id))).await.unwrap_err();
+        let err = delete_rule(State(st), Path((w.conn.clone(), created.id))).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
     }
 
@@ -562,7 +562,7 @@ mod tests {
         let other = other_portfolio(&w).await;
         let Json(s) = patch_recon(
             State(st.clone()),
-            Path(CONN.into()),
+            Path(w.conn.clone()),
             Json(ReconPatch {
                 default_portfolio_id: Some(other),
                 external_policy: Some("break".into()),
@@ -577,11 +577,11 @@ mod tests {
             (Some(other), "break", "1y", Some(30))
         );
         // untouched fields stay
-        let Json(s) = patch_recon(State(st.clone()), Path(CONN.into()), Json(ReconPatch { eod_lookback: Some("1d".into()), ..Default::default() }))
+        let Json(s) = patch_recon(State(st.clone()), Path(w.conn.clone()), Json(ReconPatch { eod_lookback: Some("1d".into()), ..Default::default() }))
             .await
             .unwrap();
         assert_eq!((s.external_policy.as_str(), s.eod_lookback.as_str(), s.intraday_poll_secs), ("break", "1d", Some(30)));
-        let bad = |p: ReconPatch| patch_recon(State(st.clone()), Path(CONN.into()), Json(p));
+        let bad = |p: ReconPatch| patch_recon(State(st.clone()), Path(w.conn.clone()), Json(p));
         let e = bad(ReconPatch { external_policy: Some("ignore".into()), ..Default::default() }).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::BAD_REQUEST);
         let e = bad(ReconPatch { intraday_poll_secs: Some(0), ..Default::default() }).await.unwrap_err();
@@ -600,15 +600,15 @@ mod tests {
         let other = other_portfolio(&w).await;
         patch_recon(
             State(st.clone()),
-            Path(CONN.into()),
+            Path(w.conn.clone()),
             Json(ReconPatch { default_portfolio_id: Some(other), eod_lookback: Some("5y".into()), intraday_poll_secs: Some(45), ..Default::default() }),
         )
         .await
         .unwrap();
-        let Json(s) = get_recon(State(st.clone()), Path(CONN.into())).await.unwrap();
+        let Json(s) = get_recon(State(st.clone()), Path(w.conn.clone())).await.unwrap();
         assert_eq!(
             (s.code.as_str(), s.default_portfolio_id, s.external_policy.as_str(), s.eod_lookback.as_str(), s.intraday_poll_secs),
-            (CONN, Some(other), "adopt", "5y", Some(45))
+            (w.conn.as_str(), Some(other), "adopt", "5y", Some(45))
         );
         let e = get_recon(State(st), Path("nope".into())).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::NOT_FOUND);
@@ -619,23 +619,23 @@ mod tests {
     async fn invalid_lookback_is_400() {
         let w = world().await;
         let st = test_app_state(w.pool.clone());
-        let e = patch_recon(State(st.clone()), Path(CONN.into()), Json(ReconPatch { eod_lookback: Some("2d".into()), ..Default::default() }))
+        let e = patch_recon(State(st.clone()), Path(w.conn.clone()), Json(ReconPatch { eod_lookback: Some("2d".into()), ..Default::default() }))
             .await
             .unwrap_err();
         assert_eq!(e.status(), StatusCode::BAD_REQUEST);
-        let e = sweep(State(st.clone()), Path(CONN.into()), Ok(Json(SweepBody { lookback: Some("2d".into()) }))).await.unwrap_err();
+        let e = sweep(State(st.clone()), Path(w.conn.clone()), Ok(Json(SweepBody { lookback: Some("2d".into()) }))).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::BAD_REQUEST);
         // valid but no live reconciler in a test process
-        let e = sweep(State(st), Path(CONN.into()), Ok(Json(SweepBody { lookback: Some("1w".into()) }))).await.unwrap_err();
+        let e = sweep(State(st), Path(w.conn.clone()), Ok(Json(SweepBody { lookback: Some("1w".into()) }))).await.unwrap_err();
         assert_eq!(e.status(), StatusCode::CONFLICT);
     }
 
     /// Two fills (1 + 2) of one venue order, parked by policy break.
     async fn break_with_two_events(w: &World) -> Uuid {
         sqlx::query("UPDATE broker_connection SET external_policy = 'break' WHERE code = $1")
-            .bind(CONN).execute(&w.pool).await.unwrap();
-        crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Fill(fill("e1", "v1", 1.0)), None).await.unwrap();
-        crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Fill(fill("e2", "v1", 2.0)), None).await.unwrap();
+            .bind(&w.conn).execute(&w.pool).await.unwrap();
+        crate::ingest::apply::ingest(&w.pool, &w.bus, &w.conn, VenueEvent::Fill(fill("e1", "v1", 1.0)), None).await.unwrap();
+        crate::ingest::apply::ingest(&w.pool, &w.bus, &w.conn, VenueEvent::Fill(fill("e2", "v1", 2.0)), None).await.unwrap();
         sqlx::query_scalar("SELECT id FROM recon_break WHERE status = 'open'").fetch_one(&w.pool).await.unwrap()
     }
 
@@ -676,7 +676,7 @@ mod tests {
         let st = test_app_state(w.pool.clone());
         let auth = principal(&w, None).await;
         sqlx::query("UPDATE broker_connection SET external_policy = 'break' WHERE code = $1")
-            .bind(CONN).execute(&w.pool).await.unwrap();
+            .bind(&w.conn).execute(&w.pool).await.unwrap();
         let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc);
         let update = gateway::venue_event::VenueOrderUpdate {
             venue_order_id: "v1".into(),
@@ -692,10 +692,10 @@ mod tests {
             ts: Some(at("2026-11-01T09:00:01Z")),
             created_at: Some(at("2026-11-01T09:00:00Z")),
         };
-        crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Order(update), None).await.unwrap();
+        crate::ingest::apply::ingest(&w.pool, &w.bus, &w.conn, VenueEvent::Order(update), None).await.unwrap();
         let mut f = fill("e1", "v1", 2.0);
         f.executed_at = Some(at("2026-11-01T09:05:00Z"));
-        crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Fill(f), None).await.unwrap();
+        crate::ingest::apply::ingest(&w.pool, &w.bus, &w.conn, VenueEvent::Fill(f), None).await.unwrap();
         let id: Uuid = sqlx::query_scalar("SELECT id FROM recon_break WHERE status = 'open'").fetch_one(&w.pool).await.unwrap();
 
         adopt_break(State(st), Extension(auth), Path(id), Json(AdoptBody { portfolio_id: w.portfolio })).await.unwrap();
@@ -772,7 +772,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) VALUES ($1, 'ACC2', $2, 'acc2', 'ACTIVE')",
         )
-        .bind(Uuid::new_v4()).bind(CONN).execute(&w.pool).await.unwrap();
+        .bind(Uuid::new_v4()).bind(&w.conn).execute(&w.pool).await.unwrap();
         sqlx::query("UPDATE recon_break SET events_json = replace(events_json::text, '\"acc\"', '\"zzz\"')::jsonb")
             .execute(&w.pool).await.unwrap();
         let e = adopt_break(State(st), Extension(auth), Path(id), Json(AdoptBody { portfolio_id: w.portfolio })).await.unwrap_err();
@@ -831,7 +831,7 @@ mod tests {
         crate::ingest::apply::ingest(
             &w.pool,
             &w.bus,
-            CONN,
+            &w.conn,
             VenueEvent::Order(gateway::venue_event::VenueOrderUpdate {
                 venue_order_id: "v-ext".into(),
                 client_order_id: None,
