@@ -3,7 +3,20 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::authz_schema_tests::{fresh_db, migrated_db};
+use crate::authz_schema_tests::migrated_db;
+
+/// A disposable database whose every connection resolves unqualified names in
+/// `oms`, as the runtime role does. Triggers from older migrations (e.g. the FIX
+/// report queue) name their tables unqualified, so a pool connection without
+/// this search_path fails at random depending on which connection a query gets.
+async fn fresh_db() -> PgPool {
+    let pool = crate::authz_schema_tests::fresh_db().await;
+    let name: String = sqlx::query_scalar("SELECT current_database()").fetch_one(&pool).await.unwrap();
+    pool.close().await;
+    let url = std::env::var("OMS_RELOAD_TEST_DATABASE_URL").unwrap();
+    let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    PgPool::connect_with(options.database(&name).options([("search_path", "oms,public")])).await.unwrap()
+}
 use crate::setup::database::migrate;
 
 const RECON_MIGRATION: &str = "0066_";
