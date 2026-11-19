@@ -5,6 +5,12 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.13.0 (2026-11-19)
+
+### Feat
+
+- trade times and observed external orders (#59)
+
 ## v0.12.0 (2026-11-19)
 
 ### BREAKING CHANGE
