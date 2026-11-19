@@ -123,8 +123,10 @@ Commissions are booked as fees; see [Fees](/concepts/fees/).
   individual fills.
 - A cancel while the gateway is disconnected is refused with a temporary error; it is
   never queued.
-- The OMS sees only the orders it placed through its own API connection. Orders entered
-  by hand in TWS or the IBKR apps are invisible to it, including to reconciliation.
+- Orders placed by other API clients are visible only if IB Gateway's Master API client
+  ID equals the connection's API client id. Orders entered by hand in TWS are seen with
+  client id 0 and adopted like any external order; see
+  [Reconciliation](/concepts/reconciliation/).
 
 ## Credentials
 
@@ -134,6 +136,7 @@ For the TWS API connection, in the connection's credentials drawer:
 | --- | --- | --- |
 | IBKR username | Your IBKR login (for paper, the paper username from Client Portal) | |
 | Password | Its password. It reaches IB Gateway only through a short-lived file, never a command line or log. | |
+| API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value) | The client id the OMS connects with. With 0 it also sees orders entered by hand in TWS. To see orders placed by other API clients, set IB Gateway's **Master API client ID** to the same value. | `0` |
 
 The FIX session's fields are listed under [FIX session](#fix-session-experimental).
 
