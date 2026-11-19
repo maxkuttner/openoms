@@ -173,6 +173,15 @@ export interface BlotterRow {
   avg_px: number | null;
   fees: FeeAmount[];
   created_at: string;
+  /** When the order was placed; the first sighting when `placed_is_first_seen`. */
+  placed_at: string;
+  placed_is_first_seen: boolean;
+  /** Venue execution time; null when nothing has executed. */
+  trade_time: string | null;
+  /** When the OMS booked it. */
+  booked_at: string;
+  /** True when the venue sent no execution time and trade_time is the booking time. */
+  trade_time_estimated: boolean;
   updated_at: string;
 }
 
@@ -186,6 +195,8 @@ export interface OrderEvent {
   occurred_at: string;
   /** When the store appended it — later than `occurred_at` for broker-driven events. */
   recorded_at: string;
+  /** When the store appended it (same instant as `recorded_at`). */
+  booked_at: string;
   status_after: string | null;
   correlation_id: string | null;
   causation_id: string | null;

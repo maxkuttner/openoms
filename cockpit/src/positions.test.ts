@@ -7,6 +7,8 @@ import type { PositionRow } from "./positions.ts";
 const row = (over: Partial<PositionRow>): PositionRow => ({
   portfolio_id: "p",
   instrument_id: "1",
+  instrument_symbol: null,
+  instrument_name: null,
   currency: "USD",
   net_qty: 1,
   avg_cost: 1,
