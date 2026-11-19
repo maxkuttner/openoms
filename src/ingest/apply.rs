@@ -460,7 +460,7 @@ async fn note_venue_order(
     o: &VenueOrderUpdate,
 ) -> Result<(), IngestError> {
     sqlx::query(
-        "UPDATE order_state SET venue_cum_qty = $2, venue_created_at = COALESCE(venue_created_at, $3) \
+        "UPDATE order_state SET venue_cum_qty = GREATEST(venue_cum_qty, $2), venue_created_at = COALESCE(venue_created_at, $3) \
          WHERE order_id = $1",
     )
     .bind(order_id)
@@ -555,11 +555,23 @@ async fn book(
     let expected_version = base.as_ref().map_or(0, |s| s.version);
     let was = base.as_ref().map(|s| s.status);
     // An observed (external) order keeps its venue status while its fills
-    // land: the aggregate takes them on a terminal status. It reopens only to
-    // grow, which the state machine refuses on a closed order.
+    // land: the aggregate takes them on a terminal status. To grow it reopens
+    // (the state machine refuses a replace on a closed order); its events then
+    // take the venue's closed status back: the update's, else the one it had.
     let observed = base.as_ref().is_some_and(|s| s.observed);
     let grows = commands.iter().any(|c| matches!(c, OrderCommand::ReplaceOrder(_)));
     let reopen = !observed || grows;
+    let venue_closed = match event {
+        VenueEvent::Order(o) => match &o.status {
+            VenueOrderStatus::Filled => Some(OrderStatus::Filled),
+            VenueOrderStatus::Canceled => Some(OrderStatus::Canceled),
+            VenueOrderStatus::Rejected { .. } => Some(OrderStatus::Rejected),
+            VenueOrderStatus::Expired => Some(OrderStatus::Expired),
+            VenueOrderStatus::Working => None,
+        },
+        _ => was.filter(|s| s.is_terminal()),
+    };
+    let keep = venue_closed.filter(|_| observed && grows);
     // The venue is truth: what it reports on a closed OMS order (a late fill)
     // still books, so reopen it for the state machine, which refuses every
     // command on a terminal order.
@@ -593,6 +605,9 @@ async fn book(
             // the order stays closed, in its events as in order_state
             if let Some(prev) = was.filter(|s| !observed && s.is_terminal() && *s != OrderStatus::Filled) {
                 e.status_after = prev;
+            }
+            if let Some(status) = keep {
+                e.status_after = status;
             }
             aggregate.apply(e).map_err(|r| IngestError::Other(r.message))?;
         }
@@ -633,7 +648,7 @@ async fn book(
             let updated = sqlx::query(
                 "UPDATE order_state SET status = $2, original_qty = $3, leaves_qty = $4, cum_qty = $5, avg_px = $6, \
                  limit_price = $7, version = $8, updated_at = now(), last_trade_at = GREATEST(last_trade_at, $10), \
-                 venue_cum_qty = COALESCE($11, venue_cum_qty), venue_created_at = COALESCE(venue_created_at, $12) \
+                 venue_cum_qty = GREATEST(venue_cum_qty, $11), venue_created_at = COALESCE(venue_created_at, $12) \
                  WHERE order_id = $1 AND version = $9",
             )
             .bind(order_id)

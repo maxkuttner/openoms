@@ -504,6 +504,22 @@ async fn late_partial_fill_on_observed_filled_order_keeps_filled_status() {
 
 #[tokio::test]
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn observed_filled_order_grown_by_update_stays_filled() {
+    let w = world().await;
+    ingest(&w.pool, &w.bus, CONN, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 12.0, 12.0, VenueOrderStatus::Filled), None).await.unwrap();
+    assert!(matches!(d.decision, Decision::Grow { new_qty, .. } if new_qty == 12.0));
+    let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
+    assert_eq!((qty, cum, status.as_str()), (12.0, 0.0, "filled"));
+    assert!(events(&w.pool).await.iter().all(|e| e.3 == "filled"));
+    assert_eq!(order_times(&w.pool).await.2, Some(12.0));
+    // a stale update never lowers the venue's cum
+    ingest(&w.pool, &w.bus, CONN, order("v1", 12.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
+    assert_eq!(order_times(&w.pool).await.2, Some(12.0));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn venue_created_at_is_set_once() {
     let w = world().await;
     let first = "2026-11-01T09:00:00Z";
