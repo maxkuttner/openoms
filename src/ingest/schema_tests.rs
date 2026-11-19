@@ -402,3 +402,37 @@ async fn order_event_created_at_is_timestamptz_and_legacy_rows_keep_utc_instant(
         assert_eq!(got, expected, "session zone {zone}");
     }
 }
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn legacy_filled_order_gets_booking_time_as_trade_time() {
+    let pool = fresh_db().await;
+    migrate::ensure_tracking(&pool).await.unwrap();
+    migrate::apply_matching(&pool, |schema, file| schema != "oms" || file < "0067_").await.unwrap();
+
+    let b = seed_base(&pool).await;
+    let filled = seed_order(&pool, &b, "lg-filled").await;
+    let unfilled = seed_order(&pool, &b, "lg-open").await;
+    for (v, ty, ts) in [(1, "order_partially_filled", "2026-01-01 12:00:00"), (2, "order_filled", "2026-01-02 08:30:00")] {
+        sqlx::query(&format!(
+            "INSERT INTO oms.order_event (order_id, version, event_id, event_type, payload_json, created_at) \
+             VALUES ($1, $2, $3, $4, '{{}}'::jsonb, TIMESTAMP '{ts}')"
+        ))
+        .bind(filled).bind(v).bind(Uuid::new_v4()).bind(ty).execute(&pool).await.unwrap();
+    }
+
+    migrate::apply_all(&pool).await.unwrap();
+
+    let get = |o: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                "SELECT last_trade_at FROM oms.order_state WHERE order_id = $1",
+            )
+            .bind(o).fetch_one(&pool).await.unwrap()
+        }
+    };
+    let expected = chrono::DateTime::parse_from_rfc3339("2026-01-02T08:30:00Z").unwrap().with_timezone(&chrono::Utc);
+    assert_eq!(get(filled).await, Some(expected));
+    assert_eq!(get(unfilled).await, None);
+}

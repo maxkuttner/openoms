@@ -74,7 +74,8 @@ Venues that report a create time: Binance, Alpaca, Bybit, OKX and Coinbase. IBKR
 (TWS and FIX) do not, so Placed shows when the order was first seen.
 
 Orders from before trade times were added keep their old history, and their
-trade time is the booking time.
+trade time is the booking time. Legacy external orders keep their old
+submitted and routed history.
 
 ## Positions follow trade time
 
