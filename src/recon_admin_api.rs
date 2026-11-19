@@ -671,6 +671,56 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn adopted_break_order_is_observed() {
+        let w = world().await;
+        let st = test_app_state(w.pool.clone());
+        let auth = principal(&w, None).await;
+        sqlx::query("UPDATE broker_connection SET external_policy = 'break' WHERE code = $1")
+            .bind(CONN).execute(&w.pool).await.unwrap();
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc);
+        let update = gateway::venue_event::VenueOrderUpdate {
+            venue_order_id: "v1".into(),
+            client_order_id: None,
+            account_ref: "acc".into(),
+            symbol: "BTCUSDT".into(),
+            buy: true,
+            order_type: "LIMIT".into(),
+            qty: 5.0,
+            limit_px: Some(100.0),
+            status: VenueOrderStatus::Working,
+            cum_qty: 0.0,
+            ts: Some(at("2026-11-01T09:00:01Z")),
+            created_at: Some(at("2026-11-01T09:00:00Z")),
+        };
+        crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Order(update), None).await.unwrap();
+        let mut f = fill("e1", "v1", 2.0);
+        f.executed_at = Some(at("2026-11-01T09:05:00Z"));
+        crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Fill(f), None).await.unwrap();
+        let id: Uuid = sqlx::query_scalar("SELECT id FROM recon_break WHERE status = 'open'").fetch_one(&w.pool).await.unwrap();
+
+        adopt_break(State(st), Extension(auth), Path(id), Json(AdoptBody { portfolio_id: w.portfolio })).await.unwrap();
+
+        let events: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)> =
+            sqlx::query_as("SELECT event_type, occurred_at FROM order_event ORDER BY global_position")
+                .fetch_all(&w.pool).await.unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ("order_observed".into(), Some(at("2026-11-01T09:00:01Z"))),
+                ("order_partially_filled".into(), Some(at("2026-11-01T09:05:00Z"))),
+            ]
+        );
+        let (status, cum, created, last): (String, f64, Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT status, cum_qty::float8, venue_created_at, last_trade_at FROM order_state")
+                .fetch_one(&w.pool).await.unwrap();
+        assert_eq!(
+            (status.as_str(), cum, created, last),
+            ("partially_filled", 2.0, Some(at("2026-11-01T09:00:00Z")), Some(at("2026-11-01T09:05:00Z")))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
     async fn adopting_a_break_that_cannot_book_leaves_it_open() {
         let w = world().await;
         let st = test_app_state(w.pool.clone());

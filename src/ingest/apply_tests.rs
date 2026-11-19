@@ -326,6 +326,7 @@ fn events_round_trip_through_a_break() {
     let mut o = order("v1", 5.0, 1.5, VenueOrderStatus::Rejected { reason: "nope".into() });
     if let VenueEvent::Order(x) = &mut o {
         x.ts = at;
+        x.created_at = at;
     }
     let all = [
         f,
@@ -340,4 +341,213 @@ fn events_round_trip_through_a_break() {
         assert_eq!(super::event_from_json(&json), Some(event), "{json}");
     }
     assert_eq!(super::event_from_json(&serde_json::json!({"type": "mystery"})), None);
+}
+
+type Ts = chrono::DateTime<chrono::Utc>;
+
+fn at(s: &str) -> Ts {
+    chrono::DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&chrono::Utc)
+}
+
+fn timed_fill(exec: &str, venue_order: &str, qty: f64, executed_at: Option<&str>) -> VenueEvent {
+    let mut ev = fill(exec, venue_order, None, qty);
+    if let VenueEvent::Fill(f) = &mut ev {
+        f.executed_at = executed_at.map(at);
+    }
+    ev
+}
+
+fn timed_order(
+    venue_order: &str,
+    qty: f64,
+    cum: f64,
+    status: VenueOrderStatus,
+    ts: Option<&str>,
+    created: Option<&str>,
+) -> VenueEvent {
+    let mut ev = order(venue_order, qty, cum, status);
+    if let VenueEvent::Order(o) = &mut ev {
+        o.ts = ts.map(at);
+        o.created_at = created.map(at);
+    }
+    ev
+}
+
+/// (event_type, occurred_at, trade_time_estimated, status_after) of every event, in order.
+async fn events(pool: &PgPool) -> Vec<(String, Option<Ts>, Option<bool>, String)> {
+    sqlx::query_as(
+        "SELECT event_type, occurred_at, (payload_json->>'trade_time_estimated')::bool, \
+         lower(payload_json->>'status_after') FROM order_event ORDER BY global_position",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// (last_trade_at, venue_created_at, venue_cum_qty) of the order on venue order `v1`.
+async fn order_times(pool: &PgPool) -> (Option<Ts>, Option<Ts>, Option<f64>) {
+    sqlx::query_as(
+        "SELECT last_trade_at, venue_created_at, venue_cum_qty::float8 FROM order_state WHERE external_order_id = 'v1'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn position_last_trade(w: &World) -> Option<Ts> {
+    sqlx::query_scalar("SELECT last_trade_at FROM position WHERE portfolio_id = $1 AND instrument_id = $2")
+        .bind(w.portfolio)
+        .bind(w.instrument.to_string())
+        .fetch_one(&w.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn fill_event_stores_venue_execution_time() {
+    let w = world().await;
+    let created = "2026-11-01T09:00:00Z";
+    let t0 = "2026-11-01T09:00:01Z";
+    let t1 = "2026-11-01T09:05:00Z";
+    let t2 = "2026-11-01T09:06:00Z";
+    let working = timed_order("v1", 5.0, 0.0, VenueOrderStatus::Working, Some(t0), Some(created));
+    ingest(&w.pool, &w.bus, CONN, working, None).await.unwrap();
+    ingest(&w.pool, &w.bus, CONN, timed_fill("e1", "v1", 2.0, Some(t1)), None).await.unwrap();
+    let canceled = timed_order("v1", 5.0, 2.0, VenueOrderStatus::Canceled, Some(t2), None);
+    ingest(&w.pool, &w.bus, CONN, canceled, None).await.unwrap();
+    assert_eq!(
+        events(&w.pool).await,
+        vec![
+            ("order_observed".into(), Some(at(t0)), None, "routed".into()),
+            ("order_partially_filled".into(), Some(at(t1)), None, "partially_filled".into()),
+            ("order_canceled".into(), Some(at(t2)), None, "canceled".into()),
+        ]
+    );
+    let (last, venue_created, _) = order_times(&w.pool).await;
+    assert_eq!((last, venue_created), (Some(at(t1)), Some(at(created))));
+    assert_eq!(position_last_trade(&w).await, Some(at(t1)));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn status_update_without_venue_time_has_null_occurred_at() {
+    let w = world().await;
+    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
+    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    let ev = events(&w.pool).await;
+    let got: Vec<(&str, Option<Ts>)> = ev.iter().map(|e| (e.0.as_str(), e.1)).collect();
+    assert_eq!(got, vec![("order_observed", None), ("order_canceled", None)]);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn missing_execution_time_is_estimated_and_not_late() {
+    let w = world().await;
+    ingest(&w.pool, &w.bus, CONN, timed_fill("e1", "v1", 1.0, Some("2026-11-01T09:05:00Z")), None).await.unwrap();
+    ingest(&w.pool, &w.bus, CONN, timed_fill("e2", "v1", 1.0, None), None).await.unwrap();
+    let (occurred, booked, estimated): (Option<Ts>, Ts, Option<bool>) = sqlx::query_as(
+        "SELECT occurred_at, created_at, (payload_json->>'trade_time_estimated')::bool FROM order_event \
+         WHERE payload_json->'payload'->>'execution_id' = 'e2'",
+    )
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    let occurred = occurred.expect("an estimated fill still has an occurred_at");
+    assert_eq!(estimated, Some(true));
+    assert!((occurred - booked).num_seconds().abs() < 5, "{occurred} vs {booked}");
+    // booking time is the latest trade time: not a late fill
+    assert_eq!(order_times(&w.pool).await.0, Some(occurred));
+    assert_eq!(position_last_trade(&w).await, Some(occurred));
+    assert_eq!(position(&w).await, 2.0);
+    let flagged = count(&w.pool, "SELECT count(*) FROM order_event WHERE payload_json ? 'trade_time_estimated'").await;
+    assert_eq!(flagged, 1);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn observed_filled_order_then_fills_books_once() {
+    let w = world().await;
+    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
+    assert!(matches!(d.decision, Decision::Adopt { .. }));
+    assert!(d.fill_gap);
+    let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
+    assert_eq!((qty, cum, status.as_str()), (10.0, 0.0, "filled"));
+    assert_eq!(order_times(&w.pool).await.2, Some(10.0));
+    assert_eq!(position(&w).await, 0.0);
+    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 4.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, CONN, fill("e2", "v1", None, 6.0), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 4.0), None).await.unwrap();
+    assert_eq!(d.decision, Decision::Duplicate);
+    let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
+    assert_eq!((qty, cum, status.as_str()), (10.0, 10.0, "filled"));
+    assert_eq!(position(&w).await, 10.0);
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 2);
+    let types: Vec<String> = events(&w.pool).await.into_iter().map(|e| e.0).collect();
+    assert_eq!(types, ["order_observed", "order_partially_filled", "order_filled"]);
+    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 10.0, 10.0, VenueOrderStatus::Filled), None).await.unwrap();
+    assert!(!d.fill_gap);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn late_partial_fill_on_observed_filled_order_keeps_filled_status() {
+    let w = world().await;
+    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None).await.unwrap();
+    let (_, _, _, _, cum, status) = only_order(&w.pool).await;
+    assert_eq!((cum, status.as_str()), (2.0, "filled"));
+    let ev = events(&w.pool).await;
+    assert_eq!((ev[1].0.as_str(), ev[1].3.as_str()), ("order_partially_filled", "filled"));
+    assert_eq!(position(&w).await, 2.0);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn venue_created_at_is_set_once() {
+    let w = world().await;
+    let first = "2026-11-01T09:00:00Z";
+    // a first sighting without a create time (FIX), then one with it (REST)
+    ingest(&w.pool, &w.bus, CONN, timed_order("v1", 5.0, 0.0, VenueOrderStatus::Working, None, None), None)
+        .await
+        .unwrap();
+    assert_eq!(order_times(&w.pool).await.1, None);
+    let with_time = timed_order("v1", 5.0, 1.0, VenueOrderStatus::Working, None, Some(first));
+    ingest(&w.pool, &w.bus, CONN, with_time, None).await.unwrap();
+    assert_eq!(order_times(&w.pool).await.1, Some(at(first)));
+    assert_eq!(order_times(&w.pool).await.2, Some(1.0));
+    // a different create time later never overwrites it
+    let other = timed_order("v1", 5.0, 2.0, VenueOrderStatus::Working, None, Some("2026-11-02T00:00:00Z"));
+    ingest(&w.pool, &w.bus, CONN, other, None).await.unwrap();
+    assert_eq!(order_times(&w.pool).await.1, Some(at(first)));
+    assert_eq!(order_times(&w.pool).await.2, Some(2.0));
+    // known from the first sighting, then a different one with a status change
+    let v2 = timed_order("v2", 5.0, 0.0, VenueOrderStatus::Working, None, Some(first));
+    ingest(&w.pool, &w.bus, CONN, v2, None).await.unwrap();
+    let v2 = timed_order("v2", 5.0, 0.0, VenueOrderStatus::Canceled, None, Some("2026-11-03T00:00:00Z"));
+    ingest(&w.pool, &w.bus, CONN, v2, None).await.unwrap();
+    let (created, status): (Option<Ts>, String) =
+        sqlx::query_as("SELECT venue_created_at, status FROM order_state WHERE external_order_id = 'v2'")
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!((created, status.as_str()), (Some(at(first)), "canceled"));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn last_trade_at_tracks_latest_fill() {
+    let w = world().await;
+    let (early, late, later) = ("2026-11-01T09:00:00Z", "2026-11-01T10:00:00Z", "2026-11-01T11:00:00Z");
+    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
+    ingest(&w.pool, &w.bus, CONN, timed_fill("e1", "v1", 1.0, Some(late)), None).await.unwrap();
+    assert_eq!(order_times(&w.pool).await.0, Some(at(late)));
+    // an older fill arriving later does not move it back
+    ingest(&w.pool, &w.bus, CONN, timed_fill("e2", "v1", 1.0, Some(early)), None).await.unwrap();
+    assert_eq!(order_times(&w.pool).await.0, Some(at(late)));
+    assert_eq!(position_last_trade(&w).await, Some(at(late)));
+    ingest(&w.pool, &w.bus, CONN, timed_fill("e3", "v1", 1.0, Some(later)), None).await.unwrap();
+    assert_eq!(order_times(&w.pool).await.0, Some(at(later)));
+    assert_eq!(position_last_trade(&w).await, Some(at(later)));
+    assert_eq!(position(&w).await, 3.0);
 }

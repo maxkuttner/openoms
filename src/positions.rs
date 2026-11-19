@@ -195,7 +195,9 @@ async fn upsert(
 }
 
 /// Load → apply one fill → upsert, inside the caller's transaction (so it commits
-/// atomically with the order_state update + event append).
+/// atomically with the order_state update + event append). `trade_time` is the
+/// fill's trade time; the position keeps the latest one it has applied.
+#[allow(clippy::too_many_arguments)]
 pub async fn persist_fill(
     conn: &mut PgConnection,
     portfolio_id: Uuid,
@@ -203,9 +205,20 @@ pub async fn persist_fill(
     side: OrderSide,
     fill_qty: f64,
     fill_price: f64,
+    trade_time: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let next = load(conn, portfolio_id, instrument_id).await?.apply_fill(side, fill_qty, fill_price);
-    upsert(conn, portfolio_id, instrument_id, next).await
+    upsert(conn, portfolio_id, instrument_id, next).await?;
+    sqlx::query(
+        "UPDATE position SET last_trade_at = GREATEST(last_trade_at, $3) \
+         WHERE portfolio_id = $1 AND instrument_id = $2",
+    )
+    .bind(portfolio_id)
+    .bind(instrument_id)
+    .bind(trade_time)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// Load → apply one venue fee → upsert, inside the caller's transaction. An

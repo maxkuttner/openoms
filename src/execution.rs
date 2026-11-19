@@ -78,6 +78,10 @@ where
 
 /// The order's current state as `order_state` holds it, or `None` when there is
 /// no such order.
+fn is_fill_event(e: &crate::domain::orders::events::OrderDomainEvent) -> bool {
+    matches!(e.payload, OrderEventPayload::OrderPartiallyFilled { .. } | OrderEventPayload::OrderFilled { .. })
+}
+
 pub(crate) async fn load_state(
     conn: &mut sqlx::PgConnection,
     order_id: Uuid,
@@ -194,6 +198,9 @@ async fn apply_once(
     }
 
     let new_state = applied.state.ok_or("missing aggregate state after apply")?;
+    // an OMS fill without a venue time trades at its booking time
+    let trade_time = |e: &crate::domain::orders::events::OrderDomainEvent| e.occurred_at.unwrap_or(e.timestamp);
+    let last_trade = events.iter().filter(|e| is_fill_event(e)).map(trade_time).max();
 
     sqlx::query(
         r#"
@@ -204,6 +211,7 @@ async fn apply_once(
             cum_qty         = $4,
             avg_px          = $5,
             version         = $6,
+            last_trade_at   = GREATEST(last_trade_at, $8),
             updated_at      = now()
         WHERE order_id = $1 AND version = $7
         "#,
@@ -215,6 +223,7 @@ async fn apply_once(
     .bind(new_state.avg_px)
     .bind(new_state.version)
     .bind(expected_version)
+    .bind(last_trade)
     .execute(&mut *tx)
     .await?;
 
@@ -236,6 +245,7 @@ async fn apply_once(
             new_state.side,
             fill_qty,
             fill_price,
+            trade_time(event),
         )
         .await?;
     }
@@ -412,18 +422,25 @@ pub(crate) mod tests {
         for _ in 0..3 {
             results.push(process_execution_report(&pool, order_id, fill(), "obs-test", None).await.is_ok());
         }
-        let (cum, status): (f64, String) = sqlx::query_as(
-            "SELECT cum_qty::double precision, status FROM order_state WHERE order_id = $1",
-        )
-        .bind(order_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read state");
+        let (cum, status, order_trade, position_trade): (f64, String, Option<chrono::DateTime<Utc>>, Option<chrono::DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT os.cum_qty::double precision, os.status, os.last_trade_at, p.last_trade_at \
+                 FROM order_state os LEFT JOIN position p \
+                   ON p.portfolio_id = os.portfolio_id AND p.instrument_id = os.instrument_id \
+                 WHERE os.order_id = $1",
+            )
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read state");
         remove_seeded(&pool, order_id).await;
 
         assert_eq!(results, vec![true, true, true]);
         assert_eq!(cum, 2.0);
         assert_eq!(status, "filled");
+        // a fill without a venue time trades at its booking time
+        assert!(order_trade.is_some_and(|t| (Utc::now() - t).num_seconds().abs() < 60));
+        assert_eq!(order_trade, position_trade);
     }
 
     #[tokio::test]
