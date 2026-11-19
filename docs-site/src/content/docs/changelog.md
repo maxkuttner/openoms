@@ -5,6 +5,12 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.14.0 (2026-11-19)
+
+### Feat
+
+- **compose**: host port from OMS_PORT (default 3001) (#60)
+
 ## v0.13.0 (2026-11-19)
 
 ### Feat
