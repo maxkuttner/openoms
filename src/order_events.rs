@@ -35,6 +35,8 @@ pub struct OrderEventView {
     pub actor: String,
     pub occurred_at: DateTime<Utc>,
     pub recorded_at: DateTime<Utc>,
+    /// When the event was booked in the store; same instant as `recorded_at`.
+    pub booked_at: DateTime<Utc>,
     pub status_after: Option<String>,
     pub correlation_id: Option<String>,
     pub causation_id: Option<String>,
@@ -58,8 +60,14 @@ pub fn view(record: &OrderEventRecord) -> OrderEventView {
         event_id: record.event_id.clone(),
         event_type: record.event_type.clone(),
         actor: record.actor.clone(),
-        occurred_at: event.as_ref().map_or(record.created_at, |e| e.occurred_at.unwrap_or(e.timestamp)),
+        // The stored column is the canonical trade/decision time; the payload is the
+        // fallback for rows written before it was filled.
+        occurred_at: record
+            .occurred_at
+            .or_else(|| event.as_ref().map(|e| e.occurred_at.unwrap_or(e.timestamp)))
+            .unwrap_or(record.created_at),
         recorded_at: record.created_at,
+        booked_at: record.created_at,
         status_after: event.as_ref().map(|e| e.status_after.as_str().to_string()),
         correlation_id: record.correlation_id.clone(),
         causation_id: record.causation_id.clone(),
@@ -688,5 +696,35 @@ mod tests {
             summarize(&e),
             "partially filled 40 @ 190.02 on XNAS (40 cumulative, 60 working, avg 190.02)"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn order_events_return_occurred_and_booked() {
+        use crate::event_store::NewOrderEvent;
+        use crate::handlers::tests::{seed_instrument, seed_order_state, seed_principal, test_pool};
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "ev-times").await;
+        let instrument_id = seed_instrument(&pool, "EVTIME").await;
+        let order_id = seed_order_state(&pool, principal_id, instrument_id, "ev-times").await;
+        let occurred = chrono::DateTime::parse_from_rfc3339("2026-11-01T10:00:00Z").unwrap().with_timezone(&Utc);
+        OrderEventStore::new(pool.clone())
+            .append_events(order_id, 0, &[NewOrderEvent {
+                event_id: Uuid::new_v4().to_string(),
+                event_type: "order_filled".into(),
+                actor: "t".into(),
+                payload: serde_json::json!({"shape": "unparsed"}),
+                correlation_id: None,
+                causation_id: None,
+                schema_version: 0,
+                occurred_at: Some(occurred),
+            }])
+            .await
+            .expect("append");
+        let timeline = load_timeline(&pool, order_id).await.expect("timeline");
+        let e = &timeline[0];
+        assert_eq!(e.occurred_at, occurred, "the stored trade time, not the booking time");
+        assert!(e.booked_at > occurred);
+        assert_eq!(e.booked_at, e.recorded_at);
     }
 }

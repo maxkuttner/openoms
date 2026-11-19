@@ -125,6 +125,10 @@ pub struct Valuation {
 pub struct Position {
     pub portfolio_id: Uuid,
     pub instrument_id: String,
+    /// Ticker of the instrument; None when the master row is missing.
+    pub instrument_symbol: Option<String>,
+    /// Display name of the instrument; None when the master row is missing.
+    pub instrument_name: Option<String>,
     /// The instrument's own currency; every amount on this row is in it (no FX).
     pub currency: String,
     pub net_qty: f64,
@@ -603,6 +607,8 @@ mod tests {
         let p = Position {
             portfolio_id: Uuid::nil(),
             instrument_id: "42".into(),
+            instrument_symbol: None,
+            instrument_name: None,
             currency: "EUR".into(),
             net_qty: 1.0,
             avg_cost: 2.0,
