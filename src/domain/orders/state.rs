@@ -107,4 +107,9 @@ pub struct OrderAggregateState {
     pub status: OrderStatus,
     pub resume_to_status: Option<OrderStatus>,
     pub version: i64,
+    /// Opened by `order_observed` (venue-originated): its status is the venue's,
+    /// so fills are still accepted on a terminal status until booked cum
+    /// reaches quantity.
+    #[serde(default)]
+    pub observed: bool,
 }

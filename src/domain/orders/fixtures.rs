@@ -2,10 +2,10 @@ use chrono::Utc;
 
 use super::aggregate::{EventMetadata, OrderAggregate};
 use super::commands::{
-    CancelOrder, ExecutionReport, ExpireOrder, ReceiveExecutionReport, ReleaseOrder, ReplaceOrder,
+    CancelOrder, ExecutionReport, ExpireOrder, ObserveOrder, ReceiveExecutionReport, ReleaseOrder, ReplaceOrder,
     SubmitOrder, SuspendOrder,
 };
-use super::state::{OrderSide, OrderType, TimeInForce};
+use super::state::{OrderSide, OrderStatus, OrderType, TimeInForce};
 
 #[derive(Debug, Clone)]
 pub struct OrderTestData {
@@ -113,6 +113,26 @@ impl OrderTestData {
         }
     }
 
+    pub fn observe(&self, qty: f64, status: OrderStatus, venue_cum_qty: f64) -> ObserveOrder {
+        ObserveOrder {
+            order_id: self.order_id.clone(),
+            client_order_id: self.client_order_id.clone(),
+            portfolio_id: self.portfolio_id.clone(),
+            account_id: self.account_id.clone(),
+            instrument_id: self.instrument_id.clone(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            limit_price: Some(100.0),
+            quantity: qty,
+            venue: "BINANCE".to_string(),
+            external_order_id: "x-1".to_string(),
+            observed_status: status,
+            venue_cum_qty,
+            venue_created_at: None,
+        }
+    }
+
     pub fn exec_reject(&self, reason: &str, venue: Option<&str>) -> ReceiveExecutionReport {
         ReceiveExecutionReport {
             order_id: self.order_id.clone(),
@@ -129,6 +149,7 @@ pub fn metadata(event_id: &str) -> EventMetadata {
         event_id: event_id.to_string(),
         timestamp: Utc::now(),
         actor: "test".to_string(),
+        occurred_at: None,
     }
 }
 

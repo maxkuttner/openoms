@@ -12,6 +12,8 @@ pub struct EventMetadata {
     pub event_id: String,
     pub timestamp: DateTime<Utc>,
     pub actor: String,
+    /// Venue time of what the command reports; copied onto every event.
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -53,7 +55,16 @@ impl OrderAggregate {
         // if we return Err(CommandRejection) we emit NO domain events.
         // Integration code should only append/publish when we return Ok(events).
         let kind = command.kind();
-        let current_status = self.state.as_ref().map(|s| s.status);
+        let current_status = self.state.as_ref().map(|s| {
+            // An observed order's status is the venue's, ahead of its booked
+            // fills: until booked cum reaches quantity it still takes fills
+            // (the fill keeps the terminal status, see below).
+            if s.observed && s.status.is_terminal() && is_fill(&command) && s.cum_qty < s.original_qty {
+                OrderStatus::PartiallyFilled
+            } else {
+                s.status
+            }
+        });
         lifecycle::ensure_command_allowed(current_status, kind)?;
 
         match command {
@@ -66,6 +77,7 @@ impl OrderAggregate {
                     order_id: cmd.order_id,
                     timestamp: metadata.timestamp,
                     actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                     payload: OrderEventPayload::OrderSubmitted {
                         client_order_id: cmd.client_order_id,
                         portfolio_id: cmd.portfolio_id,
@@ -90,6 +102,7 @@ impl OrderAggregate {
                     order_id: cmd.order_id,
                     timestamp: metadata.timestamp,
                     actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                     payload: OrderEventPayload::OrderRouted {
                         venue: cmd.venue,
                         external_order_id: cmd.external_order_id,
@@ -125,6 +138,7 @@ impl OrderAggregate {
                     order_id: cmd.order_id,
                     timestamp: metadata.timestamp,
                     actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                     payload: OrderEventPayload::OrderAmended {
                         previous_limit_price: state.limit_price,
                         new_limit_price: cmd.new_limit_price.or(state.limit_price),
@@ -145,6 +159,7 @@ impl OrderAggregate {
                     order_id: cmd.order_id,
                     timestamp: metadata.timestamp,
                     actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                     payload: OrderEventPayload::OrderCanceled { reason: cmd.reason },
                     version: next_version,
                     status_after: OrderStatus::Canceled,
@@ -160,6 +175,7 @@ impl OrderAggregate {
                     order_id: cmd.order_id,
                     timestamp: metadata.timestamp,
                     actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                     payload: OrderEventPayload::OrderSuspended {
                         reason: cmd.reason,
                         resume_to_status: state.status,
@@ -185,6 +201,7 @@ impl OrderAggregate {
                     order_id: cmd.order_id,
                     timestamp: metadata.timestamp,
                     actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                     payload: OrderEventPayload::OrderReleased { resumed_to_status },
                     version: next_version,
                     status_after: resumed_to_status,
@@ -202,6 +219,7 @@ impl OrderAggregate {
                             order_id: cmd.order_id,
                             timestamp: metadata.timestamp,
                             actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                             payload: OrderEventPayload::OrderRejected { reason },
                             version: next_version,
                             status_after: OrderStatus::Rejected,
@@ -216,6 +234,7 @@ impl OrderAggregate {
                             order_id: cmd.order_id,
                             timestamp: metadata.timestamp,
                             actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                             payload: OrderEventPayload::OrderCanceled { reason },
                             version: next_version,
                             status_after: OrderStatus::Canceled,
@@ -253,6 +272,9 @@ impl OrderAggregate {
                         let prev_notional = state.cum_qty * state.avg_px.unwrap_or(0.0);
                         let next_avg = (prev_notional + (fill_qty * fill_price)) / next_cum;
                         let next_version = state.version + 1;
+                        // a fill on an observed order the venue already
+                        // reported closed books but leaves the status alone
+                        let keep = (state.observed && state.status.is_terminal()).then_some(state.status);
 
                         if next_leaves > 0.0 {
                             Ok(vec![OrderDomainEvent {
@@ -261,6 +283,7 @@ impl OrderAggregate {
                                 order_id: cmd.order_id,
                                 timestamp: metadata.timestamp,
                                 actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                                 payload: OrderEventPayload::OrderPartiallyFilled {
                                     execution_id,
                                     fill_qty,
@@ -271,7 +294,7 @@ impl OrderAggregate {
                                     venue,
                                 },
                                 version: next_version,
-                                status_after: OrderStatus::PartiallyFilled,
+                                status_after: keep.unwrap_or(OrderStatus::PartiallyFilled),
                             }])
                         } else {
                             Ok(vec![OrderDomainEvent {
@@ -280,6 +303,7 @@ impl OrderAggregate {
                                 order_id: cmd.order_id,
                                 timestamp: metadata.timestamp,
                                 actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                                 payload: OrderEventPayload::OrderFilled {
                                     execution_id,
                                     fill_qty,
@@ -290,11 +314,46 @@ impl OrderAggregate {
                                     venue,
                                 },
                                 version: next_version,
-                                status_after: OrderStatus::Filled,
+                                status_after: keep.unwrap_or(OrderStatus::Filled),
                             }])
                         }
                     }
                 }
+            }
+            OrderCommand::ObserveOrder(cmd) => {
+                invariants::validate_submit(cmd.quantity, cmd.order_type, cmd.limit_price)?;
+                if matches!(cmd.observed_status, OrderStatus::Submitted | OrderStatus::Suspended) {
+                    return Err(CommandRejection::new(
+                        RejectionCode::InvalidStateTransition,
+                        format!("{:?} is not a venue status", cmd.observed_status),
+                    ));
+                }
+                Ok(vec![OrderDomainEvent {
+                    event_id: metadata.event_id,
+                    event_type: OrderEventType::OrderObserved,
+                    order_id: cmd.order_id,
+                    timestamp: metadata.timestamp,
+                    actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
+                    payload: OrderEventPayload::OrderObserved {
+                        client_order_id: cmd.client_order_id,
+                        portfolio_id: cmd.portfolio_id,
+                        account_id: cmd.account_id,
+                        instrument_id: cmd.instrument_id,
+                        side: cmd.side,
+                        order_type: cmd.order_type,
+                        time_in_force: cmd.time_in_force,
+                        limit_price: cmd.limit_price,
+                        quantity: cmd.quantity,
+                        venue: cmd.venue,
+                        external_order_id: cmd.external_order_id,
+                        observed_status: cmd.observed_status,
+                        venue_cum_qty: cmd.venue_cum_qty,
+                        venue_created_at: cmd.venue_created_at,
+                    },
+                    version: 1,
+                    status_after: cmd.observed_status,
+                }])
             }
             OrderCommand::ExpireOrder(cmd) => {
                 let state = invariants::require_existing_order(&self.state)?;
@@ -306,6 +365,7 @@ impl OrderAggregate {
                     order_id: cmd.order_id,
                     timestamp: metadata.timestamp,
                     actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
                     payload: OrderEventPayload::OrderExpired { reason: cmd.reason },
                     version: next_version,
                     status_after: OrderStatus::Expired,
@@ -348,6 +408,39 @@ impl OrderAggregate {
                     status: event.status_after,
                     resume_to_status: None,
                     version: event.version,
+                    observed: false,
+                });
+            }
+            OrderEventPayload::OrderObserved {
+                client_order_id,
+                portfolio_id,
+                account_id,
+                instrument_id,
+                side,
+                order_type,
+                time_in_force,
+                limit_price,
+                quantity,
+                ..
+            } => {
+                self.state = Some(OrderAggregateState {
+                    order_id: event.order_id.clone(),
+                    client_order_id: client_order_id.clone(),
+                    portfolio_id: portfolio_id.clone(),
+                    account_id: account_id.clone(),
+                    instrument_id: instrument_id.clone(),
+                    side: *side,
+                    order_type: *order_type,
+                    time_in_force: *time_in_force,
+                    limit_price: *limit_price,
+                    original_qty: *quantity,
+                    leaves_qty: *quantity,
+                    cum_qty: 0.0,
+                    avg_px: None,
+                    status: event.status_after,
+                    resume_to_status: None,
+                    version: event.version,
+                    observed: true,
                 });
             }
             OrderEventPayload::OrderAmended {
@@ -455,6 +548,10 @@ impl OrderAggregate {
 
         Ok(())
     }
+}
+
+fn is_fill(command: &OrderCommand) -> bool {
+    matches!(command, OrderCommand::ReceiveExecutionReport(r) if matches!(r.report, ExecutionReport::Fill { .. }))
 }
 
 #[cfg(test)]
@@ -572,6 +669,7 @@ mod tests {
             },
             version: before.version + 1,
             status_after: before.status,
+            occurred_at: None,
         };
         aggregate.apply(&fee).expect("apply should succeed");
         let after = aggregate.state.expect("state");
@@ -752,6 +850,7 @@ mod tests {
             },
             version: 2,
             status_after: OrderStatus::Routed,
+            occurred_at: None,
         };
         aggregate
             .apply(&routed_event)
@@ -1080,11 +1179,135 @@ mod tests {
             payload: OrderEventPayload::OrderCanceled { reason: None },
             version: 1,
             status_after: OrderStatus::Canceled,
+            occurred_at: None,
         };
 
         let err = aggregate
             .apply(&event)
             .expect_err("apply should fail before submit");
         assert_eq!(err.code, RejectionCode::OrderNotFound);
+    }
+
+    fn observed(status: OrderStatus, venue_cum: f64) -> OrderAggregate {
+        let events = OrderAggregate::default()
+            .decide(OrderCommand::ObserveOrder(t().observe(10.0, status, venue_cum)), metadata("e-obs"))
+            .expect("observe should succeed");
+        OrderAggregate::rehydrate(&events).expect("rehydrate")
+    }
+
+    #[test]
+    fn observe_creates_order_in_observed_status_with_zero_booked_cum() {
+        let events = OrderAggregate::default()
+            .decide(OrderCommand::ObserveOrder(t().observe(10.0, OrderStatus::Filled, 10.0)), metadata("e-obs"))
+            .expect("observe should succeed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, OrderEventType::OrderObserved);
+        assert_eq!(events[0].event_type.as_str(), "order_observed");
+        assert_eq!(events[0].version, 1);
+        assert_eq!(events[0].status_after, OrderStatus::Filled);
+        match &events[0].payload {
+            OrderEventPayload::OrderObserved { venue_cum_qty, external_order_id, observed_status, .. } => {
+                assert_eq!(*venue_cum_qty, 10.0);
+                assert_eq!(external_order_id, "x-1");
+                assert_eq!(*observed_status, OrderStatus::Filled);
+            }
+            other => panic!("unexpected payload {other:?}"),
+        }
+        let state = OrderAggregate::rehydrate(&events).unwrap().state.unwrap();
+        assert_eq!(state.status, OrderStatus::Filled);
+        assert_eq!(state.cum_qty, 0.0);
+        assert_eq!(state.leaves_qty, 10.0);
+        assert_eq!(state.original_qty, 10.0);
+        assert_eq!(state.avg_px, None);
+        assert!(state.observed);
+    }
+
+    #[test]
+    fn observe_on_existing_order_is_rejected() {
+        let err = submitted_aggregate()
+            .decide(OrderCommand::ObserveOrder(t().observe(10.0, OrderStatus::Routed, 0.0)), metadata("e-2"))
+            .expect_err("observe on existing stream");
+        assert_eq!(err.code, RejectionCode::OrderAlreadyExists);
+        let err = observed(OrderStatus::Routed, 0.0)
+            .decide(OrderCommand::ObserveOrder(t().observe(10.0, OrderStatus::Routed, 0.0)), metadata("e-2"))
+            .expect_err("observe twice");
+        assert_eq!(err.code, RejectionCode::OrderAlreadyExists);
+    }
+
+    #[test]
+    fn observe_with_non_positive_quantity_is_rejected() {
+        let err = OrderAggregate::default()
+            .decide(OrderCommand::ObserveOrder(t().observe(0.0, OrderStatus::Routed, 0.0)), metadata("e-1"))
+            .expect_err("zero qty");
+        assert_eq!(err.code, RejectionCode::InvalidQuantity);
+    }
+
+    #[test]
+    fn fill_after_observed_filled_is_accepted() {
+        let mut agg = observed(OrderStatus::Filled, 10.0);
+        for (i, qty) in [4.0, 6.0].into_iter().enumerate() {
+            let events = agg
+                .decide(
+                    OrderCommand::ReceiveExecutionReport(t().exec_fill(&format!("x{i}"), qty, 100.0, "BINANCE")),
+                    metadata(&format!("e-f{i}")),
+                )
+                .expect("fill on observed-filled order accepted");
+            assert_eq!(events[0].status_after, OrderStatus::Filled);
+            agg.apply(&events[0]).unwrap();
+        }
+        let s = agg.state.as_ref().unwrap();
+        assert_eq!(s.cum_qty, 10.0);
+        assert_eq!(s.leaves_qty, 0.0);
+        assert_eq!(s.status, OrderStatus::Filled);
+        // booked cum reached quantity: now really terminal
+        let err = agg
+            .decide(OrderCommand::ReceiveExecutionReport(t().exec_fill("x9", 1.0, 100.0, "BINANCE")), metadata("e-f9"))
+            .expect_err("terminal once fully booked");
+        assert_eq!(err.code, RejectionCode::InvalidStateTransition);
+    }
+
+    #[test]
+    fn fill_after_observed_canceled_books_and_keeps_canceled() {
+        let agg = observed(OrderStatus::Canceled, 3.0);
+        let events = agg
+            .decide(OrderCommand::ReceiveExecutionReport(t().exec_fill("x1", 3.0, 100.0, "BINANCE")), metadata("e-f"))
+            .expect("late fill on observed-canceled order accepted");
+        assert_eq!(events[0].event_type, OrderEventType::OrderPartiallyFilled);
+        assert_eq!(events[0].status_after, OrderStatus::Canceled);
+        // other commands still refused on the terminal order
+        let err = agg
+            .decide(OrderCommand::CancelOrder(t().cancel(None)), metadata("e-c"))
+            .expect_err("cancel on canceled");
+        assert_eq!(err.code, RejectionCode::InvalidStateTransition);
+    }
+
+    #[test]
+    fn fill_on_observed_partially_filled_completes_to_filled() {
+        let agg = observed(OrderStatus::PartiallyFilled, 4.0);
+        let events = agg
+            .decide(OrderCommand::ReceiveExecutionReport(t().exec_fill("x1", 10.0, 100.0, "BINANCE")), metadata("e-f"))
+            .expect("fill");
+        assert_eq!(events[0].status_after, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn metadata_occurred_at_is_copied_to_events() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00Z").unwrap().with_timezone(&Utc);
+        let mut md = metadata("e-1");
+        md.occurred_at = Some(at);
+        let events = OrderAggregate::default()
+            .decide(OrderCommand::ObserveOrder(t().observe(10.0, OrderStatus::Routed, 0.0)), md.clone())
+            .unwrap();
+        assert_eq!(events[0].occurred_at, Some(at));
+        let mut md2 = md.clone();
+        md2.event_id = "e-2".into();
+        let fills = observed(OrderStatus::Routed, 0.0)
+            .decide(OrderCommand::ReceiveExecutionReport(t().exec_fill("x1", 1.0, 100.0, "BINANCE")), md2)
+            .unwrap();
+        assert_eq!(fills[0].occurred_at, Some(at));
+        let plain = submitted_aggregate()
+            .decide(OrderCommand::CancelOrder(t().cancel(None)), metadata("e-3"))
+            .unwrap();
+        assert_eq!(plain[0].occurred_at, None);
     }
 }

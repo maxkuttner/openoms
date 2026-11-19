@@ -21,6 +21,8 @@ pub struct OrderEventRecord {
     pub causation_id: Option<String>,
     pub schema_version: i32,
     pub created_at: DateTime<Utc>,
+    /// Venue time; None on legacy events and where unknown.
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,7 @@ pub struct NewOrderEvent {
     pub correlation_id: Option<String>,
     pub causation_id: Option<String>,
     pub schema_version: i32,
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +93,8 @@ impl OrderEventStore {
                 correlation_id::text AS correlation_id,
                 causation_id::text AS causation_id,
                 schema_version,
-                created_at
+                created_at,
+                occurred_at
              FROM order_event
              WHERE order_id = $1
              ORDER BY version ASC"
@@ -113,6 +117,7 @@ impl OrderEventStore {
                 causation_id: row.get::<Option<String>, _>("causation_id"),
                 schema_version: row.get::<i32, _>("schema_version"),
                 created_at: row.get::<DateTime<Utc>, _>("created_at"),
+                occurred_at: row.get::<Option<DateTime<Utc>>, _>("occurred_at"),
             });
         }
 
@@ -181,7 +186,8 @@ impl OrderEventStore {
                     payload_json,
                     correlation_id,
                     causation_id,
-                    schema_version
+                    schema_version,
+                    occurred_at
                  ) VALUES (
                     $1,
                     $2,
@@ -191,7 +197,8 @@ impl OrderEventStore {
                     $6,
                     CAST($7 AS uuid),
                     CAST($8 AS uuid),
-                    $9
+                    $9,
+                    $10
                  )
                  RETURNING global_position"
             )
@@ -204,6 +211,7 @@ impl OrderEventStore {
             .bind(&event.correlation_id)
             .bind(&event.causation_id)
             .bind(event.schema_version)
+            .bind(event.occurred_at)
             .fetch_one(&mut **tx)
             .await?;
             global_positions.push(global_position);
@@ -284,6 +292,7 @@ mod tests {
             correlation_id: None,
             causation_id: None,
             schema_version: 0,
+            occurred_at: None,
         }
     }
 
@@ -316,6 +325,7 @@ mod tests {
                     correlation_id: None,
                     causation_id: None,
                     schema_version: 0,
+                    occurred_at: None,
                 }],
             )
             .await
@@ -328,6 +338,43 @@ mod tests {
         assert_eq!(stream[0].version, 1);
         assert_eq!(stream[0].actor, "event-store-test");
         assert_eq!(stream[0].payload["probe"], true);
+    }
+
+    /// An `order_observed` event carries its venue time into
+    /// `order_event.occurred_at`, and it reads back from both the column and the
+    /// payload.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn an_observed_event_persists_occurred_at() {
+        use crate::domain::orders::aggregate::OrderAggregate;
+        use crate::domain::orders::commands::OrderCommand;
+        use crate::domain::orders::events::{OrderDomainEvent, OrderEventType};
+        use crate::domain::orders::fixtures::{metadata, OrderTestData};
+        use crate::domain::orders::state::OrderStatus;
+
+        let store = test_store().await;
+        let order_id = Uuid::new_v4();
+        let at = DateTime::parse_from_rfc3339("2026-11-01T12:00:00.123456Z").unwrap().with_timezone(&Utc);
+        let mut md = metadata(&Uuid::new_v4().to_string());
+        md.occurred_at = Some(at);
+        let t = OrderTestData::new(order_id.to_string());
+        let events = OrderAggregate::default()
+            .decide(OrderCommand::ObserveOrder(t.observe(10.0, OrderStatus::Filled, 10.0)), md)
+            .expect("observe");
+        let new = crate::handlers::domain_event_to_new_event(&events[0]).expect("map");
+        assert_eq!(new.occurred_at, Some(at));
+
+        let r = store.append_events(order_id, 0, &[new]).await.expect("append");
+        let stream = store.load_stream(order_id).await.expect("load stream");
+        crate::kafka_outbox::ack(&store.pool, &r.global_positions).await.expect("clear outbox");
+
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].event_type, "order_observed");
+        assert_eq!(stream[0].occurred_at, Some(at));
+        let back: OrderDomainEvent = serde_json::from_value(stream[0].payload.clone()).expect("decode");
+        assert_eq!(back.event_type, OrderEventType::OrderObserved);
+        assert_eq!(back.occurred_at, Some(at));
+        assert_eq!(back, events[0]);
     }
 
     /// The bus publishes each appended event with its global position, so append

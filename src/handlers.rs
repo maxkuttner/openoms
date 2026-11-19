@@ -452,6 +452,7 @@ pub async fn get_order(
             .map(parse_order_status)
             .transpose()?,
         version: row.get("version"),
+        observed: false,
     };
 
     Ok(Json(order))
@@ -1209,6 +1210,7 @@ pub(crate) fn domain_event_to_new_event(event: &OrderDomainEvent) -> Result<NewO
         correlation_id: None, // need to be defined
         causation_id: None,   // to be provided by the client -> why was command sent
         schema_version: 0,    // indicate the schema version of the payload
+        occurred_at: event.occurred_at,
     })
 }
 

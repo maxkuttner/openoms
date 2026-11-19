@@ -58,7 +58,7 @@ pub fn view(record: &OrderEventRecord) -> OrderEventView {
         event_id: record.event_id.clone(),
         event_type: record.event_type.clone(),
         actor: record.actor.clone(),
-        occurred_at: event.as_ref().map_or(record.created_at, |e| e.timestamp),
+        occurred_at: event.as_ref().map_or(record.created_at, |e| e.occurred_at.unwrap_or(e.timestamp)),
         recorded_at: record.created_at,
         status_after: event.as_ref().map(|e| e.status_after.as_str().to_string()),
         correlation_id: record.correlation_id.clone(),
@@ -131,6 +131,21 @@ pub fn summarize(event: &OrderDomainEvent) -> String {
                 format!("amended {}", changes.join(", "))
             }
         }
+        OrderEventPayload::OrderObserved {
+            instrument_id,
+            side,
+            quantity,
+            venue,
+            external_order_id,
+            observed_status,
+            venue_cum_qty,
+            ..
+        } => format!(
+            "observed {} {quantity} {instrument_id} on {venue} as {external_order_id}: {} \
+             ({venue_cum_qty} filled at venue)",
+            side.as_str(),
+            observed_status.as_str()
+        ),
         OrderEventPayload::OrderFeeCharged { amount, currency, .. } => {
             format!("fee {amount} {currency}")
         }
@@ -289,6 +304,7 @@ mod tests {
             payload,
             version: 1,
             status_after: status,
+            occurred_at: None,
         }
     }
 
@@ -307,6 +323,7 @@ mod tests {
             causation_id: None,
             schema_version: 0,
             created_at: Utc::now(),
+            occurred_at: None,
         }
     }
 
@@ -365,6 +382,7 @@ mod tests {
             causation_id: None,
             schema_version: 99,
             created_at: Utc::now(),
+            occurred_at: None,
         };
 
         let v = view(&record);

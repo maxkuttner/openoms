@@ -19,6 +19,7 @@ pub enum OrderEventType {
     OrderSuspended,
     OrderReleased,
     OrderFeeCharged,
+    OrderObserved,
 }
 
 impl OrderEventType {
@@ -36,6 +37,7 @@ impl OrderEventType {
             Self::OrderSuspended => "order_suspended",
             Self::OrderReleased => "order_released",
             Self::OrderFeeCharged => "order_fee_charged",
+            Self::OrderObserved => "order_observed",
         }
     }
 }
@@ -108,6 +110,23 @@ pub enum OrderEventPayload {
         currency: String,
         effect: FeeEffect,
     },
+    /// Stream opened from the venue's view of an order; books no fills.
+    OrderObserved {
+        client_order_id: String,
+        portfolio_id: String,
+        account_id: String,
+        instrument_id: String,
+        side: OrderSide,
+        order_type: OrderType,
+        time_in_force: TimeInForce,
+        limit_price: Option<f64>,
+        quantity: f64,
+        venue: String,
+        external_order_id: String,
+        observed_status: OrderStatus,
+        venue_cum_qty: f64,
+        venue_created_at: Option<DateTime<Utc>>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -120,4 +139,7 @@ pub struct OrderDomainEvent {
     pub payload: OrderEventPayload,
     pub version: i64,
     pub status_after: OrderStatus,
+    /// When it happened at the venue (trade time for fills); None when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime<Utc>>,
 }

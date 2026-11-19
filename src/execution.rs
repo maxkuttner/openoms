@@ -130,6 +130,7 @@ pub(crate) async fn load_state(
         status,
         resume_to_status,
         version: row.get("version"),
+        observed: false,
     };
     Ok(Some(state))
 }
@@ -166,6 +167,7 @@ async fn apply_once(
         event_id: Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
         actor: actor.to_string(),
+        occurred_at: None,
     };
 
     let cmd = ReceiveExecutionReport {
@@ -245,6 +247,7 @@ async fn apply_once(
                 correlation_id: None,
                 causation_id: None,
                 schema_version: 0,
+                occurred_at: e.occurred_at,
             }
         })
         .collect();

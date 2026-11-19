@@ -216,6 +216,7 @@ async fn book_once(
         order_id: order_id.to_string(),
         timestamp: Utc::now(),
         actor: actor.to_string(),
+        occurred_at: None,
         payload: OrderEventPayload::OrderFeeCharged {
             fee_id: fee.fee_id.clone(),
             execution_id: fee.execution_id.clone(),
@@ -234,6 +235,7 @@ async fn book_once(
         correlation_id: None,
         causation_id: None,
         schema_version: 0,
+        occurred_at: event.occurred_at,
     }];
     let appended = OrderEventStore::new(pool.clone())
         .append_events_in_tx(&mut tx, order_id, version, &new_events)

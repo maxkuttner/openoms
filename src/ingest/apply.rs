@@ -526,7 +526,7 @@ async fn book(
     let mut aggregate = base.map_or_else(OrderAggregate::empty, OrderAggregate::from_state);
     let mut events: Vec<OrderDomainEvent> = Vec::new();
     for command in commands {
-        let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor.clone() };
+        let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor.clone(), occurred_at: None };
         let mut decided = aggregate
             .decide(command, metadata)
             .map_err(|r| IngestError::Other(format!("order {order_id}: {}", r.message)))?;

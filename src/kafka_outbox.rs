@@ -403,6 +403,7 @@ mod tests {
             correlation_id: None,
             causation_id: None,
             schema_version: 0,
+            occurred_at: None,
         }
     }
 

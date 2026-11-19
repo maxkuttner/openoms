@@ -5788,6 +5788,10 @@
             "format": "double",
             "nullable": true
           },
+          "observed": {
+            "type": "boolean",
+            "description": "Opened by `order_observed` (venue-originated): its status is the venue's,\nso fills are still accepted on a terminal status until booked cum\nreaches quantity."
+          },
           "order_id": {
             "type": "string"
           },

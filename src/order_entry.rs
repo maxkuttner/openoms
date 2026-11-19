@@ -178,7 +178,7 @@ async fn record_rejection(
             report: ExecutionReport::Reject { reason: format!("{}: {}", rejection.code, rejection.message), venue: None },
         }),
     ] {
-        let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor_for(auth) };
+        let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor_for(auth), occurred_at: None };
         let decided = aggregate.decide(command, metadata).map_err(map_rejection_to_api_error)?;
         for event in &decided {
             aggregate.apply(event).map_err(|e| internal("apply rejection", format!("{e:?}")))?;
@@ -273,6 +273,7 @@ pub async fn persist_routed(
             status,
             resume_to_status,
             version: row.get::<i64, _>("version"),
+            observed: false,
         };
 
         if current_state.status.is_terminal() {
@@ -301,6 +302,7 @@ pub async fn persist_routed(
             event_id: Uuid::new_v4().to_string(),
             timestamp: Utc::now(),
             actor: actor.to_string(),
+            occurred_at: None,
         };
 
         let attempt_events = applied
@@ -759,6 +761,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         event_id: Uuid::new_v4().into(),
         timestamp: Utc::now(),
         actor: actor_for(&auth),
+        occurred_at: None,
     };
 
     // run through state machine and decide whether can proceed
@@ -1054,6 +1057,7 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
         status,
         resume_to_status,
         version: row.get::<i64, _>("version"),
+        observed: false,
     };
 
     let aggregate = OrderAggregate::from_state(state.clone());
@@ -1061,6 +1065,7 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
         event_id: Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
         actor: actor_for(&auth),
+        occurred_at: None,
     };
 
     // run through state machine and decide whether can proceed
