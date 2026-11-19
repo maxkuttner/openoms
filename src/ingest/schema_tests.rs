@@ -1,4 +1,4 @@
-//! DB tests for the external-orders/execution-recon schema (migration 0066).
+//! DB tests for the external-orders/execution-recon schema (migrations 0066, 0067).
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -324,4 +324,44 @@ async fn legacy_seed_matches_new_exec_ids() {
     for b in [&okx, &tws, &alpaca, &coinbase] {
         assert_eq!(not_before(&pool, b).await, None, "{}", b.connection);
     }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn trade_time_columns_exist_and_default_null() {
+    let pool = fresh_db().await;
+    migrate::ensure_tracking(&pool).await.unwrap();
+    migrate::apply_all(&pool).await.unwrap();
+
+    let b = seed_base(&pool).await;
+    let order = seed_order(&pool, &b, "tt-1").await;
+    sqlx::query(
+        "INSERT INTO oms.order_event (order_id, version, event_id, event_type, payload_json) \
+         VALUES ($1, 1, $2, 'order_filled', '{}'::jsonb)",
+    )
+    .bind(order).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO oms.position (portfolio_id, instrument_id) VALUES ($1, 'BTCUSDT')")
+        .bind(b.portfolio).execute(&pool).await.unwrap();
+
+    let occurred: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT occurred_at FROM oms.order_event WHERE order_id = $1")
+            .bind(order).fetch_one(&pool).await.unwrap();
+    assert_eq!(occurred, None);
+
+    let (last, created, cum): (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+        sqlx::query_as("SELECT last_trade_at, venue_created_at, venue_cum_qty::text FROM oms.order_state WHERE order_id = $1")
+            .bind(order).fetch_one(&pool).await.unwrap();
+    assert_eq!((last, created, cum), (None, None, None));
+
+    let pos: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT last_trade_at FROM oms.position WHERE portfolio_id = $1")
+            .bind(b.portfolio).fetch_one(&pool).await.unwrap();
+    assert_eq!(pos, None);
+
+    let idx: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE schemaname = 'oms' AND tablename = 'order_state' \
+         AND indexdef LIKE '%last_trade_at DESC NULLS LAST%'",
+    )
+    .fetch_one(&pool).await.unwrap();
+    assert_eq!(idx, 1);
 }
