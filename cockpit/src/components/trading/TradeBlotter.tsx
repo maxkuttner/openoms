@@ -13,6 +13,8 @@ import { api, ApiError } from "../../api/client";
 import { useLive } from "../../api/liveUpdates";
 import { numeric } from "./table";
 import { OrderTimeline } from "../OrderTimeline";
+import type { Cell } from "../../tradeTimes";
+import { fmtLocal, placedCell, tradeTimeCell } from "../../tradeTimes";
 import { formatFees } from "../../fees";
 import type { BlotterRow } from "../../api/types";
 import type { GrantedPortfolio } from "../../access";
@@ -34,6 +36,16 @@ type OrderState = { order_id: string; status: string };
 function notifyError(err: unknown) {
   const message = err instanceof ApiError ? `${err.status}: ${err.message}` : String(err);
   toast.error(message);
+}
+
+function TipText({ cell }: { cell: Cell }) {
+  if (!cell.tooltip) return <>{cell.text}</>;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild><span>{cell.text}</span></TooltipTrigger>
+      <TooltipContent>{cell.tooltip}</TooltipContent>
+    </Tooltip>
+  );
 }
 
 export function TradeBlotter({
@@ -129,12 +141,13 @@ export function TradeBlotter({
     }
   }
 
-  // No client-side filtering: what came back IS the answer to the query asked.
+  // No client-side filtering or sorting: the server returns the page already
+  // ordered (trade time desc, nulls last, then booked desc).
   const rows = orders.data ?? [];
   const windowFull = rows.length >= BLOTTER_LIMIT;
 
   const HEAD: [string, boolean][] = [
-    ["Time", false], ["Instrument", false], ["Side", false], ["Type", false], ["Status", false],
+    ["Placed", false], ["Trade time", false], ["Booked", false], ["Updated", false], ["Instrument", false], ["Side", false], ["Type", false], ["Status", false],
     ["Qty", true], ["Cum", true], ["Leaves", true], ["Avg px", true], ["Fees", true], ["", false],
   ];
   const followTone = followedStatus === null || followedStatus === "submitted" ? "muted" : ORDER_STATUS_TONE[followedStatus] ?? "muted";
@@ -212,7 +225,10 @@ export function TradeBlotter({
                     onClick={() => setSelected(o)}
                     className={cn("cursor-pointer", o.order_id === followOrderId && "bg-primary/10")}
                   >
-                    <TableCell className="num">{new Date(o.created_at).toLocaleString()}</TableCell>
+                    <TableCell className="num"><TipText cell={placedCell(o)} /></TableCell>
+                    <TableCell className="num"><TipText cell={tradeTimeCell(o)} /></TableCell>
+                    <TableCell className="num">{fmtLocal(o.booked_at)}</TableCell>
+                    <TableCell className="num">{fmtLocal(o.updated_at)}</TableCell>
                     <TableCell>
                       <div className="flex flex-col items-start">
                         {o.instrument_name ? (
@@ -252,14 +268,14 @@ export function TradeBlotter({
               })}
               {windowFull && (
                 <TableRow>
-                  <TableCell colSpan={11} className="text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={14} className="text-center text-xs text-muted-foreground">
                     Showing the {BLOTTER_LIMIT} most recent orders; older ones are not listed.
                   </TableCell>
                 </TableRow>
               )}
               {rows.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={11} className="py-4 text-center text-muted-foreground">No orders.</TableCell>
+                  <TableCell colSpan={14} className="py-4 text-center text-muted-foreground">No orders.</TableCell>
                 </TableRow>
               )}
             </TableBody>

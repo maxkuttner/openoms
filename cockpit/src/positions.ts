@@ -11,6 +11,8 @@ import type { FeeAmount } from "./fees.ts";
 export interface PositionRow {
   portfolio_id: string;
   instrument_id: string;
+  instrument_symbol: string | null;
+  instrument_name: string | null;
   currency: string;
   net_qty: number;
   avg_cost: number;

@@ -5,7 +5,7 @@
 //! the same advisory lock, so a stream and a pull of the same fill serialize
 //! and the second sees the first's row.
 
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
 use serde_json::json;
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
 use tracing::{debug, info, warn};
@@ -377,8 +377,12 @@ async fn attempt_once(
                 return Ok(Attempt::Done(Decision::Break(kind), None));
             };
             let order_id = Uuid::new_v4();
-            let mut commands = adopt::commands(order_id, *portfolio_id, account, instrument, broker, event);
-            commands.extend(event_commands(order_id, broker, event));
+            // the observed status already says what an order update reports;
+            // a first-seen fill still books
+            let mut commands = vec![adopt::observe(order_id, *portfolio_id, account, instrument, broker, event)];
+            if matches!(event, VenueEvent::Fill(_)) {
+                commands.extend(event_commands(order_id, broker, event));
+            }
             book(&mut tx, &ctx, order_id, None, commands, Some(principal), event).await?.attempt(decision.clone())
         }
         Decision::Apply { order_id } | Decision::Grow { order_id, .. } => {
@@ -399,7 +403,9 @@ async fn attempt_once(
                     return Ok(Attempt::Done(Decision::Break(kind), None));
                 }
                 // a closed order's status is final; only a filled external order may grow
-                (VenueEvent::Order(_), d) if terminal && !(reopenable && matches!(d, Decision::Grow { .. })) => {
+                (VenueEvent::Order(o), d) if terminal && !(reopenable && matches!(d, Decision::Grow { .. })) => {
+                    note_venue_order(&mut tx, order_id, o).await?;
+                    tx.commit().await?;
                     return Ok(Attempt::Done(decision, None));
                 }
                 (_, Decision::Grow { new_qty, .. }) => commands.push(OrderCommand::ReplaceOrder(ReplaceOrder {
@@ -411,6 +417,10 @@ async fn attempt_once(
             }
             commands.extend(event_commands(order_id, broker, event));
             if commands.is_empty() {
+                if let VenueEvent::Order(o) = event {
+                    note_venue_order(&mut tx, order_id, o).await?;
+                    tx.commit().await?;
+                }
                 return Ok(Attempt::Done(decision, None));
             }
             book(&mut tx, &ctx, order_id, Some(state), commands, None, event).await?.attempt(decision.clone())
@@ -429,6 +439,36 @@ fn lookup_external(lookup: &Lookup, order_id: Uuid) -> bool {
         .into_iter()
         .flatten()
         .any(|k| k.order_id == order_id && k.external)
+}
+
+fn is_fill(command: &OrderCommand) -> bool {
+    matches!(
+        command,
+        OrderCommand::ReceiveExecutionReport(ReceiveExecutionReport { report: ExecutionReport::Fill { .. }, .. })
+    )
+}
+
+fn is_fill_event(e: &OrderDomainEvent) -> bool {
+    matches!(e.payload, OrderEventPayload::OrderPartiallyFilled { .. } | OrderEventPayload::OrderFilled { .. })
+}
+
+/// What an order update reports beyond status, kept when it moves nothing
+/// else: the venue's cum (informational) and its create time (set once).
+async fn note_venue_order(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    o: &VenueOrderUpdate,
+) -> Result<(), IngestError> {
+    sqlx::query(
+        "UPDATE order_state SET venue_cum_qty = GREATEST(venue_cum_qty, $2), venue_created_at = COALESCE(venue_created_at, $3) \
+         WHERE order_id = $1",
+    )
+    .bind(order_id)
+    .bind(o.cum_qty)
+    .bind(o.created_at)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 enum BookOutcome {
@@ -514,32 +554,74 @@ async fn book(
     let actor = actor(ctx.connection);
     let expected_version = base.as_ref().map_or(0, |s| s.version);
     let was = base.as_ref().map(|s| s.status);
-    // The venue is truth: what it reports on a closed order (a late fill, a
-    // filled external order growing) still books, so reopen it for the state
-    // machine, which refuses every command on a terminal order.
+    // An observed (external) order keeps its venue status while its fills
+    // land: the aggregate takes them on a terminal status. To grow it reopens
+    // (the state machine refuses a replace on a closed order); its events then
+    // take the venue's closed status back: the update's, else the one it had.
+    let observed = base.as_ref().is_some_and(|s| s.observed);
+    let grows = commands.iter().any(|c| matches!(c, OrderCommand::ReplaceOrder(_)));
+    let reopen = !observed || grows;
+    let venue_closed = match event {
+        VenueEvent::Order(o) => match &o.status {
+            VenueOrderStatus::Filled => Some(OrderStatus::Filled),
+            VenueOrderStatus::Canceled => Some(OrderStatus::Canceled),
+            VenueOrderStatus::Rejected { .. } => Some(OrderStatus::Rejected),
+            VenueOrderStatus::Expired => Some(OrderStatus::Expired),
+            VenueOrderStatus::Working => None,
+        },
+        _ => was.filter(|s| s.is_terminal()),
+    };
+    // only Filled: a canceled/rejected/expired update brings its own closing
+    // command, which a closed status would refuse
+    let keep = venue_closed.filter(|s| observed && grows && *s == OrderStatus::Filled);
+    // The venue is truth: what it reports on a closed OMS order (a late fill)
+    // still books, so reopen it for the state machine, which refuses every
+    // command on a terminal order.
     let base = base.map(|mut s| {
-        if s.status.is_terminal() {
+        if reopen && s.status.is_terminal() {
             s.status = if s.cum_qty > EPS { OrderStatus::PartiallyFilled } else { OrderStatus::Routed };
         }
         s
     });
+    let booked_at = Utc::now();
+    let executed_at = match event {
+        VenueEvent::Fill(f) => f.executed_at,
+        _ => None,
+    };
+    // a fill without a venue execution time trades at its booking time
+    // at the DB's microsecond precision: the key compared is the key stored
+    let trade_time = executed_at.unwrap_or(booked_at).trunc_subsecs(6);
     let mut aggregate = base.map_or_else(OrderAggregate::empty, OrderAggregate::from_state);
     let mut events: Vec<OrderDomainEvent> = Vec::new();
     for command in commands {
-        let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor.clone() };
+        let occurred_at = match event {
+            _ if is_fill(&command) => Some(trade_time),
+            VenueEvent::Order(o) => o.ts,
+            _ => None,
+        };
+        let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: booked_at, actor: actor.clone(), occurred_at };
         let mut decided = aggregate
             .decide(command, metadata)
             .map_err(|r| IngestError::Other(format!("order {order_id}: {}", r.message)))?;
         for e in &mut decided {
-            // a late fill on a canceled/expired/rejected order books, but the
-            // order stays closed, in its events as in order_state
-            if let Some(prev) = was.filter(|s| s.is_terminal() && *s != OrderStatus::Filled) {
+            // a late fill on a canceled/expired/rejected OMS order books, but
+            // the order stays closed, in its events as in order_state
+            if let Some(prev) = was.filter(|s| !observed && s.is_terminal() && *s != OrderStatus::Filled) {
                 e.status_after = prev;
+            }
+            if let Some(status) = keep {
+                e.status_after = status;
             }
             aggregate.apply(e).map_err(|r| IngestError::Other(r.message))?;
         }
         events.extend(decided);
     }
+    let any_fill = events.iter().any(is_fill_event);
+    let last_trade = any_fill.then_some(trade_time);
+    let venue_order = match event {
+        VenueEvent::Order(o) => Some(o),
+        _ => None,
+    };
     let state = aggregate.state.ok_or_else(|| IngestError::Other("no order state".into()))?;
 
     match principal {
@@ -547,16 +629,30 @@ async fn book(
             insert_order_state(tx, order_id, &state, principal, ctx.connection, &Origin::External, &None)
                 .await
                 .map_err(|e| IngestError::Other(e.message))?;
-            sqlx::query("UPDATE order_state SET external_order_id = $2 WHERE order_id = $1")
-                .bind(order_id)
-                .bind(ids(event).0)
-                .execute(&mut **tx)
-                .await?;
+            let (venue_cum, venue_created) = match &events[0].payload {
+                OrderEventPayload::OrderObserved { venue_cum_qty, venue_created_at, .. } => {
+                    (Some(*venue_cum_qty), *venue_created_at)
+                }
+                _ => (None, None),
+            };
+            sqlx::query(
+                "UPDATE order_state SET external_order_id = $2, venue_cum_qty = $3, venue_created_at = $4, \
+                 last_trade_at = $5 WHERE order_id = $1",
+            )
+            .bind(order_id)
+            .bind(ids(event).0)
+            .bind(venue_cum)
+            .bind(venue_created)
+            .bind(last_trade)
+            .execute(&mut **tx)
+            .await?;
         }
         None => {
             let updated = sqlx::query(
                 "UPDATE order_state SET status = $2, original_qty = $3, leaves_qty = $4, cum_qty = $5, avg_px = $6, \
-                 limit_price = $7, version = $8, updated_at = now() WHERE order_id = $1 AND version = $9",
+                 limit_price = $7, version = $8, updated_at = now(), last_trade_at = GREATEST(last_trade_at, $10), \
+                 venue_cum_qty = GREATEST(venue_cum_qty, $11), venue_created_at = COALESCE(venue_created_at, $12) \
+                 WHERE order_id = $1 AND version = $9",
             )
             .bind(order_id)
             .bind(state.status.as_str())
@@ -567,6 +663,9 @@ async fn book(
             .bind(state.limit_price)
             .bind(state.version)
             .bind(expected_version)
+            .bind(last_trade)
+            .bind(venue_order.map(|o| o.cum_qty))
+            .bind(venue_order.and_then(|o| o.created_at))
             .execute(&mut **tx)
             .await?;
             if updated.rows_affected() == 0 {
@@ -595,27 +694,46 @@ async fn book(
         fee = f.fee.as_ref().and_then(|(amount, ccy)| fee_charge(ctx.broker, &f.exec_id, *amount, ccy));
     }
 
-    let portfolio = Uuid::parse_str(&state.portfolio_id).map_err(|e| IngestError::Other(e.to_string()))?;
-    let mut any_fill = false;
-    for e in &events {
-        if let OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-        | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } = &e.payload
-        {
-            any_fill = true;
-            positions::persist_fill(tx, portfolio, &state.instrument_id, state.side, *fill_qty, *fill_price).await?;
-        }
-    }
-    let new_events = events
+    let mut new_events = events
         .iter()
         .map(domain_event_to_new_event)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| IngestError::Other(e.message))?;
+    if executed_at.is_none() {
+        for (new, e) in new_events.iter_mut().zip(&events) {
+            if is_fill_event(e) {
+                new.payload["trade_time_estimated"] = json!(true);
+            }
+        }
+    }
     let store = OrderEventStore::new(ctx.pool.clone());
     let appended = match store.append_events_in_tx(tx, order_id, expected_version, &new_events).await {
         Ok(a) => a,
         Err(EventStoreError::Concurrency(_)) => return Ok(BookOutcome::Retry),
         Err(EventStoreError::Sqlx(e)) => return Err(e.into()),
     };
+    let portfolio = Uuid::parse_str(&state.portfolio_id).map_err(|e| IngestError::Other(e.to_string()))?;
+    for e in &events {
+        if let OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, execution_id, .. }
+        | OrderEventPayload::OrderFilled { fill_qty, fill_price, execution_id, .. } = &e.payload
+        {
+            // after the append: a late fill rebuilds the position from the log
+            if positions::persist_fill(
+                tx,
+                portfolio,
+                &state.instrument_id,
+                state.side,
+                *fill_qty,
+                *fill_price,
+                trade_time,
+                execution_id,
+            )
+            .await?
+            {
+                break;
+            }
+        }
+    }
     info!(%order_id, status = state.status.as_str(), connection = ctx.connection, "ingest: booked");
     Ok(BookOutcome::Booked(Booked {
         order_id,
@@ -704,7 +822,7 @@ pub(crate) fn event_json(event: &VenueEvent) -> serde_json::Value {
             "account_ref": o.account_ref, "symbol": o.symbol, "buy": o.buy, "order_type": o.order_type,
             "qty": o.qty, "limit_px": o.limit_px, "status": status_name(&o.status),
             "reject_reason": match &o.status { VenueOrderStatus::Rejected { reason } => Some(reason.as_str()), _ => None },
-            "cum_qty": o.cum_qty, "ts": o.ts,
+            "cum_qty": o.cum_qty, "ts": o.ts, "created_at": o.created_at,
         }),
         _ => json!({}),
     }
@@ -766,6 +884,7 @@ pub fn event_from_json(v: &serde_json::Value) -> Option<VenueEvent> {
             },
             cum_qty: num("cum_qty")?,
             ts: time("ts"),
+            created_at: time("created_at"),
         })),
         _ => None,
     }

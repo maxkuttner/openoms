@@ -224,7 +224,7 @@ mod tests {
         });
         let mut order = VenueEvent::Order(VenueOrderUpdate {
             venue_order_id: "9".into(), client_order_id: None, account_ref: String::new(), symbol: "BTCUSDT".into(),
-            buy: true, order_type: "LIMIT".into(), qty: 1.0, limit_px: None, status: VenueOrderStatus::Working, cum_qty: 0.0, ts: None,
+            buy: true, order_type: "LIMIT".into(), qty: 1.0, limit_px: None, status: VenueOrderStatus::Working, cum_qty: 0.0, ts: None, created_at: None,
         });
         super::set_account_ref(&mut fill, "sub-1");
         super::set_account_ref(&mut order, "sub-1");

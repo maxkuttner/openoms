@@ -3847,7 +3847,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OrderAggregateState"
+                  "$ref": "#/components/schemas/OrderDetail"
                 }
               }
             }
@@ -4472,6 +4472,10 @@
           "cum_qty",
           "created_at",
           "updated_at",
+          "placed_at",
+          "placed_is_first_seen",
+          "booked_at",
+          "trade_time_estimated",
           "fees"
         ],
         "properties": {
@@ -4484,6 +4488,11 @@
             "format": "double",
             "nullable": true
           },
+          "booked_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the order was booked in the OMS. Never rewritten."
+          },
           "broker_connection_code": {
             "type": "string"
           },
@@ -4492,7 +4501,8 @@
           },
           "created_at": {
             "type": "string",
-            "format": "date-time"
+            "format": "date-time",
+            "description": "Same instant as `booked_at`; kept for existing clients."
           },
           "cum_qty": {
             "type": "number",
@@ -4531,6 +4541,15 @@
             "type": "number",
             "format": "double"
           },
+          "placed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the order was placed: the venue's creation time when known, else the\nbooking time."
+          },
+          "placed_is_first_seen": {
+            "type": "boolean",
+            "description": "True when `placed_at` is only when we first saw the order (an externally\nplaced order whose venue gave no creation time)."
+          },
           "portfolio_code": {
             "type": "string"
           },
@@ -4550,6 +4569,16 @@
           },
           "status": {
             "type": "string"
+          },
+          "trade_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time of the latest booked fill; None until the order has traded.",
+            "nullable": true
+          },
+          "trade_time_estimated": {
+            "type": "boolean",
+            "description": "True when the latest fill's trade time is our booking time, because the\nvenue gave none."
           },
           "updated_at": {
             "type": "string",
@@ -5788,6 +5817,10 @@
             "format": "double",
             "nullable": true
           },
+          "observed": {
+            "type": "boolean",
+            "description": "Venue-originated order (opened by `order_observed`; from a row: derived\nfrom `origin = 'EXTERNAL'`, never persisted separately). Its status is\nthe venue's, so fills are still accepted on a terminal status until\nbooked cum reaches quantity."
+          },
           "order_id": {
             "type": "string"
           },
@@ -5824,6 +5857,29 @@
           }
         }
       },
+      "OrderDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OrderAggregateState"
+          },
+          {
+            "$ref": "#/components/schemas/OrderTimes"
+          },
+          {
+            "type": "object",
+            "required": [
+              "updated_at"
+            ],
+            "properties": {
+              "updated_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        ],
+        "description": "An order's current state plus its time fields."
+      },
       "OrderEventView": {
         "type": "object",
         "description": "One entry in an order's audit trail.\n\n`occurred_at` is when the domain decided the event; `recorded_at` is when the\nstore appended it. They differ for anything that arrives from a broker stream,\nand an auditor wants both.",
@@ -5834,6 +5890,7 @@
           "actor",
           "occurred_at",
           "recorded_at",
+          "booked_at",
           "schema_version",
           "summary",
           "payload"
@@ -5841,6 +5898,11 @@
         "properties": {
           "actor": {
             "type": "string"
+          },
+          "booked_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the event was booked in the store; same instant as `recorded_at`."
           },
           "causation_id": {
             "type": "string",
@@ -5903,6 +5965,41 @@
           "expired",
           "suspended"
         ]
+      },
+      "OrderTimes": {
+        "type": "object",
+        "required": [
+          "placed_at",
+          "placed_is_first_seen",
+          "booked_at",
+          "trade_time_estimated"
+        ],
+        "properties": {
+          "booked_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the order was booked in the OMS. Never rewritten."
+          },
+          "placed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the order was placed: the venue's creation time when known, else the\nbooking time."
+          },
+          "placed_is_first_seen": {
+            "type": "boolean",
+            "description": "True when `placed_at` is only when we first saw the order (an externally\nplaced order whose venue gave no creation time)."
+          },
+          "trade_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time of the latest booked fill; None until the order has traded.",
+            "nullable": true
+          },
+          "trade_time_estimated": {
+            "type": "boolean",
+            "description": "True when the latest fill's trade time is our booking time, because the\nvenue gave none."
+          }
+        }
       },
       "OrderType": {
         "type": "string",
@@ -5978,6 +6075,16 @@
           },
           "instrument_id": {
             "type": "string"
+          },
+          "instrument_name": {
+            "type": "string",
+            "description": "Display name of the instrument; None when the master row is missing.",
+            "nullable": true
+          },
+          "instrument_symbol": {
+            "type": "string",
+            "description": "Ticker of the instrument; None when the master row is missing.",
+            "nullable": true
           },
           "mark": {
             "type": "number",

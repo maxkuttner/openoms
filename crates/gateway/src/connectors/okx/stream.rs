@@ -256,4 +256,27 @@ mod tests {
         let v = serde_json::from_str(include_str!("testdata/ws_tickers.json")).unwrap();
         assert!(venue_events(&v).is_empty());
     }
+
+    #[test]
+    fn okx_order_update_carries_created_and_update_time() {
+        let mut msg = sample("ws_orders_fill");
+        msg["data"][0]["cTime"] = serde_json::json!("1700000001000");
+        msg["data"][0]["uTime"] = serde_json::json!("1700000005000");
+        let VEvent::Order(o) = venue_events(&msg).into_iter().find(|e| matches!(e, VEvent::Order(_))).unwrap() else { unreachable!() };
+        assert_eq!(o.created_at.map(|t| t.timestamp_millis()), Some(1700000001000));
+        assert_eq!(o.ts.map(|t| t.timestamp_millis()), Some(1700000005000));
+    }
+
+    #[test]
+    fn okx_stream_fill_carries_executed_at() {
+        let mut msg = sample("ws_orders_fill");
+        msg["data"][0]["fillTime"] = serde_json::json!("1700000003000");
+        msg["data"][0]["uTime"] = serde_json::json!("1700000005000");
+        let VEvent::Fill(f) = &venue_events(&msg)[0] else { panic!("a fill") };
+        assert_eq!(f.executed_at.map(|t| t.timestamp_millis()), Some(1700000003000));
+        // Without fillTime the update time stands in.
+        msg["data"][0].as_object_mut().unwrap().remove("fillTime");
+        let VEvent::Fill(f) = &venue_events(&msg)[0] else { panic!("a fill") };
+        assert_eq!(f.executed_at.map(|t| t.timestamp_millis()), Some(1700000005000));
+    }
 }

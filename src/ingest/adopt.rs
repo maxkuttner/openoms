@@ -1,57 +1,81 @@
 //! Adopting a venue order the OMS did not place: its instrument (added from
-//! the broker's catalog when missing), its owner, and its submit + route
-//! commands.
+//! the broker's catalog when missing), its owner, and its observe command.
 
 use sqlx::{PgConnection, PgPool};
 use tracing::info;
 use uuid::Uuid;
 
 use gateway::adapter::{BrokerInstrument, InstrumentProvider};
-use gateway::venue_event::{VenueEvent, VenueFill, VenueOrderUpdate};
+use gateway::venue_event::{VenueEvent, VenueFill, VenueOrderStatus};
 
 use super::apply::IngestError;
-use crate::domain::orders::commands::{OrderCommand, RouteOrder, SubmitOrder};
-use crate::domain::orders::state::{OrderSide, OrderType, TimeInForce};
+use crate::domain::orders::commands::{ObserveOrder, OrderCommand};
+use crate::domain::orders::state::{OrderSide, OrderStatus, OrderType, TimeInForce};
 
-/// Submit and route an order the OMS did not place, sized by what the venue
-/// has reported so far: the update's quantity, or the fill's.
-pub(super) fn commands(
+/// Observe an order the OMS did not place, as the venue reports it so far:
+/// an update's status, quantity and cum, or a first-seen fill's (partially
+/// filled, sized by the fill). Fills book only from fill events.
+pub(super) fn observe(
     order_id: Uuid,
     portfolio_id: Uuid,
     account: Uuid,
     instrument: i64,
     venue: &str,
     event: &VenueEvent,
-) -> Vec<OrderCommand> {
-    let (client, venue_order_id, buy, order_type, limit, qty) = match event {
-        VenueEvent::Fill(VenueFill { client_order_id, venue_order_id, buy, price, qty, .. }) => {
-            (client_order_id, venue_order_id, *buy, OrderType::Limit, Some(*price), *qty)
-        }
-        VenueEvent::Order(VenueOrderUpdate { client_order_id, venue_order_id, buy, order_type, limit_px, qty, .. }) => {
-            let ty = if order_type.eq_ignore_ascii_case("market") { OrderType::Market } else { OrderType::Limit };
-            (client_order_id, venue_order_id, *buy, ty, if ty == OrderType::Market { None } else { *limit_px }, *qty)
+) -> OrderCommand {
+    let (client, venue_order_id, buy, order_type, limit, qty, status, venue_cum, created) = match event {
+        VenueEvent::Fill(VenueFill { client_order_id, venue_order_id, buy, price, qty, .. }) => (
+            client_order_id,
+            venue_order_id,
+            *buy,
+            OrderType::Limit,
+            Some(*price),
+            *qty,
+            OrderStatus::PartiallyFilled,
+            *qty,
+            None,
+        ),
+        VenueEvent::Order(o) => {
+            let ty = if o.order_type.eq_ignore_ascii_case("market") { OrderType::Market } else { OrderType::Limit };
+            let status = match &o.status {
+                VenueOrderStatus::Working if o.cum_qty > 0.0 => OrderStatus::PartiallyFilled,
+                VenueOrderStatus::Working => OrderStatus::Routed,
+                VenueOrderStatus::Filled => OrderStatus::Filled,
+                VenueOrderStatus::Canceled => OrderStatus::Canceled,
+                VenueOrderStatus::Rejected { .. } => OrderStatus::Rejected,
+                VenueOrderStatus::Expired => OrderStatus::Expired,
+            };
+            (
+                &o.client_order_id,
+                &o.venue_order_id,
+                o.buy,
+                ty,
+                if ty == OrderType::Market { None } else { o.limit_px },
+                o.qty,
+                status,
+                o.cum_qty.clamp(0.0, o.qty),
+                o.created_at,
+            )
         }
         _ => unreachable!("only orders and fills are adopted"),
     };
-    vec![
-        OrderCommand::SubmitOrder(SubmitOrder {
-            order_id: order_id.to_string(),
-            client_order_id: client.clone().unwrap_or_else(|| venue_order_id.clone()),
-            portfolio_id: portfolio_id.to_string(),
-            account_id: account.to_string(),
-            instrument_id: instrument.to_string(),
-            side: if buy { OrderSide::Buy } else { OrderSide::Sell },
-            order_type,
-            time_in_force: TimeInForce::Gtc,
-            limit_price: limit,
-            quantity: qty,
-        }),
-        OrderCommand::RouteOrder(RouteOrder {
-            order_id: order_id.to_string(),
-            venue: venue.into(),
-            external_order_id: venue_order_id.clone(),
-        }),
-    ]
+    OrderCommand::ObserveOrder(ObserveOrder {
+        order_id: order_id.to_string(),
+        client_order_id: client.clone().unwrap_or_else(|| venue_order_id.clone()),
+        portfolio_id: portfolio_id.to_string(),
+        account_id: account.to_string(),
+        instrument_id: instrument.to_string(),
+        side: if buy { OrderSide::Buy } else { OrderSide::Sell },
+        order_type,
+        time_in_force: TimeInForce::Gtc,
+        limit_price: limit,
+        quantity: qty,
+        venue: venue.into(),
+        external_order_id: venue_order_id.clone(),
+        observed_status: status,
+        venue_cum_qty: venue_cum,
+        venue_created_at: created,
+    })
 }
 
 /// Who an adopted order belongs to: the book's strategy, else someone who may

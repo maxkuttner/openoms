@@ -676,6 +676,7 @@ impl Reconciler {
                 status,
                 cum_qty: st.executed_qty,
                 ts: None,
+                created_at: None,
             };
             match self.ingest(VenueEvent::Order(update)).await {
                 Ok(out) if out.fill_gap => gap.store(true, Ordering::Relaxed),

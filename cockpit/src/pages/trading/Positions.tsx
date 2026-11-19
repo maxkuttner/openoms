@@ -9,6 +9,8 @@ import { numeric } from "../../components/trading/table";
 import { formatFees } from "../../fees";
 import type { Me } from "../../access";
 import type { MarkRow } from "../../components/trading/types";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { positionLabel } from "../../tradeTimes";
 import { totalsByCurrency } from "../../positions";
 import type { PositionRow } from "../../positions";
 
@@ -116,7 +118,19 @@ export function PositionsPage({ me }: { me: Me }) {
             <TableBody>
               {rows.map((p) => (
                 <TableRow key={p.instrument_id}>
-                  <TableCell>{p.instrument_id}</TableCell>
+                  <TableCell>
+                    {(() => {
+                      const l = positionLabel(p);
+                      return l.tooltip ? (
+                        <Tooltip>
+                          <TooltipTrigger asChild><span>{l.text}</span></TooltipTrigger>
+                          <TooltipContent>{l.tooltip}</TooltipContent>
+                        </Tooltip>
+                      ) : (
+                        <span>{l.text}</span>
+                      );
+                    })()}
+                  </TableCell>
                   <TableCell className={numeric}>{p.net_qty}</TableCell>
                   <TableCell className={numeric}>{p.avg_cost}</TableCell>
                   <TableCell className={numeric}>{num(p.mark)}</TableCell>

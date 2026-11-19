@@ -254,4 +254,20 @@ mod tests {
         assert_eq!(m["args"][1], 1700000005000_i64);
         assert_eq!(m["args"][2], a.sign("GET/realtime1700000005000"));
     }
+
+    #[test]
+    fn bybit_order_update_carries_created_and_update_time() {
+        let mut msg = sample("ws_order_filled");
+        msg["data"][0]["createdTime"] = serde_json::json!("1700000001000");
+        msg["data"][0]["updatedTime"] = serde_json::json!("1700000005000");
+        let o = &orders(&msg)[0];
+        assert_eq!(o.created_at.map(|t| t.timestamp_millis()), Some(1700000001000));
+        assert_eq!(o.ts.map(|t| t.timestamp_millis()), Some(1700000005000));
+    }
+
+    #[test]
+    fn bybit_stream_fill_carries_executed_at() {
+        let VEvent::Fill(f) = &venue_events(&sample("ws_execution"))[0] else { panic!("a fill") };
+        assert_eq!(f.executed_at.map(|t| t.timestamp_millis()), Some(1700000000000));
+    }
 }

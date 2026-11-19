@@ -160,15 +160,29 @@ fn sso(subject: &str, email: &str, verified: bool) -> crate::oidc::VerifiedIdent
     }
 }
 
-/// Voluntarily enrol TOTP on `cookie`. Returns the otpauth URI and the rotated cookie.
-async fn enrol_totp(st: &AppState, cookie: &str) -> (String, String) {
+/// Voluntarily enrol TOTP on `cookie`. Returns the otpauth URI, the rotated cookie
+/// and the exact code the confirm consumed.
+async fn enrol_totp(st: &AppState, cookie: &str) -> (String, String, String) {
     let resp = la_api::totp_enroll(State(st.clone()), Extension(la()), hdrs(Some(cookie))).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let uri = json(resp).await["otpauth_uri"].as_str().unwrap().to_string();
+    let confirmed = code(&uri, 0);
     let resp =
-        la_api::totp_confirm(State(st.clone()), Extension(la()), peer(), hdrs(Some(cookie)), Json(CodeBody { code: code(&uri, 0) })).await;
+        la_api::totp_confirm(State(st.clone()), Extension(la()), peer(), hdrs(Some(cookie)), Json(CodeBody { code: confirmed.clone() })).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    (uri, cookie_of(&resp))
+    (uri, cookie_of(&resp), confirmed)
+}
+
+/// The code for the step after the last one `principal` used: always unused and,
+/// right after that step, inside the verifier's +-1 window. Derived from the stored
+/// step, not the clock, so a 30s boundary between calls cannot break it.
+async fn next_code(pool: &PgPool, principal: Uuid, uri: &str) -> String {
+    let last: i64 = sqlx::query_scalar("SELECT totp_last_step FROM local_credential WHERE principal_id = $1")
+        .bind(principal)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    totp_rs::Totp::from_url(uri).unwrap().generate(((last + 1) * 30) as u64).to_string()
 }
 
 fn code(uri: &str, offset: i64) -> String {
@@ -454,7 +468,7 @@ async fn mfa_required_config_restores_strict_mode() {
     assert_eq!(next, "totp_enroll");
     assert_eq!(session_mfa(st.pool(), &cookie).await, Some(false));
     assert!(!passes_mfa_gate(&st, &cookie).await);
-    let (_, cookie) = enrol_totp(&st, &cookie).await;
+    let (_, cookie, _) = enrol_totp(&st, &cookie).await;
     assert_eq!(session_mfa(st.pool(), &cookie).await, Some(true));
     assert!(passes_mfa_gate(&st, &cookie).await);
 }
@@ -464,8 +478,8 @@ async fn mfa_required_config_restores_strict_mode() {
 async fn enrolled_totp_still_required_at_login_when_optional() {
     let st = state(migrated_db().await, false);
     let e = email();
-    let (_, cookie, _) = enrolled_trader(&st, &e).await;
-    let (uri, _) = enrol_totp(&st, &cookie).await;
+    let (id, cookie, _) = enrolled_trader(&st, &e).await;
+    let (uri, _, _) = enrol_totp(&st, &cookie).await;
 
     let resp = login(&st, &e, PASSWORD).await;
     let cookie = cookie_of(&resp);
@@ -473,7 +487,7 @@ async fn enrolled_totp_still_required_at_login_when_optional() {
     assert_eq!(session_mfa(st.pool(), &cookie).await, Some(false));
     assert!(!passes_mfa_gate(&st, &cookie).await);
 
-    let resp = la_api::totp(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: code(&uri, 30) })).await;
+    let resp = la_api::totp(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: next_code(st.pool(), id, &uri).await })).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(passes_mfa_gate(&st, &cookie_of(&resp)).await);
 }
@@ -485,7 +499,7 @@ async fn totp_disable_needs_valid_code() {
     let st = state(pool.clone(), false);
     let e = email();
     let (id, cookie, _) = enrolled_trader(&st, &e).await;
-    let (uri, cookie) = enrol_totp(&st, &cookie).await;
+    let (uri, cookie, _) = enrol_totp(&st, &cookie).await;
     let disable = |st: &AppState, cookie: &str, code: String| {
         la_api::totp_disable(State(st.clone()), Extension(la()), peer(), hdrs(Some(cookie)), Json(CodeBody { code }))
     };
@@ -501,9 +515,9 @@ async fn totp_disable_needs_valid_code() {
 
     // Strict mode refuses to drop the second factor at all.
     let strict = state(pool.clone(), true);
-    assert_eq!(disable(&strict, &cookie, code(&uri, 30)).await.status(), StatusCode::CONFLICT);
+    assert_eq!(disable(&strict, &cookie, next_code(st.pool(), id, &uri).await).await.status(), StatusCode::CONFLICT);
 
-    let resp = disable(&st, &cookie, code(&uri, 30)).await;
+    let resp = disable(&st, &cookie, next_code(st.pool(), id, &uri).await).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     let (secret, enrolled, codes): (bool, bool, i64) = sqlx::query_as(
         "SELECT totp_secret_enc IS NOT NULL, totp_enrolled_at IS NOT NULL, \
@@ -675,14 +689,13 @@ async fn totp_disable_consumes_the_code_and_announces_it() {
     let pool = migrated_db().await;
     let st = state(pool.clone(), false);
     let e = email();
-    let (_, cookie, _) = enrolled_trader(&st, &e).await;
-    let (uri, cookie) = enrol_totp(&st, &cookie).await;
-    let used = code(&uri, 0);
+    let (id, cookie, _) = enrolled_trader(&st, &e).await;
+    let (uri, cookie, used) = enrol_totp(&st, &cookie).await;
     // The confirm consumed this step already: replaying it must fail.
     let resp = la_api::totp_disable(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: used })).await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a consumed code cannot disable TOTP");
     let mut auth = st.event_bus().subscribe_auth();
-    let resp = la_api::totp_disable(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: code(&uri, 30) })).await;
+    let resp = la_api::totp_disable(State(st.clone()), Extension(la()), peer(), hdrs(Some(&cookie)), Json(CodeBody { code: next_code(&pool, id, &uri).await })).await;
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     assert!(auth.try_recv().is_ok(), "AuthChanged published");
 }

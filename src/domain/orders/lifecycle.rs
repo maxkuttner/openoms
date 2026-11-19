@@ -12,6 +12,7 @@ pub enum CommandKind {
     ReleaseOrder,
     ReceiveExecutionReport,
     ExpireOrder,
+    ObserveOrder,
 }
 
 impl CommandKind {
@@ -25,6 +26,7 @@ impl CommandKind {
             Self::ReleaseOrder => "release_order",
             Self::ReceiveExecutionReport => "receive_execution_report",
             Self::ExpireOrder => "expire_order",
+            Self::ObserveOrder => "observe_order",
         }
     }
 }
@@ -40,6 +42,7 @@ impl OrderCommand {
             OrderCommand::ReleaseOrder(_) => CommandKind::ReleaseOrder,
             OrderCommand::ReceiveExecutionReport(_) => CommandKind::ReceiveExecutionReport,
             OrderCommand::ExpireOrder(_) => CommandKind::ExpireOrder,
+            OrderCommand::ObserveOrder(_) => CommandKind::ObserveOrder,
         }
     }
 }
@@ -81,7 +84,7 @@ pub fn ensure_command_allowed(
     kind: CommandKind,
 ) -> Result<(), CommandRejection> {
     match (current_status, kind) {
-        (None, CommandKind::SubmitOrder) => Ok(()),
+        (None, CommandKind::SubmitOrder | CommandKind::ObserveOrder) => Ok(()),
         (None, _) => Err(CommandRejection::new(
             RejectionCode::OrderNotFound,
             "order stream does not exist",
@@ -90,6 +93,10 @@ pub fn ensure_command_allowed(
         (Some(_), CommandKind::SubmitOrder) => Err(CommandRejection::new(
             RejectionCode::OrderAlreadyExists,
             "submit is not allowed for an existing order stream",
+        )),
+        (Some(_), CommandKind::ObserveOrder) => Err(CommandRejection::new(
+            RejectionCode::OrderAlreadyExists,
+            "observe is not allowed for an existing order stream",
         )),
 
         (Some(status), kind) if status.is_terminal() => Err(CommandRejection::new(

@@ -200,6 +200,7 @@ pub(crate) fn venue_events(data: &serde_json::Value) -> Vec<VEvent> {
         status,
         cum_qty: num(&order["filled_qty"]).unwrap_or(0.0),
         ts,
+        created_at: time(&order["created_at"]),
     }));
     out
 }
@@ -265,5 +266,20 @@ mod tests {
         assert_eq!(s.exec_id, p.fills[0].exec_id);
         assert_eq!(s.exec_id, "ord-1:10");
         assert_eq!(super::super::fill_exec_id("o", 10.0), super::super::fill_exec_id("o", "10.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn alpaca_order_update_carries_created_and_update_time() {
+        let mut data = update("new", "new", "0");
+        data["order"]["created_at"] = serde_json::json!("2026-11-18T14:29:59.500Z");
+        let VEvent::Order(o) = &venue_events(&data)[0] else { panic!("an order") };
+        assert_eq!(o.created_at, Some("2026-11-18T14:29:59.500Z".parse().unwrap()));
+        assert_eq!(o.ts, Some("2026-11-18T14:30:00.123456Z".parse().unwrap()));
+    }
+
+    #[test]
+    fn alpaca_stream_fill_carries_executed_at() {
+        let VEvent::Fill(f) = &venue_events(&update("fill", "filled", "5"))[0] else { panic!("a fill") };
+        assert_eq!(f.executed_at, Some("2026-11-18T14:30:00.123456Z".parse().unwrap()));
     }
 }

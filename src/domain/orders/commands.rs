@@ -1,6 +1,7 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::state::{OrderSide, OrderType, TimeInForce};
+use super::state::{OrderSide, OrderStatus, OrderType, TimeInForce};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct SubmitOrder {
@@ -83,6 +84,30 @@ pub struct RouteOrder {
     pub external_order_id: String,
 }
 
+/// An order the OMS first learns about from the venue (placed outside the OMS,
+/// or found by recon). Opens the stream in the venue's status; books no fills:
+/// `venue_cum_qty` is informational and the booked cum starts at 0.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObserveOrder {
+    pub order_id: String,
+    pub client_order_id: String,
+    pub portfolio_id: String,
+    pub account_id: String,
+    pub instrument_id: String,
+    pub side: OrderSide,
+    pub order_type: OrderType,
+    pub time_in_force: TimeInForce,
+    pub limit_price: Option<f64>,
+    pub quantity: f64,
+    pub venue: String,
+    pub external_order_id: String,
+    /// Routed (working) | PartiallyFilled | Filled | Canceled | Expired | Rejected
+    /// — a venue "working"/"new" order is observed as `Routed`.
+    pub observed_status: OrderStatus,
+    pub venue_cum_qty: f64,
+    pub venue_created_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum OrderCommand {
@@ -94,4 +119,5 @@ pub enum OrderCommand {
     ReleaseOrder(ReleaseOrder),
     ReceiveExecutionReport(ReceiveExecutionReport),
     ExpireOrder(ExpireOrder),
+    ObserveOrder(ObserveOrder),
 }

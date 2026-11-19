@@ -44,7 +44,10 @@ pub struct VenueOrderUpdate {
     pub limit_px: Option<f64>,
     pub status: VenueOrderStatus,
     pub cum_qty: f64,
+    /// Venue update time.
     pub ts: Option<DateTime<Utc>>,
+    /// When the venue created the order, where its API says.
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

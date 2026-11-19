@@ -362,6 +362,7 @@ pub(crate) fn venue_events(event: &serde_json::Value) -> Vec<VEvent> {
         status,
         cum_qty: num("z").unwrap_or(0.0),
         ts: ts("E").or_else(|| ts("T")),
+        created_at: ts("O"),
     }));
     out
 }
@@ -441,5 +442,28 @@ mod tests {
         let exp = serde_json::json!({ "e": "executionReport", "x": "EXPIRED", "X": "EXPIRED", "c": "a", "s": "BTCUSDT", "S": "BUY", "i": 1, "q": "1", "z": "0", "o": "MARKET" });
         let VEvent::Order(o) = &venue_events(&exp)[0] else { panic!() };
         assert_eq!((o.status.clone(), o.limit_px), (VenueOrderStatus::Expired, None));
+    }
+
+    #[test]
+    fn binance_order_update_carries_created_and_update_time() {
+        let event = serde_json::json!({
+            "e": "executionReport", "x": "NEW", "X": "NEW", "c": "mm1-q-000001", "s": "BTCUSDT", "S": "BUY",
+            "o": "LIMIT", "i": 9001, "q": "1.0", "p": "64000.5", "z": "0",
+            "E": 1700000005000i64, "O": 1700000001000i64, "T": 1700000002000i64,
+        });
+        let VEvent::Order(o) = &venue_events(&event)[0] else { panic!("an order update") };
+        assert_eq!(o.created_at, Some(Utc.timestamp_millis_opt(1700000001000).unwrap()));
+        assert_eq!(o.ts, Some(Utc.timestamp_millis_opt(1700000005000).unwrap()));
+    }
+
+    #[test]
+    fn binance_stream_fill_carries_executed_at() {
+        let event = serde_json::json!({
+            "e": "executionReport", "x": "TRADE", "X": "FILLED", "c": "x", "s": "BTCUSDT", "S": "SELL",
+            "o": "LIMIT", "i": 1, "q": "1", "p": "1", "z": "1", "l": "1", "L": "1", "t": 5,
+            "E": 1700000009000i64, "T": 1700000003000i64, "O": 1700000001000i64,
+        });
+        let VEvent::Fill(f) = &venue_events(&event)[0] else { panic!("a fill") };
+        assert_eq!(f.executed_at, Some(Utc.timestamp_millis_opt(1700000003000).unwrap()));
     }
 }

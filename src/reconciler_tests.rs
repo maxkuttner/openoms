@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Semaphore};
 use uuid::Uuid;
 
 use super::{spawn, spawn_with, ReconcilerHandle};
-use crate::ingest::apply::tests::{world, World, CONN};
+use crate::ingest::apply::tests::{world, World};
 
 #[derive(Default)]
 struct FakeSource {
@@ -137,17 +137,17 @@ fn page(execs: &[&str], next: &str, more: bool) -> PullPage {
 
 fn start(w: &World, source: Arc<FakeSource>, engine: EngineHandle) -> (ReconcilerHandle, mpsc::Sender<VenueEvent>) {
     let (tx, rx) = mpsc::channel(16);
-    (spawn(CONN.into(), source, rx, engine, w.pool.clone()), tx)
+    (spawn(w.conn.clone(), source, rx, engine, w.pool.clone()), tx)
 }
 
 async fn set_cursor(w: &World, cursor: &str) {
     sqlx::query("INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor) VALUES ($1, $2, '', $3)")
-        .bind(CONN).bind(w.account).bind(cursor).execute(&w.pool).await.unwrap();
+        .bind(&w.conn).bind(w.account).bind(cursor).execute(&w.pool).await.unwrap();
 }
 
 async fn cursor(w: &World) -> Option<String> {
     sqlx::query_scalar("SELECT cursor FROM recon_cursor WHERE broker_connection_code = $1 AND account_id = $2")
-        .bind(CONN).bind(w.account).fetch_optional(&w.pool).await.unwrap()
+        .bind(&w.conn).bind(w.account).fetch_optional(&w.pool).await.unwrap()
 }
 
 async fn eventually(mut check: impl FnMut() -> bool) {
@@ -251,11 +251,11 @@ async fn working_order_missing_from_snapshot_is_resolved() {
          leaves_qty, cum_qty, status, version, origin, external_order_id) \
          VALUES ($1, 'mine', $2, $3, $4, $5, $6, 'buy', 'limit', 'gtc', 100, 5, 5, 0, 'routed', 0, 'API', 'v-oms')",
     )
-    .bind(order_id).bind(principal).bind(w.portfolio).bind(w.account).bind(CONN).bind(w.instrument.to_string())
+    .bind(order_id).bind(principal).bind(w.portfolio).bind(w.account).bind(&w.conn).bind(w.instrument.to_string())
     .execute(&w.pool).await.unwrap();
     let (engine, seen) = fake_engine(ok);
     let (_tx, rx) = mpsc::channel(16);
-    let h = spawn_with(CONN.into(), Arc::new(FakeSource::default()), rx, engine, w.pool.clone(), Some(Arc::new(ClosedAtVenue)), None, super::Accounts::Unfollowed);
+    let h = spawn_with(w.conn.clone(), Arc::new(FakeSource::default()), rx, engine, w.pool.clone(), Some(Arc::new(ClosedAtVenue)), None, super::Accounts::Unfollowed);
     h.pull_now();
     eventually(|| seen.lock().unwrap().iter().any(|e| matches!(e, VenueEvent::Order(_)))).await;
     let events = seen.lock().unwrap().clone();
@@ -374,7 +374,7 @@ async fn eod_sweep_registry_does_not_keep_a_reconciler_alive() {
     let w = world().await;
     let (engine, _) = fake_engine(ok);
     let (_tx, rx) = mpsc::channel(1);
-    // Its own connection name: the shared CONN is respawned by parallel tests.
+    // Its own connection name: not the world's, to show the registry by name.
     let h = spawn("registry-test".into(), Arc::new(FakeSource::default()), rx, engine, w.pool.clone());
     assert!(super::live("registry-test").is_some());
     drop(h);
@@ -410,7 +410,7 @@ async fn per_symbol_scopes_add_the_accounts_order_symbols() {
          leaves_qty, cum_qty, status, version, origin) \
          VALUES ($1, 'mine', $2, $3, $4, $5, $6, 'buy', 'limit', 'gtc', 100, 5, 0, 5, 'filled', 0, 'API')",
     )
-    .bind(Uuid::new_v4()).bind(principal).bind(w.portfolio).bind(w.account).bind(CONN).bind(w.instrument.to_string())
+    .bind(Uuid::new_v4()).bind(principal).bind(w.portfolio).bind(w.account).bind(&w.conn).bind(w.instrument.to_string())
     .execute(&w.pool).await.unwrap();
     let source = Arc::new(FakeSource { venue_symbols: Some(vec!["ETHUSDT".into()]), ..Default::default() });
     let (engine, _seen) = fake_engine(ok);
@@ -429,7 +429,7 @@ async fn per_symbol_scopes_add_the_accounts_order_symbols() {
     assert_eq!(scopes().await, ["BTCUSDT", "ETHUSDT"]);
 }
 
-/// A sub-account on `CONN` that a co-located strategy follows with its own key.
+/// A sub-account on the world's connection that a co-located strategy follows with its own key.
 async fn followed_subaccount(w: &World) -> Uuid {
     let code = crate::strategies::test_support::seed_strategy(&w.pool).await;
     let sub = Uuid::new_v4();
@@ -437,7 +437,7 @@ async fn followed_subaccount(w: &World) -> Uuid {
         "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) \
          VALUES ($1, 'SUB', $2, 'sub', 'ACTIVE')",
     )
-    .bind(sub).bind(CONN).execute(&w.pool).await.unwrap();
+    .bind(sub).bind(&w.conn).execute(&w.pool).await.unwrap();
     sqlx::query(
         "UPDATE strategy SET mode = 'COLOCATED', follow_environment = 'PAPER', follow_credentials = '\\x00'::bytea WHERE code = $1",
     )
@@ -447,10 +447,10 @@ async fn followed_subaccount(w: &World) -> Uuid {
     sub
 }
 
-/// The accounts with a recon cursor on `CONN`, main account last.
+/// The accounts with a recon cursor on the world's connection, main account last.
 async fn cursor_accounts(w: &World) -> Vec<Uuid> {
     sqlx::query_scalar("SELECT account_id FROM recon_cursor WHERE broker_connection_code = $1 ORDER BY account_id = $2")
-        .bind(CONN).bind(w.account).fetch_all(&w.pool).await.unwrap()
+        .bind(&w.conn).bind(w.account).fetch_all(&w.pool).await.unwrap()
 }
 
 /// The connection's key cannot see a followed sub-account's trades, and its
@@ -474,7 +474,7 @@ async fn main_reconciler_skips_followed_accounts() {
 
     // The follow's reconciler covers the sub-account alone.
     let (_ftx, frx) = mpsc::channel(16);
-    let follow = spawn_with(CONN.into(), Arc::new(FakeSource::default()), frx, engine, w.pool.clone(), None, None, super::Accounts::Only(sub));
+    let follow = spawn_with(w.conn.clone(), Arc::new(FakeSource::default()), frx, engine, w.pool.clone(), None, None, super::Accounts::Only(sub));
     follow.pull_now();
     for _ in 0..500 {
         if cursor_accounts(&w).await.len() == 2 {
@@ -483,10 +483,10 @@ async fn main_reconciler_skips_followed_accounts() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(cursor_accounts(&w).await, [sub, w.account]);
-    // Other tests share `CONN` in the live registry; the follow is there by its own key.
-    assert!(super::live(&super::Accounts::Only(sub).key(CONN)).is_some());
+    // The main reconciler shares the code; the follow is there by its own key.
+    assert!(super::live(&super::Accounts::Only(sub).key(&w.conn)).is_some());
     assert!(
-        super::live_all(CONN).iter().any(|h| Arc::ptr_eq(&h.inner, &follow.inner)),
+        super::live_all(&w.conn).iter().any(|h| Arc::ptr_eq(&h.inner, &follow.inner)),
         "the EOD sweep finds the follow's reconciler under its connection"
     );
     drop((main, follow));
@@ -503,7 +503,7 @@ async fn binance_main_stream_fills_resolve_to_main_account_with_followed_subacco
     let mut unlabelled = fill("e-main");
     unlabelled.account_ref = String::new();
 
-    let refused = crate::ingest::apply::ingest(&w.pool, &w.bus, CONN, VenueEvent::Fill(unlabelled.clone()), None).await;
+    let refused = crate::ingest::apply::ingest(&w.pool, &w.bus, &w.conn, VenueEvent::Fill(unlabelled.clone()), None).await;
     assert!(
         matches!(refused, Err(crate::ingest::apply::IngestError::UnknownAccount { .. })),
         "two accounts on the connection: ingest does not pick one"
@@ -544,7 +544,7 @@ async fn sweep_discovers_symbol_from_nonzero_balance() {
 async fn held_assets_failure_keeps_existing_scopes_and_retries_discovery() {
     let w = world().await;
     sqlx::query("INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor) VALUES ($1, $2, 'ETHUSDT', 'c0'), ($1, $2, 'BTCUSDT', 'c0')")
-        .bind(CONN).bind(w.account).execute(&w.pool).await.unwrap();
+        .bind(&w.conn).bind(w.account).execute(&w.pool).await.unwrap();
     let source = Arc::new(FakeSource {
         venue_symbols: Some(vec!["ETHUSDT".into()]),
         held: vec!["BTC".into()],
@@ -579,7 +579,7 @@ async fn reconnect_discovered_symbol_pulls_since_account_watermark() {
     let w = world().await;
     let stamp = Utc::now() - chrono::Duration::hours(3);
     sqlx::query("INSERT INTO recon_cursor (broker_connection_code, account_id, scope, cursor, updated_at) VALUES ($1, $2, 'ETHUSDT', 'c0', $3)")
-        .bind(CONN).bind(w.account).bind(stamp).execute(&w.pool).await.unwrap();
+        .bind(&w.conn).bind(w.account).bind(stamp).execute(&w.pool).await.unwrap();
     let source = Arc::new(FakeSource {
         venue_symbols: Some(vec!["ETHUSDT".into()]),
         held: vec!["BTC".into()],
@@ -597,7 +597,7 @@ async fn reconnect_discovered_symbol_pulls_since_account_watermark() {
         (stamp - super::SINCE_MARGIN).timestamp_micros()
     );
     let saved: DateTime<Utc> = sqlx::query_scalar("SELECT updated_at FROM recon_cursor WHERE broker_connection_code = $1 AND account_id = $2 AND scope = 'BTCUSDT'")
-        .bind(CONN).bind(w.account).fetch_one(&w.pool).await.unwrap();
+        .bind(&w.conn).bind(w.account).fetch_one(&w.pool).await.unwrap();
     assert_eq!(saved.timestamp_micros(), stamp.timestamp_micros());
 }
 
@@ -609,7 +609,7 @@ async fn watermark_blocks_pre_upgrade_refetch() {
     let w = world().await;
     let upgrade = Utc::now() - chrono::Duration::hours(1);
     sqlx::query("UPDATE broker_connection SET recon_not_before = $2 WHERE code = $1")
-        .bind(CONN).bind(upgrade).execute(&w.pool).await.unwrap();
+        .bind(&w.conn).bind(upgrade).execute(&w.pool).await.unwrap();
     let at = |f: VenueFill, t: DateTime<Utc>| VenueFill { executed_at: Some(t), ..f };
     let fills = || vec![at(fill("old"), upgrade - chrono::Duration::minutes(5)), at(fill("new"), upgrade + chrono::Duration::minutes(5))];
     set_cursor(&w, "c0").await;
@@ -659,7 +659,7 @@ async fn persistently_failing_fill_becomes_ingest_error_break_and_scope_advances
     let (kind, events): (String, serde_json::Value) = sqlx::query_as(
         "SELECT kind, events_json FROM recon_break WHERE broker_connection_code = $1 AND account_id = $2 AND venue_order_id = 'v1' AND status = 'open'",
     )
-    .bind(CONN).bind(w.account).fetch_one(&w.pool).await.unwrap();
+    .bind(&w.conn).bind(w.account).fetch_one(&w.pool).await.unwrap();
     assert_eq!(kind, "ingest_error");
     assert_eq!((events[0]["exec_id"].as_str(), events[0]["error"].as_str()), (Some("bad"), Some("poisoned")));
 }

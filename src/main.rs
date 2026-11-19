@@ -201,7 +201,7 @@ mod first_run_tests;
         local_auth_api::methods,
     ),
     components(schemas(
-        SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
+        SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState, handlers::OrderDetail, handlers::OrderTimes,
         crate::domain::orders::state::OrderStatus,
         crate::positions::Position,
         handlers::VenueOption,
@@ -1403,6 +1403,21 @@ async fn serve() {
     // held by `AppState` so a reload hands restarted streams the same one.
     let event_bus = event_bus::EventBus::new();
 
+    // Rebuild an empty position projection from the event log before anything
+    // that can book a fill starts: the order engine, colo ingest, the FIX
+    // acceptor, exec streams and reconcilers all start below. Migration 0067
+    // empties it so every row carries its trade-time key. No-op on a fresh install.
+    match positions::rebuild_if_empty(&pool).await {
+        Ok(Some(n)) => info!(positions = n, "rebuilt position projection from event log"),
+        Ok(None) => {}
+        // Refuse to start: booking into an empty projection would leave positions
+        // without trade-time keys, and no later boot would rebuild a non-empty table.
+        Err(e) => {
+            error!(error = ?e, "failed to rebuild position projection; refusing to start");
+            std::process::exit(1);
+        }
+    }
+
     // The order engine: the only place that books. Connectors send it execution
     // events instead of writing to the database (see `order_engine.rs`). Started
     // before any connector, though its channel would buffer either way.
@@ -1551,20 +1566,6 @@ async fn serve() {
     strategies::control::boot_recovery(&state).await;
     if let Err(e) = state.fix_sessions().start(&state, file_cfg.and_then(|f| f.fix_acceptor())) {
         error!(error = %e, "FIX acceptor did not start; strategies cannot log on over FIX");
-    }
-
-    // One-time backfill: if the position projection is empty, rebuild it from the
-    // event log so existing fills are reflected. No-op on a fresh install.
-    match sqlx::query_scalar::<_, i64>("SELECT count(*) FROM position")
-        .fetch_one(state.pool())
-        .await
-    {
-        Ok(0) => match positions::rebuild_positions(state.pool()).await {
-            Ok(n) => info!(positions = n, "rebuilt position projection from event log"),
-            Err(e) => error!(error = ?e, "failed to rebuild position projection"),
-        },
-        Ok(_) => {}
-        Err(e) => error!(error = ?e, "failed to check position projection"),
     }
 
     // (stream_health, event_bus and the market data gateway were created

@@ -47,6 +47,44 @@ Fills are de-duplicated, so overlapping windows never book a fill twice.
 | Coinbase | No cap |
 | Binance | Per symbol. Pairs are discovered from open orders, orders booked in the OMS, and non-zero balances |
 
+## Observed orders
+
+An order the OMS did not place starts as **Observed at venue**. It has no
+submitted or routed step, because the OMS never sent it. Observing an order
+books no fills; the fills follow, and the order is not closed until the booked
+quantity reaches the order quantity. An observed order that the venue reports as
+Filled can therefore briefly show less booked than filled.
+
+## Order times
+
+Every order shows four times.
+
+- **Placed.** For an order the OMS placed, when it was submitted. For an external
+  order, the venue's create time where the venue gives one, otherwise the time
+  the OMS first saw it.
+- **Trade time.** The venue's execution time of the last fill. A `~` in front
+  means it is estimated: the venue sent no execution time, so the booking time
+  is used.
+- **Booked.** When the OMS recorded the order or fill.
+- **Updated.** The last change to the order.
+
+Each fill and history row shows both its venue time and its booking time.
+
+Venues that report a create time: Binance, Alpaca, Bybit, OKX and Coinbase. IBKR
+(TWS and FIX) do not, so Placed shows when the order was first seen.
+
+Orders from before trade times were added keep their old history, and their
+trade time is the booking time. Legacy external orders keep their old
+submitted and routed history.
+
+## Positions follow trade time
+
+Positions and realized P&L are ordered by trade time, not by when a fill was
+booked. A fill that arrives late is placed where it traded, and the position is
+recalculated from that point. Fills with the same trade time are ordered by fill
+id, and a fee always follows its fill. Co-located transfers are included in the
+recalculation.
+
 ## Breaks
 
 A break is something the OMS saw at the venue but could not book on its own,

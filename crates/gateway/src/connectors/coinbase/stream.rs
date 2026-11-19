@@ -219,4 +219,12 @@ mod tests {
         let v = serde_json::from_str(include_str!("testdata/ws_ticker.json")).unwrap();
         assert!(venue_events(&v).is_empty());
     }
+
+    #[test]
+    fn coinbase_order_update_carries_created_time() {
+        let mut msg = sample("partial");
+        msg["events"][0]["orders"][0]["creation_time"] = serde_json::json!("2026-11-03T12:00:00.250Z");
+        let o = &orders(&msg)[0];
+        assert_eq!(o.created_at, Some("2026-11-03T12:00:00.250Z".parse().unwrap()));
+    }
 }

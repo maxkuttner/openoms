@@ -382,12 +382,22 @@ pub async fn orders_cancel(
 }
 
 
+/// An order's current state plus its time fields.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct OrderDetail {
+    #[serde(flatten)]
+    pub state: OrderAggregateState,
+    #[serde(flatten)]
+    pub times: OrderTimes,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Get an order's current state
 #[utoipa::path(
     get, path = "/orders/{id}", tag = "orders",
     params(("id" = Uuid, Path, description = "Order ID")),
     responses(
-        (status = 200, description = "OK", body = OrderAggregateState),
+        (status = 200, description = "OK", body = OrderDetail),
         (status = 400, description = "Invalid UUID"),
         (status = 404, description = "Order not found"),
     ),
@@ -397,31 +407,36 @@ pub async fn get_order(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Path(order_id_str): Path<String>,
-) -> Result<Json<OrderAggregateState>, ApiError> {
+) -> Result<Json<OrderDetail>, ApiError> {
     let order_id = Uuid::parse_str(&order_id_str).map_err(|_| ApiError {
         status: StatusCode::BAD_REQUEST,
         message: "id must be a UUID".to_string(),
     })?;
 
     require_order_grant(state.pool(), auth.principal_id, order_id, OrderAccess::View).await?;
+    load_order_detail(state.pool(), order_id).await.map(Json)
+}
 
-    let row = sqlx::query(
+async fn load_order_detail(pool: &PgPool, order_id: Uuid) -> Result<OrderDetail, ApiError> {
+    let row = sqlx::query(&format!(
         r#"
         SELECT
-            order_id, client_order_id, portfolio_id, account_id, instrument_id,
-            side, order_type, time_in_force,
-            limit_price::double precision AS limit_price,
-            original_qty::double precision AS original_qty,
-            leaves_qty::double precision AS leaves_qty,
-            cum_qty::double precision AS cum_qty,
-            avg_px::double precision AS avg_px,
-            status, resume_to_status, version
-        FROM order_state
-        WHERE order_id = $1
+            os.order_id, os.client_order_id, os.portfolio_id, os.account_id, os.instrument_id,
+            os.side, os.order_type, os.time_in_force,
+            os.limit_price::double precision AS limit_price,
+            os.original_qty::double precision AS original_qty,
+            os.leaves_qty::double precision AS leaves_qty,
+            os.cum_qty::double precision AS cum_qty,
+            os.avg_px::double precision AS avg_px,
+            os.status, os.resume_to_status, os.version, os.origin,
+            os.created_at, os.updated_at, {TIMES_SELECT}
+        FROM order_state os
+        {TIMES_LATERAL}
+        WHERE os.order_id = $1
         "#,
-    )
+    ))
     .bind(order_id)
-    .fetch_optional(state.pool())
+    .fetch_optional(pool)
     .await
     .map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -432,7 +447,7 @@ pub async fn get_order(
         message: "order not found".to_string(),
     })?;
 
-    let order = OrderAggregateState {
+    let state = OrderAggregateState {
         order_id: row.get::<Uuid, _>("order_id").to_string(),
         client_order_id: row.get("client_order_id"),
         portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
@@ -452,9 +467,10 @@ pub async fn get_order(
             .map(parse_order_status)
             .transpose()?,
         version: row.get("version"),
+        observed: row.get::<String, _>("origin") == "EXTERNAL",
     };
 
-    Ok(Json(order))
+    Ok(OrderDetail { state, times: OrderTimes::from_row(&row), updated_at: row.get("updated_at") })
 }
 
 /// One portfolio the caller is entitled to, with the entitlement itself.
@@ -543,6 +559,10 @@ pub async fn get_portfolio_positions(
     Path(portfolio_id): Path<Uuid>,
 ) -> Result<Json<Vec<Position>>, ApiError> {
     authz::require(state.pool(), auth.principal_id, Permission::PositionsView, portfolio_id).await?;
+    load_positions(&state, portfolio_id).await.map(Json)
+}
+
+async fn load_positions(state: &AppState, portfolio_id: Uuid) -> Result<Vec<Position>, ApiError> {
 
     // contract_size scales the mark into money (x100 for options, 1 for spot).
     // LEFT JOIN: a position whose master row is missing still returns, valued at 1x.
@@ -554,7 +574,8 @@ pub async fn get_portfolio_positions(
                 p.realized_pnl::double precision AS realized_pnl, \
                 p.updated_at, \
                 COALESCE(i.contract_size, 1)::double precision AS contract_size, \
-                COALESCE(i.currency, 'XXX') AS currency \
+                COALESCE(i.currency, 'XXX') AS currency, \
+                i.symbol AS instrument_symbol, i.name AS instrument_name \
          FROM position p \
          LEFT JOIN instrument i ON i.id::text = p.instrument_id \
          WHERE p.portfolio_id = $1 ORDER BY p.instrument_id",
@@ -595,6 +616,8 @@ pub async fn get_portfolio_positions(
                 portfolio_id: r.get("portfolio_id"),
                 other_fees: other_fees.remove(&instrument_id).unwrap_or_default(),
                 instrument_id,
+                instrument_symbol: r.get("instrument_symbol"),
+                instrument_name: r.get("instrument_name"),
                 currency: r.get("currency"),
                 net_qty,
                 avg_cost,
@@ -607,7 +630,7 @@ pub async fn get_portfolio_positions(
             }
         })
         .collect();
-    Ok(Json(positions))
+    Ok(positions)
 }
 
 /// One (broker_instrument, broker_connection) pair's usability for a
@@ -850,6 +873,12 @@ pub async fn create_allocations(
 
     // 4. apply atomically: record each allocation + transfer the position at cost.
     let mut tx = pool.begin().await.map_err(|e| internal("tx begin", e))?;
+    // every position this allocation touches, locked up front in one global order
+    let mut touched = target_ids.clone();
+    touched.push(from_portfolio);
+    crate::positions::lock_positions(&mut tx, &touched, &instrument_id)
+        .await
+        .map_err(|e| internal("failed to lock positions", e))?;
     let mut created = Vec::with_capacity(req.splits.len());
     for s in &req.splits {
         let row = sqlx::query(
@@ -958,6 +987,53 @@ pub struct BlotterFilter {
     pub client_order_id: Option<String>,
 }
 
+/// The five time fields every order row carries, projected once for the blotter and
+/// the detail endpoint. `TIMES_SELECT` and `TIMES_LATERAL` are the SQL side; both
+/// expect the order table aliased `os`.
+const TIMES_SELECT: &str = "COALESCE(os.venue_created_at, os.created_at) AS placed_at, \
+    (os.origin = 'EXTERNAL' AND os.venue_created_at IS NULL) AS placed_is_first_seen, \
+    os.last_trade_at AS trade_time, \
+    COALESCE(lf.estimated, FALSE) AS trade_time_estimated";
+
+/// Whether the latest fill's trade time is an estimate (booking time).
+const TIMES_LATERAL: &str = "LEFT JOIN LATERAL ( \
+    SELECT COALESCE((e.payload_json->>'trade_time_estimated')::boolean, FALSE) AS estimated \
+    FROM order_event e \
+    WHERE e.order_id = os.order_id \
+      AND e.event_type IN ('order_filled', 'order_partially_filled') \
+    ORDER BY COALESCE(e.occurred_at, e.created_at) DESC, e.global_position DESC \
+    LIMIT 1) lf ON TRUE";
+
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct OrderTimes {
+    /// When the order was placed: the venue's creation time when known, else the
+    /// booking time.
+    pub placed_at: DateTime<Utc>,
+    /// True when `placed_at` is only when we first saw the order (an externally
+    /// placed order whose venue gave no creation time).
+    pub placed_is_first_seen: bool,
+    /// Time of the latest booked fill; None until the order has traded.
+    pub trade_time: Option<DateTime<Utc>>,
+    /// When the order was booked in the OMS. Never rewritten.
+    pub booked_at: DateTime<Utc>,
+    /// True when the latest fill's trade time is our booking time, because the
+    /// venue gave none.
+    pub trade_time_estimated: bool,
+}
+
+impl OrderTimes {
+    /// Reads a row built with `TIMES_SELECT` plus `os.created_at`.
+    fn from_row(r: &sqlx::postgres::PgRow) -> Self {
+        Self {
+            placed_at: r.get("placed_at"),
+            placed_is_first_seen: r.get("placed_is_first_seen"),
+            trade_time: r.get("trade_time"),
+            booked_at: r.get("created_at"),
+            trade_time_estimated: r.get("trade_time_estimated"),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BlotterRow {
     pub order_id: Uuid,
@@ -978,8 +1054,22 @@ pub struct BlotterRow {
     pub leaves_qty: f64,
     pub cum_qty: f64,
     pub avg_px: Option<f64>,
+    /// Same instant as `booked_at`; kept for existing clients.
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the order was placed: the venue's creation time when known, else the
+    /// booking time.
+    pub placed_at: DateTime<Utc>,
+    /// True when `placed_at` is only when we first saw the order (an externally
+    /// placed order whose venue gave no creation time).
+    pub placed_is_first_seen: bool,
+    /// Time of the latest booked fill; None until the order has traded.
+    pub trade_time: Option<DateTime<Utc>>,
+    /// When the order was booked in the OMS. Never rewritten.
+    pub booked_at: DateTime<Utc>,
+    /// True when the latest fill's trade time is our booking time, because the
+    /// venue gave none.
+    pub trade_time_estimated: bool,
     /// Venue fees booked on the order, summed per currency (never FX-converted).
     pub fees: Vec<FeeAmount>,
 }
@@ -1003,7 +1093,9 @@ async fn load_blotter(
     f: &BlotterFilter,
     scope: BlotterScope,
 ) -> Result<Vec<BlotterRow>, ApiError> {
-    let mut qb = QueryBuilder::<Postgres>::new(
+    // Page first, then join: the scoped, filtered, ordered page is cut in a subquery,
+    // so the per-order fill lookup runs for at most `limit` rows.
+    let mut qb = QueryBuilder::<Postgres>::new(format!(
         "SELECT os.order_id, os.client_order_id, os.principal_id, p.code AS principal_code, \
                 os.portfolio_id, pf.code AS portfolio_code, os.account_id, \
                 os.broker_connection_code, os.instrument_id, \
@@ -1013,13 +1105,9 @@ async fn load_blotter(
                 os.leaves_qty::double precision   AS leaves_qty, \
                 os.cum_qty::double precision      AS cum_qty, \
                 os.avg_px::double precision       AS avg_px, \
-                os.created_at, os.updated_at \
-         FROM order_state os \
-         JOIN principal p  ON p.id  = os.principal_id \
-         JOIN portfolio pf ON pf.id = os.portfolio_id \
-         LEFT JOIN instrument i ON i.id::text = os.instrument_id \
-         WHERE TRUE",
-    );
+                os.created_at, os.updated_at, {TIMES_SELECT} \
+         FROM (SELECT * FROM order_state os WHERE TRUE",
+    ));
     // Scope first, so it can never be widened by a filter appended after it.
     match scope {
         BlotterScope::All => {
@@ -1043,12 +1131,20 @@ async fn load_blotter(
         qb.push(" AND os.broker_connection_code = ").push_bind(v.clone());
     }
     if let Some(v) = &f.side { qb.push(" AND os.side = ").push_bind(v.clone()); }
+    // since/until filter on booked time (created_at), not trade time.
     if let Some(v) = f.since { qb.push(" AND os.created_at >= ").push_bind(v); }
     if let Some(v) = f.until { qb.push(" AND os.created_at <= ").push_bind(v); }
-    qb.push(" ORDER BY os.created_at DESC");
+    qb.push(" ORDER BY os.last_trade_at DESC NULLS LAST, os.created_at DESC");
     let limit = f.limit.unwrap_or(100).clamp(1, 500);
     let offset = f.offset.unwrap_or(0).max(0);
     qb.push(" LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+    qb.push(format!(
+        ") os {TIMES_LATERAL} \
+         JOIN principal p  ON p.id  = os.principal_id \
+         JOIN portfolio pf ON pf.id = os.portfolio_id \
+         LEFT JOIN instrument i ON i.id::text = os.instrument_id \
+         ORDER BY os.last_trade_at DESC NULLS LAST, os.created_at DESC"
+    ));
 
     let rows = qb.build().fetch_all(state.pool()).await.map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1085,6 +1181,11 @@ async fn load_blotter(
             avg_px: r.get("avg_px"),
             created_at: r.get("created_at"),
             updated_at: r.get("updated_at"),
+            placed_at: r.get("placed_at"),
+            placed_is_first_seen: r.get("placed_is_first_seen"),
+            trade_time: r.get("trade_time"),
+            booked_at: r.get("created_at"),
+            trade_time_estimated: r.get("trade_time_estimated"),
         })
         .collect();
     Ok(out)
@@ -1209,6 +1310,7 @@ pub(crate) fn domain_event_to_new_event(event: &OrderDomainEvent) -> Result<NewO
         correlation_id: None, // need to be defined
         causation_id: None,   // to be provided by the client -> why was command sent
         schema_version: 0,    // indicate the schema version of the payload
+        occurred_at: event.occurred_at,
     })
 }
 
@@ -2359,6 +2461,183 @@ pub(crate) mod tests {
         };
         let rows = load_blotter(&state, &filter, BlotterScope::All).await.expect("load blotter");
         assert!(rows.is_empty());
+    }
+
+    fn no_filter(client_order_id: Option<String>) -> BlotterFilter {
+        BlotterFilter {
+            status: None, portfolio_id: None, instrument_id: None, principal_id: None,
+            broker_connection_code: None, side: None, since: None, until: None,
+            limit: None, offset: None, client_order_id,
+        }
+    }
+
+    async fn set_times(
+        pool: &sqlx::PgPool,
+        order_id: Uuid,
+        created: &str,
+        trade: Option<&str>,
+        venue_created: Option<&str>,
+        origin: &str,
+    ) {
+        sqlx::query(
+            "UPDATE order_state SET created_at = $2::timestamptz, last_trade_at = $3::timestamptz,              venue_created_at = $4::timestamptz, origin = $5 WHERE order_id = $1",
+        )
+        .bind(order_id).bind(created).bind(trade).bind(venue_created).bind(origin)
+        .execute(pool).await.expect("set times");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn orders_list_returns_trade_times_sorted() {
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "blotter-times").await;
+        let instrument_id = seed_instrument(&pool, "BLOTTIME").await;
+        let tag = format!("tt-{}", &Uuid::new_v4().to_string()[..8]);
+        // Booked order is the reverse of trade order; one order has never traded.
+        let old_trade = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        let new_trade = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        let untraded = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        set_times(&pool, old_trade, "2026-11-03T00:00:00Z", Some("2026-11-01T10:00:00Z"), None, "API").await;
+        set_times(&pool, new_trade, "2026-11-02T00:00:00Z", Some("2026-11-02T10:00:00Z"), None, "API").await;
+        set_times(&pool, untraded, "2026-11-04T00:00:00Z", None, None, "API").await;
+        let fill = |id: Uuid, est: bool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO order_event (order_id, version, event_id, event_type, actor, payload_json, schema_version) \
+                     VALUES ($1, 1, gen_random_uuid(), 'order_filled', 't', $2, 0)",
+                )
+                .bind(id)
+                .bind(if est { serde_json::json!({"trade_time_estimated": true}) } else { serde_json::json!({}) })
+                .execute(&pool).await.expect("fill event");
+            }
+        };
+        fill(old_trade, true).await;
+        fill(new_trade, false).await;
+
+        let state = test_app_state(pool);
+        let rows = load_blotter(&state, &no_filter(Some(tag)), BlotterScope::All).await.expect("blotter");
+        let ids: Vec<Uuid> = rows.iter().map(|r| r.order_id).collect();
+        assert_eq!(ids, vec![new_trade, old_trade, untraded], "trade_time DESC NULLS LAST");
+        let (n, o, u) = (&rows[0], &rows[1], &rows[2]);
+        assert_eq!(n.trade_time.unwrap().to_rfc3339(), "2026-11-02T10:00:00+00:00");
+        assert_eq!(n.booked_at.to_rfc3339(), "2026-11-02T00:00:00+00:00");
+        assert_eq!(n.booked_at, n.created_at);
+        assert_eq!(n.placed_at, n.booked_at, "no venue time: placed = booked");
+        assert!(!n.trade_time_estimated);
+        assert!(o.trade_time_estimated);
+        assert!(u.trade_time.is_none() && !u.trade_time_estimated);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn only_the_latest_fill_decides_trade_time_estimated() {
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "blotter-latest-est").await;
+        let instrument_id = seed_instrument(&pool, "BLOTEST").await;
+        let tag = format!("le-{}", &Uuid::new_v4().to_string()[..8]);
+        let early_est = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        let late_est = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        // (order, version, occurred_at, estimated)
+        for (id, v, at, est) in [
+            (early_est, 1_i64, "2026-11-01T10:00:00Z", true),
+            (early_est, 2, "2026-11-01T11:00:00Z", false),
+            (late_est, 1, "2026-11-01T10:00:00Z", false),
+            (late_est, 2, "2026-11-01T11:00:00Z", true),
+        ] {
+            sqlx::query(
+                "INSERT INTO order_event (order_id, version, event_id, event_type, actor, payload_json, \
+                 schema_version, occurred_at) \
+                 VALUES ($1, $2, gen_random_uuid(), 'order_partially_filled', 't', $3, 0, $4::timestamptz)",
+            )
+            .bind(id).bind(v)
+            .bind(serde_json::json!({ "trade_time_estimated": est }))
+            .bind(at)
+            .execute(&pool).await.expect("fill event");
+        }
+        let state = test_app_state(pool);
+        let rows = load_blotter(&state, &no_filter(Some(tag)), BlotterScope::All).await.expect("blotter");
+        let by = |id| rows.iter().find(|r| r.order_id == id).unwrap();
+        assert!(!by(early_est).trade_time_estimated, "latest fill is exact");
+        assert!(by(late_est).trade_time_estimated, "latest fill is estimated");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn order_detail_returns_trade_times() {
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "detail-times").await;
+        let instrument_id = seed_instrument(&pool, "DETTIME").await;
+        let order = seed_order_state(&pool, principal_id, instrument_id, "detail-times").await;
+        set_times(&pool, order, "2026-11-05T00:00:00Z", Some("2026-11-04T10:00:00Z"), None, "EXTERNAL").await;
+        sqlx::query(
+            "INSERT INTO order_event (order_id, version, event_id, event_type, actor, payload_json, schema_version) \
+             VALUES ($1, 1, gen_random_uuid(), 'order_filled', 't', '{\"trade_time_estimated\": true}', 0)",
+        )
+        .bind(order).execute(&pool).await.expect("fill event");
+
+        let d = load_order_detail(&pool, order).await.expect("detail");
+        assert_eq!(d.times.trade_time.unwrap().to_rfc3339(), "2026-11-04T10:00:00+00:00");
+        assert_eq!(d.times.booked_at.to_rfc3339(), "2026-11-05T00:00:00+00:00");
+        assert_eq!(d.times.placed_at, d.times.booked_at);
+        assert!(d.times.placed_is_first_seen && d.times.trade_time_estimated);
+        assert!(d.state.observed);
+        let json = serde_json::to_value(&d).unwrap();
+        for k in ["order_id", "placed_at", "placed_is_first_seen", "trade_time", "booked_at",
+                  "trade_time_estimated", "updated_at", "status"] {
+            assert!(json.get(k).is_some(), "missing {k}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn external_order_without_venue_time_marks_placed_first_seen() {
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "blotter-first-seen").await;
+        let instrument_id = seed_instrument(&pool, "BLOTSEEN").await;
+        let tag = format!("fs-{}", &Uuid::new_v4().to_string()[..8]);
+        let ext_no_venue = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        let ext_venue = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        let own = seed_order_state(&pool, principal_id, instrument_id, &tag).await;
+        set_times(&pool, ext_no_venue, "2026-11-05T00:00:00Z", None, None, "EXTERNAL").await;
+        set_times(&pool, ext_venue, "2026-11-06T00:00:00Z", None, Some("2026-11-01T09:00:00Z"), "EXTERNAL").await;
+        set_times(&pool, own, "2026-11-07T00:00:00Z", None, None, "API").await;
+
+        let state = test_app_state(pool);
+        let rows = load_blotter(&state, &no_filter(Some(tag)), BlotterScope::All).await.expect("blotter");
+        let by = |id| rows.iter().find(|r| r.order_id == id).unwrap();
+        let a = by(ext_no_venue);
+        assert!(a.placed_is_first_seen);
+        assert_eq!(a.placed_at, a.booked_at);
+        let b = by(ext_venue);
+        assert!(!b.placed_is_first_seen);
+        assert_eq!(b.placed_at.to_rfc3339(), "2026-11-01T09:00:00+00:00");
+        assert!(!by(own).placed_is_first_seen);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn positions_include_instrument_name() {
+        let pool = test_pool().await;
+        let (principal_id, _) = seed_principal(&pool, "pos-name").await;
+        let instrument_id = seed_instrument(&pool, "POSNAME").await;
+        let order = seed_order_state(&pool, principal_id, instrument_id, "pos-name").await;
+        let portfolio_id: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM order_state WHERE order_id = $1")
+            .bind(order).fetch_one(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO position (portfolio_id, instrument_id, net_qty, avg_cost, realized_pnl) \
+             VALUES ($1, $2, 1, 10, 0), ($1, '999999999', 1, 10, 0)",
+        )
+        .bind(portfolio_id).bind(instrument_id.to_string())
+        .execute(&pool).await.unwrap();
+
+        let state = test_app_state(pool);
+        let rows = load_positions(&state, portfolio_id).await.expect("positions");
+        let known = rows.iter().find(|p| p.instrument_id == instrument_id.to_string()).unwrap();
+        assert_eq!(known.instrument_name.as_deref(), Some("Watchlist test instrument"));
+        assert!(known.instrument_symbol.as_deref().unwrap().starts_with("WATCHPOSNAME"));
+        let orphan = rows.iter().find(|p| p.instrument_id == "999999999").unwrap();
+        assert!(orphan.instrument_name.is_none() && orphan.instrument_symbol.is_none());
     }
 
     /// Mirrors the existing actor-attribution test's `AppState::new(...)` call
