@@ -426,6 +426,7 @@ pub(crate) fn order_update_from_row(d: &serde_json::Value, account_ref: &str) ->
         status: venue_status(d)?,
         cum_qty: num(&d["cumExecQty"]).unwrap_or(0.0),
         ts: time_ms(&d["updatedTime"]),
+        created_at: time_ms(&d["createdTime"]),
     })
 }
 

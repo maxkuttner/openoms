@@ -581,6 +581,7 @@ pub(crate) fn parse_open_order_snapshot(orders: &serde_json::Value, account_ref:
                 status: VenueOrderStatus::Working,
                 cum_qty: num(&o["filled_qty"]).unwrap_or(0.0),
                 ts: o["updated_at"].as_str().and_then(|s| s.parse().ok()),
+                created_at: o["created_at"].as_str().and_then(|s| s.parse().ok()),
             })
         })
         .collect()
@@ -769,5 +770,16 @@ mod tests {
         let rows = parse_open_order_snapshot(&body, "");
         assert_eq!((rows[0].venue_order_id.as_str(), rows[0].cum_qty, rows[0].qty, rows[0].limit_px), ("o1", 1.0, 5.0, Some(100.0)));
         assert_eq!(ExecutionSource::hints(&AlpacaAdapter::new("k".into(), "s".into(), "PAPER")), PullHints { intraday_secs: 60, max_history: None, per_symbol: false });
+    }
+
+    #[test]
+    fn alpaca_snapshot_order_carries_created_and_update_time() {
+        let body = serde_json::json!([{
+            "id": "o1", "client_order_id": "c", "symbol": "AAPL", "side": "buy", "type": "limit", "qty": "5",
+            "limit_price": "1", "filled_qty": "0", "created_at": "2026-11-18T14:00:00Z", "updated_at": "2026-11-18T14:05:00Z",
+        }]);
+        let o = &parse_open_order_snapshot(&body, "a")[0];
+        assert_eq!(o.created_at, Some("2026-11-18T14:00:00Z".parse().unwrap()));
+        assert_eq!(o.ts, Some("2026-11-18T14:05:00Z".parse().unwrap()));
     }
 }

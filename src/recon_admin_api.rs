@@ -794,6 +794,7 @@ mod tests {
                 status: VenueOrderStatus::Working,
                 cum_qty: 0.0,
                 ts: None,
+                created_at: None,
             }),
             None,
         )

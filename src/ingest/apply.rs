@@ -766,6 +766,7 @@ pub fn event_from_json(v: &serde_json::Value) -> Option<VenueEvent> {
             },
             cum_qty: num("cum_qty")?,
             ts: time("ts"),
+            created_at: None,
         })),
         _ => None,
     }

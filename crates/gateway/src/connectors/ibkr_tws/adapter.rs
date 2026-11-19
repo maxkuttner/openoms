@@ -404,6 +404,8 @@ pub(crate) fn order_update(order_id: i32, st: &TwsOrderState) -> VenueOrderUpdat
         status: venue_status(&st.status),
         cum_qty: st.filled,
         ts: None,
+        // TWS order state carries no creation or update time.
+        created_at: None,
     }
 }
 
@@ -818,5 +820,11 @@ pub(crate) mod tests {
         fake.completed.lock().unwrap().push((-3, String::new(), sample_state(-3, "")));
         let s = adapter.order_status("4242", "4242", "AAPL").await.unwrap();
         assert_eq!(s.executed_qty, 1.0);
+    }
+
+    #[test]
+    fn ibkr_order_update_has_no_created_time() {
+        let u = order_update(7, &sample_state(7, "ref"));
+        assert_eq!((u.created_at, u.ts), (None, None));
     }
 }

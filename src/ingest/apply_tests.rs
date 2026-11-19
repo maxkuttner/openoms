@@ -85,6 +85,7 @@ fn order(venue_order: &str, qty: f64, cum: f64, status: VenueOrderStatus) -> Ven
         status,
         cum_qty: cum,
         ts: None,
+        created_at: None,
     })
 }
 

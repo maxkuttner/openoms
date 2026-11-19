@@ -178,6 +178,8 @@ pub struct StatusReport {
     pub last_rpt_requested: bool,
     /// `TotNumReports`(911)=0 — the venue's "no open orders" empty-batch reply.
     pub empty_batch: bool,
+    /// `TransactTime`(60): the venue's time of this report.
+    pub transact_time: Option<DateTime<Utc>>,
 }
 
 impl StatusReport {
@@ -217,7 +219,8 @@ impl StatusReport {
             limit_px: self.limit_px,
             status: VenueOrderStatus::Working,
             cum_qty: self.cum_qty,
-            ts: None,
+            ts: self.transact_time,
+            created_at: None,
         })
     }
 
@@ -260,6 +263,7 @@ pub fn parse_order_status_report(msg: &Message) -> Option<StatusReport> {
         limit_px: msg.get_field(tag::PRICE).and_then(|s| s.parse::<f64>().ok()).filter(|p| *p != 0.0),
         last_rpt_requested: msg.get_field(tag::LAST_RPT_REQUESTED).as_deref() == Some("Y"),
         empty_batch: msg.get_field(tag::TOT_NUM_REPORTS).and_then(|s| s.parse::<i64>().ok()) == Some(0),
+        transact_time: msg.get_field(tag::TRANSACT_TIME).as_deref().and_then(fix_time),
     })
 }
 
@@ -539,6 +543,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fix_order_update_carries_update_time_and_no_created_time() {
+        let msg = exec_report(&[
+            (tag::CL_ORD_ID, "c-1"), (tag::ORDER_ID, "B-1"), (tag::EXEC_TYPE, "0"), (tag::ORD_STATUS, "0"),
+            (tag::SYMBOL, "BTCUSDT"), (tag::SIDE, "1"), (tag::ORDER_QTY, "1"), (tag::ORD_TYPE, "2"), (tag::PRICE, "100"),
+            (tag::TRANSACT_TIME, "20261119-10:00:01.250"),
+        ]);
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
+        let o = order_of(&p);
+        assert_eq!(o.ts, Some("2026-11-19T10:00:01.250Z".parse().unwrap()));
+        assert_eq!(o.created_at, None);
+        // The mass-status snapshot carries the report's TransactTime as the update time.
+        let sr = status_reply(&[
+            (tag::ORDER_ID, "701"), (tag::ORD_STATUS, "0"), (tag::SIDE, "1"), (tag::ORDER_QTY, "1"),
+            (tag::TRANSACT_TIME, "20261119-10:00:02"),
+        ]);
+        let u = snapshot_updates(&[sr], "").remove(0);
+        assert_eq!((u.ts, u.created_at), (Some("2026-11-19T10:00:02Z".parse().unwrap()), None));
+    }
+
+    #[test]
+    fn fix_stream_fill_carries_executed_at() {
+        let msg = exec_report(&[
+            (tag::CL_ORD_ID, "c-1"), (tag::ORDER_ID, "B-1"), (tag::EXEC_ID, "E-1"), (tag::EXEC_TYPE, "F"), (tag::ORD_STATUS, "1"),
+            (tag::SYMBOL, "BTCUSDT"), (tag::SIDE, "1"), (tag::LAST_QTY, "0.5"), (tag::LAST_PX, "100"),
+            (tag::TRANSACT_TIME, "20261119-10:00:03.500"),
+        ]);
+        let p = parse_standard_exec_report(&msg, tag::EXEC_ID).unwrap();
+        assert_eq!(fill_of(&p).executed_at, Some("2026-11-19T10:00:03.500Z".parse().unwrap()));
+    }
+
+    #[test]
     fn unknown_order_status_reply_does_not_close_the_order() {
         // IBKR answers 35=H for an order it doesn't know with OrdStatus=8.
         let unknown = status_reply(&[(tag::ORDER_ID, "0"), (tag::ORD_STATUS, "8"), (tag::ORD_REJ_REASON, "5")]);
@@ -753,6 +788,7 @@ pub fn parse_standard_exec_report(msg: &Message, exec_id_tag: i32) -> Option<Par
                 status,
                 cum_qty: num(tag::CUM_QTY).unwrap_or(0.0),
                 ts,
+                created_at: None,
             })),
             None => warn!(msg_seq_num = ?seq, exec_id = ?field(tag::EXEC_ID), missing = tag::ORDER_ID, "FIX: execution report without OrderID, no order update"),
         }

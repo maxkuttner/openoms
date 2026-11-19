@@ -589,7 +589,8 @@ pub(crate) fn parse_open_order_snapshot(body: &serde_json::Value, account_ref: &
                 qty: num(&o["origQty"])?,
                 status: VenueOrderStatus::Working,
                 cum_qty: num(&o["executedQty"]).unwrap_or(0.0),
-                ts: o["time"].as_i64().and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
+                ts: o["updateTime"].as_i64().or(o["time"].as_i64()).and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
+                created_at: o["time"].as_i64().and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
             })
         })
         .collect()
@@ -887,5 +888,16 @@ mod tests {
         .unwrap();
         let stats = parse_binance_24hr_stats(&body);
         assert_eq!(stats, vec![("BTCUSDT".to_string(), 64000.50)]);
+    }
+
+    #[test]
+    fn binance_snapshot_order_carries_created_and_update_time() {
+        let body = serde_json::json!([{
+            "orderId": 7, "clientOrderId": "c", "symbol": "BTCUSDT", "side": "BUY", "type": "LIMIT",
+            "price": "1", "origQty": "1", "executedQty": "0", "time": 1700000001000i64, "updateTime": 1700000007000i64,
+        }]);
+        let o = &parse_open_order_snapshot(&body, "a")[0];
+        assert_eq!(o.created_at, Utc.timestamp_millis_opt(1700000001000).single());
+        assert_eq!(o.ts, Utc.timestamp_millis_opt(1700000007000).single());
     }
 }

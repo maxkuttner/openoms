@@ -319,6 +319,10 @@ pub(crate) fn parse_prev_prices(body: &serde_json::Value, wanted: &[String]) -> 
         .collect()
 }
 
+fn iso_time(v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    v.as_str().and_then(|s| s.parse().ok())
+}
+
 /// The client id an order carries into the OMS: as Coinbase has it, `None` when empty.
 fn client_id(v: &serde_json::Value) -> Option<String> {
     v.as_str().filter(|c| !c.is_empty()).map(str::to_string)
@@ -355,6 +359,7 @@ pub(crate) fn order_update_from_push(o: &serde_json::Value, account_ref: &str) -
         status: venue_status(o["status"].as_str()?, o["reject_reason"].as_str().unwrap_or(""))?,
         cum_qty: cum,
         ts: None,
+        created_at: iso_time(&o["creation_time"]).or_else(|| iso_time(&o["created_time"])),
     })
 }
 
@@ -384,6 +389,7 @@ pub(crate) fn parse_open_order_snapshot(body: &serde_json::Value, account_ref: &
                 status: venue_status(o["status"].as_str()?, "")?,
                 cum_qty: cum,
                 ts: None,
+                created_at: iso_time(&o["created_time"]),
             })
         })
         .collect()
@@ -979,5 +985,13 @@ mod tests {
         assert!(btc.is_tradeable);
         assert!(!list.iter().find(|i| i.broker_symbol == "HALT-USD").unwrap().is_tradeable);
         assert!(list.iter().all(|i| i.broker_symbol != "BIT-28NOV26-CDE"), "futures are not loaded");
+    }
+
+    #[test]
+    fn coinbase_snapshot_order_carries_created_time() {
+        let mut body = sample("orders_open");
+        body["orders"][0]["created_time"] = serde_json::json!("2026-11-03T11:59:00Z");
+        let snap = parse_open_order_snapshot(&body, "acct");
+        assert_eq!(snap[0].created_at, Some("2026-11-03T11:59:00Z".parse().unwrap()));
     }
 }
