@@ -520,6 +520,31 @@ async fn observed_filled_order_grown_by_update_stays_filled() {
 
 #[tokio::test]
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn observed_working_order_grown_by_canceled_update_closes_canceled() {
+    let w = world().await;
+    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 0.0, VenueOrderStatus::Working), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 8.0, 0.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    assert!(matches!(d.decision, Decision::Grow { new_qty, .. } if new_qty == 8.0));
+    let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
+    assert_eq!((qty, cum, status.as_str()), (8.0, 0.0, "canceled"));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn observed_filled_order_grown_by_canceled_update_closes_canceled() {
+    let w = world().await;
+    ingest(&w.pool, &w.bus, CONN, order("v1", 5.0, 5.0, VenueOrderStatus::Filled), None).await.unwrap();
+    ingest(&w.pool, &w.bus, CONN, fill("e1", "v1", None, 2.0), None).await.unwrap();
+    let d = ingest(&w.pool, &w.bus, CONN, order("v1", 8.0, 2.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    assert!(matches!(d.decision, Decision::Grow { new_qty, .. } if new_qty == 8.0));
+    let (_, _, _, qty, cum, status) = only_order(&w.pool).await;
+    assert_eq!((qty, cum, status.as_str()), (8.0, 2.0, "canceled"));
+    assert_eq!(position(&w).await, 2.0);
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 1);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn venue_created_at_is_set_once() {
     let w = world().await;
     let first = "2026-11-01T09:00:00Z";

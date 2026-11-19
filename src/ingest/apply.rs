@@ -571,7 +571,9 @@ async fn book(
         },
         _ => was.filter(|s| s.is_terminal()),
     };
-    let keep = venue_closed.filter(|_| observed && grows);
+    // only Filled: a canceled/rejected/expired update brings its own closing
+    // command, which a closed status would refuse
+    let keep = venue_closed.filter(|s| observed && grows && *s == OrderStatus::Filled);
     // The venue is truth: what it reports on a closed OMS order (a late fill)
     // still books, so reopen it for the state machine, which refuses every
     // command on a terminal order.
