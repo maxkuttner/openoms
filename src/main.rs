@@ -201,7 +201,7 @@ mod first_run_tests;
         local_auth_api::methods,
     ),
     components(schemas(
-        SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState,
+        SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState, handlers::OrderDetail, handlers::OrderTimes,
         crate::domain::orders::state::OrderStatus,
         crate::positions::Position,
         handlers::VenueOption,

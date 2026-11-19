@@ -26,4 +26,5 @@ ALTER TABLE position
     ADD COLUMN last_trade_exec   TEXT,
     ADD COLUMN last_trade_is_fee BOOLEAN;
 
-CREATE INDEX idx_order_state_last_trade_at ON order_state (last_trade_at DESC NULLS LAST);
+-- Matches the blotter's default order (trade time, then booking time).
+CREATE INDEX idx_order_state_last_trade_at ON order_state (last_trade_at DESC NULLS LAST, created_at DESC);

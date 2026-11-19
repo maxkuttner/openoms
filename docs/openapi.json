@@ -3847,7 +3847,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/OrderAggregateState"
+                  "$ref": "#/components/schemas/OrderDetail"
                 }
               }
             }
@@ -5857,6 +5857,29 @@
           }
         }
       },
+      "OrderDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/OrderAggregateState"
+          },
+          {
+            "$ref": "#/components/schemas/OrderTimes"
+          },
+          {
+            "type": "object",
+            "required": [
+              "updated_at"
+            ],
+            "properties": {
+              "updated_at": {
+                "type": "string",
+                "format": "date-time"
+              }
+            }
+          }
+        ],
+        "description": "An order's current state plus its time fields."
+      },
       "OrderEventView": {
         "type": "object",
         "description": "One entry in an order's audit trail.\n\n`occurred_at` is when the domain decided the event; `recorded_at` is when the\nstore appended it. They differ for anything that arrives from a broker stream,\nand an auditor wants both.",
@@ -5942,6 +5965,41 @@
           "expired",
           "suspended"
         ]
+      },
+      "OrderTimes": {
+        "type": "object",
+        "required": [
+          "placed_at",
+          "placed_is_first_seen",
+          "booked_at",
+          "trade_time_estimated"
+        ],
+        "properties": {
+          "booked_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the order was booked in the OMS. Never rewritten."
+          },
+          "placed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the order was placed: the venue's creation time when known, else the\nbooking time."
+          },
+          "placed_is_first_seen": {
+            "type": "boolean",
+            "description": "True when `placed_at` is only when we first saw the order (an externally\nplaced order whose venue gave no creation time)."
+          },
+          "trade_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time of the latest booked fill; None until the order has traded.",
+            "nullable": true
+          },
+          "trade_time_estimated": {
+            "type": "boolean",
+            "description": "True when the latest fill's trade time is our booking time, because the\nvenue gave none."
+          }
+        }
       },
       "OrderType": {
         "type": "string",
