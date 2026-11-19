@@ -5,6 +5,16 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.12.0 (2026-11-19)
+
+### BREAKING CHANGE
+
+- IBKR TWS now connects with master_client_id (default 0); orders still working under the old client id 1 are no longer seen — cancel and re-place them before upgrading; set IB Gateway's "Master API client ID" to see other API clients' orders.
+
+### Feat
+
+- external orders and execution reconciliation (#56)
+
 ## v0.11.0 (2026-11-17)
 
 ### Feat
