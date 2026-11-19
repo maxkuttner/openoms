@@ -102,6 +102,7 @@ pub struct ObserveOrder {
     pub venue: String,
     pub external_order_id: String,
     /// Routed (working) | PartiallyFilled | Filled | Canceled | Expired | Rejected
+    /// — a venue "working"/"new" order is observed as `Routed`.
     pub observed_status: OrderStatus,
     pub venue_cum_qty: f64,
     pub venue_created_at: Option<DateTime<Utc>>,

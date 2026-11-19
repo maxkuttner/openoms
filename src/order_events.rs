@@ -139,13 +139,20 @@ pub fn summarize(event: &OrderDomainEvent) -> String {
             external_order_id,
             observed_status,
             venue_cum_qty,
+            venue_created_at,
             ..
-        } => format!(
-            "observed {} {quantity} {instrument_id} on {venue} as {external_order_id}: {} \
-             ({venue_cum_qty} filled at venue)",
-            side.as_str(),
-            observed_status.as_str()
-        ),
+        } => {
+            let mut s = format!(
+                "observed {} {quantity} {instrument_id} on {venue} as {external_order_id}: {} \
+                 ({venue_cum_qty} filled at venue)",
+                side.as_str(),
+                observed_status.as_str()
+            );
+            if let Some(at) = venue_created_at {
+                s.push_str(&format!(", placed {}", at.to_rfc3339()));
+            }
+            s
+        }
         OrderEventPayload::OrderFeeCharged { amount, currency, .. } => {
             format!("fee {amount} {currency}")
         }
@@ -341,6 +348,35 @@ mod tests {
             OrderStatus::Routed,
         );
         assert_eq!(view(&record_of(&e)).summary, "fee 1.5 USD");
+    }
+
+    #[test]
+    fn order_observed_summary_shows_venue_created_at() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-01T12:00:00Z").unwrap().with_timezone(&Utc);
+        let e = event(
+            OrderEventPayload::OrderObserved {
+                client_order_id: "c".into(),
+                portfolio_id: "p".into(),
+                account_id: "a".into(),
+                instrument_id: "i-1".into(),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Gtc,
+                limit_price: Some(1.0),
+                quantity: 10.0,
+                venue: "BINANCE".into(),
+                external_order_id: "x-1".into(),
+                observed_status: OrderStatus::Filled,
+                venue_cum_qty: 10.0,
+                venue_created_at: Some(at),
+            },
+            OrderEventType::OrderObserved,
+            OrderStatus::Filled,
+        );
+        assert_eq!(
+            view(&record_of(&e)).summary,
+            "observed buy 10 i-1 on BINANCE as x-1: filled (10 filled at venue), placed 2026-11-01T12:00:00+00:00"
+        );
     }
 
     #[test]

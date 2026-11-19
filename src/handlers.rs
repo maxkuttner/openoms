@@ -415,7 +415,7 @@ pub async fn get_order(
             leaves_qty::double precision AS leaves_qty,
             cum_qty::double precision AS cum_qty,
             avg_px::double precision AS avg_px,
-            status, resume_to_status, version
+            status, resume_to_status, version, origin
         FROM order_state
         WHERE order_id = $1
         "#,
@@ -452,7 +452,7 @@ pub async fn get_order(
             .map(parse_order_status)
             .transpose()?,
         version: row.get("version"),
-        observed: false,
+        observed: row.get::<String, _>("origin") == "EXTERNAL",
     };
 
     Ok(Json(order))

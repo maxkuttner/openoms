@@ -234,7 +234,7 @@ pub async fn persist_routed(
                 leaves_qty::double precision AS leaves_qty,
                 cum_qty::double precision AS cum_qty,
                 avg_px::double precision AS avg_px,
-                status, resume_to_status, version
+                status, resume_to_status, version, origin
             FROM order_state
             WHERE order_id = $1
             "#,
@@ -273,7 +273,7 @@ pub async fn persist_routed(
             status,
             resume_to_status,
             version: row.get::<i64, _>("version"),
-            observed: false,
+            observed: row.get::<String, _>("origin") == "EXTERNAL",
         };
 
         if current_state.status.is_terminal() {
@@ -942,7 +942,8 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
             resume_to_status,
             version,
             external_order_id,
-            broker_connection_code
+            broker_connection_code,
+            origin
         FROM order_state
         WHERE order_id = $1
         "#
@@ -1057,7 +1058,7 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
         status,
         resume_to_status,
         version: row.get::<i64, _>("version"),
-        observed: false,
+        observed: row.get::<String, _>("origin") == "EXTERNAL",
     };
 
     let aggregate = OrderAggregate::from_state(state.clone());

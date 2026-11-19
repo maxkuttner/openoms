@@ -5790,7 +5790,7 @@
           },
           "observed": {
             "type": "boolean",
-            "description": "Opened by `order_observed` (venue-originated): its status is the venue's,\nso fills are still accepted on a terminal status until booked cum\nreaches quantity."
+            "description": "Venue-originated order (opened by `order_observed`; from a row: derived\nfrom `origin = 'EXTERNAL'`, never persisted separately). Its status is\nthe venue's, so fills are still accepted on a terminal status until\nbooked cum reaches quantity."
           },
           "order_id": {
             "type": "string"

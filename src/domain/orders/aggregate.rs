@@ -328,6 +328,12 @@ impl OrderAggregate {
                         format!("{:?} is not a venue status", cmd.observed_status),
                     ));
                 }
+                if !(0.0..=cmd.quantity).contains(&cmd.venue_cum_qty) {
+                    return Err(CommandRejection::new(
+                        RejectionCode::InvalidQuantity,
+                        "venue cum qty must be between 0 and quantity",
+                    ));
+                }
                 Ok(vec![OrderDomainEvent {
                     event_id: metadata.event_id,
                     event_type: OrderEventType::OrderObserved,
@@ -1240,6 +1246,16 @@ mod tests {
             .decide(OrderCommand::ObserveOrder(t().observe(0.0, OrderStatus::Routed, 0.0)), metadata("e-1"))
             .expect_err("zero qty");
         assert_eq!(err.code, RejectionCode::InvalidQuantity);
+    }
+
+    #[test]
+    fn observe_with_venue_cum_out_of_range_is_rejected() {
+        for cum in [-1.0, 10.5] {
+            let err = OrderAggregate::default()
+                .decide(OrderCommand::ObserveOrder(t().observe(10.0, OrderStatus::Filled, cum)), metadata("e-1"))
+                .expect_err("venue cum out of range");
+            assert_eq!(err.code, RejectionCode::InvalidQuantity);
+        }
     }
 
     #[test]

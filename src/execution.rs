@@ -92,7 +92,7 @@ pub(crate) async fn load_state(
             leaves_qty::double precision AS leaves_qty,
             cum_qty::double precision AS cum_qty,
             avg_px::double precision AS avg_px,
-            status, resume_to_status, version
+            status, resume_to_status, version, origin
         FROM order_state
         WHERE order_id = $1
         "#,
@@ -130,7 +130,7 @@ pub(crate) async fn load_state(
         status,
         resume_to_status,
         version: row.get("version"),
-        observed: false,
+        observed: row.get::<String, _>("origin") == "EXTERNAL",
     };
     Ok(Some(state))
 }
@@ -156,7 +156,12 @@ async fn apply_once(
         }
     };
 
-    if state.status.is_terminal() {
+    // an observed (external) order's status is the venue's: it still takes
+    // fills until booked cum reaches quantity
+    let takes_fill = state.observed
+        && matches!(report, ExecutionReport::Fill { .. })
+        && state.cum_qty < state.original_qty;
+    if state.status.is_terminal() && !takes_fill {
         warn!(order_id = %order_id, status = state.status.as_str(), "execution: order already in terminal state, skipping duplicate event");
         return Ok(());
     }
@@ -384,6 +389,41 @@ pub(crate) mod tests {
             .iter()
             .all(|ev| matches!(ev, OrderLaneEvent::Appended { order_id: o, .. } if *o == order_id)));
         assert_eq!(*last, OrderLaneEvent::PositionChanged { portfolio_id, instrument_id });
+    }
+
+    /// An external order the venue reported Filled before its fills were
+    /// booked still books fills until booked cum reaches quantity, and keeps
+    /// its Filled status; past quantity the engine skips it as before.
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn engine_fill_on_observed_filled_order_books_until_qty() {
+        let pool = test_pool().await;
+        let (order_id, _, _) = seeded_order(&pool, 0).await;
+        sqlx::query(
+            "UPDATE order_state SET origin = 'EXTERNAL', status = 'filled', original_qty = 2, \
+             leaves_qty = 2, cum_qty = 0, avg_px = NULL WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .expect("make observed-filled");
+
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            results.push(process_execution_report(&pool, order_id, fill(), "obs-test", None).await.is_ok());
+        }
+        let (cum, status): (f64, String) = sqlx::query_as(
+            "SELECT cum_qty::double precision, status FROM order_state WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read state");
+        remove_seeded(&pool, order_id).await;
+
+        assert_eq!(results, vec![true, true, true]);
+        assert_eq!(cum, 2.0);
+        assert_eq!(status, "filled");
     }
 
     #[tokio::test]
