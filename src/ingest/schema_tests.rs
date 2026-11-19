@@ -365,3 +365,40 @@ async fn trade_time_columns_exist_and_default_null() {
     .fetch_one(&pool).await.unwrap();
     assert_eq!(idx, 1);
 }
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn order_event_created_at_is_timestamptz_and_legacy_rows_keep_utc_instant() {
+    let pool = fresh_db().await;
+    migrate::ensure_tracking(&pool).await.unwrap();
+    migrate::apply_matching(&pool, |schema, file| schema != "oms" || file < "0067_").await.unwrap();
+
+    // Before 0067 created_at is a zoneless UTC wall clock.
+    let b = seed_base(&pool).await;
+    let order = seed_order(&pool, &b, "tz-1").await;
+    sqlx::query(
+        "INSERT INTO oms.order_event (order_id, version, event_id, event_type, payload_json, created_at) \
+         VALUES ($1, 1, $2, 'order_filled', '{}'::jsonb, TIMESTAMP '2026-01-01 12:00:00')",
+    )
+    .bind(order).bind(Uuid::new_v4()).execute(&pool).await.unwrap();
+
+    migrate::apply_all(&pool).await.unwrap();
+
+    let ty: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_schema = 'oms' AND table_name = 'order_event' AND column_name = 'created_at'",
+    )
+    .fetch_one(&pool).await.unwrap();
+    assert_eq!(ty, "timestamp with time zone");
+
+    // The instant is the stored wall clock read as UTC, whatever the session zone.
+    let expected = chrono::DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z").unwrap().with_timezone(&chrono::Utc);
+    for zone in ["UTC", "Europe/Rome", "America/New_York"] {
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::query(&format!("SET TimeZone = '{zone}'")).execute(&mut *conn).await.unwrap();
+        let got: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT created_at FROM oms.order_event WHERE order_id = $1")
+                .bind(order).fetch_one(&mut *conn).await.unwrap();
+        assert_eq!(got, expected, "session zone {zone}");
+    }
+}

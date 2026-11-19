@@ -6,6 +6,13 @@
 -- ADD COLUMN is DDL, so the append-only row triggers do not fire.
 ALTER TABLE order_event ADD COLUMN occurred_at TIMESTAMPTZ;
 
+-- created_at was TIMESTAMP (no zone), written in UTC. COALESCE(occurred_at, created_at)
+-- would mix zoned and zoneless values and mis-order under a non-UTC session, so make
+-- it TIMESTAMPTZ. Existing values are read as the UTC instants they always were.
+-- ALTER TYPE rewrites the table without firing the row triggers.
+ALTER TABLE order_event
+    ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE 'UTC';
+
 ALTER TABLE order_state
     ADD COLUMN last_trade_at    TIMESTAMPTZ,  -- latest trade time among booked fills
     ADD COLUMN venue_created_at TIMESTAMPTZ,  -- when the venue created the order; set once

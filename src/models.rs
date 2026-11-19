@@ -1,4 +1,4 @@
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
@@ -130,5 +130,5 @@ pub struct OrderEvent {
     pub status_after: String,
     pub payload_json: serde_json::Value,
     pub source: String,
-    pub created_at: NaiveDateTime,
+    pub created_at: DateTime<Utc>,
 }

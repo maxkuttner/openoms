@@ -90,9 +90,7 @@ impl OrderEventStore {
                 correlation_id::text AS correlation_id,
                 causation_id::text AS causation_id,
                 schema_version,
-                -- Stored as TIMESTAMP (no zone) in UTC; sqlx will only decode a
-                -- DateTime<Utc> from a TIMESTAMPTZ, so say so in the query.
-                created_at AT TIME ZONE 'UTC' AS created_at
+                created_at
              FROM order_event
              WHERE order_id = $1
              ORDER BY version ASC"
@@ -290,8 +288,8 @@ mod tests {
     }
 
     /// `load_stream` had never run against a real database — nothing called it — so
-    /// its column list and its types had never been checked. `created_at` is
-    /// `TIMESTAMP` (no zone), which sqlx refuses to decode as `DateTime<Utc>`, and
+    /// its column list and its types had never been checked. `created_at` was
+    /// `TIMESTAMP` (no zone) before 0067, which sqlx refuses to decode as `DateTime<Utc>`, and
     /// the column it ordered by was spelled differently from the column that
     /// existed. Only Postgres can catch either.
     ///
