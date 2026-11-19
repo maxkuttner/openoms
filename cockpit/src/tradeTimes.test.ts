@@ -1,19 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sortBlotter, eventLabel, eventTimes, positionLabel, tradeTimeCell, placedCell } from "./tradeTimes.ts";
-
-const r = (id: string, trade_time: string | null, booked_at: string) => ({ order_id: id, trade_time, booked_at });
-
-test("blotter_sorts_by_trade_time_then_booked", () => {
-  const rows = [
-    r("none", null, "2026-01-05T00:00:00Z"),
-    r("old", "2026-01-01T00:00:00Z", "2026-01-09T00:00:00Z"),
-    r("new-early-book", "2026-01-03T00:00:00Z", "2026-01-03T01:00:00Z"),
-    r("new-late-book", "2026-01-03T00:00:00Z", "2026-01-03T02:00:00Z"),
-  ];
-  assert.deepEqual(sortBlotter(rows).map((x) => x.order_id), ["new-late-book", "new-early-book", "old", "none"]);
-  assert.equal(rows[0].order_id, "none"); // input untouched
-});
+import { eventLabel, eventTimes, positionLabel, tradeTimeCell, placedCell } from "./tradeTimes.ts";
 
 test("timeline_labels_observed_not_submitted", () => {
   assert.equal(eventLabel("order_observed"), "Observed at venue");
@@ -24,6 +11,7 @@ test("timeline_labels_observed_not_submitted", () => {
 
 test("positions_label_uses_instrument_name", () => {
   assert.deepEqual(positionLabel({ instrument_id: "7", instrument_symbol: "AAPL", instrument_name: "Apple Inc" }), { text: "AAPL", tooltip: "Apple Inc (7)" });
+  assert.deepEqual(positionLabel({ instrument_id: "7", instrument_symbol: null, instrument_name: "Apple Inc" }), { text: "Apple Inc", tooltip: "7" });
   assert.deepEqual(positionLabel({ instrument_id: "7", instrument_symbol: null, instrument_name: null }), { text: "7", tooltip: null });
 });
 

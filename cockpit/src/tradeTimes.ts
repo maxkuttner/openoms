@@ -8,21 +8,6 @@ export const FIRST_SEEN_TIP = "first seen: the OMS did not place this order; thi
 /// Default formatter: the user's local timezone, like every other cockpit timestamp.
 export const fmtLocal = (iso: string): string => new Date(iso).toLocaleString();
 
-/// Trade time desc (no trade time last), then booked desc. Returns a new array.
-export function sortBlotter<T extends { trade_time: string | null; booked_at: string }>(rows: T[]): T[] {
-  const ms = (s: string | null) => (s === null ? null : Date.parse(s));
-  return [...rows].sort((a, b) => {
-    const ta = ms(a.trade_time);
-    const tb = ms(b.trade_time);
-    if (ta !== tb) {
-      if (ta === null) return 1;
-      if (tb === null) return -1;
-      return tb - ta;
-    }
-    return Date.parse(b.booked_at) - Date.parse(a.booked_at);
-  });
-}
-
 export interface Cell {
   text: string;
   tooltip: string | null;
@@ -68,7 +53,9 @@ export function positionLabel(p: {
   instrument_symbol: string | null;
   instrument_name: string | null;
 }): Cell {
-  if (p.instrument_symbol === null) return { text: p.instrument_id, tooltip: null };
+  if (p.instrument_symbol === null) {
+    return p.instrument_name ? { text: p.instrument_name, tooltip: p.instrument_id } : { text: p.instrument_id, tooltip: null };
+  }
   return {
     text: p.instrument_symbol,
     tooltip: p.instrument_name ? `${p.instrument_name} (${p.instrument_id})` : p.instrument_id,

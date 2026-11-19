@@ -14,7 +14,7 @@ import { useLive } from "../../api/liveUpdates";
 import { numeric } from "./table";
 import { OrderTimeline } from "../OrderTimeline";
 import type { Cell } from "../../tradeTimes";
-import { placedCell, sortBlotter, tradeTimeCell } from "../../tradeTimes";
+import { fmtLocal, placedCell, tradeTimeCell } from "../../tradeTimes";
 import { formatFees } from "../../fees";
 import type { BlotterRow } from "../../api/types";
 import type { GrantedPortfolio } from "../../access";
@@ -141,8 +141,9 @@ export function TradeBlotter({
     }
   }
 
-  // No client-side filtering: what came back IS the answer to the query asked.
-  const rows = sortBlotter(orders.data ?? []);
+  // No client-side filtering or sorting: the server returns the page already
+  // ordered (trade time desc, nulls last, then booked desc).
+  const rows = orders.data ?? [];
   const windowFull = rows.length >= BLOTTER_LIMIT;
 
   const HEAD: [string, boolean][] = [
@@ -226,8 +227,8 @@ export function TradeBlotter({
                   >
                     <TableCell className="num"><TipText cell={placedCell(o)} /></TableCell>
                     <TableCell className="num"><TipText cell={tradeTimeCell(o)} /></TableCell>
-                    <TableCell className="num">{new Date(o.booked_at).toLocaleString()}</TableCell>
-                    <TableCell className="num">{new Date(o.updated_at).toLocaleString()}</TableCell>
+                    <TableCell className="num">{fmtLocal(o.booked_at)}</TableCell>
+                    <TableCell className="num">{fmtLocal(o.updated_at)}</TableCell>
                     <TableCell>
                       <div className="flex flex-col items-start">
                         {o.instrument_name ? (
