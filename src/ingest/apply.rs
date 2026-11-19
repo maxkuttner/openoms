@@ -693,15 +693,6 @@ async fn book(
         fee = f.fee.as_ref().and_then(|(amount, ccy)| fee_charge(ctx.broker, &f.exec_id, *amount, ccy));
     }
 
-    let portfolio = Uuid::parse_str(&state.portfolio_id).map_err(|e| IngestError::Other(e.to_string()))?;
-    for e in &events {
-        if let OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-        | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } = &e.payload
-        {
-            positions::persist_fill(tx, portfolio, &state.instrument_id, state.side, *fill_qty, *fill_price, trade_time)
-                .await?;
-        }
-    }
     let mut new_events = events
         .iter()
         .map(domain_event_to_new_event)
@@ -720,6 +711,19 @@ async fn book(
         Err(EventStoreError::Concurrency(_)) => return Ok(BookOutcome::Retry),
         Err(EventStoreError::Sqlx(e)) => return Err(e.into()),
     };
+    let portfolio = Uuid::parse_str(&state.portfolio_id).map_err(|e| IngestError::Other(e.to_string()))?;
+    for e in &events {
+        if let OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
+        | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } = &e.payload
+        {
+            // after the append: a late fill rebuilds the position from the log
+            if positions::persist_fill(tx, portfolio, &state.instrument_id, state.side, *fill_qty, *fill_price, trade_time)
+                .await?
+            {
+                break;
+            }
+        }
+    }
     info!(%order_id, status = state.status.as_str(), connection = ctx.connection, "ingest: booked");
     Ok(BookOutcome::Booked(Booked {
         order_id,

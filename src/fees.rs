@@ -208,8 +208,6 @@ async fn book_once(
         return Ok(FeeBooked::Duplicate);
     }
 
-    positions::persist_fee(&mut *tx, portfolio_id, &instrument_id, fee.amount, effect).await?;
-
     let event = OrderDomainEvent {
         event_id: Uuid::new_v4().to_string(),
         event_type: OrderEventType::OrderFeeCharged,
@@ -248,6 +246,10 @@ async fn book_once(
                 other => format!("event store error: {other:?}").into(),
             }
         })?;
+
+    // after the append: a base fee on an older fill rebuilds the position from the log
+    positions::persist_fee(&mut *tx, portfolio_id, &instrument_id, order_id, fee.execution_id.as_deref(), fee.amount, effect)
+        .await?;
 
     sqlx::query("UPDATE order_state SET version = version + 1, updated_at = now() WHERE order_id = $1")
         .bind(order_id)

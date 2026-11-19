@@ -227,29 +227,6 @@ async fn apply_once(
     .execute(&mut *tx)
     .await?;
 
-    // Maintain the position projection from any fill events, in the same tx so it
-    // commits atomically with the order_state update + event append below.
-    let portfolio_uuid = Uuid::parse_str(&new_state.portfolio_id)?;
-    let mut any_fill = false;
-    for event in &events {
-        let (fill_qty, fill_price) = match &event.payload {
-            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (*fill_qty, *fill_price),
-            _ => continue,
-        };
-        any_fill = true;
-        positions::persist_fill(
-            &mut *tx,
-            portfolio_uuid,
-            &new_state.instrument_id,
-            new_state.side,
-            fill_qty,
-            fill_price,
-            trade_time(event),
-        )
-        .await?;
-    }
-
     let new_events: Vec<NewOrderEvent> = events
         .iter()
         .map(|e| {
@@ -278,6 +255,33 @@ async fn apply_once(
                 other => format!("event store error: {other:?}").into(),
             }
         })?;
+
+    // Maintain the position projection from any fill events, in the same tx so it
+    // commits atomically with the order_state update + event append above. The
+    // events go first: a late fill rebuilds the position from the log.
+    let portfolio_uuid = Uuid::parse_str(&new_state.portfolio_id)?;
+    let mut any_fill = false;
+    for event in &events {
+        let (fill_qty, fill_price) = match &event.payload {
+            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
+            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (*fill_qty, *fill_price),
+            _ => continue,
+        };
+        any_fill = true;
+        let rebuilt = positions::persist_fill(
+            &mut *tx,
+            portfolio_uuid,
+            &new_state.instrument_id,
+            new_state.side,
+            fill_qty,
+            fill_price,
+            trade_time(event),
+        )
+        .await?;
+        if rebuilt {
+            break;
+        }
+    }
 
     tx.commit().await?;
 
