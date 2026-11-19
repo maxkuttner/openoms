@@ -554,23 +554,66 @@ pub async fn rebuild_positions(pool: &PgPool) -> Result<usize, sqlx::Error> {
     rebuild_positions_scoped(pool, None).await
 }
 
+/// Boot backfill: when the position projection is empty, rebuild it from the event
+/// log (Some(rows written)); otherwise do nothing (None). Boot calls it before
+/// anything that can book a fill starts. Migration 0067 empties the table so every
+/// row gets its trade-time key here.
+pub async fn rebuild_if_empty(pool: &PgPool) -> Result<Option<usize>, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM position").fetch_one(pool).await?;
+    if n > 0 {
+        return Ok(None);
+    }
+    rebuild_positions(pool).await.map(Some)
+}
+
 /// [`rebuild_positions`] limited to one portfolio (`Some`), leaving every other
 /// portfolio's positions untouched; `None` rebuilds everything.
+///
+/// Safe against concurrent booking: it takes the incremental path's per-position
+/// advisory lock for every position it rewrites (existing rows plus every key with
+/// inputs), in one (instrument, portfolio) order, then reads the inputs inside the
+/// transaction. A position that first appears after the key list was taken is
+/// neither locked nor touched: its own writer maintains it.
 pub async fn rebuild_positions_scoped(pool: &PgPool, portfolio: Option<Uuid>) -> Result<usize, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut keys: Vec<(String, Uuid)> = sqlx::query_as(
+        "SELECT instrument_id, portfolio_id FROM position WHERE ($1::uuid IS NULL OR portfolio_id = $1) \
+         UNION SELECT os.instrument_id, os.portfolio_id FROM order_state os \
+           WHERE ($1::uuid IS NULL OR os.portfolio_id = $1) \
+             AND EXISTS (SELECT 1 FROM order_event e WHERE e.order_id = os.order_id \
+                         AND e.event_type IN ('order_partially_filled', 'order_filled', 'order_fee_charged')) \
+         UNION SELECT instrument_id, from_portfolio_id FROM allocation WHERE ($1::uuid IS NULL OR from_portfolio_id = $1) \
+         UNION SELECT instrument_id, to_portfolio_id FROM allocation WHERE ($1::uuid IS NULL OR to_portfolio_id = $1)",
+    )
+    .bind(portfolio)
+    .fetch_all(&mut *tx)
+    .await?;
+    keys.sort();
+    for (instrument_id, portfolio_id) in &keys {
+        lock_position(&mut tx, *portfolio_id, instrument_id).await?;
+    }
     let rows = sqlx::query(&replay_sql())
         .bind(portfolio)
         .bind(None::<String>)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
     let acc = replay(&rows);
 
-    let mut tx = pool.begin().await?;
-    sqlx::query("DELETE FROM position WHERE ($1::uuid IS NULL OR portfolio_id = $1)")
-        .bind(portfolio)
-        .execute(&mut *tx)
-        .await?;
+    let (instruments, portfolios): (Vec<String>, Vec<Uuid>) = keys.iter().cloned().unzip();
+    sqlx::query(
+        "DELETE FROM position p USING unnest($1::text[], $2::uuid[]) k(instrument_id, portfolio_id) \
+         WHERE p.instrument_id = k.instrument_id AND p.portfolio_id = k.portfolio_id",
+    )
+    .bind(&instruments)
+    .bind(&portfolios)
+    .execute(&mut *tx)
+    .await?;
+    let locked: std::collections::HashSet<(Uuid, &str)> = keys.iter().map(|(i, p)| (*p, i.as_str())).collect();
     let mut written = 0;
     for ((portfolio_id, instrument_id), r) in &acc {
+        if !locked.contains(&(*portfolio_id, instrument_id.as_str())) {
+            continue;
+        }
         let Some(p) = r.math else { continue };
         sqlx::query(
             "INSERT INTO position \
@@ -1244,6 +1287,37 @@ mod tests {
             rebuilt.unwrap();
             close(live, PositionMath { net_qty: 1.9, avg_cost: 100.0, realized_pnl: 40.0 }, "live");
             assert_eq!(after, live);
+        }
+
+        /// A rebuild waits for a writer holding the position lock, then sees its
+        /// fill: it neither overwrites an in-flight booking nor misses it.
+        #[tokio::test]
+        #[ignore = "needs a live Postgres; run with --ignored"]
+        async fn rebuild_waits_for_in_flight_fill() {
+            let pool = test_pool().await;
+            let b = book(&pool).await;
+            fill(&pool, &b, OrderSide::Buy, "w0", 1.0, 100.0, t(0)).await;
+            // a writer mid-booking: lock held, fill appended and applied, not committed
+            let mut tx = pool.begin().await.unwrap();
+            let payload = OrderEventPayload::OrderPartiallyFilled {
+                execution_id: "w1".into(), fill_qty: 1.0, fill_price: 200.0, cum_qty: 1.0, leaves_qty: 0.0, avg_px: 200.0, venue: "TEST".into(),
+            };
+            append(&pool, &mut tx, b.buy, OrderEventType::OrderPartiallyFilled, payload, Some(t(1))).await;
+            persist_fill(&mut tx, b.portfolio, &b.instrument, OrderSide::Buy, 1.0, 200.0, t(1), "w1").await.unwrap();
+            let rebuild = tokio::spawn({
+                let pool = pool.clone();
+                let portfolio = b.portfolio;
+                async move { rebuild_positions_scoped(&pool, Some(portfolio)).await }
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let waited = !rebuild.is_finished();
+            tx.commit().await.unwrap();
+            let rebuilt = rebuild.await.unwrap();
+            let after = pos(&pool, b.portfolio, &b.instrument).await;
+            drop_book(&pool, &b).await;
+            rebuilt.unwrap();
+            assert!(waited, "rebuild did not wait for the position lock");
+            close(after, PositionMath { net_qty: 2.0, avg_cost: 150.0, realized_pnl: 0.0 }, "after");
         }
     }
 }

@@ -19,7 +19,7 @@ ALTER TABLE order_state
     ADD COLUMN venue_cum_qty    NUMERIC;      -- venue-reported cumulative qty; informational
 
 -- Legacy filled orders: trade time falls back to booking time of the last fill event.
--- Position rows are left alone.
+-- Position rows are emptied below and rebuilt at boot.
 UPDATE order_state os SET last_trade_at = f.t
 FROM (SELECT order_id, max(created_at) t FROM order_event
       WHERE event_type IN ('order_partially_filled','order_filled') GROUP BY order_id) f
@@ -35,3 +35,8 @@ ALTER TABLE position
 
 -- Matches the blotter's default order (trade time, then booking time).
 CREATE INDEX idx_order_state_last_trade_at ON order_state (last_trade_at DESC NULLS LAST, created_at DESC);
+
+-- Legacy position rows have no key, so a late fill would apply incrementally on top
+-- of them. Empty the projection; the server rebuilds it from the event log (with
+-- keys) at boot, before anything can book (positions::rebuild_if_empty).
+DELETE FROM position;

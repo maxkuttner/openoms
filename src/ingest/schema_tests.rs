@@ -436,3 +436,86 @@ async fn legacy_filled_order_gets_booking_time_as_trade_time() {
     assert_eq!(get(filled).await, Some(expected));
     assert_eq!(get(unfilled).await, None);
 }
+
+/// A fill event's payload as the domain writes it (replay reads it back).
+fn fill_payload(order: Uuid, version: i64, exec: &str, qty: f64, price: f64, at: Option<chrono::DateTime<chrono::Utc>>) -> serde_json::Value {
+    use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload, OrderEventType};
+    serde_json::to_value(OrderDomainEvent {
+        event_id: Uuid::new_v4().to_string(),
+        event_type: OrderEventType::OrderPartiallyFilled,
+        order_id: order.to_string(),
+        timestamp: chrono::Utc::now(),
+        actor: "test".into(),
+        payload: OrderEventPayload::OrderPartiallyFilled {
+            execution_id: exec.into(), fill_qty: qty, fill_price: price, cum_qty: qty, leaves_qty: 0.0, avg_px: price, venue: "TEST".into(),
+        },
+        version,
+        status_after: crate::domain::orders::state::OrderStatus::PartiallyFilled,
+        occurred_at: at,
+    })
+    .unwrap()
+}
+
+/// A position booked before 0067 has no trade-time key. After the upgrade and the
+/// boot rebuild, a fill older than its legacy inputs must rebuild the position, so
+/// the result equals a full canonical rebuild.
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn legacy_position_then_older_fill_matches_canonical_rebuild() {
+    use crate::domain::orders::state::OrderSide;
+    let pool = fresh_db().await;
+    migrate::ensure_tracking(&pool).await.unwrap();
+    migrate::apply_matching(&pool, |schema, file| schema != "oms" || file < "0067_").await.unwrap();
+
+    let b = seed_base(&pool).await;
+    let buy = seed_order(&pool, &b, "lp-buy").await;
+    let sell = seed_order(&pool, &b, "lp-sell").await;
+    sqlx::query("UPDATE oms.order_state SET side = 'buy' WHERE order_id = $1").bind(buy).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE oms.order_state SET side = 'sell' WHERE order_id = $1").bind(sell).execute(&pool).await.unwrap();
+    // Legacy: buy 2 @ 100 booked 12:00, sell 1 @ 120 booked 13:00 → long 1 @ 100, realized 20.
+    for (order, v, exec, qty, px, ts) in [(buy, 1, "lx-1", 2.0, 100.0, "2026-01-01 12:00:00"), (sell, 1, "lx-2", 1.0, 120.0, "2026-01-01 13:00:00")] {
+        sqlx::query(&format!(
+            "INSERT INTO oms.order_event (order_id, version, event_id, event_type, payload_json, created_at) \
+             VALUES ($1, $2, $3, 'order_partially_filled', $4, TIMESTAMP '{ts}')"
+        ))
+        .bind(order).bind(v).bind(Uuid::new_v4()).bind(fill_payload(order, v, exec, qty, px, None))
+        .execute(&pool).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO oms.position (portfolio_id, instrument_id, net_qty, avg_cost, realized_pnl) \
+         VALUES ($1, 'BTCUSDT', 1, 100, 20)",
+    )
+    .bind(b.portfolio).execute(&pool).await.unwrap();
+
+    migrate::apply_all(&pool).await.unwrap();
+    crate::positions::rebuild_if_empty(&pool).await.unwrap();
+
+    // A late buy 1 @ 50 traded 11:00, before both legacy fills.
+    let at = chrono::DateTime::parse_from_rfc3339("2026-01-01T11:00:00Z").unwrap().with_timezone(&chrono::Utc);
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO oms.order_event (order_id, version, event_id, event_type, payload_json, occurred_at) \
+         VALUES ($1, 2, $2, 'order_partially_filled', $3, $4)",
+    )
+    .bind(buy).bind(Uuid::new_v4()).bind(fill_payload(buy, 2, "lx-0", 1.0, 50.0, Some(at))).bind(at)
+    .execute(&mut *tx).await.unwrap();
+    crate::positions::persist_fill(&mut tx, b.portfolio, "BTCUSDT", OrderSide::Buy, 1.0, 50.0, at, "lx-0").await.unwrap();
+    tx.commit().await.unwrap();
+
+    let read = || {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (f64, f64, f64)>(
+                "SELECT net_qty::float8, avg_cost::float8, realized_pnl::float8 FROM oms.position \
+                 WHERE portfolio_id = $1 AND instrument_id = 'BTCUSDT'",
+            )
+            .bind(b.portfolio).fetch_one(&pool).await.unwrap()
+        }
+    };
+    let incremental = read().await;
+    crate::positions::rebuild_positions(&pool).await.unwrap();
+    let canonical = read().await;
+    // Canonical: buy 1@50, buy 2@100 → 3 @ 83.33; sell 1 @ 120 → realized 36.67.
+    assert!((canonical.1 - 250.0 / 3.0).abs() < 1e-9, "canonical {canonical:?}");
+    assert_eq!(incremental, canonical);
+}
