@@ -18,6 +18,13 @@ use super::{Connector, Manifest, QuoteScope};
 
 pub struct Okx;
 
+/// The dedup key of one OKX fill, the same from the orders stream and the
+/// fills pull: `tradeId` is per instrument, and on a self-trade both sides
+/// share one, so the key is `{instId}:{tradeId}:{B|S}`.
+pub(crate) fn fill_exec_id(inst_id: &str, trade_id: &str, buy: bool) -> String {
+    format!("{inst_id}:{trade_id}:{}", if buy { "B" } else { "S" })
+}
+
 static MANIFEST: Manifest = Manifest {
     code: "OKX",
     credential_kind: "Okx",
@@ -31,6 +38,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: false,
     price_band_exempt: false,
     per_currency_notional: false,
+    multi_account: false,
 };
 
 impl Connector for Okx {
@@ -42,12 +50,15 @@ impl Connector for Okx {
         let c: crate::connectors::okx::adapter::OkxCredentials = typed(creds, MANIFEST.credential_kind)?;
         let adapter = Arc::new(crate::connectors::okx::adapter::OkxAdapter::new(c.api_key, c.api_secret, c.passphrase, env));
         let stream_adapter = adapter.clone();
+        // Venue events only: the reconciler books every fill (exactly once,
+        // through ingest) and pulls what the stream missed.
         Ok(Connected {
+            source: Some(adapter.clone()),
+            venue_stream: Some(Arc::new(move |health, tx| {
+                Box::pin(crate::connectors::okx::stream::run(env, stream_adapter.clone(), health, tx))
+            })),
             daily_stats: Some(adapter.clone()),
             adapter,
-            exec_stream: Some(Arc::new(move |health, engine| {
-                Box::pin(crate::connectors::okx::stream::run(env, stream_adapter.clone(), health, engine))
-            })),
         })
     }
 

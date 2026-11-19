@@ -22,6 +22,13 @@ use crate::fix::dialect::{
 /// unordered (recommended for order entry).
 const MESSAGE_HANDLING: i32 = 25035;
 
+/// `TradeID`(1003), on trade execution reports: the trade id REST `myTrades`
+/// returns as `id`. Fills key on it, not on `ExecID`(17) — an execution id that
+/// differs from the trade id — so the FIX stream and the REST pull book one
+/// trade under one exec id. NewOrderSingle carries no `Account`(1): Binance's
+/// FIX dictionary does not define it (a FIX session is one account).
+pub const TRADE_ID: i32 = 1003;
+
 pub struct BinanceDialect {
     api_key: String,
     signing_key: SigningKey,
@@ -111,7 +118,13 @@ impl FixDialect for BinanceDialect {
     }
 
     fn parse_execution_report(&self, msg: &Message) -> Option<ParsedExecReport> {
-        parse_standard_exec_report(msg, self.venue())
+        let mut parsed = parse_standard_exec_report(msg, TRADE_ID)?;
+        for e in &mut parsed.events {
+            if let crate::venue_event::VenueEvent::Fill(f) = e {
+                f.exec_id = super::fill_exec_id(&f.symbol, &f.exec_id, f.buy);
+            }
+        }
+        Some(parsed)
     }
 }
 
@@ -126,6 +139,44 @@ mod tests {
     // A throwaway Ed25519 PKCS#8 PEM (generated for tests only, not a real
     // credential) so the Binance dialect constructs its signing key.
     const TEST_ED25519_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAGvAMHEDQzczRRSN2T3AYeEUyaWSwA6GXlSZ2hjM8TC\n-----END PRIVATE KEY-----\n";
+
+    /// Binance FIX `ExecID`(17) is an execution id (also on non-trade reports);
+    /// REST `myTrades.id` is the trade id, which FIX carries as `TradeID`(1003).
+    /// Both paths must key a fill on the trade id or ingest books it twice.
+    #[test]
+    fn binance_fix_and_rest_produce_the_same_exec_id() {
+        let d = BinanceDialect::new("key".into(), TEST_ED25519_PEM).unwrap();
+        let mut m = Message::new();
+        m.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "8")).unwrap();
+        for (t, v) in [
+            (tag::CL_ORD_ID, "c-1"), (tag::ORDER_ID, "9001"), (tag::EXEC_ID, "88812"), (TRADE_ID, "501"),
+            (tag::EXEC_TYPE, "F"), (tag::ORD_STATUS, "2"), (tag::SYMBOL, "BTCUSDT"), (tag::SIDE, "1"),
+            (tag::LAST_QTY, "0.25"), (tag::LAST_PX, "64000.5"),
+        ] {
+            m.set_field(t, v).unwrap();
+        }
+        let fix = d.parse_execution_report(&m).unwrap();
+        let fix_fill = fix.events.iter().find_map(|e| match e { crate::venue_event::VenueEvent::Fill(f) => Some(f.clone()), _ => None }).unwrap();
+
+        let body = serde_json::json!([{ "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0", "commissionAsset": "BNB" }]);
+        let rest = crate::connectors::binance::adapter::trades_page(&body, "", 1000, chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        assert_eq!(fix_fill.exec_id, rest.fills[0].exec_id);
+        assert_eq!(fix_fill.exec_id, "BTCUSDT:501:B");
+        let ws = serde_json::json!({ "e": "executionReport", "x": "TRADE", "X": "FILLED", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+            "i": 9001, "q": "0.25", "z": "0.25", "l": "0.25", "L": "64000.5", "t": 501, "T": 1700000000000i64 });
+        let ws_fill = crate::connectors::binance::stream::venue_events(&ws).into_iter()
+            .find_map(|e| match e { crate::venue_event::VenueEvent::Fill(f) => Some(f), _ => None }).unwrap();
+        assert_eq!(ws_fill.exec_id, fix_fill.exec_id, "stream, REST and FIX share one key");
+        assert_eq!(fix_fill.venue_order_id, rest.fills[0].venue_order_id);
+    }
+
+    #[test]
+    fn binance_new_order_single_omits_account_tag() {
+        // Binance's FIX dictionary has no Account(1) on 35=D; sending it draws a Reject.
+        let d = BinanceDialect::new("key".into(), TEST_ED25519_PEM).unwrap();
+        let msg = d.build_new_order_single(&order(&Uuid::new_v4(), "market", None)).unwrap();
+        assert_eq!(msg.get_field(tag::ACCOUNT), None);
+    }
 
     #[test]
     fn binance_market_order_omits_price_and_tif() {

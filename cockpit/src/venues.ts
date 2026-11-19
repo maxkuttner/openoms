@@ -26,6 +26,8 @@ export type Venue = {
   universe: string | null;
   environments: VenueEnvironment[];
   fields: VenueField[];
+  // One credential reaches several venue accounts (IBKR).
+  multi_account?: boolean;
 };
 
 type Option = { value: string; label: string };

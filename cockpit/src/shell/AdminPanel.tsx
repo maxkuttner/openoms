@@ -3,6 +3,7 @@ import { ADMIN_TABS, adminTabFor } from "../nav";
 import { SetupChecklist } from "../components/SetupChecklist";
 import { cn } from "@/lib/utils";
 import { useSession } from "./session";
+import { useOpenBreaks } from "../pages/admin/Breaks";
 
 /** Shown in the shell when a non-admin opens an admin URL. */
 export function NoAccess() {
@@ -13,10 +14,20 @@ export function NoAccess() {
   );
 }
 
+function CountBadge({ n }: { n: number }) {
+  if (n === 0) return null;
+  return (
+    <span className="ml-1.5 rounded-full bg-sell px-1.5 py-px text-[10px] font-medium text-white" aria-label={`${n} open breaks`}>
+      {n}
+    </span>
+  );
+}
+
 /** The Admin Panel: four tabs across the top, a sub-nav per tab, the page below. */
 export function AdminPanel() {
   const { admin } = useSession();
   const { pathname } = useLocation();
+  const openBreaks = useOpenBreaks(admin).length;
   if (!admin) return <NoAccess />;
 
   const active = adminTabFor(pathname) ?? ADMIN_TABS[0];
@@ -34,6 +45,7 @@ export function AdminPanel() {
             )}
           >
             {t.title}
+            {t.id === "monitoring" && <CountBadge n={openBreaks} />}
           </NavLink>
         ))}
       </nav>
@@ -48,6 +60,7 @@ export function AdminPanel() {
               }
             >
               {p.title}
+              {p.id === "breaks" && <CountBadge n={openBreaks} />}
             </NavLink>
           ))}
         </nav>

@@ -13,7 +13,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use colo_link::v2::{EventBatch, EventRecord};
-use gateway::contract::ExternalFill;
+use gateway::venue_event::VenueFill;
 use gateway::runtime::{AccountIdentity, RuntimeEvent, Side, Trade, TradeKey, VenueEvent};
 
 use crate::admin::AdminError;
@@ -207,8 +207,9 @@ pub async fn drain_inbox(
     let guard = state.colo().drain_guard(deployment_id);
     let _draining = guard.lock().await;
     let deployment = sqlx::query(
-        "SELECT strategy_code, account_id, venue, environment, external_account_ref, status, ingest_suspended_reason \
-         FROM colo_deployment WHERE id = $1",
+        "SELECT d.strategy_code, d.account_id, d.venue, d.environment, d.external_account_ref, d.status, \
+                d.ingest_suspended_reason, a.broker_connection_code \
+         FROM colo_deployment d JOIN account a ON a.id = d.account_id WHERE d.id = $1",
     )
     .bind(deployment_id)
     .fetch_optional(state.pool())
@@ -228,6 +229,7 @@ pub async fn drain_inbox(
         external_account_ref: deployment.get("external_account_ref"),
     };
     let strategy_code: String = deployment.get("strategy_code");
+    let connection: String = deployment.get("broker_connection_code");
     let rows = sqlx::query(
         "SELECT sequence, payload FROM colo_event_inbox \
          WHERE deployment_id = $1 AND processed_at IS NULL ORDER BY sequence",
@@ -245,31 +247,29 @@ pub async fn drain_inbox(
             .map_err(|e| IngestError::Invalid(e.to_string()))?;
         if let RuntimeEvent::Venue { account: _, event: VenueEvent::Trade(trade) } = &record.event {
             observe_trade(state, &identity, trade).await?;
-            {
-                let strategy = state
-                    .strategies()
-                    .by_code(&strategy_code)
-                    .ok_or_else(|| IngestError::Invalid(format!("unknown strategy {strategy_code}")))?;
-                let adapter = state
-                    .colo()
-                    .adapter(&strategy_code)
-                    .ok_or_else(|| IngestError::Invalid("no venue adapter for booking".into()))?;
-                let fill = ExternalFill {
-                    trade_id: trade.key.trade_id.clone(),
-                    venue_order_id: trade.venue_order_id.clone(),
-                    client_order_id: trade.client_order_id.clone(),
-                    symbol: trade.key.symbol.clone(),
-                    buy: trade.side == Side::Buy,
-                    qty: trade.quantity,
-                    price: trade.price,
-                    fee_amount: trade.fee.as_ref().map(|f| f.amount),
-                    fee_currency: trade.fee.as_ref().map(|f| f.currency.clone()),
-                    executed_at: Some(trade.executed_at),
-                };
-                super::booking::book_fill(state, &strategy, &adapter, &fill)
-                    .await
-                    .map_err(IngestError::Invalid)?;
-            }
+            // The OMS order and its fill book through ingest, once: the
+            // follow stream and pulls report the same trade id and dedupe.
+            let fill = VenueFill {
+                exec_id: gateway::connectors::binance::fill_exec_id(&trade.key.symbol, &trade.key.trade_id, trade.side == Side::Buy),
+                venue_order_id: trade.venue_order_id.clone(),
+                client_order_id: Some(trade.client_order_id.clone()).filter(|c| !c.is_empty()),
+                account_ref: identity.external_account_ref.clone(),
+                symbol: trade.key.symbol.clone(),
+                buy: trade.side == Side::Buy,
+                qty: trade.quantity,
+                price: trade.price,
+                fee: trade.fee.as_ref().filter(|f| f.amount != 0.0).map(|f| (f.amount, f.currency.clone())),
+                executed_at: Some(trade.executed_at),
+            };
+            let instruments = state
+                .colo()
+                .adapter(&strategy_code)
+                .map(|a| a as std::sync::Arc<dyn gateway::adapter::InstrumentProvider>);
+            state
+                .engine()
+                .venue_ack(&connection, gateway::venue_event::VenueEvent::Fill(fill), instruments)
+                .await
+                .map_err(IngestError::Invalid)?;
         }
         sqlx::query(
             "UPDATE colo_event_inbox SET processed_at = now() \
@@ -662,7 +662,7 @@ pub async fn adjustment(
 
 pub fn trade_from_external(
     identity: &AccountIdentity,
-    fill: &gateway::contract::ExternalFill,
+    fill: &VenueFill,
     executed_at: DateTime<Utc>,
 ) -> Trade {
     Trade {
@@ -671,10 +671,10 @@ pub fn trade_from_external(
             account_id: identity.account_id,
             environment: identity.environment.clone(),
             symbol: fill.symbol.clone(),
-            trade_id: fill.trade_id.clone(),
+            trade_id: gateway::connectors::binance::trade_id_of(&fill.exec_id).to_string(),
         },
         venue_order_id: fill.venue_order_id.clone(),
-        client_order_id: fill.client_order_id.clone(),
+        client_order_id: fill.client_order_id.clone().unwrap_or_default(),
         side: if fill.buy { Side::Buy } else { Side::Sell },
         quantity: fill.qty,
         price: fill.price,
@@ -712,7 +712,7 @@ pub async fn identity_for_strategy(
 pub async fn observe_external_fill(
     state: &AppState,
     identity: &AccountIdentity,
-    fill: &gateway::contract::ExternalFill,
+    fill: &VenueFill,
 ) -> Result<Option<TradeReceipt>, IngestError> {
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM colo_deployment WHERE account_id = $1 AND venue = $2 AND environment = $3 AND status = 'ACTIVE')",
@@ -733,7 +733,6 @@ pub async fn observe_external_fill(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway::contract::ExternalFill;
 
     fn identity() -> AccountIdentity {
         AccountIdentity {
@@ -744,17 +743,17 @@ mod tests {
         }
     }
 
-    fn fill() -> ExternalFill {
-        ExternalFill {
-            trade_id: "7".into(),
+    fn fill() -> VenueFill {
+        VenueFill {
+            exec_id: "BTCUSDT:7:B".into(),
             venue_order_id: "9".into(),
-            client_order_id: "c".into(),
+            client_order_id: Some("c".into()),
+            account_ref: "sub".into(),
             symbol: "BTCUSDT".into(),
             buy: true,
             qty: 1.0,
             price: 100.0,
-            fee_amount: None,
-            fee_currency: None,
+            fee: None,
             executed_at: None,
         }
     }

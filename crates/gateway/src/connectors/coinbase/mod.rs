@@ -31,6 +31,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: false,
     price_band_exempt: false,
     per_currency_notional: false,
+    multi_account: false,
 };
 
 impl Connector for Coinbase {
@@ -44,12 +45,15 @@ impl Connector for Coinbase {
             .map_err(|e| format!("Coinbase adapter not registered: {e}"))?;
         let adapter = Arc::new(adapter);
         let stream_adapter = adapter.clone();
+        // Venue events only: the reconciler books every fill (exactly once,
+        // through ingest) and pulls what the stream missed.
         Ok(Connected {
+            source: Some(adapter.clone()),
+            venue_stream: Some(Arc::new(move |health, tx| {
+                Box::pin(crate::connectors::coinbase::stream::run(env, stream_adapter.clone(), health, tx))
+            })),
             daily_stats: Some(adapter.clone()),
             adapter,
-            exec_stream: Some(Arc::new(move |health, engine| {
-                Box::pin(crate::connectors::coinbase::stream::run(env, stream_adapter.clone(), health, engine))
-            })),
         })
     }
 

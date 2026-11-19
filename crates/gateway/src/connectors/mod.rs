@@ -78,6 +78,9 @@ pub struct Manifest {
     /// is dropped, and only a limit set in the instrument's own currency
     /// applies. Every other venue refuses such an order.
     pub per_currency_notional: bool,
+    /// One credential reaches several venue accounts (IBKR), so every venue
+    /// event names the account it belongs to.
+    pub multi_account: bool,
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential
@@ -90,8 +93,10 @@ pub struct RegistrationDeps {
     pub engine: EngineHandle,
 }
 
-/// Starts one execution stream; called again on every restart.
-pub type ExecStream = Arc<dyn Fn(StreamHandle, EngineHandle) -> BoxFuture<'static, ()> + Send + Sync>;
+/// Starts one venue-event stream; called again on every restart. Its events go
+/// to the connection's reconciler, not straight to the engine.
+pub type VenueStream =
+    Arc<dyn Fn(StreamHandle, tokio::sync::mpsc::Sender<crate::venue_event::VenueEvent>) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// A live quote source the OMS drives: it knows what it can price and how to stream it.
 pub trait QuoteSource: LiveQuoteFeed + FeedSymbology {}
@@ -110,12 +115,13 @@ pub struct PublicFeed {
 /// What connecting one configured connection produced.
 pub struct Connected {
     pub adapter: Arc<dyn BrokerAdapter>,
-    /// The execution stream to (re)start for it; `None` when the session that
-    /// routes orders also delivers fills (FIX).
-    pub exec_stream: Option<ExecStream>,
     /// Its previous-close source for the market-data side; `None` when the
     /// connection has no snapshot endpoint (FIX).
     pub daily_stats: Option<Arc<dyn DailyStats>>,
+    /// Pull side of execution reconciliation; `None` until a connector has one.
+    pub source: Option<Arc<dyn crate::venue_event::ExecutionSource>>,
+    /// The sink-based stream that goes with `source`.
+    pub venue_stream: Option<VenueStream>,
 }
 
 pub trait Connector: Send + Sync {
@@ -208,6 +214,14 @@ pub fn by_credential_kind(kind: &str) -> Option<&'static dyn Connector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_multi_account_only_ibkr() {
+        for c in all() {
+            let m = c.manifest();
+            assert_eq!(m.multi_account, matches!(m.code, "IBKR" | "IBKR_TWS"), "{}", m.code);
+        }
+    }
 
     /// `GET /admin/venues` drives the cockpit's connection form; moving each
     /// venue's description into its connector must not change one byte of it.

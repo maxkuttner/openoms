@@ -270,6 +270,15 @@
         "section": null,
         "paper": null,
         "live": null
+      },
+      {
+        "name": "master_client_id",
+        "label": "API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value)",
+        "secret": false,
+        "input": "text",
+        "section": null,
+        "paper": "0",
+        "live": "0"
       }
     ]
   },

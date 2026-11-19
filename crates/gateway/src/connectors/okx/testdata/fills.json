@@ -1,0 +1,5 @@
+{"code":"0","msg":"","data":[
+{"instType":"SPOT","instId":"BTC-USDT","tradeId":"123456791","ordId":"312269865356374099","clOrdId":"manual1","billId":"900000000000000003","fillPx":"65000","fillSz":"1","side":"buy","execType":"T","feeCcy":"BTC","fee":"-0.001","ts":"1700000060000"},
+{"instType":"SPOT","instId":"BTC-USDT","tradeId":"123456790","ordId":"312269865356374016","clOrdId":"3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b","billId":"900000000000000002","fillPx":"65010","fillSz":"0.0006","side":"sell","execType":"M","feeCcy":"USDT","fee":"0.01","ts":"1700000050000"},
+{"instType":"SPOT","instId":"BTC-USDT","tradeId":"123456789","ordId":"312269865356374016","clOrdId":"3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b","billId":"900000000000000001","fillPx":"65000","side":"buy","execType":"T","feeCcy":"USDT","fee":"-0.026","ts":"1700000000000"}
+]}

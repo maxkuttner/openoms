@@ -17,6 +17,13 @@ use super::{Connector, Manifest, QuoteScope};
 
 pub struct Alpaca;
 
+/// The dedup key of one fill, the same from the stream and from the activities
+/// pull: the order's id plus its cumulative filled quantity after the fill.
+/// Parsed and printed as a number so "10" and "10.000" are one key.
+pub(crate) fn fill_exec_id(order_id: &str, cum_qty: f64) -> String {
+    format!("{order_id}:{cum_qty}")
+}
+
 static MANIFEST: Manifest = Manifest {
     code: "ALPACA",
     credential_kind: "Alpaca",
@@ -30,6 +37,7 @@ static MANIFEST: Manifest = Manifest {
     session_bound: false,
     price_band_exempt: false,
     per_currency_notional: false,
+    multi_account: false,
 };
 
 impl Connector for Alpaca {
@@ -40,12 +48,14 @@ impl Connector for Alpaca {
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
         let c: crate::connectors::alpaca::adapter::AlpacaCredentials = typed(creds, MANIFEST.credential_kind)?;
         let adapter = Arc::new(crate::connectors::alpaca::adapter::AlpacaAdapter::new(c.key.clone(), c.secret.clone(), env));
-        let stream_adapter = adapter.clone();
+        // Venue events only: the reconciler books every fill (exactly once,
+        // through ingest) and pulls what the stream missed.
         Ok(Connected {
             daily_stats: Some(adapter.clone()),
+            source: Some(adapter.clone()),
             adapter,
-            exec_stream: Some(Arc::new(move |health, engine| {
-                Box::pin(crate::connectors::alpaca::stream::run(env, c.key.clone(), c.secret.clone(), stream_adapter.clone(), health, engine))
+            venue_stream: Some(Arc::new(move |health, tx| {
+                Box::pin(crate::connectors::alpaca::stream::run(env, c.key.clone(), c.secret.clone(), health, tx))
             })),
         })
     }

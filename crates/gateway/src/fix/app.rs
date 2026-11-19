@@ -2,8 +2,8 @@
 //!
 //! QuickFIX drives its own session threads and invokes these callbacks on them.
 //! We keep the callbacks cheap and thread-safe: parse the message, resolve any
-//! pending `submit_order` ack, and hand normalized execution reports to an async
-//! drain task over an unbounded channel (whose `send` is synchronous, so it is
+//! pending `submit_order` ack, and hand the reports' venue events to the
+//! connection's venue stream over an unbounded channel (whose `send` is synchronous, so it is
 //! safe to call from the C++ callback thread). Session admin — logon, heartbeat,
 //! sequence numbers, resend/gap-fill — is entirely QuickFIX's job.
 
@@ -13,12 +13,10 @@ use std::sync::{Arc, Mutex};
 use quickfix::{ApplicationCallback, FieldMap, Message, MsgFromAdminError, MsgFromAppError, SessionId};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use crate::contract::VenueReport;
 use crate::fix::dialect::{parse_order_status_report, tag, FixDialect, StatusReport};
-use crate::contract::{BrokerOpenOrder, BrokerOrderState};
 use crate::stream_health::StreamHandle;
+use crate::venue_event::VenueEvent;
 
 /// Result handed back to a waiting `submit_order`: the broker `OrderID` on accept,
 /// or a reject reason.
@@ -32,19 +30,15 @@ pub type PendingAcks = Arc<Mutex<HashMap<String, oneshot::Sender<AckResult>>>>;
 /// `acc` on the callback thread until the batch's final report, then `tx` delivers
 /// them to the awaiting adapter.
 pub struct SnapshotWaiter {
-    pub acc: Vec<BrokerOpenOrder>,
-    pub tx: oneshot::Sender<Vec<BrokerOpenOrder>>,
+    pub acc: Vec<StatusReport>,
+    pub tx: oneshot::Sender<Vec<StatusReport>>,
 }
 
 /// MassStatusReqID → the mass-status collector for an `open_orders` call.
 pub type PendingSnapshots = Arc<Mutex<HashMap<String, SnapshotWaiter>>>;
 
 /// ClOrdID → the oneshot an `order_status` (35=H) call is blocked on.
-pub type PendingStatus = Arc<Mutex<HashMap<String, oneshot::Sender<BrokerOrderState>>>>;
-
-/// A normalized inbound report addressed to one of our orders, carried from the
-/// callback thread to the async drain task.
-pub type InboundReport = (Uuid, VenueReport);
+pub type PendingStatus = Arc<Mutex<HashMap<String, oneshot::Sender<StatusReport>>>>;
 
 /// Bridges one broker's QuickFIX session to the OMS. One instance per session.
 pub struct FixApplication {
@@ -53,9 +47,9 @@ pub struct FixApplication {
     pending: PendingAcks,
     snapshots: PendingSnapshots,
     statuses: PendingStatus,
-    report_tx: mpsc::UnboundedSender<InboundReport>,
-    /// Nudges the order-reconcile driver to snapshot on each (re)logon.
-    logon_tx: mpsc::Sender<()>,
+    /// Venue events for the connection's reconciler (or forwarder): reports,
+    /// plus `Connected` on each (re)logon and `Disconnected` on logout.
+    venue_tx: mpsc::UnboundedSender<VenueEvent>,
 }
 
 impl FixApplication {
@@ -65,10 +59,15 @@ impl FixApplication {
         pending: PendingAcks,
         snapshots: PendingSnapshots,
         statuses: PendingStatus,
-        report_tx: mpsc::UnboundedSender<InboundReport>,
-        logon_tx: mpsc::Sender<()>,
+        venue_tx: mpsc::UnboundedSender<VenueEvent>,
     ) -> Self {
-        Self { dialect, health, pending, snapshots, statuses, report_tx, logon_tx }
+        Self { dialect, health, pending, snapshots, statuses, venue_tx }
+    }
+
+    fn emit(&self, event: VenueEvent) {
+        if self.venue_tx.send(event).is_err() {
+            warn!(venue = self.dialect.venue(), "FIX: venue-event sink closed, dropping event");
+        }
     }
 
     /// Resolve a pending `submit_order` for `cl_ord_id`, if one is waiting.
@@ -86,8 +85,8 @@ impl FixApplication {
         let Some(reqid) = sr.mass_status_req_id.clone() else { return };
         let Ok(mut map) = self.snapshots.lock() else { return };
         if let Some(w) = map.get_mut(&reqid) {
-            if let Some(open) = sr.to_open_order() {
-                w.acc.push(open);
+            if !sr.empty_batch {
+                w.acc.push(sr.clone());
             }
         }
         if sr.last_rpt_requested || sr.empty_batch {
@@ -105,7 +104,7 @@ impl FixApplication {
         }
         let Ok(mut map) = self.statuses.lock() else { return false };
         if let Some(tx) = map.remove(&sr.client_order_id) {
-            let _ = tx.send(sr.to_order_state());
+            let _ = tx.send(sr.clone());
             true
         } else {
             false
@@ -122,15 +121,15 @@ impl ApplicationCallback for FixApplication {
     fn on_logon(&self, session: &SessionId) {
         info!(venue = self.dialect.venue(), ?session, "FIX logon");
         self.health.set_live();
-        // Snapshot-on-(re)logon: nudge the recon driver. `ResetOnLogon=Y` means
-        // QuickFIX won't resend messages missed during the outage, so a mass-status
-        // diff here is how we recover them.
-        let _ = self.logon_tx.try_send(());
+        // `ResetOnLogon=Y` means QuickFIX won't resend what was missed during
+        // the outage; `Connected` makes the reconciler pull (when it has a source).
+        self.emit(VenueEvent::Connected);
     }
 
     fn on_logout(&self, session: &SessionId) {
         warn!(venue = self.dialect.venue(), ?session, "FIX logout");
         self.health.set_down("logged out");
+        self.emit(VenueEvent::Disconnected);
     }
 
     /// Outgoing admin messages: stamp Logon (35=A) with broker auth fields. The
@@ -190,20 +189,19 @@ impl ApplicationCallback for FixApplication {
         };
 
         // Resolve a waiting submit_order: accept → OrderID, reject → reason.
-        let cl_ord_id = parsed.order_id.to_string();
-        if let Some(reason) = &parsed.reject_reason {
-            self.resolve_ack(&cl_ord_id, Err(reason.clone()));
-        } else if parsed.is_ack {
-            let ext = parsed.external_order_id.clone().unwrap_or_default();
-            self.resolve_ack(&cl_ord_id, Ok(ext));
+        if let Some(cl_ord_id) = &parsed.client_order_id {
+            if let Some(reason) = &parsed.reject_reason {
+                self.resolve_ack(cl_ord_id, Err(reason.clone()));
+            } else if parsed.is_ack {
+                let ext = parsed.external_order_id.clone().unwrap_or_default();
+                self.resolve_ack(cl_ord_id, Ok(ext));
+            }
         }
 
-        // Apply anything that changes OMS state (fills, cancels, rejects). A pure
-        // New ack carries no report and only resolved the oneshot above.
-        if let Some(report) = parsed.report {
-            if self.report_tx.send((parsed.order_id, report)).is_err() {
-                warn!(order_id = %parsed.order_id, "FIX: exec-report drain closed, dropping report");
-            }
+        // Everything the report says goes to ingest as venue events (the only
+        // booking path for FIX).
+        for event in parsed.events {
+            self.emit(event);
         }
         Ok(())
     }

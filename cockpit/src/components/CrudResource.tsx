@@ -28,6 +28,7 @@ export type Field = {
   optionsPath?: string;
   optionValue?: string;
   optionLabel?: string;
+  optionFilter?: (row: any) => boolean; // keep only some rows of optionsPath
   required?: boolean;
   default?: string; // starting value for a new row
   inCreate?: boolean; // default true
@@ -57,6 +58,8 @@ type Props = {
   derive?: (previous: Record<string, any>, next: Record<string, any>) => Record<string, any>;
   // Called with the created row once a create succeeds.
   onCreated?: (row: any) => void;
+  // Show only some rows of the list.
+  rowFilter?: (row: any) => boolean;
 };
 
 type Form = { values: Record<string, any>; set: (name: string, value: unknown) => void };
@@ -92,7 +95,7 @@ function FieldInput({ field, form }: { field: Field; form: Form }) {
     case "select": {
       const opts =
         (typeof field.options === "function" ? field.options(form.values) : field.options) ??
-        (remote.data ?? []).map((r) => ({
+        (remote.data ?? []).filter(field.optionFilter ?? (() => true)).map((r) => ({
           value: String(r[field.optionValue ?? "id"]),
           label: String(r[field.optionLabel ?? "code"]),
         }));
@@ -104,7 +107,7 @@ function FieldInput({ field, form }: { field: Field; form: Form }) {
 }
 
 export function CrudResource({
-  title, path, idKey = "id", columns, fields, editable, deletable, rowAction, lifecycle, derive, onCreated,
+  title, path, idKey = "id", columns, fields, editable, deletable, rowAction, lifecycle, derive, onCreated, rowFilter,
 }: Props) {
   const list = useList<any>(path);
   const life = useLifecycle(list.data, {
@@ -114,7 +117,7 @@ export function CrudResource({
     label: (r) => String(r.code ?? r[idKey]),
     afterChange: lifecycle?.afterChange,
   });
-  const rows = lifecycle ? life.visible : (list.data ?? []);
+  const rows = (lifecycle ? life.visible : (list.data ?? [])).filter(rowFilter ?? (() => true));
   const [editing, setEditing] = useState<any | null>(null); // row being edited, or {} for create
   const isCreate = editing && !editing[idKey];
 

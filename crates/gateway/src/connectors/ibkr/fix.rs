@@ -10,7 +10,7 @@ use quickfix::{FieldMap, Message};
 
 use crate::adapter::{BrokerError, BrokerOrderRequest};
 use crate::fix::dialect::{
-    fix_ord_type, fix_side, fix_time_in_force, parse_standard_exec_report, tag, transact_time,
+    fix_ord_type, fix_side, fix_time_in_force, parse_standard_exec_report, set_account, tag, transact_time,
     FixDialect, ParsedExecReport,
 };
 
@@ -83,6 +83,8 @@ impl FixDialect for IbkrDialect {
         set(&mut msg, tag::ORD_TYPE, fix_ord_type(&req.order_type)?)?;
         set(&mut msg, tag::TIME_IN_FORCE, fix_time_in_force(&req.time_in_force))?;
         set(&mut msg, tag::TRANSACT_TIME, &transact_time())?;
+        // Account(1): which of the login's accounts the order books to.
+        set_account(&mut msg, req)?;
         if req.order_type == "limit" {
             let px = req
                 .limit_price
@@ -109,7 +111,7 @@ impl FixDialect for IbkrDialect {
     }
 
     fn parse_execution_report(&self, msg: &Message) -> Option<ParsedExecReport> {
-        parse_standard_exec_report(msg, self.venue())
+        parse_standard_exec_report(msg, tag::EXEC_ID)
     }
 }
 
@@ -134,6 +136,22 @@ mod tests {
         assert_eq!(msg.get_field(tag::SIDE).as_deref(), Some("1")); // buy
         assert_eq!(msg.get_field(tag::ORD_TYPE).as_deref(), Some("2")); // limit
         assert_eq!(msg.get_field(tag::PRICE).as_deref(), Some("101.5"));
+    }
+
+    #[test]
+    fn new_order_single_carries_account_tag_1() {
+        let d = IbkrDialect::new("pw".into());
+        let msg = d.build_new_order_single(&order(&Uuid::new_v4(), "market", None)).unwrap();
+        assert_eq!(msg.get_field(tag::ACCOUNT).as_deref(), Some("acct"));
+    }
+
+    #[test]
+    fn empty_account_ref_omits_tag_1() {
+        let d = IbkrDialect::new("pw".into());
+        let mut req = order(&Uuid::new_v4(), "market", None);
+        req.external_account_ref = String::new();
+        let msg = d.build_new_order_single(&req).unwrap();
+        assert_eq!(msg.get_field(tag::ACCOUNT), None);
     }
 
     #[test]

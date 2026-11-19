@@ -16,7 +16,10 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand::RngCore;
 use reqwest::Client;
 
-use tracing::info;
+use chrono::{DateTime, Utc};
+use tracing::{info, warn};
+
+use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
 use crate::adapter::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
 use crate::md::daily_stats::DailyStats;
@@ -316,6 +319,254 @@ pub(crate) fn parse_prev_prices(body: &serde_json::Value, wanted: &[String]) -> 
         .collect()
 }
 
+/// The client id an order carries into the OMS: as Coinbase has it, `None` when empty.
+fn client_id(v: &serde_json::Value) -> Option<String> {
+    v.as_str().filter(|c| !c.is_empty()).map(str::to_string)
+}
+
+/// Coinbase's order `status` as the venue's view; `None` for one the OMS does
+/// not know (the caller warns).
+pub(crate) fn venue_status(status: &str, reject_reason: &str) -> Option<VenueOrderStatus> {
+    Some(match status {
+        "OPEN" | "PENDING" | "QUEUED" | "CANCEL_QUEUED" => VenueOrderStatus::Working,
+        "FILLED" => VenueOrderStatus::Filled,
+        "CANCELLED" => VenueOrderStatus::Canceled,
+        "EXPIRED" => VenueOrderStatus::Expired,
+        "FAILED" => VenueOrderStatus::Rejected { reason: if reject_reason.is_empty() { "FAILED".into() } else { reject_reason.to_string() } },
+        _ => return None,
+    })
+}
+
+/// One order of the `user` channel as the venue's view of it. The channel
+/// reports the order's cumulative state; the quantity is what is filled plus
+/// what is left.
+pub(crate) fn order_update_from_push(o: &serde_json::Value, account_ref: &str) -> Option<VenueOrderUpdate> {
+    let order_type = o["order_type"].as_str().unwrap_or("").to_string();
+    let cum = num(&o["cumulative_quantity"]).unwrap_or(0.0);
+    Some(VenueOrderUpdate {
+        venue_order_id: o["order_id"].as_str().filter(|i| !i.is_empty())?.to_string(),
+        client_order_id: client_id(&o["client_order_id"]),
+        account_ref: account_ref.to_string(),
+        symbol: o["product_id"].as_str().unwrap_or("").to_string(),
+        buy: o["order_side"].as_str() == Some("BUY"),
+        limit_px: if order_type == "MARKET" { None } else { num(&o["limit_price"]).filter(|p| *p != 0.0) },
+        order_type,
+        qty: cum + num(&o["leaves_quantity"]).unwrap_or(0.0),
+        status: venue_status(o["status"].as_str()?, o["reject_reason"].as_str().unwrap_or(""))?,
+        cum_qty: cum,
+        ts: None,
+    })
+}
+
+/// The order's base size from its `order_configuration` (`{"limit_limit_gtc": {"base_size": ..}}`).
+fn configured_size(o: &serde_json::Value) -> Option<f64> {
+    o["order_configuration"].as_object()?.values().find_map(|c| num(&c["base_size"]))
+}
+
+/// `orders/historical/batch?order_status=OPEN` as the venue's view of each open order.
+pub(crate) fn parse_open_order_snapshot(body: &serde_json::Value, account_ref: &str) -> Vec<VenueOrderUpdate> {
+    body["orders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let order_type = o["order_type"].as_str().unwrap_or("").to_string();
+            let cum = num(&o["filled_size"]).unwrap_or(0.0);
+            Some(VenueOrderUpdate {
+                venue_order_id: o["order_id"].as_str().filter(|i| !i.is_empty())?.to_string(),
+                client_order_id: client_id(&o["client_order_id"]),
+                account_ref: account_ref.to_string(),
+                symbol: o["product_id"].as_str()?.to_string(),
+                buy: o["side"].as_str()? == "BUY",
+                limit_px: None,
+                order_type,
+                qty: configured_size(o).unwrap_or(cum),
+                status: venue_status(o["status"].as_str()?, "")?,
+                cum_qty: cum,
+                ts: None,
+            })
+        })
+        .collect()
+}
+
+const FILLS_LIMIT: usize = 250;
+/// Pages one call may walk before it gives up rather than advance its cursor
+/// past rows it did not read.
+const MAX_PAGES: usize = 400;
+
+/// One page of `orders/historical/fills` rows, read against a scan's bounds.
+#[derive(Debug, Default)]
+pub(crate) struct FillsRows {
+    pub fills: Vec<VenueFill>,
+    /// The newest row seen (by trade time) and its trade id, filtered or not.
+    pub newest: Option<(DateTime<Utc>, String)>,
+    /// Every timed row is older than the resume threshold.
+    pub all_older: bool,
+    /// The rows are in ascending time order (first before last).
+    pub ascending: bool,
+}
+
+impl FillsRows {
+    /// Nothing further back can be new: the page is entirely behind the
+    /// cursor's margin and rows run newest first. An ascending page proves
+    /// nothing about the pages after it, so it never stops the walk.
+    pub fn stop(&self) -> bool {
+        self.all_older && !self.ascending
+    }
+}
+
+/// How far behind its newest trade a resume reads, for fills Coinbase indexes late.
+const RESUME_MARGIN_MS: i64 = 30 * 60 * 1000;
+
+/// The resume cursor: `"{trade_time_ms}:{trade_id}"` of the newest fill seen.
+pub(crate) fn parse_cursor(c: &Cursor) -> Option<(DateTime<Utc>, String)> {
+    let (ms, id) = c.0.split_once(':')?;
+    Some((chrono::TimeZone::timestamp_millis_opt(&Utc, ms.parse().ok()?).single()?, id.to_string()))
+}
+
+/// Rows of `orders/historical/fills` as fills. Rows executed before `since`, or
+/// before `threshold` (the cursor's time less the resume margin), are dropped;
+/// a row missing a field is warned about and skipped. A fill's `size` is in base
+/// units unless `size_in_quote`. Fills have no client order id: they join their
+/// order by `order_id`. The commission is in the product's quote currency.
+pub(crate) fn fills_rows(body: &serde_json::Value, account_ref: &str, since: DateTime<Utc>, threshold: Option<DateTime<Utc>>) -> FillsRows {
+    let mut out = FillsRows::default();
+    let rows = body["fills"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let times: Vec<DateTime<Utc>> = rows.iter().filter_map(|d| d["trade_time"].as_str().and_then(|s| s.parse().ok())).collect();
+    out.ascending = times.len() >= 2 && times.first() < times.last();
+    out.all_older = threshold.is_some_and(|t| !times.is_empty() && times.iter().all(|at| *at < t));
+    for d in rows {
+        let trade_id = d["trade_id"].as_str().unwrap_or("");
+        let at = d["trade_time"].as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
+        if let (false, Some(at)) = (trade_id.is_empty(), at) {
+            if out.newest.as_ref().is_none_or(|(n, _)| at > *n) {
+                out.newest = Some((at, trade_id.to_string()));
+            }
+        }
+        if at.is_some_and(|at| at < since || threshold.is_some_and(|t| at < t)) {
+            continue;
+        }
+        match fill_of(d, trade_id, at, account_ref) {
+            Ok(f) => out.fills.push(f),
+            Err(missing) => warn!(trade_id, order_id = d["order_id"].as_str().unwrap_or(""), missing, "Coinbase fills: row skipped"),
+        }
+    }
+    out
+}
+
+fn fill_of(d: &serde_json::Value, trade_id: &str, at: Option<DateTime<Utc>>, account_ref: &str) -> Result<VenueFill, &'static str> {
+    if trade_id.is_empty() {
+        return Err("trade_id");
+    }
+    let venue_order_id = d["order_id"].as_str().filter(|o| !o.is_empty()).ok_or("order_id")?;
+    let price = num(&d["price"]).filter(|p| *p > 0.0).ok_or("price")?;
+    let size = num(&d["size"]).ok_or("size")?;
+    let qty = if d["size_in_quote"].as_bool() == Some(true) { size / price } else { size };
+    let product = d["product_id"].as_str().filter(|p| !p.is_empty()).ok_or("product_id")?;
+    let buy = match d["side"].as_str() {
+        Some("BUY") => true,
+        Some("SELL") => false,
+        _ => return Err("side"),
+    };
+    let fee = num(&d["commission"])
+        .filter(|c| *c != 0.0)
+        .and_then(|c| product.rsplit_once('-').map(|(_, quote)| quote).filter(|q| !q.is_empty()).map(|q| (c, q.to_string())));
+    Ok(VenueFill {
+        exec_id: trade_id.to_string(),
+        venue_order_id: venue_order_id.to_string(),
+        client_order_id: None,
+        account_ref: account_ref.to_string(),
+        symbol: product.to_string(),
+        buy,
+        qty,
+        price,
+        fee,
+        executed_at: at,
+    })
+}
+
+/// A whole walk as one pull page: the cursor is the newest trade seen
+/// (`"{time_ms}:{trade_id}"`), and nothing is left to page. Nothing seen keeps
+/// the reconciler's cursor.
+pub(crate) fn pull_result(pages: Vec<FillsRows>) -> PullPage {
+    let newest = pages
+        .iter()
+        .filter_map(|p| p.newest.clone())
+        .max_by_key(|(at, _)| *at)
+        .map(|(at, id)| format!("{}:{id}", at.timestamp_millis()))
+        .unwrap_or_default();
+    PullPage { fills: pages.into_iter().flat_map(|p| p.fills).collect(), next: Cursor(newest), more: false }
+}
+
+#[async_trait::async_trait]
+impl ExecutionSource for CoinbaseAdapter {
+    /// Pages `orders/historical/fills` (newest first, asked for explicitly) with
+    /// the API's own cursor, whole, until a page lies entirely 30 minutes behind
+    /// the resume cursor's trade time, or the history ends. The API cursor walks
+    /// into the past, so it cannot be resumed from; the resume token is instead
+    /// the newest trade's time and id, and one call returns everything new.
+    /// Re-reads within the margin are exec-id duplicates.
+    async fn fills_since(
+        &self,
+        account_ref: &str,
+        scope: &str,
+        from: Option<&Cursor>,
+        since: DateTime<Utc>,
+    ) -> Result<PullPage, BrokerError> {
+        let threshold = from.and_then(parse_cursor).map(|(at, _)| at - chrono::Duration::milliseconds(RESUME_MARGIN_MS));
+        let mut pages = Vec::new();
+        let mut api_cursor = String::new();
+        for _ in 0..MAX_PAGES {
+            let mut query = format!("limit={FILLS_LIMIT}&sort_by=TRADE_TIME");
+            if since > DateTime::<Utc>::MIN_UTC {
+                query.push_str(&format!("&start_sequence_timestamp={}", urlencoding_minimal(&since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))));
+            }
+            if !api_cursor.is_empty() {
+                query.push_str(&format!("&cursor={}", urlencoding_minimal(&api_cursor)));
+            }
+            let body = self.get("/orders/historical/fills", &query, true).await?;
+            let page = fills_rows(&body, account_ref, since, threshold);
+            let rows = body["fills"].as_array().map_or(0, Vec::len);
+            let stopped = page.stop();
+            pages.push(page);
+            api_cursor = body["cursor"].as_str().unwrap_or("").to_string();
+            if stopped || api_cursor.is_empty() || rows == 0 {
+                return Ok(pull_result(pages));
+            }
+        }
+        Err(BrokerError::Network(format!(
+            "Coinbase fills pull for scope \"{scope}\" read more than {MAX_PAGES} pages without reaching its bound; \
+             this scope stalls until that is resolved (a shorter gap, or a manual EOD sweep)"
+        )))
+    }
+
+    /// `GET /orders/historical/batch?order_status=OPEN`, following the cursor.
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        let mut out = Vec::new();
+        let mut cursor = String::new();
+        loop {
+            let mut query = "order_status=OPEN&limit=250".to_string();
+            if !cursor.is_empty() {
+                query.push_str(&format!("&cursor={}", urlencoding_minimal(&cursor)));
+            }
+            let body = self.get("/orders/historical/batch", &query, true).await?;
+            out.extend(parse_open_order_snapshot(&body, account_ref));
+            cursor = body["cursor"].as_str().unwrap_or("").to_string();
+            if body["has_next"].as_bool() != Some(true) || cursor.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+
+    async fn scopes(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(vec![String::new()])
+    }
+
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 60, max_history: None, per_symbol: false }
+    }
+}
+
 #[async_trait::async_trait]
 impl BrokerAdapter for CoinbaseAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
@@ -441,6 +692,115 @@ mod tests {
             other => panic!("no sample {other}"),
         };
         serde_json::from_str(text).unwrap()
+    }
+
+    // --- execution pull ---
+
+    fn fills_body() -> serde_json::Value {
+        serde_json::from_str(include_str!("testdata/fills.json")).unwrap()
+    }
+
+    #[test]
+    fn coinbase_fill_without_oms_id_is_kept() {
+        // Fills carry no client order id, and the first row is an order the OMS never placed.
+        let rows = fills_rows(&fills_body(), "", DateTime::<Utc>::MIN_UTC, None);
+        let f = rows.fills.iter().find(|f| f.exec_id == "t-300").expect("kept");
+        assert_eq!((f.venue_order_id.as_str(), f.client_order_id.clone(), f.symbol.as_str(), f.buy, f.qty, f.price), ("99999999-0000-4000-8000-000000000009", None, "BTC-USD", false, 1.0, 65020.0));
+    }
+
+    #[test]
+    fn coinbase_pull_page_maps_and_cursors() {
+        let rows = fills_rows(&fills_body(), "acct", DateTime::<Utc>::MIN_UTC, None);
+        // The oldest row has no size: skipped (and warned).
+        assert_eq!(rows.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-300", "t-200"]);
+        let f = &rows.fills[0];
+        assert_eq!((f.account_ref.as_str(), f.fee.clone()), ("acct", Some((0.5, "USD".to_string()))));
+        assert_eq!(f.executed_at, Some("2026-11-03T12:00:03.500Z".parse().unwrap()));
+        // A size in quote currency is converted to base at the fill's price.
+        assert_eq!(rows.fills[1].qty, 32.5 / 65000.0);
+        assert_eq!(rows.newest.as_ref().map(|n| n.1.as_str()), Some("t-300"));
+        let page = pull_result(vec![rows]);
+        let t300: DateTime<Utc> = "2026-11-03T12:00:03.500Z".parse().unwrap();
+        assert_eq!((page.next, page.more, page.fills.len()), (Cursor(format!("{}:t-300", t300.timestamp_millis())), false, 2));
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_walk_stops_on_a_page_entirely_behind_the_cursor_margin_and_since_drops_old_rows() {
+        // Threshold 12:00:02.5: only t-300 is at or after it, so the rest are dropped; the page is not all older.
+        let page = fills_rows(&fills_body(), "", DateTime::<Utc>::MIN_UTC, Some(at("2026-11-03T12:00:02.500Z")));
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-300"]);
+        assert!(!page.stop());
+        let behind = fills_rows(&fills_body(), "", DateTime::<Utc>::MIN_UTC, Some(at("2026-11-03T12:30:00Z")));
+        assert!(behind.fills.is_empty() && behind.stop());
+        let recent = fills_rows(&fills_body(), "", at("2026-11-03T12:00:03Z"), None);
+        assert_eq!(recent.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-300"]);
+        assert!(!recent.stop());
+        // Nothing seen: the cursor is left to the reconciler.
+        let none = fills_rows(&serde_json::json!({ "fills": [] }), "", DateTime::<Utc>::MIN_UTC, None);
+        assert_eq!(pull_result(vec![none]), PullPage { fills: vec![], next: Cursor(String::new()), more: false });
+    }
+
+    fn row(id: &str, t: &str) -> serde_json::Value {
+        serde_json::json!({ "trade_id": id, "order_id": "o", "trade_time": t, "price": "1", "size": "1", "commission": "0", "product_id": "BTC-USD", "side": "BUY" })
+    }
+
+    #[test]
+    fn coinbase_ascending_rows_do_not_lose_new_fills() {
+        // Oldest first: page 1 is entirely behind the cursor, yet the new fill is on page 2.
+        let threshold = Some(at("2026-11-03T12:00:00Z") - chrono::Duration::milliseconds(RESUME_MARGIN_MS));
+        let page1 = fills_rows(&serde_json::json!({ "fills": [row("a", "2026-11-03T10:00:00Z"), row("b", "2026-11-03T10:05:00Z")] }), "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert!(page1.ascending && page1.all_older);
+        assert!(!page1.stop(), "an ascending page never ends the walk");
+        let page2 = fills_rows(&serde_json::json!({ "fills": [row("c", "2026-11-03T11:59:00Z"), row("new", "2026-11-03T12:05:00Z")] }), "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert_eq!(page2.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["c", "new"]);
+        let page = pull_result(vec![page1, page2]);
+        assert_eq!(page.next, Cursor(format!("{}:new", at("2026-11-03T12:05:00Z").timestamp_millis())));
+        // And a descending page of old rows does end it.
+        let desc = fills_rows(&serde_json::json!({ "fills": [row("b", "2026-11-03T10:05:00Z"), row("a", "2026-11-03T10:00:00Z")] }), "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert!(desc.stop());
+    }
+
+    #[test]
+    fn coinbase_late_indexed_older_fill_within_margin_is_pulled() {
+        // The cursor's trade is at 12:00; a fill stamped 11:50 only now appeared.
+        let (cursor_at, id) = parse_cursor(&Cursor(format!("{}:t-1", at("2026-11-03T12:00:00Z").timestamp_millis()))).unwrap();
+        assert_eq!(id, "t-1");
+        let threshold = Some(cursor_at - chrono::Duration::milliseconds(RESUME_MARGIN_MS));
+        let body = serde_json::json!({ "fills": [row("t-2", "2026-11-03T12:01:00Z"), row("t-1", "2026-11-03T12:00:00Z"), row("late", "2026-11-03T11:50:00Z"), row("old", "2026-11-03T11:00:00Z")] });
+        let page = fills_rows(&body, "", DateTime::<Utc>::MIN_UTC, threshold);
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["t-2", "t-1", "late"]);
+        assert!(!page.stop());
+    }
+
+    #[test]
+    fn coinbase_stream_and_pull_produce_the_same_exec_id_for_one_fill() {
+        // The user channel reports an order's cumulative state with no trade id or
+        // per-fill size, so any exec id it made would differ from the fills endpoint's
+        // `trade_id`. A partial fill is therefore an order update only (its cum_qty
+        // makes ingest ask for a pull); the fill itself, and its id, come from the pull.
+        let msg: serde_json::Value = serde_json::from_str(include_str!("testdata/ws_user_partial.json")).unwrap();
+        let events = crate::connectors::coinbase::stream::venue_events(&msg);
+        assert!(events.iter().all(|e| matches!(e, crate::venue_event::VenueEvent::Order(_))), "{events:?}");
+        let rows = fills_rows(&fills_body(), "", DateTime::<Utc>::MIN_UTC, None);
+        assert!(rows.fills.iter().all(|f| !f.exec_id.is_empty()));
+    }
+
+    #[test]
+    fn open_order_snapshot_maps_working_orders_and_hints_are_unbounded() {
+        let snap = parse_open_order_snapshot(&sample("orders_open"), "acct");
+        assert_eq!(snap.len(), 1);
+        let o = &snap[0];
+        assert_eq!((o.venue_order_id.as_str(), o.client_order_id.as_deref(), o.account_ref.as_str(), o.buy, o.cum_qty), ("11111111-2222-4333-8444-555555555555", Some("3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b"), "acct", true, 0.0005));
+        assert_eq!(o.status, VenueOrderStatus::Working);
+        assert_eq!(ExecutionSource::hints(&CoinbaseAdapter::new("k".into(), &test_pem()).unwrap()), PullHints { intraday_secs: 60, max_history: None, per_symbol: false });
+    }
+
+    fn test_pem() -> String {
+        p256::SecretKey::random(&mut rand::thread_rng()).to_sec1_pem(p256::pkcs8::LineEnding::LF).unwrap().to_string()
     }
 
     #[test]

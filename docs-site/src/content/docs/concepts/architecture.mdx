@@ -29,15 +29,16 @@ runtime is shown separately under [Target architecture](#target-architecture).
    positions, then stores it.
 3. The **order gateway** sends it to the venue through that venue's connector.
 4. The venue's executions come back through the same connector as plain
-   `ExecEvent`s.
+   venue events, to that connection's reconciler.
 5. The **order engine** applies them. It is the only place that books a fill,
    and it books each fill once, however often it is reported.
 6. Every change is appended to the **event store**, then published on the event
    bus.
 
-**Order recon** asks the gateway for open orders and order status after every
-reconnect, and lets the order engine heal anything missed while a stream was
-down.
+**The reconciler** of each connection pulls the venue's fills and open orders
+after every reconnect and on a timer, so anything missed while a stream was
+down still books once. A co-located strategy's account gets a reconciler of its
+own, on the strategy's follow key.
 
 ## The price path
 

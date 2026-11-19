@@ -9,12 +9,14 @@ import { autoCode, environmentOptions, venueOptions, type Venue } from "../../ve
 import { CredentialsPanel } from "../../components/CredentialsPanel";
 import { StreamHealthStrip } from "../../components/StreamHealthStrip";
 import { UniverseStatus } from "../../components/UniverseStatus";
+import { ReconPanel } from "../../components/ReconPanel";
 import type { BrokerConnection } from "../../api/types";
 
 const STATUS = statusOptions("brokerConnection");
 
 export function BrokerConnectionsPage() {
   const [selected, setSelected] = useState<BrokerConnection | null>(null);
+  const [recon, setRecon] = useState<BrokerConnection | null>(null);
   const venues = useList<Venue>("/admin/venues").data ?? [];
   const venueOf = (code: string) => venues.find((v) => v.code === code);
 
@@ -35,9 +37,14 @@ export function BrokerConnectionsPage() {
       // Credentials are the next step for a new connection, so open them.
       onCreated={(row: BrokerConnection) => setSelected(row)}
       rowAction={(row: BrokerConnection) => (
-        <Button size="xs" variant="secondary" onClick={() => setSelected(row)}>
-          Credentials
-        </Button>
+        <>
+          <Button size="xs" variant="secondary" onClick={() => setSelected(row)}>
+            Credentials
+          </Button>
+          <Button size="xs" variant="secondary" onClick={() => setRecon(row)}>
+            Reconciliation
+          </Button>
+        </>
       )}
       columns={[
         { key: "code", label: "Code" },
@@ -86,6 +93,10 @@ export function BrokerConnectionsPage() {
             environment={selected.environment}
           />
         )}
+      </Drawer>
+
+      <Drawer open={!!recon} onClose={() => setRecon(null)} title={recon ? `Reconciliation — ${recon.code}` : ""} className="sm:max-w-lg">
+        {recon && <ReconPanel connection={recon} venues={venues} />}
       </Drawer>
     </div>
   );

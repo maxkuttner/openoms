@@ -139,6 +139,14 @@ impl StreamHandle {
     }
 
     /// Dialing / (re)authenticating.
+    /// Whether a FIX session owns this entry (it marks itself live on logon).
+    pub fn is_fix_session(&self) -> bool {
+        self.inner
+            .read()
+            .map(|m| m.get(&self.key).is_some_and(|h| matches!(h.transport, StreamTransport::Fix)))
+            .unwrap_or(false)
+    }
+
     pub fn set_connecting(&self) {
         self.mutate(|h| {
             h.state = StreamState::Connecting;

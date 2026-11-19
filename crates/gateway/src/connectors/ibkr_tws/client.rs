@@ -22,8 +22,6 @@ use ibapi::subscriptions::SubscriptionItem;
 use ibapi::Client;
 use tokio::sync::broadcast;
 
-/// The API client id the OMS connects with.
-const CLIENT_ID: i32 = 1;
 /// How long a one-shot snapshot or list request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_CAPACITY: usize = 1024;
@@ -104,16 +102,36 @@ pub struct TwsOrderState {
     pub remaining: f64,
     pub avg_fill_price: f64,
     pub symbol: String,
+    /// IBKR's permanent order id: stable across API client ids and sessions; 0 when unknown.
+    pub perm_id: i64,
     pub order: TwsOrder,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TwsEvent {
-    Status { order_id: i32, order_ref: String, status: String, filled: f64, remaining: f64 },
-    Execution { exec_id: String, order_id: i32, order_ref: String, qty: f64, price: f64, time: DateTime<Utc> },
+    /// An order's current state: from `openOrder`, or an `orderStatus` merged
+    /// into the last `openOrder` seen for the id.
+    Order { order_id: i32, order_ref: String, state: TwsOrderState },
+    Execution(TwsExecution),
     Commission { exec_id: String, amount: f64, currency: String },
     Error { order_id: Option<i32>, code: i32, message: String },
     Disconnected,
+}
+
+/// One execution as IBKR reports it (`execDetails` / `reqExecutions`).
+/// `account` is the IBKR account number it booked to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwsExecution {
+    pub exec_id: String,
+    pub order_id: i32,
+    pub perm_id: i64,
+    pub order_ref: String,
+    pub account: String,
+    pub symbol: String,
+    pub buy: bool,
+    pub qty: f64,
+    pub price: f64,
+    pub time: DateTime<Utc>,
 }
 
 /// A stock lookup; sec type is always STK, exchange defaults to SMART.
@@ -125,10 +143,10 @@ pub struct ContractQuery {
     pub con_id: Option<i64>,
 }
 
-/// One IB Gateway API session. Order listings (`open_orders`,
-/// `completed_orders`) and the order-update stream cover only orders placed by
-/// this API client id: orders entered by hand in TWS or the IBKR apps are
-/// invisible, so recon cannot see or settle them.
+/// One IB Gateway API session. Connected as the master client id 0, the
+/// order-update stream and `open_orders` also carry orders entered by hand in
+/// TWS or the IBKR apps (`reqAutoOpenOrders(true)`); under any other client id
+/// they cover only that client's orders.
 #[async_trait]
 pub trait TwsClient: Send + Sync {
     async fn next_order_id(&self) -> Result<i32, TwsError>;
@@ -142,9 +160,10 @@ pub trait TwsClient: Send + Sync {
     async fn open_orders(&self) -> Result<Vec<(i32, String, TwsOrderState)>, TwsError>;
     /// Orders that finished (API orders only); also records their refs, like `open_orders`.
     async fn completed_orders(&self) -> Result<Vec<(i32, String, TwsOrderState)>, TwsError>;
-    /// Today's `Execution` and `Commission` events. TWS also replays these onto
-    /// [`TwsClient::events`] (the order-update stream), so consumers must dedupe by `exec_id`.
-    async fn executions_today(&self) -> Result<Vec<TwsEvent>, TwsError>;
+    /// `Execution` and `Commission` events of `account` since `since` (IBKR
+    /// serves about the last 7 days, in one response, no paging). TWS also
+    /// replays these onto [`TwsClient::events`], so consumers dedupe by `exec_id`.
+    async fn executions(&self, account: &str, since: DateTime<Utc>) -> Result<Vec<TwsEvent>, TwsError>;
     async fn contract_details(&self, q: &ContractQuery) -> Result<Vec<TwsContract>, TwsError>;
     /// Symbol search. Results carry `min_tick: 0.0`, no lot size and no ISIN:
     /// follow up with `contract_details` for the tradable facts.
@@ -164,6 +183,9 @@ pub trait TwsClient: Send + Sync {
 // ---------------------------------------------------------------------------
 
 type OrderRefs = Arc<Mutex<HashMap<i32, String>>>;
+/// Last `openOrder` per IBKR order id, so an `orderStatus` (which names only
+/// the id) becomes a whole order state.
+type OrderCache = Arc<Mutex<HashMap<i32, TwsOrderState>>>;
 
 /// [`TwsClient`] over `ibapi`'s async client. One order-update subscription,
 /// owned by a background task, feeds [`TwsClient::events`].
@@ -175,15 +197,20 @@ pub struct IbapiClient {
 }
 
 impl IbapiClient {
-    /// Connects to IB Gateway on `127.0.0.1:<port>` as client id 1 and asks for
-    /// delayed (type 3) market data.
-    pub async fn connect(port: u16) -> Result<Self, TwsError> {
-        let client = Client::connect(&format!("127.0.0.1:{port}"), CLIENT_ID).await?;
+    /// Connects to IB Gateway on `127.0.0.1:<port>` as `client_id` and asks for
+    /// delayed (type 3) market data. As the master client id 0 it also binds
+    /// orders entered in TWS (`reqAutoOpenOrders(true)`), so they stream too.
+    pub async fn connect(port: u16, client_id: i32) -> Result<Self, TwsError> {
+        let client = Client::connect(&format!("127.0.0.1:{port}"), client_id).await?;
         client.switch_market_data_type(MarketDataType::Delayed).await?;
         let client = Arc::new(client);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let order_refs: OrderRefs = Arc::default();
-        let pump = tokio::spawn(pump_order_updates(client.clone(), events.clone(), order_refs.clone()));
+        let pump = tokio::spawn(pump_order_updates(client.clone(), events.clone(), order_refs.clone(), OrderCache::default()));
+        if client_id == 0 {
+            // Its updates fan out to the order-update stream the pump reads.
+            drop(client.auto_open_orders(true).await?);
+        }
         Ok(Self { client, events, order_refs, pump })
     }
 
@@ -216,14 +243,14 @@ impl Drop for IbapiClient {
 
 /// Reads the single order-update subscription for the client's life,
 /// resubscribing after a connection loss and announcing it with `Disconnected`.
-async fn pump_order_updates(client: Arc<Client>, tx: broadcast::Sender<TwsEvent>, refs: OrderRefs) {
+async fn pump_order_updates(client: Arc<Client>, tx: broadcast::Sender<TwsEvent>, refs: OrderRefs, orders: OrderCache) {
     loop {
         match client.order_update_stream().await {
             Ok(mut stream) => {
                 while let Some(item) = stream.next().await {
                     match item {
                         Ok(SubscriptionItem::Data(update)) => {
-                            for ev in update_events(update, &refs) {
+                            for ev in update_events(update, &refs, &orders) {
                                 let _ = tx.send(ev);
                             }
                         }
@@ -258,39 +285,65 @@ async fn pump_order_updates(client: Arc<Client>, tx: broadcast::Sender<TwsEvent>
     }
 }
 
-fn update_events(update: OrderUpdate, refs: &OrderRefs) -> Vec<TwsEvent> {
+fn update_events(update: OrderUpdate, refs: &OrderRefs, orders: &OrderCache) -> Vec<TwsEvent> {
     let lookup = |id: i32| refs.lock().unwrap().get(&id).cloned().unwrap_or_default();
     match update {
-        OrderUpdate::OrderStatus(s) => vec![TwsEvent::Status {
-            order_id: s.order_id,
-            order_ref: lookup(s.order_id),
-            status: s.status.as_str().to_string(),
-            filled: s.filled,
-            remaining: s.remaining,
-        }],
+        OrderUpdate::OrderStatus(s) => {
+            let mut cache = orders.lock().unwrap();
+            let Some(state) = cache.get_mut(&s.order_id) else {
+                tracing::warn!(order_id = s.order_id, perm_id = s.perm_id, status = s.status.as_str(), "IBKR orderStatus before its openOrder; skipped");
+                return vec![];
+            };
+            state.status = s.status.as_str().to_string();
+            state.filled = s.filled;
+            state.remaining = s.remaining;
+            state.avg_fill_price = s.average_fill_price.unwrap_or(state.avg_fill_price);
+            if s.perm_id != 0 {
+                state.perm_id = s.perm_id;
+            }
+            vec![TwsEvent::Order { order_id: s.order_id, order_ref: lookup(s.order_id), state: state.clone() }]
+        }
         OrderUpdate::OpenOrder(d) => {
             if !d.order.order_ref.is_empty() {
                 refs.lock().unwrap().insert(d.order_id, d.order.order_ref.clone());
             }
-            vec![]
+            let (id, order_ref, state) = to_tws_order_state(&d, false, None);
+            orders.lock().unwrap().insert(id, state.clone());
+            vec![TwsEvent::Order { order_id: id, order_ref, state }]
         }
         OrderUpdate::ExecutionData(d) => {
-            let e = d.execution;
-            let order_ref = if e.order_reference.is_empty() { lookup(e.order_id) } else { e.order_reference };
-            vec![TwsEvent::Execution {
-                exec_id: e.execution_id,
-                order_id: e.order_id,
-                order_ref,
-                qty: e.shares,
-                price: e.price,
-                time: exec_time_or_now(&e.time),
-            }]
+            let mut e = to_tws_execution(d);
+            if e.order_ref.is_empty() {
+                e.order_ref = lookup(e.order_id);
+            }
+            vec![TwsEvent::Execution(e)]
         }
         OrderUpdate::CommissionReport(c) => {
             vec![TwsEvent::Commission { exec_id: c.execution_id, amount: c.commission, currency: c.currency }]
         }
         _ => vec![],
     }
+}
+
+fn to_tws_execution(d: ibapi::orders::ExecutionData) -> TwsExecution {
+    let e = d.execution;
+    TwsExecution {
+        time: exec_time_or_now(&e.time),
+        exec_id: e.execution_id,
+        order_id: e.order_id,
+        perm_id: e.perm_id,
+        order_ref: e.order_reference,
+        account: e.account_number,
+        symbol: d.contract.symbol.to_string(),
+        buy: matches!(e.side, ibapi::orders::ExecutionSide::Bought),
+        qty: e.shares,
+        price: e.price,
+    }
+}
+
+/// `reqExecutions`' time filter: `yyyymmdd-hh:mm:ss`, which TWS reads as UTC.
+pub(crate) fn exec_filter_time(t: DateTime<Utc>) -> String {
+    t.format("%Y%m%d-%H:%M:%S").to_string()
 }
 
 /// TWS sends execution times as `yyyymmdd  hh:mm:ss <IANA zone>` in the login
@@ -401,6 +454,7 @@ fn to_tws_order_state(d: &OrderData, completed: bool, status: Option<(f64, f64, 
         remaining,
         avg_fill_price,
         symbol: d.contract.symbol.to_string(),
+        perm_id: o.perm_id,
         order,
     };
     (d.order_id, o.order_ref.clone(), state)
@@ -475,21 +529,22 @@ impl TwsClient for IbapiClient {
         Ok(join_orders(sub.collect_to_end_within(REQUEST_TIMEOUT).await?, true, &self.order_refs))
     }
 
-    async fn executions_today(&self) -> Result<Vec<TwsEvent>, TwsError> {
+    async fn executions(&self, account: &str, since: DateTime<Utc>) -> Result<Vec<TwsEvent>, TwsError> {
         self.ensure_connected()?;
-        let mut sub = self.client.executions(ExecutionFilter::default()).await?;
+        // Days back to reach `since` (today counts as one), at most IBKR's 7.
+        let days = (Utc::now().date_naive() - since.date_naive()).num_days().clamp(0, 6) as i32 + 1;
+        let filter = ExecutionFilter {
+            account_code: account.to_string(),
+            time: exec_filter_time(since),
+            last_n_days: days,
+            ..ExecutionFilter::default()
+        };
+        let mut sub = self.client.executions(filter).await?;
         let rows = sub.collect_to_end_within(REQUEST_TIMEOUT).await?;
         Ok(rows
             .into_iter()
             .map(|r| match r {
-                Executions::ExecutionData(d) => TwsEvent::Execution {
-                    exec_id: d.execution.execution_id,
-                    order_id: d.execution.order_id,
-                    order_ref: d.execution.order_reference,
-                    qty: d.execution.shares,
-                    price: d.execution.price,
-                    time: exec_time_or_now(&d.execution.time),
-                },
+                Executions::ExecutionData(d) => TwsEvent::Execution(to_tws_execution(d)),
                 Executions::CommissionReport(c) => {
                     TwsEvent::Commission { exec_id: c.execution_id, amount: c.commission, currency: c.currency }
                 }
@@ -648,9 +703,12 @@ impl TwsClient for FakeTws {
         Ok(self.completed.lock().unwrap().clone())
     }
 
-    async fn executions_today(&self) -> Result<Vec<TwsEvent>, TwsError> {
+    /// Every scripted event, the executions narrowed to `account` (dropping
+    /// those before `since` is the source's job, so it is left to it).
+    async fn executions(&self, account: &str, _since: DateTime<Utc>) -> Result<Vec<TwsEvent>, TwsError> {
         self.up()?;
-        Ok(self.executions.lock().unwrap().clone())
+        let all = self.executions.lock().unwrap().clone();
+        Ok(all.into_iter().filter(|e| !matches!(e, TwsEvent::Execution(x) if x.account != account)).collect())
     }
 
     async fn contract_details(&self, q: &ContractQuery) -> Result<Vec<TwsContract>, TwsError> {

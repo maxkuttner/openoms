@@ -18,7 +18,7 @@ use crate::adapter::{
     BrokerAdapter, BrokerError, BrokerOrderRequest, BrokerOrderResponse,
 };
 use crate::fix::app::{PendingAcks, PendingSnapshots, PendingStatus, SnapshotWaiter};
-use crate::fix::dialect::{tag, FixDialect};
+use crate::fix::dialect::{order_state_from_status_reply, snapshot_updates, tag, FixDialect, StatusReport};
 use crate::contract::{BrokerOpenOrder, BrokerOrderState};
 
 use std::sync::Arc;
@@ -85,6 +85,32 @@ impl FixBrokerAdapter {
         msg.set_field(tag::CL_ORD_ID, req.order_id.as_str())
             .map_err(|e| BrokerError::Network(format!("set ClOrdID: {e}")))?;
         self.send(msg)
+    }
+
+    /// Every order's status report from an Order Mass Status Request (35=AF).
+    /// Register the collector before sending so a fast reply can't race us.
+    async fn mass_status(&self) -> Result<Vec<StatusReport>, BrokerError> {
+        let req_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut map = self
+                .snapshots
+                .lock()
+                .map_err(|_| BrokerError::Network("snapshots lock poisoned".into()))?;
+            map.insert(req_id.clone(), SnapshotWaiter { acc: Vec::new(), tx });
+        }
+
+        let sent = self.dialect.build_mass_status_request(&req_id).and_then(|m| self.send(m));
+        await_correlated_reply(
+            rx,
+            sent,
+            SNAPSHOT_TIMEOUT,
+            "timed out waiting for FIX mass-status snapshot",
+            || {
+                self.snapshots.lock().ok().and_then(|mut m| m.remove(&req_id));
+            },
+        )
+        .await
     }
 
     /// Build and send an `OrderCancelRequest`. Synchronous for the same reason as
@@ -162,27 +188,7 @@ impl BrokerAdapter for FixBrokerAdapter {
     /// (Venues with no FIX open-orders message are handled by composing a REST reader
     /// via [`crate::adapter::SplitAdapter`], not by branching here.)
     async fn open_orders(&self) -> Result<Vec<BrokerOpenOrder>, BrokerError> {
-        let req_id = Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut map = self
-                .snapshots
-                .lock()
-                .map_err(|_| BrokerError::Network("snapshots lock poisoned".into()))?;
-            map.insert(req_id.clone(), SnapshotWaiter { acc: Vec::new(), tx });
-        }
-
-        let sent = self.dialect.build_mass_status_request(&req_id).and_then(|m| self.send(m));
-        await_correlated_reply(
-            rx,
-            sent,
-            SNAPSHOT_TIMEOUT,
-            "timed out waiting for FIX mass-status snapshot",
-            || {
-                self.snapshots.lock().ok().and_then(|mut m| m.remove(&req_id));
-            },
-        )
-        .await
+        Ok(self.mass_status().await?.iter().filter_map(StatusReport::to_open_order).collect())
     }
 
     /// Resolve one order's state via an Order Status Request (35=H), correlated on
@@ -206,7 +212,7 @@ impl BrokerAdapter for FixBrokerAdapter {
             .dialect
             .build_order_status_request(client_order_id, external_order_id, symbol)
             .and_then(|m| self.send(m));
-        await_correlated_reply(
+        let reply = await_correlated_reply(
             rx,
             sent,
             STATUS_TIMEOUT,
@@ -215,6 +221,38 @@ impl BrokerAdapter for FixBrokerAdapter {
                 self.statuses.lock().ok().and_then(|mut m| m.remove(client_order_id));
             },
         )
-        .await
+        .await?;
+        order_state_from_status_reply(&reply, external_order_id)
+    }
+}
+
+/// The pull side for a FIX session with no REST twin (IBKR FIX). FIX here has
+/// no execution-history query, so `fills_since` is always an empty page and
+/// the EOD sweep finds nothing (`max_history` zero); what this gives the
+/// reconciler is the 35=AF open-order snapshot on every (re)logon and timer,
+/// so orders closed while the session was down are resolved (35=H) and their
+/// fill gap shows.
+#[async_trait::async_trait]
+impl crate::venue_event::ExecutionSource for FixBrokerAdapter {
+    async fn fills_since(
+        &self,
+        _account_ref: &str,
+        _scope: &str,
+        _from: Option<&crate::venue_event::Cursor>,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<crate::venue_event::PullPage, BrokerError> {
+        Ok(crate::venue_event::PullPage { fills: Vec::new(), next: crate::venue_event::Cursor(String::new()), more: false })
+    }
+
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<crate::venue_event::VenueOrderUpdate>, BrokerError> {
+        Ok(snapshot_updates(&self.mass_status().await?, account_ref))
+    }
+
+    async fn scopes(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(vec![String::new()])
+    }
+
+    fn hints(&self) -> crate::venue_event::PullHints {
+        crate::venue_event::PullHints { intraday_secs: 300, max_history: Some(chrono::Duration::zero()), per_symbol: false }
     }
 }

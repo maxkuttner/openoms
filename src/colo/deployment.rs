@@ -9,7 +9,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool, Row};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use colo_link::v2::{Allocation, Bootstrap, Policy, RuntimeCheckpoint, Timings, ToRuntime};
@@ -460,6 +460,40 @@ pub async fn register_deployment(
         .await
         .map_err(db)?;
     }
+
+    // Ingest adopts the strategy's own trading on its account into the
+    // strategy's portfolio: one account rule on the account's connection,
+    // owned by this registration (`colo:<strategy>`), replacing only the rule
+    // it owned before. Rules a person made are left alone.
+    let owner = format!("colo:{}", input.strategy_code);
+    sqlx::query("DELETE FROM attribution_rule WHERE owner = $1")
+        .bind(&owner)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    let shadowing: Vec<(Uuid, i32)> = sqlx::query_as(
+        "SELECT id, priority FROM attribution_rule \
+         WHERE account_id = $1 AND client_id_prefix IS NULL AND priority <= 0 ORDER BY priority",
+    )
+    .bind(input.account_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(db)?;
+    for (rule, priority) in &shadowing {
+        warn!(strategy = %input.strategy_code, account = %input.account_id, %rule, priority,
+            "co-located registration: an existing attribution rule on the account takes precedence over the strategy's; kept");
+    }
+    sqlx::query(
+        "INSERT INTO attribution_rule (id, broker_connection_code, account_id, client_id_prefix, portfolio_id, priority, owner) \
+         SELECT $1, a.broker_connection_code, a.id, NULL, $3, 0, $4 FROM account a WHERE a.id = $2",
+    )
+    .bind(Uuid::new_v4())
+    .bind(input.account_id)
+    .bind(portfolio_id)
+    .bind(&owner)
+    .execute(&mut *tx)
+    .await
+    .map_err(db)?;
 
     let policy = policy_for(&mut tx, deployment_id, &input.strategy_code, portfolio_id).await?;
     sqlx::query(
@@ -1901,4 +1935,83 @@ mod tests {
         ));
     }
 
+
+    /// Registration replaces only the attribution rule it owns: a person's
+    /// account rule (made through the API) survives, with its priority.
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn registration_keeps_user_attribution_rules() {
+        let pool = isolated_pool().await;
+        let (code, account, _, input) = seed_registration(&pool, "PAPER").await;
+        let portfolio: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM strategy WHERE code = $1")
+            .bind(&code).fetch_one(&pool).await.unwrap();
+        let user_rule = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO attribution_rule (id, broker_connection_code, account_id, client_id_prefix, portfolio_id, priority) \
+             SELECT $1, a.broker_connection_code, a.id, NULL, $3, -5 FROM account a WHERE a.id = $2",
+        )
+        .bind(user_rule).bind(account).bind(portfolio).execute(&pool).await.unwrap();
+        register_deployment(&pool, &input).await.expect("registered");
+        let rules: Vec<(Uuid, i32, Option<String>)> = sqlx::query_as(
+            "SELECT id, priority, owner FROM attribution_rule WHERE account_id = $1 ORDER BY priority",
+        )
+        .bind(account).fetch_all(&pool).await.unwrap();
+        assert_eq!(rules.len(), 2, "{rules:?}");
+        assert_eq!((rules[0].0, rules[0].1, rules[0].2.clone()), (user_rule, -5, None), "the person's rule is untouched");
+        assert_eq!(rules[1].2.as_deref(), Some(format!("colo:{code}").as_str()));
+        let owned: i64 = sqlx::query_scalar("SELECT count(*) FROM attribution_rule WHERE owner = $1")
+            .bind(format!("colo:{code}")).fetch_one(&pool).await.unwrap();
+        assert_eq!(owned, 1);
+    }
+
+    /// A co-located strategy's fill, ingested on its account through the shared
+    /// Binance connection, is adopted into the strategy's portfolio by the
+    /// attribution rule its registration set.
+    #[tokio::test]
+    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn colo_strategy_fill_lands_in_strategy_portfolio_via_rule() {
+        use gateway::venue_event::{VenueEvent, VenueFill};
+        let pool = isolated_pool().await;
+        let (code, account, instrument_id, input) = seed_registration(&pool, "PAPER").await;
+        register_deployment(&pool, &input).await.expect("registered");
+        let (connection, symbol): (String, String) = sqlx::query_as(
+            "SELECT a.broker_connection_code, bi.broker_symbol FROM account a \
+             JOIN broker_instrument bi ON bi.instrument_id = $2 AND bi.broker_code = 'BINANCE' WHERE a.id = $1",
+        )
+        .bind(account)
+        .bind(instrument_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let portfolio: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM strategy WHERE code = $1")
+            .bind(&code)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let venue_order_id = format!("colo-vo-{}", Uuid::new_v4().simple());
+        let fill = VenueFill {
+            exec_id: format!("colo-x-{}", Uuid::new_v4().simple()),
+            venue_order_id: venue_order_id.clone(),
+            client_order_id: Some(format!("{code}-q-1")),
+            account_ref: input.external_account_ref.clone(),
+            symbol,
+            buy: true,
+            qty: 0.5,
+            price: 100.0,
+            fee: None,
+            executed_at: Some(chrono::Utc::now()),
+        };
+        crate::ingest::apply::ingest(&pool, &crate::event_bus::EventBus::new(), &connection, VenueEvent::Fill(fill), None)
+            .await
+            .expect("ingested");
+        let booked: (Uuid, Uuid) = sqlx::query_as(
+            "SELECT portfolio_id, account_id FROM order_state WHERE broker_connection_code = $1 AND external_order_id = $2",
+        )
+        .bind(&connection)
+        .bind(&venue_order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("an adopted order");
+        assert_eq!(booked, (portfolio, account));
+    }
 }

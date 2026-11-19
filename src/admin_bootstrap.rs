@@ -520,6 +520,38 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn recon_routes_are_admin_only() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let pm = pm_session(&pool).await;
+        let (_, admin) = mfa_admin(&st, &email()).await;
+        let id = Uuid::new_v4();
+        let body = Some(serde_json::json!({}));
+        let routes = [
+            ("GET", "/admin/broker-connections/x/recon".to_string()),
+            ("PATCH", "/admin/broker-connections/x/recon".to_string()),
+            ("GET", "/admin/broker-connections/x/attribution-rules".to_string()),
+            ("POST", "/admin/broker-connections/x/attribution-rules".to_string()),
+            ("PUT", format!("/admin/broker-connections/x/attribution-rules/{id}")),
+            ("DELETE", format!("/admin/broker-connections/x/attribution-rules/{id}")),
+            ("POST", "/admin/broker-connections/x/sweep".to_string()),
+            ("GET", "/admin/recon-breaks?status=open".to_string()),
+            ("POST", format!("/admin/recon-breaks/{id}/adopt")),
+            ("POST", format!("/admin/recon-breaks/{id}/dismiss")),
+        ];
+        for (method, path) in &routes {
+            assert_eq!(send(&st, method, path, Cred::None, body.clone()).await.0, StatusCode::UNAUTHORIZED, "{method} {path}");
+            assert_eq!(send(&st, method, path, Cred::Cookie(&pm), body.clone()).await.0, StatusCode::FORBIDDEN, "{method} {path}");
+            // an admin passes the gate: whatever it answers, it is not auth
+            let got = send(&st, method, path, Cred::Cookie(&admin), body.clone()).await.0;
+            assert!(got != StatusCode::UNAUTHORIZED && got != StatusCode::FORBIDDEN, "{method} {path}: {got}");
+        }
+        let (status, _) = send(&st, "GET", "/admin/recon-breaks?status=open", Cred::Cookie(&admin), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
     async fn admin_routes_need_admin_capability() {
         let pool = migrated_db().await;
         let st = state(pool.clone());

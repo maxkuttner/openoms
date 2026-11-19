@@ -1,61 +1,50 @@
-//! OKX spot private stream (v5 WebSocket) — real-time order push, mirroring the
-//! Bybit and Binance streams (no polling).
+//! OKX spot private stream (v5 WebSocket): real-time order push as venue events.
 //!
 //! Connect `wss://ws.okx.com/ws/v5/private` (Demo Trading: `wspap.okx.com`), log
 //! in with `{"op":"login","args":[{apiKey, passphrase, timestamp, sign}]}` where
 //! `sign` is the base64 HMAC of `{unix seconds}GET/users/self/verify`, then
 //! subscribe to the `orders` channel for SPOT. Every push carries the order's
-//! cumulative state (`accFillSz`, `avgPx`, `state`). The push's `tradeId` /
-//! `fillSz` describe the last trade and can be repeated on later pushes (a cancel
-//! after a partial fill may carry them again), and the execution path does not
-//! dedupe by execution id — so a push is never booked as one trade. Instead the
-//! OMS books whatever OKX has filled that it hasn't
-//! ([`crate::contract::ExecKind::Cumulative`]), and `filled` / `canceled` /
-//! `mmp_canceled` close the order through reconcile
-//! ([`crate::contract::ExecKind::Terminal`]). Both are idempotent.
+//! state; one that also carries a `tradeId` is a fill (`fillSz` at `fillPx`, its
+//! fee in `fillFee`/`fillFeeCcy`). The `tradeId` is the same id `/trade/fills`
+//! carries, so a fill the stream and the pull both see is one fill; a later push
+//! repeating the last fill's `tradeId` (a cancel after a partial fill) repeats
+//! the same exec id, which ingest drops.
 
 use std::sync::Arc;
 
+use chrono::{TimeZone, Utc};
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use crate::connectors::okx::adapter::{oms_order_id, parse_order_state, OkxAdapter};
-use crate::contract::{EngineHandle, ExecEvent, ExecKind, ExecSource};
-use crate::contract::BrokerOrderState;
+use crate::connectors::okx::adapter::{fee_of, fill_of, order_update_from_row, OkxAdapter};
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
+use crate::venue_event::VenueEvent as VEvent;
 
-const VENUE: &str = "OKX";
-
-/// OKX drops a connection that sends nothing for 30s; each beat sends "ping"
-/// and also sweeps for missed terminal reports.
+/// OKX drops a connection that sends nothing for 30s; each beat sends "ping".
 const HEARTBEAT_SECS: u64 = 20;
 
 struct OkxSession {
-    environment: &'static str,
     adapter: Arc<OkxAdapter>,
     health: StreamHandle,
-    engine: EngineHandle,
+    tx: mpsc::Sender<VEvent>,
 }
 
 #[async_trait::async_trait]
 impl Session for OkxSession {
     async fn run_once(&mut self) -> StreamResult {
-        connect_and_run(self.environment, &self.adapter, &self.health, &self.engine).await
+        let result = connect_and_run(&self.adapter, &self.health, &self.tx).await;
+        let _ = self.tx.send(VEvent::Disconnected).await;
+        result
     }
 }
 
-pub async fn run(
-    environment: &'static str,
-    adapter: Arc<OkxAdapter>,
-    health: StreamHandle,
-    engine: EngineHandle,
-) {
+pub async fn run(environment: &'static str, adapter: Arc<OkxAdapter>, health: StreamHandle, tx: mpsc::Sender<VEvent>) {
     info!(env = environment, "starting OKX private stream");
-    let session = OkxSession { environment, adapter, health: health.clone(), engine };
+    let session = OkxSession { adapter, health: health.clone(), tx };
     let name: &'static str = if environment == "LIVE" { "OKX/LIVE" } else { "OKX/PAPER" };
     supervise(name, health, session).await
 }
@@ -77,85 +66,42 @@ fn subscribe_message() -> serde_json::Value {
     serde_json::json!({"op": "subscribe", "args": [{"channel": "orders", "instType": "SPOT"}]})
 }
 
-/// What one pushed entry means for its OMS order.
-#[derive(Debug)]
-pub(crate) enum Update {
-    /// OKX's cumulative filled size and average price for a working order.
-    Progress { cum: f64, avg: f64 },
-    /// A cancel for an order with fills: apply through reconcile so any fill the
-    /// OMS missed is booked before the close.
-    Terminal(BrokerOrderState),
-}
-
-/// The updates one `orders` push carries, by OMS order id. Entries for orders the
-/// OMS didn't place (no UUID `clOrdId`) are dropped.
-pub(crate) fn updates(msg: &serde_json::Value) -> Vec<(Uuid, Update)> {
+/// What one `orders` push means, whoever placed the order: an entry with a
+/// `tradeId` is a fill (with its fee), and every entry is the order's current
+/// state. One OKX key is one account, which ingest resolves by the connection alone.
+pub(crate) fn venue_events(msg: &serde_json::Value) -> Vec<VEvent> {
     if msg["arg"]["channel"].as_str() != Some("orders") {
         return Vec::new();
     }
-    let data = msg["data"].as_array().cloned().unwrap_or_default();
-    data.iter()
-        .filter_map(|d| {
-            let id = oms_order_id(d["clOrdId"].as_str()?)?;
-            let st = parse_order_state(d);
-            let update = match d["state"].as_str()? {
-                "filled" | "canceled" | "mmp_canceled" => Update::Terminal(st),
-                _ if st.executed_qty > 0.0 => Update::Progress { cum: st.executed_qty, avg: st.avg_px },
-                // live, nothing filled yet: nothing new.
-                _ => return None,
-            };
-            Some((id, update))
-        })
-        .collect()
-}
-
-/// The running fee total each entry reports, by OMS order id, in the fee
-/// currency. OKX reports a charge as a negative `fee`, so the total flips its
-/// sign (a rebate becomes a negative total). No fee yet (zero, empty) sends nothing.
-pub(crate) fn fee_totals(msg: &serde_json::Value) -> Vec<(Uuid, f64, String)> {
-    if msg["arg"]["channel"].as_str() != Some("orders") {
-        return Vec::new();
+    let mut out = Vec::new();
+    for d in msg["data"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        if d["tradeId"].as_str().is_some_and(|t| !t.is_empty()) {
+            let at = d["fillTime"]
+                .as_str()
+                .or(d["uTime"].as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+            match fill_of(d, at, fee_of(&d["fillFee"], &d["fillFeeCcy"]), "") {
+                Ok(f) => out.push(VEvent::Fill(f)),
+                Err(missing) => warn!(trade_id = d["tradeId"].as_str().unwrap_or(""), missing, "OKX WS: fill skipped"),
+            }
+        }
+        match order_update_from_row(d, "") {
+            Some(o) => out.push(VEvent::Order(o)),
+            None => warn!(?d, "OKX WS: order entry with unknown state or no ordId"),
+        }
     }
-    let data = msg["data"].as_array().cloned().unwrap_or_default();
-    data.iter()
-        .filter_map(|d| {
-            let id = oms_order_id(d["clOrdId"].as_str()?)?;
-            let fee: f64 = d["fee"].as_str()?.parse().ok()?;
-            let ccy = d["feeCcy"].as_str().filter(|c| !c.is_empty())?;
-            (fee != 0.0).then(|| (id, -fee, ccy.to_string()))
-        })
-        .collect()
-}
-
-fn fee_event(order_id: Uuid, total: f64, currency: String) -> ExecEvent {
-    ExecEvent {
-        order_id,
-        venue: VENUE.to_string(),
-        actor: "okx",
-        source: ExecSource::Session,
-        kind: ExecKind::FeeTotal { total, currency },
-    }
-}
-
-/// What one parsed update tells the order engine: cumulative progress books
-/// only what the OMS is missing, so a repeated update books nothing.
-fn exec_event(order_id: Uuid, update: Update) -> ExecEvent {
-    let kind = match update {
-        Update::Progress { cum, avg } => ExecKind::Cumulative { cum_qty: cum, avg_px: avg },
-        Update::Terminal(st) => ExecKind::Terminal(st),
-    };
-    ExecEvent { order_id, venue: VENUE.to_string(), actor: "okx", source: ExecSource::Session, kind }
+    out
 }
 
 async fn connect_and_run(
-    environment: &'static str,
     adapter: &Arc<OkxAdapter>,
     health: &StreamHandle,
-    engine: &EngineHandle,
+    tx: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (mut ws, _) = connect_async(adapter.private_ws_url()).await?;
     info!("OKX private WS connected");
-    ws.send(Message::Text(login_message(adapter, chrono::Utc::now().timestamp()).to_string())).await?;
+    ws.send(Message::Text(login_message(adapter, Utc::now().timestamp()).to_string())).await?;
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(HEARTBEAT_SECS));
     heartbeat.tick().await; // consume the immediate first tick
@@ -164,7 +110,6 @@ async fn connect_and_run(
         let text = tokio::select! {
             _ = heartbeat.tick() => {
                 ws.send(Message::Text("ping".into())).await?;
-                engine.reconcile(VENUE, environment, "okx", adapter.clone()).await;
                 continue;
             }
             msg = ws.next() => {
@@ -192,11 +137,10 @@ async fn connect_and_run(
         };
 
         if v.get("data").is_some() {
-            for (order_id, update) in updates(&v) {
-                engine.exec(exec_event(order_id, update)).await;
-            }
-            for (order_id, total, currency) in fee_totals(&v) {
-                engine.exec(fee_event(order_id, total, currency)).await;
+            for event in venue_events(&v) {
+                if tx.send(event).await.is_err() {
+                    return Ok(());
+                }
             }
             continue;
         }
@@ -210,8 +154,10 @@ async fn connect_and_run(
             Some("subscribe") => {
                 info!("OKX private WS subscribed to orders");
                 health.set_live();
-                // Snapshot-on-(re)connect: heal anything that resolved during the outage.
-                engine.reconcile(VENUE, environment, "okx", adapter.clone()).await;
+                // The reconciler pulls fills and the open-order snapshot for the outage.
+                if tx.send(VEvent::Connected).await.is_err() {
+                    return Ok(());
+                }
             }
             Some("login") | Some("error") => {
                 return Err(format!("OKX WS {}: {} (code {})", v["event"], v["msg"], v["code"]).into());
@@ -225,21 +171,9 @@ async fn connect_and_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::BrokerOrderOutcome;
+    use crate::venue_event::VenueOrderStatus;
 
     const ORDER_ID: &str = "3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b";
-
-    #[test]
-    fn okx_filled_order_becomes_terminal_event() {
-        let (order_id, update) = updates(&sample("ws_orders_fill"))
-            .into_iter()
-            .find(|(_, u)| matches!(u, Update::Terminal(_)))
-            .expect("the sample carries one");
-        let ev = exec_event(order_id, update);
-        assert_eq!(ev.order_id, order_id);
-        assert_eq!(ev.actor, "okx");
-        assert!(matches!(ev.kind, crate::contract::ExecKind::Terminal(_)), "{:?}", ev.kind);
-    }
 
     fn sample(name: &str) -> serde_json::Value {
         let text = match name {
@@ -269,89 +203,57 @@ mod tests {
         assert_eq!(m["args"][0]["instType"], "SPOT");
     }
 
-    // OKX repeats the last fill's tradeId/fillSz on later pushes for the same
-    // order, so a push is read as OKX's cumulative state, never as one trade:
-    // booking what the OMS is missing is idempotent across repeats.
     #[test]
-    fn a_partial_fill_push_is_cumulative_progress() {
-        let u = updates(&sample("ws_orders_fill"));
-        assert_eq!(u.len(), 2, "the manual order is not ours");
-        assert_eq!(u[0].0.to_string(), ORDER_ID);
-        assert!(matches!(u[0].1, Update::Progress { cum, avg } if cum == 0.0004 && avg == 65000.0), "{:?}", u[0].1);
+    fn a_push_with_a_trade_is_a_fill_then_the_order_state() {
+        let events = venue_events(&sample("ws_orders_fill"));
+        // Three entries (one placed outside the OMS), each a fill and a state.
+        assert_eq!(events.len(), 6);
+        let VEvent::Fill(f) = &events[0] else { panic!("a fill first") };
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("BTC-USDT:123456789:B", "312269865356374016", "BTC-USDT", true, 0.0004, 65000.0));
+        assert_eq!((f.client_order_id.as_deref(), f.account_ref.as_str(), f.fee.clone()), (Some(ORDER_ID), "", None));
+        let VEvent::Order(o) = &events[1] else { panic!("then the order") };
+        assert_eq!((o.status.clone(), o.cum_qty, o.qty, o.limit_px, o.buy), (VenueOrderStatus::Working, 0.0004, 0.001, None, true));
+        let VEvent::Order(done) = &events[3] else { panic!() };
+        assert_eq!((done.status.clone(), done.cum_qty), (VenueOrderStatus::Filled, 0.001));
     }
 
     #[test]
-    fn a_filled_push_closes_through_reconcile_with_okx_totals() {
-        let u = updates(&sample("ws_orders_fill"));
-        match &u[1].1 {
-            Update::Terminal(st) => {
-                assert_eq!(st.outcome, BrokerOrderOutcome::Filled);
-                assert_eq!(st.executed_qty, 0.001);
-                assert_eq!(st.avg_px, 65006.0);
-            }
-            other => panic!("{other:?}"),
+    fn okx_fill_without_oms_id_is_kept() {
+        let events = venue_events(&sample("ws_orders_fill"));
+        let VEvent::Fill(f) = &events[4] else { panic!("the app's fill") };
+        assert_eq!((f.exec_id.as_str(), f.client_order_id.as_deref()), ("BTC-USDT:123456791:B", Some("manual1")));
+    }
+
+    #[test]
+    fn the_fill_fee_flips_okx_sign_so_a_charge_is_positive() {
+        let mut m = sample("ws_orders_fill");
+        for (i, fee) in ["-0.026", "0.01", "0"].iter().enumerate() {
+            m["data"][i]["fillFee"] = (*fee).into();
+            m["data"][i]["fillFeeCcy"] = "USDT".into();
         }
+        let fees: Vec<_> = venue_events(&m).into_iter().filter_map(|e| match e { VEvent::Fill(f) => Some(f.fee), _ => None }).collect();
+        assert_eq!(fees, [Some((0.026, "USDT".to_string())), Some((-0.01, "USDT".to_string())), None]);
     }
 
     #[test]
-    fn live_is_nothing_and_a_cancel_without_fills_closes_with_nothing_filled() {
-        let u = updates(&sample("ws_orders_lifecycle"));
-        assert_eq!(u.len(), 2, "live produces nothing");
-        assert_eq!(u[0].0.to_string(), ORDER_ID);
-        assert!(
-            matches!(&u[0].1, Update::Terminal(st) if st.outcome == BrokerOrderOutcome::Canceled && st.executed_qty == 0.0),
-            "{:?}",
-            u[0].1
-        );
+    fn lifecycle_pushes_map_to_order_states_and_only_a_trade_makes_a_fill() {
+        let events = venue_events(&sample("ws_orders_lifecycle"));
+        let states: Vec<_> = events.iter().filter_map(|e| match e { VEvent::Order(o) => Some(o.status.clone()), _ => None }).collect();
+        assert_eq!(states, [VenueOrderStatus::Working, VenueOrderStatus::Canceled, VenueOrderStatus::Canceled]);
+        let fills: Vec<_> = events.iter().filter_map(|e| match e { VEvent::Fill(f) => Some(f.exec_id.as_str()), _ => None }).collect();
+        assert_eq!(fills, ["BTC-USDT:123456700:B"], "live and a plain cancel carry no trade");
     }
 
     #[test]
-    fn a_cancel_repeating_its_last_fill_closes_with_okx_totals() {
-        let u = updates(&sample("ws_orders_lifecycle"));
-        let (id, update) = &u[1];
-        assert_eq!(id.to_string(), "9a8b7c6d-0000-4000-8000-000000000002");
-        match update {
-            Update::Terminal(st) => {
-                assert_eq!(st.outcome, BrokerOrderOutcome::Canceled);
-                assert_eq!(st.executed_qty, 0.0005);
-                assert_eq!(st.avg_px, 65000.0);
-            }
-            other => panic!("{other:?}"),
-        }
+    fn a_malformed_fill_is_skipped_but_its_order_state_is_kept() {
+        let mut m = sample("ws_orders_fill");
+        m["data"][0].as_object_mut().unwrap().remove("fillSz");
+        assert_eq!(venue_events(&m).len(), 5);
     }
 
     #[test]
     fn other_channels_are_ignored() {
         let v = serde_json::from_str(include_str!("testdata/ws_tickers.json")).unwrap();
-        assert!(updates(&v).is_empty());
-    }
-
-    fn with_fee(fee: &str) -> serde_json::Value {
-        let mut m = sample("ws_orders_fill");
-        m["data"][1]["fee"] = fee.into();
-        m["data"][1]["feeCcy"] = "USDT".into();
-        m
-    }
-
-    #[test]
-    fn okx_order_update_sends_fee_total_with_charged_positive() {
-        let t = fee_totals(&with_fee("-0.06"));
-        assert_eq!(t.len(), 1);
-        assert_eq!(t[0].0.to_string(), ORDER_ID);
-        let ev = fee_event(t[0].0, t[0].1, t[0].2.clone());
-        assert!(matches!(&ev.kind, ExecKind::FeeTotal { total, currency } if *total == 0.06 && currency == "USDT"), "{:?}", ev.kind);
-    }
-
-    #[test]
-    fn okx_rebate_is_a_negative_total() {
-        let t = fee_totals(&with_fee("0.01"));
-        assert_eq!((t[0].1, t[0].2.as_str()), (-0.01, "USDT"));
-    }
-
-    #[test]
-    fn okx_zero_or_missing_fee_sends_nothing() {
-        assert!(fee_totals(&with_fee("0")).is_empty());
-        assert!(fee_totals(&with_fee("")).is_empty());
-        assert!(fee_totals(&sample("ws_orders_fill")).is_empty());
+        assert!(venue_events(&v).is_empty());
     }
 }

@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
 
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+
 use dataprovider::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
 use reqwest::Client;
 use serde::Serialize;
@@ -10,6 +13,7 @@ use crate::adapter::{
     BrokerOrderResponse, InstrumentProvider,
 };
 use crate::md::daily_stats::DailyStats;
+use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 
 /// Alpaca's market-data API is a separate host from the trading API
@@ -492,6 +496,143 @@ pub(crate) fn parse_open_orders(orders: &serde_json::Value) -> Vec<BrokerOpenOrd
         .collect()
 }
 
+/// Activities per page; Alpaca's maximum.
+const ACTIVITIES_PAGE: usize = 100;
+
+/// `GET /v2/account/activities` parameters: ascending from the cursor (the last
+/// activity id, as `page_token`) when there is one, else from `since`.
+/// Assumes `page_token` is exclusive (the page starts after that activity). If
+/// the boundary fill were re-served it is harmless: its exec id (order id plus
+/// cumulative quantity) matches the one already booked, so ingest dedups it.
+pub(crate) fn activities_query(from: Option<&Cursor>, since: DateTime<Utc>) -> Vec<(&'static str, String)> {
+    let mut q = vec![
+        ("activity_types", "FILL".to_string()),
+        ("direction", "asc".to_string()),
+        ("page_size", ACTIVITIES_PAGE.to_string()),
+    ];
+    match from {
+        Some(c) => q.push(("page_token", c.0.clone())),
+        None => q.push(("after", since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))),
+    }
+    q
+}
+
+/// FILL activities as a pull page: the next cursor is the last activity id
+/// (empty when there were none, so the caller keeps its stamp), and a full page
+/// means there may be more. Rows executed before `since` are dropped on every
+/// page; the cursor still moves past them. Equity fills carry no fee.
+pub(crate) fn activities_page(body: &serde_json::Value, account_ref: &str, limit: usize, since: DateTime<Utc>) -> PullPage {
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok());
+    let rows = body.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let next = Cursor(rows.last().and_then(|r| r["id"].as_str()).unwrap_or_default().to_string());
+    let fills = rows
+        .iter()
+        .filter_map(|r| {
+            let executed_at = r["transaction_time"].as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
+            if executed_at.is_some_and(|at| at < since) {
+                return None;
+            }
+            let id = r["id"].as_str().unwrap_or("?");
+            let skip = |field: &str| {
+                warn!(activity = id, field, "Alpaca activities: FILL row skipped, required field missing or malformed");
+                None
+            };
+            let Some(order_id) = r["order_id"].as_str().filter(|o| !o.is_empty()) else { return skip("order_id") };
+            let Some(cum) = num(&r["cum_qty"]) else { return skip("cum_qty") };
+            let Some(symbol) = r["symbol"].as_str() else { return skip("symbol") };
+            let Some(side) = r["side"].as_str() else { return skip("side") };
+            let Some(qty) = num(&r["qty"]) else { return skip("qty") };
+            let Some(price) = num(&r["price"]) else { return skip("price") };
+            Some(VenueFill {
+                exec_id: super::fill_exec_id(order_id, cum),
+                venue_order_id: order_id.to_string(),
+                client_order_id: None,
+                account_ref: account_ref.to_string(),
+                symbol: symbol.to_string(),
+                buy: side == "buy",
+                qty,
+                price,
+                fee: None,
+                executed_at,
+            })
+        })
+        .collect();
+    PullPage { fills, next, more: rows.len() >= limit }
+}
+
+/// `GET /v2/orders?status=open` as the venue's view of each open order.
+pub(crate) fn parse_open_order_snapshot(orders: &serde_json::Value, account_ref: &str) -> Vec<VenueOrderUpdate> {
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok());
+    orders
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let order_type = o["type"].as_str().unwrap_or("").to_string();
+            Some(VenueOrderUpdate {
+                venue_order_id: o["id"].as_str()?.to_string(),
+                client_order_id: o["client_order_id"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
+                account_ref: account_ref.to_string(),
+                symbol: o["symbol"].as_str()?.to_string(),
+                buy: o["side"].as_str()? == "buy",
+                limit_px: if order_type == "market" { None } else { num(&o["limit_price"]) },
+                order_type,
+                qty: num(&o["qty"])?,
+                status: VenueOrderStatus::Working,
+                cum_qty: num(&o["filled_qty"]).unwrap_or(0.0),
+                ts: o["updated_at"].as_str().and_then(|s| s.parse().ok()),
+            })
+        })
+        .collect()
+}
+
+/// One Alpaca key is one account, so `account_ref` is only echoed into what is
+/// returned, and there is a single scope.
+#[async_trait]
+impl ExecutionSource for AlpacaAdapter {
+    async fn fills_since(
+        &self,
+        account_ref: &str,
+        _scope: &str,
+        from: Option<&Cursor>,
+        since: DateTime<Utc>,
+    ) -> Result<PullPage, BrokerError> {
+        let mut url = reqwest::Url::parse(&format!("{}/v2/account/activities", self.base_url))
+            .map_err(|e| BrokerError::NotConfigured(e.to_string()))?;
+        url.query_pairs_mut().extend_pairs(activities_query(from, since));
+        let resp = self
+            .get_json(url.as_str())
+            .send()
+            .await
+            .map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(activities_page(&body, account_ref, ACTIVITIES_PAGE, since))
+    }
+
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        let url = format!("{}{OPEN_ORDERS_PATH}", self.base_url);
+        let resp = self.get_json(&url).send().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_open_order_snapshot(&body, account_ref))
+    }
+
+    async fn scopes(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(vec![String::new()])
+    }
+
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 60, max_history: None, per_symbol: false }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +710,64 @@ mod tests {
         .unwrap();
         let stats = parse_alpaca_snapshots(&body);
         assert_eq!(stats, vec![("AAPL".to_string(), 227.16)]);
+    }
+
+    #[test]
+    fn activities_page_maps_and_cursors() {
+        let body = serde_json::json!([
+            { "id": "20261118143000000::a", "activity_type": "FILL", "transaction_time": "2026-11-18T14:30:00.5Z", "type": "fill",
+              "price": "101.5", "qty": "2", "side": "buy", "symbol": "AAPL", "order_id": "ord-1", "cum_qty": "2" },
+            { "id": "20261118143100000::b", "activity_type": "FILL", "transaction_time": "2026-11-18T14:31:00Z", "type": "partial_fill",
+              "price": "50", "qty": "1", "side": "sell", "symbol": "MSFT", "order_id": "ord-2", "cum_qty": "1" },
+        ]);
+        let page = activities_page(&body, "", 2, chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        assert_eq!(page.fills.len(), 2);
+        let f = &page.fills[0];
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("ord-1:2", "ord-1", "AAPL", true, 2.0, 101.5));
+        assert_eq!((f.fee.clone(), f.client_order_id.clone()), (None, None));
+        assert!(!page.fills[1].buy);
+        assert_eq!(page.next, Cursor("20261118143100000::b".into()));
+        assert!(page.more, "a full page asks for the next");
+        assert!(!activities_page(&body, "", 3, chrono::DateTime::<chrono::Utc>::MIN_UTC).more);
+        // since drops older rows but the cursor still moves past them.
+        let since = "2026-11-18T14:30:30Z".parse().unwrap();
+        let late = activities_page(&body, "", 100, since);
+        assert_eq!(late.fills.len(), 1);
+        assert_eq!(late.next, Cursor("20261118143100000::b".into()));
+        // An empty page gives no cursor, so the reconciler keeps its stamp.
+        let empty = activities_page(&serde_json::json!([]), "", 100, since);
+        assert!(empty.fills.is_empty() && empty.next == Cursor(String::new()) && !empty.more);
+    }
+
+    #[test]
+    fn pull_row_missing_order_id_is_skipped_with_a_warning() {
+        let body = serde_json::json!([
+            { "id": "a1", "order_id": "", "cum_qty": "1", "qty": "1", "price": "10", "side": "buy", "symbol": "AAPL" },
+            { "id": "a2", "cum_qty": "1", "qty": "1", "price": "10", "side": "buy", "symbol": "AAPL" },
+            { "id": "a3", "order_id": "o", "cum_qty": "1", "qty": "1", "price": "10", "side": "buy", "symbol": "AAPL" },
+        ]);
+        let page = activities_page(&body, "", 100, chrono::DateTime::<chrono::Utc>::MIN_UTC);
+        assert_eq!(page.fills.len(), 1);
+        assert_eq!(page.fills[0].exec_id, "o:1");
+        assert_eq!(page.next, Cursor("a3".into()));
+    }
+
+    #[test]
+    fn activities_query_resumes_from_the_cursor_else_from_since() {
+        let since = "2026-11-18T14:30:30Z".parse().unwrap();
+        let first = activities_query(None, since);
+        assert!(first.contains(&("after", "2026-11-18T14:30:30Z".to_string())) && !first.iter().any(|(k, _)| *k == "page_token"));
+        let resumed = activities_query(Some(&Cursor("id-9".into())), since);
+        assert!(resumed.contains(&("page_token", "id-9".to_string())) && !resumed.iter().any(|(k, _)| *k == "after"));
+        assert!(resumed.contains(&("direction", "asc".to_string())));
+    }
+
+    #[test]
+    fn open_orders_snapshot_rows_are_working_updates() {
+        let body = serde_json::json!([{ "id": "o1", "client_order_id": "c1", "symbol": "AAPL", "side": "buy", "type": "limit",
+            "qty": "5", "filled_qty": "1", "limit_price": "100" }]);
+        let rows = parse_open_order_snapshot(&body, "");
+        assert_eq!((rows[0].venue_order_id.as_str(), rows[0].cum_qty, rows[0].qty, rows[0].limit_px), ("o1", 1.0, 5.0, Some(100.0)));
+        assert_eq!(ExecutionSource::hints(&AlpacaAdapter::new("k".into(), "s".into(), "PAPER")), PullHints { intraday_secs: 60, max_history: None, per_symbol: false });
     }
 }

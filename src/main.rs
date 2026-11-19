@@ -11,7 +11,9 @@ mod instruments_import;
 mod risk_engine;
 mod positions;
 mod fees;
-mod recon_orders;
+mod ingest;
+mod reconciler;
+mod recon_admin_api;
 mod symbology_resolver;
 mod setup;
 mod sessions;
@@ -1031,6 +1033,22 @@ fn build_app(
         .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
         .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
         .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
+        .route(
+            "/admin/broker-connections/:code/recon",
+            get(recon_admin_api::get_recon).patch(recon_admin_api::patch_recon),
+        )
+        .route(
+            "/admin/broker-connections/:code/attribution-rules",
+            get(recon_admin_api::list_rules).post(recon_admin_api::create_rule),
+        )
+        .route(
+            "/admin/broker-connections/:code/attribution-rules/:id",
+            axum::routing::put(recon_admin_api::update_rule).delete(recon_admin_api::delete_rule),
+        )
+        .route("/admin/broker-connections/:code/sweep", post(recon_admin_api::sweep))
+        .route("/admin/recon-breaks", get(recon_admin_api::list_breaks))
+        .route("/admin/recon-breaks/:id/adopt", post(recon_admin_api::adopt_break))
+        .route("/admin/recon-breaks/:id/dismiss", post(recon_admin_api::dismiss_break))
         .route("/admin/jobs", get(jobs::api::list_jobs))
         .route("/admin/jobs/:id", get(jobs::api::get_job))
         .route("/admin/feed-connections", get(admin::list_feed_connections))
@@ -1389,7 +1407,7 @@ async fn serve() {
     // events instead of writing to the database (see `order_engine.rs`). Started
     // before any connector, though its channel would buffer either way.
     let (engine, engine_rx) = gateway::contract::EngineHandle::new();
-    tokio::spawn(order_engine::run(engine_rx, engine.clone(), pool.clone(), event_bus.clone()));
+    tokio::spawn(order_engine::run(engine_rx, pool.clone(), event_bus.clone()));
 
     // The market data gateway, and the one receiver of every quote it emits.
     // Created here, ahead of `AppState`, for the same reason: a runtime reload
@@ -1560,7 +1578,7 @@ async fn serve() {
     // that task rather than leave fills arriving against a credential orders no
     // longer route on.
     for stream in &exec_streams {
-        reload::restart_exec_stream(stream, &registration_deps, state.streams()).await;
+        reload::restart_exec_stream(stream, &registration_deps, state.streams(), state.pool()).await;
     }
 
     // Market data: feeds emit quotes onto one channel (created above, alongside
@@ -1600,6 +1618,7 @@ async fn serve() {
     // supervised: `stream_supervisor` exists to reconnect streams, and treats a clean
     // return as a disconnect to back off from — wrong shape for a periodic job.
     tokio::spawn(expiry::run(state.pool().clone()));
+    tokio::spawn(jobs::eod_sweep::run(state.pool().clone()));
 
     // Re-resolve imported IBKR instruments daily at 06:00 UTC while a TWS session is live.
     tokio::spawn(instruments_import::run_nightly(state.pool().clone()));

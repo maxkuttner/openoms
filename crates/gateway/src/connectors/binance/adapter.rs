@@ -11,7 +11,10 @@
 //! balances report and reconciliation matches on.
 
 use base64::Engine;
-use chrono::{TimeZone, Utc};
+use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
+
+use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 use dataprovider::{Identifiers, InstrumentDef};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
@@ -178,23 +181,19 @@ impl BinanceAdapter {
         Ok(parse_exchange_info(&body).into_iter().find(|i| i.broker_symbol == symbol))
     }
 
-    /// GET /api/v3/myTrades — up to 1000 of the account's fills on `symbol`:
-    /// from a trade id on, or else from a start time (milliseconds), for
-    /// filling a follow stream's gap.
-    pub async fn my_trades(&self, symbol: &str, from_trade_id: Option<i64>, start_time_ms: Option<i64>) -> Result<Vec<crate::contract::ExternalFill>, BrokerError> {
-        let body = self.my_trades_body(symbol, from_trade_id, start_time_ms).await?;
-        Ok(parse_my_trades(&body))
-    }
-
-    /// Raw `myTrades` rows, so the runtime path can retain fees and original
-    /// timestamps the follow path does not need.
+    /// Raw `myTrades` rows (GET /api/v3/myTrades, up to 1000 of the account's
+    /// fills on `symbol`, from a trade id or a start time in milliseconds).
     pub(crate) async fn my_trades_body(&self, symbol: &str, from_trade_id: Option<i64>, start_time_ms: Option<i64>) -> Result<serde_json::Value, BrokerError> {
-        let mut params = vec![("symbol", symbol.to_string()), ("limit", "1000".to_string())];
+        let mut params = vec![("symbol", symbol.to_string()), ("limit", MY_TRADES_LIMIT.to_string())];
         match (from_trade_id, start_time_ms) {
             (Some(from), _) => params.push(("fromId", from.to_string())),
             (None, Some(start)) => params.push(("startTime", start.to_string())),
             (None, None) => {}
         }
+        self.my_trades_query(&params).await
+    }
+
+    async fn my_trades_query(&self, params: &[(&'static str, String)]) -> Result<serde_json::Value, BrokerError> {
         let resp = self.signed(Method::GET, "/api/v3/myTrades", &params).await?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -513,25 +512,157 @@ pub(crate) fn parse_exchange_info(body: &serde_json::Value) -> Vec<BrokerInstrum
         .collect()
 }
 
-/// `myTrades` rows as external fills (the history carries no client order id).
-pub(crate) fn parse_my_trades(body: &serde_json::Value) -> Vec<crate::contract::ExternalFill> {
+/// `myTrades` rows as venue fills (the history carries no client order id).
+pub(crate) fn parse_my_trades(body: &serde_json::Value, account_ref: &str) -> Vec<VenueFill> {
     body.as_array()
         .into_iter()
         .flatten()
         .filter_map(|t| {
-            Some(crate::contract::ExternalFill {
-                trade_id: t["id"].as_i64()?.to_string(),
+            Some(VenueFill {
+                exec_id: super::fill_exec_id(t["symbol"].as_str()?, &t["id"].as_i64()?.to_string(), t["isBuyer"].as_bool()?),
                 venue_order_id: t["orderId"].as_i64()?.to_string(),
-                client_order_id: String::new(),
+                client_order_id: None,
+                account_ref: account_ref.to_string(),
                 symbol: t["symbol"].as_str()?.to_string(),
                 buy: t["isBuyer"].as_bool()?,
                 qty: t["qty"].as_str()?.parse().ok()?,
                 price: t["price"].as_str()?.parse().ok()?,
-                fee_amount: t["commission"].as_str().and_then(|v| v.parse().ok()),
-                fee_currency: t["commissionAsset"].as_str().map(str::to_string),
+                fee: match (t["commission"].as_str().and_then(|v| v.parse::<f64>().ok()), t["commissionAsset"].as_str()) {
+                    (Some(a), Some(c)) if a != 0.0 && !c.is_empty() => Some((a, c.to_string())),
+                    _ => None,
+                },
                 executed_at: t["time"].as_i64().and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
             })
         })
+        .collect()
+}
+
+/// Most rows one `myTrades` call returns.
+const MY_TRADES_LIMIT: usize = 1000;
+/// The `fromId` of the next `myTrades` call: after the cursor's trade id, or
+/// the symbol's oldest trade when there is no cursor yet (paging by id costs
+/// one call per 1000 trades, where scanning time windows costs one per day).
+pub(crate) fn from_id(from: Option<&Cursor>) -> i64 {
+    from.and_then(|c| c.0.parse::<i64>().ok()).map_or(0, |id| id + 1)
+}
+
+/// `myTrades` rows as a pull page: the next cursor is the last trade id (empty
+/// when there were none), and a full page (`limit` rows) means there may be
+/// more. Rows executed before `since` are dropped (on every page); the
+/// cursor still moves past them.
+pub(crate) fn trades_page(body: &serde_json::Value, account_ref: &str, limit: usize, since: DateTime<Utc>) -> PullPage {
+    let rows = body.as_array().map(Vec::len).unwrap_or(0);
+    let all = parse_my_trades(body, account_ref);
+    // The cursor is the raw trade id (`fromId`), not the prefixed exec id.
+    let next = Cursor(
+        body.as_array()
+            .and_then(|a| a.iter().rev().find_map(|t| t["id"].as_i64()))
+            .map(|id| id.to_string())
+            .unwrap_or_default(),
+    );
+    let fills = all
+        .into_iter()
+        .filter(|t| match t.executed_at {
+            Some(at) => at >= since,
+            _ => true,
+        })
+        .collect();
+    PullPage { fills, next, more: rows >= limit }
+}
+
+/// `GET /api/v3/openOrders` as the venue's view of each open order.
+pub(crate) fn parse_open_order_snapshot(body: &serde_json::Value, account_ref: &str) -> Vec<VenueOrderUpdate> {
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok());
+    body.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|o| {
+            let order_type = o["type"].as_str().unwrap_or("").to_string();
+            Some(VenueOrderUpdate {
+                venue_order_id: o["orderId"].as_i64()?.to_string(),
+                client_order_id: o["clientOrderId"].as_str().filter(|c| !c.is_empty()).map(str::to_string),
+                account_ref: account_ref.to_string(),
+                symbol: o["symbol"].as_str()?.to_string(),
+                buy: o["side"].as_str()? == "BUY",
+                limit_px: if order_type == "MARKET" { None } else { num(&o["price"]).filter(|p| *p != 0.0) },
+                order_type,
+                qty: num(&o["origQty"])?,
+                status: VenueOrderStatus::Working,
+                cum_qty: num(&o["executedQty"]).unwrap_or(0.0),
+                ts: o["time"].as_i64().and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
+            })
+        })
+        .collect()
+}
+
+/// The distinct symbols of `open`, sorted.
+pub(crate) fn open_order_symbols(open: &[VenueOrderUpdate]) -> Vec<String> {
+    open.iter().map(|o| o.symbol.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect()
+}
+
+/// Binance serves executions one symbol at a time (`myTrades`), so a scope is
+/// a symbol. One API key is one account, so `account_ref` is only echoed into
+/// what is returned.
+#[async_trait]
+impl ExecutionSource for BinanceAdapter {
+    async fn fills_since(
+        &self,
+        account_ref: &str,
+        scope: &str,
+        from: Option<&Cursor>,
+        since: DateTime<Utc>,
+    ) -> Result<PullPage, BrokerError> {
+        let params = vec![
+            ("symbol", scope.to_string()),
+            ("limit", MY_TRADES_LIMIT.to_string()),
+            ("fromId", from_id(from).to_string()),
+        ];
+        let body = self.my_trades_query(&params).await?;
+        Ok(trades_page(&body, account_ref, MY_TRADES_LIMIT, since))
+    }
+
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        let resp = self.signed(Method::GET, "/api/v3/openOrders", &[]).await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(parse_open_order_snapshot(&body, account_ref))
+    }
+
+    /// The symbols of the account's open orders. The OMS adds the symbols it
+    /// has orders on for the account, since it holds them and this crate has
+    /// no database (see the OMS reconciler's `scopes`).
+    async fn scopes(&self, account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(open_order_symbols(&self.open_order_snapshot(account_ref).await?))
+    }
+
+    /// GET /api/v3/account (weight 20): assets with free + locked above zero.
+    async fn held_assets(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        let resp = self.signed(Method::GET, "/api/v3/account", &[("omitZeroBalances", "true".to_string())]).await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(crate::adapter::http_failure(status, resp.text().await.unwrap_or_default()));
+        }
+        let body: serde_json::Value = resp.json().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+        Ok(nonzero_assets(&body))
+    }
+
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 60, max_history: None, per_symbol: true }
+    }
+}
+
+/// The assets of `/api/v3/account` `balances` whose free + locked is above zero.
+pub(crate) fn nonzero_assets(body: &serde_json::Value) -> Vec<String> {
+    let num = |v: &serde_json::Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    body["balances"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| num(&b["free"]) + num(&b["locked"]) > 0.0)
+        .filter_map(|b| b["asset"].as_str().map(str::to_string))
         .collect()
 }
 
@@ -548,17 +679,143 @@ mod tests {
     use super::*;
 
     #[test]
-    fn my_trades_parse_into_external_fills() {
+    fn held_assets_are_the_nonzero_balances() {
+        let body = serde_json::json!({ "balances": [
+            { "asset": "BTC", "free": "0.5", "locked": "0" },
+            { "asset": "ETH", "free": "0", "locked": "1.2" },
+            { "asset": "BNB", "free": "0.00000000", "locked": "0.00000000" },
+        ]});
+        assert_eq!(nonzero_assets(&body), ["BTC", "ETH"]);
+    }
+
+    #[test]
+    fn my_trades_page_maps_to_venue_fills_with_next_cursor() {
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0.01", "commissionAsset": "BNB" },
+            { "symbol": "BTCUSDT", "id": 502, "orderId": 9003, "price": "64010", "qty": "0.1", "isBuyer": false, "commission": "0", "commissionAsset": "USDT" },
+        ]);
+        let page = trades_page(&body, "acct-1", 1000, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(page.fills.len(), 2);
+        let f = &page.fills[0];
+        assert_eq!((f.exec_id.as_str(), f.venue_order_id.as_str(), f.account_ref.as_str(), f.symbol.as_str()), ("BTCUSDT:501:B", "9001", "acct-1", "BTCUSDT"));
+        assert_eq!((f.buy, f.qty, f.price, f.client_order_id.clone()), (true, 0.25, 64000.5, None));
+        assert_eq!(f.fee, Some((0.01, "BNB".into())));
+        assert_eq!(page.fills[1].fee, None);
+        assert_eq!(page.next, crate::venue_event::Cursor("502".into()));
+        assert!(!page.more, "a short page is the last");
+        let full = trades_page(&body, "acct-1", 2, DateTime::<Utc>::MIN_UTC);
+        assert!(full.more, "a full page asks for the next");
+    }
+
+    #[test]
+    fn a_trade_id_cursor_pages_from_the_next_id() {
+        // `fromId` is inclusive, so the cursor's own trade is not pulled again.
+        assert_eq!(from_id(Some(&crate::venue_event::Cursor("502".into()))), 503);
+    }
+
+    #[test]
+    fn no_cursor_starts_from_id_zero_and_filters_by_since() {
+        assert_eq!(from_id(None), 0);
+        let body = serde_json::json!([
+            { "symbol": "X", "id": 1, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": 1000i64 },
+            { "symbol": "X", "id": 2, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": 3000i64 },
+        ]);
+        let page = trades_page(&body, "a", 1000, Utc.timestamp_millis_opt(2000).unwrap());
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["X:2:B"]);
+        assert_eq!(page.next.0, "2");
+        // Only old trades: none booked, but the cursor still moves past them.
+        let page = trades_page(&body, "a", 1000, Utc.timestamp_millis_opt(9000).unwrap());
+        assert!(page.fills.is_empty());
+        assert_eq!(page.next.0, "2");
+    }
+
+    #[test]
+    fn empty_symbol_costs_one_call_and_leaves_cursor_empty() {
+        let page = trades_page(&serde_json::json!([]), "a", 1000, Utc::now());
+        assert_eq!(page, PullPage { fills: vec![], next: crate::venue_event::Cursor(String::new()), more: false });
+    }
+
+    #[test]
+    fn since_filter_applies_on_every_page_of_an_anchored_scan() {
+        // A two-page history (limit 2), every row older than `since` except id 4.
+        let row = |id: i64, ms: i64| serde_json::json!({ "symbol": "X", "id": id, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true, "time": ms });
+        let history = [row(1, 100), row(2, 200), row(3, 300), row(4, 5000)];
+        let since = Utc.timestamp_millis_opt(1000).unwrap();
+        let mut from: Option<crate::venue_event::Cursor> = None;
+        let mut booked = vec![];
+        loop {
+            let start = from_id(from.as_ref()) as usize;
+            let body = serde_json::Value::Array(history.iter().filter(|r| r["id"].as_i64().unwrap() as usize >= start).take(2).cloned().collect());
+            let page = trades_page(&body, "a", 2, since);
+            booked.extend(page.fills.iter().map(|f| f.exec_id.clone()));
+            if !page.more {
+                break;
+            }
+            from = Some(page.next);
+        }
+        assert_eq!(booked, ["X:4:B"], "old rows on page 2 are dropped too");
+    }
+
+    #[test]
+    fn open_orders_snapshot_maps_to_working_updates() {
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "orderId": 9001, "clientOrderId": "mm1", "side": "SELL", "type": "LIMIT", "origQty": "1.5", "price": "64000", "executedQty": "0.5", "time": 1700000000000i64 },
+        ]);
+        let snap = parse_open_order_snapshot(&body, "acct-1");
+        assert_eq!(snap.len(), 1);
+        let o = &snap[0];
+        assert_eq!((o.venue_order_id.as_str(), o.client_order_id.as_deref(), o.account_ref.as_str(), o.buy), ("9001", Some("mm1"), "acct-1", false));
+        assert_eq!((o.qty, o.limit_px, o.cum_qty, o.status.clone()), (1.5, Some(64000.0), 0.5, crate::venue_event::VenueOrderStatus::Working));
+    }
+
+    #[test]
+    fn scopes_are_open_order_symbols_and_hints_are_per_symbol() {
+        let body = serde_json::json!([
+            { "symbol": "ETHUSDT", "orderId": 1, "clientOrderId": "a", "side": "BUY", "type": "LIMIT", "origQty": "1", "price": "1", "executedQty": "0" },
+            { "symbol": "BTCUSDT", "orderId": 2, "clientOrderId": "b", "side": "BUY", "type": "LIMIT", "origQty": "1", "price": "1", "executedQty": "0" },
+            { "symbol": "ETHUSDT", "orderId": 3, "clientOrderId": "c", "side": "BUY", "type": "LIMIT", "origQty": "1", "price": "1", "executedQty": "0" },
+        ]);
+        assert_eq!(open_order_symbols(&parse_open_order_snapshot(&body, "")), vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
+        let a = BinanceAdapter::new("k".into(), "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAGvAMHEDQzczRRSN2T3AYeEUyaWSwA6GXlSZ2hjM8TC\n-----END PRIVATE KEY-----\n", "PAPER").unwrap();
+        assert_eq!(crate::venue_event::ExecutionSource::hints(&a), crate::venue_event::PullHints { intraday_secs: 60, max_history: None, per_symbol: true });
+    }
+
+    #[test]
+    fn two_symbols_sharing_a_trade_id_both_book() {
+        // Binance trade ids are per symbol: id 501 on BTCUSDT and on ETHUSDT are two fills.
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "id": 501, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true },
+            { "symbol": "ETHUSDT", "id": 501, "orderId": 2, "price": "1", "qty": "1", "isBuyer": true },
+        ]);
+        let page = trades_page(&body, "a", 1000, DateTime::<Utc>::MIN_UTC);
+        let ids: std::collections::HashSet<_> = page.fills.iter().map(|f| f.exec_id.clone()).collect();
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_eq!(page.next.0, "501", "the cursor stays the raw trade id");
+    }
+
+    #[test]
+    fn self_trade_both_sides_book() {
+        // A self-trade: both sides carry the same trade id on one account.
+        let body = serde_json::json!([
+            { "symbol": "BTCUSDT", "id": 7, "orderId": 1, "price": "1", "qty": "1", "isBuyer": true },
+            { "symbol": "BTCUSDT", "id": 7, "orderId": 2, "price": "1", "qty": "1", "isBuyer": false },
+        ]);
+        let fills = parse_my_trades(&body, "a");
+        assert_ne!(fills[0].exec_id, fills[1].exec_id);
+    }
+
+    #[test]
+    fn my_trades_parse_into_venue_fills() {
         let body = serde_json::json!([
             { "symbol": "BTCUSDT", "id": 501, "orderId": 9001, "price": "64000.5", "qty": "0.25", "isBuyer": true, "time": 1700000000000i64, "commission": "0.01", "commissionAsset": "BNB" },
             { "symbol": "BTCUSDT", "id": 502, "orderId": 9003, "price": "64010", "qty": "0.1", "isBuyer": false },
         ]);
-        let fills = parse_my_trades(&body);
+        let fills = parse_my_trades(&body, "acct-1");
         assert_eq!(fills.len(), 2);
-        assert_eq!((fills[0].trade_id.as_str(), fills[0].venue_order_id.as_str(), fills[0].buy, fills[0].qty), ("501", "9001", true, 0.25));
+        assert_eq!((fills[0].exec_id.as_str(), fills[0].venue_order_id.as_str(), fills[0].buy, fills[0].qty), ("BTCUSDT:501:B", "9001", true, 0.25));
         assert!(!fills[1].buy);
-        assert_eq!(fills[0].fee_amount, Some(0.01));
-        assert_eq!(fills[0].fee_currency.as_deref(), Some("BNB"));
+        assert_eq!(fills[0].fee, Some((0.01, "BNB".into())));
+        assert_eq!(fills[0].account_ref, "acct-1");
         assert!(fills[0].executed_at.is_some());
     }
 

@@ -3,8 +3,10 @@
 //! One [`start_session`] call per broker/environment wires a full FIX order-entry
 //! session into the OMS: outbound orders through [`adapter::FixBrokerAdapter`]
 //! (registered in the [`BrokerRegistry`](crate::adapter::BrokerRegistry)), and
-//! inbound execution reports through [`app::FixApplication`] to the
-//! [order engine](crate::order_engine), which books them.
+//! inbound execution reports through [`app::FixApplication`] as venue events,
+//! out of the [`VenueStream`](crate::connectors::VenueStream) the session
+//! returns: the OMS feeds them to the connection's reconciler (with a pull
+//! source) or straight to ingest (without one).
 //! QuickFIX owns the session mechanics — logon, heartbeat, sequence numbers,
 //! resend/gap-fill, TLS, and reconnect — so there is no supervisor loop here.
 
@@ -20,7 +22,6 @@ use quickfix::{
     LogFactory, MemoryMessageStoreFactory, SessionId, SessionSettings,
 };
 use tokio::sync::mpsc;
-use tokio::time::Duration;
 use tracing::{debug, error, info};
 
 /// FIX tags whose value is authentication material and must never reach a log
@@ -127,7 +128,7 @@ use crate::adapter::BrokerError;
 use crate::fix::adapter::FixBrokerAdapter;
 use crate::fix::app::FixApplication;
 use crate::fix::dialect::FixDialect;
-use crate::contract::{EngineHandle, ExecEvent};
+use crate::connectors::VenueStream;
 use crate::stream_health::StreamHandle;
 
 /// Connection parameters for one FIX session. Credentials live on the dialect;
@@ -175,23 +176,18 @@ fn build_settings(cfg: &FixConfig, begin_string: &str) -> Result<(SessionSetting
     Ok((settings, session_id))
 }
 
-/// Start one FIX session: spawn the QuickFIX initiator (on its own OS thread) and
-/// the async execution-report drain, returning the adapter to register in the
-/// broker registry. `actor` labels the events this session appends (e.g. "ibkr").
-#[allow(clippy::too_many_arguments)]
+/// Start one FIX session: spawn the QuickFIX initiator (on its own OS thread),
+/// returning the adapter to register and the session's venue-event stream.
+///
+/// The session has no stream task of its own — the QuickFIX callbacks emit the
+/// events. The returned [`VenueStream`] drains them into the sink it is given
+/// until that sink closes; the receiver outlives an aborted drain (it sits
+/// behind a shared lock), so a restarted stream picks up where the last left off.
 pub fn start_session(
-    environment: &'static str,
     dialect: Arc<dyn FixDialect>,
     cfg: FixConfig,
-    actor: &'static str,
     health: StreamHandle,
-    engine: EngineHandle,
-    // Optional REST adapter that owns the reconciliation reads (open orders / order
-    // status) for venues with no FIX equivalent (Binance Spot FIX). When present, the
-    // recon driver reconciles through a SplitAdapter — orders over FIX, reads over
-    // REST; when absent (IBKR) it uses the native 35=AF/35=H path.
-    read_delegate: Option<Arc<dyn crate::adapter::BrokerAdapter>>,
-) -> Result<Arc<FixBrokerAdapter>, BrokerError> {
+) -> Result<(Arc<FixBrokerAdapter>, VenueStream), BrokerError> {
     let begin_string = dialect.begin_string();
     // Validate settings eagerly so a misconfiguration surfaces at startup; the
     // real SessionSettings is rebuilt inside the session thread because its FFI
@@ -201,23 +197,19 @@ pub fn start_session(
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let snapshots = Arc::new(Mutex::new(HashMap::new()));
     let statuses = Arc::new(Mutex::new(HashMap::new()));
-    let (report_tx, mut report_rx) = mpsc::unbounded_channel();
-    // Logon nudges (bounded, coalescing) for the order-reconcile driver.
-    let (logon_tx, mut logon_rx) = mpsc::channel::<()>(4);
-
-    // Venue/registry code (e.g. "IBKR"), captured before `dialect` moves onto the
-    // session thread — used as the broker_code for reconciliation queries.
-    let broker_code = dialect.venue();
-
-    // Forward inbound execution reports to the order engine, which books them.
-    {
-        let engine = engine.clone();
-        tokio::spawn(async move {
-            while let Some((order_id, report)) = report_rx.recv().await {
-                engine.exec(ExecEvent::from_report(order_id, broker_code, actor, report)).await;
+    let (venue_tx, venue_rx) = mpsc::unbounded_channel();
+    let venue_rx = Arc::new(tokio::sync::Mutex::new(venue_rx));
+    let venue_stream: VenueStream = Arc::new(move |_health, sink| {
+        let rx = venue_rx.clone();
+        Box::pin(async move {
+            let mut rx = rx.lock().await;
+            while let Some(event) = rx.recv().await {
+                if sink.send(event).await.is_err() {
+                    break;
+                }
             }
-        });
-    }
+        })
+    });
 
     let adapter = Arc::new(FixBrokerAdapter::new(
         dialect.clone(),
@@ -227,37 +219,6 @@ pub fn start_session(
         cfg.sender_comp_id.clone(),
         cfg.target_comp_id.clone(),
     ));
-
-    // The adapter the recon driver reconciles through: pure FIX by default, or a
-    // FIX-writer / REST-reader split when a read delegate is supplied. Order routing
-    // (the returned `adapter`) always stays pure FIX.
-    let recon_adapter: Arc<dyn crate::adapter::BrokerAdapter> = match read_delegate {
-        Some(reader) => Arc::new(crate::adapter::SplitAdapter { writer: adapter.clone(), reader }),
-        None => adapter.clone(),
-    };
-
-    // Order-reconcile driver: mass-status snapshot on each (re)logon and every 30s,
-    // diffing the broker's open orders against the OMS working set. This is FIX's
-    // snapshot-on-reconnect — necessary because `ResetOnLogon=Y` disables QuickFIX's
-    // own resend of anything missed during an outage.
-    {
-        let engine = engine.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.tick().await; // consume the immediate first tick
-            loop {
-                tokio::select! {
-                    recv = logon_rx.recv() => {
-                        if recv.is_none() {
-                            break; // session gone — stop the driver
-                        }
-                    }
-                    _ = interval.tick() => {}
-                }
-                engine.reconcile(broker_code, environment, actor, recon_adapter.clone()).await;
-            }
-        });
-    }
 
     let server_kind = if cfg.ssl {
         FixSocketServerKind::SslSingleThreaded
@@ -277,7 +238,7 @@ pub fn start_session(
                 Err(e) => { error!(venue, error = %e, "FIX: settings build failed"); return; }
             };
             let app_cb =
-                FixApplication::new(dialect, health, pending, snapshots, statuses, report_tx, logon_tx);
+                FixApplication::new(dialect, health, pending, snapshots, statuses, venue_tx);
             let application = match Application::try_new(&app_cb) {
                 Ok(a) => a,
                 Err(e) => { error!(venue, error = %e, "FIX: application init failed"); return; }
@@ -302,5 +263,5 @@ pub fn start_session(
         })
         .map_err(|e| BrokerError::NotConfigured(format!("FIX thread spawn: {e}")))?;
 
-    Ok(adapter)
+    Ok((adapter, venue_stream))
 }

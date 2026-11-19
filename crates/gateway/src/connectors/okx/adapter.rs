@@ -23,7 +23,10 @@ use dataprovider::{Identifiers, InstrumentDef};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use sha2::Sha256;
-use tracing::info;
+use chrono::{DateTime, TimeZone, Utc};
+use tracing::{info, warn};
+
+use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 use uuid::Uuid;
 
 use crate::adapter::{BrokerAdapter, BrokerError, BrokerInstrument, BrokerOrderRequest, BrokerOrderResponse, InstrumentProvider};
@@ -136,6 +139,9 @@ async fn read(resp: Result<reqwest::Response, reqwest::Error>) -> Result<serde_j
     let resp = resp.map_err(|e| BrokerError::Network(e.to_string()))?;
     let status = resp.status().as_u16();
     let text = resp.text().await.map_err(|e| BrokerError::Network(e.to_string()))?;
+    if status == 429 || status >= 500 {
+        return Err(crate::adapter::http_failure(status, text));
+    }
     parse_body(status, &text)
 }
 
@@ -345,6 +351,244 @@ pub(crate) fn parse_prev_prices(data: &serde_json::Value, wanted: &[String]) -> 
         .collect()
 }
 
+/// The client id an order carries into the OMS: its UUID for an order the OMS
+/// placed, the venue's own `clOrdId` otherwise; `None` when empty.
+pub(crate) fn venue_client_id(cl_ord_id: &str) -> Option<String> {
+    (!cl_ord_id.is_empty()).then(|| oms_order_id(cl_ord_id).map_or_else(|| cl_ord_id.to_string(), |id| id.to_string()))
+}
+
+fn time_ms(v: &serde_json::Value) -> Option<DateTime<Utc>> {
+    v.as_str().and_then(|s| s.parse::<i64>().ok()).and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+}
+
+/// A fee as OKX reports it (`fee`, `fillFee`): negative when charged, positive
+/// for a rebate. The OMS books a charge positive, so the sign flips; a zero or
+/// currency-less fee is none.
+pub(crate) fn fee_of(amount: &serde_json::Value, currency: &serde_json::Value) -> Option<(f64, String)> {
+    let amount: f64 = amount.as_str()?.parse().ok()?;
+    let currency = currency.as_str().filter(|c| !c.is_empty())?;
+    (amount != 0.0).then(|| (-amount, currency.to_string()))
+}
+
+/// One fill as the stream and the pull both read it, from the fields the two
+/// share under different names. `Err` names what is missing.
+pub(crate) fn fill_of(
+    d: &serde_json::Value,
+    time: Option<DateTime<Utc>>,
+    fee: Option<(f64, String)>,
+    account_ref: &str,
+) -> Result<VenueFill, &'static str> {
+    let trade_id = d["tradeId"].as_str().filter(|t| !t.is_empty()).ok_or("tradeId")?;
+    let venue_order_id = d["ordId"].as_str().filter(|o| !o.is_empty()).ok_or("ordId")?;
+    let qty = num(&d["fillSz"]).ok_or("fillSz")?;
+    let price = num(&d["fillPx"]).ok_or("fillPx")?;
+    let buy = match d["side"].as_str() {
+        Some("buy") => true,
+        Some("sell") => false,
+        _ => return Err("side"),
+    };
+    Ok(VenueFill {
+        exec_id: super::fill_exec_id(d["instId"].as_str().unwrap_or(""), trade_id, buy),
+        venue_order_id: venue_order_id.to_string(),
+        client_order_id: venue_client_id(d["clOrdId"].as_str().unwrap_or("")),
+        account_ref: account_ref.to_string(),
+        symbol: d["instId"].as_str().unwrap_or("").to_string(),
+        buy,
+        qty,
+        price,
+        fee,
+        executed_at: time,
+    })
+}
+
+/// OKX's order `state` as the venue's view; `None` for a state the OMS does not know.
+pub(crate) fn venue_status(state: &str) -> Option<VenueOrderStatus> {
+    Some(match state {
+        "live" | "partially_filled" => VenueOrderStatus::Working,
+        "filled" => VenueOrderStatus::Filled,
+        "canceled" | "mmp_canceled" => VenueOrderStatus::Canceled,
+        _ => return None,
+    })
+}
+
+/// One order row (`orders` push or `orders-pending`) as the venue's view of the order.
+pub(crate) fn order_update_from_row(d: &serde_json::Value, account_ref: &str) -> Option<VenueOrderUpdate> {
+    let order_type = d["ordType"].as_str().unwrap_or("").to_string();
+    Some(VenueOrderUpdate {
+        venue_order_id: d["ordId"].as_str().filter(|o| !o.is_empty())?.to_string(),
+        client_order_id: venue_client_id(d["clOrdId"].as_str().unwrap_or("")),
+        account_ref: account_ref.to_string(),
+        symbol: d["instId"].as_str().unwrap_or("").to_string(),
+        buy: d["side"].as_str() == Some("buy"),
+        limit_px: if order_type == "market" { None } else { num(&d["px"]).filter(|p| *p != 0.0) },
+        order_type,
+        qty: num(&d["sz"]).unwrap_or(0.0),
+        status: venue_status(d["state"].as_str()?)?,
+        cum_qty: num(&d["accFillSz"]).unwrap_or(0.0),
+        ts: time_ms(&d["uTime"]),
+    })
+}
+
+/// `orders-pending` rows as the venue's view of each open order.
+pub(crate) fn parse_open_order_snapshot(data: &serde_json::Value, account_ref: &str) -> Vec<VenueOrderUpdate> {
+    data.as_array().into_iter().flatten().filter_map(|o| order_update_from_row(o, account_ref)).collect()
+}
+
+/// `/trade/fills` serves the last 3 days; `/trade/fills-history` goes further.
+const FILLS_PATH: &str = "/api/v5/trade/fills";
+const FILLS_HISTORY_PATH: &str = "/api/v5/trade/fills-history";
+const RECENT_DAYS: i64 = 3;
+/// What `/trade/fills-history` holds (about 3 months); a year would need the
+/// async `/trade/fills-archive`. The sweep reports the window it obtained.
+const MAX_HISTORY_DAYS: i64 = 90;
+/// Pages one call may walk (100 rows each) before it gives up rather than
+/// advance its cursor past rows it did not read.
+const MAX_PAGES: usize = 1000;
+
+/// One page of fills rows (newest first), read against a scan's bounds.
+#[derive(Debug, Default)]
+pub(crate) struct FillsRows {
+    pub fills: Vec<VenueFill>,
+    /// Rows the venue returned, before any filtering.
+    pub rows: usize,
+    pub newest_bill: Option<String>,
+    pub oldest_bill: Option<String>,
+    /// The walk reached its bound: a row at or before the cursor's bill, or before `since`.
+    pub done: bool,
+}
+
+/// Rows of `/trade/fills[-history]` as fills, stopping at the first row at or
+/// before `after_bill` (the cursor) or executed before `since`, since rows are
+/// newest first and everything beyond is older. A row missing a field is warned
+/// about and skipped; the bills still count for the cursor.
+pub(crate) fn fills_rows(data: &serde_json::Value, account_ref: &str, since: DateTime<Utc>, after_bill: Option<u128>) -> FillsRows {
+    let rows = data.as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut out = FillsRows { rows: rows.len(), ..Default::default() };
+    for d in rows {
+        let bill = d["billId"].as_str().unwrap_or("");
+        if let (Some(after), Ok(b)) = (after_bill, bill.parse::<u128>()) {
+            if b <= after {
+                out.done = true;
+                break;
+            }
+        }
+        let at = time_ms(&d["ts"]);
+        if at.is_some_and(|at| at < since) {
+            out.done = true;
+            break;
+        }
+        if !bill.is_empty() {
+            out.newest_bill.get_or_insert_with(|| bill.to_string());
+            out.oldest_bill = Some(bill.to_string());
+        }
+        match fill_of(d, at, fee_of(&d["fee"], &d["feeCcy"]), account_ref) {
+            Ok(f) => out.fills.push(f),
+            Err(missing) => warn!(bill_id = bill, trade_id = d["tradeId"].as_str().unwrap_or(""), missing, "OKX fills: row skipped"),
+        }
+    }
+    out
+}
+
+/// A whole walk (newest page first) as one pull page: the cursor is the newest
+/// bill seen, and nothing is left to page. Nothing seen keeps the cursor.
+pub(crate) fn pull_result(pages: Vec<FillsRows>) -> PullPage {
+    let next = pages.iter().find_map(|p| p.newest_bill.clone()).unwrap_or_default();
+    PullPage { fills: pages.into_iter().flat_map(|p| p.fills).collect(), next: Cursor(next), more: false }
+}
+
+/// Where a scan starts: `(fills-history first, effective since, begin param)`.
+/// A resume (`since` = MIN_UTC) starts on the recent `/trade/fills` with no
+/// `begin`; it falls into history only if its cursor is not reached there. Only
+/// a real `since` older than 3 days starts on `/trade/fills-history`, bounded to
+/// what that endpoint holds.
+pub(crate) fn scan_plan(since: DateTime<Utc>, now: DateTime<Utc>) -> (bool, DateTime<Utc>, Option<i64>) {
+    if since == DateTime::<Utc>::MIN_UTC {
+        return (false, since, None);
+    }
+    let since = since.max(now - chrono::Duration::days(MAX_HISTORY_DAYS));
+    (since < now - chrono::Duration::days(RECENT_DAYS), since, Some(since.timestamp_millis()))
+}
+
+#[async_trait::async_trait]
+impl ExecutionSource for OkxAdapter {
+    /// Walks fills newest to oldest with `after=<billId>` until the cursor's
+    /// bill or `since`, so one call returns everything new: `before=` does not
+    /// say which side of the cursor its page is taken from. Recent fills come
+    /// from `/trade/fills`; beyond its 3 days, or when the cursor is not
+    /// reached there, the walk continues in `/trade/fills-history`.
+    async fn fills_since(
+        &self,
+        account_ref: &str,
+        scope: &str,
+        from: Option<&Cursor>,
+        since: DateTime<Utc>,
+    ) -> Result<PullPage, BrokerError> {
+        let after_bill = from.and_then(|c| c.0.parse::<u128>().ok());
+        let now = Utc::now();
+        let (mut history, since, begin) = scan_plan(since, now);
+        let mut paging: Option<String> = None;
+        let mut pages = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let path = if history { FILLS_HISTORY_PATH } else { FILLS_PATH };
+            let mut query = format!("{path}?instType=SPOT&limit={PAGE_LIMIT}");
+            if let Some(begin) = begin {
+                query.push_str(&format!("&begin={begin}"));
+            }
+            if let Some(oldest) = &paging {
+                query.push_str(&format!("&after={oldest}"));
+            }
+            let data = self.get(&query, true).await?;
+            let page = fills_rows(&data, account_ref, since, after_bill);
+            let (exhausted, done, oldest) = (page.rows < PAGE_LIMIT, page.done, page.oldest_bill.clone());
+            pages.push(page);
+            if done {
+                return Ok(pull_result(pages));
+            }
+            if exhausted {
+                // The last 3 days are read; a cursor not reached in them may be older.
+                if !history && after_bill.is_some() {
+                    history = true;
+                    paging = oldest.or(paging);
+                    continue;
+                }
+                return Ok(pull_result(pages));
+            }
+            paging = oldest.or(paging);
+        }
+        Err(BrokerError::Network(format!(
+            "OKX fills pull for scope \"{scope}\" read more than {MAX_PAGES} pages without reaching its bound; \
+             this scope stalls until that is resolved (a shorter gap, or a manual EOD sweep)"
+        )))
+    }
+
+    /// `GET /api/v5/trade/orders-pending`: every open spot order, paging back by `after=<ordId>`.
+    async fn open_order_snapshot(&self, account_ref: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
+        let mut out = Vec::new();
+        let mut after = String::new();
+        loop {
+            let mut path = format!("/api/v5/trade/orders-pending?instType=SPOT&limit={PAGE_LIMIT}");
+            if !after.is_empty() {
+                path.push_str(&format!("&after={after}"));
+            }
+            let data = self.get(&path, true).await?;
+            out.extend(parse_open_order_snapshot(&data, account_ref));
+            let page = data.as_array().map_or(0, Vec::len);
+            match data.as_array().and_then(|l| l.last()).and_then(|o| o["ordId"].as_str()) {
+                Some(last) if page == PAGE_LIMIT => after = last.to_string(),
+                _ => return Ok(out),
+            }
+        }
+    }
+
+    async fn scopes(&self, _account_ref: &str) -> Result<Vec<String>, BrokerError> {
+        Ok(vec![String::new()])
+    }
+
+    fn hints(&self) -> PullHints {
+        PullHints { intraday_secs: 60, max_history: Some(chrono::Duration::days(MAX_HISTORY_DAYS)), per_symbol: false }
+    }
+}
+
 #[async_trait::async_trait]
 impl BrokerAdapter for OkxAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
@@ -425,6 +669,7 @@ impl InstrumentProvider for OkxAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::venue_event::VenueEvent as VEvent;
 
     #[test]
     fn a_timeout_or_busy_answer_is_not_a_rejection() {
@@ -480,6 +725,122 @@ mod tests {
 
     fn sample(name: &str) -> serde_json::Value {
         envelope(raw(name)).unwrap()
+    }
+
+    // --- execution pull ---
+
+    fn fills_data() -> serde_json::Value {
+        envelope(serde_json::from_str(include_str!("testdata/fills.json")).unwrap()).unwrap()
+    }
+
+    fn ms(v: i64) -> DateTime<Utc> {
+        Utc.timestamp_millis_opt(v).unwrap()
+    }
+
+    #[test]
+    fn okx_fill_without_oms_id_is_kept() {
+        let page = fills_rows(&fills_data(), "", DateTime::<Utc>::MIN_UTC, None);
+        // The newest row was placed in the OKX app: its clOrdId is not an OMS id, and it is still a fill.
+        let f = page.fills.iter().find(|f| f.exec_id == "BTC-USDT:123456791:B").expect("kept");
+        assert_eq!(f.client_order_id.as_deref(), Some("manual1"));
+        assert_eq!((f.venue_order_id.as_str(), f.symbol.as_str(), f.buy, f.qty, f.price), ("312269865356374099", "BTC-USDT", true, 1.0, 65000.0));
+        // The OMS's own order reads back as its UUID.
+        let ours = page.fills.iter().find(|f| f.exec_id == "BTC-USDT:123456790:S").unwrap();
+        assert_eq!(ours.client_order_id.as_deref(), Some("3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b"));
+    }
+
+    #[test]
+    fn okx_pull_page_maps_and_cursors() {
+        let page = fills_rows(&fills_data(), "acct", DateTime::<Utc>::MIN_UTC, None);
+        // The oldest row has no fillSz: skipped (and warned); the other two map.
+        assert_eq!(page.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["BTC-USDT:123456791:B", "BTC-USDT:123456790:S"]);
+        let f = &page.fills[0];
+        assert_eq!((f.account_ref.as_str(), f.executed_at), ("acct", Some(ms(1700000060000))));
+        assert_eq!(f.fee, Some((0.001, "BTC".to_string())), "OKX reports a charge as negative; the OMS books it positive");
+        assert_eq!(page.fills[1].fee, Some((-0.01, "USDT".to_string())), "a rebate is negative");
+        assert_eq!((page.rows, page.newest_bill.as_deref(), page.oldest_bill.as_deref(), page.done), (3, Some("900000000000000003"), Some("900000000000000001"), false));
+        // Whole-scan result: the cursor is the newest bill, and a scan is never "more".
+        let pulled = pull_result(vec![page]);
+        assert_eq!(pulled.next, Cursor("900000000000000003".into()));
+        assert!(!pulled.more);
+    }
+
+    #[test]
+    fn a_cursor_stops_the_walk_at_its_bill_and_since_stops_it_at_old_rows() {
+        let after = fills_rows(&fills_data(), "", DateTime::<Utc>::MIN_UTC, Some(900000000000000002));
+        assert_eq!(after.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["BTC-USDT:123456791:B"]);
+        assert!(after.done);
+        let recent = fills_rows(&fills_data(), "", ms(1700000055000), None);
+        assert_eq!(recent.fills.iter().map(|f| f.exec_id.as_str()).collect::<Vec<_>>(), ["BTC-USDT:123456791:B"]);
+        assert!(recent.done);
+        // Nothing new: no cursor to move.
+        let none = fills_rows(&fills_data(), "", DateTime::<Utc>::MIN_UTC, Some(900000000000000003));
+        assert!(none.fills.is_empty() && none.newest_bill.is_none());
+        assert_eq!(pull_result(vec![none]), PullPage { fills: vec![], next: Cursor(String::new()), more: false });
+    }
+
+    #[test]
+    fn two_symbols_sharing_a_trade_id_both_book() {
+        let row = |inst: &str, side: &str, bill: &str| serde_json::json!({ "instId": inst, "tradeId": "42", "ordId": "1", "billId": bill,
+            "fillPx": "1", "fillSz": "1", "side": side, "ts": "1700000000000" });
+        let p = fills_rows(&serde_json::json!([row("BTC-USDT", "buy", "3"), row("ETH-USDT", "buy", "2")]), "", DateTime::<Utc>::MIN_UTC, None);
+        assert_ne!(p.fills[0].exec_id, p.fills[1].exec_id);
+    }
+
+    #[test]
+    fn self_trade_both_sides_book() {
+        let row = |side: &str, bill: &str| serde_json::json!({ "instId": "BTC-USDT", "tradeId": "42", "ordId": "1", "billId": bill,
+            "fillPx": "1", "fillSz": "1", "side": side, "ts": "1700000000000" });
+        let p = fills_rows(&serde_json::json!([row("buy", "3"), row("sell", "2")]), "", DateTime::<Utc>::MIN_UTC, None);
+        assert_eq!((p.fills[0].exec_id.as_str(), p.fills[1].exec_id.as_str()), ("BTC-USDT:42:B", "BTC-USDT:42:S"));
+    }
+
+    #[test]
+    fn okx_stream_and_pull_produce_the_same_exec_id_for_one_fill() {
+        let push = serde_json::json!({"arg": {"channel": "orders"}, "data": [{
+            "instId": "BTC-USDT", "ordId": "1", "clOrdId": "3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b", "state": "partially_filled", "side": "buy", "ordType": "limit",
+            "sz": "0.001", "px": "65000", "fillSz": "0.0004", "fillPx": "65000", "tradeId": "123456789", "accFillSz": "0.0004",
+            "fillFee": "-0.026", "fillFeeCcy": "USDT", "fillTime": "1700000000000" }]});
+        let VEvent::Fill(s) = &crate::connectors::okx::stream::venue_events(&push)[0] else { panic!("a fill") };
+        let row = serde_json::json!({ "instId": "BTC-USDT", "tradeId": "123456789", "ordId": "1", "clOrdId": "3f6b1c2e8a4d4e5f9b211c2d3e4f5a6b", "billId": "5",
+            "fillPx": "65000", "fillSz": "0.0004", "side": "buy", "feeCcy": "USDT", "fee": "-0.026", "ts": "1700000000000" });
+        let p = fills_rows(&serde_json::json!([row]), "", DateTime::<Utc>::MIN_UTC, None);
+        assert_eq!(s.exec_id, p.fills[0].exec_id);
+        assert_eq!(s.exec_id, "BTC-USDT:123456789:B");
+        assert_eq!(s, &p.fills[0], "the whole fill is the same from both paths");
+    }
+
+    #[test]
+    fn okx_resume_uses_recent_endpoint_without_begin() {
+        let now = ms(1_700_000_000_000);
+        assert_eq!(scan_plan(DateTime::<Utc>::MIN_UTC, now), (false, DateTime::<Utc>::MIN_UTC, None));
+        let recent = now - chrono::Duration::hours(1);
+        assert_eq!(scan_plan(recent, now), (false, recent, Some(recent.timestamp_millis())));
+        let old = now - chrono::Duration::days(10);
+        assert_eq!(scan_plan(old, now), (true, old, Some(old.timestamp_millis())));
+        let ancient = now - chrono::Duration::days(500);
+        let (history, eff, begin) = scan_plan(ancient, now);
+        assert_eq!((history, eff, begin), (true, now - chrono::Duration::days(90), Some((now - chrono::Duration::days(90)).timestamp_millis())));
+    }
+
+    #[test]
+    fn okx_max_history_is_90_days() {
+        let a = OkxAdapter::new("k".into(), "s".into(), "p".into(), "PAPER");
+        assert_eq!(ExecutionSource::hints(&a).max_history, Some(chrono::Duration::days(90)));
+    }
+
+    #[test]
+    fn open_order_snapshot_maps_working_orders_and_hints_are_90_days() {
+        let snap = parse_open_order_snapshot(&sample("orders_pending"), "acct");
+        assert_eq!(snap.len(), 2);
+        let o = &snap[0];
+        assert_eq!((o.venue_order_id.as_str(), o.client_order_id.as_deref(), o.account_ref.as_str(), o.buy, o.qty, o.cum_qty), ("312269865356374016", Some("3f6b1c2e-8a4d-4e5f-9b21-1c2d3e4f5a6b"), "acct", true, 0.001, 0.0005));
+        assert_eq!(o.status, VenueOrderStatus::Working);
+        assert_eq!((snap[1].client_order_id.clone(), snap[1].buy), (None, false));
+        assert_eq!(
+            ExecutionSource::hints(&OkxAdapter::new("k".into(), "s".into(), "p".into(), "PAPER")),
+            PullHints { intraday_secs: 60, max_history: Some(chrono::Duration::days(90)), per_symbol: false }
+        );
     }
 
     #[test]

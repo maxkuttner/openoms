@@ -16,4 +16,5 @@ pub mod runtime;
 pub mod stream_health;
 pub mod stream_supervisor;
 pub mod venue;
+pub mod venue_event;
 pub mod verify;

@@ -12,7 +12,10 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use gateway::adapter::{BrokerAdapter, BrokerRegistry};
-use gateway::connectors::{self, ExecStream, RegistrationDeps};
+use gateway::adapter::InstrumentProvider;
+use gateway::connectors::{self, RegistrationDeps, VenueStream};
+use gateway::venue_event::{ExecutionSource, VenueEvent};
+use sqlx::PgPool;
 use gateway::md::daily_stats::DailyStatsRegistry;
 use crate::app_state::{AppState, StreamRegistry};
 use gateway::credentials::BrokerCredentials;
@@ -97,7 +100,21 @@ pub struct ExecStreamStart {
     pub env: &'static str,
     /// The adapter the stream books against — the one just registered.
     pub adapter: Arc<dyn BrokerAdapter>,
-    pub start: ExecStream,
+    pub start: StreamStart,
+}
+
+/// How a connection's events reach the engine.
+pub enum StreamStart {
+    /// Venue events into the connection's reconciler, which also pulls from
+    /// `source` (see `crate::reconciler` on why only this path gets one).
+    /// Without a source (e.g. Binance FIX whose REST reader failed to build)
+    /// the events go straight to ingest and nothing is pulled.
+    Venue {
+        connection: String,
+        stream: VenueStream,
+        source: Option<Arc<dyn ExecutionSource>>,
+        instruments: Option<Arc<dyn InstrumentProvider>>,
+    },
 }
 
 /// Turn every broker connection into an entry in a fresh `BrokerRegistry`.
@@ -230,7 +247,14 @@ pub async fn build_registry(
                                     if let Some(source) = connected.daily_stats {
                                         daily_stats.register(m.code, env_name, source);
                                     }
-                                    if let Some(start) = connected.exec_stream {
+                                    // A venue stream without a source feeds ingest directly.
+                                    let start = connected.venue_stream.map(|stream| StreamStart::Venue {
+                                        connection: conn.code.clone(),
+                                        stream,
+                                        source: connected.source,
+                                        instruments: connector.universe_provider(env_name, creds).ok().map(Arc::from),
+                                    });
+                                    if let Some(start) = start {
                                         exec_streams.push(ExecStreamStart { code: m.code, env: env_name, adapter: connected.adapter, start });
                                     }
                                     info!(code = %conn.code, credentials_updated_at = ?conn.credentials_updated_at, "registered {}/{env_name} adapter", m.code);
@@ -285,7 +309,7 @@ pub(crate) use gateway::connectors::exec_stream_code;
 /// are substituted with controlled tasks.
 #[async_trait::async_trait]
 pub(crate) trait ReloadStreams: Send + Sync + 'static {
-    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry);
+    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry, pool: &PgPool);
 
     async fn databento(&self, api_key: String, state: &AppState);
 }
@@ -294,8 +318,8 @@ pub(crate) struct LiveReloadStreams;
 
 #[async_trait::async_trait]
 impl ReloadStreams for LiveReloadStreams {
-    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry) {
-        restart_exec_stream(&stream, deps, streams).await;
+    async fn exec(&self, stream: ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry, pool: &PgPool) {
+        restart_exec_stream(&stream, deps, streams, pool).await;
     }
 
     async fn databento(&self, api_key: String, state: &AppState) {
@@ -312,12 +336,53 @@ impl ReloadStreams for LiveReloadStreams {
 /// would leave fills landing against an adapter the registry no longer routes
 /// orders through. Aborting first (rather than only inserting) is what makes
 /// boot — where nothing runs yet — the same call as a reload.
-pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry) {
+///
+/// A venue-event stream runs with its reconciler inside the same task, so
+/// stopping the stream (abort under `exec_stream_code`) stops the reconciler.
+pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDeps, streams: &StreamRegistry, pool: &PgPool) {
     let code = exec_stream_code(stream.code, stream.env);
     streams.abort_and_remove(&code).await;
     let health = deps.stream_health.handle(stream.code, stream.env, StreamKind::Execution);
-    health.set_connecting();
-    let handle = tokio::spawn((stream.start)(health, deps.engine.clone()));
+    // A FIX session owns its entry and may already be live (its logon can
+    // precede this); only a stream task we start here begins as connecting.
+    if !health.is_fix_session() {
+        health.set_connecting();
+    }
+    let handle = match &stream.start {
+        StreamStart::Venue { connection, stream: start, source: None, instruments } => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
+            let run = start(health, tx);
+            let (engine, connection, instruments) = (deps.engine.clone(), connection.clone(), instruments.clone());
+            tokio::spawn(async move {
+                let forward = async move {
+                    while let Some(event) = rx.recv().await {
+                        if !matches!(event, VenueEvent::Connected | VenueEvent::Disconnected) {
+                            engine.venue_send(&connection, event, instruments.clone(), None).await;
+                        }
+                    }
+                };
+                tokio::join!(run, forward);
+            })
+        }
+        StreamStart::Venue { connection, stream: start, source: Some(source), instruments } => {
+            let (tx, rx) = tokio::sync::mpsc::channel(gateway::contract::ENGINE_CHANNEL_CAPACITY);
+            let reconciler = crate::reconciler::spawn_with(
+                connection.clone(),
+                source.clone(),
+                rx,
+                deps.engine.clone(),
+                pool.clone(),
+                Some(stream.adapter.clone()),
+                instruments.clone(),
+                crate::reconciler::Accounts::Unfollowed,
+            );
+            let run = start(health, tx);
+            tokio::spawn(async move {
+                let _reconciler = reconciler;
+                run.await;
+            })
+        }
+    };
     streams.insert(code, handle);
 }
 
@@ -382,6 +447,62 @@ mod tests {
         assert_eq!(exec_stream_code("OKX", "PAPER"), "okx-paper:exec");
     }
 
+    /// A venue stream with no pull source: the events go straight to
+    /// ingest (reply-less); `Connected`/`Disconnected` are not ingested.
+    #[tokio::test]
+    async fn sourceless_venue_stream_forwards_events_to_ingest() {
+        let (engine, mut engine_rx) = gateway::contract::EngineHandle::new();
+        let deps = RegistrationDeps { stream_health: StreamHealthRegistry::new(), engine };
+        let fill = gateway::venue_event::VenueFill {
+            exec_id: "E-1".into(), venue_order_id: "9".into(), client_order_id: Some("manual".into()),
+            account_ref: "U1".into(), symbol: "AAPL".into(), buy: true, qty: 1.0, price: 2.0, fee: None, executed_at: None,
+        };
+        let sent = fill.clone();
+        let stream: VenueStream = Arc::new(move |_h, tx| {
+            let f = sent.clone();
+            Box::pin(async move {
+                let _ = tx.send(VenueEvent::Connected).await;
+                let _ = tx.send(VenueEvent::Fill(f)).await;
+            })
+        });
+        let start = ExecStreamStart {
+            code: "IBKR",
+            env: "PAPER",
+            adapter: Arc::new(AlpacaAdapter::new("k".into(), "s".into(), "PAPER")),
+            start: StreamStart::Venue { connection: "ibkr-paper".into(), stream, source: None, instruments: None },
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://x@localhost/x").unwrap();
+        restart_exec_stream(&start, &deps, &StreamRegistry::new(), &pool).await;
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), engine_rx.recv()).await.unwrap().unwrap();
+        match msg {
+            gateway::contract::GatewayMsg::Venue { connection, event, reply, .. } => {
+                assert_eq!(connection, "ibkr-paper");
+                assert_eq!(event, VenueEvent::Fill(fill));
+                assert!(reply.is_none());
+            }
+            _ => panic!("expected a venue event"),
+        }
+    }
+
+    /// A FIX session owns its health entry (live on logon, which may come
+    /// before its venue stream starts): starting the stream must not reset it.
+    #[tokio::test]
+    async fn starting_a_fix_venue_stream_keeps_the_session_live() {
+        let deps = stub_deps();
+        deps.stream_health.fix_handle("IBKR", "PAPER").set_live();
+        let stream: VenueStream = Arc::new(|_h, _tx| Box::pin(async {}));
+        let start = ExecStreamStart {
+            code: "IBKR",
+            env: "PAPER",
+            adapter: Arc::new(AlpacaAdapter::new("k".into(), "s".into(), "PAPER")),
+            start: StreamStart::Venue { connection: "ibkr-paper".into(), stream, source: None, instruments: None },
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://x@localhost/x").unwrap();
+        restart_exec_stream(&start, &deps, &StreamRegistry::new(), &pool).await;
+        let h = deps.stream_health.snapshot().into_iter().find(|h| h.broker_code == "IBKR").unwrap();
+        assert!(matches!(h.state, gateway::stream_health::StreamState::Live));
+    }
+
     #[tokio::test]
     async fn unknown_credential_kind_is_reported_failed() {
         let c = conn("nasdaq-paper", "ACTIVE", CredentialState::Configured(BrokerCredentials::new("Nasdaq", Default::default())));
@@ -416,7 +537,7 @@ mod tests {
     async fn an_ibkr_tws_credential_change_is_applied_on_reload() {
         let creds = BrokerCredentials::from_typed(
             "IbkrTws",
-            &gateway::connectors::ibkr_tws::IbkrTwsCredentials { username: "u".into(), password: "p".into() },
+            &gateway::connectors::ibkr_tws::IbkrTwsCredentials { username: "u".into(), password: "p".into(), master_client_id: 0 },
         );
         let mut c = conn("ibkr-tws-paper", "ACTIVE", CredentialState::Configured(creds));
         c.kind = "IBKR_TWS".into();

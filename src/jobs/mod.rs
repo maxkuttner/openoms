@@ -15,6 +15,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 pub mod api;
+pub mod eod_sweep;
 pub mod universe;
 
 /// Newest log lines kept per job; older ones are dropped as new ones arrive,
@@ -27,6 +28,7 @@ pub enum JobKind {
     Enrichment,
     SymbologyBackfill,
     ExpirySweep,
+    EodSweep,
 }
 
 /// Kinds that write a broker connection's instruments and mappings. At most one
@@ -44,6 +46,7 @@ impl JobKind {
             Self::Enrichment => "enrichment",
             Self::SymbologyBackfill => "symbology_backfill",
             Self::ExpirySweep => "expiry_sweep",
+            Self::EodSweep => "eod_sweep",
         }
     }
 }
@@ -283,16 +286,30 @@ pub async fn record_finished(
     started_by: &str,
     result: Value,
 ) -> Result<Uuid, sqlx::Error> {
+    record_outcome(pool, kind, subject, started_by, result, None).await
+}
+
+/// Like [`record_finished`], but `failed` with `error` when it is `Some`
+/// (the result is kept either way).
+pub async fn record_outcome(
+    pool: &PgPool,
+    kind: JobKind,
+    subject: Option<&str>,
+    started_by: &str,
+    result: Value,
+    error: Option<&str>,
+) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO job (id, kind, subject, started_by, status, result, started_at, finished_at) \
-         VALUES ($1, $2, $3, $4, 'succeeded', $5, now(), now())",
+        "INSERT INTO job (id, kind, subject, started_by, status, result, error, started_at, finished_at) \
+         VALUES ($1, $2, $3, $4, CASE WHEN $6::text IS NULL THEN 'succeeded' ELSE 'failed' END, $5, $6, now(), now())",
     )
     .bind(id)
     .bind(kind.as_str())
     .bind(subject)
     .bind(started_by)
     .bind(result)
+    .bind(error)
     .execute(pool)
     .await?;
     Ok(id)
