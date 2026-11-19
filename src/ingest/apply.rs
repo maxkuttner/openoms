@@ -714,12 +714,21 @@ async fn book(
     };
     let portfolio = Uuid::parse_str(&state.portfolio_id).map_err(|e| IngestError::Other(e.to_string()))?;
     for e in &events {
-        if let OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-        | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } = &e.payload
+        if let OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, execution_id, .. }
+        | OrderEventPayload::OrderFilled { fill_qty, fill_price, execution_id, .. } = &e.payload
         {
             // after the append: a late fill rebuilds the position from the log
-            if positions::persist_fill(tx, portfolio, &state.instrument_id, state.side, *fill_qty, *fill_price, trade_time)
-                .await?
+            if positions::persist_fill(
+                tx,
+                portfolio,
+                &state.instrument_id,
+                state.side,
+                *fill_qty,
+                *fill_price,
+                trade_time,
+                execution_id,
+            )
+            .await?
             {
                 break;
             }

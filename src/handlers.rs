@@ -851,6 +851,12 @@ pub async fn create_allocations(
 
     // 4. apply atomically: record each allocation + transfer the position at cost.
     let mut tx = pool.begin().await.map_err(|e| internal("tx begin", e))?;
+    // every position this allocation touches, locked up front in one global order
+    let mut touched = target_ids.clone();
+    touched.push(from_portfolio);
+    crate::positions::lock_positions(&mut tx, &touched, &instrument_id)
+        .await
+        .map_err(|e| internal("failed to lock positions", e))?;
     let mut created = Vec::with_capacity(req.splits.len());
     for s in &req.splits {
         let row = sqlx::query(

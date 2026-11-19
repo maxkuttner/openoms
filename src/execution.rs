@@ -267,9 +267,11 @@ async fn apply_once(
     let portfolio_uuid = Uuid::parse_str(&new_state.portfolio_id)?;
     let mut any_fill = false;
     for event in &events {
-        let (fill_qty, fill_price) = match &event.payload {
-            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
-            | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => (*fill_qty, *fill_price),
+        let (fill_qty, fill_price, execution_id) = match &event.payload {
+            OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, execution_id, .. }
+            | OrderEventPayload::OrderFilled { fill_qty, fill_price, execution_id, .. } => {
+                (*fill_qty, *fill_price, execution_id.as_str())
+            }
             _ => continue,
         };
         any_fill = true;
@@ -281,6 +283,7 @@ async fn apply_once(
             fill_qty,
             fill_price,
             trade_time(event),
+            execution_id,
         )
         .await?;
         if rebuilt {

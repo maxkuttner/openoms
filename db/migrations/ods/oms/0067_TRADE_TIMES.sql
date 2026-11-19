@@ -18,6 +18,12 @@ ALTER TABLE order_state
     ADD COLUMN venue_created_at TIMESTAMPTZ,  -- when the venue created the order; set once
     ADD COLUMN venue_cum_qty    NUMERIC;      -- venue-reported cumulative qty; informational
 
-ALTER TABLE position ADD COLUMN last_trade_at TIMESTAMPTZ;
+-- The canonical-order key of the latest input applied to the position (fill,
+-- base fee or transfer): (last_trade_at, last_trade_exec, last_trade_is_fee).
+-- A newcomer that sorts before it rebuilds the position. NULL exec sorts last.
+ALTER TABLE position
+    ADD COLUMN last_trade_at     TIMESTAMPTZ,
+    ADD COLUMN last_trade_exec   TEXT,
+    ADD COLUMN last_trade_is_fee BOOLEAN;
 
 CREATE INDEX idx_order_state_last_trade_at ON order_state (last_trade_at DESC NULLS LAST);
