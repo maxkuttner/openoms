@@ -9,6 +9,7 @@
 #   docker compose up -d
 #
 # Then open http://localhost:3001/app/ — published on this machine only.
+# Another port on this machine (e.g. a second install)? Add OMS_PORT=3002 to .env.
 # The first start creates the database; later starts apply pending migrations.
 # Reached at any other URL (a domain, a reverse proxy, Tailscale)? Add
 # OMS_PUBLIC_BASE_URL=https://your.url to .env. Back up .env: OMS_MASTER_KEY is
@@ -43,7 +44,7 @@ services:
     volumes:
       - oms-config:/config
     ports:
-      - "127.0.0.1:3001:3001"
+      - "127.0.0.1:${OMS_PORT:-3001}:3001"
     depends_on:
       postgres:
         condition: service_healthy
