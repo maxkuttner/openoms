@@ -84,7 +84,8 @@ signed up is the admin). See
 - [compose.yaml](https://github.com/maxkuttner/openoms/releases/latest/download/compose.yaml) comes with each release and runs that release's
   `ghcr.io/maxkuttner/openoms` image (amd64 and arm64) next to `postgres:16`.
 - The web app is published on this machine only (`127.0.0.1:3001`). On a remote server,
-  reach it through an SSH tunnel or Tailscale.
+  reach it through an SSH tunnel or Tailscale. To use another port, for example for a
+  second install on the same machine, add `OMS_PORT=3002` to `.env`.
 - Settings come from `.env`; nothing to set up by hand. The first start creates the database;
   every later start applies pending migrations.
 - **Back up `.env`.** `OMS_MASTER_KEY` is the only key to stored broker credentials: lose
