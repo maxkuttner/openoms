@@ -7,6 +7,12 @@
 //! `order_state`, maintains the position projection, and appends the resulting
 //! events (the outbox trigger queues them for Kafka). On commit it publishes to
 //! the bus's order lane.
+//!
+//! Production venue fills go through `ingest` (venue trade times, exec-id
+//! dedupe via `venue_fill`). This path is what the engine still drives for
+//! rejects/cancels and tests; a fill here has no venue time, so it trades at its
+//! booking time flagged `trade_time_estimated`, and a fill whose execution id is
+//! already booked on the order is an idempotent no-op.
 
 use chrono::{SubsecRound, Utc};
 use sqlx::{PgPool, Row};
@@ -169,6 +175,22 @@ async fn apply_once(
         warn!(order_id = %order_id, status = state.status.as_str(), "execution: order already in terminal state, skipping duplicate event");
         return Ok(());
     }
+    // A fill whose execution id is already booked on this order is a replay: no-op.
+    if let ExecutionReport::Fill { execution_id, .. } = &report {
+        let booked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM order_event WHERE order_id = $1 \
+             AND event_type IN ('order_partially_filled', 'order_filled') \
+             AND payload_json->'payload'->>'execution_id' = $2)",
+        )
+        .bind(order_id)
+        .bind(execution_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if booked {
+            info!(order_id = %order_id, execution_id, "execution: fill already booked, skipping replay");
+            return Ok(());
+        }
+    }
 
     let expected_version = state.version;
     let aggregate = OrderAggregate::from_state(state);
@@ -193,9 +215,13 @@ async fn apply_once(
     };
     // An OMS fill without a venue time trades at its booking time. Store it as
     // occurred_at (at the DB's microsecond precision), so the key the position
-    // compares is the key a rebuild orders by.
+    // compares is the key a rebuild orders by, and flag it an estimate.
+    let mut estimated = std::collections::HashSet::new();
     for event in events.iter_mut().filter(|e| is_fill_event(e)) {
-        event.occurred_at.get_or_insert(event.timestamp.trunc_subsecs(6));
+        if event.occurred_at.is_none() {
+            estimated.insert(event.event_id.clone());
+            event.occurred_at = Some(event.timestamp.trunc_subsecs(6));
+        }
     }
 
     let mut applied = aggregate;
@@ -235,7 +261,10 @@ async fn apply_once(
     let new_events: Vec<NewOrderEvent> = events
         .iter()
         .map(|e| {
-            let payload = serde_json::to_value(e).unwrap_or_default();
+            let mut payload = serde_json::to_value(e).unwrap_or_default();
+            if estimated.contains(&e.event_id) {
+                payload["trade_time_estimated"] = serde_json::json!(true);
+            }
             NewOrderEvent {
                 event_id: e.event_id.clone(),
                 event_type: e.event_type.as_str().to_string(),
@@ -453,6 +482,48 @@ pub(crate) mod tests {
         // a fill without a venue time trades at its booking time
         assert!(order_trade.is_some_and(|t| (Utc::now() - t).num_seconds().abs() < 60));
         assert_eq!(order_trade, position_trade);
+    }
+
+    /// A fill replayed with the same execution id books once, even on an observed
+    /// order that still takes fills; the booked fill's trade time is marked an
+    /// estimate (the engine has no venue time).
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn engine_replayed_fill_on_observed_order_books_once() {
+        let pool = test_pool().await;
+        let (order_id, _, _) = seeded_order(&pool, 0).await;
+        sqlx::query(
+            "UPDATE order_state SET origin = 'EXTERNAL', status = 'filled', original_qty = 3, \
+             leaves_qty = 3, cum_qty = 0, avg_px = NULL WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .expect("make observed-filled");
+
+        let report = fill();
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            results.push(process_execution_report(&pool, order_id, report.clone(), "obs-test", None).await.is_ok());
+        }
+        let cum: f64 = sqlx::query_scalar("SELECT cum_qty::double precision FROM order_state WHERE order_id = $1")
+            .bind(order_id).fetch_one(&pool).await.expect("cum");
+        let fills: Vec<Option<bool>> = sqlx::query_scalar(
+            "SELECT (payload_json->>'trade_time_estimated')::bool FROM order_event \
+             WHERE order_id = $1 AND event_type IN ('order_partially_filled', 'order_filled')",
+        )
+        .bind(order_id).fetch_all(&pool).await.expect("fills");
+        let net: Option<f64> = sqlx::query_scalar(
+            "SELECT p.net_qty::double precision FROM position p JOIN order_state os \
+               ON p.portfolio_id = os.portfolio_id AND p.instrument_id = os.instrument_id WHERE os.order_id = $1",
+        )
+        .bind(order_id).fetch_optional(&pool).await.expect("position");
+        remove_seeded(&pool, order_id).await;
+
+        assert_eq!(results, vec![true, true]);
+        assert_eq!(cum, 1.0);
+        assert_eq!(fills, vec![Some(true)]);
+        assert_eq!(net, Some(1.0));
     }
 
     #[tokio::test]
