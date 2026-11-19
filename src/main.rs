@@ -1410,7 +1410,12 @@ async fn serve() {
     match positions::rebuild_if_empty(&pool).await {
         Ok(Some(n)) => info!(positions = n, "rebuilt position projection from event log"),
         Ok(None) => {}
-        Err(e) => error!(error = ?e, "failed to rebuild position projection"),
+        // Refuse to start: booking into an empty projection would leave positions
+        // without trade-time keys, and no later boot would rebuild a non-empty table.
+        Err(e) => {
+            error!(error = ?e, "failed to rebuild position projection; refusing to start");
+            std::process::exit(1);
+        }
     }
 
     // The order engine: the only place that books. Connectors send it execution
