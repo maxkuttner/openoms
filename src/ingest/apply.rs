@@ -5,7 +5,7 @@
 //! the same advisory lock, so a stream and a pull of the same fill serialize
 //! and the second sees the first's row.
 
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
 use serde_json::json;
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
 use tracing::{debug, info, warn};
@@ -589,7 +589,8 @@ async fn book(
         _ => None,
     };
     // a fill without a venue execution time trades at its booking time
-    let trade_time = executed_at.unwrap_or(booked_at);
+    // at the DB's microsecond precision: the key compared is the key stored
+    let trade_time = executed_at.unwrap_or(booked_at).trunc_subsecs(6);
     let mut aggregate = base.map_or_else(OrderAggregate::empty, OrderAggregate::from_state);
     let mut events: Vec<OrderDomainEvent> = Vec::new();
     for command in commands {

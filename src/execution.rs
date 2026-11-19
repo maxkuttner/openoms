@@ -8,7 +8,7 @@
 //! events (the outbox trigger queues them for Kafka). On commit it publishes to
 //! the bus's order lane.
 
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -184,13 +184,19 @@ async fn apply_once(
         report,
     };
 
-    let events = match aggregate.decide(OrderCommand::ReceiveExecutionReport(cmd), metadata) {
+    let mut events = match aggregate.decide(OrderCommand::ReceiveExecutionReport(cmd), metadata) {
         Ok(evts) => evts,
         Err(rejection) => {
             warn!(order_id = %order_id, reason = %rejection.message, "execution: state machine rejected execution report, skipping");
             return Ok(());
         }
     };
+    // An OMS fill without a venue time trades at its booking time. Store it as
+    // occurred_at (at the DB's microsecond precision), so the key the position
+    // compares is the key a rebuild orders by.
+    for event in events.iter_mut().filter(|e| is_fill_event(e)) {
+        event.occurred_at.get_or_insert(event.timestamp.trunc_subsecs(6));
+    }
 
     let mut applied = aggregate;
     for event in &events {
@@ -198,7 +204,6 @@ async fn apply_once(
     }
 
     let new_state = applied.state.ok_or("missing aggregate state after apply")?;
-    // an OMS fill without a venue time trades at its booking time
     let trade_time = |e: &crate::domain::orders::events::OrderDomainEvent| e.occurred_at.unwrap_or(e.timestamp);
     let last_trade = events.iter().filter(|e| is_fill_event(e)).map(trade_time).max();
 

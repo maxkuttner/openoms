@@ -197,8 +197,8 @@ async fn upsert(
 /// Canonical replay order of position inputs — the one place it is defined, used by
 /// the per-position rebuild and the full rebuild. A fill's time is its trade time
 /// (`occurred_at`, else booking time); a fee takes its fill's time; equal times
-/// break on execution id (bytewise), then on append order.
-const CANONICAL_ORDER: &str = "trade_at, execution_id COLLATE \"C\", global_position";
+/// break on execution id (bytewise), a fee after its own fill, then on append order.
+const CANONICAL_ORDER: &str = "trade_at, execution_id COLLATE \"C\", is_fee, global_position";
 
 /// Trade time of the fill `exec` (an execution id expression) on order `order`, or
 /// NULL when that fill isn't booked.
@@ -224,18 +224,18 @@ fn replay_sql() -> String {
                        THEN COALESCE({fee_fill_time}, e.occurred_at, e.created_at) \
                        ELSE COALESCE(e.occurred_at, e.created_at) END AS trade_at, \
                   e.payload_json->'payload'->>'execution_id' AS execution_id, \
-                  e.global_position \
+                  (e.event_type = 'order_fee_charged') AS is_fee, e.global_position \
            FROM order_event e JOIN order_state os ON os.order_id = e.order_id \
            WHERE e.event_type IN ('order_partially_filled', 'order_filled', 'order_fee_charged') \
              AND ($1::uuid IS NULL OR os.portfolio_id = $1) AND ($2::text IS NULL OR os.instrument_id = $2) \
            UNION ALL \
            SELECT a.from_portfolio_id, a.instrument_id, os.side, 'transfer_out', NULL, \
-                  a.qty::float8, a.price::float8, a.created_at, NULL, NULL \
+                  a.qty::float8, a.price::float8, a.created_at, NULL, false, NULL \
            FROM allocation a JOIN order_state os ON os.order_id = a.order_id \
            WHERE ($1::uuid IS NULL OR a.from_portfolio_id = $1) AND ($2::text IS NULL OR a.instrument_id = $2) \
            UNION ALL \
            SELECT a.to_portfolio_id, a.instrument_id, os.side, 'transfer_in', NULL, \
-                  a.qty::float8, a.price::float8, a.created_at, NULL, NULL \
+                  a.qty::float8, a.price::float8, a.created_at, NULL, false, NULL \
            FROM allocation a JOIN order_state os ON os.order_id = a.order_id \
            WHERE ($1::uuid IS NULL OR a.to_portfolio_id = $1) AND ($2::text IS NULL OR a.instrument_id = $2) \
          ) r ORDER BY {CANONICAL_ORDER}"
@@ -246,8 +246,15 @@ fn replay_sql() -> String {
 #[derive(Default)]
 struct Replayed {
     math: Option<PositionMath>,
+    /// Latest ordered input (fill, base fee, transfer): what a newcomer must not precede.
     last_trade_at: Option<DateTime<Utc>>,
     fills: usize,
+}
+
+/// Raise a replayed position's latest ordered input time.
+fn bump(acc: &mut HashMap<(Uuid, String), Replayed>, key: &(Uuid, String), at: DateTime<Utc>) {
+    let entry = acc.entry(key.clone()).or_default();
+    entry.last_trade_at = entry.last_trade_at.max(Some(at));
 }
 
 /// Fold canonical-ordered replay rows into one position per (portfolio, instrument).
@@ -263,10 +270,12 @@ fn replay(rows: &[sqlx::postgres::PgRow]) -> HashMap<(Uuid, String), Replayed> {
         let step: Box<dyn Fn(PositionMath) -> PositionMath> = match r.get::<String, _>("kind").as_str() {
             "transfer_out" => {
                 let qty: f64 = r.get("qty");
+                bump(&mut acc, &key, trade_at);
                 Box::new(move |p| p.reduce_at_cost(qty))
             }
             "transfer_in" => {
                 let (qty, price): (f64, f64) = (r.get("qty"), r.get("price"));
+                bump(&mut acc, &key, trade_at);
                 Box::new(move |p| p.apply_fill(side, qty, price))
             }
             _ => {
@@ -277,12 +286,15 @@ fn replay(rows: &[sqlx::postgres::PgRow]) -> HashMap<(Uuid, String), Replayed> {
                 match event.payload {
                     OrderEventPayload::OrderPartiallyFilled { fill_qty, fill_price, .. }
                     | OrderEventPayload::OrderFilled { fill_qty, fill_price, .. } => {
-                        let entry = acc.entry(key.clone()).or_default();
-                        entry.fills += 1;
-                        entry.last_trade_at = entry.last_trade_at.max(Some(trade_at));
+                        acc.entry(key.clone()).or_default().fills += 1;
+                        bump(&mut acc, &key, trade_at);
                         Box::new(move |p| p.apply_fill(side, fill_qty, fill_price))
                     }
                     OrderEventPayload::OrderFeeCharged { amount, effect, .. } if effect != FeeEffect::Other => {
+                        // a quote fee commutes, so only a base fee holds a place in the order
+                        if effect == FeeEffect::Base {
+                            bump(&mut acc, &key, trade_at);
+                        }
                         Box::new(move |p| p.apply_fee(amount, effect))
                     }
                     _ => continue,
@@ -295,12 +307,25 @@ fn replay(rows: &[sqlx::postgres::PgRow]) -> HashMap<(Uuid, String), Replayed> {
     acc
 }
 
-/// The position's latest applied trade time, locking its row (None when absent or legacy).
+/// Serialize every writer of one (portfolio, instrument) position for the rest of
+/// the transaction, also when its row doesn't exist yet (FOR UPDATE can't lock that).
+async fn lock_position(conn: &mut PgConnection, portfolio_id: Uuid, instrument_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text || '/' || $2, 0))")
+        .bind(portfolio_id)
+        .bind(instrument_id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+/// Lock the position ([`lock_position`]) and read its latest ordered input time
+/// (None when absent or legacy).
 async fn lock_last_trade_at(
     conn: &mut PgConnection,
     portfolio_id: Uuid,
     instrument_id: &str,
 ) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    lock_position(conn, portfolio_id, instrument_id).await?;
     let last: Option<Option<DateTime<Utc>>> = sqlx::query_scalar(
         "SELECT last_trade_at FROM position WHERE portfolio_id = $1 AND instrument_id = $2 FOR UPDATE",
     )
@@ -366,15 +391,7 @@ pub async fn persist_fill(
     }
     let next = load(conn, portfolio_id, instrument_id).await?.apply_fill(side, fill_qty, fill_price);
     upsert(conn, portfolio_id, instrument_id, next).await?;
-    sqlx::query(
-        "UPDATE position SET last_trade_at = GREATEST(last_trade_at, $3) \
-         WHERE portfolio_id = $1 AND instrument_id = $2",
-    )
-    .bind(portfolio_id)
-    .bind(instrument_id)
-    .bind(trade_time)
-    .execute(&mut *conn)
-    .await?;
+    raise_last_trade_at(conn, portfolio_id, instrument_id, Some(trade_time)).await?;
     Ok(false)
 }
 
@@ -396,26 +413,51 @@ pub async fn persist_fee(
     if effect == FeeEffect::Other {
         return Ok(());
     }
-    if let (FeeEffect::Base, Some(exec)) = (effect, execution_id) {
-        let last = lock_last_trade_at(conn, portfolio_id, instrument_id).await?;
-        let fill_time: Option<DateTime<Utc>> = sqlx::query_scalar(&format!("SELECT {}", fill_time_sql("$1", "$2")))
+    let last = lock_last_trade_at(conn, portfolio_id, instrument_id).await?;
+    let mut fee_time = None;
+    if effect == FeeEffect::Base {
+        // its fill's trade time; a fee ahead of its fill sits at its own booking time
+        let at: DateTime<Utc> = sqlx::query_scalar(&format!("SELECT COALESCE({}, now())", fill_time_sql("$1", "$2")))
             .bind(order_id)
-            .bind(exec)
+            .bind(execution_id)
             .fetch_one(&mut *conn)
             .await?;
-        if matches!((fill_time, last), (Some(f), Some(l)) if f < l) {
+        if last.is_some_and(|l| at <= l) {
             rebuild_position(conn, portfolio_id, instrument_id).await?;
             return Ok(());
         }
+        fee_time = Some(at);
     }
     let next = load(conn, portfolio_id, instrument_id).await?.apply_fee(amount, effect);
-    upsert(conn, portfolio_id, instrument_id, next).await
+    upsert(conn, portfolio_id, instrument_id, next).await?;
+    raise_last_trade_at(conn, portfolio_id, instrument_id, fee_time).await
+}
+
+/// `last_trade_at = GREATEST(last_trade_at, at)`; a no-op for None.
+async fn raise_last_trade_at(
+    conn: &mut PgConnection,
+    portfolio_id: Uuid,
+    instrument_id: &str,
+    at: Option<DateTime<Utc>>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE position SET last_trade_at = GREATEST(last_trade_at, $3) \
+         WHERE portfolio_id = $1 AND instrument_id = $2",
+    )
+    .bind(portfolio_id)
+    .bind(instrument_id)
+    .bind(at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// Cost-preserving allocation transfer of `qty` (> 0) of `instrument_id` from one
 /// portfolio to another at `price`, inside the caller's tx. The source reduces at
 /// cost (no P&L — a conduit); the destination books at `price` via the normal fill
-/// logic. Caller validates `qty <= |source net_qty|`.
+/// logic. Caller validates `qty <= |source net_qty|` and inserts the `allocation`
+/// row first: the transfer sits at its time (`now()`, the row's `created_at`), and
+/// a side whose latest input isn't older rebuilds from the log instead.
 pub async fn persist_transfer(
     conn: &mut PgConnection,
     from_portfolio: Uuid,
@@ -425,10 +467,23 @@ pub async fn persist_transfer(
     qty: f64,
     price: f64,
 ) -> Result<(), sqlx::Error> {
-    let from = load(conn, from_portfolio, instrument_id).await?.reduce_at_cost(qty);
-    upsert(conn, from_portfolio, instrument_id, from).await?;
-    let to = load(conn, to_portfolio, instrument_id).await?.apply_fill(side, qty, price);
-    upsert(conn, to_portfolio, instrument_id, to).await
+    // both sides locked in one order, so two opposite transfers can't deadlock
+    let (first, second) =
+        if from_portfolio <= to_portfolio { (from_portfolio, to_portfolio) } else { (to_portfolio, from_portfolio) };
+    lock_position(conn, first, instrument_id).await?;
+    lock_position(conn, second, instrument_id).await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT now()").fetch_one(&mut *conn).await?;
+    for (portfolio, out) in [(from_portfolio, true), (to_portfolio, false)] {
+        if lock_last_trade_at(conn, portfolio, instrument_id).await?.is_some_and(|l| now <= l) {
+            rebuild_position(conn, portfolio, instrument_id).await?;
+            continue;
+        }
+        let p = load(conn, portfolio, instrument_id).await?;
+        let next = if out { p.reduce_at_cost(qty) } else { p.apply_fill(side, qty, price) };
+        upsert(conn, portfolio, instrument_id, next).await?;
+        raise_last_trade_at(conn, portfolio, instrument_id, Some(now)).await?;
+    }
+    Ok(())
 }
 
 /// Recovery / backfill: rebuild every position by replaying fills, fees and
@@ -770,46 +825,172 @@ mod tests {
             out
         }
 
+        #[derive(Clone, Copy, Debug)]
+        enum Input {
+            Fill(usize),
+            Fee(usize),
+            Transfer,
+        }
+
+        /// Record an allocation of `qty` from the block to `fund` at `price` and
+        /// transfer it (row first, then the positions), as create_allocations does.
+        async fn allocate(pool: &PgPool, b: &Book, fund: Uuid, qty: f64, price: f64) {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query(
+                "INSERT INTO allocation (order_id, from_portfolio_id, to_portfolio_id, instrument_id, qty, price) \
+                 VALUES ($1, $2, $3, $4, $5, $6)")
+                .bind(b.buy).bind(b.portfolio).bind(fund).bind(&b.instrument).bind(qty).bind(price)
+                .execute(&mut *tx).await.unwrap();
+            persist_transfer(&mut tx, b.portfolio, fund, &b.instrument, OrderSide::Buy, qty, price).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        async fn new_fund(pool: &PgPool) -> Uuid {
+            let fund = Uuid::new_v4();
+            sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, $2, 'ACTIVE')")
+                .bind(fund).bind(format!("ZZFUND{}", &fund.simple().to_string()[..8])).execute(pool).await.unwrap();
+            fund
+        }
+
+        async fn drop_fund(pool: &PgPool, b: &Book, fund: Uuid) {
+            sqlx::query("DELETE FROM allocation WHERE order_id = $1").bind(b.buy).execute(pool).await.unwrap();
+            sqlx::query("DELETE FROM position WHERE portfolio_id = $1").bind(fund).execute(pool).await.unwrap();
+            sqlx::query("DELETE FROM kafka_position_outbox WHERE portfolio_id = $1").bind(fund).execute(pool).await.unwrap();
+            sqlx::query("DELETE FROM portfolio WHERE id = $1").bind(fund).execute(pool).await.unwrap();
+        }
+
+        /// Every arrival order of the fills, with the fees and one allocation transfer
+        /// as independent arrivals placed at varying positions (a fee ahead of its fill,
+        /// a fee after later fills, the transfer anywhere), ends at the position the
+        /// trade-time order gives.
         #[tokio::test]
         #[ignore = "needs a live Postgres; run with --ignored"]
         async fn any_arrival_order_gives_the_same_position() {
             use OrderSide::{Buy, Sell};
             let pool = test_pool().await;
-            // in trade-time order: open long, add, flip short through zero, flip back long, trim
+            // in trade-time order: open long, add, flip short through zero, then an
+            // equal-time pair (e4 sorts before e5) that flips back long and trims
             let fills = [
-                (Buy, "e1", 2.0, 100.0, t(1), None),
-                (Buy, "e2", 1.0, 110.0, t(2), Some((0.01, FeeEffect::Base))),
-                (Sell, "e3", 4.0, 120.0, t(3), Some((0.5, FeeEffect::Quote))),
-                (Buy, "e4", 3.0, 90.0, t(4), Some((0.02, FeeEffect::Base))),
-                (Sell, "e5", 1.0, 95.0, t(5), None),
+                (Buy, "e1", 2.0, 100.0, t(1)),
+                (Buy, "e2", 1.0, 110.0, t(2)),
+                (Sell, "e3", 4.0, 120.0, t(3)),
+                (Buy, "e4", 3.0, 90.0, t(4)),
+                (Sell, "e5", 1.0, 95.0, t(4)),
             ];
+            // fees on fills e2 (base), e3 (quote), e4 (base)
+            let fees = [(1, 0.01, FeeEffect::Base), (2, 0.5, FeeEffect::Quote), (3, 0.02, FeeEffect::Base)];
+            let (xfer_qty, xfer_px) = (0.5, 100.0); // block → fund, booked now: after every fill
             let mut want = PositionMath::FLAT;
-            for (side, _, qty, price, _, f) in fills {
-                want = want.apply_fill(side, qty, price);
-                if let Some((amount, effect)) = f {
-                    want = want.apply_fee(amount, effect);
+            for (i, (side, _, qty, price, _)) in fills.iter().enumerate() {
+                want = want.apply_fill(*side, *qty, *price);
+                for (on, amount, effect) in fees {
+                    if on == i {
+                        want = want.apply_fee(amount, effect);
+                    }
                 }
             }
+            want = want.reduce_at_cost(xfer_qty);
+            let fund_want = PositionMath::FLAT.apply_fill(Buy, xfer_qty, xfer_px);
+
             let mut failures = Vec::new();
-            for perm in permutations(fills.len()) {
+            for (k, perm) in permutations(fills.len()).into_iter().enumerate() {
+                let mut arrivals: Vec<Input> = perm.iter().map(|&i| Input::Fill(i)).collect();
+                // spread the other inputs over every slot as k varies
+                for (j, _) in fees.iter().enumerate() {
+                    let slot = (k / (j + 1) + j * 2) % (arrivals.len() + 1);
+                    arrivals.insert(slot, Input::Fee(j));
+                }
+                let slot = (k * 7) % (arrivals.len() + 1);
+                arrivals.insert(slot, Input::Transfer);
+
                 let b = book(&pool).await;
-                for &i in &perm {
-                    let (side, exec, qty, price, at, f) = fills[i];
-                    fill(&pool, &b, side, exec, qty, price, at).await;
-                    if let Some((amount, effect)) = f {
-                        fee(&pool, &b, side, exec, amount, effect).await;
+                let fund = new_fund(&pool).await;
+                for input in &arrivals {
+                    match *input {
+                        Input::Fill(i) => {
+                            let (side, exec, qty, price, at) = fills[i];
+                            fill(&pool, &b, side, exec, qty, price, at).await;
+                        }
+                        Input::Fee(j) => {
+                            let (on, amount, effect) = fees[j];
+                            let (side, exec, ..) = fills[on];
+                            fee(&pool, &b, side, exec, amount, effect).await;
+                        }
+                        Input::Transfer => allocate(&pool, &b, fund, xfer_qty, xfer_px).await,
                     }
                 }
                 let got = pos(&pool, b.portfolio, &b.instrument).await;
+                let fund_got = pos(&pool, fund, &b.instrument).await;
+                drop_fund(&pool, &b, fund).await;
                 drop_book(&pool, &b).await;
-                let ok = (got.0 - want.net_qty).abs() < EPS
-                    && (got.1 - want.avg_cost).abs() < EPS
-                    && (got.2 - want.realized_pnl).abs() < EPS;
-                if !ok {
-                    failures.push(format!("{perm:?}: {got:?}"));
+                let near = |g: (f64, f64, f64), w: PositionMath| {
+                    (g.0 - w.net_qty).abs() < EPS && (g.1 - w.avg_cost).abs() < EPS && (g.2 - w.realized_pnl).abs() < EPS
+                };
+                if !near(got, want) || !near(fund_got, fund_want) {
+                    failures.push(format!("{arrivals:?}: block {got:?} fund {fund_got:?}"));
                 }
             }
             assert!(failures.is_empty(), "want {want:?}; {} of 120 differ, e.g. {:?}", failures.len(), failures.first());
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live Postgres; run with --ignored"]
+        async fn fill_older_than_allocation_triggers_rebuild() {
+            let pool = test_pool().await;
+            let b = book(&pool).await;
+            let fund = new_fund(&pool).await;
+            let now = Utc::now();
+            fill(&pool, &b, OrderSide::Buy, "b0", 2.0, 80.0, now - Duration::seconds(10)).await;
+            allocate(&pool, &b, fund, 1.0, 80.0).await;
+            // traded before the allocation, after the last fill: lands before the transfer
+            fill(&pool, &b, OrderSide::Buy, "b1", 1.0, 100.0, now - Duration::seconds(5)).await;
+            let got = pos(&pool, b.portfolio, &b.instrument).await;
+            drop_fund(&pool, &b, fund).await;
+            drop_book(&pool, &b).await;
+            // 2@80 + 1@100 → 3 @ 86.67; 1 out at cost → 2 @ 86.67
+            close(got, PositionMath { net_qty: 2.0, avg_cost: 260.0 / 3.0, realized_pnl: 0.0 }, "block");
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live Postgres; run with --ignored"]
+        async fn concurrent_first_fills_on_new_position_both_apply() {
+            let pool = test_pool().await;
+            let mut lost = 0;
+            for _ in 0..20 {
+                let b = book(&pool).await;
+                tokio::join!(
+                    fill(&pool, &b, OrderSide::Buy, "c1", 2.0, 100.0, t(1)),
+                    fill(&pool, &b, OrderSide::Sell, "c2", 1.0, 110.0, t(2)),
+                );
+                let got = pos(&pool, b.portfolio, &b.instrument).await;
+                drop_book(&pool, &b).await;
+                if (got.0 - 1.0).abs() > EPS || (got.2 - 10.0).abs() > EPS {
+                    lost += 1;
+                }
+            }
+            assert_eq!(lost, 0, "a concurrent first fill was lost or misordered");
+        }
+
+        #[tokio::test]
+        #[ignore = "needs a live Postgres; run with --ignored"]
+        async fn oms_fill_stores_its_trade_time() {
+            use crate::domain::orders::commands::ExecutionReport;
+            let pool = test_pool().await;
+            let (order_id, portfolio_id, instrument_id) = seeded_order(&pool, 0).await;
+            let report = ExecutionReport::Fill {
+                execution_id: Uuid::new_v4().to_string(), fill_qty: 1.0, fill_price: 100.0, venue: "TEST".into(),
+            };
+            let applied = crate::execution::process_execution_report(&pool, order_id, report, "test", None).await;
+            let row: Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT e.occurred_at, p.last_trade_at FROM order_event e, position p \
+                 WHERE e.order_id = $1 AND e.event_type IN ('order_partially_filled', 'order_filled') \
+                   AND p.portfolio_id = $2 AND p.instrument_id = $3")
+                .bind(order_id).bind(portfolio_id).bind(&instrument_id).fetch_optional(&pool).await.unwrap();
+            remove_seeded(&pool, order_id).await;
+            applied.unwrap();
+            let (occurred, last) = row.expect("fill event and position");
+            assert!(occurred.is_some(), "the fill's trade time is stored as occurred_at");
+            assert_eq!(occurred, last, "the compared key is the stored key");
         }
 
         #[tokio::test]
