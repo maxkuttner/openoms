@@ -3,6 +3,10 @@ title: Co-located strategies
 description: Run a latency-sensitive strategy on its own server, trading the venue directly, while the OMS follows and controls it.
 ---
 
+> **Note:** :warning: Co-located strategies are 
+> still in development ... actually so is pretty much everything. So don't spend too much time here.
+> We're working on it.
+
 A co-located strategy trades its venue **directly**, from its own server next to the
 exchange (or wherever it has the compute). It never waits for the OMS. The OMS follows
 the strategy's venue account and shows its fills, positions and P&L moments after they
