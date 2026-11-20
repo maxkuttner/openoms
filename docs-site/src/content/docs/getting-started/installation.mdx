@@ -40,28 +40,6 @@ follow the **macOS & Linux** tab.
 </Aside>
 
 </TabItem>
-<TabItem label="Package Managers">
-
-**Homebrew** (macOS on Apple Silicon, Linux x86_64):
-
-```sh
-brew install maxkuttner/tap/openoms
-```
-
-Or add the tap once, then use the short name:
-
-```sh
-brew tap maxkuttner/tap
-brew install openoms
-```
-
-The formula is named `openoms`; the command it installs is `oms`, already on your `PATH`.
-
-<Aside type="caution" title="pip: to be implemented">
-`pip install openoms` is planned. Until then, use Homebrew or the **macOS & Linux** tab.
-</Aside>
-
-</TabItem>
 <TabItem label="Docker">
 
 Runs openoms and PostgreSQL 16 together with Docker Compose:
@@ -149,12 +127,11 @@ Once installed, `oms` upgrades itself:
 oms update
 ```
 
-`oms update --check` only reports whether a newer release exists. A binary a package
-manager or container owns refuses to overwrite itself and names the command to use:
+`oms update --check` only reports whether a newer release exists. A binary a container
+owns refuses to overwrite itself and names the command to use:
 
 | Installed with | Upgrade |
 |---|---|
-| Homebrew | `brew upgrade openoms` |
 | Docker Compose | `docker compose pull && docker compose run --rm oms database migrate && docker compose up -d` |
 | From source | `git pull`, then rebuild |
 
@@ -233,14 +210,6 @@ rm ~/.local/bin/oms
 <TabItem label="Windows">
 
 Inside WSL 2, use the **macOS & Linux** command.
-
-</TabItem>
-<TabItem label="Package Managers">
-
-```sh
-brew uninstall openoms
-brew untap maxkuttner/tap
-```
 
 </TabItem>
 <TabItem label="Docker">

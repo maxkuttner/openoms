@@ -58,13 +58,6 @@ fn is_cargo_build(exe: &Path) -> bool {
         .any(|w| w[0] == "target" && (w[1] == "debug" || w[1] == "release"))
 }
 
-/// A binary inside a Homebrew Cellar belongs to brew: replacing it would break
-/// brew's own checksums and be undone by the next `brew upgrade`.
-fn is_homebrew_install(exe: &Path) -> bool {
-    let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
-    parts.windows(2).any(|w| w[0] == "Cellar" && w[1] == "openoms")
-}
-
 /// Set by the published Docker image. A container's binary is replaced by
 /// pulling a new image, never in place.
 fn in_container() -> bool {
@@ -75,8 +68,6 @@ fn in_container() -> bool {
 fn managed_refusal(exe: &Path, in_container: bool) -> Option<String> {
     if in_container {
         Some("oms runs in a container — update it with: docker compose pull && docker compose run --rm oms database migrate && docker compose up -d".into())
-    } else if is_homebrew_install(exe) {
-        Some("oms was installed by Homebrew — update it with: brew upgrade openoms".into())
     } else if is_cargo_build(exe) {
         Some(format!(
             "{} was built from source — update it with `git pull && cargo build --release` instead",
@@ -291,15 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn a_homebrew_install_is_refused_with_brew_upgrade() {
-        let m = managed_refusal(Path::new("/opt/homebrew/Cellar/openoms/0.6.0/bin/oms"), false).unwrap();
-        assert!(m.contains("brew upgrade openoms"), "{m}");
-        assert!(managed_refusal(Path::new("/home/linuxbrew/.linuxbrew/Cellar/openoms/0.6.0/bin/oms"), false).is_some());
-        assert!(managed_refusal(Path::new("/home/me/.local/bin/oms"), false).is_none());
-        assert!(managed_refusal(Path::new("/opt/Cellar-backup/oms"), false).is_none());
-    }
-
-    #[test]
     fn a_container_install_is_refused_with_compose_pull() {
         let m = managed_refusal(Path::new("/usr/local/bin/oms"), true).unwrap();
         assert!(
@@ -323,9 +305,9 @@ mod tests {
 
     #[test]
     fn check_still_reports_when_managed() {
-        let cellar = Path::new("/opt/homebrew/Cellar/openoms/0.6.0/bin/oms");
-        assert!(update_refusal(cellar, true, true).is_none(), "--check only reads");
-        assert!(update_refusal(cellar, false, false).is_some());
+        let managed = Path::new("/src/oms/target/release/oms");
+        assert!(update_refusal(managed, true, true).is_none(), "--check only reads");
+        assert!(update_refusal(managed, false, false).is_some());
     }
 
     #[test]
