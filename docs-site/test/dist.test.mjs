@@ -231,18 +231,17 @@ test("the grain background shows in light mode too", () => {
 
 test("installation has OS tabs and links the installer source, not the raw script", () => {
   const html = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
-  for (const tab of ["macOS &amp; Linux", "Windows", "Package Managers", "Docker"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
+  for (const tab of ["macOS &amp; Linux", "Windows", "Docker"]) assert.ok(html.includes(`>${tab}<`), `${tab} tab missing`);
   assert.ok(html.includes('data-sync-key="os"'), "tabs not synced across pages");
   assert.ok(html.includes("https://github.com/maxkuttner/openoms/blob/main/install.sh"));
   assert.ok(!html.includes('href="/install.sh"'), "still links the raw script");
 });
 
-test("installation's Package Managers and Docker tabs give real commands", () => {
+test("installation's Docker tab gives real commands", () => {
   const html = readFileSync(join(DIST, "getting-started/installation/index.html"), "utf8");
-  // The first tab group's panels, in label order: macOS & Linux, Windows, Package Managers, Docker.
-  const panels = html.split(/<div[^>]*role="tabpanel"/).slice(1, 5);
-  const [, , pkg, docker] = panels;
-  assert.ok(pkg.includes("brew install maxkuttner/tap/openoms"), "no Homebrew command");
+  // The first tab group's panels, in label order: macOS & Linux, Windows, Docker.
+  const panels = html.split(/<div[^>]*role="tabpanel"/).slice(1, 4);
+  const docker = panels[2];
   assert.ok(docker.includes("docker compose up -d"), "no compose flow");
   assert.ok(docker.includes("OMS_MASTER_KEY"), "the master key is not generated into .env");
   // The last panel runs on into the page; the text after the tabs may mention `oms init`.

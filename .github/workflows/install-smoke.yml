@@ -49,32 +49,6 @@ jobs:
           grep -qa 'oms-cockpit\|<div id="root">' "$HOME/.local/bin/oms" \
             || { echo "no cockpit bundle found in the released binary"; exit 1; }
 
-  brew:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
-    runs-on: macos-15
-    steps:
-      - name: install exactly the way the docs say to
-        run: brew install maxkuttner/tap/openoms
-
-      - name: the formula installs the latest release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          got="$(oms --version | awk '{print $NF}')"
-          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
-          echo "installed $got, latest release $tag"
-          [ "$got" = "${tag#v}" ] || { echo "formula does not install the latest release"; exit 1; }
-
-      - run: brew test openoms
-
-      - name: oms update defers to brew
-        run: |
-          if out="$(oms update 2>&1)"; then echo "oms update replaced a brew-owned binary"; exit 1; fi
-          echo "$out"
-          echo "$out" | grep -q "brew upgrade openoms"
-
   docker:
     if: >-
       github.event_name == 'workflow_dispatch' ||

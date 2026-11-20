@@ -149,7 +149,7 @@ jobs:
 
       # The install guide downloads compose.yaml from the latest release, pinned
       # to this release's image (OMS_VERSION still overrides it). Not part of
-      # SHA256SUMS, which covers the binaries the installer and Homebrew verify.
+      # SHA256SUMS, which covers the binaries the installer verifies.
       - name: compose.yaml pinned to this release
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -260,37 +260,3 @@ jobs:
             "$img:$v-amd64" "$img:$v-arm64"
           docker buildx imagetools inspect "$img:$v"
 
-  # Formula/openoms.rb in maxkuttner/homebrew-tap, rendered from this release's
-  # SHA256SUMS. HOMEBREW_TAP_TOKEN: a fine-grained token with contents write on
-  # the tap repo only.
-  homebrew:
-    needs: [publish, docker-manifest]
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: render the formula from the release's SHA256SUMS
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" -p SHA256SUMS
-          sh packaging/homebrew/render.sh "${GITHUB_REF_NAME#v}" SHA256SUMS > openoms.rb
-          grep -q "releases/download/$GITHUB_REF_NAME/" openoms.rb
-          cat openoms.rb
-
-      - name: push to maxkuttner/homebrew-tap
-        env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: |
-          [ -n "$TAP_TOKEN" ] || { echo "secret HOMEBREW_TAP_TOKEN is not set"; exit 1; }
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/maxkuttner/homebrew-tap.git" tap
-          mkdir -p tap/Formula
-          cp openoms.rb tap/Formula/openoms.rb
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/openoms.rb
-          if git diff --cached --quiet; then echo "formula unchanged"; exit 0; fi
-          msg="openoms ${GITHUB_REF_NAME#v}"
-          git commit -m "$msg"
-          git push
