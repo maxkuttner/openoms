@@ -3,6 +3,9 @@ title: Co-located strategies
 description: Run a latency-sensitive strategy on its own server, trading the venue directly, while the OMS follows and controls it.
 ---
 
+> **Legacy:** co-located strategies are being replaced by
+> [reported strategies](/strategies/reported/). New strategies should use those.
+
 > **Note:** :warning: Co-located strategies are 
 > still in development ... actually so is pretty much everything. So don't spend too much time here.
 > We're working on it.
