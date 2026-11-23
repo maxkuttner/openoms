@@ -16,13 +16,14 @@ import { OrderTimeline } from "../OrderTimeline";
 import type { Cell } from "../../tradeTimes";
 import { fmtLocal, placedCell, tradeTimeCell } from "../../tradeTimes";
 import { formatFees } from "../../fees";
+import { TERMINAL, filterOrders, type StatusFilter } from "../../orders";
 import type { BlotterRow } from "../../api/types";
 import type { GrantedPortfolio } from "../../access";
 
 // Statuses the OMS will never move on from. Mirrors the terminal check in
 // POST /orders/cancel (src/handlers.rs) — an order in one of these states is
 // done, one way or another.
-const TERMINAL = new Set(["filled", "canceled", "rejected", "expired"]);
+// (TERMINAL lives in src/orders.ts so the Orders page filters by the same set.)
 
 // How many orders to ask for. The server defaults to 100 and clamps to 1..500
 // (list_orders in src/handlers.rs); asking explicitly means the window is a
@@ -51,8 +52,13 @@ function TipText({ cell }: { cell: Cell }) {
 export function TradeBlotter({
   portfolios,
   followOrderId = null,
+  statusFilter = "all",
+  query = "",
 }: {
   portfolios: GrantedPortfolio[];
+  /** Orders page only: which status bucket and text to show; the blotter's fetch is unchanged. */
+  statusFilter?: StatusFilter;
+  query?: string;
   // The order the ticket just submitted, if any. GET /orders is scoped
   // server-side to can_view grants, so the same permission that decides which
   // rows come back decides which portfolios can be picked — Positions uses
@@ -143,8 +149,8 @@ export function TradeBlotter({
 
   // No client-side filtering or sorting: the server returns the page already
   // ordered (trade time desc, nulls last, then booked desc).
-  const rows = orders.data ?? [];
-  const windowFull = rows.length >= BLOTTER_LIMIT;
+  const rows = filterOrders(orders.data ?? [], statusFilter, query);
+  const windowFull = (orders.data ?? []).length >= BLOTTER_LIMIT;
 
   const HEAD: [string, boolean][] = [
     ["Placed", false], ["Trade time", false], ["Booked", false], ["Updated", false], ["Instrument", false], ["Side", false], ["Type", false], ["Status", false],

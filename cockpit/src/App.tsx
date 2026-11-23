@@ -12,6 +12,7 @@ import { TradePage } from "./pages/trading/Trade";
 import { PositionsPage } from "./pages/trading/Positions";
 import { StrategiesPage as ReportedStrategiesPage } from "./pages/trading/Strategies";
 import { ApiKeysPage } from "./pages/trading/Api";
+import { OrdersPage } from "./pages/trading/Orders";
 import { AccessPage } from "./pages/trading/Access";
 import { UsersPage } from "./pages/admin/Users";
 import { GroupsPage } from "./pages/admin/Groups";
@@ -30,6 +31,11 @@ import { BreaksPage } from "./pages/admin/Breaks";
 function Trade() {
   const { me } = useSession();
   return <TradePage me={me} />;
+}
+
+function Orders() {
+  const { me } = useSession();
+  return <OrdersPage me={me} />;
 }
 
 function Positions() {
@@ -53,7 +59,7 @@ export function App() {
         <Route path="strategies" element={<ReportedStrategiesPage />} />
         <Route path="api" element={<ApiKeysPage />} />
         <Route path="portfolios" element={<Positions />} />
-        <Route path="orders" element={<Pending />} />
+        <Route path="orders" element={<Orders />} />
         <Route path="jobs" element={<Pending />} />
         <Route path="events" element={<Pending />} />
         <Route path="positions" element={<Navigate to={legacyRedirect("/positions")!} replace />} />
