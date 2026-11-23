@@ -3,7 +3,6 @@ title: Architecture
 description: How orders, fills, prices and strategies move through OpenOMS, and how the instrument catalog ties them together.
 ---
 
-import ArchitectureDiagram from "../../../components/ArchitectureDiagram.astro";
 import Mermaid from "../../../components/Mermaid.astro";
 import overview from "../../../diagrams/overview.mmd?raw";
 import er from "../../../diagrams/er.mmd?raw";
@@ -11,17 +10,11 @@ import runtime from "../../../diagrams/runtime.mmd?raw";
 
 The central OMS is one program. Its core owns durable accounting state in
 Postgres. Two embedded gateways connect it to venues: one for orders and fills,
-one for prices. Co-located strategies are separate programs with direct venue
-connections and an asynchronous control link to the OMS.
-
-## Shipped architecture
-
-<ArchitectureDiagram />
+one for prices. Strategies run elsewhere and report their fills over HTTP.
 
 ## The order path
 
-1. An order arrives from the web app (`/app/`; admins also see its Admin Panel), or from a
-   strategy over FIX or REST (path ①).
+1. An order arrives from the web app (`/app/`; admins also see its Admin Panel), or over the REST API.
 2. **Order API + Risk** checks it against the portfolio's limits and current
    positions, then stores it.
 3. The **order gateway** sends it to the venue through that venue's connector.
@@ -34,8 +27,7 @@ connections and an asynchronous control link to the OMS.
 
 **The reconciler** of each connection pulls the venue's fills and open orders
 after every reconnect and on a timer, so anything missed while a stream was
-down still books once. A co-located strategy's account gets a reconciler of its
-own, on the strategy's follow key.
+down still books once.
 
 ## The price path
 
@@ -64,23 +56,9 @@ optional; without it the OMS runs fully.
 
 ## Strategies
 
-- **Path ①, through the OMS.** The strategy sends its orders to the OMS over
-  FIX 4.4 (TLS) or REST, and every order passes the same checks as a trader's.
-  See [FIX](/strategies/fix/) and [REST](/strategies/rest/).
-- **Path ②, co-located.** A latency-sensitive strategy runs on its own server
-  next to the venue and trades its own venue account directly. It links four
-  crates from this repository:
-  - `risk` is the shared pure pre-trade evaluator;
-  - `colo-runtime` owns reservations, the durable journal and recovery;
-  - `colo-link` holds two authenticated v2 sockets — control and events;
-  - `gateway` provides the venue connector.
-  The v2 event socket cannot authorize trading; authority arrives only on the
-  control socket and is valid from receipt time.
-
-  The OMS follows that account with its own key and books every fill, so the
-  strategy's positions and P&L appear moments later. Kill tells the strategy,
-  and also cancels everything on the account with the OMS's key, without
-  waiting for the strategy. See [Co-located strategies](/strategies/colocated/).
+A strategy trades its venue on its own and reports its fills to the OMS over HTTP.
+The OMS books them into the strategy's portfolio like any other fill. See
+[Strategies](/trade/strategies/).
 
 ## Instrument model
 

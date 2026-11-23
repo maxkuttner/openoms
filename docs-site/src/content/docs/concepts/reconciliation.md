@@ -82,8 +82,7 @@ submitted and routed history.
 Positions and realized P&L are ordered by trade time, not by when a fill was
 booked. A fill that arrives late is placed where it traded, and the position is
 recalculated from that point. Fills with the same trade time are ordered by fill
-id, and a fee always follows its fill. Co-located transfers are included in the
-recalculation.
+id, and a fee always follows its fill.
 
 ## Breaks
 
@@ -106,9 +105,7 @@ the accounts list is shown only for IBKR connections. Orders are tagged with the
 account they were placed on, which is what attribution rules match.
 
 Binance sub-accounts are not listed under one connection. A sub-account is its
-own API key. Today there is one Binance connection per environment, so
-co-located strategies pull their fills with their own follow key rather than a
-second connection.
+own API key; today there is one Binance connection per environment.
 
 ## IBKR setup
 

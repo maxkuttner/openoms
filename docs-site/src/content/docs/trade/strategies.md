@@ -1,17 +1,15 @@
 ---
-title: Reported strategies
+title: Strategies
 description: Run a strategy anywhere, trade the venue yourself, and report its fills to the OMS over HTTP.
 ---
 
-A **reported** strategy trades its venue on its own and sends its fills to the OMS
+A strategy trades its venue on its own and sends its fills to the OMS
 afterwards. The OMS books them into the strategy's portfolio, so positions and P&L show
 in the cockpit. The cockpit labels these **self-managed / unverified**:
 
 - Reports are trusted; the OMS does not check them against the venue.
 - The OMS cannot stop the strategy. That is your job.
 - If no batch arrives within the strategy's stale threshold, the cockpit warns.
-
-Need a kill switch? Trade [through the OMS](/strategies/fix/) instead.
 
 ## Manage
 

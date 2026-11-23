@@ -41,7 +41,7 @@ export default defineConfig({
           items: ["configuration/reference", "configuration/file-locations", "configuration/login"],
         },
         { label: "Concepts", items: ["concepts/architecture", "concepts/fees", "concepts/reconciliation"] },
-        { label: "Strategies", items: ["strategies/fix", "strategies/rest", "strategies/reported", "strategies/colocated"] },
+        { label: "Trade", items: ["trade/order-entry", "trade/strategies", "trade/api"] },
         {
           label: "Integrations",
           items: [
