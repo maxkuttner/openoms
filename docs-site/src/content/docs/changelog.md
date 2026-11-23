@@ -5,6 +5,8 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.15.1 (2026-11-23)
+
 ## v0.15.0 (2026-11-23)
 
 ### Feat
