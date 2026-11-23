@@ -140,6 +140,9 @@ export function TradePage({ me }: { me: Me }) {
   );
 }
 
+/** Book (300px) + gap + the tallest ticket: the top panel never shrinks below this. */
+const TOP_MIN_PX = 780;
+
 /** True at Tailwind's `lg` width and up, where the trade screen splits into resizable panels. */
 function useWide(): boolean {
   const q = "(min-width: 1024px)";
@@ -172,17 +175,18 @@ function TradeLayout({ chart, book, ticket, bottom }: { chart: ReactNode; book: 
     );
   }
   return (
-    <ResizablePanelGroup orientation="vertical" className="h-[calc(100svh-11rem)] min-h-[760px]"
+    <ResizablePanelGroup orientation="vertical" className="h-[calc(100svh-11rem)] min-h-[960px]"
       defaultLayout={outer.defaultLayout} onLayoutChanged={outer.onLayoutChanged}>
-      <ResizablePanel id="top" defaultSize="68" minSize="30">
+      <ResizablePanel id="top" defaultSize="70" minSize={TOP_MIN_PX}>
         <ResizablePanelGroup orientation="horizontal" defaultLayout={row.defaultLayout} onLayoutChanged={row.onLayoutChanged}>
           <ResizablePanel id="chart" defaultSize="70" minSize="30" className="pr-1.5">{chart}</ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel id="side" defaultSize="30" minSize={300} className="pl-1.5">
             {/* Book takes what the ticket leaves; the ticket keeps its natural height. */}
-            {/* The book never shrinks below a readable height; the column scrolls instead. */}
-            <div className="flex h-full flex-col gap-3 overflow-y-auto">
-              <div className="min-h-[300px] flex-1 overflow-auto">{book}</div>
+            {/* The top panel's minimum height fits a readable book plus the whole ticket,
+                so this column never needs its own scrollbar. */}
+            <div className="flex h-full flex-col gap-3">
+              <div className="min-h-[300px] flex-1 overflow-hidden">{book}</div>
               <div className="shrink-0">{ticket}</div>
             </div>
           </ResizablePanel>
