@@ -1,5 +1,4 @@
 import { Navigate, Route, Routes } from "react-router-dom";
-import { Notice } from "./components/common";
 import { legacyRedirect } from "./nav";
 import { APP_HOME } from "./login/api";
 import { LoginPage } from "./login/LoginPage";
@@ -13,6 +12,8 @@ import { PortfoliosPage as TradingPortfoliosPage } from "./pages/trading/Portfol
 import { StrategiesPage as ReportedStrategiesPage } from "./pages/trading/Strategies";
 import { ApiKeysPage } from "./pages/trading/Api";
 import { OrdersPage } from "./pages/trading/Orders";
+import { JobsPage } from "./pages/Jobs";
+import { EventsPage } from "./pages/Events";
 import { AccessPage } from "./pages/trading/Access";
 import { UsersPage } from "./pages/admin/Users";
 import { GroupsPage } from "./pages/admin/Groups";
@@ -43,11 +44,6 @@ function Portfolios() {
   return <TradingPortfoliosPage me={me} />;
 }
 
-/** Placeholder for a page later in this branch. */
-function Pending() {
-  return <Notice tone="info">Coming in this branch.</Notice>;
-}
-
 /** The whole app. Sign-in and the access page render without a session. */
 export function App() {
   return (
@@ -60,8 +56,8 @@ export function App() {
         <Route path="api" element={<ApiKeysPage />} />
         <Route path="portfolios" element={<Portfolios />} />
         <Route path="orders" element={<Orders />} />
-        <Route path="jobs" element={<Pending />} />
-        <Route path="events" element={<Pending />} />
+        <Route path="jobs" element={<JobsPage />} />
+        <Route path="events" element={<EventsPage />} />
         <Route path="positions" element={<Navigate to={legacyRedirect("/positions")!} replace />} />
         <Route path="reported" element={<Navigate to={legacyRedirect("/reported")!} replace />} />
         <Route path="settings" element={<AccountSettings />} />
