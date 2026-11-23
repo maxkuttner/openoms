@@ -132,7 +132,7 @@ async fn connections(conn: &mut PgConnection, code: &str) -> Result<BTreeMap<Str
 
 pub async fn load_all(pool: &PgPool) -> Result<Vec<Strategy>, sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    let rows = sqlx::query(&format!("SELECT {STRATEGY_SELECT} FROM strategy ORDER BY code"))
+    let rows = sqlx::query(&format!("SELECT {STRATEGY_SELECT} FROM strategy WHERE mode <> 'REPORTED' ORDER BY code"))
         .fetch_all(&mut *conn)
         .await?;
     let mut out = Vec::with_capacity(rows.len());
@@ -147,7 +147,7 @@ pub async fn load_all(pool: &PgPool) -> Result<Vec<Strategy>, sqlx::Error> {
 /// The strategy that owns `portfolio_id`, if any, locking its row so
 /// concurrent submits on the strategy serialize like a `risk_limits` row does.
 pub async fn by_portfolio(conn: &mut PgConnection, portfolio_id: Uuid) -> Result<Option<Strategy>, sqlx::Error> {
-    let row = sqlx::query(&format!("SELECT {STRATEGY_SELECT} FROM strategy WHERE portfolio_id = $1 FOR UPDATE"))
+    let row = sqlx::query(&format!("SELECT {STRATEGY_SELECT} FROM strategy WHERE portfolio_id = $1 AND mode <> 'REPORTED' FOR UPDATE"))
         .bind(portfolio_id)
         .fetch_optional(&mut *conn)
         .await?;

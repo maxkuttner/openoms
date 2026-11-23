@@ -255,7 +255,7 @@ pub async fn list_strategies(State(state): State<AppState>) -> Result<Json<Vec<S
 /// Strategies with their live status; `portfolios` narrows to those books.
 pub(crate) async fn list_rows(state: &AppState, portfolios: Option<&[Uuid]>) -> Result<Vec<StrategyRow>, AdminError> {
     let mut rows = sqlx::query_as::<_, StrategyRow>(&format!(
-        "SELECT {ROW_SELECT} FROM strategy WHERE $1::uuid[] IS NULL OR portfolio_id = ANY($1) ORDER BY code"
+        "SELECT {ROW_SELECT} FROM strategy WHERE mode <> 'REPORTED' AND ($1::uuid[] IS NULL OR portfolio_id = ANY($1)) ORDER BY code"
     ))
         .bind(portfolios)
         .fetch_all(state.pool())
@@ -361,7 +361,7 @@ pub(crate) async fn require_responsible(pool: &sqlx::PgPool, code: &str) -> Resu
 }
 
 pub(crate) async fn fetch_row(pool: &sqlx::PgPool, code: &str) -> Result<StrategyRow, AdminError> {
-    let mut row = sqlx::query_as::<_, StrategyRow>(&format!("SELECT {ROW_SELECT} FROM strategy WHERE code = $1"))
+    let mut row = sqlx::query_as::<_, StrategyRow>(&format!("SELECT {ROW_SELECT} FROM strategy WHERE code = $1 AND mode <> 'REPORTED'"))
         .bind(code)
         .fetch_optional(pool)
         .await
@@ -537,7 +537,7 @@ pub async fn update_strategy(
             kill_when_unmonitored = COALESCE($15, kill_when_unmonitored), \
             limits_version = limits_version + CASE WHEN $16 THEN 1 ELSE 0 END, \
             updated_at = now() \
-         WHERE code = $1 RETURNING {ROW_SELECT}"
+         WHERE code = $1 AND mode <> 'REPORTED' RETURNING {ROW_SELECT}"
     ))
     .bind(&code)
     .bind(p.name)
@@ -584,6 +584,14 @@ pub async fn update_strategy(
 )]
 pub async fn delete_strategy(State(state): State<AppState>, Path(code): Path<String>) -> Result<StatusCode, AdminError> {
     info!(%code, "admin delete strategy");
+    let mode: Option<String> = sqlx::query_scalar("SELECT mode FROM strategy WHERE code = $1")
+        .bind(&code)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(map_db_error)?;
+    if mode.as_deref() == Some("REPORTED") {
+        return Err(AdminError::new(StatusCode::CONFLICT, "a reported strategy cannot be deleted here"));
+    }
     let done = sqlx::query("DELETE FROM strategy WHERE code = $1")
         .bind(&code)
         .execute(state.pool())

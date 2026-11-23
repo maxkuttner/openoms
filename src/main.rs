@@ -940,6 +940,11 @@ fn build_app(
         .route("/strategies/securities", get(strategies::admin::strategy_securities))
         .route("/strategies", get(strategies::trader_api::list).post(strategies::trader_api::create))
         .route("/strategies/:code/handover", post(strategies::trader_api::handover))
+        .route("/strategies/reported", get(reported::strategy::list_mine).post(reported::strategy::create))
+        .route(
+            "/strategies/reported/:code/token",
+            post(reported::strategy::rotate_token).delete(reported::strategy::revoke_token),
+        )
         .route("/portfolios", get(handlers::list_portfolios))
         .route(
             "/watchlist",
