@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bookRows, movingAverage, sampleMarketData as md } from "./marketData.ts";
+import { bookRows, depthPoints, movingAverage, sampleMarketData as md } from "./marketData.ts";
 
 test("same instrument gives identical candles", () => {
   const a = md.candles("BTCUSDT", "1h", 100);
@@ -50,3 +50,16 @@ test("empty book yields no rows and no NaN", () => {
 });
 
 test("moving average", () => assert.deepEqual(movingAverage([1, 2, 3, 4], 2), [null, 1.5, 2.5, 3.5]));
+
+test("depth points keep every level for low-priced instruments", () => {
+  const book = { bids: Array.from({ length: 40 }, (_, i) => ({ price: 0.5 - i * 0.0005, size: 1 })),
+    asks: Array.from({ length: 40 }, (_, i) => ({ price: 0.5005 + i * 0.0005, size: 1 })) };
+  const { bids, asks } = depthPoints(book);
+  const xs = [...bids, ...asks].map((p) => p.x);
+  assert.equal(xs.length, 80);
+  for (let i = 1; i < xs.length; i++) assert.ok(xs[i] > xs[i - 1]);
+  assert.ok(xs[0] >= 1);
+  assert.equal(bids[0].price, book.bids[39].price);
+  assert.equal(bids[0].total, 40);
+  assert.equal(asks[39].total, 40);
+});

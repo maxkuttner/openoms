@@ -4,7 +4,7 @@ import {
   type IChartApi, type UTCTimestamp,
 } from "lightweight-charts";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { movingAverage, type MarketDataSource, type Timeframe } from "../../marketData";
+import { depthPoints, movingAverage, type DepthPoint, type MarketDataSource, type Timeframe } from "../../marketData";
 import { SampleBadge } from "./SampleBadge";
 import { cssVar, useMarketTick } from "./useMarketTick";
 
@@ -57,24 +57,23 @@ export function PriceChart({ source, instrumentId }: { source: MarketDataSource;
         price.update({ time: time(last.time), open: last.open, high: Math.max(last.high, close), low: Math.min(last.low, close), close });
       };
     } else {
-      // Depth: cumulative size against price; bids left of mid, asks right. The x axis is
-      // the price ladder, so time formatting is replaced by plain numbers.
-      const draw = () => {
-        const b = source.book(instrumentId, 40);
-        let t = 0;
-        const bids = b.bids.map((l) => ({ p: l.price, v: (t += l.size) })).reverse();
-        t = 0;
-        const asks = b.asks.map((l) => ({ p: l.price, v: (t += l.size) }));
-        return { bids, asks };
+      // Depth: cumulative size against price, bids left of mid, asks right. The x axis is a
+      // rank (one step per level) so any tick size stays distinct; labels look the price up.
+      const priceAt = new Map<number, number>();
+      const label = (x: number) => {
+        const p = priceAt.get(x);
+        return p === undefined ? "" : p.toLocaleString(undefined, { maximumSignificantDigits: 6 });
       };
-      c.applyOptions({ localization: { timeFormatter: (x: number) => (x / 100).toFixed(2) }, timeScale: { tickMarkFormatter: (x: number) => (x / 100).toFixed(0) } });
+      c.applyOptions({ localization: { timeFormatter: label }, timeScale: { tickMarkFormatter: label } });
       const bidSeries = c.addSeries(AreaSeries, { lineColor: buy, topColor: buy + "55", bottomColor: buy + "08", lineWidth: 2 });
       const askSeries = c.addSeries(AreaSeries, { lineColor: sell, topColor: sell + "55", bottomColor: sell + "08", lineWidth: 2 });
       const put = () => {
-        const { bids, asks } = draw();
-        const pt = (x: { p: number; v: number }) => ({ time: Math.round(x.p * 100) as UTCTimestamp, value: x.v });
-        bidSeries.setData(dedupe(bids.map(pt)));
-        askSeries.setData(dedupe(asks.map(pt)));
+        const { bids, asks } = depthPoints(source.book(instrumentId, 40));
+        priceAt.clear();
+        for (const p of [...bids, ...asks]) priceAt.set(p.x, p.price);
+        const pt = (p: DepthPoint) => ({ time: p.x as UTCTimestamp, value: p.total });
+        bidSeries.setData(bids.map(pt));
+        askSeries.setData(asks.map(pt));
       };
       put();
       c.timeScale().fitContent();
@@ -104,14 +103,4 @@ export function PriceChart({ source, instrumentId }: { source: MarketDataSource;
       <div ref={box} className="min-h-0 flex-1" aria-label={view === "price" ? "Price chart" : "Depth chart"} role="img" />
     </div>
   );
-}
-
-/** Lightweight Charts needs strictly increasing x values; keep the last point per x. */
-function dedupe<T extends { time: UTCTimestamp }>(pts: T[]): T[] {
-  const out: T[] = [];
-  for (const p of pts) {
-    if (out.length && out[out.length - 1].time >= p.time) out[out.length - 1] = p;
-    else out.push(p);
-  }
-  return out;
 }

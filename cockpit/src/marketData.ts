@@ -120,3 +120,22 @@ export function movingAverage(closes: number[], period: number): (number | null)
     return i >= period - 1 ? sum / period : null;
   });
 }
+
+export type DepthPoint = { x: number; price: number; total: number };
+
+/**
+ * The depth curve as points on a rank axis (1, 2, 3, … from the lowest bid to the highest
+ * ask), so levels of any price or tick size stay distinct; `price` labels each point.
+ * Bid totals accumulate from the best bid outward, ask totals from the best ask outward.
+ */
+export function depthPoints(book: Book): { bids: DepthPoint[]; asks: DepthPoint[] } {
+  let t = 0;
+  const bidsOut = book.bids.map((l) => ({ price: l.price, total: (t += l.size) })).reverse();
+  t = 0;
+  const asksOut = book.asks.map((l) => ({ price: l.price, total: (t += l.size) }));
+  let x = 0;
+  return {
+    bids: bidsOut.map((p) => ({ x: ++x, ...p })),
+    asks: asksOut.map((p) => ({ x: ++x, ...p })),
+  };
+}
