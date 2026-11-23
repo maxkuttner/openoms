@@ -51,7 +51,7 @@ export function BreaksPage() {
           </TableHeader>
           <TableBody>
             {breaks.map((b) => (
-              <BreakRow key={b.id} row={b} account={accountCode(b.account_id)} portfolios={portfolios} />
+              <BreakRow key={b.id} row={b} account={accountCode(b.account_id ?? "")} portfolios={portfolios} />
             ))}
           </TableBody>
         </Table>

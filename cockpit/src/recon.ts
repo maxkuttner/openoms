@@ -71,9 +71,12 @@ export type SweepReport = {
 
 export type ReconBreak = {
   id: string;
-  broker_connection_code: string;
-  account_id: string;
-  venue_order_id: string;
+  source: string;
+  broker_connection_code: string | null;
+  account_id: string | null;
+  venue_order_id: string | null;
+  strategy_code: string | null;
+  reported_fill: unknown;
   kind: string;
   events: unknown;
   status: string;

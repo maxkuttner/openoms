@@ -59,7 +59,7 @@ fn side_any_case<'de, D: Deserializer<'de>>(d: D) -> Result<OrderSide, D::Error>
 
 impl ReportedFill {
     /// Shape checks serde can't express.
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         for (name, v) in [("venue", &self.venue), ("account_ref", &self.account_ref), ("exec_id", &self.exec_id), ("symbol", &self.symbol)] {
             if v.trim().is_empty() {
                 return Err(format!("{name} is empty"));
