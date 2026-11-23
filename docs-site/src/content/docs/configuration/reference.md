@@ -61,9 +61,6 @@ credential can drop the database — so those commands prompt for it or take it 
   admin API, all on one port. The default only accepts connections from the same machine.
   To serve other machines, bind to an address they can reach (`0.0.0.0:3001`), and put
   HTTPS in front (see [Sign-in and users](/configuration/login/#https-beyond-localhost)).
-- **`admin_password`** — removed. An old `oms.toml` that still has it loads, with a warning,
-  and the value is ignored (so is `OMS_ADMIN_PASSWORD`). See
-  [Upgrading from the shared admin password](/configuration/login/#upgrading-from-the-shared-admin-password).
 
 ## `[auth]`
 
