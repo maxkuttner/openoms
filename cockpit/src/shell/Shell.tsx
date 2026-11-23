@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { Activity, BriefcaseBusiness, CandlestickChart, Clock, ListOrdered, Shield } from "lucide-react";
+import { Activity, BriefcaseBusiness, CandlestickChart, ChevronRight, Clock, ListOrdered, Shield } from "lucide-react";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import {
   Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton,
   SidebarMenuItem, SidebarMenuSub, SidebarMenuSubButton, SidebarMenuSubItem, SidebarProvider, SidebarTrigger,
@@ -28,23 +29,32 @@ function isActive(page: Page, pathname: string, group?: NavGroup["id"]): boolean
   return pathname === page.path || pathname.startsWith(page.path + "/");
 }
 
+/** A collapsible sidebar group; starts open for Trade or when it holds the current page. */
 function Group({ group, pathname }: { group: NavGroup; pathname: string }) {
   const Icon = GROUP_ICONS[group.id];
+  const holdsCurrent = group.pages.some((p) => isActive(p, pathname, group.id));
   return (
-    <SidebarMenuItem>
-      <SidebarMenuButton className="font-medium text-sidebar-foreground" tooltip={group.title}>
-        <Icon /> <span>{group.title}</span>
-      </SidebarMenuButton>
-      <SidebarMenuSub>
-        {group.pages.map((p) => (
-          <SidebarMenuSubItem key={p.path}>
-            <SidebarMenuSubButton asChild isActive={isActive(p, pathname, group.id)}>
-              <NavLink to={p.path} end={p.path === "/"}>{p.title}</NavLink>
-            </SidebarMenuSubButton>
-          </SidebarMenuSubItem>
-        ))}
-      </SidebarMenuSub>
-    </SidebarMenuItem>
+    <Collapsible asChild defaultOpen={group.id === "trade" || holdsCurrent} className="group/collapsible">
+      <SidebarMenuItem>
+        <CollapsibleTrigger asChild>
+          <SidebarMenuButton className="font-medium text-sidebar-foreground" tooltip={group.title}>
+            <Icon /> <span>{group.title}</span>
+            <ChevronRight className="ml-auto transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+          </SidebarMenuButton>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <SidebarMenuSub>
+            {group.pages.map((p) => (
+              <SidebarMenuSubItem key={p.path}>
+                <SidebarMenuSubButton asChild isActive={isActive(p, pathname, group.id)}>
+                  <NavLink to={p.path} end={p.path === "/"}>{p.title}</NavLink>
+                </SidebarMenuSubButton>
+              </SidebarMenuSubItem>
+            ))}
+          </SidebarMenuSub>
+        </CollapsibleContent>
+      </SidebarMenuItem>
+    </Collapsible>
   );
 }
 
@@ -88,9 +98,16 @@ export function Shell() {
                   </SidebarMenuItem>
                 );
               })}
-              {nav.groups.slice(1).map((g) => <Group key={g.id} group={g} pathname={pathname} />)}
             </SidebarMenu>
           </SidebarGroup>
+          {nav.groups.length > 1 && (
+            // Admin sits at the bottom of the sidebar, just above the account menu.
+            <SidebarGroup className="mt-auto">
+              <SidebarMenu>
+                {nav.groups.slice(1).map((g) => <Group key={g.id} group={g} pathname={pathname} />)}
+              </SidebarMenu>
+            </SidebarGroup>
+          )}
         </SidebarContent>
         <SidebarFooter className="border-t">
           <UserMenu onSignOut={signOut} />
