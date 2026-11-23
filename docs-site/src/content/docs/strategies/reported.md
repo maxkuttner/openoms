@@ -16,9 +16,10 @@ The cockpit labels these strategies **self-managed / unverified**.
   report is what gets booked.
 - **No kill switch.** The OMS has no connection to your venue account, so it cannot stop
   the strategy. Stopping it is your job.
-- **"Reports stopped" is the only liveness signal.** If no batch arrives for a while,
-  the cockpit shows a stale warning. That is all the OMS knows about whether the
-  strategy is running.
+- **Reports stopping is the only liveness signal.** If no batch arrives for longer than
+  the strategy's stale threshold (configurable per strategy), the cockpit shows a stale
+  warning. A strategy that has never reported shows as stale too. That is all the OMS
+  knows about whether the strategy is running.
 
 If you need the OMS to watch the venue account and be able to stop the strategy, use a
 strategy that trades [through the OMS](/strategies/fix/) instead.
@@ -27,10 +28,12 @@ strategy that trades [through the OMS](/strategies/fix/) instead.
 
 1. In the cockpit, open **Strategies** and create a reported strategy. A portfolio and a
    private group are created with it. You own it; admins can see and act on it too.
-2. Mint its reporting token. **The token is shown once.** Copy it then.
+   Rotating and revoking require the owner or an admin, with MFA.
+2. Creating it issues the reporting token. **The token is shown once.** Copy it then.
 3. **Rotate** mints a new token; the old one keeps working for 24 hours so you can
-   redeploy without dropping reports. **Revoke** stops a token at once (requests get
-   `401`).
+   redeploy without dropping reports. Only one old token is kept in its grace period:
+   rotating again revokes it at once. **Revoke** stops all the strategy's tokens at once
+   (requests get `401`).
 
 ## Reporting fills
 
@@ -99,14 +102,21 @@ Other fields are ignored. Fills always book into the strategy's own portfolio.
 
 A bad fill never rejects the batch: the rest still books.
 
-Errors: `400` bad body or schema version, `401` missing/invalid/revoked token, `403` token
-belongs to another strategy, `404` unknown strategy, `413` more than 500 fills, `429`
-rate limit.
+Errors:
+
+- `400`: the body is not valid JSON, or `schema_version` is not `1`.
+- `415`: `Content-Type` is missing or not `application/json`.
+- `422`: a top-level field is missing or has the wrong type (for example no `batch_id`,
+  or `fills` is not an array).
+- `401`: missing, invalid, expired or revoked token (or the strategy is inactive).
+- `403`: the token belongs to another strategy.
+- `413`: more than 500 fills.
+- `429`: rate limit.
 
 ### Limits
 
 - 500 fills per batch.
-- 20 batches per second per strategy.
+- 20 batches per second per strategy sustained, with bursts up to 40.
 
 ### Config
 
@@ -117,12 +127,15 @@ a startup check.
 ## Breaks and adoption
 
 Breaks from reported fills appear on the cockpit's breaks page with source `REPORTED`.
-For each one you can:
+What you can do depends on the kind:
 
-- **Adopt** it: pick the instrument (and, if needed, a different portfolio). The stored
-  fill is booked exactly once. Add the venue symbol mapping as well and later fills for
-  that symbol book normally.
-- **Dismiss** it: the fill is dropped.
+- `UNKNOWN_INSTRUMENT` can be **adopted**: pick the instrument (and, if needed, a
+  different portfolio). The stored fill is booked exactly once. Choose to map the venue
+  symbol to that instrument as well, and later fills for that symbol book normally.
+- `INVALID_FILL` and `CONFLICTING_DUPLICATE` are **dismiss-only**: adopting them is
+  refused, since the OMS cannot invent missing fields or overrule a booked fill. Dismiss
+  the break and, if the fill was real, resend a corrected fill with a new `exec_id`.
+- **Dismissing** any break drops the fill.
 
 ## Example
 
@@ -143,7 +156,8 @@ curl -sS -X POST https://oms.example/api/v1/strategies/my-strat/fills \
 ```
 
 Send the same command again and you get the same response back (same `batch_id`).
-Change the `batch_id` and the fill comes back as `duplicate`.
+Change the `batch_id` (and set `sequence` to `2`) and the fill comes back as
+`duplicate`. Keep `sequence: 1` and the response also flags `sequence_gap: true`.
 
 ## SDK
 
