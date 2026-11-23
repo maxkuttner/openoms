@@ -27,7 +27,7 @@ serde_json = "1"
 # admin update endpoint tell "field omitted" (keep the existing value) apart
 # from "field explicitly set to null" (clear it) — see UpdateAccount::portfolio_id.
 serde_with = "3"
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }

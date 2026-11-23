@@ -220,7 +220,9 @@ fn fill_time_sql(order: &str, exec: &str) -> String {
 /// in [`CANONICAL_ORDER`]. Transfers sit at their own time and touch both sides.
 /// Reported fills (and their Quote/Base fees) join through their strategy's
 /// portfolio at their trade time; like transfers they carry no global_position,
-/// which sorts NULLS LAST and only breaks ties the earlier keys leave.
+/// which sorts NULLS LAST and only breaks ties the earlier keys leave. A reported
+/// row's execution id is `venue|account_ref|exec_id` (what ingest passes to
+/// [`persist_fill`]), so one exec id reused on two venues still sorts one way.
 fn replay_sql() -> String {
     let fee_fill_time = fill_time_sql("e.order_id", "e.payload_json->'payload'->>'execution_id'");
     format!(
@@ -247,13 +249,13 @@ fn replay_sql() -> String {
            WHERE ($1::uuid IS NULL OR a.to_portfolio_id = $1) AND ($2::text IS NULL OR a.instrument_id = $2) \
            UNION ALL \
            SELECT s.portfolio_id, rf.instrument_id::text, lower(rf.side), 'reported_fill', NULL, \
-                  rf.qty::float8, rf.price::float8, rf.trade_time, rf.exec_id, false, NULL \
+                  rf.qty::float8, rf.price::float8, rf.trade_time, rf.venue || '|' || rf.account_ref || '|' || rf.exec_id, false, NULL \
            FROM reported_fill rf JOIN strategy s ON s.code = rf.strategy_code \
            WHERE ($1::uuid IS NULL OR s.portfolio_id = $1) AND ($2::text IS NULL OR rf.instrument_id::text = $2) \
            UNION ALL \
            SELECT s.portfolio_id, rf.instrument_id::text, lower(rf.side), 'reported_fee', \
                   jsonb_build_object('effect', rf.fee_effect), \
-                  rf.fee::float8, NULL, rf.trade_time, rf.exec_id, true, NULL \
+                  rf.fee::float8, NULL, rf.trade_time, rf.venue || '|' || rf.account_ref || '|' || rf.exec_id, true, NULL \
            FROM reported_fill rf JOIN strategy s ON s.code = rf.strategy_code \
            WHERE rf.fee IS NOT NULL AND rf.fee_effect IN ('Quote', 'Base') \
              AND ($1::uuid IS NULL OR s.portfolio_id = $1) AND ($2::text IS NULL OR rf.instrument_id::text = $2) \
@@ -1457,7 +1459,7 @@ mod tests {
             for (exec, side, os, price, at) in [("r2", "BUY", OrderSide::Buy, 100.0, t(2)), ("r3", "SELL", OrderSide::Sell, 110.0, t(3)), ("r1", "BUY", OrderSide::Buy, 90.0, t(1))] {
                 let mut tx = pool.begin().await.unwrap();
                 report(&mut tx, &r, &b.instrument, exec, side, 1.0, price, at, None).await;
-                persist_fill(&mut tx, r.portfolio, &b.instrument, os, 1.0, price, at, exec).await.unwrap();
+                persist_fill(&mut tx, r.portfolio, &b.instrument, os, 1.0, price, at, &format!("TEST|acct|{exec}")).await.unwrap();
                 tx.commit().await.unwrap();
             }
             let incremental = pos(&pool, r.portfolio, &b.instrument).await;
@@ -1479,10 +1481,10 @@ mod tests {
             let r = reported(&pool).await;
             let mut tx = pool.begin().await.unwrap();
             report(&mut tx, &r, &b.instrument, "r1", "BUY", 1.0, 100.0, t(1), Some((0.5, "Quote"))).await;
-            persist_fill(&mut tx, r.portfolio, &b.instrument, OrderSide::Buy, 1.0, 100.0, t(1), "r1").await.unwrap();
-            persist_reported_fee(&mut tx, r.portfolio, &b.instrument, "r1", t(1), 0.5, FeeEffect::Quote).await.unwrap();
+            persist_fill(&mut tx, r.portfolio, &b.instrument, OrderSide::Buy, 1.0, 100.0, t(1), "TEST|acct|r1").await.unwrap();
+            persist_reported_fee(&mut tx, r.portfolio, &b.instrument, "TEST|acct|r1", t(1), 0.5, FeeEffect::Quote).await.unwrap();
             report(&mut tx, &r, &b.instrument, "r2", "SELL", 1.0, 110.0, t(2), Some((0.001, "Other"))).await;
-            persist_fill(&mut tx, r.portfolio, &b.instrument, OrderSide::Sell, 1.0, 110.0, t(2), "r2").await.unwrap();
+            persist_fill(&mut tx, r.portfolio, &b.instrument, OrderSide::Sell, 1.0, 110.0, t(2), "TEST|acct|r2").await.unwrap();
             tx.commit().await.unwrap();
             let incremental = pos(&pool, r.portfolio, &b.instrument).await;
             let res = rebuild_positions_scoped(&pool, Some(r.portfolio)).await;

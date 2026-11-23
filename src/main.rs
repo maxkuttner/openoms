@@ -1136,7 +1136,9 @@ fn build_app(
         .route("/health", get(handlers::health))
         .merge(orders_router)
         .merge(admin_router)
-        .merge(cockpit::router());
+        .merge(cockpit::router())
+        // Reported strategies: bearer reporting token only, outside session auth.
+        .merge(reported::api::router(state.pool().clone()));
 
     // 3) Register the unauthenticated OIDC routes — merged only when
     // `auth_api_state` resolved above, i.e. only when `[auth.oidc]` is
