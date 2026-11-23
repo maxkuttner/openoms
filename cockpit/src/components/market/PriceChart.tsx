@@ -85,7 +85,7 @@ export function PriceChart({ source, instrumentId }: { source: MarketDataSource;
   useEffect(() => { live.current?.(tick); }, [tick]);
 
   return (
-    <div className="flex h-full min-h-[420px] flex-col rounded-md border bg-card">
+    <div className="flex h-full flex-col rounded-md border bg-card">
       <div className="flex flex-wrap items-center gap-2 border-b px-2.5 py-2">
         {view === "price" && (
           <Tabs value={tf} onValueChange={(v) => setTf(v as Timeframe)}>

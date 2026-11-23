@@ -77,8 +77,8 @@ export function TradePage({ me }: { me: Me }) {
           onPick={(i) => { setPendingLegs(null); setSelectedInstrument(i); }}
           onOpenSearch={() => setSearchOpen(true)}
         />
-        <div className="flex flex-col gap-3 lg:flex-row">
-          <div className="min-h-[520px] min-w-0 flex-1">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
+          <div className="h-[420px] min-w-0 flex-1 xl:h-[460px]">
             {selectedInstrument ? (
               // Sample prices only: nothing here feeds the ticket below.
               <PriceChart source={sampleMarketData} instrumentId={selectedInstrument.symbol} />
