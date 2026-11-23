@@ -140,9 +140,6 @@ export function TradePage({ me }: { me: Me }) {
   );
 }
 
-/** Book (300px) + gap + the tallest ticket: the top panel never shrinks below this. */
-const TOP_MIN_PX = 780;
-
 /** True at Tailwind's `lg` width and up, where the trade screen splits into resizable panels. */
 function useWide(): boolean {
   const q = "(min-width: 1024px)";
@@ -157,13 +154,14 @@ function useWide(): boolean {
 }
 
 /**
- * Chart | (order book / ticket) over the orders and positions tabs. On wide screens the
- * chart/side and top/bottom splits have drag handles and the sizes are remembered per browser; narrow screens stack.
+ * Left: chart over the orders and positions tabs; right: order book over the ticket, full
+ * height. On wide screens the chart/tabs split (left column only) and the left/right split
+ * have drag handles, remembered per browser; narrow screens stack.
  */
 function TradeLayout({ chart, book, ticket, bottom }: { chart: ReactNode; book: ReactNode; ticket: ReactNode; bottom: ReactNode }) {
   const wide = useWide();
-  const outer = useDefaultLayout({ id: "trade-outer", panelIds: ["top", "bottom"] });
-  const row = useDefaultLayout({ id: "trade-row", panelIds: ["chart", "side"] });
+  const row = useDefaultLayout({ id: "trade-row", panelIds: ["left", "side"] });
+  const left = useDefaultLayout({ id: "trade-left", panelIds: ["chart", "bottom"] });
   if (!wide) {
     return (
       <>
@@ -175,25 +173,23 @@ function TradeLayout({ chart, book, ticket, bottom }: { chart: ReactNode; book: 
     );
   }
   return (
-    <ResizablePanelGroup orientation="vertical" className="h-[calc(100svh-11rem)] min-h-[960px]"
-      defaultLayout={outer.defaultLayout} onLayoutChanged={outer.onLayoutChanged}>
-      <ResizablePanel id="top" defaultSize="70" minSize={TOP_MIN_PX}>
-        <ResizablePanelGroup orientation="horizontal" defaultLayout={row.defaultLayout} onLayoutChanged={row.onLayoutChanged}>
-          <ResizablePanel id="chart" defaultSize="70" minSize="30" className="pr-1.5">{chart}</ResizablePanel>
+    // Tall enough for a readable book plus the whole ticket, so the right column never scrolls.
+    <ResizablePanelGroup orientation="horizontal" className="h-[calc(100svh-11rem)] min-h-[780px]"
+      defaultLayout={row.defaultLayout} onLayoutChanged={row.onLayoutChanged}>
+      <ResizablePanel id="left" defaultSize="70" minSize="30" className="pr-1.5">
+        <ResizablePanelGroup orientation="vertical" defaultLayout={left.defaultLayout} onLayoutChanged={left.onLayoutChanged}>
+          <ResizablePanel id="chart" defaultSize="62" minSize={280} className="pb-1.5">{chart}</ResizablePanel>
           <ResizableHandle withHandle />
-          <ResizablePanel id="side" defaultSize="30" minSize={300} className="pl-1.5">
-            {/* Book takes what the ticket leaves; the ticket keeps its natural height. */}
-            {/* The top panel's minimum height fits a readable book plus the whole ticket,
-                so this column never needs its own scrollbar. */}
-            <div className="flex h-full flex-col gap-3">
-              <div className="min-h-[300px] flex-1 overflow-hidden">{book}</div>
-              <div className="shrink-0">{ticket}</div>
-            </div>
-          </ResizablePanel>
+          <ResizablePanel id="bottom" defaultSize="38" minSize={140} className="overflow-auto pt-3">{bottom}</ResizablePanel>
         </ResizablePanelGroup>
       </ResizablePanel>
       <ResizableHandle withHandle />
-      <ResizablePanel id="bottom" defaultSize="32" minSize="12" className="overflow-auto pt-3">{bottom}</ResizablePanel>
+      <ResizablePanel id="side" defaultSize="30" minSize={300} className="pl-1.5">
+        <div className="flex h-full flex-col gap-3">
+          <div className="min-h-[300px] flex-1 overflow-hidden">{book}</div>
+          <div className="shrink-0">{ticket}</div>
+        </div>
+      </ResizablePanel>
     </ResizablePanelGroup>
   );
 }
