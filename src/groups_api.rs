@@ -59,6 +59,8 @@ pub struct Group {
     pub description: Option<String>,
     pub members: Vec<Uuid>,
     pub portfolios: Vec<GroupPortfolio>,
+    /// Set when a reported strategy owns the group.
+    pub strategy_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -111,6 +113,22 @@ async fn lock_group(tx: &mut Transaction<'_, Postgres>, group: Uuid) -> Result<(
     found.map(|_| ()).ok_or_else(|| api_error(StatusCode::NOT_FOUND, "group not found"))
 }
 
+/// For a strategy-owned group: the strategy's owner and portfolio. `None`
+/// for an ordinary group.
+async fn strategy_of(tx: &mut Transaction<'_, Postgres>, group: Uuid) -> Result<Option<(Uuid, Uuid)>, ApiError> {
+    sqlx::query_as(
+        "SELECT s.owner_principal_id, s.portfolio_id FROM user_group g JOIN strategy s ON s.code = g.strategy_code WHERE g.id = $1",
+    )
+    .bind(group)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db)
+}
+
+fn owner_stays() -> ApiError {
+    api_error(StatusCode::UNPROCESSABLE_ENTITY, "owner must stay in strategy group")
+}
+
 fn announce(state: &AppState, who: impl IntoIterator<Item = Uuid>) {
     for id in who {
         state.event_bus().publish_auth_changed(id);
@@ -120,7 +138,7 @@ fn announce(state: &AppState, who: impl IntoIterator<Item = Uuid>) {
 /// `GET /admin/groups`, by name.
 pub async fn list_groups(State(state): State<AppState>) -> Result<Json<Vec<Group>>, ApiError> {
     let pool = state.pool();
-    let groups = sqlx::query("SELECT id, name, description FROM user_group ORDER BY lower(name), name")
+    let groups = sqlx::query("SELECT id, name, description, strategy_code FROM user_group ORDER BY lower(name), name")
         .fetch_all(pool)
         .await
         .map_err(db)?;
@@ -141,6 +159,7 @@ pub async fn list_groups(State(state): State<AppState>) -> Result<Json<Vec<Group
                     id,
                     name: g.get("name"),
                     description: g.get("description"),
+                    strategy_code: g.get("strategy_code"),
                     members: members.iter().filter(|m| m.get::<Uuid, _>("group_id") == id).map(|m| m.get("principal_id")).collect(),
                     portfolios: access
                         .iter()
@@ -216,6 +235,9 @@ pub async fn delete_group(
 ) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool().begin().await.map_err(db)?;
     lock_group(&mut tx, id).await?;
+    if strategy_of(&mut tx, id).await?.is_some() {
+        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "a strategy group cannot be deleted"));
+    }
     let affected = members_of(&mut tx, id).await?;
     sqlx::query("DELETE FROM user_group WHERE id = $1").bind(id).execute(&mut *tx).await.map_err(db)?;
     audit(&mut tx, &ctx, "group.deleted", id, serde_json::json!({ "members": affected })).await?;
@@ -243,6 +265,11 @@ pub async fn set_members(
     unique.dedup();
     if humans != unique.len() as i64 {
         return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "members must be people"));
+    }
+    if let Some((owner, _)) = strategy_of(&mut tx, id).await? {
+        if !unique.contains(&owner) {
+            return Err(owner_stays());
+        }
     }
     let before = members_of(&mut tx, id).await?;
     sqlx::query("DELETE FROM user_group_member WHERE group_id = $1").bind(id).execute(&mut *tx).await.map_err(db)?;
@@ -273,6 +300,11 @@ pub async fn set_portfolios(
     }
     let mut tx = state.pool().begin().await.map_err(db)?;
     lock_group(&mut tx, id).await?;
+    if let Some((_, portfolio)) = strategy_of(&mut tx, id).await? {
+        if !access.iter().any(|a| a.portfolio_id == portfolio) {
+            return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "a strategy group must keep its strategy portfolio"));
+        }
+    }
     sqlx::query("DELETE FROM user_group_portfolio WHERE group_id = $1").bind(id).execute(&mut *tx).await.map_err(db)?;
     for a in &access {
         sqlx::query("INSERT INTO user_group_portfolio (group_id, portfolio_id, access) VALUES ($1, $2, $3)")
@@ -297,10 +329,21 @@ pub async fn set_portfolios(
 /// Put `principal` in exactly `groups` (used by approve and the Users page).
 /// Returns nothing to announce: the caller publishes for `principal`.
 pub async fn set_user_groups(tx: &mut Transaction<'_, Postgres>, principal: Uuid, groups: &[Uuid]) -> Result<(), ApiError> {
-    sqlx::query("DELETE FROM user_group_member WHERE principal_id = $1").bind(principal).execute(&mut **tx).await.map_err(db)?;
     let mut unique = groups.to_vec();
     unique.sort();
     unique.dedup();
+    // A person keeps the strategy groups of the strategies they own.
+    let owned: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT g.id FROM user_group g JOIN strategy s ON s.code = g.strategy_code WHERE s.owner_principal_id = $1",
+    )
+    .bind(principal)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db)?;
+    if owned.iter().any(|g| !unique.contains(g)) {
+        return Err(owner_stays());
+    }
+    sqlx::query("DELETE FROM user_group_member WHERE principal_id = $1").bind(principal).execute(&mut **tx).await.map_err(db)?;
     for g in &unique {
         sqlx::query("INSERT INTO user_group_member (group_id, principal_id) VALUES ($1, $2)")
             .bind(g)
@@ -591,5 +634,98 @@ mod tests {
         let list = crate::handlers::list_portfolios(State(st), Extension(ctx)).await.unwrap().0;
         assert_eq!(list.len(), 1, "one row per portfolio");
         assert!(list[0].can_trade);
+    }
+
+    /// A strategy-owned group, as `reported::strategy::create` makes it:
+    /// (group, owner, portfolio).
+    async fn strategy_group(st: &AppState) -> (Uuid, Uuid, Uuid) {
+        let pool = st.pool();
+        let (owner, pf) = (person(pool).await, portfolio(pool).await);
+        let code = format!("S{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO strategy (code, name, portfolio_id, owner_principal_id, mode) VALUES ($1, 's', $2, $3, 'REPORTED')")
+            .bind(&code).bind(pf).bind(owner).execute(pool).await.unwrap();
+        let g = Uuid::new_v4();
+        sqlx::query("INSERT INTO user_group (id, name, strategy_code) VALUES ($1, $2, $3)").bind(g).bind(format!("strategy {code}")).bind(&code).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO user_group_member (group_id, principal_id) VALUES ($1, $2)").bind(g).bind(owner).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO user_group_portfolio (group_id, portfolio_id, access) VALUES ($1, $2, 'manage')").bind(g).bind(pf).execute(pool).await.unwrap();
+        (g, owner, pf)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn admin_adds_person_to_strategy_group_grants_access() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (g, owner, pf) = strategy_group(&st).await;
+        let other = person(&pool).await;
+        assert!(!allowed(&pool, other, Permission::PositionsView, pf).await.unwrap());
+        set_members(State(st.clone()), Extension(admin()), Path(g), Json(vec![owner, other])).await.unwrap();
+        assert!(allowed(&pool, other, Permission::PositionsView, pf).await.unwrap());
+        let listed = list_groups(State(st.clone())).await.unwrap().0;
+        let row = listed.iter().find(|x| x.id == g).unwrap();
+        assert!(row.strategy_code.is_some(), "the list says which strategy owns the group");
+        set_members(State(st.clone()), Extension(admin()), Path(g), Json(vec![owner])).await.unwrap();
+        assert!(!allowed(&pool, other, Permission::PositionsView, pf).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn owner_cannot_be_removed_from_strategy_group() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (g, owner, _) = strategy_group(&st).await;
+        let other = person(&pool).await;
+        for members in [vec![], vec![other]] {
+            let err = set_members(State(st.clone()), Extension(admin()), Path(g), Json(members)).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(err.message, "owner must stay in strategy group");
+        }
+        assert_eq!(members_of(&mut pool.begin().await.unwrap(), g).await.unwrap(), vec![owner]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn strategy_group_cannot_be_deleted() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (g, _, pf) = strategy_group(&st).await;
+        let err = delete_group(State(st.clone()), Extension(admin()), Path(g)).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let err = set_portfolios(State(st.clone()), Extension(admin()), Path(g), Json(vec![])).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let other = portfolio(&pool).await;
+        let swapped = vec![GroupPortfolio { portfolio_id: other, code: String::new(), access: Access::View }];
+        assert_eq!(set_portfolios(State(st.clone()), Extension(admin()), Path(g), Json(swapped)).await.unwrap_err().status, StatusCode::UNPROCESSABLE_ENTITY);
+        // Keeping the strategy portfolio (and adding another) is fine.
+        let both = vec![
+            GroupPortfolio { portfolio_id: pf, code: String::new(), access: Access::Manage },
+            GroupPortfolio { portfolio_id: other, code: String::new(), access: Access::View },
+        ];
+        set_portfolios(State(st.clone()), Extension(admin()), Path(g), Json(both)).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM user_group WHERE id = $1").bind(g).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn set_user_groups_keeps_owner_in_strategy_group() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (g, owner, _) = strategy_group(&st).await;
+        let plain = group(&st, "plain", &[], &[]).await;
+        let mut tx = pool.begin().await.unwrap();
+        let err = set_user_groups(&mut tx, owner, &[plain]).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.message, "owner must stay in strategy group");
+        tx.rollback().await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        set_user_groups(&mut tx, owner, &[plain, g]).await.unwrap();
+        tx.commit().await.unwrap();
+        // A non-owner may be dropped from a strategy group.
+        let other = person(&pool).await;
+        let mut tx = pool.begin().await.unwrap();
+        set_user_groups(&mut tx, other, &[g]).await.unwrap();
+        set_user_groups(&mut tx, other, &[]).await.unwrap();
+        tx.commit().await.unwrap();
     }
 }

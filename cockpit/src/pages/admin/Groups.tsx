@@ -16,6 +16,7 @@ type GroupRow = {
   id: string;
   name: string;
   description: string | null;
+  strategy_code: string | null;
   members: string[];
   portfolios: { portfolio_id: string; code: string; access: Access }[];
 };
