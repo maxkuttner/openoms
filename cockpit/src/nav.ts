@@ -8,6 +8,7 @@ export type AdminTab = { id: "people" | "setup" | "connectivity" | "monitoring";
 export const SIDEBAR: Page[] = [
   { id: "trade", title: "Trade", path: "/" },
   { id: "positions", title: "Positions", path: "/positions" },
+  { id: "reported", title: "Reported strategies", path: "/reported" },
 ];
 
 export const ACCOUNT_PAGES: Page[] = [

@@ -9,6 +9,7 @@ import { ACCESS_OPTIONS, accessLabel, accessTableBody, groupSummary, type Access
 import { ConfirmButton } from "../../components/ConfirmButton";
 import { MultiSelect, Select, TextField } from "../../components/form";
 import { Modal } from "../../components/overlay";
+import { Pill } from "../../components/status";
 
 const PATH = "/admin/groups";
 
@@ -79,6 +80,9 @@ function GroupModal({ group, onClose }: { group: GroupRow | null; onClose: () =>
       <form onSubmit={(e) => { e.preventDefault(); save.mutate(undefined); }} className="flex flex-col gap-3">
         <TextField label="Name" required value={name} onChange={setName} />
         <TextField label="Description" value={description} onChange={setDescription} />
+        {group?.strategy_code && (
+          <p className="text-xs text-muted-foreground">Belongs to reported strategy {group.strategy_code}: its owner stays a member and the group cannot be deleted.</p>
+        )}
         <MultiSelect label="Members" value={members} onChange={setMembers}
           data={(users.data ?? []).filter((u) => u.status !== "DISABLED").map((u) => ({ value: u.principal_id, label: label(u) }))} />
         <AccessTable value={access} onChange={setAccess} />
@@ -114,13 +118,13 @@ export function GroupsPage() {
           <TableBody>
             {(list.data ?? []).map((g) => (
               <TableRow key={g.id}>
-                <TableCell>{g.name}{g.description && <div className="text-xs text-muted-foreground">{g.description}</div>}</TableCell>
+                <TableCell>{g.name}{g.strategy_code && <Pill tone="info" className="ml-1.5">strategy {g.strategy_code}</Pill>}{g.description && <div className="text-xs text-muted-foreground">{g.description}</div>}</TableCell>
                 <TableCell>{g.portfolios.length ? g.portfolios.map((p) => `${p.code}: ${accessLabel(p.access)}`).join(", ") : <span className="text-muted-foreground">—</span>}</TableCell>
                 <TableCell>{groupSummary(g)}</TableCell>
                 <TableCell>
                   <div className="flex justify-end gap-1.5">
                     <Button size="xs" variant="secondary" onClick={() => setEditing(g)}>Edit</Button>
-                    <ConfirmButton size="xs" variant="destructive" title={`Delete ${g.name}?`} description="Its members lose the access it gives."
+                    <ConfirmButton size="xs" variant="destructive" disabled={!!g.strategy_code} title={`Delete ${g.name}?`} description="Its members lose the access it gives."
                       confirmLabel="Delete" onConfirm={() => remove.mutate(g.id)}>Delete</ConfirmButton>
                   </div>
                 </TableCell>

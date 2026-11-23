@@ -8,6 +8,7 @@ import { AdminPanel } from "./shell/AdminPanel";
 import { useSession } from "./shell/session";
 import { TradePage } from "./pages/trading/Trade";
 import { PositionsPage } from "./pages/trading/Positions";
+import { ReportedStrategiesPage } from "./pages/trading/ReportedStrategies";
 import { AccessPage } from "./pages/trading/Access";
 import { UsersPage } from "./pages/admin/Users";
 import { GroupsPage } from "./pages/admin/Groups";
@@ -42,6 +43,7 @@ export function App() {
       <Route element={<AuthGate><Shell /></AuthGate>}>
         <Route index element={<Trade />} />
         <Route path="positions" element={<Positions />} />
+        <Route path="reported" element={<ReportedStrategiesPage />} />
         <Route path="settings" element={<AccountSettings />} />
         <Route path="admin" element={<AdminPanel />}>
           <Route index element={<Navigate to="users" replace />} />

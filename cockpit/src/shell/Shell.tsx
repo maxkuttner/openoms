@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { CandlestickChart, Wallet } from "lucide-react";
+import { CandlestickChart, FileInput, Wallet } from "lucide-react";
 import { authApi } from "../login/api";
 import { goToLogin } from "../api/client";
 import { Logo } from "../components/Logo";
@@ -12,7 +12,7 @@ import { ConnectionDot } from "./ConnectionDot";
 import { UserMenu } from "./UserMenu";
 import { useSession } from "./session";
 
-const ICONS: Record<string, typeof Wallet> = { trade: CandlestickChart, positions: Wallet };
+const ICONS: Record<string, typeof Wallet> = { trade: CandlestickChart, positions: Wallet, reported: FileInput };
 
 /** Sidebar (same for every user) + top bar + page. */
 export function Shell() {

@@ -2,7 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ADMIN_TABS, SIDEBAR, ACCOUNT_PAGES, adminRouteAllowed, adminTabFor, commandItems, pageFor } from "./nav.ts";
 
-test("sidebar is Trade and Positions", () => assert.deepEqual(SIDEBAR.map((p) => p.title), ["Trade", "Positions"]));
+test("sidebar is Trade, Positions and Reported strategies", () =>
+  assert.deepEqual(SIDEBAR.map((p) => p.title), ["Trade", "Positions", "Reported strategies"]));
+test("reported strategies page is reachable by everyone", () => {
+  assert.equal(pageFor("/reported")?.title, "Reported strategies");
+  assert.ok(commandItems(false).some((p) => p.path === "/reported"));
+});
 test("account pages are settings only; /access is the refused-sign-in landing, not a page to visit", () => {
   assert.deepEqual(ACCOUNT_PAGES.map((p) => p.path), ["/settings"]);
   assert.ok(commandItems(true).every((p) => p.path !== "/access"));
