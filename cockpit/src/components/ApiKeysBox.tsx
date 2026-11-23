@@ -8,7 +8,7 @@ import { CopyText, FormRow, Notice, Section, Spinner } from "./common";
 /** One API key as the box shows it; `secret` only right after creation. */
 export type ApiKey = { key_id: string; name: string | null; created_at: string; secret?: string | null };
 
-/** Where the box reads and writes keys: your own (Settings) or one user's (Admin Panel). */
+/** Where the box reads and writes keys: your own (Trade → API) or one user's (Admin Panel). */
 export type ApiKeysSource = {
   list: () => Promise<ApiKey[]>;
   create: (name: string) => Promise<ApiKey>;
@@ -18,7 +18,7 @@ export type ApiKeysSource = {
 
 /**
  * "API keys": list, create and revoke the keys that act as one user, with that
- * user's group access. Used by Settings (your own keys) and the Admin Panel's
+ * user's group access. Used by Trade → API (your own keys) and the Admin Panel's
  * API page (any user's keys).
  */
 export function ApiKeysBox({ source, intro, idPrefix = "key" }: { source: ApiKeysSource; intro: ReactNode; idPrefix?: string }) {

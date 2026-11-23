@@ -26,7 +26,7 @@ strategy that trades [through the OMS](/strategies/fix/) instead.
 
 ## Create one
 
-1. In the cockpit, open **Strategies** and create a reported strategy. A portfolio and a
+1. In the cockpit, open **Trade → Strategies** and create a reported strategy. A portfolio and a
    private group are created with it. You own it; admins can see and act on it too.
    Rotating and revoking require the owner or an admin, with MFA.
 2. Creating it issues the reporting token. **The token is shown once.** Copy it then.

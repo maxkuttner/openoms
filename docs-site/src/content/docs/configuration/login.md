@@ -57,7 +57,7 @@ user can change it under **Account**. The API is `POST /admin/users` with
 
 From the list you can also change a user's **groups** (effective on the next request), grant or remove **admin**, **disable** a user (sessions end at once and API
 keys stop), and create or revoke their **API keys**. Users manage their own keys under
-**Account → API keys** (`GET`/`POST /auth/keys`, `DELETE /auth/keys/{key_id}`); a key acts as
+**Trade → API** (`GET`/`POST /auth/keys`, `DELETE /auth/keys/{key_id}`); a key acts as
 its user, with that user's group access, and the secret is shown once. Revoking access ends the user's open
 live-update connections immediately; changes the running server is not told about (a host-CLI
 `oms auth recover-admin`, a session reaching its absolute lifetime) close them within 15
