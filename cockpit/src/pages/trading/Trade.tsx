@@ -154,14 +154,13 @@ function useWide(): boolean {
 }
 
 /**
- * Chart | (order book / ticket) over the orders and positions tabs. On wide screens every
- * split has a drag handle and the sizes are remembered per browser; narrow screens stack.
+ * Chart | (order book / ticket) over the orders and positions tabs. On wide screens the
+ * chart/side and top/bottom splits have drag handles and the sizes are remembered per browser; narrow screens stack.
  */
 function TradeLayout({ chart, book, ticket, bottom }: { chart: ReactNode; book: ReactNode; ticket: ReactNode; bottom: ReactNode }) {
   const wide = useWide();
   const outer = useDefaultLayout({ id: "trade-outer", panelIds: ["top", "bottom"] });
   const row = useDefaultLayout({ id: "trade-row", panelIds: ["chart", "side"] });
-  const side = useDefaultLayout({ id: "trade-side", panelIds: ["book", "ticket"] });
   if (!wide) {
     return (
       <>
@@ -180,11 +179,11 @@ function TradeLayout({ chart, book, ticket, bottom }: { chart: ReactNode; book: 
           <ResizablePanel id="chart" defaultSize="70" minSize="30" className="pr-1.5">{chart}</ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel id="side" defaultSize="30" minSize={300} className="pl-1.5">
-            <ResizablePanelGroup orientation="vertical" defaultLayout={side.defaultLayout} onLayoutChanged={side.onLayoutChanged}>
-              <ResizablePanel id="book" defaultSize="45" minSize="15" className="overflow-auto pb-1.5">{book}</ResizablePanel>
-              <ResizableHandle withHandle />
-              <ResizablePanel id="ticket" defaultSize="55" minSize="20" className="overflow-auto pt-1.5">{ticket}</ResizablePanel>
-            </ResizablePanelGroup>
+            {/* Book takes what the ticket leaves; the ticket keeps its natural height. */}
+            <div className="flex h-full flex-col gap-3">
+              <div className="min-h-0 flex-1 overflow-auto">{book}</div>
+              <div className="shrink-0">{ticket}</div>
+            </div>
           </ResizablePanel>
         </ResizablePanelGroup>
       </ResizablePanel>
