@@ -5,6 +5,49 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.15.0 (2026-11-23)
+
+### Feat
+
+- **cockpit**: order book shows 7 levels per side
+- **reported**: archiving closes the strategy portfolio
+- **cockpit**: collapsible Trade and Admin groups, Admin at sidebar bottom
+- **cockpit**: chart and tabs share the left column on trade entry
+- **cockpit**: resizable trade entry panels
+- **cockpit**: search-and-select portfolio picker on orders and portfolios
+- **cockpit**: command-style instrument search on trade entry
+- **reported**: archive a reported strategy
+- **cockpit**: jobs and events pages with sample data
+- **cockpit**: portfolios page
+- **cockpit**: orders page
+- **cockpit**: API keys page under Trade
+- **cockpit**: strategies page
+- **cockpit**: Binance-style trade entry page
+- **cockpit**: price chart and order book components
+- **cockpit**: sample market data source
+- **cockpit**: shadcn sidebar shell with Trade and Admin groups
+- **reported**: expose token_active on strategy status
+- **cockpit**: reported strategies page and reported breaks
+- **reported**: status, fills and batches views
+- **groups**: protect strategy-owned groups
+- **recon**: adopt and dismiss reported breaks
+- **reported**: fill ingest endpoint
+- **positions**: include reported fills in replay
+- **reported**: trader-created reported strategies with tokens
+- **db**: reported strategy schema
+
+### Fix
+
+- **cockpit**: admin group back under the main pages
+- **cockpit**: taller trade panel minimum so book and ticket never scroll
+- **cockpit**: keep order book readable above the ticket
+- **cockpit**: fixed order book and ticket split on trade entry
+- **cockpit**: shorter price chart on trade entry
+- **cockpit**: keep every depth level distinct for low-priced instruments
+- **reported**: composite fills cursor, bound status gaps
+- **recon**: pin rebooked reported fills to their portfolio, 409 on mapping conflict
+- **reported**: sha-256 reporting tokens, refuse orders into reported portfolios
+
 ## v0.14.0 (2026-11-19)
 
 ### Feat
