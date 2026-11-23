@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
 import { ChartContainer, ChartTooltip, ChartTooltipContent, type ChartConfig } from "@/components/ui/chart";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Me } from "../../access";
 import { api } from "../../api/client";
 import type { BlotterRow } from "../../api/types";
@@ -13,6 +12,7 @@ import { OrderStatus, SideBadge } from "../../components/status";
 import type { PositionRow } from "../../positions";
 import { fmtLocal } from "../../tradeTimes";
 import { exposureShares, pickDefaultPortfolio, samplePnl } from "../../portfolioView";
+import { PortfolioPicker } from "../../components/PortfolioPicker";
 import { PositionsPage } from "./Positions";
 
 const RECENT = 10;
@@ -99,11 +99,9 @@ export function PortfoliosPage({ me }: { me: Me }) {
   return (
     <div className="flex flex-col gap-3">
       {viewable.length > 1 && (
-        <Tabs value={portfolioId} onValueChange={setPicked}>
-          <TabsList className="flex-wrap">
-            {viewable.map((p) => <TabsTrigger key={p.portfolio_id} value={p.portfolio_id}>{p.code}</TabsTrigger>)}
-          </TabsList>
-        </Tabs>
+        <div className="flex items-center gap-2">
+          <PortfolioPicker portfolios={viewable} value={portfolioId} onChange={(id) => id && setPicked(id)} className="w-72" />
+        </div>
       )}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
         <div className="lg:col-span-2"><PnlChart portfolioId={portfolioId} /></div>

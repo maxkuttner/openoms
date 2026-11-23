@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Me } from "../../access";
+import { PortfolioPicker } from "../../components/PortfolioPicker";
 import { TradeBlotter } from "../../components/trading/TradeBlotter";
 import type { StatusFilter } from "../../orders";
 
@@ -11,9 +12,14 @@ const FILTERS: [StatusFilter, string][] = [["all", "All"], ["open", "Open"], ["f
 export function OrdersPage({ me }: { me: Me }) {
   const [filter, setFilter] = useState<StatusFilter>("all");
   const [query, setQuery] = useState("");
+  const [portfolioId, setPortfolioId] = useState<string | null>(null);
+  const viewable = me.portfolios.filter((p) => p.can_view);
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2">
+        {viewable.length > 1 && (
+          <PortfolioPicker portfolios={viewable} value={portfolioId} onChange={setPortfolioId} allLabel="All portfolios" />
+        )}
         <Tabs value={filter} onValueChange={(v) => setFilter(v as StatusFilter)}>
           <TabsList>{FILTERS.map(([v, l]) => <TabsTrigger key={v} value={v}>{l}</TabsTrigger>)}</TabsList>
         </Tabs>
@@ -25,7 +31,8 @@ export function OrdersPage({ me }: { me: Me }) {
           className="h-8 w-64"
         />
       </div>
-      <TradeBlotter portfolios={me.portfolios} statusFilter={filter} query={query} />
+      <TradeBlotter portfolios={me.portfolios} statusFilter={filter} query={query}
+        portfolioId={portfolioId} onPortfolioChange={setPortfolioId} />
     </div>
   );
 }

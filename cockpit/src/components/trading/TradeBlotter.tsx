@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { Select } from "../form";
+import { PortfolioPicker } from "../PortfolioPicker";
 import { Notice, Spinner } from "../common";
 import { OrderStatus, Pill, SideBadge, ORDER_STATUS_TONE } from "../status";
 import { cn } from "@/lib/utils";
@@ -54,7 +54,12 @@ export function TradeBlotter({
   followOrderId = null,
   statusFilter = "all",
   query = "",
+  portfolioId: controlledId,
+  onPortfolioChange,
 }: {
+  /** Orders page: the page owns the portfolio picker; the blotter shows none. */
+  portfolioId?: string | null;
+  onPortfolioChange?: (id: string | null) => void;
   portfolios: GrantedPortfolio[];
   /** Orders page only: which status bucket and text to show; the blotter's fetch is unchanged. */
   statusFilter?: StatusFilter;
@@ -66,7 +71,10 @@ export function TradeBlotter({
   followOrderId?: string | null;
 }) {
   const viewable = portfolios.filter((p) => p.can_view);
-  const [portfolioId, setPortfolioId] = useState<string | null>(null);
+  const [ownId, setOwnId] = useState<string | null>(null);
+  const controlled = onPortfolioChange !== undefined;
+  const portfolioId = controlled ? (controlledId ?? null) : ownId;
+  const setPortfolioId = controlled ? onPortfolioChange : setOwnId;
   const [selected, setSelected] = useState<BlotterRow | null>(null);
 
   // POST /orders/cancel answers 202 when the cancel was FORWARDED to the broker
@@ -160,20 +168,14 @@ export function TradeBlotter({
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-end justify-between gap-3">
-        <h2 className="text-sm font-semibold">Blotter</h2>
-        {viewable.length > 1 && (
-          <Select
-            className="w-52"
-            label="Portfolio"
-            placeholder="All portfolios"
-            data={viewable.map((p) => ({ value: p.portfolio_id, label: p.code }))}
-            value={portfolioId}
-            onChange={setPortfolioId}
-            clearable
-          />
-        )}
-      </div>
+      {!controlled && (
+        <div className="flex flex-wrap items-center gap-3">
+          <h2 className="text-sm font-semibold">Blotter</h2>
+          {viewable.length > 1 && (
+            <PortfolioPicker portfolios={viewable} value={portfolioId} onChange={setPortfolioId} allLabel="All portfolios" />
+          )}
+        </div>
+      )}
 
       {followOrderId !== null && (
         <Notice
