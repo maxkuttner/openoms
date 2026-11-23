@@ -9,7 +9,7 @@ import { Shell } from "./shell/Shell";
 import { AdminPanel } from "./shell/AdminPanel";
 import { useSession } from "./shell/session";
 import { TradePage } from "./pages/trading/Trade";
-import { PositionsPage } from "./pages/trading/Positions";
+import { PortfoliosPage as TradingPortfoliosPage } from "./pages/trading/Portfolios";
 import { StrategiesPage as ReportedStrategiesPage } from "./pages/trading/Strategies";
 import { ApiKeysPage } from "./pages/trading/Api";
 import { OrdersPage } from "./pages/trading/Orders";
@@ -38,9 +38,9 @@ function Orders() {
   return <OrdersPage me={me} />;
 }
 
-function Positions() {
+function Portfolios() {
   const { me } = useSession();
-  return <PositionsPage me={me} />;
+  return <TradingPortfoliosPage me={me} />;
 }
 
 /** Placeholder for a page later in this branch. */
@@ -58,7 +58,7 @@ export function App() {
         <Route index element={<Trade />} />
         <Route path="strategies" element={<ReportedStrategiesPage />} />
         <Route path="api" element={<ApiKeysPage />} />
-        <Route path="portfolios" element={<Positions />} />
+        <Route path="portfolios" element={<Portfolios />} />
         <Route path="orders" element={<Orders />} />
         <Route path="jobs" element={<Pending />} />
         <Route path="events" element={<Pending />} />

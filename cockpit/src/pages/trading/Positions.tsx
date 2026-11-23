@@ -22,9 +22,11 @@ export type { PositionRow };
 // P&L is exactly the number someone glances at before deciding something.
 const num = (v: number | null | undefined) => (v === null || v === undefined ? "—" : v);
 
-export function PositionsPage({ me }: { me: Me }) {
+/** Positions of one portfolio. Pass `portfolioId` to control it from outside (the picker then hides). */
+export function PositionsPage({ me, portfolioId: controlled }: { me: Me; portfolioId?: string | null }) {
   const viewable = me.portfolios.filter((p) => p.can_view);
-  const [portfolioId, setPortfolioId] = useState<string | null>(viewable[0]?.portfolio_id ?? null);
+  const [own, setPortfolioId] = useState<string | null>(viewable[0]?.portfolio_id ?? null);
+  const portfolioId = controlled === undefined ? own : controlled;
 
   const live = useLive();
   const positions = useQuery<PositionRow[]>({
@@ -66,7 +68,7 @@ export function PositionsPage({ me }: { me: Me }) {
     <div className="flex flex-col gap-3">
       <div className="flex items-end justify-between gap-3">
         <h2 className="text-sm font-semibold">Positions</h2>
-        {viewable.length > 1 && (
+        {controlled === undefined && viewable.length > 1 && (
           <Select
             className="w-52"
             label="Portfolio"
