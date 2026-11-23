@@ -98,16 +98,9 @@ export function Shell() {
                   </SidebarMenuItem>
                 );
               })}
+              {nav.groups.slice(1).map((g) => <Group key={g.id} group={g} pathname={pathname} />)}
             </SidebarMenu>
           </SidebarGroup>
-          {nav.groups.length > 1 && (
-            // Admin sits at the bottom of the sidebar, just above the account menu.
-            <SidebarGroup className="mt-auto">
-              <SidebarMenu>
-                {nav.groups.slice(1).map((g) => <Group key={g.id} group={g} pathname={pathname} />)}
-              </SidebarMenu>
-            </SidebarGroup>
-          )}
         </SidebarContent>
         <SidebarFooter className="border-t">
           <UserMenu onSignOut={signOut} />
