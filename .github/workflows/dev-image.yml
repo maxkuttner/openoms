@@ -1,0 +1,62 @@
+name: Dev image
+
+# Every push to `dev` publishes ghcr.io/maxkuttner/openoms:dev (and :dev-<sha>),
+# so a dev environment can run the branch's code without building Rust itself.
+# amd64 only: dev images are for testing, release.yml builds the multi-arch ones.
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-image
+  cancel-in-progress: true
+
+jobs:
+  image:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: openoms:ci
+          build-args: VERSION=dev-${{ github.sha }}
+          cache-from: type=gha,scope=image-amd64
+          cache-to: type=gha,mode=max,scope=dev-image-amd64
+
+      - name: the image starts from env vars alone
+        run: |
+          docker network create smoke
+          docker run -d --name pg --network smoke -e POSTGRES_PASSWORD=pw postgres:16
+          until [ "$(docker logs pg 2>&1 | grep -c 'ready to accept connections')" -ge 2 ]; do sleep 1; done
+          key="base64:$(openssl rand -base64 32)"
+          docker run -d --name oms --network smoke -p 127.0.0.1:3001:3001 \
+            -e POSTGRES_HOST=pg -e POSTGRES_PASSWORD=pw -e OMS_PASSWORD=smoke-role-pw \
+            -e OMS_MASTER_KEY="$key" -e OMS_PUBLIC_BASE_URL=http://localhost:3001 openoms:ci
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:3001/health && exit 0; sleep 2; done
+          docker logs oms; exit 1
+
+      - name: push :dev and :dev-<sha>
+        run: |
+          img=ghcr.io/maxkuttner/openoms
+          for t in dev "dev-${GITHUB_SHA::7}"; do
+            docker tag openoms:ci "$img:$t"
+            docker push "$img:$t"
+          done
