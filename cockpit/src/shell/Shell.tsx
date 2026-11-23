@@ -1,24 +1,59 @@
 import { useState } from "react";
 import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { CandlestickChart, FileInput, Wallet } from "lucide-react";
+import { Activity, BriefcaseBusiness, CandlestickChart, Clock, ListOrdered, Shield } from "lucide-react";
+import {
+  Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton,
+  SidebarMenuItem, SidebarMenuSub, SidebarMenuSubButton, SidebarMenuSubItem, SidebarProvider, SidebarTrigger,
+} from "@/components/ui/sidebar";
+import { Separator } from "@/components/ui/separator";
 import { authApi } from "../login/api";
 import { goToLogin } from "../api/client";
 import { Logo } from "../components/Logo";
 import { JobsIndicator } from "../components/JobsIndicator";
-import { SIDEBAR, pageFor } from "../nav";
-import { cn } from "@/lib/utils";
+import { adminTabFor, pageFor, sidebarFor, type NavGroup, type Page } from "../nav";
 import { CommandMenu } from "./CommandMenu";
 import { ConnectionDot } from "./ConnectionDot";
 import { UserMenu } from "./UserMenu";
 import { useSession } from "./session";
 
-const ICONS: Record<string, typeof Wallet> = { trade: CandlestickChart, positions: Wallet, reported: FileInput };
+const PAGE_ICONS: Record<string, typeof Shield> = {
+  portfolios: BriefcaseBusiness, orders: ListOrdered, jobs: Clock, events: Activity,
+};
+const GROUP_ICONS: Record<NavGroup["id"], typeof Shield> = { trade: CandlestickChart, admin: Shield };
 
-/** Sidebar (same for every user) + top bar + page. */
+/** Admin items stand for a whole Admin Panel tab; other items for their own path. */
+function isActive(page: Page, pathname: string, group?: NavGroup["id"]): boolean {
+  if (group === "admin") return adminTabFor(pathname)?.id === page.id;
+  if (page.path === "/") return pathname === "/";
+  return pathname === page.path || pathname.startsWith(page.path + "/");
+}
+
+function Group({ group, pathname }: { group: NavGroup; pathname: string }) {
+  const Icon = GROUP_ICONS[group.id];
+  return (
+    <SidebarMenuItem>
+      <SidebarMenuButton className="font-medium text-sidebar-foreground" tooltip={group.title}>
+        <Icon /> <span>{group.title}</span>
+      </SidebarMenuButton>
+      <SidebarMenuSub>
+        {group.pages.map((p) => (
+          <SidebarMenuSubItem key={p.path}>
+            <SidebarMenuSubButton asChild isActive={isActive(p, pathname, group.id)}>
+              <NavLink to={p.path} end={p.path === "/"}>{p.title}</NavLink>
+            </SidebarMenuSubButton>
+          </SidebarMenuSubItem>
+        ))}
+      </SidebarMenuSub>
+    </SidebarMenuItem>
+  );
+}
+
+/** shadcn sidebar (Trade group, main pages, Admin group for admins) + top bar + page. */
 export function Shell() {
   const { admin } = useSession();
   const { pathname } = useLocation();
   const [cmdOpen, setCmdOpen] = useState(false);
+  const nav = sidebarFor(admin);
   const title = pathname.startsWith("/admin") ? "Admin Panel" : (pageFor(pathname)?.title ?? "");
 
   const signOut = () => {
@@ -26,9 +61,9 @@ export function Shell() {
   };
 
   return (
-    <div className="flex h-screen overflow-hidden bg-background text-foreground">
-      <aside className="flex w-[190px] shrink-0 flex-col border-r bg-sidebar px-2 py-2.5">
-        <div className="flex items-center justify-between px-2 pb-3">
+    <SidebarProvider className="h-screen overflow-hidden">
+      <Sidebar collapsible="offcanvas">
+        <SidebarHeader className="flex-row items-center justify-between px-3 py-3">
           <Logo />
           <button
             type="button"
@@ -38,36 +73,35 @@ export function Shell() {
           >
             ⌘K
           </button>
-        </div>
-        <nav className="flex flex-col gap-px">
-          {SIDEBAR.map((p) => {
-            const Icon = ICONS[p.id];
-            return (
-              <NavLink
-                key={p.path}
-                to={p.path}
-                end
-                className={({ isActive }) =>
-                  cn(
-                    "flex items-center gap-2 rounded-md px-2 py-[5px] text-sidebar-foreground hover:bg-accent hover:text-foreground",
-                    isActive && "bg-accent text-foreground",
-                  )
-                }
-              >
-                {Icon && <Icon className="size-3.5" />}
-                {p.title}
-              </NavLink>
-            );
-          })}
-        </nav>
-        <div className="mt-auto border-t pt-2">
+        </SidebarHeader>
+        <SidebarContent>
+          <SidebarGroup>
+            <SidebarMenu>
+              <Group group={nav.groups[0]} pathname={pathname} />
+              {nav.pages.map((p) => {
+                const Icon = PAGE_ICONS[p.id];
+                return (
+                  <SidebarMenuItem key={p.path}>
+                    <SidebarMenuButton asChild isActive={isActive(p, pathname)} tooltip={p.title}>
+                      <NavLink to={p.path}>{Icon && <Icon />}<span>{p.title}</span></NavLink>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                );
+              })}
+              {nav.groups.slice(1).map((g) => <Group key={g.id} group={g} pathname={pathname} />)}
+            </SidebarMenu>
+          </SidebarGroup>
+        </SidebarContent>
+        <SidebarFooter className="border-t">
           <UserMenu onSignOut={signOut} />
-        </div>
-      </aside>
-      <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-[38px] shrink-0 items-center gap-3 border-b px-3.5">
+        </SidebarFooter>
+      </Sidebar>
+      <SidebarInset className="min-w-0">
+        <header className="flex h-[38px] shrink-0 items-center gap-2 border-b px-2">
+          <SidebarTrigger aria-label="Toggle sidebar" />
+          <Separator orientation="vertical" className="h-4" />
           <span className="font-semibold">{title}</span>
-          <div className="ml-auto flex items-center gap-3">
+          <div className="ml-auto flex items-center gap-3 pr-1.5">
             {admin && <JobsIndicator />}
             <ConnectionDot />
           </div>
@@ -75,8 +109,8 @@ export function Shell() {
         <main className="min-h-0 flex-1 overflow-auto p-3.5">
           <Outlet />
         </main>
-      </div>
+      </SidebarInset>
       <CommandMenu open={cmdOpen} setOpen={setCmdOpen} admin={admin} onSignOut={signOut} />
-    </div>
+    </SidebarProvider>
   );
 }

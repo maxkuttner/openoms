@@ -1,13 +1,13 @@
 import { Link } from "react-router-dom";
-import { ChevronsUpDown, ExternalLink, LogOut, Settings, Shield } from "lucide-react";
+import { ChevronsUpDown, ExternalLink, LogOut, Settings } from "lucide-react";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useSession } from "./session";
 
-/** Sidebar foot: who is signed in, and Settings · Admin Panel (admins) · Sign out. */
+/** Sidebar foot: who is signed in, and Settings · Docs · Sign out. */
 export function UserMenu({ onSignOut }: { onSignOut: () => void }) {
-  const { me, admin } = useSession();
+  const { me } = useSession();
   const name = me.display_name ?? me.code;
   return (
     <DropdownMenu>
@@ -21,7 +21,6 @@ export function UserMenu({ onSignOut }: { onSignOut: () => void }) {
       <DropdownMenuContent side="top" align="start" className="w-52">
         <DropdownMenuLabel className="truncate text-xs text-muted-foreground">{me.code}</DropdownMenuLabel>
         <DropdownMenuItem asChild><Link to="/settings"><Settings /> Settings</Link></DropdownMenuItem>
-        {admin && <DropdownMenuItem asChild><Link to="/admin"><Shield /> Admin Panel</Link></DropdownMenuItem>}
         <DropdownMenuItem asChild>
           <a href="https://openoms.dev/" target="_blank" rel="noreferrer"><ExternalLink /> Docs</a>
         </DropdownMenuItem>

@@ -1,4 +1,6 @@
 import { Navigate, Route, Routes } from "react-router-dom";
+import { Notice } from "./components/common";
+import { legacyRedirect } from "./nav";
 import { APP_HOME } from "./login/api";
 import { LoginPage } from "./login/LoginPage";
 import { AccountSettings } from "./login/AccountSettings";
@@ -34,6 +36,11 @@ function Positions() {
   return <PositionsPage me={me} />;
 }
 
+/** Placeholder for a page later in this branch. */
+function Pending() {
+  return <Notice tone="info">Coming in this branch.</Notice>;
+}
+
 /** The whole app. Sign-in and the access page render without a session. */
 export function App() {
   return (
@@ -42,8 +49,14 @@ export function App() {
       <Route path="/access" element={<AccessPage />} />
       <Route element={<AuthGate><Shell /></AuthGate>}>
         <Route index element={<Trade />} />
-        <Route path="positions" element={<Positions />} />
-        <Route path="reported" element={<ReportedStrategiesPage />} />
+        <Route path="strategies" element={<ReportedStrategiesPage />} />
+        <Route path="api" element={<Pending />} />
+        <Route path="portfolios" element={<Positions />} />
+        <Route path="orders" element={<Pending />} />
+        <Route path="jobs" element={<Pending />} />
+        <Route path="events" element={<Pending />} />
+        <Route path="positions" element={<Navigate to={legacyRedirect("/positions")!} replace />} />
+        <Route path="reported" element={<Navigate to={legacyRedirect("/reported")!} replace />} />
         <Route path="settings" element={<AccountSettings />} />
         <Route path="admin" element={<AdminPanel />}>
           <Route index element={<Navigate to="users" replace />} />
