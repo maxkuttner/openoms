@@ -23,6 +23,7 @@ export type ReportedStatus = {
   last_sequence: number | null;
   gaps: Gap[];
   open_breaks: number;
+  token_active: boolean;
 };
 
 export type ReportedFill = {

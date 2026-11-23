@@ -404,3 +404,16 @@ fn rate_limit_bucket_refills() {
     let allowed = (0..60).filter(|_| api::allow(&code)).count();
     assert_eq!(allowed, 40, "burst of 40");
 }
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+async fn token_active_tracks_issue_and_revoke() {
+    let f = fixture().await;
+    let mut conn = f.pool.acquire().await.unwrap();
+    super::token::issue(&mut conn, &f.code).await.unwrap();
+    drop(conn);
+    assert!(super::status::token_active(&f.pool, &f.code).await.unwrap());
+    sqlx::query("UPDATE strategy_reporting_token SET revoked_at = now() WHERE strategy_code = $1")
+        .bind(&f.code).execute(&f.pool).await.unwrap();
+    assert!(!super::status::token_active(&f.pool, &f.code).await.unwrap());
+}

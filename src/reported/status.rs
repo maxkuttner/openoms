@@ -83,6 +83,18 @@ pub struct Status {
     pub last_sequence: Option<i64>,
     pub gaps: Vec<Gap>,
     pub open_breaks: i64,
+    /// True while the strategy holds an unrevoked reporting token.
+    pub token_active: bool,
+}
+
+/// Whether `code` has a reporting token that has not been revoked.
+pub async fn token_active(pool: &PgPool, code: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM strategy_reporting_token WHERE strategy_code = $1 AND revoked_at IS NULL)",
+    )
+    .bind(code)
+    .fetch_one(pool)
+    .await
 }
 
 pub async fn get_status(
@@ -125,7 +137,8 @@ pub async fn get_status(
     .fetch_one(pool)
     .await
     .map_err(db)?;
-    Ok(Json(Status { last_report_at, stale, last_sequence, gaps, open_breaks }))
+    let token_active = token_active(pool, &code).await.map_err(db)?;
+    Ok(Json(Status { last_report_at, stale, last_sequence, gaps, open_breaks, token_active }))
 }
 
 #[derive(Debug, Deserialize)]
