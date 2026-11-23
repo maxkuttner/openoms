@@ -9,3 +9,4 @@ pub mod api;
 pub mod ingest;
 #[cfg(test)]
 mod ingest_tests;
+pub mod status;

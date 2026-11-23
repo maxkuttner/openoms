@@ -941,6 +941,10 @@ fn build_app(
         .route("/strategies", get(strategies::trader_api::list).post(strategies::trader_api::create))
         .route("/strategies/:code/handover", post(strategies::trader_api::handover))
         .route("/strategies/reported", get(reported::strategy::list_mine).post(reported::strategy::create))
+        .route("/strategies/reported/:code", axum::routing::patch(reported::status::patch))
+        .route("/strategies/reported/:code/status", get(reported::status::get_status))
+        .route("/strategies/reported/:code/fills", get(reported::status::get_fills))
+        .route("/strategies/reported/:code/batches", get(reported::status::get_batches))
         .route(
             "/strategies/reported/:code/token",
             post(reported::strategy::rotate_token).delete(reported::strategy::revoke_token),
