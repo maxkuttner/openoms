@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { useDefaultLayout } from "react-resizable-panels";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { useQueryClient } from "@tanstack/react-query";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { Me } from "../../access";
@@ -77,17 +79,19 @@ export function TradePage({ me }: { me: Me }) {
           onPick={(i) => { setPendingLegs(null); setSelectedInstrument(i); }}
           onOpenSearch={() => setSearchOpen(true)}
         />
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
-          <div className="h-[420px] min-w-0 flex-1 xl:h-[460px]">
+        <TradeLayout
+          chart={
+            <>
             {selectedInstrument ? (
               // Sample prices only: nothing here feeds the ticket below.
               <PriceChart source={sampleMarketData} instrumentId={selectedInstrument.symbol} />
             ) : (
               <Notice tone="info">Pick an instrument to see its chart and order book.</Notice>
             )}
-          </div>
-          <div className="flex w-full flex-col gap-3 lg:w-[360px] lg:shrink-0">
-            {selectedInstrument && <OrderBook source={sampleMarketData} instrumentId={selectedInstrument.symbol} />}
+            </>
+          }
+          book={selectedInstrument ? <OrderBook source={sampleMarketData} instrumentId={selectedInstrument.symbol} /> : null}
+          ticket={
         <div>
           {pendingLegs ? (
             // Keyed by the combo's own legs so a new "Use this combo" pick
@@ -113,8 +117,8 @@ export function TradePage({ me }: { me: Me }) {
             />
           )}
         </div>
-          </div>
-        </div>
+          }
+          bottom={
         <div className="min-w-0">
           <Tabs value={activeTab ?? "orders"} onValueChange={setActiveTab}>
             <TabsList>
@@ -129,7 +133,63 @@ export function TradePage({ me }: { me: Me }) {
             </TabsContent>
           </Tabs>
         </div>
+          }
+        />
       </div>
     </>
+  );
+}
+
+/** True at Tailwind's `lg` width and up, where the trade screen splits into resizable panels. */
+function useWide(): boolean {
+  const q = "(min-width: 1024px)";
+  const [wide, setWide] = useState(() => typeof window !== "undefined" && window.matchMedia(q).matches);
+  useEffect(() => {
+    const m = window.matchMedia(q);
+    const on = () => setWide(m.matches);
+    m.addEventListener("change", on);
+    return () => m.removeEventListener("change", on);
+  }, []);
+  return wide;
+}
+
+/**
+ * Chart | (order book / ticket) over the orders and positions tabs. On wide screens every
+ * split has a drag handle and the sizes are remembered per browser; narrow screens stack.
+ */
+function TradeLayout({ chart, book, ticket, bottom }: { chart: ReactNode; book: ReactNode; ticket: ReactNode; bottom: ReactNode }) {
+  const wide = useWide();
+  const outer = useDefaultLayout({ id: "trade-outer", panelIds: ["top", "bottom"] });
+  const row = useDefaultLayout({ id: "trade-row", panelIds: ["chart", "side"] });
+  const side = useDefaultLayout({ id: "trade-side", panelIds: ["book", "ticket"] });
+  if (!wide) {
+    return (
+      <>
+        <div className="h-[420px] min-w-0">{chart}</div>
+        {book}
+        {ticket}
+        {bottom}
+      </>
+    );
+  }
+  return (
+    <ResizablePanelGroup orientation="vertical" className="h-[calc(100svh-11rem)] min-h-[640px]"
+      defaultLayout={outer.defaultLayout} onLayoutChanged={outer.onLayoutChanged}>
+      <ResizablePanel id="top" defaultSize="68" minSize="30">
+        <ResizablePanelGroup orientation="horizontal" defaultLayout={row.defaultLayout} onLayoutChanged={row.onLayoutChanged}>
+          <ResizablePanel id="chart" defaultSize="70" minSize="30" className="pr-1.5">{chart}</ResizablePanel>
+          <ResizableHandle withHandle />
+          <ResizablePanel id="side" defaultSize="30" minSize={300} className="pl-1.5">
+            <ResizablePanelGroup orientation="vertical" defaultLayout={side.defaultLayout} onLayoutChanged={side.onLayoutChanged}>
+              <ResizablePanel id="book" defaultSize="45" minSize="15" className="overflow-auto pb-1.5">{book}</ResizablePanel>
+              <ResizableHandle withHandle />
+              <ResizablePanel id="ticket" defaultSize="55" minSize="20" className="overflow-auto pt-1.5">{ticket}</ResizablePanel>
+            </ResizablePanelGroup>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </ResizablePanel>
+      <ResizableHandle withHandle />
+      <ResizablePanel id="bottom" defaultSize="32" minSize="12" className="overflow-auto pt-3">{bottom}</ResizablePanel>
+    </ResizablePanelGroup>
   );
 }
