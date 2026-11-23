@@ -218,8 +218,8 @@ fn fill_time_sql(order: &str, exec: &str) -> String {
 /// Every input the incremental path applies — fills, fees and allocation
 /// transfers — for one portfolio ($1, NULL = all) and instrument ($2, NULL = all),
 /// in [`CANONICAL_ORDER`]. Transfers sit at their own time and touch both sides.
-/// Reported fills (and their Quote/Base fees) join through their strategy's
-/// portfolio at their trade time; like transfers they carry no global_position,
+/// Reported fills (and their Quote/Base fees) join through their own pinned
+/// portfolio (an admin rebook) or else their strategy's, at their trade time; like transfers they carry no global_position,
 /// which sorts NULLS LAST and only breaks ties the earlier keys leave. A reported
 /// row's execution id is `venue|account_ref|exec_id` (what ingest passes to
 /// [`persist_fill`]), so one exec id reused on two venues still sorts one way.
@@ -248,17 +248,17 @@ fn replay_sql() -> String {
            FROM allocation a JOIN order_state os ON os.order_id = a.order_id \
            WHERE ($1::uuid IS NULL OR a.to_portfolio_id = $1) AND ($2::text IS NULL OR a.instrument_id = $2) \
            UNION ALL \
-           SELECT s.portfolio_id, rf.instrument_id::text, lower(rf.side), 'reported_fill', NULL, \
+           SELECT COALESCE(rf.portfolio_id, s.portfolio_id), rf.instrument_id::text, lower(rf.side), 'reported_fill', NULL, \
                   rf.qty::float8, rf.price::float8, rf.trade_time, rf.venue || '|' || rf.account_ref || '|' || rf.exec_id, false, NULL \
            FROM reported_fill rf JOIN strategy s ON s.code = rf.strategy_code \
-           WHERE ($1::uuid IS NULL OR s.portfolio_id = $1) AND ($2::text IS NULL OR rf.instrument_id::text = $2) \
+           WHERE ($1::uuid IS NULL OR COALESCE(rf.portfolio_id, s.portfolio_id) = $1) AND ($2::text IS NULL OR rf.instrument_id::text = $2) \
            UNION ALL \
-           SELECT s.portfolio_id, rf.instrument_id::text, lower(rf.side), 'reported_fee', \
+           SELECT COALESCE(rf.portfolio_id, s.portfolio_id), rf.instrument_id::text, lower(rf.side), 'reported_fee', \
                   jsonb_build_object('effect', rf.fee_effect), \
                   rf.fee::float8, NULL, rf.trade_time, rf.venue || '|' || rf.account_ref || '|' || rf.exec_id, true, NULL \
            FROM reported_fill rf JOIN strategy s ON s.code = rf.strategy_code \
            WHERE rf.fee IS NOT NULL AND rf.fee_effect IN ('Quote', 'Base') \
-             AND ($1::uuid IS NULL OR s.portfolio_id = $1) AND ($2::text IS NULL OR rf.instrument_id::text = $2) \
+             AND ($1::uuid IS NULL OR COALESCE(rf.portfolio_id, s.portfolio_id) = $1) AND ($2::text IS NULL OR rf.instrument_id::text = $2) \
          ) r ORDER BY {CANONICAL_ORDER}"
     )
 }
@@ -651,8 +651,8 @@ pub async fn rebuild_positions_scoped(pool: &PgPool, portfolio: Option<Uuid>) ->
                          AND e.event_type IN ('order_partially_filled', 'order_filled', 'order_fee_charged')) \
          UNION SELECT instrument_id, from_portfolio_id FROM allocation WHERE ($1::uuid IS NULL OR from_portfolio_id = $1) \
          UNION SELECT instrument_id, to_portfolio_id FROM allocation WHERE ($1::uuid IS NULL OR to_portfolio_id = $1) \
-         UNION SELECT rf.instrument_id::text, s.portfolio_id FROM reported_fill rf JOIN strategy s ON s.code = rf.strategy_code \
-           WHERE ($1::uuid IS NULL OR s.portfolio_id = $1)",
+         UNION SELECT rf.instrument_id::text, COALESCE(rf.portfolio_id, s.portfolio_id) FROM reported_fill rf JOIN strategy s ON s.code = rf.strategy_code \
+           WHERE ($1::uuid IS NULL OR COALESCE(rf.portfolio_id, s.portfolio_id) = $1)",
     )
     .bind(portfolio)
     .fetch_all(&mut *tx)

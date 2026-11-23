@@ -266,7 +266,7 @@ async fn ingest_one(
     let [instrument_id] = found[..] else {
         return Ok(broke(open_reported_break(conn, strategy_code, UNKNOWN_INSTRUMENT, raw).await?));
     };
-    book_fill(conn, strategy_code, portfolio_id, instrument_id, &fill, batch_id, raw).await
+    book_fill(conn, strategy_code, portfolio_id, instrument_id, &fill, batch_id, raw, None).await
 }
 
 /// Fee asset → effect: the instrument currency is Quote, its base is Base,
@@ -293,7 +293,8 @@ fn effect_db(e: FeeEffect) -> &'static str {
 
 /// Insert one resolved fill and apply it (and its fee) to the strategy's
 /// position. An existing identical fill is a duplicate; a differing one is a
-/// `CONFLICTING_DUPLICATE` break. Reused by break adoption.
+/// `CONFLICTING_DUPLICATE` break. Reused by break adoption, which pins the row to
+/// `pinned_portfolio` for an explicit rebook (replay then honours it).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn book_fill(
     conn: &mut PgConnection,
@@ -303,6 +304,7 @@ pub(crate) async fn book_fill(
     fill: &ReportedFill,
     batch_id: &str,
     raw: &Value,
+    pinned_portfolio: Option<Uuid>,
 ) -> Result<FillOutcome, sqlx::Error> {
     let exec_id = Some(fill.exec_id.clone());
     let fee_effect = match (fill.fee, fill.fee_asset.as_deref()) {
@@ -322,8 +324,8 @@ pub(crate) async fn book_fill(
     };
     let inserted = sqlx::query(
         "INSERT INTO reported_fill (id, strategy_code, batch_id, venue, account_ref, exec_id, client_order_id, \
-           symbol, instrument_id, side, qty, price, fee, fee_asset, fee_effect, trade_time, raw_json) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) \
+           symbol, instrument_id, side, qty, price, fee, fee_asset, fee_effect, trade_time, raw_json, portfolio_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
          ON CONFLICT (strategy_code, venue, account_ref, exec_id) DO NOTHING",
     )
     .bind(Uuid::new_v4())
@@ -343,6 +345,7 @@ pub(crate) async fn book_fill(
     .bind(fee_effect.map(effect_db))
     .bind(fill.trade_time)
     .bind(raw)
+    .bind(pinned_portfolio)
     .execute(&mut *conn)
     .await?
     .rows_affected();

@@ -487,6 +487,18 @@ async fn adopt_reported(state: &AppState, auth: &AuthContext, found: ReconBreak,
     .map_err(map_db_error)?
     .ok_or_else(|| conflict("the break was resolved by someone else"))?;
     if body.map_symbol.unwrap_or(true) {
+        let mapped: Vec<i64> = sqlx::query_scalar("SELECT instrument_id FROM broker_instrument WHERE broker_code = $1 AND broker_symbol = $2")
+            .bind(&fill.venue)
+            .bind(&fill.symbol)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+        if let Some(other) = mapped.iter().find(|m| **m != instrument) {
+            return Err(conflict(format!(
+                "{}/{} is already mapped to instrument {other}; pass map_symbol=false to book only this fill",
+                fill.venue, fill.symbol
+            )));
+        }
         sqlx::query(
             "INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol) \
              SELECT $1, $2, $3 WHERE NOT EXISTS (SELECT 1 FROM broker_instrument WHERE broker_code = $2 AND broker_symbol = $3)",
@@ -510,7 +522,7 @@ async fn adopt_reported(state: &AppState, auth: &AuthContext, found: ReconBreak,
     .execute(&mut *tx)
     .await
     .map_err(map_db_error)?;
-    let done = book_fill(&mut tx, &strategy, portfolio, instrument, &fill, &batch_id, &raw).await.map_err(map_db_error)?;
+    let done = book_fill(&mut tx, &strategy, portfolio, instrument, &fill, &batch_id, &raw, (portfolio != own).then_some(portfolio)).await.map_err(map_db_error)?;
     match done.outcome {
         Outcome::Booked => {}
         Outcome::Duplicate => {} // booked meanwhile through the mapping: the break just closes
@@ -1235,5 +1247,45 @@ mod tests {
         assert_eq!((rec.len(), rec[0].id), (1, reconciled));
         assert!(rec[0].broker_connection_code.is_some() && rec[0].reported_fill.is_none());
         assert_eq!(list(Some("nope")).await.unwrap_err().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn rebooked_fill_survives_rebuild() {
+        let w = world().await;
+        let st = test_app_state(w.pool.clone());
+        let auth = principal(&w, None).await;
+        let r = reported(&w).await;
+        let target = other_portfolio(&w).await;
+        let id = reported_break(&w, &r, reported_fill("e1", 2.0)).await;
+        let body = AdoptBody { portfolio_id: Some(target), ..adopt_into(&r) };
+        let _ = adopt_break(State(st), Extension(auth), Path(id), Json(body)).await.unwrap();
+        for scope in [Some(target), Some(r.portfolio), None] {
+            crate::positions::rebuild_positions_scoped(&w.pool, scope).await.unwrap();
+            let net: Option<f64> = sqlx::query_scalar("SELECT net_qty::float8 FROM position WHERE portfolio_id = $1 AND instrument_id = $2")
+                .bind(target).bind(r.instrument.to_string()).fetch_optional(&w.pool).await.unwrap();
+            assert_eq!(net, Some(2.0), "override portfolio after rebuild {scope:?}");
+            assert_eq!(net_qty(&w, &r).await, 0.0, "strategy portfolio untouched after rebuild {scope:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn adopt_conflicting_mapping_is_409() {
+        let w = world().await;
+        let st = test_app_state(w.pool.clone());
+        let auth = principal(&w, None).await;
+        let r = reported(&w).await;
+        let other = reported(&w).await;
+        let id = reported_break(&w, &r, reported_fill("e1", 1.0)).await;
+        sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol) VALUES ($1, 'ZEXCH', 'ZZZUSDT')")
+            .bind(other.instrument).execute(&w.pool).await.unwrap();
+        let e = adopt_break(State(st.clone()), Extension(auth.clone()), Path(id), Json(adopt_into(&r))).await.unwrap_err();
+        assert_eq!(e.status(), StatusCode::CONFLICT);
+        assert_eq!(fill_rows(&w).await, 0);
+        // map_symbol=false books just this fill
+        let body = AdoptBody { map_symbol: Some(false), ..adopt_into(&r) };
+        let _ = adopt_break(State(st), Extension(auth), Path(id), Json(body)).await.unwrap();
+        assert_eq!(fill_rows(&w).await, 1);
     }
 }
