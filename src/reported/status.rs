@@ -110,12 +110,14 @@ pub async fn get_status(
                                       ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) + 1 AS expected \
              FROM reported_batch WHERE strategy_code = $1) t \
           WHERE sequence_gap AND sequence IS NOT NULL AND expected IS NOT NULL \
-          ORDER BY received_at, batch_id",
+          ORDER BY received_at DESC, batch_id DESC LIMIT 100",
     )
     .bind(&code)
     .fetch_all(pool)
     .await
     .map_err(db)?;
+    let mut gaps = gaps;
+    gaps.reverse(); // oldest first within the latest 100
     let open_breaks: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM recon_break WHERE source = 'REPORTED' AND strategy_code = $1 AND status = 'open'",
     )
@@ -129,8 +131,21 @@ pub async fn get_status(
 #[derive(Debug, Deserialize)]
 pub struct FillsQuery {
     pub limit: Option<i64>,
-    /// Only fills with `trade_time` strictly before this (paging cursor).
-    pub before: Option<DateTime<Utc>>,
+    /// Opaque paging cursor: the previous page's `next_before`.
+    pub before: Option<String>,
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct FillsPage {
+    pub fills: Vec<FillRow>,
+    /// Pass as `before` for the next page; null on the last page.
+    pub next_before: Option<String>,
+}
+
+/// `<rfc3339 trade_time>|<fill id>`: the (trade_time, id) sort key of the last row.
+fn parse_cursor(c: &str) -> Option<(DateTime<Utc>, Uuid)> {
+    let (t, id) = c.split_once('|')?;
+    Some((DateTime::parse_from_rfc3339(t).ok()?.with_timezone(&Utc), id.parse().ok()?))
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow, utoipa::ToSchema)]
@@ -162,22 +177,31 @@ pub async fn get_fills(
     Extension(auth): Extension<AuthContext>,
     Path(code): Path<String>,
     Query(q): Query<FillsQuery>,
-) -> Result<Json<Vec<FillRow>>, ApiError> {
+) -> Result<Json<FillsPage>, ApiError> {
     let pool = state.pool();
     require_view(pool, auth.principal_id, &code).await?;
+    let cursor = match q.before.as_deref() {
+        Some(c) => Some(parse_cursor(c).ok_or_else(|| fail(StatusCode::BAD_REQUEST, "invalid before cursor"))?),
+        None => None,
+    };
+    let limit = clamp(q.limit);
     let rows = sqlx::query_as::<_, FillRow>(
         "SELECT id, batch_id, venue, account_ref, exec_id, client_order_id, symbol, instrument_id, side, qty::float8 AS qty, \
                 price::float8 AS price, fee::float8 AS fee, fee_asset, fee_effect, trade_time, booked_at \
-           FROM reported_fill WHERE strategy_code = $1 AND ($2::timestamptz IS NULL OR trade_time < $2) \
-          ORDER BY trade_time DESC, id LIMIT $3",
+           FROM reported_fill WHERE strategy_code = $1 AND ($2::timestamptz IS NULL OR (trade_time, id) < ($2, $3)) \
+          ORDER BY trade_time DESC, id DESC LIMIT $4",
     )
     .bind(&code)
-    .bind(q.before)
-    .bind(clamp(q.limit))
+    .bind(cursor.map(|c| c.0))
+    .bind(cursor.map(|c| c.1))
+    .bind(limit)
     .fetch_all(pool)
     .await
     .map_err(db)?;
-    Ok(Json(rows))
+    let next_before = (rows.len() as i64 == limit)
+        .then(|| rows.last().map(|r| format!("{}|{}", r.trade_time.to_rfc3339_opts(chrono::SecondsFormat::Micros, true), r.id)))
+        .flatten();
+    Ok(Json(FillsPage { fills: rows, next_before }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,5 +380,35 @@ mod tests {
         assert_eq!(err.status, StatusCode::FORBIDDEN);
         let err = get_fills(State(state), ctx(me), Path("nope".into()), q()).await.unwrap_err();
         assert_eq!(err.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn fills_paging_with_equal_trade_times_skips_nothing() {
+        let (pool, state, me, _) = setup("st4").await;
+        report(&pool, "st4", "b1", 1).await;
+        sqlx::query("INSERT INTO venue (code, name) VALUES ('CRYPTO', 'c') ON CONFLICT DO NOTHING").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO currency (code, name) VALUES ('USDT', 'tether') ON CONFLICT DO NOTHING").execute(&pool).await.unwrap();
+        let inst: i64 = sqlx::query_scalar(
+            "INSERT INTO instrument (symbol, name, venue, asset_class, instrument_class, currency, price_precision, price_increment) \
+             VALUES ('BTCUSDT', 'btc', 'CRYPTO', 'CRYPTO', 'SPOT', 'USDT', 2, 0.01) RETURNING id",
+        ).fetch_one(&pool).await.unwrap();
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO reported_fill (id, strategy_code, batch_id, venue, account_ref, exec_id, symbol, instrument_id, \
+                   side, qty, price, trade_time, raw_json) \
+                 VALUES ($1, 'st4', 'b1', 'BINANCE', 'a', $2, 'BTCUSDT', $3, 'BUY', 1, 1, '2026-01-01T00:00:00Z', '{}')",
+            ).bind(Uuid::new_v4()).bind(format!("e{i}")).bind(inst).execute(&pool).await.unwrap();
+        }
+        let mut seen = Vec::new();
+        let mut before = None;
+        loop {
+            let Json(page) = get_fills(State(state.clone()), ctx(me), Path("st4".into()), Query(FillsQuery { limit: Some(2), before })).await.unwrap();
+            seen.extend(page.fills.iter().map(|f| f.exec_id.clone()));
+            before = page.next_before;
+            if before.is_none() { break; }
+        }
+        seen.sort();
+        assert_eq!(seen, vec!["e0", "e1", "e2", "e3", "e4"]);
     }
 }
