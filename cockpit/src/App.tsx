@@ -10,7 +10,7 @@ import { AdminPanel } from "./shell/AdminPanel";
 import { useSession } from "./shell/session";
 import { TradePage } from "./pages/trading/Trade";
 import { PositionsPage } from "./pages/trading/Positions";
-import { ReportedStrategiesPage } from "./pages/trading/ReportedStrategies";
+import { StrategiesPage as ReportedStrategiesPage } from "./pages/trading/Strategies";
 import { AccessPage } from "./pages/trading/Access";
 import { UsersPage } from "./pages/admin/Users";
 import { GroupsPage } from "./pages/admin/Groups";

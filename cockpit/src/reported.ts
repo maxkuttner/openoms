@@ -111,3 +111,12 @@ export const adoptReportedBreak = (
   id: string,
   body: { instrument_id: string; portfolio_id?: string; map_symbol?: boolean },
 ) => post(`/admin/recon-breaks/${id}/adopt`, body);
+
+/** Which token buttons a strategy card offers; unknown status hides Revoke until it loads. */
+export function tokenActions(status: { token_active: boolean } | undefined): {
+  rotateLabel: "Rotate token" | "Issue token";
+  canRevoke: boolean;
+} {
+  if (!status) return { rotateLabel: "Rotate token", canRevoke: false };
+  return { rotateLabel: status.token_active ? "Rotate token" : "Issue token", canRevoke: status.token_active };
+}

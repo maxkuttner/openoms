@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
+import { cn } from "@/lib/utils";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "../../api/client";
 import { notifyError, notifyOk } from "../../api/hooks";
@@ -21,6 +24,7 @@ import {
   revokeToken,
   rotateToken,
   staleLabel,
+  tokenActions,
   type ReportedFill,
   type ReportedStrategy,
 } from "../../reported";
@@ -115,59 +119,99 @@ function StaleAfter({ row }: { row: ReportedStrategy }) {
   );
 }
 
+function BatchesTable({ code }: { code: string }) {
+  const batches = useQuery({ queryKey: [BASE, code, "batches"], queryFn: () => getBatches(api.get, code) });
+  if ((batches.data ?? []).length === 0) return <p className="text-sm text-muted-foreground">No batches.</p>;
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow><TableHead>Batch</TableHead><TableHead>Sequence</TableHead><TableHead>Received</TableHead><TableHead>Booked</TableHead><TableHead>Duplicate</TableHead><TableHead>Broken</TableHead></TableRow>
+      </TableHeader>
+      <TableBody>
+        {batches.data!.map((b) => (
+          <TableRow key={b.batch_id}>
+            <TableCell className="font-mono text-xs">{b.batch_id}</TableCell>
+            <TableCell>{b.sequence ?? "—"}{b.sequence_gap && <Pill tone="sell" className="ml-1">gap</Pill>}</TableCell>
+            <TableCell>{new Date(b.received_at).toLocaleString()}</TableCell>
+            <TableCell className="num">{b.booked}</TableCell>
+            <TableCell className="num">{b.duplicate}</TableCell>
+            <TableCell className="num">{b.broken}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="text-sm">{children}</span>
+    </div>
+  );
+}
+
+/** One strategy: health, token state and actions; fills, batches and settings open in a sheet. */
 function StrategyCard({ row, onToken }: { row: ReportedStrategy; onToken: (code: string, token: string) => void }) {
+  const qc = useQueryClient();
   const status = useQuery({ queryKey: [BASE, row.code, "status"], queryFn: () => getStatus(api.get, row.code), refetchInterval: 30_000 });
-  const batches = useQuery({ queryKey: [BASE, row.code, "batches"], queryFn: () => getBatches(api.get, row.code) });
   const s = status.data;
   const label = s ? staleLabel(s) : "…";
-  const rotate = () => rotateToken(api.post, row.code).then((r) => onToken(row.code, r.token)).catch(notifyError);
-  const revoke = () => revokeToken(api.del, row.code).then(() => notifyOk(`${row.code}: token revoked`)).catch(notifyError);
+  const actions = tokenActions(s);
+  const refresh = () => qc.invalidateQueries({ queryKey: [BASE, row.code, "status"] });
+  const rotate = () => rotateToken(api.post, row.code).then((r) => { refresh(); onToken(row.code, r.token); }).catch(notifyError);
+  const revoke = () => revokeToken(api.del, row.code).then(() => { refresh(); notifyOk(`${row.code}: token revoked`); }).catch(notifyError);
   return (
-    <Section title={<span className="flex items-center gap-2">{row.code} <span className="font-normal text-muted-foreground">{row.name}</span>
-      <Pill tone="warn">Self-managed / unverified</Pill></span>}>
-      <div className="flex flex-col gap-3">
-        <div className="flex flex-wrap items-center gap-3 text-sm">
-          <span>Last report: {s?.last_report_at ? new Date(s.last_report_at).toLocaleString() : "never"}</span>
-          <Pill tone={label === "ok" ? "buy" : "warn"}>{label}</Pill>
-          <span>Last sequence: {s?.last_sequence ?? "—"}</span>
-          <span>Open breaks: {s?.open_breaks ?? "—"}</span>
+    <Card className="gap-3 py-4">
+      <CardHeader className="flex flex-row flex-wrap items-center gap-2 px-4">
+        <CardTitle className="font-mono">{row.code}</CardTitle>
+        <span className="flex-1 truncate text-sm text-muted-foreground">{row.name}</span>
+        <Pill tone={label === "ok" ? "buy" : "warn"}>{label}</Pill>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3 px-4">
+        <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+          <Field label="Last report">{s?.last_report_at ? new Date(s.last_report_at).toLocaleString() : "never"}</Field>
+          <Field label="Last sequence"><span className="num">{s?.last_sequence ?? "—"}</span></Field>
+          <Field label="Open breaks"><span className={cn("num", s && s.open_breaks > 0 && "text-sell")}>{s?.open_breaks ?? "—"}</span></Field>
+          <Field label="Stale after"><span className="num">{row.stale_after_secs}s</span></Field>
+        </div>
+        {s && s.gaps.length > 0 && <Notice tone="error" title="Sequence gaps">{gapSummary(s.gaps)}</Notice>}
+        <div className="flex flex-wrap items-center gap-1.5 border-t pt-3">
+          {s && <Pill tone={s.token_active ? "buy" : "sell"}>{s.token_active ? "token active" : "no token"}</Pill>}
+          <Pill tone="warn">Self-managed / unverified</Pill>
           <div className="ml-auto flex gap-1.5">
-            <ConfirmButton size="xs" variant="secondary" title={`Rotate ${row.code}'s token?`} description="The current token stops working."
-              confirmLabel="Rotate" onConfirm={rotate}>Rotate token</ConfirmButton>
-            <ConfirmButton size="xs" variant="destructive" title={`Revoke ${row.code}'s token?`} description="Reports are refused until you rotate a new token."
-              confirmLabel="Revoke" onConfirm={revoke}>Revoke token</ConfirmButton>
+            <ConfirmButton size="xs" variant="secondary" title={`${actions.rotateLabel} for ${row.code}?`} description="Any current token stops working."
+              confirmLabel={actions.rotateLabel} onConfirm={rotate}>{actions.rotateLabel}</ConfirmButton>
+            {actions.canRevoke && (
+              <ConfirmButton size="xs" variant="destructive" title={`Revoke ${row.code}'s token?`} description="Reports are refused until you issue a new token."
+                confirmLabel="Revoke" onConfirm={revoke}>Revoke token</ConfirmButton>
+            )}
           </div>
         </div>
-        {s && s.stale && <Notice tone="error">{s.last_report_at ? `No report for longer than ${row.stale_after_secs}s.` : "This strategy has never reported."}</Notice>}
-        {s && s.gaps.length > 0 && <Notice tone="error" title="Sequence gaps">{gapSummary(s.gaps)}</Notice>}
-        <StaleAfter row={row} />
-        <FillsTable code={row.code} />
-        {(batches.data ?? []).length > 0 && (
-          <Table>
-            <TableHeader>
-              <TableRow><TableHead>Batch</TableHead><TableHead>Sequence</TableHead><TableHead>Received</TableHead><TableHead>Booked</TableHead><TableHead>Duplicate</TableHead><TableHead>Broken</TableHead></TableRow>
-            </TableHeader>
-            <TableBody>
-              {batches.data!.map((b) => (
-                <TableRow key={b.batch_id}>
-                  <TableCell className="font-mono text-xs">{b.batch_id}</TableCell>
-                  <TableCell>{b.sequence ?? "—"}{b.sequence_gap && <Pill tone="sell" className="ml-1">gap</Pill>}</TableCell>
-                  <TableCell>{new Date(b.received_at).toLocaleString()}</TableCell>
-                  <TableCell className="num">{b.booked}</TableCell>
-                  <TableCell className="num">{b.duplicate}</TableCell>
-                  <TableCell className="num">{b.broken}</TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        )}
-      </div>
-    </Section>
+        <Sheet>
+          <SheetTrigger asChild>
+            <Button size="xs" variant="link" className="self-start px-0">Fills, batches and settings →</Button>
+          </SheetTrigger>
+          <SheetContent className="w-full overflow-y-auto sm:max-w-3xl">
+            <SheetHeader><SheetTitle>{row.code} — {row.name}</SheetTitle></SheetHeader>
+            <div className="flex flex-col gap-4 px-4 pb-4">
+              {s && s.stale && <Notice tone="error">{s.last_report_at ? `No report for longer than ${row.stale_after_secs}s.` : "This strategy has never reported."}</Notice>}
+              <StaleAfter row={row} />
+              <h3 className="text-sm font-semibold">Fills</h3>
+              <FillsTable code={row.code} />
+              <h3 className="text-sm font-semibold">Batches</h3>
+              <BatchesTable code={row.code} />
+            </div>
+          </SheetContent>
+        </Sheet>
+      </CardContent>
+    </Card>
   );
 }
 
 /** Strategies that trade outside the OMS and report their fills to it. */
-export function ReportedStrategiesPage() {
+export function StrategiesPage() {
   const list = useQuery({ queryKey: [BASE], queryFn: () => listReported(api.get) });
   const [token, setToken] = useState<{ code: string; token: string } | null>(null);
   const show = (code: string, t: string) => setToken({ code, token: t });
@@ -177,8 +221,13 @@ export function ReportedStrategiesPage() {
         These strategies trade on their own and report fills here. The OMS books what they report but does not see the venue:
         positions are self-managed and unverified.
       </p>
-      <CreateForm onCreated={show} />
-      {(list.data ?? []).map((r) => <StrategyCard key={r.code} row={r} onToken={show} />)}
+      <Section title="New strategy">
+        <CreateForm onCreated={show} />
+        <p className="mt-2 text-xs text-muted-foreground">Creates the strategy, a private portfolio and a reporting token (shown once).</p>
+      </Section>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2 2xl:grid-cols-3">
+        {(list.data ?? []).map((r) => <StrategyCard key={r.code} row={r} onToken={show} />)}
+      </div>
       {list.data?.length === 0 && <Notice tone="info">No reported strategies yet.</Notice>}
       {token && <TokenModal code={token.code} token={token.token} onClose={() => setToken(null)} />}
     </div>

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gapSummary, isReportedBreak, reportedBreakLabel, staleLabel } from "./reported.ts";
+import { gapSummary, isReportedBreak, reportedBreakLabel, staleLabel, tokenActions } from "./reported.ts";
 
 const now = Date.parse("2026-11-23T12:00:00Z");
 
@@ -31,4 +31,10 @@ test("reported breaks are labelled unverified", () => {
   assert.equal(isReportedBreak({ source: "REPORTED" }), true);
   assert.equal(isReportedBreak({ source: "RECONCILED" }), false);
   assert.equal(reportedBreakLabel, "Reported, not verified");
+});
+
+test("token actions follow token_active", () => {
+  assert.deepEqual(tokenActions({ token_active: true }), { rotateLabel: "Rotate token", canRevoke: true });
+  assert.deepEqual(tokenActions({ token_active: false }), { rotateLabel: "Issue token", canRevoke: false });
+  assert.deepEqual(tokenActions(undefined), { rotateLabel: "Rotate token", canRevoke: false });
 });
