@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { gapSummary, isReportedBreak, reportedBreakLabel, staleLabel, tokenActions } from "./reported.ts";
+import { gapSummary, isReportedBreak, reportedBreakLabel, staleLabel, tokenActions, visibleStrategies } from "./reported.ts";
 
 const now = Date.parse("2026-11-23T12:00:00Z");
 
@@ -37,4 +37,10 @@ test("token actions follow token_active", () => {
   assert.deepEqual(tokenActions({ token_active: true }), { rotateLabel: "Rotate token", canRevoke: true });
   assert.deepEqual(tokenActions({ token_active: false }), { rotateLabel: "Issue token", canRevoke: false });
   assert.deepEqual(tokenActions(undefined), { rotateLabel: "Rotate token", canRevoke: false });
+});
+
+test("visibleStrategies hides archived unless asked", () => {
+  const rows = [{ code: "a", archived_at: null }, { code: "b", archived_at: "2026-11-23T12:00:00Z" }];
+  assert.deepEqual(visibleStrategies(rows, false).map((r) => r.code), ["a"]);
+  assert.deepEqual(visibleStrategies(rows, true).map((r) => r.code), ["a", "b"]);
 });

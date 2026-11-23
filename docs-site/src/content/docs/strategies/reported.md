@@ -34,6 +34,9 @@ strategy that trades [through the OMS](/strategies/fix/) instead.
    redeploy without dropping reports. Only one old token is kept in its grace period:
    rotating again revokes it at once. **Revoke** stops all the strategy's tokens at once
    (requests get `401`).
+4. **Archive** retires a strategy you no longer run: it revokes every token, blocks new
+   ones and hides the strategy from the list (**Show archived** brings it back into view).
+   Its fills, batches and portfolio are kept for audit. Strategies are never deleted.
 
 ## Reporting fills
 

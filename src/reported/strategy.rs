@@ -46,6 +46,8 @@ pub struct ReportedStrategy {
     pub state: String,
     pub stale_after_secs: i32,
     pub created_at: DateTime<Utc>,
+    /// Set once archived: no reporting, kept for audit.
+    pub archived_at: Option<DateTime<Utc>>,
 }
 
 fn db(e: sqlx::Error) -> ApiError {
@@ -161,11 +163,14 @@ pub async fn rotate_token(
     crate::authz::require_mfa(&auth)?;
     require_owner(state.pool(), auth.principal_id, &code).await?;
     let mut tx = state.pool().begin().await.map_err(db)?;
-    sqlx::query("SELECT 1 FROM strategy WHERE code = $1 FOR UPDATE")
+    let archived: bool = sqlx::query_scalar("SELECT archived_at IS NOT NULL FROM strategy WHERE code = $1 FOR UPDATE")
         .bind(&code)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await
         .map_err(db)?;
+    if archived {
+        return Err(status(StatusCode::CONFLICT, "strategy is archived"));
+    }
     sqlx::query(
         "UPDATE strategy_reporting_token SET revoked_at = now() \
           WHERE strategy_code = $1 AND revoked_at IS NULL AND expires_at IS NOT NULL",
@@ -203,14 +208,39 @@ pub async fn revoke_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The caller's own reported strategies; an admin sees all.
+/// Archive: revoke every token and hide the strategy from the list. Fills,
+/// batches and the portfolio stay. Idempotent.
+pub async fn archive(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(code): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    crate::authz::require_mfa(&auth)?;
+    require_owner(state.pool(), auth.principal_id, &code).await?;
+    let mut tx = state.pool().begin().await.map_err(db)?;
+    sqlx::query("UPDATE strategy SET archived_at = COALESCE(archived_at, now()) WHERE code = $1")
+        .bind(&code)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    sqlx::query("UPDATE strategy_reporting_token SET revoked_at = now() WHERE strategy_code = $1 AND revoked_at IS NULL")
+        .bind(&code)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    tx.commit().await.map_err(db)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The caller's own reported strategies, archived ones included (the UI
+/// hides them by default); an admin sees all.
 pub async fn list_mine(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<ReportedStrategy>>, ApiError> {
     let admin = is_admin(state.pool(), auth.principal_id).await?;
     let rows = sqlx::query_as::<_, ReportedStrategy>(
-        "SELECT code, name, portfolio_id, owner_principal_id, state, stale_after_secs, created_at \
+        "SELECT code, name, portfolio_id, owner_principal_id, state, stale_after_secs, created_at, archived_at \
            FROM strategy WHERE mode = 'REPORTED' AND ($2 OR owner_principal_id = $1) ORDER BY code",
     )
     .bind(auth.principal_id)
@@ -339,6 +369,27 @@ mod tests {
         let s = revoke_token(State(state), ctx(me), Path("delta".into())).await.unwrap();
         assert_eq!(s, StatusCode::NO_CONTENT);
         assert!(token::authenticate(&pool, &c.token).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn archive_revokes_tokens_blocks_rotate_and_keeps_history() {
+        let (pool, state, me) = setup().await;
+        let other = human(&pool).await;
+        let Json(c) = create(State(state.clone()), ctx(me), req("arch")).await.unwrap();
+        let err = archive(State(state.clone()), ctx(other), Path("arch".into())).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(archive(State(state.clone()), ctx(me), Path("arch".into())).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(token::authenticate(&pool, &c.token).await.is_err());
+        let err = rotate_token(State(state.clone()), ctx(me), Path("arch".into())).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        // Idempotent; strategy and portfolio stay.
+        assert_eq!(archive(State(state.clone()), ctx(me), Path("arch".into())).await.unwrap(), StatusCode::NO_CONTENT);
+        let Json(mine) = list_mine(State(state), ctx(me)).await.unwrap();
+        assert!(mine[0].archived_at.is_some());
+        let portfolio: i64 = sqlx::query_scalar("SELECT count(*) FROM portfolio WHERE id = $1")
+            .bind(c.portfolio_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(portfolio, 1);
     }
 
     #[tokio::test]

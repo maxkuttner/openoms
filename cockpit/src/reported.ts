@@ -11,6 +11,8 @@ export type ReportedStrategy = {
   state: string;
   stale_after_secs: number;
   created_at: string;
+  /** Set once archived: reporting stopped, history kept. */
+  archived_at: string | null;
 };
 
 export type ReportedCreated = { code: string; portfolio_id: string; group_id: string; token: string };
@@ -93,6 +95,7 @@ export const createReported = (post: Post, body: { code: string; name: string; b
   post<ReportedCreated>(BASE, body);
 export const rotateToken = (post: Post, code: string) => post<{ token: string }>(`${BASE}/${enc(code)}/token`, {});
 export const revokeToken = (del: Del, code: string) => del(`${BASE}/${enc(code)}/token`);
+export const archiveReported = (post: Post, code: string) => post(`${BASE}/${enc(code)}/archive`, {});
 export const getStatus = (get: Get, code: string) => get<ReportedStatus>(`${BASE}/${enc(code)}/status`);
 export function fillsPath(code: string, limit = 50, before?: string | null): string {
   const q = new URLSearchParams({ limit: String(limit) });
@@ -119,4 +122,9 @@ export function tokenActions(status: { token_active: boolean } | undefined): {
 } {
   if (!status) return { rotateLabel: "Rotate token", canRevoke: false };
   return { rotateLabel: status.token_active ? "Rotate token" : "Issue token", canRevoke: status.token_active };
+}
+
+/** The strategies the list shows: archived ones only on request. */
+export function visibleStrategies<T extends { archived_at: string | null }>(rows: T[], showArchived: boolean): T[] {
+  return showArchived ? rows : rows.filter((r) => !r.archived_at);
 }

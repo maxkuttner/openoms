@@ -276,7 +276,7 @@ pub async fn patch(
     }
     let row = sqlx::query_as::<_, ReportedStrategy>(
         "UPDATE strategy SET stale_after_secs = COALESCE($2, stale_after_secs) WHERE code = $1 \
-         RETURNING code, name, portfolio_id, owner_principal_id, state, stale_after_secs, created_at",
+         RETURNING code, name, portfolio_id, owner_principal_id, state, stale_after_secs, created_at, archived_at",
     )
     .bind(&code)
     .bind(p.stale_after_secs)

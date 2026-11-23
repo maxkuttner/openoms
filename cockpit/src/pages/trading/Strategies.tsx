@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -19,12 +21,14 @@ import {
   getBatches,
   getFills,
   getStatus,
+  archiveReported,
   listReported,
   patchReported,
   revokeToken,
   rotateToken,
   staleLabel,
   tokenActions,
+  visibleStrategies,
   type ReportedFill,
   type ReportedStrategy,
 } from "../../reported";
@@ -162,12 +166,16 @@ function StrategyCard({ row, onToken }: { row: ReportedStrategy; onToken: (code:
   const refresh = () => qc.invalidateQueries({ queryKey: [BASE, row.code, "status"] });
   const rotate = () => rotateToken(api.post, row.code).then((r) => { refresh(); onToken(row.code, r.token); }).catch(notifyError);
   const revoke = () => revokeToken(api.del, row.code).then(() => { refresh(); notifyOk(`${row.code}: token revoked`); }).catch(notifyError);
+  const archive = () => archiveReported(api.post, row.code)
+    .then(() => { qc.invalidateQueries({ queryKey: [BASE] }); notifyOk(`${row.code}: archived`); })
+    .catch(notifyError);
+  const archived = !!row.archived_at;
   return (
     <Card className="gap-3 py-4">
       <CardHeader className="flex flex-row flex-wrap items-center gap-2 px-4">
         <CardTitle className="font-mono">{row.code}</CardTitle>
         <span className="flex-1 truncate text-sm text-muted-foreground">{row.name}</span>
-        <Pill tone={label === "ok" ? "buy" : "warn"}>{label}</Pill>
+        {archived ? <Pill tone="muted">archived</Pill> : <Pill tone={label === "ok" ? "buy" : "warn"}>{label}</Pill>}
       </CardHeader>
       <CardContent className="flex flex-col gap-3 px-4">
         <div className="grid grid-cols-2 gap-x-4 gap-y-2">
@@ -178,8 +186,11 @@ function StrategyCard({ row, onToken }: { row: ReportedStrategy; onToken: (code:
         </div>
         {s && s.gaps.length > 0 && <Notice tone="error" title="Sequence gaps">{gapSummary(s.gaps)}</Notice>}
         <div className="flex flex-wrap items-center gap-1.5 border-t pt-3">
-          {s && <Pill tone={s.token_active ? "buy" : "sell"}>{s.token_active ? "token active" : "no token"}</Pill>}
+          {s && !archived && <Pill tone={s.token_active ? "buy" : "sell"}>{s.token_active ? "token active" : "no token"}</Pill>}
           <Pill tone="warn">Self-managed / unverified</Pill>
+          {archived ? (
+            <span className="ml-auto text-xs text-muted-foreground">Archived {new Date(row.archived_at!).toLocaleDateString()}</span>
+          ) : (
           <div className="ml-auto flex gap-1.5">
             <ConfirmButton size="xs" variant="secondary" title={`${actions.rotateLabel} for ${row.code}?`} description="Any current token stops working."
               confirmLabel={actions.rotateLabel} onConfirm={rotate}>{actions.rotateLabel}</ConfirmButton>
@@ -187,7 +198,11 @@ function StrategyCard({ row, onToken }: { row: ReportedStrategy; onToken: (code:
               <ConfirmButton size="xs" variant="destructive" title={`Revoke ${row.code}'s token?`} description="Reports are refused until you issue a new token."
                 confirmLabel="Revoke" onConfirm={revoke}>Revoke token</ConfirmButton>
             )}
+            <ConfirmButton size="xs" variant="destructive" title={`Archive ${row.code}?`}
+              description="Revokes its tokens and hides it from this list. Fills, batches and its portfolio are kept. This cannot be undone here."
+              confirmLabel="Archive" onConfirm={archive}>Archive</ConfirmButton>
           </div>
+          )}
         </div>
         <Sheet>
           <SheetTrigger asChild>
@@ -215,6 +230,10 @@ export function StrategiesPage() {
   const list = useQuery({ queryKey: [BASE], queryFn: () => listReported(api.get) });
   const [token, setToken] = useState<{ code: string; token: string } | null>(null);
   const show = (code: string, t: string) => setToken({ code, token: t });
+  const [showArchived, setShowArchived] = useState(false);
+  const all = list.data ?? [];
+  const rows = visibleStrategies(all, showArchived);
+  const archivedCount = all.length - visibleStrategies(all, false).length;
   return (
     <div className="flex flex-col gap-4">
       <p className="text-sm text-muted-foreground">
@@ -225,10 +244,16 @@ export function StrategiesPage() {
         <CreateForm onCreated={show} />
         <p className="mt-2 text-xs text-muted-foreground">Creates the strategy, a private portfolio and a reporting token (shown once).</p>
       </Section>
+      {archivedCount > 0 && (
+        <div className="flex items-center gap-2">
+          <Switch id="show-archived" checked={showArchived} onCheckedChange={setShowArchived} />
+          <Label htmlFor="show-archived" className="text-sm">Show archived ({archivedCount})</Label>
+        </div>
+      )}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 2xl:grid-cols-3">
-        {(list.data ?? []).map((r) => <StrategyCard key={r.code} row={r} onToken={show} />)}
+        {rows.map((r) => <StrategyCard key={r.code} row={r} onToken={show} />)}
       </div>
-      {list.data?.length === 0 && <Notice tone="info">No reported strategies yet.</Notice>}
+      {list.data && rows.length === 0 && <Notice tone="info">No reported strategies yet.</Notice>}
       {token && <TokenModal code={token.code} token={token.token} onClose={() => setToken(null)} />}
     </div>
   );
