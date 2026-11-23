@@ -23,7 +23,7 @@ ALTER TABLE user_group ADD COLUMN strategy_code TEXT UNIQUE REFERENCES strategy(
 CREATE TABLE strategy_reporting_token (
     id            UUID PRIMARY KEY,
     strategy_code TEXT NOT NULL REFERENCES strategy(code) ON DELETE CASCADE,
-    token_hash    TEXT NOT NULL UNIQUE,
+    token_hash    TEXT NOT NULL UNIQUE, -- SHA-256 hex of the 256-bit secret
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at    TIMESTAMPTZ,
     expires_at    TIMESTAMPTZ

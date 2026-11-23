@@ -262,11 +262,16 @@ mod tests {
         let pcode: String = sqlx::query_scalar("SELECT code FROM portfolio WHERE id = $1")
             .bind(c.portfolio_id).fetch_one(&pool).await.unwrap();
         assert_eq!(pcode, "RPT-alpha");
-        let role: String = sqlx::query_scalar(
-            "SELECT role_code FROM portfolio_access WHERE principal_id = $1 AND portfolio_id = $2",
+        let access: String = sqlx::query_scalar(
+            "SELECT access FROM user_group_portfolio WHERE group_id = $1 AND portfolio_id = $2",
+        )
+        .bind(c.group_id).bind(c.portfolio_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(access, "manage");
+        let visible: bool = sqlx::query_scalar(
+            "SELECT can_view FROM portfolio_access WHERE principal_id = $1 AND portfolio_id = $2",
         )
         .bind(me).bind(c.portfolio_id).fetch_one(&pool).await.unwrap();
-        assert_eq!(role, "pm");
+        assert!(visible);
         let theirs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM portfolio_access WHERE principal_id = $1 AND portfolio_id = $2",
         )
@@ -296,6 +301,11 @@ mod tests {
         let stored: String = sqlx::query_scalar("SELECT token_hash FROM strategy_reporting_token")
             .fetch_one(&pool).await.unwrap();
         assert!(!c.token.contains(&stored));
+        assert_eq!(stored.len(), 64);
+        let (id, _) = c.token.split_once('.').unwrap();
+        assert!(token::authenticate(&pool, &format!("{id}.sk_wrong")).await.is_err());
+        let unknown = format!("{}.sk_x", Uuid::new_v4().simple());
+        assert!(token::authenticate(&pool, &unknown).await.is_err());
     }
 
     #[tokio::test]

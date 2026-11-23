@@ -459,6 +459,23 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         status: StatusCode::BAD_REQUEST,
         message: "portfolio_id must be a UUID".to_string(),
     })?;
+    // A reported strategy's portfolio is reported-only: its fills arrive over
+    // the reporting API, never through the OMS order path.
+    if !matches!(origin, Origin::External) {
+        let reported: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM strategy WHERE portfolio_id = $1 AND mode = 'REPORTED')",
+        )
+        .bind(portfolio_id)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| crate::handlers::internal("database error", e))?;
+        if reported {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "portfolio belongs to a self-managed reported strategy".to_string(),
+            });
+        }
+    }
     // A strategy's portfolio is traded only by the strategy. Its orders may name
     // the instrument by broker symbol plus broker code (`venue`), which also
     // picks the strategy's account for that broker.
@@ -1233,5 +1250,28 @@ mod tests {
         let e = submit(&state, &other, request(s.portfolio_id, "BTCUSDT", "BINANCE"), Origin::Api).await.unwrap_err();
         assert!(e.message.contains("strategy_portfolio"), "{}", e.message);
         test_support::drop_strategy(&pool, &code).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn order_into_reported_portfolio_is_refused() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let me = Uuid::new_v4();
+        sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, 'rp-owner', 'HUMAN', 'ACTIVE')")
+            .bind(me).execute(&pool).await.unwrap();
+        let auth = AuthContext::machine(me, "rp-owner".into());
+        let axum::Json(c) = crate::reported::strategy::create(
+            axum::extract::State(state.clone()),
+            axum::extract::Extension(auth.clone()),
+            axum::Json(crate::reported::strategy::CreateReported { code: "rp".into(), name: "rp".into(), base_currency: None }),
+        )
+        .await
+        .unwrap();
+        let e = submit(&state, &auth, request(c.portfolio_id, "BTCUSDT", "BINANCE"), Origin::Api).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.message, "portfolio belongs to a self-managed reported strategy");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM order_state").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
     }
 }
