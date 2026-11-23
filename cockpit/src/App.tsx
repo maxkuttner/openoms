@@ -11,6 +11,7 @@ import { useSession } from "./shell/session";
 import { TradePage } from "./pages/trading/Trade";
 import { PositionsPage } from "./pages/trading/Positions";
 import { StrategiesPage as ReportedStrategiesPage } from "./pages/trading/Strategies";
+import { ApiKeysPage } from "./pages/trading/Api";
 import { AccessPage } from "./pages/trading/Access";
 import { UsersPage } from "./pages/admin/Users";
 import { GroupsPage } from "./pages/admin/Groups";
@@ -50,7 +51,7 @@ export function App() {
       <Route element={<AuthGate><Shell /></AuthGate>}>
         <Route index element={<Trade />} />
         <Route path="strategies" element={<ReportedStrategiesPage />} />
-        <Route path="api" element={<Pending />} />
+        <Route path="api" element={<ApiKeysPage />} />
         <Route path="portfolios" element={<Positions />} />
         <Route path="orders" element={<Pending />} />
         <Route path="jobs" element={<Pending />} />

@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ApiKeysBox, type ApiKeysSource } from "../components/ApiKeysBox";
 import { FormRow, Notice, Section, Spinner } from "../components/common";
 import { authApi, authErrorText, type SessionInfo } from "./api";
 import { ChangePassword } from "./ChangePassword";
@@ -62,15 +61,7 @@ function TwoStepSignIn({ me, onChanged }: { me: SessionInfo; onChanged: () => vo
   );
 }
 
-/** Your own keys, through the session's `/auth/keys`. */
-const ownKeys: ApiKeysSource = {
-  list: authApi.myKeys,
-  create: authApi.createKey,
-  revoke: authApi.revokeKey,
-  errorText: authErrorText,
-};
-
-/** The account page: password and two-step sign-in for local accounts, and API keys. */
+/** The account page: password and two-step sign-in for local accounts, API keys live under Trade → API. */
 export function AccountSettings() {
   const [me, setMe] = useState<SessionInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -95,10 +86,6 @@ export function AccountSettings() {
           <TwoStepSignIn me={me} onChanged={() => void reload()} />
         </>
       )}
-      <ApiKeysBox
-        source={ownKeys}
-        intro={<>A key acts as you, with your portfolio access. Use it as <code className="num">Authorization: Bearer key_id.secret</code>.</>}
-      />
     </div>
   );
 }
