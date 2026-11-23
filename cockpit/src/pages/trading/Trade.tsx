@@ -1,14 +1,16 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Search } from "lucide-react";
 import type { Me } from "../../access";
 import { TradeBlotter } from "../../components/trading/TradeBlotter";
 import { OrderTicket } from "../../components/trading/OrderTicket";
 import { StrategyTicket } from "../../components/trading/StrategyTicket";
 import { InstrumentSearchModal } from "../../components/trading/InstrumentSearchModal";
-import { Watchlist } from "../../components/trading/Watchlist";
+import { InstrumentHeader } from "../../components/trading/InstrumentHeader";
+import { OrderBook } from "../../components/market/OrderBook";
+import { PriceChart } from "../../components/market/PriceChart";
+import { Notice } from "../../components/common";
+import { sampleMarketData } from "../../marketData";
 import { PositionsPage } from "./Positions";
 import type { Side, StrategyLeg } from "../../components/trading/types";
 
@@ -68,13 +70,24 @@ export function TradePage({ me }: { me: Me }) {
         }}
         onPickLegs={(legs) => setPendingLegs(legs)}
       />
-      <div className="grid grid-cols-1 gap-3 lg:grid-cols-[minmax(220px,1fr)_minmax(260px,1fr)_minmax(0,2fr)]">
-        <div className="flex flex-col gap-2">
-          <Button variant="secondary" onClick={() => setSearchOpen(true)}>
-            <Search /> Search instruments
-          </Button>
-          <Watchlist onSelectInstrument={setSelectedInstrument} />
-        </div>
+      <div className="flex flex-col gap-3">
+        <InstrumentHeader
+          source={sampleMarketData}
+          instrument={selectedInstrument}
+          onPick={(i) => { setPendingLegs(null); setSelectedInstrument(i); }}
+          onOpenSearch={() => setSearchOpen(true)}
+        />
+        <div className="flex flex-col gap-3 lg:flex-row">
+          <div className="min-h-[520px] min-w-0 flex-1">
+            {selectedInstrument ? (
+              // Sample prices only: nothing here feeds the ticket below.
+              <PriceChart source={sampleMarketData} instrumentId={selectedInstrument.symbol} />
+            ) : (
+              <Notice tone="info">Pick an instrument to see its chart and order book.</Notice>
+            )}
+          </div>
+          <div className="flex w-full flex-col gap-3 lg:w-[360px] lg:shrink-0">
+            {selectedInstrument && <OrderBook source={sampleMarketData} instrumentId={selectedInstrument.symbol} />}
         <div>
           {pendingLegs ? (
             // Keyed by the combo's own legs so a new "Use this combo" pick
@@ -99,6 +112,8 @@ export function TradePage({ me }: { me: Me }) {
               onSubmitted={onOrdersSubmitted}
             />
           )}
+        </div>
+          </div>
         </div>
         <div className="min-w-0">
           <Tabs value={activeTab ?? "orders"} onValueChange={setActiveTab}>
