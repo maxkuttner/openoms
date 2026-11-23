@@ -208,8 +208,8 @@ pub async fn revoke_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Archive: revoke every token and hide the strategy from the list. Fills,
-/// batches and the portfolio stay. Idempotent.
+/// Archive: revoke every token, hide the strategy from the list and close its
+/// portfolio. Fills, batches and the portfolio's rows stay. Idempotent.
 pub async fn archive(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
@@ -219,6 +219,12 @@ pub async fn archive(
     require_owner(state.pool(), auth.principal_id, &code).await?;
     let mut tx = state.pool().begin().await.map_err(db)?;
     sqlx::query("UPDATE strategy SET archived_at = COALESCE(archived_at, now()) WHERE code = $1")
+        .bind(&code)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?;
+    // Close its portfolio too, so it drops out of every trader-facing portfolio list.
+    sqlx::query("UPDATE portfolio SET status = 'CLOSED' WHERE id = (SELECT portfolio_id FROM strategy WHERE code = $1)")
         .bind(&code)
         .execute(&mut *tx)
         .await
@@ -390,6 +396,9 @@ mod tests {
         let portfolio: i64 = sqlx::query_scalar("SELECT count(*) FROM portfolio WHERE id = $1")
             .bind(c.portfolio_id).fetch_one(&pool).await.unwrap();
         assert_eq!(portfolio, 1);
+        let pstatus: String = sqlx::query_scalar("SELECT status FROM portfolio WHERE id = $1")
+            .bind(c.portfolio_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(pstatus, "CLOSED");
     }
 
     #[tokio::test]

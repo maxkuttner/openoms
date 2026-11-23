@@ -517,7 +517,7 @@ pub async fn list_portfolios(
                 g.portfolio_id = ANY($3) AS can_trade, g.can_view, g.can_allocate \
          FROM portfolio_access g \
          JOIN portfolio p ON p.id = g.portfolio_id \
-         WHERE g.principal_id = $1 AND g.portfolio_id = ANY($2) \
+         WHERE g.principal_id = $1 AND g.portfolio_id = ANY($2) AND p.status = 'ACTIVE' \
          ORDER BY p.code",
     )
     .bind(auth.principal_id)

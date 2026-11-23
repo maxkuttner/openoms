@@ -564,7 +564,7 @@ pub async fn me(
                 g.can_trade, g.can_view, g.can_allocate \
          FROM portfolio_access g \
          JOIN portfolio p ON p.id = g.portfolio_id \
-         WHERE g.principal_id = $1 \
+         WHERE g.principal_id = $1 AND p.status = 'ACTIVE' \
          ORDER BY p.code",
     )
     .bind(auth.principal_id)
