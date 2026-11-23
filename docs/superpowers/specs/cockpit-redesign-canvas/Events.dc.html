@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenOMS — Events</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0;background:#13171d}
+a{color:#25b083}a:hover{color:#4fd1a5}
+.nav a{color:#a3a3a3;text-decoration:none}
+.nav a:hover{color:#ededed;background:#1d232c}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #13171d; color: #ededed; font-family: Inter, system-ui, sans-serif; display: flex; flex-wrap: wrap">
+  <nav class="nav" aria-label="Main" style="{{ navStyle }}">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 6px 10px 18px">
+      <svg width="18.4" height="17" viewBox="0 0 26 24" role="img" aria-label="openOMS"><rect x="0" y="0" width="15.6" height="3" rx="1" fill="#25b083"></rect><rect x="0" y="5.5" width="22.1" height="3" rx="1" fill="#25b083"></rect><rect x="0" y="11" width="26" height="2" rx="1" fill="#2a2f38"></rect><rect x="0" y="15" width="18.7" height="3" rx="1" fill="#ce9a3b"></rect><rect x="0" y="20.5" width="23.4" height="3" rx="1" fill="#ce9a3b"></rect></svg>
+      <sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span aria-hidden="true" style="font-size: 15px; letter-spacing: -0.5px; line-height: 1; white-space: nowrap"><span style="font-weight: 400; color: #737373">open</span><span style="font-weight: 600; color: #ededed">OMS</span></span></sc-if>
+    </div>
+    <a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 18l5-6 4 3 7-9"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span style="flex: 1 1 auto">Trade</span></sc-if></a>
+    <div style="display: flex; flex-direction: column; gap: 2px; margin: 0 0 4px 19px; padding-left: 10px; border-left: 1px solid #2a2f38"><a href="Main.dc.html" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Trade entry</a><a href="Strategies.dc.html" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Strategies</a><a href="Api.dc.html" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">API</a></div>
+    <a href="Portfolios.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="7" width="18" height="13" rx="2"></rect><path d="M9 7V5h6v2"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Portfolios</span></sc-if></a>
+    <a href="Orders.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Orders</span></sc-if></a>
+    <a href="Jobs.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 8v4l3 2"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Jobs</span></sc-if></a>
+    <a href="Events.dc.html" aria-current="page" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; background: #1d232c; color: #ededed; font-weight: 600; font-size: 14px; box-shadow: inset 2px 0 0 #25b083">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M13 3L5 14h6l-1 7 8-11h-6z"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Events</span></sc-if></a>
+    <sc-if value="{{ isAdmin }}" hint-placeholder-val="{{ true }}">
+    <a href="#" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span style="flex: 1 1 auto">Admin</span></sc-if></a>
+    <sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><div style="display: flex; flex-direction: column; gap: 2px; margin: 0 0 4px 19px; padding-left: 10px; border-left: 1px solid #2a2f38"><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">People</a><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Trading setup</a><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Connectivity</a><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Monitoring</a></div></sc-if>
+    </sc-if>
+    <div style="flex: 1 1 auto"></div>
+    <button type="button" aria-label="Account menu" style="display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 10px; border-radius: 5px; border: 1px solid #2a2f38; background: #13171d; color: #ededed; font: inherit; font-size: 14px">
+      <span style="width: 26px; height: 26px; border-radius: 50%; background: #1d232c; color: #ce9a3b; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700">M</span>
+      <sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span style="flex: 1 1 auto; text-align: left">max</span></sc-if>
+    </button>
+  </nav>
+
+  <main style="flex: 999 1 560px; min-width: 0; padding: 20px; box-sizing: border-box; display: flex; flex-direction: column; gap: 16px">
+    <div style="display: flex; align-items: center; gap: 8px; min-height: 40px; margin: -8px 0 -4px; border-bottom: 1px solid #2a2f38; padding-bottom: 8px">
+      <button type="button" onClick="{{ toggleNav }}" aria-label="Toggle sidebar" title="Toggle sidebar (Ctrl+B)" style="display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 5px; border: 0; background: transparent; color: #ededed; cursor: pointer"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M9 4v16"></path></svg></button>
+      <span style="width: 1px; height: 18px; background: #2a2f38"></span>
+      <span style="font-size: 13px; color: #a3a3a3">Events</span>
+    </div>
+    <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+      <h1 style="margin: 0; font-size: 22px; font-weight: 700; flex: 1 1 auto">Events</h1>
+      <div role="tablist" aria-label="Stream" style="display: flex; flex-wrap: wrap; gap: 2px; background: #1d232c; padding: 3px; border-radius: 5px; width: fit-content">
+        <button type="button" role="tab" onClick="{{ showBus }}" style="{{ busStyle }}">Message bus</button>
+        <button type="button" role="tab" onClick="{{ showOut }}" style="{{ outStyle }}">Published (Kafka)</button>
+      </div>
+      <label style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #a3a3a3">Filter
+        <input placeholder="topic, order id…" style="min-height: 36px; width: 220px; background: #0d1014; color: #ededed; border: 1px solid #2a2f38; border-radius: 5px; padding: 0 10px; font: inherit; font-size: 13px"></label>
+    </header>
+
+    <section aria-label="Event stream" style="background: #0d1014; border: 1px solid #2a2f38; border-radius: 5px; padding: 8px 16px; overflow-x: auto">
+      <table style="width: 100%; min-width: 720px; border-collapse: collapse; font-size: 13px">
+        <thead><tr style="color: #a3a3a3; text-align: left">
+          <th style="padding: 10px 8px; font-weight: 500">Time</th><th style="padding: 10px 8px; font-weight: 500">Topic</th><th style="padding: 10px 8px; font-weight: 500">Key</th><th style="padding: 10px 8px; font-weight: 500">Summary</th>
+        </tr></thead>
+        <tbody>
+          <sc-for list="{{ rows }}" as="r" hint-placeholder-count="10">
+            <tr style="border-top: 1px solid #1d232c">
+              <td style="padding: 10px 8px; font-family: ui-monospace, Menlo, monospace; color: #a3a3a3; white-space: nowrap">{{ r.t }}</td>
+              <td style="padding: 10px 8px"><span style="font-family: ui-monospace, Menlo, monospace; font-size: 12px; padding: 3px 8px; border-radius: 5px; background: #1d232c; color: #ce9a3b">{{ r.topic }}</span></td>
+              <td style="padding: 10px 8px; font-family: ui-monospace, Menlo, monospace; color: #ededed">{{ r.key }}</td>
+              <td style="padding: 10px 8px">{{ r.sum }}</td>
+            </tr>
+          </sc-for>
+        </tbody>
+      </table>
+    </section>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"isAdmin":{"editor":"boolean","default":true},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(p) { super(p); this.state = { collapsed: false, tab: 'bus' }; }
+  navVals() {
+    const c = this.state.collapsed;
+    return {
+      navOpen: !c,
+      isAdmin: this.props.isAdmin ?? true,
+      navToggleLabel: c ? 'Expand sidebar' : 'Collapse sidebar',
+      toggleNav: () => this.setState({ collapsed: !c }),
+      navStyle: 'flex: 0 0 232px; background: #0d1014; border-right: 1px solid #2a2f38; display: flex; flex-direction: column; padding: 16px 12px; gap: 4px; box-sizing: border-box; overflow: hidden' + (c ? '; display: none' : ''),
+    };
+  }
+  renderVals() {
+    const on = (x) => 'min-height: 36px; padding: 0 14px; border-radius: 5px; font: inherit; font-size: 13px; cursor: pointer; border: 1px solid ' + (x ? '#2a2f38' : 'transparent') + '; background: ' + (x ? '#13171d' : 'transparent') + '; color: ' + (x ? '#ededed' : '#a3a3a3');
+    const bus = [
+      ['10:42:11.204', 'order.filled', 'ord-8f21', 'BTCUSDT BUY 0.01 @ 61,004.5'],
+      ['10:42:11.198', 'fill.booked', 'ord-8f21', 'Booked into MAIN'],
+      ['10:42:10.951', 'order.acked', 'ord-8f21', 'Venue accepted'],
+      ['10:42:10.902', 'order.new', 'ord-8f21', 'Limit BUY 0.01 BTCUSDT'],
+      ['10:41:03.440', 'order.partial', 'ord-7c09', 'ETHUSDT SELL 0.10 of 0.25'],
+      ['10:40:00.000', 'job.run', 'recon-orders', 'Order recon started'],
+      ['10:39:12.333', 'reported.batch', 'abc-1a2b3c4d5e6f', '5 fills, 5 breaks'],
+    ];
+    const out = [
+      ['10:42:11.210', 'oms.fills', 'ord-8f21', 'Published to Kafka'],
+      ['10:42:10.960', 'oms.orders', 'ord-8f21', 'Published to Kafka'],
+      ['10:41:03.450', 'oms.fills', 'ord-7c09', 'Published to Kafka'],
+    ];
+    const rows = (this.state.tab === 'bus' ? bus : out).map(([t, topic, key, sum]) => ({ t, topic, key, sum }));
+    return { ...this.navVals(), rows, busStyle: on(this.state.tab === 'bus'), outStyle: on(this.state.tab === 'out'),
+      showBus: () => this.setState({ tab: 'bus' }), showOut: () => this.setState({ tab: 'out' }) };
+  }
+}
+</script>
+</body>
+</html>

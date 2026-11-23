@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenOMS — Trade</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0;background:#13171d}
+a{color:#25b083}a:hover{color:#4fd1a5}
+.nav a{color:#a3a3a3;text-decoration:none}
+.nav a:hover{color:#ededed;background:#1d232c}
+</style>
+</helmet>
+<div style="min-height: 900px; background: #13171d; color: #ededed; font-family: Inter, system-ui, sans-serif; display: flex; flex-wrap: wrap">
+  <nav class="nav" aria-label="Main" style="{{ navStyle }}">
+    <div style="display: flex; align-items: center; gap: 10px; padding: 6px 10px 18px">
+      <svg width="18.4" height="17" viewBox="0 0 26 24" role="img" aria-label="openOMS"><rect x="0" y="0" width="15.6" height="3" rx="1" fill="#25b083"></rect><rect x="0" y="5.5" width="22.1" height="3" rx="1" fill="#25b083"></rect><rect x="0" y="11" width="26" height="2" rx="1" fill="#2a2f38"></rect><rect x="0" y="15" width="18.7" height="3" rx="1" fill="#ce9a3b"></rect><rect x="0" y="20.5" width="23.4" height="3" rx="1" fill="#ce9a3b"></rect></svg>
+      <sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span aria-hidden="true" style="font-size: 15px; letter-spacing: -0.5px; line-height: 1; white-space: nowrap"><span style="font-weight: 400; color: #737373">open</span><span style="font-weight: 600; color: #ededed">OMS</span></span></sc-if>
+    </div>
+    <a href="Main.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px; color: #ededed"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 18l5-6 4 3 7-9"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span style="flex: 1 1 auto">Trade</span></sc-if></a>
+    <div style="display: flex; flex-direction: column; gap: 2px; margin: 0 0 4px 19px; padding-left: 10px; border-left: 1px solid #2a2f38"><a href="Main.dc.html" aria-current="page" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px; background: #1d232c; color: #ededed; font-weight: 600">Trade entry</a><a href="Strategies.dc.html" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Strategies</a><a href="Api.dc.html" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">API</a></div>
+    <a href="Portfolios.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="7" width="18" height="13" rx="2"></rect><path d="M9 7V5h6v2"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Portfolios</span></sc-if></a>
+    <a href="Orders.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Orders</span></sc-if></a>
+    <a href="Jobs.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 8v4l3 2"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Jobs</span></sc-if></a>
+    <a href="Events.dc.html" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M13 3L5 14h6l-1 7 8-11h-6z"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span>Events</span></sc-if></a>
+    <sc-if value="{{ isAdmin }}" hint-placeholder-val="{{ true }}">
+    <a href="#" style="display: flex; align-items: center; gap: 10px; padding: 10px; min-height: 40px; box-sizing: border-box; border-radius: 5px; font-size: 14px"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"></path></svg><sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span style="flex: 1 1 auto">Admin</span></sc-if></a>
+    <sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><div style="display: flex; flex-direction: column; gap: 2px; margin: 0 0 4px 19px; padding-left: 10px; border-left: 1px solid #2a2f38"><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">People</a><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Trading setup</a><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Connectivity</a><a href="#" style="display: flex; align-items: center; min-height: 32px; padding: 6px 10px; box-sizing: border-box; border-radius: 5px; font-size: 13px">Monitoring</a></div></sc-if>
+    </sc-if>
+    <div style="flex: 1 1 auto"></div>
+    <sc-if value="{{ menuOpen }}" hint-placeholder-val="{{ false }}">
+      <div role="menu" style="background: #1d232c; border: 1px solid #2a2f38; border-radius: 5px; padding: 6px; display: flex; flex-direction: column; margin-bottom: 6px">
+        <a href="#" role="menuitem" style="padding: 10px; border-radius: 5px; font-size: 14px">Docs</a>
+        <a href="#" role="menuitem" style="padding: 10px; border-radius: 5px; font-size: 14px">Settings</a>
+      </div>
+    </sc-if>
+    <button type="button" onClick="{{ toggleMenu }}" aria-label="Account menu" style="display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 8px 10px; border-radius: 5px; border: 1px solid #2a2f38; background: #13171d; color: #ededed; font: inherit; font-size: 14px; cursor: pointer">
+      <span style="width: 26px; height: 26px; border-radius: 50%; background: #1d232c; color: #ce9a3b; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700">M</span>
+      <sc-if value="{{ navOpen }}" hint-placeholder-val="{{ true }}"><span style="flex: 1 1 auto; text-align: left">max</span></sc-if>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 15l5-5 5 5"></path></svg>
+    </button>
+  </nav>
+
+  <main style="flex: 999 1 560px; min-width: 0; padding: 20px; box-sizing: border-box; display: flex; flex-direction: column; gap: 16px">
+    <div style="display: flex; align-items: center; gap: 8px; min-height: 40px; margin: -8px 0 -4px; border-bottom: 1px solid #2a2f38; padding-bottom: 8px">
+      <button type="button" onClick="{{ toggleNav }}" aria-label="Toggle sidebar" title="Toggle sidebar (Ctrl+B)" style="display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 5px; border: 0; background: transparent; color: #ededed; cursor: pointer"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M9 4v16"></path></svg></button>
+      <span style="width: 1px; height: 18px; background: #2a2f38"></span>
+      <span style="font-size: 13px; color: #a3a3a3">Trade</span>
+    </div>
+    <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 28px; padding: 16px 20px; background: #0d1014; border: 1px solid #2a2f38; border-radius: 5px">
+      <div style="position: relative">
+        <button type="button" onClick="{{ toggleSearch }}" aria-label="Change instrument" style="display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 6px 12px; border-radius: 5px; border: 1px solid #2a2f38; background: #13171d; color: #ededed; font: inherit; cursor: pointer; text-align: left">
+          <span style="display: flex; flex-direction: column; gap: 2px">
+            <span style="font-size: 20px; font-weight: 700">{{ sym }}</span>
+            <span style="font-size: 12px; color: #a3a3a3">{{ symDesc }}</span>
+          </span>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-4-4"></path></svg>
+          <span style="font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #a3a3a3; border: 1px solid #2a2f38; border-radius: 4px; padding: 1px 5px">/</span>
+        </button>
+        <sc-if value="{{ searchOpen }}" hint-placeholder-val="{{ true }}">
+          <div role="dialog" aria-label="Instrument search" style="position: absolute; top: 58px; left: 0; z-index: 10; width: 460px; max-width: 90vw; background: #13171d; border: 1px solid #2a2f38; border-radius: 5px; padding: 12px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 16px 40px rgba(0,0,0,0.5)">
+            <label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; background: #13171d; border: 1px solid #25b083; border-radius: 5px">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#a3a3a3" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-4-4"></path></svg>
+              <input aria-label="Search instruments" value="eth" placeholder="Symbol, name or ISIN…" style="flex: 1 1 auto; background: transparent; border: 0; color: #ededed; font: inherit; font-size: 14px; outline: none">
+            </label>
+            <div role="tablist" style="display: flex; flex-wrap: wrap; gap: 2px; background: #1d232c; padding: 3px; border-radius: 5px; width: fit-content">
+              <sc-for list="{{ classes }}" as="c" hint-placeholder-count="5">
+                <button type="button" onClick="{{ c.pick }}" style="{{ c.style }}">{{ c.label }}</button>
+              </sc-for>
+            </div>
+            <div role="listbox" style="display: flex; flex-direction: column">
+              <sc-for list="{{ results }}" as="r" hint-placeholder-count="5">
+                <button type="button" role="option" onClick="{{ r.pick }}" style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: center; gap: 8px; min-height: 44px; padding: 6px 10px; border: 0; border-radius: 5px; background: transparent; color: #ededed; font: inherit; font-size: 13px; text-align: left; cursor: pointer">
+                  <span style="display: flex; flex-direction: column"><span style="font-weight: 600">{{ r.sym }}</span><span style="font-size: 11px; color: #a3a3a3">{{ r.name }}</span></span>
+                  <span style="font-size: 12px; color: #a3a3a3">{{ r.cls }} · {{ r.venue }}</span>
+                  <span style="font-family: ui-monospace, Menlo, monospace; text-align: right">{{ r.px }}</span>
+                </button>
+              </sc-for>
+            </div>
+            <div style="font-size: 11px; color: #a3a3a3">↑↓ to move · Enter to pick · Esc to close</div>
+          </div>
+        </sc-if>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 2px">
+        <span style="font-family: ui-monospace, Menlo, monospace; font-size: 22px; font-weight: 500">61,004.50</span>
+        <span style="font-size: 12px; color: #25b083">+1.24% 24h</span>
+      </div>
+      <div style="display: flex; flex-wrap: wrap; gap: 28px; font-size: 12px; color: #a3a3a3">
+        <div style="display: flex; flex-direction: column; gap: 2px"><span>Bid / Ask</span><span style="color: #ededed; font-family: ui-monospace, Menlo, monospace">61,004.0 / 61,005.0</span></div>
+        <div style="display: flex; flex-direction: column; gap: 2px"><span>24h volume</span><span style="color: #ededed; font-family: ui-monospace, Menlo, monospace">[VOLUME]</span></div>
+        <div style="display: flex; flex-direction: column; gap: 2px"><span>Position</span><span style="color: #ededed; font-family: ui-monospace, Menlo, monospace">[POSITION]</span></div>
+        <div style="display: flex; flex-direction: column; gap: 2px"><span>Tick / lot</span><span style="color: #ededed; font-family: ui-monospace, Menlo, monospace">0.1 / 0.0001</span></div>
+      </div>
+    </header>
+
+    <div style="display: flex; flex-wrap: wrap; gap: 12px; flex: 1 1 auto; align-items: stretch">
+      <section aria-label="Chart" style="flex: 999 1 640px; min-width: 0; background: #0d1014; border: 1px solid #2a2f38; border-radius: 5px; display: flex; flex-direction: column; min-height: 640px">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid #2a2f38">
+          <div role="tablist" style="display: flex; flex-wrap: wrap; gap: 2px; background: #1d232c; padding: 3px; border-radius: 5px; width: fit-content">
+            <sc-for list="{{ frames }}" as="f" hint-placeholder-count="5">
+              <button type="button" onClick="{{ f.pick }}" style="{{ f.style }}">{{ f.label }}</button>
+            </sc-for>
+          </div>
+          <span style="width: 1px; height: 20px; background: #2a2f38"></span>
+          <button type="button" style="min-height: 30px; padding: 0 10px; border-radius: 5px; border: 0; background: transparent; color: #ededed; font: inherit; font-size: 12px; cursor: pointer">Candles ▾</button>
+          <button type="button" style="min-height: 30px; padding: 0 10px; border-radius: 5px; border: 0; background: transparent; color: #ededed; font: inherit; font-size: 12px; cursor: pointer">ƒx Indicators</button>
+          <div style="flex: 1 1 auto"></div>
+          <div role="tablist" style="display: flex; gap: 2px; background: #1d232c; padding: 3px; border-radius: 5px">
+            <button type="button" style="min-height: 26px; padding: 0 10px; border-radius: 5px; border: 1px solid #2a2f38; background: #13171d; color: #ededed; font: inherit; font-size: 12px">Price</button>
+            <button type="button" style="min-height: 26px; padding: 0 10px; border-radius: 5px; border: 1px solid transparent; background: transparent; color: #a3a3a3; font: inherit; font-size: 12px">Depth</button>
+          </div>
+        </div>
+        <div style="display: flex; flex: 1 1 auto; min-height: 0">
+          <div aria-label="Drawing tools" style="display: flex; flex-direction: column; gap: 2px; padding: 6px 4px; border-right: 1px solid #2a2f38"><button type="button" aria-label="Drawing tool 1" style="width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: #a3a3a3; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 20L20 4"></path></svg></button><button type="button" aria-label="Drawing tool 2" style="width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: #a3a3a3; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 12h16"></path></svg></button><button type="button" aria-label="Drawing tool 3" style="width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: #a3a3a3; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 4v16M4 12h16"></path></svg></button><button type="button" aria-label="Drawing tool 4" style="width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: #a3a3a3; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M5 19h14M7 15l4-8 4 8"></path></svg></button><button type="button" aria-label="Drawing tool 5" style="width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: #a3a3a3; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M4 4h16v16H4z"></path></svg></button><button type="button" aria-label="Drawing tool 6" style="width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 5px; background: transparent; color: #a3a3a3; cursor: pointer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M6 18l6-12 6 12z"></path></svg></button></div>
+          <div style="position: relative; flex: 1 1 auto; min-width: 0; overflow: hidden">
+            <div style="position: absolute; left: 12px; top: 8px; z-index: 2; display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; font-family: ui-monospace, Menlo, monospace; color: #a3a3a3">
+              <span style="color: #ededed; font-family: Inter, sans-serif; font-weight: 600">{{ sym }} · {{ frameLabel }}</span>
+              <span>O <span style="color: #25b083">60,912.0</span></span><span>H <span style="color: #25b083">61,088.5</span></span><span>L <span style="color: #25b083">60,874.0</span></span><span>C <span style="color: #25b083">61,004.5</span></span>
+              <span style="color: #ce9a3b">MA(20) 60,780.2</span>
+            </div>
+            <div style="position: absolute; left: 0; right: 64px; top: 0; bottom: 120px">
+              <div style="position: absolute; inset: 0; background-image: linear-gradient(#1d232c 1px, transparent 1px), linear-gradient(90deg, #1d232c 1px, transparent 1px); background-size: 100% 20%, 10% 100%"></div>
+              <sc-for list="{{ candles }}" as="k" hint-placeholder-count="48">
+                <div style="{{ k.wick }}"></div><div style="{{ k.body }}"></div>
+              </sc-for>
+              <div style="position: absolute; left: 0; right: 0; top: 22%; border-top: 1px dashed #25b083"></div>
+            </div>
+            <div style="position: absolute; left: 0; right: 64px; bottom: 24px; height: 90px; border-top: 1px solid #1d232c">
+              <sc-for list="{{ candles }}" as="k" hint-placeholder-count="48"><div style="{{ k.vol }}"></div></sc-for>
+            </div>
+            <div style="position: absolute; top: 0; right: 0; bottom: 24px; width: 64px; border-left: 1px solid #2a2f38; display: flex; flex-direction: column; justify-content: space-between; padding: 8px 6px; box-sizing: border-box; font-size: 11px; font-family: ui-monospace, Menlo, monospace; color: #a3a3a3">
+              <span>61,200</span><span style="background: #25b083; color: #0d1014; padding: 1px 3px; border-radius: 3px">61,004.5</span><span>60,800</span><span>60,600</span><span>60,400</span><span>60,200</span>
+            </div>
+            <div style="position: absolute; left: 0; right: 64px; bottom: 0; height: 24px; border-top: 1px solid #2a2f38; display: flex; justify-content: space-between; padding: 0 12px; align-items: center; font-size: 11px; font-family: ui-monospace, Menlo, monospace; color: #a3a3a3">
+              <span>06:00</span><span>08:00</span><span>10:00</span><span>12:00</span><span>14:00</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div style="flex: 1 1 320px; max-width: 360px; min-width: 0; display: flex; flex-direction: column; gap: 12px">
+        <section aria-label="Order book" style="background: #0d1014; border: 1px solid #2a2f38; border-radius: 5px; padding: 12px; display: flex; flex-direction: column; gap: 1px; font-family: ui-monospace, Menlo, monospace; font-size: 12px">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px"><h2 style="margin: 0; font-family: Inter, sans-serif; font-size: 14px; font-weight: 600">Order book</h2><span style="font-family: Inter, sans-serif; font-size: 11px; color: #a3a3a3">tick 0.5 ▾</span></div>
+          <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); color: #a3a3a3; padding-bottom: 4px; font-family: Inter, sans-serif; font-size: 11px"><span>Price</span><span style="text-align: right">Size</span><span style="text-align: right">Total</span></div>
+          <sc-for list="{{ asks }}" as="r" hint-placeholder-count="8">
+            <div style="position: relative; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 2px 0"><div style="{{ r.bar }}"></div><span style="position: relative; color: #f06470">{{ r.p }}</span><span style="position: relative; text-align: right">{{ r.s }}</span><span style="position: relative; text-align: right; color: #a3a3a3">{{ r.t }}</span></div>
+          </sc-for>
+          <div style="display: flex; align-items: baseline; gap: 8px; padding: 8px 0; border-top: 1px solid #2a2f38; border-bottom: 1px solid #2a2f38"><span style="font-size: 16px; font-weight: 600; color: #25b083">61,004.50</span><span style="font-size: 11px; color: #a3a3a3">spread 1.0</span></div>
+          <sc-for list="{{ bids }}" as="r" hint-placeholder-count="8">
+            <div style="position: relative; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 2px 0"><div style="{{ r.bar }}"></div><span style="position: relative; color: #25b083">{{ r.p }}</span><span style="position: relative; text-align: right">{{ r.s }}</span><span style="position: relative; text-align: right; color: #a3a3a3">{{ r.t }}</span></div>
+          </sc-for>
+        </section>
+      <section aria-label="Order entry" style="background: #0d1014; border: 1px solid #2a2f38; border-radius: 5px; padding: 14px; display: flex; flex-direction: column; gap: 12px">
+        <h2 style="margin: 0; font-size: 14px; font-weight: 600">Order entry</h2>
+        <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px">
+          <button type="button" onClick="{{ buy }}" style="{{ buyStyle }}">Buy</button>
+          <button type="button" onClick="{{ sell }}" style="{{ sellStyle }}">Sell</button>
+        </div>
+        <label style="display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #a3a3a3">Portfolio
+          <select style="min-height: 40px; background: #13171d; color: #ededed; border: 1px solid #2a2f38; border-radius: 5px; padding: 0 10px; font: inherit; font-size: 14px"><option>[PORTFOLIO]</option></select></label>
+        <label style="display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #a3a3a3">Type
+          <select style="min-height: 40px; background: #13171d; color: #ededed; border: 1px solid #2a2f38; border-radius: 5px; padding: 0 10px; font: inherit; font-size: 14px"><option>Limit</option><option>Market</option></select></label>
+        <label style="display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #a3a3a3">Price
+          <input value="61,004.50" style="min-height: 40px; background: #13171d; color: #ededed; border: 1px solid #2a2f38; border-radius: 5px; padding: 0 10px; font-family: ui-monospace, Menlo, monospace; font-size: 14px"></label>
+        <label style="display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #a3a3a3">Quantity
+          <input value="0.01" style="min-height: 40px; background: #13171d; color: #ededed; border: 1px solid #2a2f38; border-radius: 5px; padding: 0 10px; font-family: ui-monospace, Menlo, monospace; font-size: 14px"></label>
+        <div style="display: flex; justify-content: space-between; font-size: 12px; color: #a3a3a3"><span>Notional</span><span style="font-family: ui-monospace, Menlo, monospace; color: #ededed">610.05</span></div>
+        <div style="flex: 1 1 auto"></div>
+        <button type="button" style="{{ submitStyle }}">{{ submitLabel }}</button>
+      </section>
+      </div>
+    </div>
+  </main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"isAdmin":{"editor":"boolean","default":true},"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  constructor(p) { super(p); this.state = { collapsed: false, menuOpen: false, side: 'BUY', frame: '1h', searchOpen: true, cls: 'All', sym: 'BTCUSDT', symDesc: 'Crypto spot · Binance' }; }
+  navVals() {
+    const c = this.state.collapsed;
+    return {
+      navOpen: !c,
+      isAdmin: this.props.isAdmin ?? true,
+      navToggleLabel: c ? 'Expand sidebar' : 'Collapse sidebar',
+      toggleNav: () => this.setState({ collapsed: !c }),
+      navStyle: 'flex: 0 0 232px; background: #0d1014; border-right: 1px solid #2a2f38; display: flex; flex-direction: column; padding: 16px 12px; gap: 4px; box-sizing: border-box; overflow: hidden' + (c ? '; display: none' : ''),
+    };
+  }
+  renderVals() {
+    const s = this.state;
+    const seg = (on, c) => 'min-height: 44px; border-radius: 5px; font: inherit; font-weight: 600; font-size: 14px; cursor: pointer; border: 1px solid ' + (on ? c : '#2a2f38') + '; background: ' + (on ? c : 'transparent') + '; color: ' + (on ? '#13171d' : '#ededed');
+    const mk = (ps, side) => { let t = 0; const rows = ps.map((p, i) => { const sz = side === 'a' ? 0.12 + (ps.length - 1 - i) * 0.07 : 0.4 - i * 0.04; return { p, sz }; });
+      const ord = side === 'a' ? rows.slice().reverse() : rows; ord.forEach((r) => { t += r.sz; r.tot = t; });
+      return rows.map((r) => ({ p: r.p, s: r.sz.toFixed(4), t: r.tot.toFixed(3), bar: 'position: absolute; top: 0; bottom: 0; right: 0; width: ' + Math.min(100, r.tot / 2.2 * 100).toFixed(0) + '%; background: ' + (side === 'a' ? 'rgba(219,52,64,0.14)' : 'rgba(37,176,131,0.14)') })); };
+    const asks = mk(['61,009.0','61,008.0','61,007.5','61,007.0','61,006.0','61,005.5','61,005.0','61,004.5'], 'a');
+    const bids = mk(['61,004.0','61,003.5','61,003.0','61,002.0','61,001.5','61,001.0','61,000.0','60,999.5'], 'b');
+    const candles = []; let px = 50;
+    for (let i = 0; i < 48; i++) { const o = px; const c = Math.max(8, Math.min(92, o + Math.sin(i * 1.7) * 6 + (i % 7 === 0 ? -5 : 2.2))); const hi = Math.max(o, c) + 2 + (i % 3); const lo = Math.min(o, c) - 2 - (i % 4); px = c;
+      const up = c >= o, col = up ? '#25b083' : '#db3440', x = (i / 48 * 100), w = (100 / 48 * 0.6);
+      candles.push({ wick: 'position: absolute; left: calc(' + (x + w / 2).toFixed(2) + '% - 0.5px); width: 1px; bottom: ' + lo.toFixed(1) + '%; height: ' + (hi - lo).toFixed(1) + '%; background: ' + col,
+        body: 'position: absolute; left: ' + x.toFixed(2) + '%; width: ' + w.toFixed(2) + '%; bottom: ' + Math.min(o, c).toFixed(1) + '%; height: ' + Math.max(0.6, Math.abs(c - o)).toFixed(1) + '%; background: ' + col,
+        vol: 'position: absolute; bottom: 0; left: ' + x.toFixed(2) + '%; width: ' + w.toFixed(2) + '%; height: ' + (20 + ((i * 37) % 70)) + '%; background: ' + (up ? 'rgba(37,176,131,0.45)' : 'rgba(219,52,64,0.45)') }); }
+    const frames = ['1m','5m','1h','4h','1d'].map((label) => ({ label, pick: () => this.setState({ frame: label }),
+      style: 'min-height: 32px; padding: 0 12px; border-radius: 5px; font: inherit; font-size: 12px; cursor: pointer; border: 1px solid ' + (s.frame === label ? '#2a2f38' : 'transparent') + '; background: ' + (s.frame === label ? '#13171d' : 'transparent') + '; color: ' + (s.frame === label ? '#ededed' : '#a3a3a3') }));
+    const c = s.side === 'BUY' ? '#25b083' : '#f06470';
+    const all = [
+      ['ETHUSDT', 'Ether / Tether', 'Crypto spot', 'Binance', '3,212.10'],
+      ['ETHUSD', 'Ether / US Dollar', 'Crypto spot', 'Coinbase', '3,211.85'],
+      ['ETHUSDT-PERP', 'Ether perpetual', 'Futures', 'Binance', '3,213.40'],
+      ['ETHE', 'Grayscale Ethereum Trust', 'Equity', 'IBKR', '[PRICE]'],
+      ['ETH 27DEC26 C3500', 'Ether call option', 'Options', 'IBKR', '[PRICE]'],
+    ];
+    const classes = ['All', 'Crypto spot', 'Futures', 'Equity', 'Options'].map((label) => ({ label, pick: () => this.setState({ cls: label }),
+      style: 'min-height: 30px; padding: 0 10px; border-radius: 5px; font: inherit; font-size: 12px; cursor: pointer; border: 1px solid ' + (s.cls === label ? '#2a2f38' : 'transparent') + '; background: ' + (s.cls === label ? '#13171d' : 'transparent') + '; color: ' + (s.cls === label ? '#ededed' : '#a3a3a3') }));
+    const results = all.filter((r) => s.cls === 'All' || r[2] === s.cls).map(([sym, name, cls, venue, px]) => ({ sym, name, cls, venue, px,
+      pick: () => this.setState({ sym, symDesc: cls + ' · ' + venue, searchOpen: false }) }));
+    return { ...this.navVals(),
+      searchOpen: s.searchOpen, toggleSearch: () => this.setState({ searchOpen: !s.searchOpen }),
+      sym: s.sym, symDesc: s.symDesc, candles, frameLabel: s.frame, classes, results,
+      menuOpen: s.menuOpen, toggleMenu: () => this.setState({ menuOpen: !s.menuOpen }),
+      asks, bids, frames,
+      buy: () => this.setState({ side: 'BUY' }), sell: () => this.setState({ side: 'SELL' }),
+      buyStyle: seg(s.side === 'BUY', '#25b083'), sellStyle: seg(s.side === 'SELL', '#f06470'),
+      submitLabel: (s.side === 'BUY' ? 'Buy' : 'Sell') + ' ' + s.sym,
+      submitStyle: 'min-height: 48px; border-radius: 5px; border: 0; font: inherit; font-weight: 700; font-size: 15px; cursor: pointer; background: ' + c + '; color: #13171d',
+    };
+  }
+}
+</script>
+</body>
+</html>
