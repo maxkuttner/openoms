@@ -25,7 +25,7 @@ function Rows({ rows, side, priceDigits }: { rows: BookRow[]; side: "bid" | "ask
 }
 
 /** Price ladder with cumulative depth bars; redraws at most 10×/s. */
-export function OrderBook({ source, instrumentId, depth = 12 }: { source: MarketDataSource; instrumentId: string; depth?: number }) {
+export function OrderBook({ source, instrumentId, depth = 7 }: { source: MarketDataSource; instrumentId: string; depth?: number }) {
   const tick = useThrottled(useMarketTick(source, instrumentId), 100);
   const book = source.book(instrumentId, depth);
   void tick;
