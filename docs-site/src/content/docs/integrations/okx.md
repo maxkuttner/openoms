@@ -49,7 +49,7 @@ Saving the credentials offers to load OKX's spot pairs as a background job; the
 
 OKX pairs are their own instruments: `BTC-USDT` on OKX and `BTCUSDT` on Binance are two
 entries in the instrument picker, one per venue. To trade on OKX, an admin grants the portfolio the
-`okx-paper` (or `okx-live`) connection under **Portfolios → Grants**.
+`okx-paper` (or `okx-live`) connection under **Portfolios → Venues**.
 
 ## Paper or live
 

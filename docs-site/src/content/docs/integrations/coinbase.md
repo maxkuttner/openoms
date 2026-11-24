@@ -57,7 +57,7 @@ Saving the credentials offers to load Coinbase's spot products as a background j
 
 Coinbase products are their own instruments: `BTC-USD` on Coinbase is a different entry
 from `BTCUSDT` on Binance. To trade on Coinbase, an admin grants the portfolio the
-`coinbase-live` connection under **Portfolios → Grants**.
+`coinbase-live` connection under **Portfolios → Venues**.
 
 Coinbase quotes products in USD, USDC, USDT, EUR, GBP and a few other currencies, but not
 CHF; trade the pairs your account holds a balance in.

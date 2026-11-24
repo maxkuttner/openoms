@@ -43,37 +43,75 @@ default_user_role = "pending" # "user" activates sign-ups at once
 passed, a session can only read: orders, strategies, limits and admin changes need MFA.
 API keys and strategy tokens are exempt.
 
-## Groups
+## Groups and grants
 
-A group has members and, per portfolio, an access level:
+Two things decide what someone can do on a portfolio, and they need both:
 
-| Level | Can |
-|---|---|
-| **view** | see all orders, positions and limits |
-| **trade** | place, cancel and allocate own orders; see positions and limits |
-| **manage** | everything, plus cancel any order, set limits, manage strategies |
+- **Access** to the portfolio: *view*, *trade* or *manage*, set on the portfolio.
+- The **grant** for the action, such as cancelling any order.
 
-Several groups give the highest level per portfolio. **Admin** is separate: a switch on
-the Users page. The last active admin cannot be removed.
-
-## Portfolios and grants
-
-Only admins create portfolios. Creating one also creates the group `portfolio <code>`
-with the creating admin as its only member, at **view** access. It is an ordinary
-group: raise it to trade or manage, add people, or delete it.
+Without the grant the OMS refuses with `not granted: <key>`, and the cockpit hides the
+button. **Admin** (a switch on the Users page) skips grant checks, but an admin still
+needs portfolio access to trade. The last active admin cannot be removed.
 
 ### Grants
 
-A grant says what a portfolio may do. Venues (broker connections) are the first kind;
-others, such as instrument classes or trading hours, may follow.
+Open **People → Groups → Default grants** to set what every user gets. A group adds
+grants on top of that. A grant counts if it is on in the defaults or in any of the
+person's groups. Nothing can take a grant away.
 
-1. Open **Portfolios → Grants** on the portfolio.
+| Group | Grant | Controls |
+|---|---|---|
+| Trading | Place and cancel own orders | own orders |
+| Trading | Cancel any order | other people's orders |
+| Trading | Allocate block orders | allocation |
+| Trading | Trade options and combos | option and combo orders |
+| Strategies | Create strategies | new strategies |
+| Strategies | Rotate and revoke strategy tokens | tokens, and archiving |
+| Risk | See risk limits | reading limits |
+| Risk | Set risk limits | changing limits |
+| Account | Personal API keys | your own API keys |
+
+Strategy tokens and the host CLI token are not grant-checked.
+
+### Edit a group
+
+Open a group on **People → Groups**. Its tabs:
+
+- **General:** name and description.
+- **Users:** the members.
+- **Portfolios:** the access level per portfolio. Several groups give the highest level.
+- **Grants:** the grants this group adds.
+- **Preview:** what its members end up with.
+
+On an upgrade nothing changes. The defaults start with own orders, allocate, options,
+create strategies, strategy tokens, see limits and personal API keys. Groups with
+manage on a portfolio also get cancel any order and set limits. A newly reported
+strategy's group gets the same two.
+
+## Portfolios
+
+Only admins create portfolios. Creating one also creates the group `portfolio <code>`
+with the creating admin as its only member, at **view** access. It is an ordinary
+group: raise it, add people, or delete it.
+
+Open one under **Trading setup → Portfolios**. Its tabs:
+
+- **Access:** who may use it. Add groups or single people, each at View, Trade or
+  Manage. The highest level wins.
+- **Venues:** where it may trade.
+- **General:** name and details.
+
+### Venues
+
+A venue is a broker connection.
+
+1. Open **Portfolios → Venues** on the portfolio.
 2. Tick the venues it may trade on. IBKR also asks for the IBKR account.
 
-- A portfolio with no venue granted cannot trade anywhere.
-- The order ticket offers only the granted venues.
-- Revoking a grant keeps history. Orders already placed keep booking fills.
-- For any other kind, no grants means no restriction.
+- A portfolio with no venue cannot trade anywhere.
+- The order ticket offers only the allowed venues.
+- Removing a venue keeps history. Orders already placed keep booking fills.
 
 ## Single sign-on
 

@@ -49,7 +49,7 @@ Saving the credentials offers to load Bybit's spot pairs as a background job; th
 
 Bybit pairs are their own instruments: `BTCUSDT` on Bybit and `BTCUSDT` on Binance are
 two entries in the instrument picker, one per venue. To trade on Bybit, an admin grants the
-portfolio the `bybit-paper` (or `bybit-live`) connection under **Portfolios → Grants**.
+portfolio the `bybit-paper` (or `bybit-live`) connection under **Portfolios → Venues**.
 
 ## Paper or live
 

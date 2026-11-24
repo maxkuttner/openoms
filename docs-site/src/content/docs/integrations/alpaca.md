@@ -78,7 +78,7 @@ FIGI enrichment through OpenFIGI is a separate job,
 
 ## Trading on Alpaca
 
-An admin grants a portfolio the Alpaca connection under **Portfolios → Grants**; see
+An admin grants a portfolio the Alpaca connection under **Portfolios → Venues**; see
 [Grants](/configuration/login/#grants). Without it, the portfolio cannot trade on Alpaca.
 
 ## Limits
