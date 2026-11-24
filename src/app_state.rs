@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
-use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 use tokio::task::JoinHandle;
 
 use gateway::adapter::BrokerRegistry;
@@ -12,9 +11,6 @@ use crate::event_bus::EventBus;
 use gateway::contract::EngineHandle;
 use crate::marks::MarkStore;
 use gateway::stream_health::StreamHealthRegistry;
-
-/// The OpenFIGI-backed instrument identification engine, with an in-memory cache.
-pub type SymbologyEngine = Identifier<OpenFigiClient, InMemoryCache>;
 
 /// Handles for the supervised feed tasks, keyed by connection code, so a
 /// credential change can stop one and start its replacement.
@@ -110,7 +106,6 @@ pub struct AppState {
     /// Serialize the entire reload, including store reads and stream joins.
     /// Order readers still use ArcSwap and never acquire this lock.
     reload_lock: Arc<tokio::sync::Mutex<()>>,
-    symbology: Arc<SymbologyEngine>,
     stream_health: StreamHealthRegistry,
     marks: MarkStore,
     daily_stats: crate::daily_stats::DailyStatsStore,
@@ -138,7 +133,6 @@ impl AppState {
     pub fn new(
         pool: PgPool,
         registry: BrokerRegistry,
-        symbology: SymbologyEngine,
         stream_health: StreamHealthRegistry,
         event_bus: EventBus,
         engine: EngineHandle,
@@ -155,7 +149,6 @@ impl AppState {
             registry: Arc::new(ArcSwap::from_pointee(registry)),
             daily_stats_sources: Arc::new(ArcSwap::from_pointee(DailyStatsRegistry::new())),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
-            symbology: Arc::new(symbology),
             stream_health,
             marks: MarkStore::new(),
             daily_stats: crate::daily_stats::DailyStatsStore::new(),
@@ -200,10 +193,6 @@ impl AppState {
         self.reload_lock.lock().await
     }
 
-
-    pub fn symbology(&self) -> &Arc<SymbologyEngine> {
-        &self.symbology
-    }
 
     pub fn stream_health(&self) -> &StreamHealthRegistry {
         &self.stream_health
@@ -258,7 +247,6 @@ mod tests {
     fn sample_state() -> AppState {
         let pool = PgPool::connect_lazy("postgres://localhost/oms_test_never_connects")
             .expect("connect_lazy never actually connects");
-        let symbology = Identifier::new(OpenFigiClient::new(None), InMemoryCache::new());
         let mut registry = BrokerRegistry::new();
         registry.register("ALPACA", "PAPER", sample_alpaca_adapter());
         // Nothing in these tests drains the quote channel — they only exercise
@@ -266,7 +254,6 @@ mod tests {
         AppState::new(
             pool,
             registry,
-            symbology,
             StreamHealthRegistry::new(),
             EventBus::new(),
             EngineHandle::new().0,

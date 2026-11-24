@@ -15,16 +15,15 @@ use super::{get, JobStatus};
 use gateway::adapter::InstrumentProvider;
 use crate::setup::brokers::{self, Broker, LoadOptions, LoadProgress};
 
-/// Cockpit and boot loads: base instruments only, no OpenFIGI enrichment (that
-/// is its own job), and a load that skips some instruments still completes —
-/// it reports them, and the connection shows "partial" with the reason.
 /// Upper bound on one load, so a broker call that never returns cannot leave
 /// its job "running" — which would also refuse every retry for the connection.
-/// Generous: an enrichment pass through a rate-limited OpenFIGI is slow.
 pub const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Cockpit and boot loads: base instruments only, and a load that skips some
+/// instruments still completes — it reports them, and the connection shows
+/// "partial" with the reason.
 fn default_options() -> LoadOptions {
-    LoadOptions { no_enrich: true, allow_skips: true, underlyings: Vec::new() }
+    LoadOptions { allow_skips: true, underlyings: Vec::new() }
 }
 
 /// Record a universe load for `broker`'s connection and start it in the
@@ -38,16 +37,6 @@ pub async fn spawn_universe_load(pool: PgPool, broker: Broker, started_by: &str)
     spawn_load(pool, broker, started_by, JobKind::UniverseLoad, default_options()).await
 }
 
-/// Look up FIGIs for `broker`'s instruments through OpenFIGI, as an
-/// `enrichment` job: the same load with enrichment on. It re-fetches the
-/// broker's list (seconds) because the enricher works on the broker's own
-/// instrument definitions; the slow part is OpenFIGI, rate-limited without
-/// `OPENFIGI_API_KEY`.
-pub async fn spawn_enrichment(pool: PgPool, broker: Broker, started_by: &str) -> Result<Uuid, CreateError> {
-    let opts = LoadOptions { no_enrich: false, ..default_options() };
-    spawn_load(pool, broker, started_by, JobKind::Enrichment, opts).await
-}
-
 async fn spawn_load(
     pool: PgPool,
     broker: Broker,
@@ -55,7 +44,7 @@ async fn spawn_load(
     kind: JobKind,
     opts: LoadOptions,
 ) -> Result<Uuid, CreateError> {
-    let params = serde_json::json!({ "broker": broker.code(), "no_enrich": opts.no_enrich });
+    let params = serde_json::json!({ "broker": broker.code() });
     let id = create(&pool, kind, Some(&broker.connection_code()), started_by, params).await?;
     let handle = JobHandle::new(pool.clone(), id);
     // Kept to record a failure from here if the load's own runtime cannot start.
@@ -239,7 +228,6 @@ mod tests {
                 native_id: None,
                 provider_exchange: None,
                 derivative: None,
-                identifiers: Default::default(),
             },
             broker_symbol: symbol.to_string(),
             broker_exchange: None,
@@ -267,7 +255,7 @@ mod tests {
     }
 
     fn opts() -> LoadOptions {
-        LoadOptions { no_enrich: true, allow_skips: true, underlyings: Vec::new() }
+        LoadOptions { allow_skips: true, underlyings: Vec::new() }
     }
 
     async fn new_job(pool: &sqlx::PgPool, subject: &str) -> JobHandle {

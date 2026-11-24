@@ -45,7 +45,7 @@ the Bybit stream appears under **Live execution streams** once it connects.
 
 Saving the credentials offers to load Bybit's spot pairs as a background job; the
 **Instrument universe** column on **Broker connections** shows its state and has
-**Load** / **Reload**. From a terminal: `oms setup sync-broker --broker bybit --no-enrich`.
+**Load** / **Reload**. From a terminal: `oms setup sync-broker --broker bybit`.
 
 Bybit pairs are their own instruments: `BTCUSDT` on Bybit and `BTCUSDT` on Binance are
 two entries in the instrument picker, one per venue. To trade on Bybit, an admin grants the

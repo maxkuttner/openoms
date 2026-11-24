@@ -107,7 +107,6 @@ These have no `oms.toml` key.
 | `OMS_SYNC_ON_BOOT` | `never` stops the automatic instrument load at startup — otherwise each broker connection with credentials whose instruments were never loaded gets one, as a background job. |
 | `ALPACA_ENV`, `BINANCE_ENV` | `PAPER` (default) or `LIVE`: which of the broker's connections the OMS routes to. |
 | `BINANCE_PAPER_TRANSPORT`, `BINANCE_LIVE_TRANSPORT` | `rest` (default) or `fix`: how Binance orders are sent. |
-| `OPENFIGI_API_KEY` | Raises the OpenFIGI rate limit used when enriching the catalog. |
 | `KAFKA_BROKER`, `KAFKA_TOPIC` | Publish order events to Kafka. Optional; without them publishing is off. |
 | `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug`. Default `info`. Logs go to stderr. |
 

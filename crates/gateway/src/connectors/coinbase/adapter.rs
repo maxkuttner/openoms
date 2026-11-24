@@ -11,7 +11,7 @@
 //! symbol = `product_id` (`BTC-USD`); the base currency is the native id.
 
 use base64::Engine;
-use dataprovider::{Identifiers, InstrumentDef};
+use dataprovider::{InstrumentDef};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand::RngCore;
 use reqwest::Client;
@@ -197,7 +197,6 @@ pub(crate) fn parse_spot_products(body: &serde_json::Value) -> Vec<BrokerInstrum
                 native_id: Some(p["base_currency_id"].as_str()?.to_string()),
                 provider_exchange: Some("COINBASE".to_string()),
                 derivative: None,
-                identifiers: Identifiers::default(),
             };
             Some(BrokerInstrument {
                 broker_symbol: symbol,

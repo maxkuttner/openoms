@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 
 use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
-use dataprovider::{Identifiers, InstrumentDef};
+use dataprovider::{InstrumentDef};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::{Client, Method};
@@ -495,7 +495,6 @@ pub(crate) fn parse_exchange_info(body: &serde_json::Value) -> Vec<BrokerInstrum
                 native_id: Some(base), // base asset — what recon matches balances on
                 provider_exchange: Some("BINANCE".to_string()),
                 derivative: None,
-                identifiers: Identifiers::default(),
             };
             Some(BrokerInstrument {
                 broker_symbol: pair,

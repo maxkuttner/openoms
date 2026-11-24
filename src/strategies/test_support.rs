@@ -28,11 +28,9 @@ pub async fn dev_pool() -> PgPool {
 pub fn state(pool: PgPool) -> AppState {
     use gateway::adapter::BrokerRegistry;
     use gateway::stream_health::StreamHealthRegistry;
-    use symbology::{Identifier, InMemoryCache, OpenFigiClient};
     AppState::new(
         pool,
         BrokerRegistry::new(),
-        Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
         StreamHealthRegistry::new(),
         crate::event_bus::EventBus::new(),
         gateway::contract::EngineHandle::new().0,

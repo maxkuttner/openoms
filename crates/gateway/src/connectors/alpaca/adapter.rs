@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use dataprovider::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
+use dataprovider::{DerivativeDef, InstrumentDef, OptionKind};
 use reqwest::Client;
 use serde::Serialize;
 use tracing::{info, warn};
@@ -196,7 +196,6 @@ impl AlpacaAdapter {
                     native_id: a["id"].as_str().map(|s| s.to_string()), // Alpaca asset UUID
                     provider_exchange: raw_exchange.map(|s| s.to_string()),
                     derivative: None,
-                    identifiers: Identifiers::default(),
                 };
                 Some(BrokerInstrument {
                     broker_symbol: symbol,
@@ -288,7 +287,6 @@ impl AlpacaAdapter {
                     native_id: None,
                     provider_exchange: Some("OPRA".to_string()),
                     derivative: Some(derivative),
-                    identifiers: Identifiers::default(),
                 };
                 out.push(BrokerInstrument {
                     broker_symbol: symbol.to_string(),

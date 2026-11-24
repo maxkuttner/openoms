@@ -2,7 +2,7 @@
 name = "dataprovider"
 version = "0.1.0"
 edition = "2021"
-description = "Extensible data-provider abstraction for live quote feeds + instrument enrichment."
+description = "Extensible data-provider abstraction for live quote feeds."
 license = "MIT"
 
 [dependencies]
@@ -11,9 +11,6 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["sync", "rt"] }
-
-# In-repo FIGI identification engine (re-exported for the seeder).
-symbology = { path = "../symbology" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

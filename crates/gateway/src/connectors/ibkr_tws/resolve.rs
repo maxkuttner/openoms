@@ -4,7 +4,7 @@
 //! Identity is the IBKR conId. A symbol that matches more than one contract is
 //! reported with every candidate, never guessed.
 
-use dataprovider::{Identifiers, InstrumentDef};
+use dataprovider::{InstrumentDef};
 
 use super::client::{ContractQuery, TwsClient, TwsContract};
 use super::exchanges::{from_mic, to_mic};
@@ -138,7 +138,6 @@ pub fn to_broker_instrument(c: &TwsContract) -> Result<BrokerInstrument, String>
         native_id: Some(c.con_id.to_string()),
         provider_exchange: Some(mic.to_string()),
         derivative: None,
-        identifiers: Identifiers { isin: c.isin.clone(), ..Identifiers::default() },
     };
     Ok(BrokerInstrument {
         broker_symbol: c.symbol.clone(),
@@ -284,7 +283,6 @@ mod tests {
         assert_eq!(d.native_id.as_deref(), Some("2"));
         assert_eq!((d.asset_class.as_str(), d.instrument_class.as_str()), ("EQUITY", "SPOT"));
         assert_eq!((d.price_precision, d.size_increment), (2, 1.0));
-        assert_eq!(d.identifiers.isin.as_deref(), Some("DE0007164600"));
         assert_eq!(bi.broker_exchange.as_deref(), Some("IBIS"));
     }
 

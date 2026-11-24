@@ -135,7 +135,7 @@ pub async fn ensure_instrument(
     let listed = provider.list_instruments(&[]).await.map_err(|e| IngestError::Other(e.to_string()))?;
     let Some(found) = listed.into_iter().find(|i| i.broker_symbol == symbol) else { return Ok(None) };
     let Some(b) = crate::setup::brokers::Broker::by_code(broker) else { return Ok(None) };
-    let opts = crate::setup::brokers::LoadOptions { no_enrich: true, allow_skips: true, underlyings: Vec::new() };
+    let opts = crate::setup::brokers::LoadOptions { allow_skips: true, underlyings: Vec::new() };
     crate::setup::brokers::load_universe(pool, b, &OneInstrument(std::sync::Mutex::new(Some(found))), &opts, &Quiet)
         .await
         .map_err(|e| IngestError::Other(e.to_string()))?;

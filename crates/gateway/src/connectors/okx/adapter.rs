@@ -19,7 +19,7 @@
 //! dashes ([`client_order_id`]) and is read back with [`oms_order_id`].
 
 use base64::Engine;
-use dataprovider::{Identifiers, InstrumentDef};
+use dataprovider::{InstrumentDef};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use sha2::Sha256;
@@ -243,7 +243,6 @@ pub(crate) fn parse_spot_instruments(data: &serde_json::Value) -> Vec<BrokerInst
                 native_id: Some(base),
                 provider_exchange: Some("OKX".to_string()),
                 derivative: None,
-                identifiers: Identifiers::default(),
             };
             Some(BrokerInstrument {
                 broker_symbol: pair,

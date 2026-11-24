@@ -569,55 +569,6 @@
         ]
       }
     },
-    "/admin/broker-connections/{code}/universe/enrich": {
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "summary": "Enrich a broker connection's instruments with FIGIs",
-        "operationId": "enrich_connection_universe",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Broker connection code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "description": "Started; follow it at /admin/jobs/{job_id}",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobStarted"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "409": {
-            "description": "Enrichment for this connection is already running; its job_id is in the body"
-          },
-          "422": {
-            "description": "No usable credentials, a broker without a catalog, or not the active connection"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
     "/admin/broker-connections/{code}/universe/load": {
       "post": {
         "tags": [
@@ -2410,84 +2361,6 @@
         ]
       }
     },
-    "/admin/symbology/backfill": {
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "summary": "Backfill FIGIs for instruments that have none, as a job",
-        "description": "Runs in the background and answers at once with the job id; the counts that\nused to be the response body are the job's result.",
-        "operationId": "backfill_symbology",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BackfillRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "202": {
-            "description": "Started; follow it at /admin/jobs/{job_id}; the result is a BackfillResult",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JobStarted"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/symbology/resolve": {
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "resolve_symbology",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ResolveRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Resolution",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ResolveOutcome"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
     "/admin/trading-tokens": {
       "get": {
         "tags": [
@@ -3994,43 +3867,6 @@
           }
         }
       },
-      "BackfillRequest": {
-        "type": "object",
-        "properties": {
-          "limit": {
-            "type": "integer",
-            "format": "int64",
-            "nullable": true
-          }
-        }
-      },
-      "BackfillResult": {
-        "type": "object",
-        "required": [
-          "scanned",
-          "stamped",
-          "ambiguous",
-          "unresolved"
-        ],
-        "properties": {
-          "ambiguous": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "scanned": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "stamped": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "unresolved": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
-      },
       "BlotterRow": {
         "type": "object",
         "required": [
@@ -4930,7 +4766,7 @@
           },
           "kind": {
             "type": "string",
-            "description": "`universe_load`, `enrichment`, `symbology_backfill` or `expiry_sweep`."
+            "description": "`universe_load`, `expiry_sweep` or `eod_sweep`."
           },
           "params": {},
           "progress_done": {
@@ -5564,148 +5400,6 @@
           "value": {
             "type": "string",
             "description": "The stored value, when it is safe to echo and safe to submit back\nunchanged. `None` for both secrets and masked identifiers — in either\ncase the cockpit must leave the input blank, so that an untouched\nfield submits empty and the merge rule keeps what is stored.",
-            "nullable": true
-          }
-        }
-      },
-      "ResolveOutcome": {
-        "oneOf": [
-          {
-            "type": "object",
-            "description": "Identified; `instrument_id` is `None` if we hold no matching master instrument.",
-            "required": [
-              "figi",
-              "outcome"
-            ],
-            "properties": {
-              "figi": {
-                "type": "string"
-              },
-              "identity": {
-                "allOf": [
-                  {
-                    "$ref": "#/components/schemas/ResolvedIdentity"
-                  }
-                ],
-                "nullable": true
-              },
-              "instrument_id": {
-                "type": "integer",
-                "format": "int64",
-                "nullable": true
-              },
-              "outcome": {
-                "type": "string",
-                "enum": [
-                  "resolved"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "candidates",
-              "outcome"
-            ],
-            "properties": {
-              "candidates": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/ResolvedIdentity"
-                }
-              },
-              "outcome": {
-                "type": "string",
-                "enum": [
-                  "ambiguous"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "outcome"
-            ],
-            "properties": {
-              "outcome": {
-                "type": "string",
-                "enum": [
-                  "unresolved"
-                ]
-              }
-            }
-          }
-        ],
-        "discriminator": {
-          "propertyName": "outcome"
-        }
-      },
-      "ResolveRequest": {
-        "type": "object",
-        "properties": {
-          "cusip": {
-            "type": "string",
-            "nullable": true
-          },
-          "exch_code": {
-            "type": "string",
-            "nullable": true
-          },
-          "figi": {
-            "type": "string",
-            "nullable": true
-          },
-          "isin": {
-            "type": "string",
-            "nullable": true
-          },
-          "mic": {
-            "type": "string",
-            "nullable": true
-          },
-          "ticker": {
-            "type": "string",
-            "nullable": true
-          }
-        }
-      },
-      "ResolvedIdentity": {
-        "type": "object",
-        "required": [
-          "figi"
-        ],
-        "properties": {
-          "composite_figi": {
-            "type": "string",
-            "nullable": true
-          },
-          "exch_code": {
-            "type": "string",
-            "nullable": true
-          },
-          "figi": {
-            "type": "string"
-          },
-          "market_sector": {
-            "type": "string",
-            "nullable": true
-          },
-          "name": {
-            "type": "string",
-            "nullable": true
-          },
-          "security_type": {
-            "type": "string",
-            "nullable": true
-          },
-          "share_class_figi": {
-            "type": "string",
-            "nullable": true
-          },
-          "ticker": {
-            "type": "string",
             "nullable": true
           }
         }

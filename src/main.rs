@@ -15,7 +15,6 @@ mod ingest;
 mod reported;
 mod reconciler;
 mod recon_admin_api;
-mod symbology_resolver;
 mod setup;
 mod sessions;
 mod oidc;
@@ -145,7 +144,6 @@ mod first_run_tests;
         admin::delete_broker_connection_credentials,
         jobs::api::get_connection_universe,
         jobs::api::load_connection_universe,
-        jobs::api::enrich_connection_universe,
         jobs::api::list_jobs,
         jobs::api::get_job,
         admin::test_broker_connection_credentials,
@@ -165,8 +163,6 @@ mod first_run_tests;
         instruments_import::save,
         instruments_import::search,
         admin::list_feeds,
-        admin::resolve_symbology,
-        admin::backfill_symbology,
         admin::expiry_sweep,
         users_api::setup_status,
         strategies::admin::list_strategies,
@@ -219,10 +215,8 @@ mod first_run_tests;
         admin::RiskLimit, admin::CreateRiskLimit, admin::UpdateRiskLimit,
         admin::InstrumentSummary, admin::FeedSummary, admin::FeedConnectionSummary,
         instruments_api::ChainLeg, instruments_api::ChainRow,
-        admin::ResolveRequest, admin::BackfillRequest, admin::BackfillResult,
         admin::ExpirySweepResult,
         users_api::SetupStatus,
-        crate::symbology_resolver::ResolveOutcome, crate::symbology_resolver::ResolvedIdentity,
         auth_api::MeResponse,
         local_auth_api::AuthMethods,
         local_auth_api::SignupBody,
@@ -1048,7 +1042,6 @@ fn build_app(
         )
         .route("/admin/broker-connections/:code/universe", get(jobs::api::get_connection_universe))
         .route("/admin/broker-connections/:code/universe/load", post(jobs::api::load_connection_universe))
-        .route("/admin/broker-connections/:code/universe/enrich", post(jobs::api::enrich_connection_universe))
         .route(
             "/admin/broker-connections/:code/recon",
             get(recon_admin_api::get_recon).patch(recon_admin_api::patch_recon),
@@ -1110,8 +1103,6 @@ fn build_app(
         .route("/admin/instruments", get(admin::list_instruments))
         .merge(instruments_import::routes())
         .route("/admin/feeds", get(admin::list_feeds))
-        .route("/admin/symbology/resolve", post(admin::resolve_symbology))
-        .route("/admin/symbology/backfill", post(admin::backfill_symbology))
         .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
 
@@ -1450,19 +1441,6 @@ async fn serve() {
         daily_stats,
     } = reload::build_registry(&broker_connections, true, &BrokerRegistry::new(), &DailyStatsRegistry::new(), &registration_deps).await;
 
-    // Symbology engine (OpenFIGI). Works without a key (lower rate limits); a key
-    // (OPENFIGI_API_KEY) raises the limits and batch size.
-    let openfigi_key = env::var("OPENFIGI_API_KEY").ok();
-    if openfigi_key.is_some() {
-        info!("OpenFIGI: using API key");
-    } else {
-        info!("OPENFIGI_API_KEY not set — using unauthenticated OpenFIGI (lower limits)");
-    }
-    let symbology = symbology::Identifier::new(
-        symbology::OpenFigiClient::new(openfigi_key),
-        symbology::InMemoryCache::new(),
-    );
-
     // AppState. Constructed with an empty registry and immediately swapped to the
     // one `build_registry` just produced — the same `swap_registries` call a
     // runtime reload will use — so boot itself exercises that path rather than
@@ -1521,7 +1499,6 @@ async fn serve() {
     let mut state = AppState::new(
         pool,
         BrokerRegistry::new(),
-        symbology,
         stream_health,
         event_bus,
         engine,

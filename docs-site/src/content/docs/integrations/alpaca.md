@@ -66,15 +66,11 @@ load automatically; `OMS_SYNC_ON_BOOT=never` turns that off.
 From a terminal, the same load is:
 
 ```sh
-oms setup sync-broker --broker alpaca --no-enrich
+oms setup sync-broker --broker alpaca
 ```
 
 Option chains are not part of the universe. To seed chains for particular underlyings
-from the terminal: `oms setup sync-broker --broker alpaca --underlyings SPY,QQQ --no-enrich`.
-
-FIGI enrichment through OpenFIGI is a separate job,
-`POST /admin/broker-connections/alpaca-paper/universe/enrich` — slow without an
-`OPENFIGI_API_KEY`.
+from the terminal: `oms setup sync-broker --broker alpaca --underlyings SPY,QQQ`.
 
 ## Trading on Alpaca
 

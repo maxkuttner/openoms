@@ -34,8 +34,6 @@ export type UniverseStatus = {
 
 export const JOB_KIND_LABEL: Record<string, string> = {
   universe_load: "Instrument universe",
-  enrichment: "FIGI enrichment",
-  symbology_backfill: "Symbology backfill",
   expiry_sweep: "Expiry sweep",
 };
 
@@ -107,12 +105,11 @@ export function summarize(job: JobRecord): string {
   if (job.status === "interrupted") return "interrupted by a restart";
   const r = job.result;
   if (!r) return "";
-  if (job.kind === "universe_load" || job.kind === "enrichment") {
+  if (job.kind === "universe_load") {
     const skipped = Number(r.skipped ?? 0);
     const reasons = Array.isArray(r.skipped_reasons) ? (r.skipped_reasons as string[]).join(", ") : "";
     return `${Number(r.mapped ?? 0).toLocaleString()} loaded` + (skipped ? `, ${skipped} skipped: ${reasons}` : "");
   }
   if (job.kind === "expiry_sweep") return `${r.expired ?? 0} expired, ${r.recomputed ?? 0} dated`;
-  if (job.kind === "symbology_backfill") return `${r.stamped ?? 0} of ${r.scanned ?? 0} stamped`;
   return "";
 }

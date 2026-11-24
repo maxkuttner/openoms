@@ -69,7 +69,7 @@ instrument can be **priced** and whether it can be **traded** are independent.
 
 | | What it is |
 |---|---|
-| **Master** — `instrument` | Canonical identity, keyed `(symbol, venue)`. Asset and instrument class, microstructure, FIGI. Option legs live in `instrument_derivative`. |
+| **Master** — `instrument` | Canonical identity, keyed `(symbol, venue)`. Asset and instrument class, microstructure. Option legs live in `instrument_derivative`. |
 | **Execution** — `broker_instrument` | The tradable mapping: one row per instrument per broker, with `broker_symbol`, `native_id` and limits. Written by `oms setup sync-broker` from the broker adapter's instrument list. A row existing means the instrument is tradable through that broker. |
 | **Market data** — `FeedSymbology` | The pricing mapping, one-to-many — and a pure function, not a table. `candidates()` picks the slice of the catalog a feed covers; `to_feed_symbol()` renames each hit into the feed's own symbol. One symbol can price the same pair on several venues. Evaluated at subscribe time. |
 

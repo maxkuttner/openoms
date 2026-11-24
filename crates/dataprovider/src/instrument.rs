@@ -1,19 +1,8 @@
 //! Provider-neutral instrument records, produced by a broker adapter's
-//! `InstrumentProvider` during broker-first seeding and mutated in place by
-//! [`crate::Enricher`]s before the catalog upsert persists them.
+//! `InstrumentProvider` during broker-first seeding, which the catalog upsert
+//! persists.
 
 use serde::{Deserialize, Serialize};
-
-/// Extensible bag of external identifiers for an instrument. Enrichers fill the
-/// fields they own (OpenFIGI → `figi`/`composite_figi`); the seeder persists
-/// whatever is set. Add a field here to support a new identifier type.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Identifiers {
-    pub figi: Option<String>,
-    pub composite_figi: Option<String>,
-    pub isin: Option<String>,
-    pub cusip: Option<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OptionKind {
@@ -22,8 +11,7 @@ pub enum OptionKind {
 }
 
 /// Provider-neutral instrument record. The seeder maps this into
-/// `public.instrument` + (optionally) `public.instrument_derivative` +
-/// `oms.instrument_xref` PROVIDER row.
+/// `public.instrument` + (optionally) `public.instrument_derivative`.
 #[derive(Debug, Clone)]
 pub struct InstrumentDef {
     pub symbol: String,
@@ -40,8 +28,6 @@ pub struct InstrumentDef {
     pub native_id: Option<String>,
     pub provider_exchange: Option<String>,
     pub derivative: Option<DerivativeDef>,
-    /// Enrichment output — filled by the enricher pipeline, empty at fetch time.
-    pub identifiers: Identifiers,
 }
 
 #[derive(Debug, Clone)]

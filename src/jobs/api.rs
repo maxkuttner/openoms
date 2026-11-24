@@ -9,7 +9,7 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{latest, CreateError, JobKind, JobLogLine, JobRecord, JobStatus};
+use super::{CreateError, JobKind, JobLogLine, JobRecord, JobStatus};
 use crate::app_state::AppState;
 use crate::credentials::CredentialState;
 use crate::secrets::MasterKey;
@@ -102,15 +102,8 @@ impl IntoResponse for LoadRefusal {
 /// can this broker be loaded at all, is it the connection the OMS routes to.
 /// Nothing is written unless all pass.
 pub async fn start_load(pool: &PgPool, master: Option<&MasterKey>, code: &str) -> Result<Uuid, LoadRefusal> {
-    let broker = check_loadable(pool, master, code, JobKind::UniverseLoad).await?;
+    let broker = check_loadable(pool, master, code).await?;
     super::universe::spawn_universe_load(pool.clone(), broker, "admin").await.map_err(refusal)
-}
-
-/// Check `code` can be enriched now, then start an `enrichment` job: the same
-/// checks as a universe load.
-pub async fn start_enrichment(pool: &PgPool, master: Option<&MasterKey>, code: &str) -> Result<Uuid, LoadRefusal> {
-    let broker = check_loadable(pool, master, code, JobKind::Enrichment).await?;
-    super::universe::spawn_enrichment(pool.clone(), broker, "admin").await.map_err(refusal)
 }
 
 fn refusal(e: CreateError) -> LoadRefusal {
@@ -120,18 +113,13 @@ fn refusal(e: CreateError) -> LoadRefusal {
     }
 }
 
-async fn check_loadable(pool: &PgPool, master: Option<&MasterKey>, code: &str, kind: JobKind) -> Result<Broker, LoadRefusal> {
+async fn check_loadable(pool: &PgPool, master: Option<&MasterKey>, code: &str) -> Result<Broker, LoadRefusal> {
     let connections = crate::credentials::load_brokers(pool, master)
         .await
         .map_err(|e| LoadRefusal::Internal(format!("could not read broker connections: {e}")))?;
     let conn = connections.into_iter().find(|c| c.code == code).ok_or(LoadRefusal::NotFound)?;
 
-    // A load and an enrichment write the same rows: either one active blocks both.
-    let latest_job = if kind.writes_universe() {
-        super::latest_universe_job(pool, code).await
-    } else {
-        latest(pool, kind, code).await
-    };
+    let latest_job = super::latest_universe_job(pool, code).await;
     if let Some(job) = latest_job.map_err(|e| LoadRefusal::Internal(e.to_string()))? {
         if matches!(job.status, JobStatus::Queued | JobStatus::Running) {
             return Err(LoadRefusal::AlreadyRunning(job.id));
@@ -288,28 +276,6 @@ pub async fn start_expiry_sweep(pool: &PgPool, started_by: &str) -> Result<Uuid,
         }
     });
     Ok(id)
-}
-
-/// Enrich a broker connection's instruments with FIGIs
-#[utoipa::path(
-    post, path = "/admin/broker-connections/{code}/universe/enrich", tag = "admin",
-    operation_id = "enrich_connection_universe",
-    params(("code" = String, Path, description = "Broker connection code")),
-    responses(
-        (status = 202, description = "Started; follow it at /admin/jobs/{job_id}", body = JobStarted),
-        (status = 404, description = "Not found"),
-        (status = 409, description = "Enrichment for this connection is already running; its job_id is in the body"),
-        (status = 422, description = "No usable credentials, a broker without a catalog, or not the active connection"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn enrich_connection_universe(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-) -> Result<(StatusCode, Json<JobStarted>), LoadRefusal> {
-    let master = master_key()?;
-    let job_id = start_enrichment(state.pool(), master.as_ref(), &code).await?;
-    Ok((StatusCode::ACCEPTED, Json(JobStarted { job_id })))
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -489,7 +455,7 @@ mod tests {
         }
     }
 
-    // --- job list / detail, sweep, enrichment ---------------------------------
+    // --- job list / detail, sweep ---------------------------------
 
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
@@ -499,7 +465,7 @@ mod tests {
         let s = format!("test-{}", uuid::Uuid::new_v4().simple());
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let id = super::super::create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
+            let id = super::super::create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
             super::super::JobHandle::new(pool.clone(), id).succeed(json!({})).await.unwrap();
             ids.push(id);
         }
@@ -528,7 +494,7 @@ mod tests {
         let _jobs = crate::jobs::test_lock::shared().await;
         let pool = test_pool().await;
         let s = format!("test-{}", uuid::Uuid::new_v4().simple());
-        let id = super::super::create(&pool, JobKind::Enrichment, Some(&s), "test", json!({})).await.unwrap();
+        let id = super::super::create(&pool, JobKind::UniverseLoad, Some(&s), "test", json!({})).await.unwrap();
         let h = super::super::JobHandle::new(pool.clone(), id);
         h.log("info", "first").await.unwrap();
         h.log("warn", "second").await.unwrap();
@@ -570,18 +536,6 @@ mod tests {
         assert_eq!(job.kind, "expiry_sweep");
         let result = job.result.unwrap();
         assert!(result["recomputed"].is_u64() && result["expired"].is_u64(), "{result}");
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn enrich_endpoint_refuses_unconfigured_credentials() {
-        let _jobs = crate::jobs::test_lock::shared().await;
-        let pool = test_pool().await;
-        let master = crate::config::master_key(crate::config::load()).and_then(Result::ok);
-        let code = bare_connection(&pool).await;
-        let err = start_enrichment(&pool, master.as_ref(), &code).await.unwrap_err();
-        drop_connection(&pool, &code).await;
-        assert!(matches!(&err, LoadRefusal::Unprocessable(m) if m.contains("add credentials first")), "{err:?}");
     }
 }
 

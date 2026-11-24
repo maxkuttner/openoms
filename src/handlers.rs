@@ -1648,7 +1648,6 @@ pub(crate) mod tests {
         use crate::app_state::AppState;
         use gateway::adapter::BrokerRegistry;
         use gateway::stream_health::StreamHealthRegistry;
-        use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
         let pool = test_pool().await;
         let suffix = Uuid::new_v4();
@@ -1751,7 +1750,6 @@ pub(crate) mod tests {
         let state = AppState::new(
             pool.clone(),
             BrokerRegistry::new(), // empty: nothing can route
-            Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
             gateway::contract::EngineHandle::new().0,
@@ -2548,12 +2546,10 @@ pub(crate) mod tests {
     pub(crate) fn test_app_state(pool: sqlx::PgPool) -> AppState {
         use gateway::adapter::BrokerRegistry;
         use gateway::stream_health::StreamHealthRegistry;
-        use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
         AppState::new(
             pool,
             BrokerRegistry::new(),
-            Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
             gateway::contract::EngineHandle::new().0,

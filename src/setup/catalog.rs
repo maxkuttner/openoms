@@ -1,6 +1,5 @@
 //! Shared master-catalog upsert: turn provider-neutral [`InstrumentDef`]s into
-//! `public.instrument` (+ `instrument_derivative`) rows, and optionally enrich them
-//! with external identifiers (FIGI/CUSIP/ISIN via OpenFIGI).
+//! `public.instrument` (+ `instrument_derivative`) rows.
 //!
 //! Broker-first seeding drives this from `setup::brokers`: an adapter's
 //! `InstrumentProvider` yields the definitions, this module writes the master rows
@@ -11,7 +10,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use dataprovider::{Enricher, InstrumentDef, OptionKind};
+use dataprovider::{InstrumentDef, OptionKind};
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::{info, warn};
 
@@ -30,7 +29,6 @@ pub struct CatalogSummary {
     /// a re-sync that changed nothing, or when the venue has no calendar row —
     /// preflight reports the latter.
     pub dated: u64,
-    pub enriched: u64,
     /// The distinct venue/currency codes that failed the FK check. Distinct rather
     /// than per-row: a skip count alone says something is wrong but not what, and
     /// the answer is always a handful of codes even when thousands of rows drop.
@@ -46,13 +44,12 @@ impl CatalogSummary {
 
 /// Upsert a batch of instrument definitions into the master catalog. FK-filters on
 /// the known venue/currency sets, drops already-expired options, dedups by
-/// (symbol, venue), upserts instruments then derivatives in one transaction, then
-/// runs the enricher pipeline. Returns the summary plus the `(symbol, venue) -> id`
+/// (symbol, venue) and upserts instruments then derivatives in one transaction.
+/// Returns the summary plus the `(symbol, venue) -> id`
 /// map for every upserted row so the caller can write dependent mappings.
 pub async fn upsert_catalog(
     pool: &PgPool,
     defs: &[InstrumentDef],
-    enrichers: &[Box<dyn Enricher>],
 ) -> Result<(CatalogSummary, HashMap<(String, String), i64>), Box<dyn std::error::Error>> {
     let mut summary = CatalogSummary::default();
     let mut ids: HashMap<(String, String), i64> = HashMap::new();
@@ -141,10 +138,6 @@ pub async fn upsert_catalog(
     // Same function the sweep runs, so a contract cannot end up with an instant that
     // depends on which path wrote it.
     summary.dated = crate::expiry::recompute_expires_at(pool).await?;
-
-    if !enrichers.is_empty() {
-        summary.enriched = run_enrichers(pool, enrichers, defs).await?;
-    }
     Ok((summary, ids))
 }
 
@@ -269,64 +262,4 @@ async fn bulk_upsert_derivatives(
     .rows_affected();
 
     Ok(affected as usize)
-}
-
-/// Run each enricher over the FIGI-less SPOT rows and persist the identifiers it
-/// resolves onto the master. Returns the number of instruments stamped.
-async fn run_enrichers(
-    pool: &PgPool,
-    enrichers: &[Box<dyn Enricher>],
-    defs: &[InstrumentDef],
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let mut working: Vec<InstrumentDef> = Vec::new();
-    for d in defs.iter().filter(|d| d.instrument_class == "SPOT") {
-        let figi: Option<Option<String>> =
-            sqlx::query_scalar("SELECT figi FROM instrument WHERE symbol = $1 AND venue = $2")
-                .bind(&d.symbol)
-                .bind(&d.venue)
-                .fetch_optional(pool)
-                .await?;
-        if matches!(figi, Some(None)) {
-            working.push(d.clone());
-        }
-    }
-    if working.is_empty() {
-        return Ok(0);
-    }
-    info!(
-        "enriching {} SPOT symbol(s) via {} enricher(s)",
-        working.len(),
-        enrichers.len()
-    );
-
-    let mut stamped = 0u64;
-    for enricher in enrichers {
-        let report = enricher.enrich(&mut working).await?;
-        for (symbol, venue) in &report.resolved {
-            if let Some(d) = working.iter().find(|d| &d.symbol == symbol && &d.venue == venue) {
-                persist_identifiers(pool, d).await?;
-                stamped += 1;
-            }
-        }
-    }
-    Ok(stamped)
-}
-
-/// Stamp an enriched def's identifiers onto the master (only where still empty).
-async fn persist_identifiers(pool: &PgPool, d: &InstrumentDef) -> Result<(), Box<dyn std::error::Error>> {
-    sqlx::query(
-        "UPDATE instrument SET \
-            figi  = COALESCE(figi,  $3), \
-            cusip = COALESCE(cusip, $4), \
-            isin  = COALESCE(isin,  $5) \
-         WHERE symbol = $1 AND venue = $2",
-    )
-    .bind(&d.symbol)
-    .bind(&d.venue)
-    .bind(d.identifiers.figi.as_deref())
-    .bind(d.identifiers.cusip.as_deref())
-    .bind(d.identifiers.isin.as_deref())
-    .execute(pool)
-    .await?;
-    Ok(())
 }

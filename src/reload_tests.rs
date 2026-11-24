@@ -31,7 +31,6 @@ fn adapter() -> Arc<AlpacaAdapter> {
 
 fn state(pool: PgPool) -> AppState {
     AppState::new(pool, BrokerRegistry::new(),
-        symbology::Identifier::new(symbology::OpenFigiClient::new(None), symbology::InMemoryCache::new()),
         StreamHealthRegistry::new(), crate::event_bus::EventBus::new(),
         gateway::contract::EngineHandle::new().0, std::sync::Arc::new(gateway::md::MarketDataGateway::new(StreamHealthRegistry::new()).0),
         crate::sessions::SessionConfig {

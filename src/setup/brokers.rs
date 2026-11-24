@@ -12,7 +12,7 @@
 use std::env;
 
 use clap::{Args as ClapArgs, ValueEnum};
-use dataprovider::{Enricher, InstrumentDef, OpenFigiEnricher};
+use dataprovider::InstrumentDef;
 use sqlx::{PgPool, Postgres, Transaction};
 use tracing::{info, warn};
 
@@ -143,9 +143,6 @@ pub struct Args {
     /// Empty seeds equities/spot only — the full option tape is not seeded wholesale.
     #[arg(long, default_value = "")]
     pub underlyings: String,
-    /// Skip the enricher pipeline (FIGI via OpenFIGI).
-    #[arg(long)]
-    pub no_enrich: bool,
     /// Fetch + match + print counts, but write nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -189,7 +186,7 @@ pub async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let opts = LoadOptions { no_enrich: args.no_enrich, allow_skips: args.allow_skips, underlyings };
+    let opts = LoadOptions { allow_skips: args.allow_skips, underlyings };
     let report = load_universe(&pool, args.broker, provider.as_ref(), &opts, &TracingProgress).await?;
 
     // Loud by default. `upsert_catalog` already named the offending venues and
@@ -276,7 +273,6 @@ pub async fn provider_for(
 /// fails a skipping load unless it is set); the load itself always completes and
 /// reports what it skipped.
 pub struct LoadOptions {
-    pub no_enrich: bool,
     pub allow_skips: bool,
     /// Option chains to seed alongside the base instruments. Empty for cockpit
     /// and boot loads.
@@ -339,22 +335,16 @@ pub async fn load_universe(
 
     // 1) Create/refresh the master instrument catalog from the broker's definitions.
     let defs: Vec<InstrumentDef> = catalog.iter().map(|bi| bi.definition.clone()).collect();
-    let enrichers: Vec<Box<dyn Enricher>> = if opts.no_enrich {
-        Vec::new()
-    } else {
-        vec![Box::new(OpenFigiEnricher::new(env::var("OPENFIGI_API_KEY").ok()))]
-    };
-    let (summary, ids) = catalog::upsert_catalog(pool, &defs, &enrichers).await?;
+    let (summary, ids) = catalog::upsert_catalog(pool, &defs).await?;
     p.log(
         "info",
         &format!(
-            "master: upserted={} skipped_fk={} skipped_expired={} derivatives={} dated={} enriched={}",
+            "master: upserted={} skipped_fk={} skipped_expired={} derivatives={} dated={}",
             summary.upserted,
             summary.skipped_fk(),
             summary.skipped_expired,
             summary.derivatives,
-            summary.dated,
-            summary.enriched
+            summary.dated
         ),
     );
 
@@ -626,7 +616,6 @@ mod tests {
                 native_id: None,
                 provider_exchange: None,
                 derivative: None,
-                identifiers: Default::default(),
             },
             broker_symbol: symbol.to_string(),
             broker_exchange: None,
@@ -666,7 +655,7 @@ mod tests {
     }
 
     fn opts() -> LoadOptions {
-        LoadOptions { no_enrich: true, allow_skips: true, underlyings: Vec::new() }
+        LoadOptions { allow_skips: true, underlyings: Vec::new() }
     }
 
     #[tokio::test]

@@ -227,7 +227,7 @@ pub async fn save(
         instruments.push(to_broker_instrument(contract).map_err(|e| unprocessable(format!("conId {con_id}: {e}")))?);
     }
     dropped(client.as_ref())?;
-    let report = save_instruments(state.pool(), instruments, false)
+    let report = save_instruments(state.pool(), instruments)
         .await
         .map_err(|e| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(report))
@@ -279,10 +279,9 @@ impl LoadProgress for Quiet {
 pub async fn save_instruments(
     pool: &PgPool,
     instruments: Vec<BrokerInstrument>,
-    no_enrich: bool,
 ) -> Result<UniverseLoadReport, Box<dyn std::error::Error>> {
     let broker = Broker::of("IBKR_TWS").ok_or("IBKR_TWS is not a universe broker")?;
-    let opts = LoadOptions { no_enrich, allow_skips: true, underlyings: Vec::new() };
+    let opts = LoadOptions { allow_skips: true, underlyings: Vec::new() };
     load_universe(pool, broker, &Chosen(Mutex::new(instruments)), &opts, &Quiet).await
 }
 
@@ -349,7 +348,7 @@ async fn refresh(pool: &PgPool, client: &dyn TwsClient) -> Result<RefreshReport,
         }
     }
 
-    let updated = if current.is_empty() { 0 } else { save_instruments(pool, current, true).await?.mapped as usize };
+    let updated = if current.is_empty() { 0 } else { save_instruments(pool, current).await?.mapped as usize };
     let untradeable = if vanished.is_empty() {
         0
     } else {
@@ -610,7 +609,7 @@ mod tests {
         let (mut a, mut b) = (contract(kept, "IBIS"), contract(gone, "IBIS"));
         a.symbol = "ZKEEP".into();
         b.symbol = "ZGONE".into();
-        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()], true)
+        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()])
             .await
             .unwrap();
 
@@ -635,7 +634,7 @@ mod tests {
         let (mut a, mut b) = (contract(refused, "IBIS"), contract(ok, "IBIS"));
         a.symbol = "ZREFUSED".into();
         b.symbol = "ZOKTICK".into();
-        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()], true)
+        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()])
             .await
             .unwrap();
 
@@ -659,7 +658,7 @@ mod tests {
         let con_id = 990_000_021_i64;
         let mut c = contract(con_id, "IBIS");
         c.symbol = "ZTICK".into();
-        save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()], true).await.unwrap();
+        save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()]).await.unwrap();
 
         c.min_tick = 0.05;
         let client = Scripted { details: [(con_id, c)].into(), ..Default::default() };
@@ -712,9 +711,9 @@ mod tests {
                 .unwrap()
         };
 
-        let first = save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()], true).await.unwrap();
+        let first = save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()]).await.unwrap();
         assert_eq!((first.mapped, first.skipped), (1, 0), "{first:?}");
-        let second = save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()], true).await.unwrap();
+        let second = save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()]).await.unwrap();
         assert_eq!((second.mapped, second.skipped), (1, 0));
         assert_eq!(count(pool.clone()).await, 1);
         assert_eq!(master(pool.clone()).await, 1);

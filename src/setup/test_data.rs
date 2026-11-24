@@ -8,7 +8,7 @@
 
 use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use clap::Args as ClapArgs;
-use dataprovider::{DerivativeDef, Identifiers, InstrumentDef, OptionKind};
+use dataprovider::{DerivativeDef, InstrumentDef, OptionKind};
 use sqlx::PgPool;
 use tracing::info;
 
@@ -28,9 +28,7 @@ pub struct Args {}
 pub async fn run(_args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let pool = PgPool::connect(&super::database_url()?).await?;
     let defs = spy_chain_defs(Utc::now().date_naive());
-    // No enrichers: this data has no vendor identifiers to enrich, and it must
-    // never make a network call.
-    let (summary, _ids) = catalog::upsert_catalog(&pool, &defs, &[]).await?;
+    let (summary, _ids) = catalog::upsert_catalog(&pool, &defs).await?;
     info!(
         "seed-test-chain done: upserted={} skipped_fk={} derivatives={} dated={}",
         summary.upserted,
@@ -94,7 +92,6 @@ pub fn spy_chain_defs(today: NaiveDate) -> Vec<InstrumentDef> {
         native_id: None,
         provider_exchange: None,
         derivative: None,
-        identifiers: Identifiers::default(),
     });
 
     for expiry in next_fridays(today, EXPIRY_COUNT) {
@@ -122,7 +119,6 @@ pub fn spy_chain_defs(today: NaiveDate) -> Vec<InstrumentDef> {
                         expiry_date: Some(expiry),
                         activation_date: None,
                     }),
-                    identifiers: Identifiers::default(),
                 });
             }
         }

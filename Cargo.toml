@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/symbology", "crates/dataprovider", "crates/gateway", "crates/risk"]
+members = [".", "crates/dataprovider", "crates/gateway", "crates/risk"]
 resolver = "2"
 
 [package]
@@ -79,10 +79,8 @@ tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
 domain = "0.12.1"
 
-# In-repo instrument identification (OpenFIGI symbology engine)
-symbology = { path = "crates/symbology" }
 
-# In-repo data-provider abstraction (universe discovery + seeding + enrichment)
+# In-repo data-provider abstraction (universe discovery + seeding)
 dataprovider = { path = "crates/dataprovider" }
 gateway = { path = "crates/gateway" }
 

@@ -7,7 +7,6 @@ use axum::{
 use base64::engine::{general_purpose, Engine};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
 use tracing::info;
 use uuid::Uuid;
 
@@ -20,8 +19,6 @@ use crate::credentials_api::{self, CredentialSubmission};
 use crate::reload;
 use gateway::stream_health::StreamHealth;
 use crate::domain::identity::{Account, BrokerConnection, Portfolio};
-use crate::symbology_resolver::{self, ResolveError, ResolveOutcome};
-use symbology::InstrumentQuery;
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePortfolio {
@@ -2189,31 +2186,6 @@ pub async fn list_instruments(
     Ok(Json(records))
 }
 
-// ── Symbology (FIGI resolution) ───────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct ResolveRequest {
-    pub ticker: Option<String>,
-    pub isin: Option<String>,
-    pub cusip: Option<String>,
-    pub figi: Option<String>,
-    pub mic: Option<String>,
-    pub exch_code: Option<String>,
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct BackfillRequest {
-    pub limit: Option<i64>,
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct BackfillResult {
-    pub scanned: i64,
-    pub stamped: i64,
-    pub ambiguous: i64,
-    pub unresolved: i64,
-}
-
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ExpirySweepResult {
     /// Contracts whose UTC `expires_at` was derived or corrected from the venue
@@ -2222,125 +2194,6 @@ pub struct ExpirySweepResult {
     pub recomputed: u64,
     /// Instruments moved from ACTIVE to EXPIRED.
     pub expired: u64,
-}
-
-fn map_resolve_error(err: ResolveError) -> AdminError {
-    match err {
-        ResolveError::Db(e) => AdminError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("database error: {e}"),
-        },
-        ResolveError::Engine(e) => AdminError {
-            status: StatusCode::BAD_GATEWAY,
-            message: format!("symbology engine error: {e}"),
-        },
-    }
-}
-
-#[utoipa::path(
-    post, path = "/admin/symbology/resolve", tag = "admin",
-    request_body = ResolveRequest,
-    responses((status = 200, description = "Resolution", body = ResolveOutcome)),
-    security(("bearer_token" = []))
-)]
-pub async fn resolve_symbology(
-    State(state): State<AppState>,
-    Json(req): Json<ResolveRequest>,
-) -> Result<Json<ResolveOutcome>, AdminError> {
-    let query = InstrumentQuery {
-        figi: req.figi,
-        isin: req.isin,
-        cusip: req.cusip,
-        ticker: req.ticker,
-        mic: req.mic,
-        exch_code: req.exch_code,
-        currency: None,
-        market_sec_des: None,
-    };
-    let outcome = symbology_resolver::resolve(state.pool(), state.symbology().as_ref(), &query)
-        .await
-        .map_err(map_resolve_error)?;
-    Ok(Json(outcome))
-}
-
-/// Backfill FIGIs for instruments that have none, as a job
-///
-/// Runs in the background and answers at once with the job id; the counts that
-/// used to be the response body are the job's result.
-#[utoipa::path(
-    post, path = "/admin/symbology/backfill", tag = "admin",
-    request_body = BackfillRequest,
-    responses((status = 202, description = "Started; follow it at /admin/jobs/{job_id}; the result is a BackfillResult", body = JobStarted)),
-    security(("bearer_token" = []))
-)]
-pub async fn backfill_symbology(
-    State(state): State<AppState>,
-    axum::Extension(ctx): axum::Extension<crate::auth::AuthContext>,
-    Json(req): Json<BackfillRequest>,
-) -> Result<(StatusCode, Json<JobStarted>), AdminError> {
-    let limit = req.limit.unwrap_or(50).clamp(1, 500);
-    info!(limit, "admin symbology backfill");
-    let job_id = crate::jobs::create(
-        state.pool(),
-        crate::jobs::JobKind::SymbologyBackfill,
-        None,
-        &ctx.principal_code,
-        serde_json::json!({ "limit": limit }),
-    )
-    .await
-    .map_err(|e| AdminError { status: StatusCode::INTERNAL_SERVER_ERROR, message: e.to_string() })?;
-    let handle = crate::jobs::JobHandle::new(state.pool().clone(), job_id);
-    tokio::spawn(async move {
-        let _ = handle.start().await;
-        // In a task of its own so a panic is seen here and still ends the job.
-        let (task_state, task_handle) = (state.clone(), handle.clone());
-        let outcome = tokio::spawn(async move { run_backfill(&task_state, limit, &task_handle).await }).await;
-        let recorded = match outcome {
-            Ok(Ok(result)) => handle.succeed(serde_json::to_value(result).unwrap_or_default()).await,
-            Ok(Err(e)) => handle.fail(&e.to_string()).await,
-            Err(e) => handle.fail(&format!("the backfill crashed: {e}")).await,
-        };
-        if let Err(e) = recorded {
-            tracing::error!("symbology backfill job {}: could not record its outcome: {e}", handle.id);
-        }
-    });
-    Ok((StatusCode::ACCEPTED, Json(JobStarted { job_id })))
-}
-
-async fn run_backfill(
-    state: &AppState,
-    limit: i64,
-    handle: &crate::jobs::JobHandle,
-) -> Result<BackfillResult, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT id, symbol, venue FROM instrument \
-         WHERE figi IS NULL AND status = 'ACTIVE' ORDER BY id LIMIT $1",
-    )
-    .bind(limit)
-    .fetch_all(state.pool())
-    .await?;
-    let total = rows.len() as i64;
-
-    let mut result = BackfillResult { scanned: 0, stamped: 0, ambiguous: 0, unresolved: 0 };
-    for row in rows {
-        result.scanned += 1;
-        let symbol: String = row.get("symbol");
-        let venue: String = row.get("venue");
-        // Translate our MIC -> OpenFIGI exchCode for the lookup; mic pins the master match.
-        let query = InstrumentQuery {
-            ticker: Some(symbol),
-            exch_code: symbology::openfigi_exch_code(&venue).map(str::to_string),
-            mic: Some(venue),
-            ..Default::default()
-        };
-        match symbology_resolver::resolve(state.pool(), state.symbology().as_ref(), &query).await {
-            Ok(ResolveOutcome::Resolved { instrument_id: Some(_), .. }) => result.stamped += 1,
-            Ok(ResolveOutcome::Ambiguous { .. }) => result.ambiguous += 1,
-            _ => result.unresolved += 1,
-        }
-        handle.progress(result.scanned, Some(total)).await?;
-    }
-    Ok(result)
 }
 
 /// Run the instrument expiry pass now, as a job, instead of waiting for the hourly tick
@@ -2924,12 +2777,10 @@ mod tests {
     fn test_app_state(pool: sqlx::PgPool) -> AppState {
         use gateway::adapter::BrokerRegistry;
         use gateway::stream_health::StreamHealthRegistry;
-        use symbology::{Identifier, InMemoryCache, OpenFigiClient};
 
         AppState::new(
             pool,
             BrokerRegistry::new(),
-            Identifier::new(OpenFigiClient::new(None), InMemoryCache::new()),
             StreamHealthRegistry::new(),
             crate::event_bus::EventBus::new(),
             gateway::contract::EngineHandle::new().0,

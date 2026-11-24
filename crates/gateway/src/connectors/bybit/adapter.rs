@@ -14,7 +14,7 @@
 //! `BINANCE` rows — separate markets, see `mark_router.rs`). The pair (e.g.
 //! `BTCUSDT`) is the routing symbol; the base coin (e.g. `BTC`) is the native id.
 
-use dataprovider::{Identifiers, InstrumentDef};
+use dataprovider::{InstrumentDef};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
 use sha2::Sha256;
@@ -208,7 +208,6 @@ pub(crate) fn parse_spot_instruments(result: &serde_json::Value) -> Vec<BrokerIn
                 native_id: Some(base),
                 provider_exchange: Some("BYBIT".to_string()),
                 derivative: None,
-                identifiers: Identifiers::default(),
             };
             Some(BrokerInstrument {
                 broker_symbol: pair,

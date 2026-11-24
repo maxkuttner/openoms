@@ -53,7 +53,7 @@ it connects.
 
 Saving the credentials offers to load Coinbase's spot products as a background job; the
 **Instrument universe** column on **Broker connections** shows its state and has
-**Load** / **Reload**. From a terminal: `oms setup sync-broker --broker coinbase --no-enrich`.
+**Load** / **Reload**. From a terminal: `oms setup sync-broker --broker coinbase`.
 
 Coinbase products are their own instruments: `BTC-USD` on Coinbase is a different entry
 from `BTCUSDT` on Binance. To trade on Coinbase, an admin grants the portfolio the
