@@ -4,9 +4,12 @@
 
 use std::collections::BTreeSet;
 
+use axum::extract::{Path, State};
+use axum::{Extension, Json};
 use sqlx::{PgExecutor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::handlers::ApiError;
 
@@ -150,6 +153,140 @@ pub async fn set_group_grants(tx: &mut Transaction<'_, Postgres>, ctx: &AuthCont
     crate::groups_api::audit(tx, ctx, "grants.group_set", group, serde_json::json!({ "grants": names })).await
 }
 
+// ---- admin API -----------------------------------------------------------
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct GrantsBody {
+    pub grants: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CatalogEntry {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub category: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PreviewEntry {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub granted: bool,
+    /// Where it comes from: "default" (everyone has it) or "group".
+    pub from: &'static str,
+}
+
+fn category(k: GrantKey) -> &'static str {
+    match k {
+        GrantKey::Orders | GrantKey::CancelAny | GrantKey::Allocate | GrantKey::Options => "Trading",
+        GrantKey::Strategies | GrantKey::StrategyTokens => "Strategies",
+        GrantKey::LimitsView | GrantKey::LimitsSet => "Risk",
+        GrantKey::ApiKeys => "Account",
+    }
+}
+
+fn api_error(status: axum::http::StatusCode, message: impl Into<String>) -> ApiError {
+    ApiError { status, message: message.into() }
+}
+
+fn internal(e: sqlx::Error) -> ApiError {
+    crate::handlers::internal("database error", e)
+}
+
+fn names(set: &BTreeSet<GrantKey>) -> Vec<String> {
+    set.iter().map(|k| k.as_str().to_string()).collect()
+}
+
+/// Validate every key before anything is written.
+fn parse_keys(body: &GrantsBody) -> Result<Vec<GrantKey>, ApiError> {
+    let mut out = BTreeSet::new();
+    for k in &body.grants {
+        let key = GrantKey::parse(k).ok_or_else(|| api_error(axum::http::StatusCode::UNPROCESSABLE_ENTITY, format!("unknown grant {k}")))?;
+        out.insert(key);
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// `GET /admin/grants/catalog`: every key with label and category, in display order.
+pub async fn catalog() -> Json<Vec<CatalogEntry>> {
+    Json(GrantKey::ALL.into_iter().map(|k| CatalogEntry { key: k.as_str(), label: k.label(), category: category(k) }).collect())
+}
+
+/// `GET /admin/grants/default`
+pub async fn get_default(State(state): State<AppState>) -> Result<Json<GrantsBody>, ApiError> {
+    let set = default_grants(state.pool()).await.map_err(internal)?;
+    Ok(Json(GrantsBody { grants: names(&set) }))
+}
+
+/// `PUT /admin/grants/default`: exactly these grants for everyone.
+pub async fn put_default(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Json(body): Json<GrantsBody>,
+) -> Result<Json<GrantsBody>, ApiError> {
+    let keys = parse_keys(&body)?;
+    let mut tx = state.pool().begin().await.map_err(internal)?;
+    set_default_grants(&mut tx, &ctx, &keys).await?;
+    tx.commit().await.map_err(internal)?;
+    // Everyone is affected: refresh every active person's open sessions.
+    let people: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM principal WHERE principal_type = 'HUMAN' AND status = 'ACTIVE'")
+        .fetch_all(state.pool())
+        .await
+        .map_err(internal)?;
+    crate::groups_api::announce(&state, people);
+    Ok(Json(GrantsBody { grants: names(&keys.into_iter().collect()) }))
+}
+
+async fn require_group(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    let found: Option<Uuid> = sqlx::query_scalar("SELECT id FROM user_group WHERE id = $1").bind(id).fetch_optional(state.pool()).await.map_err(internal)?;
+    found.map(|_| ()).ok_or_else(|| api_error(axum::http::StatusCode::NOT_FOUND, "group not found"))
+}
+
+/// `GET /admin/groups/:id/grants`
+pub async fn get_group(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<GrantsBody>, ApiError> {
+    require_group(&state, id).await?;
+    let set = group_grants(state.pool(), id).await.map_err(internal)?;
+    Ok(Json(GrantsBody { grants: names(&set) }))
+}
+
+/// `PUT /admin/groups/:id/grants`: exactly these grants for the group's members.
+pub async fn put_group(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<AuthContext>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<GrantsBody>,
+) -> Result<Json<GrantsBody>, ApiError> {
+    let keys = parse_keys(&body)?;
+    require_group(&state, id).await?;
+    let mut tx = state.pool().begin().await.map_err(internal)?;
+    set_group_grants(&mut tx, &ctx, id, &keys).await?;
+    let members: Vec<Uuid> = sqlx::query_scalar("SELECT principal_id FROM user_group_member WHERE group_id = $1")
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    crate::groups_api::announce(&state, members);
+    Ok(Json(GrantsBody { grants: names(&keys.into_iter().collect()) }))
+}
+
+/// `GET /admin/groups/:id/preview`: what a member of this group would get.
+pub async fn preview(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<serde_json::Value>, ApiError> {
+    require_group(&state, id).await?;
+    let default = default_grants(state.pool()).await.map_err(internal)?;
+    let group = group_grants(state.pool(), id).await.map_err(internal)?;
+    let grants: Vec<PreviewEntry> = GrantKey::ALL
+        .into_iter()
+        .map(|k| PreviewEntry {
+            key: k.as_str(),
+            label: k.label(),
+            granted: default.contains(&k) || group.contains(&k),
+            from: if default.contains(&k) { "default" } else { "group" },
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "grants": grants })))
+}
+
 /// Test fixture: give `principal` `keys` through a fresh one-member group (as
 /// an admin would), for tests whose setup predates access grants.
 #[cfg(test)]
@@ -201,6 +338,75 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         set_group_grants(&mut tx, &admin(), g, keys).await.unwrap();
         tx.commit().await.unwrap();
+    }
+
+    #[test]
+    fn catalog_lists_all_keys_in_order() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let Json(c) = rt.block_on(catalog());
+        let got: Vec<_> = c.iter().map(|e| (e.key, e.category)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("orders", "Trading"), ("cancel_any", "Trading"), ("allocate", "Trading"), ("options", "Trading"),
+                ("strategies", "Strategies"), ("strategy_tokens", "Strategies"),
+                ("limits_view", "Risk"), ("limits_set", "Risk"), ("api_keys", "Account"),
+            ]
+        );
+        assert_eq!(c[0].label, "Place and cancel own orders");
+    }
+
+    fn body(keys: &[&str]) -> Json<GrantsBody> {
+        Json(GrantsBody { grants: keys.iter().map(|s| s.to_string()).collect() })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn put_default_grants_round_trips() {
+        let pool = migrated_db().await;
+        let st = crate::groups_api::tests::state(pool.clone());
+        let Json(put) = put_default(State(st.clone()), Extension(admin()), body(&["options", "orders"])).await.unwrap();
+        assert_eq!(put.grants, vec!["orders", "options"]);
+        let Json(got) = get_default(State(st.clone())).await.unwrap();
+        assert_eq!(got.grants, vec!["orders", "options"]);
+        let _ = put_default(State(st.clone()), Extension(admin()), body(&[])).await.unwrap();
+        assert!(get_default(State(st)).await.unwrap().0.grants.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn unknown_grant_is_422() {
+        let pool = migrated_db().await;
+        let st = crate::groups_api::tests::state(pool.clone());
+        let before = default_grants(&pool).await.unwrap();
+        let err = put_default(State(st.clone()), Extension(admin()), body(&["orders", "fly"])).await.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.message, "unknown grant fly");
+        assert_eq!(default_grants(&pool).await.unwrap(), before, "nothing written");
+        let g = group(&pool, &[]).await;
+        let err = put_group(State(st.clone()), Extension(admin()), Path(g), body(&["fly"])).await.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(group_grants(&pool, g).await.unwrap().is_empty());
+        let err = put_group(State(st), Extension(admin()), Path(Uuid::new_v4()), body(&["orders"])).await.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn preview_marks_default_vs_group() {
+        let pool = migrated_db().await;
+        let st = crate::groups_api::tests::state(pool.clone());
+        let _ = put_default(State(st.clone()), Extension(admin()), body(&["orders"])).await.unwrap();
+        let g = group(&pool, &[]).await;
+        let _ = put_group(State(st.clone()), Extension(admin()), Path(g), body(&["orders", "options"])).await.unwrap();
+        let Json(v) = preview(State(st), Path(g)).await.unwrap();
+        let rows = v["grants"].as_array().unwrap();
+        assert_eq!(rows.len(), 9);
+        let row = |k: &str| rows.iter().find(|r| r["key"] == k).unwrap().clone();
+        assert_eq!((row("orders")["granted"].clone(), row("orders")["from"].clone()), (true.into(), "default".into()));
+        assert_eq!((row("options")["granted"].clone(), row("options")["from"].clone()), (true.into(), "group".into()));
+        assert_eq!(row("limits_set")["granted"], false);
+        assert_eq!(row("orders")["label"], "Place and cancel own orders");
     }
 
     #[tokio::test]
