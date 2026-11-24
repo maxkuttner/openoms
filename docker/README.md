@@ -1,3 +1,3 @@
 # docker
 
-Config for the containers the root `compose.dev.yaml` can bring up — currently just `authentik/blueprints/` (the dev blueprint creating the `oms` OIDC provider and application, used by the opt-in `oidc` profile as a local SSO test provider). The OMS works with any OIDC issuer (Entra, Google, Okta, Keycloak, Authentik, ...) via `[auth.oidc]`; Authentik here is a dev-only fixture with a public client secret, which the OMS refuses off-loopback, and the deploy stack does not run it.
+The container image's start script: `entrypoint.sh` sets up the database on first start, then serves; `entrypoint_test.sh` tests it (run in CI). The image itself is built from the root `Dockerfile`.

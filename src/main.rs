@@ -360,14 +360,6 @@ fn refuses_plain_http_oidc(bind_addr: &str, public_base_url: &str) -> bool {
     !(https || purely_local)
 }
 
-/// The client secret the bundled dev identity-provider fixture registers.
-/// Anyone can read it, so it is refused anywhere but a loopback bind.
-const DEV_OIDC_CLIENT_SECRET: &str = "oms-dev-secret";
-
-fn refuses_dev_client_secret(bind_addr: &str, client_secret: Option<&str>) -> bool {
-    client_secret == Some(DEV_OIDC_CLIENT_SECRET) && !bind_is_loopback(bind_addr)
-}
-
 /// Bind address on the usual tiers. No CLI flag exists for this today, so the
 /// chain is env → file → default. Both sources are emptiness-filtered: a blank
 /// `bind_addr` in `oms.toml` must fall through to the default the same way a
@@ -1371,14 +1363,6 @@ async fn serve() {
             );
             std::process::exit(1);
         }
-        if refuses_dev_client_secret(&bind_addr, env::var("OMS_OIDC_CLIENT_SECRET").ok().as_deref()) {
-            error!(
-                "refusing to start: OMS_OIDC_CLIENT_SECRET is the public development secret and \
-                 OMS_BIND_ADDR ({bind_addr}) is not loopback. Register a real client secret at \
-                 your identity provider and set OMS_OIDC_CLIENT_SECRET to it."
-            );
-            std::process::exit(1);
-        }
     }
 
     // Stream health + the event bus are created here (before the broker
@@ -1889,20 +1873,6 @@ mod tests {
     /// The OIDC start-up gate. Plain http is only ever acceptable when the
     /// whole deployment is loopback; `https://` is fine on any bind, which is
     /// the reverse-proxy topology C2 was about.
-    #[test]
-    fn boot_refuses_dev_secret_off_loopback() {
-        use super::refuses_dev_client_secret as refuses;
-
-        assert!(refuses("0.0.0.0:3001", Some("oms-dev-secret")));
-        assert!(refuses("oms.internal:3001", Some("oms-dev-secret")));
-        // Local development may keep the fixture's secret.
-        assert!(!refuses("127.0.0.1:3001", Some("oms-dev-secret")));
-        assert!(!refuses("localhost:3001", Some("oms-dev-secret")));
-        // A real secret, or none, is not this rule's business.
-        assert!(!refuses("0.0.0.0:3001", Some("a-real-registered-secret")));
-        assert!(!refuses("0.0.0.0:3001", None));
-    }
-
     #[test]
     fn plain_http_oidc_is_only_tolerated_when_everything_is_local() {
         use super::refuses_plain_http_oidc as refuses;

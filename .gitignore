@@ -1,9 +1,8 @@
 .env
 .env.*
 !.env.example
-scripts/.env
 
-# Python (scripts/)
+# Python
 __pycache__/
 *.pyc
 
@@ -41,8 +40,6 @@ oms.toml
 # per-boot admin token the server writes beside oms.toml
 host-token
 
-# scripts/colo-demo.sh state
-/colo-demo/
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
