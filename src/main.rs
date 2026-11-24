@@ -29,6 +29,7 @@ mod admin_bootstrap;
 mod authz;
 mod limits_api;
 mod grants;
+mod access_grants;
 
 use gateway::adapter::BrokerRegistry;
 use gateway::md::daily_stats::DailyStatsRegistry;
