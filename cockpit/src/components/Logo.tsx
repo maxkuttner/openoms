@@ -12,13 +12,13 @@ export function DepthGlyph({ height = 24 }: { height?: number }) {
   );
 }
 
-// "openOMS" wordmark — muted "open", bold "OMS".
+// "openOMS" wordmark in the app font — muted "open", "OMS" in the foreground colour.
 export function Logo({ size = 15 }: { size?: number }) {
   return (
     <span className="inline-flex items-center gap-2 whitespace-nowrap">
       <DepthGlyph height={size + 2} />
-      <span style={{ fontSize: size, letterSpacing: -0.5, lineHeight: 1 }}>
-        <span className="font-normal text-muted-foreground">open</span>
+      <span style={{ fontSize: size, lineHeight: 1 }}>
+        <span className="font-semibold text-muted-foreground">open</span>
         <span className="font-semibold text-foreground">OMS</span>
       </span>
     </span>

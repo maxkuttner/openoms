@@ -1,7 +1,7 @@
 # OpenOMS
 
 <p align="center">
-  <img alt="openOMS" src="cockpit/public/favicon.svg" width="72">
+  <img alt="openOMS" src="brand/logo.svg" width="72">
 </p>
 <p align="center">
   <a href="https://github.com/maxkuttner/openoms/actions/workflows/build.yml">

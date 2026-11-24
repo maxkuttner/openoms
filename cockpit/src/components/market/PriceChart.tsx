@@ -7,6 +7,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { depthPoints, movingAverage, type DepthPoint, type MarketDataSource, type Timeframe } from "../../marketData";
 import { SampleBadge } from "./SampleBadge";
 import { cssVar, useMarketTick } from "./useMarketTick";
+import { useTheme } from "../../theme";
 
 const TIMEFRAMES: Timeframe[] = ["1m", "5m", "1h", "4h", "1d"];
 const CANDLES = 300;
@@ -20,6 +21,7 @@ export function PriceChart({ source, instrumentId }: { source: MarketDataSource;
   const [tf, setTf] = useState<Timeframe>("1h");
   const [view, setView] = useState<View>("price");
   const tick = useMarketTick(source, instrumentId);
+  const theme = useTheme(); // the chart reads colours once; rebuild on a theme change
   const live = useRef<((t: number) => void) | null>(null);
 
   useEffect(() => {
@@ -80,7 +82,7 @@ export function PriceChart({ source, instrumentId }: { source: MarketDataSource;
       live.current = put;
     }
     return () => { c.remove(); chart.current = null; live.current = null; };
-  }, [source, instrumentId, tf, view]);
+  }, [source, instrumentId, tf, view, theme]);
 
   useEffect(() => { live.current?.(tick); }, [tick]);
 

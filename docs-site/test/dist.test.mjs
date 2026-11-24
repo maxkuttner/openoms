@@ -64,6 +64,14 @@ test("the app's colour tokens match the docs' brand colours", () => {
   }
 });
 
+// brand/ holds the logos. The favicons are copies (each build only sees its own
+// folder), so they must stay byte-equal to brand/logo.svg.
+test("the favicons are copies of brand/logo.svg", () => {
+  const logo = readFileSync(new URL("../../brand/logo.svg", import.meta.url), "utf8");
+  for (const f of ["../../cockpit/public/favicon.svg", "../public/favicon.svg"])
+    assert.equal(readFileSync(new URL(f, import.meta.url), "utf8"), logo, `${f} differs from brand/logo.svg`);
+});
+
 // Env vars win over oms.toml. An install from before env-only setup keeps its
 // role password, master key and URL in oms.toml: the compose file must pass these
 // through only when set, never require or default them.

@@ -1,4 +1,4 @@
-/* The one list of colours in the web app (dark only). Every colour in src/ comes
+/* The one list of colours in the web app: dark by default, light under html.light. Every colour in src/ comes
    from here. The brand colours are the docs site's --oms-* tokens
    (docs-site/src/styles/theme.css); a docs test keeps them equal. */
 :root {
@@ -49,4 +49,49 @@
   --chart-4: #a3a3a3;
   --chart-5: #737373;
   color-scheme: dark;
+}
+
+/* Light theme: same brand hues, darkened so they read on white. */
+:root.light {
+  --background: #f6f7f9;
+  --card: #ffffff;
+  --sidebar: #ffffff;
+  --popover: #ffffff;
+  --accent: #eceef2;
+  --secondary: #eceef2;
+  --muted: #eceef2;
+  --border: #d9dde3;
+  --input: #d9dde3;
+  --border-subtle: #eceef2;
+
+  --foreground: #16191e;
+  --foreground-2: #4b5563;
+  --muted-foreground: #6b7280;
+  --card-foreground: #16191e;
+  --popover-foreground: #16191e;
+  --secondary-foreground: #16191e;
+  --accent-foreground: #16191e;
+
+  --primary: #138a63;
+  --primary-foreground: #ffffff;
+  --ring: #138a63;
+  --warn: #a86f0f;
+  --brand-amber: #ce9a3b;
+  --buy: #138a63;
+  --sell: #d22f3d;
+  --destructive: #d22f3d;
+
+  --sidebar-foreground: #4b5563;
+  --sidebar-primary: #138a63;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #eceef2;
+  --sidebar-accent-foreground: #16191e;
+  --sidebar-border: #d9dde3;
+  --sidebar-ring: #138a63;
+  --chart-1: #138a63;
+  --chart-2: #a86f0f;
+  --chart-3: #d22f3d;
+  --chart-4: #4b5563;
+  --chart-5: #6b7280;
+  color-scheme: light;
 }

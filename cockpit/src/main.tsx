@@ -6,6 +6,11 @@ import "./styles/globals.css";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { App } from "./App";
+import { useTheme } from "./theme";
+
+function ThemedToaster() {
+  return <Toaster position="top-right" theme={useTheme()} />;
+}
 
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
@@ -22,7 +27,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
         <BrowserRouter basename={basename}>
           <App />
         </BrowserRouter>
-        <Toaster position="top-right" theme="dark" />
+        <ThemedToaster />
       </TooltipProvider>
     </QueryClientProvider>
   </React.StrictMode>,

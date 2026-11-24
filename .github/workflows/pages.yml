@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "docs-site/**"
+      - "brand/**"
       - "install.sh"
       - "docs/openapi.json"
       # The docs' CLI-reference test reads the subcommands from here.

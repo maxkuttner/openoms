@@ -11,7 +11,7 @@ export default defineConfig({
     starlight({
       title: "openoms",
       description: "An open source multi-client order management system.",
-      logo: { src: "./src/assets/logo.svg" },
+      logo: { src: "../brand/logo.svg" },
       favicon: "/favicon.svg",
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/maxkuttner/openoms" }],
       editLink: { baseUrl: "https://github.com/maxkuttner/openoms/edit/main/docs-site/" },
