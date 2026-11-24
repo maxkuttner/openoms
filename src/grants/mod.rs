@@ -154,6 +154,13 @@ mod tests {
         assert_eq!(spec("venue").denied, "venue not granted to this portfolio");
     }
     #[test]
+    fn every_kind_has_an_explicit_spec_arm() {
+        let generic = spec("\u{0}unregistered").denied;
+        for kind in KINDS {
+            assert_ne!(spec(kind).denied, generic, "{kind} falls through to the generic spec arm");
+        }
+    }
+    #[test]
     fn venue_with_account_ref_admits() {
         let g = Grant::Venue { connection: "ibkr".into(), account_ref: Some("DU1".into()) };
         assert!(check(&facts("ibkr"), &[g]).is_ok());

@@ -556,7 +556,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     let account_id: Uuid = match (strategy_route, &grants) {
         (Some((account, _)), _) => account,
         (None, Some(grants)) => granted_account(&pool, portfolio_id, instrument_id_bigint, req.account_id.as_deref(), grants).await?,
-        (None, None) => unreachable!("grants are loaded for every non-strategy order"),
+        (None, None) => return Err(crate::handlers::internal("trading grants not loaded", "grants missing for non-strategy order")),
     };
     let fix_cl_ord_id = match &origin {
         Origin::Fix { cl_ord_id } => Some(cl_ord_id.clone()),
