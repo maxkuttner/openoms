@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 /// Future shapes: `InstrumentClass { connection, class }` and
 /// `Hours { tz, days, from, to }`.
 ///
-/// A new kind touches four places: (1) a variant here, (2) its arm in
-/// `admits`, (3) `KINDS` and `when_absent`, (4) a UI section in the cockpit.
+/// A new kind touches: (1) a variant here, (2) its arm in `kind()` and
+/// `admits`, (3) `KINDS` and its arm in `spec` (default when absent + denial
+/// message), (4) a UI section in the cockpit. The `every_variant_is_in_kinds`
+/// test fails if (3) forgets `KINDS`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params", rename_all = "snake_case")]
 pub enum Grant {
@@ -23,8 +25,22 @@ pub enum Absent {
     Allow,
 }
 
+/// Per-kind policy: the default when absent and the denial message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KindSpec {
+    absent: Absent,
+    denied: &'static str,
+}
+
 /// Every grant kind the check enforces.
 const KINDS: &[&str] = &["venue"];
+
+fn spec(kind: &str) -> KindSpec {
+    match kind {
+        "venue" => KindSpec { absent: Absent::Deny, denied: "venue not granted to this portfolio" },
+        _ => KindSpec { absent: Absent::Allow, denied: "not granted to this portfolio" },
+    }
+}
 
 /// The facts about an order that grants are checked against.
 pub struct OrderFacts {
@@ -48,27 +64,16 @@ impl Grant {
     }
 
     pub fn when_absent(kind: &str) -> Absent {
-        match kind {
-            "venue" => Absent::Deny,
-            _ => Absent::Allow,
-        }
+        spec(kind).absent
     }
 
     fn admits(&self, f: &OrderFacts) -> bool {
         match self {
+            // account_ref is a routing detail (which broker account to use),
+            // not part of the permission check.
             Grant::Venue { connection, .. } => *connection == f.connection,
         }
     }
-}
-
-fn denial(kind: &str) -> Denied {
-    Denied(
-        match kind {
-            "venue" => "venue not granted to this portfolio",
-            _ => "not granted to this portfolio",
-        }
-        .to_string(),
-    )
 }
 
 /// For each registered kind: if the portfolio holds grants of that kind, at
@@ -82,7 +87,7 @@ pub fn check(f: &OrderFacts, grants: &[Grant]) -> Result<(), Denied> {
             of_kind.any(|g| g.admits(f))
         };
         if !ok {
-            return Err(denial(kind));
+            return Err(Denied(spec(kind).denied.to_string()));
         }
     }
     Ok(())
@@ -132,5 +137,29 @@ mod tests {
     #[test]
     fn unknown_kind_fails_to_parse() {
         assert!(serde_json::from_str::<Grant>(r#"{"kind":"nope","params":{}}"#).is_err());
+    }
+    #[test]
+    fn every_variant_is_in_kinds() {
+        let one_of_each = [venue("c")];
+        for g in &one_of_each {
+            assert!(KINDS.contains(&g.kind()), "{} missing from KINDS", g.kind());
+        }
+    }
+    #[test]
+    fn absent_defaults_are_pinned() {
+        assert_eq!(Grant::when_absent("venue"), Absent::Deny);
+        assert_eq!(Grant::when_absent("hours"), Absent::Allow);
+        assert_eq!(spec("venue").denied, "venue not granted to this portfolio");
+    }
+    #[test]
+    fn venue_with_account_ref_admits() {
+        let g = Grant::Venue { connection: "ibkr".into(), account_ref: Some("DU1".into()) };
+        assert!(check(&facts("ibkr"), &[g]).is_ok());
+    }
+    #[test]
+    fn missing_or_malformed_params_fail_to_parse() {
+        assert!(serde_json::from_str::<Grant>(r#"{"kind":"venue"}"#).is_err());
+        assert!(serde_json::from_str::<Grant>(r#"{"kind":"venue","params":{}}"#).is_err());
+        assert!(serde_json::from_str::<Grant>(r#"{"kind":"venue","params":{"connection":1}}"#).is_err());
     }
 }
