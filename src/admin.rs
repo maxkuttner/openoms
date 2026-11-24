@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use base64::engine::{general_purpose, Engine};
 use chrono::{DateTime, Utc};
@@ -112,10 +112,12 @@ pub struct RedactedCredentials {
 )]
 pub async fn create_portfolio(
     State(state): State<AppState>,
+    Extension(ctx): Extension<crate::auth::AuthContext>,
     Json(payload): Json<CreatePortfolio>,
 ) -> Result<Json<Portfolio>, AdminError> {
     info!(code = %payload.code, name = %payload.name, "admin create portfolio");
     let id = Uuid::new_v4();
+    let mut tx = state.pool().begin().await.map_err(map_db_error)?;
     let record = sqlx::query_as::<_, Portfolio>(
         r#"
         INSERT INTO portfolio (
@@ -130,14 +132,44 @@ pub async fn create_portfolio(
         "#,
     )
     .bind(id)
-    .bind(payload.code)
+    .bind(&payload.code)
     .bind(payload.name)
     .bind(payload.status)
     .bind(payload.base_currency)
     .bind(payload.default_account_id)
-    .fetch_one(state.pool())
+    .fetch_one(&mut *tx)
     .await
     .map_err(map_db_error)?;
+
+    // The portfolio's own view group: the creator (when a person) is its
+    // first member; a host-CLI creation leaves it empty.
+    let group_id = Uuid::new_v4();
+    let group_name = format!("portfolio {}", payload.code);
+    sqlx::query("INSERT INTO user_group (id, name) VALUES ($1, $2)")
+        .bind(group_id)
+        .bind(&group_name)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+    sqlx::query("INSERT INTO user_group_portfolio (group_id, portfolio_id, access) VALUES ($1, $2, 'view')")
+        .bind(group_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+    sqlx::query(
+        "INSERT INTO user_group_member (group_id, principal_id) \
+         SELECT $1, id FROM principal WHERE id = $2 AND principal_type = 'HUMAN'",
+    )
+    .bind(group_id)
+    .bind(ctx.principal_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_db_error)?;
+    crate::groups_api::audit(&mut tx, &ctx, "group.created", group_id, serde_json::json!({ "name": group_name }))
+        .await
+        .map_err(|e| AdminError { status: e.status, message: e.message })?;
+    tx.commit().await.map_err(map_db_error)?;
 
     Ok(Json(record))
 }
@@ -2332,6 +2364,58 @@ pub(crate) fn map_db_error(err: sqlx::Error) -> AdminError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthContext;
+    use crate::authz_schema_tests::migrated_db;
+    use crate::groups_api::tests::{person, state};
+    use axum::Extension;
+    use sqlx::PgPool;
+
+    async fn make_portfolio(pool: &PgPool, ctx: AuthContext, code: &str) -> Uuid {
+        let body = CreatePortfolio { code: code.into(), name: "n".into(), status: "ACTIVE".into(), base_currency: None, default_account_id: None };
+        create_portfolio(State(state(pool.clone())), Extension(ctx), Json(body)).await.unwrap().0.id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn admin_created_portfolio_gets_owner_group() {
+        let pool = migrated_db().await;
+        let me = person(&pool).await;
+        let code = format!("own-{}", Uuid::new_v4().simple());
+        let pf = make_portfolio(&pool, AuthContext::machine(me, "ada".into()), &code).await;
+        let name = format!("portfolio {code}");
+        let (members, access): (i64, String) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM user_group_member m WHERE m.group_id = g.id AND m.principal_id = $2), p.access \
+             FROM user_group g JOIN user_group_portfolio p ON p.group_id = g.id WHERE g.name = $1 AND p.portfolio_id = $3",
+        )
+        .bind(&name).bind(me).bind(pf)
+        .fetch_one(&pool).await.unwrap();
+        assert_eq!((members, access.as_str()), (1, "view"));
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM user_group_member m JOIN user_group g ON g.id = m.group_id WHERE g.name = $1")
+            .bind(&name).fetch_one(&pool).await.unwrap();
+        assert_eq!(total, 1, "creator is the sole member");
+        let (v, t): (bool, bool) = sqlx::query_as("SELECT can_view, can_trade FROM portfolio_access WHERE principal_id = $1 AND portfolio_id = $2")
+            .bind(me).bind(pf).fetch_one(&pool).await.unwrap();
+        assert!(v && !t);
+        let audited: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_event WHERE action = 'group.created' AND actor = 'ada' AND detail->'detail'->>'name' = $1")
+            .bind(&name).fetch_one(&pool).await.unwrap();
+        assert_eq!(audited, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn host_created_portfolio_gets_empty_owner_group() {
+        let pool = migrated_db().await;
+        let code = format!("host-{}", Uuid::new_v4().simple());
+        let pf = make_portfolio(&pool, crate::admin_bootstrap::host_context(), &code).await;
+        let name = format!("portfolio {code}");
+        let (members, access): (i64, String) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM user_group_member m WHERE m.group_id = g.id), p.access \
+             FROM user_group g JOIN user_group_portfolio p ON p.group_id = g.id WHERE g.name = $1 AND p.portfolio_id = $2",
+        )
+        .bind(&name).bind(pf)
+        .fetch_one(&pool).await.unwrap();
+        assert_eq!((members, access.as_str()), (0, "view"));
+    }
 
     fn broker(code: &str, state: CredentialState<BrokerCredentials>) -> Connection<BrokerCredentials> {
         Connection {

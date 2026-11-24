@@ -86,7 +86,7 @@ fn db(err: sqlx::Error) -> ApiError {
     }
 }
 
-async fn audit(tx: &mut Transaction<'_, Postgres>, ctx: &AuthContext, action: &str, group: Uuid, detail: serde_json::Value) -> Result<(), ApiError> {
+pub(crate) async fn audit(tx: &mut Transaction<'_, Postgres>, ctx: &AuthContext, action: &str, group: Uuid, detail: serde_json::Value) -> Result<(), ApiError> {
     sqlx::query("INSERT INTO audit_event (actor, action, detail) VALUES ($1, $2, $3)")
         .bind(&ctx.principal_code)
         .bind(action)
@@ -371,17 +371,17 @@ pub async fn set_user_groups(tx: &mut Transaction<'_, Postgres>, principal: Uuid
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::authz::{allowed, Permission};
     use crate::authz_schema_tests::migrated_db;
     use sqlx::PgPool;
 
-    fn admin() -> AuthContext {
+    pub(crate) fn admin() -> AuthContext {
         AuthContext::machine(Uuid::nil(), "ada".to_string())
     }
 
-    async fn person(pool: &PgPool) -> Uuid {
+    pub(crate) async fn person(pool: &PgPool) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, $2, 'HUMAN', 'ACTIVE')")
             .bind(id)
@@ -392,7 +392,7 @@ mod tests {
         id
     }
 
-    async fn portfolio(pool: &PgPool) -> Uuid {
+    pub(crate) async fn portfolio(pool: &PgPool) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'p', 'ACTIVE')")
             .bind(id)
@@ -415,7 +415,7 @@ mod tests {
         id
     }
 
-    fn state(pool: PgPool) -> AppState {
+    pub(crate) fn state(pool: PgPool) -> AppState {
         crate::handlers::tests::test_app_state(pool)
     }
 
