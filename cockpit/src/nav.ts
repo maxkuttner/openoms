@@ -38,7 +38,6 @@ export const ADMIN_TABS: AdminTab[] = [
     title: "Trading setup",
     pages: [
       admin("portfolios", "Portfolios"),
-      admin("accounts", "Accounts"),
       admin("strategies", "Strategies"),
       admin("risk-limits", "Risk limits"),
       admin("instruments", "Instruments"),

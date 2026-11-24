@@ -29,9 +29,9 @@ test("account pages are settings only; /access is the refused-sign-in landing, n
   assert.deepEqual(ACCOUNT_PAGES.map((p) => p.path), ["/settings"]);
   assert.ok(commandItems(true).every((p) => p.path !== "/access"));
 });
-test("admin tabs group the thirteen admin pages", () => {
+test("admin tabs group the twelve admin pages", () => {
   assert.deepEqual(ADMIN_TABS.map((t) => t.title), ["People", "Trading setup", "Connectivity", "Monitoring"]);
-  assert.equal(ADMIN_TABS.flatMap((t) => t.pages).length, 13);
+  assert.equal(ADMIN_TABS.flatMap((t) => t.pages).length, 12);
   assert.deepEqual(ADMIN_TABS[0].pages.map((p) => p.title), ["Users", "Groups", "Sign-in", "API"]);
   assert.deepEqual(ADMIN_TABS[3].pages.map((p) => p.path), ["/admin/blotter", "/admin/breaks"]);
 });
@@ -49,7 +49,7 @@ test("non-admin may not open admin routes", () => {
 });
 test("command menu hides admin pages from non-admins", () => {
   assert.ok(commandItems(false).every((p) => !p.path.startsWith("/admin")));
-  assert.equal(commandItems(true).filter((p) => p.path.startsWith("/admin")).length, 13);
+  assert.equal(commandItems(true).filter((p) => p.path.startsWith("/admin")).length, 12);
   assert.ok(commandItems(false).some((p) => p.path === "/settings"));
 });
 test("pageFor names the page a path belongs to", () => {

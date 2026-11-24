@@ -20,7 +20,6 @@ import { GroupsPage } from "./pages/admin/Groups";
 import { SignInPage } from "./pages/admin/SignIn";
 import { ApiPage } from "./pages/admin/Api";
 import { PortfoliosPage } from "./pages/admin/Portfolios";
-import { AccountsPage } from "./pages/admin/Accounts";
 import { StrategiesPage } from "./pages/admin/Strategies";
 import { RiskLimitsPage } from "./pages/admin/RiskLimits";
 import { InstrumentsPage } from "./pages/admin/Instruments";
@@ -68,7 +67,6 @@ export function App() {
           <Route path="sign-in" element={<SignInPage />} />
           <Route path="api" element={<ApiPage />} />
           <Route path="portfolios" element={<PortfoliosPage />} />
-          <Route path="accounts" element={<AccountsPage />} />
           <Route path="strategies" element={<StrategiesPage />} />
           <Route path="risk-limits" element={<RiskLimitsPage />} />
           <Route path="instruments" element={<InstrumentsPage />} />

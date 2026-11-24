@@ -8,7 +8,6 @@ export interface Portfolio {
   name: string;
   status: string;
   base_currency: string | null;
-  default_account_id: string | null;
   created_at: string;
   updated_at: string;
 }
