@@ -43,7 +43,7 @@ use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, Allocat
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
 use crate::admin::{
-    CreatePortfolio, UpdatePortfolio,
+    CreatePortfolio, UpdatePortfolio, HistoryEvent,
     CreateAccount, UpdateAccount,
     CreateBrokerConnection, UpdateBrokerConnection,
     CreateKey, ApiKeyRecord,
@@ -130,6 +130,7 @@ mod first_run_tests;
         admin::revoke_trading_token,
         admin::create_portfolio,
         admin::list_portfolios,
+        admin::portfolio_history,
         admin::get_portfolio,
         admin::update_portfolio,
         admin::create_account,
@@ -213,7 +214,7 @@ mod first_run_tests;
         order_events::OrderEventView,
         handlers::GrantedPortfolio,
         Principal, Portfolio, Account, BrokerConnection,
-        CreatePortfolio, UpdatePortfolio,
+        CreatePortfolio, UpdatePortfolio, HistoryEvent,
         CreateAccount, UpdateAccount,
         CreateBrokerConnection, UpdateBrokerConnection,
         admin::RedactedCredentials, crate::credentials::RedactedField,
@@ -1020,6 +1021,7 @@ fn build_app(
             "/admin/portfolios/:id",
             axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
         )
+        .route("/admin/portfolios/:id/history", get(admin::portfolio_history))
         .route(
             "/admin/portfolios/:id/grants",
             get(grants::store::get_grants).put(grants::store::put_grants),

@@ -1657,6 +1657,49 @@
         ]
       }
     },
+    "/admin/portfolios/{id}/history": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "portfolio_history",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Portfolio ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audit events, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/HistoryEvent"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/risk-limits": {
       "get": {
         "tags": [
@@ -5472,6 +5515,28 @@
             "type": "string",
             "format": "uuid"
           }
+        }
+      },
+      "HistoryEvent": {
+        "type": "object",
+        "required": [
+          "at",
+          "actor",
+          "action",
+          "detail"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "actor": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "detail": {}
         }
       },
       "ImportResolveRequest": {

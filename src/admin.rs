@@ -141,6 +141,19 @@ pub async fn create_portfolio(
     .await
     .map_err(map_db_error)?;
 
+    sqlx::query("INSERT INTO audit_event (actor, action, detail) VALUES ($1, 'portfolio.created', $2)")
+        .bind(&ctx.principal_code)
+        .bind(serde_json::json!({
+            "portfolio_id": id,
+            "code": record.code,
+            "name": record.name,
+            "status": record.status,
+            "base_currency": record.base_currency,
+        }))
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_error)?;
+
     // The portfolio's own view group: the creator (when a person) is its
     // first member; a host-CLI creation leaves it empty.
     let group_id = Uuid::new_v4();
@@ -166,7 +179,7 @@ pub async fn create_portfolio(
     .execute(&mut *tx)
     .await
     .map_err(map_db_error)?;
-    crate::groups_api::audit(&mut tx, &ctx, "group.created", group_id, serde_json::json!({ "name": group_name }))
+    crate::groups_api::audit(&mut tx, &ctx, "group.created", group_id, serde_json::json!({ "name": group_name, "portfolio_id": id }))
         .await
         .map_err(|e| AdminError { status: e.status, message: e.message })?;
     tx.commit().await.map_err(map_db_error)?;
@@ -241,10 +254,34 @@ pub async fn get_portfolio(
 )]
 pub async fn update_portfolio(
     State(state): State<AppState>,
+    Extension(ctx): Extension<crate::auth::AuthContext>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdatePortfolio>,
 ) -> Result<Json<Portfolio>, AdminError> {
     info!(portfolio_id = %id, "admin update portfolio");
+    let mut tx = state.pool().begin().await.map_err(map_db_error)?;
+    let before = sqlx::query_as::<_, Portfolio>(
+        "SELECT id, code, name, status, base_currency, default_account_id, created_at, updated_at \
+         FROM portfolio WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_db_error)?
+    .ok_or_else(|| AdminError::not_found("portfolio"))?;
+    let mut changes = serde_json::Map::new();
+    let mut note = |field: &str, old: serde_json::Value, new: Option<serde_json::Value>| {
+        if let Some(new) = new {
+            if new != old {
+                changes.insert(field.to_string(), serde_json::json!([old, new]));
+            }
+        }
+    };
+    note("code", before.code.clone().into(), payload.code.clone().map(Into::into));
+    note("name", before.name.clone().into(), payload.name.clone().map(Into::into));
+    note("status", before.status.clone().into(), payload.status.clone().map(Into::into));
+    note("base_currency", serde_json::json!(before.base_currency), payload.base_currency.clone().map(Into::into));
+    note("default_account_id", serde_json::json!(before.default_account_id), payload.default_account_id.map(|v| serde_json::json!(v)));
     let record = sqlx::query_as::<_, Portfolio>(
         r#"
         UPDATE portfolio
@@ -265,12 +302,61 @@ pub async fn update_portfolio(
     .bind(payload.base_currency)
     .bind(payload.default_account_id)
     .bind(id)
-    .fetch_optional(state.pool())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(map_db_error)?
     .ok_or_else(|| AdminError::not_found("portfolio"))?;
+    if !changes.is_empty() {
+        sqlx::query("INSERT INTO audit_event (actor, action, detail) VALUES ($1, 'portfolio.updated', $2)")
+            .bind(&ctx.principal_code)
+            .bind(serde_json::json!({ "portfolio_id": id, "changes": changes }))
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_error)?;
+    }
+    tx.commit().await.map_err(map_db_error)?;
 
     Ok(Json(record))
+}
+
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct HistoryEvent {
+    pub at: DateTime<Utc>,
+    pub actor: String,
+    pub action: String,
+    pub detail: serde_json::Value,
+}
+
+#[utoipa::path(
+    get, path = "/admin/portfolios/{id}/history", tag = "admin",
+    params(("id" = Uuid, Path, description = "Portfolio ID")),
+    responses(
+        (status = 200, description = "Audit events, newest first", body = [HistoryEvent]),
+        (status = 404, description = "Not found"),
+    ),
+    security(("bearer_token" = []))
+)]
+pub async fn portfolio_history(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<HistoryEvent>>, AdminError> {
+    let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM portfolio WHERE id = $1")
+        .bind(id)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(map_db_error)?;
+    exists.ok_or_else(|| AdminError::not_found("portfolio"))?;
+    let key = id.to_string();
+    let rows = sqlx::query_as::<_, (DateTime<Utc>, String, String, serde_json::Value)>(
+        "SELECT at, actor, action, detail FROM audit_event \
+         WHERE detail->>'portfolio_id' = $1 OR detail->'detail'->>'portfolio_id' = $1 \
+         ORDER BY at DESC, id DESC LIMIT 200",
+    )
+    .bind(key)
+    .fetch_all(state.pool())
+    .await
+    .map_err(map_db_error)?;
+    Ok(Json(rows.into_iter().map(|(at, actor, action, detail)| HistoryEvent { at, actor, action, detail }).collect()))
 }
 
 #[utoipa::path(
@@ -2369,6 +2455,31 @@ mod tests {
     use crate::groups_api::tests::{person, state};
     use axum::Extension;
     use sqlx::PgPool;
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn portfolio_history_records_and_scopes() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let me = person(&pool).await;
+        let ctx = AuthContext::machine(me, "ada".into());
+        let a = make_portfolio(&pool, ctx.clone(), &format!("ha-{}", Uuid::new_v4().simple())).await;
+        let b = make_portfolio(&pool, ctx.clone(), &format!("hb-{}", Uuid::new_v4().simple())).await;
+        let body = UpdatePortfolio { code: None, name: Some("renamed".into()), status: Some("CLOSED".into()), base_currency: None, default_account_id: None };
+        update_portfolio(State(st.clone()), Extension(ctx.clone()), Path(a), Json(body)).await.unwrap();
+        let noop = UpdatePortfolio { code: None, name: Some("renamed".into()), status: None, base_currency: None, default_account_id: None };
+        update_portfolio(State(st.clone()), Extension(ctx.clone()), Path(a), Json(noop)).await.unwrap();
+        let h = portfolio_history(State(st.clone()), Path(a)).await.unwrap().0;
+        let actions: Vec<_> = h.iter().map(|e| e.action.as_str()).collect();
+        assert_eq!(actions, ["portfolio.updated", "group.created", "portfolio.created"]);
+        assert_eq!(h[0].actor, "ada");
+        assert_eq!(h[0].detail["changes"]["status"], serde_json::json!(["ACTIVE", "CLOSED"]));
+        assert_eq!(h[0].detail["changes"]["name"], serde_json::json!(["n", "renamed"]));
+        let hb = portfolio_history(State(st.clone()), Path(b)).await.unwrap().0;
+        assert_eq!(hb.len(), 2, "only b's own events");
+        let missing = portfolio_history(State(st.clone()), Path(Uuid::new_v4())).await.unwrap_err();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
 
     async fn make_portfolio(pool: &PgPool, ctx: AuthContext, code: &str) -> Uuid {
         let body = CreatePortfolio { code: code.into(), name: "n".into(), status: "ACTIVE".into(), base_currency: None, default_account_id: None };
