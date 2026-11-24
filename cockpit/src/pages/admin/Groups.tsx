@@ -1,5 +1,9 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
+  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -34,6 +38,13 @@ type CatalogItem = { key: string; label: string; category: string };
 type GrantsBody = { grants: string[] };
 type PreviewItem = { key: string; label: string; granted: boolean; from: "default" | "group" | null };
 
+type Dirty = (dirty: boolean) => void;
+/** Tell the editor whether this tab holds unsaved changes. */
+function useReportDirty(dirty: boolean, onDirty: Dirty) {
+  useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
+}
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 const userLabel = (u: UserRef) => u.display_name ?? u.email ?? u.code;
 const grantsPath = (id: string) => (id === DEFAULT_ID ? DEFAULT_PATH : `${PATH}/${id}/grants`);
 const previewPath = (id: string) => `${PATH}/${id}/preview`;
@@ -47,15 +58,24 @@ function SaveBar({ onSave, pending, disabled }: { onSave: () => void; pending: b
 }
 
 /** Grant switches by category. Grants from the default are on and locked in a group. */
-function GrantsTab({ id }: { id: string }) {
+function GrantsTab({ id, onDirty }: { id: string; onDirty: Dirty }) {
   const isDefault = id === DEFAULT_ID;
   const catalog = useQuery({ queryKey: [CATALOG_PATH], queryFn: () => api.get<CatalogItem[]>(CATALOG_PATH) });
   const defaults = useQuery({ queryKey: [DEFAULT_PATH], queryFn: () => api.get<GrantsBody>(DEFAULT_PATH) });
   const own = useQuery({ queryKey: [grantsPath(id)], queryFn: () => api.get<GrantsBody>(grantsPath(id)) });
+  const qc = useQueryClient();
   const [draft, setDraft] = useState<string[] | null>(null);
+  useReportDirty(draft !== null, onDirty);
   const save = useApiMutation((grants: string[]) => api.put(grantsPath(id), { grants }), {
-    invalidate: [grantsPath(id), DEFAULT_PATH, previewPath(id)], success: "Grants saved", onDone: () => setDraft(null),
+    invalidate: [grantsPath(id), DEFAULT_PATH, previewPath(id)], success: "Grants saved",
+    onDone: () => {
+      setDraft(null);
+      // Default grants feed every group's grants and preview.
+      if (id === DEFAULT_ID) qc.invalidateQueries({ predicate: (q) => String(q.queryKey[0]).startsWith(`${PATH}/`) });
+    },
   });
+  const failed = catalog.error ?? defaults.error ?? own.error;
+  if (failed) return <p className="text-destructive">Could not load grants: {errText(failed)}</p>;
   if (!catalog.data || !defaults.data || !own.data) return <p className="text-muted-foreground">Loading…</p>;
   const current = draft ?? own.data.grants;
   const inherited = new Set(isDefault ? [] : resolveGrants(defaults.data.grants, []).map((g) => g.key));
@@ -88,6 +108,7 @@ function GrantsTab({ id }: { id: string }) {
 
 function PreviewTab({ id }: { id: string }) {
   const preview = useQuery({ queryKey: [previewPath(id)], queryFn: () => api.get<{ grants: PreviewItem[] }>(previewPath(id)) });
+  if (preview.error) return <p className="text-destructive">Could not load preview: {errText(preview.error)}</p>;
   return (
     <div className="flex flex-col gap-2">
       <p className="text-muted-foreground">
@@ -105,19 +126,22 @@ function PreviewTab({ id }: { id: string }) {
   );
 }
 
-function GeneralTab({ group, onSaved, onDeleted }: { group: GroupRow | null; onSaved: (id: string) => void; onDeleted: () => void }) {
-  const [name, setName] = useState(group?.name ?? "");
-  const [description, setDescription] = useState(group?.description ?? "");
+function GeneralTab({ group, onSaved, onDeleted, onDirty }: { group: GroupRow | null; onSaved: (id: string) => void; onDeleted: () => void; onDirty: Dirty }) {
+  const [nameDraft, setName] = useState<string | null>(null);
+  const [descDraft, setDescription] = useState<string | null>(null);
+  const name = nameDraft ?? group?.name ?? "";
+  const description = descDraft ?? group?.description ?? "";
+  useReportDirty(nameDraft !== null || descDraft !== null, onDirty);
   const save = useApiMutation(
     async () => {
       const body = { name: name.trim(), description: description.trim() || null };
       if (group) { await api.put(`${PATH}/${group.id}`, body); return group.id; }
       return (await api.post<{ id: string }>(PATH, body)).id;
     },
-    { invalidate: [PATH, "/admin/users"], success: "Group saved", onDone: (id) => onSaved(id as string) },
+    { invalidate: [PATH, "/admin/users"], success: "Group saved", onDone: (id) => { setName(null); setDescription(null); onSaved(id as string); } },
   );
   const remove = useApiMutation(() => api.del(`${PATH}/${group!.id}`), {
-    invalidate: [PATH, "/admin/users"], success: "Group deleted", onDone: onDeleted,
+    invalidate: [PATH, "/admin/users"], success: "Group deleted", onDone: () => { setName(null); setDescription(null); onDeleted(); },
   });
   return (
     <div className="flex flex-col gap-3">
@@ -140,11 +164,13 @@ function GeneralTab({ group, onSaved, onDeleted }: { group: GroupRow | null; onS
   );
 }
 
-function UsersTab({ group }: { group: GroupRow }) {
+function UsersTab({ group, onDirty }: { group: GroupRow; onDirty: Dirty }) {
   const users = useList<UserRef>("/admin/users");
-  const [members, setMembers] = useState<string[]>(group.members);
+  const [draft, setMembers] = useState<string[] | null>(null);
+  const members = draft ?? group.members;
+  useReportDirty(draft !== null, onDirty);
   const save = useApiMutation(() => api.put(`${PATH}/${group.id}/members`, members), {
-    invalidate: [PATH, "/admin/users"], success: "Members saved",
+    invalidate: [PATH, "/admin/users"], success: "Members saved", onDone: () => setMembers(null),
   });
   return (
     <div className="flex flex-col gap-3">
@@ -158,13 +184,13 @@ function UsersTab({ group }: { group: GroupRow }) {
 }
 
 /** Per-portfolio access level for this group: unchecked = none. */
-function PortfoliosTab({ group }: { group: GroupRow }) {
+function PortfoliosTab({ group, onDirty }: { group: GroupRow; onDirty: Dirty }) {
   const portfolios = useList<Portfolio>("/admin/portfolios");
-  const [value, setValue] = useState<Record<string, Access>>(
-    Object.fromEntries(group.portfolios.map((p) => [p.portfolio_id, p.access])),
-  );
+  const [draft, setValue] = useState<Record<string, Access> | null>(null);
+  const value = draft ?? Object.fromEntries(group.portfolios.map((p) => [p.portfolio_id, p.access]));
+  useReportDirty(draft !== null, onDirty);
   const save = useApiMutation(() => api.put(`${PATH}/${group.id}/portfolios`, accessTableBody(value)), {
-    invalidate: [PATH], success: "Portfolio access saved",
+    invalidate: [PATH], success: "Portfolio access saved", onDone: () => setValue(null),
   });
   return (
     <div className="flex flex-col gap-1.5">
@@ -194,10 +220,17 @@ function PortfoliosTab({ group }: { group: GroupRow }) {
   );
 }
 
-function Editor({ selected, group, onSelect }: { selected: string; group: GroupRow | null; onSelect: (id: string | null) => void }) {
+function Editor({ selected, group, onSelect, onDirtyChange }: { selected: string; group: GroupRow | null; onSelect: (id: string | null) => void; onDirtyChange: Dirty }) {
   const isDefault = selected === DEFAULT_ID;
   const isNew = selected === "new";
   const [tab, setTab] = useState(isNew ? "general" : "grants");
+  const [dirtyTabs, setDirtyTabs] = useState<Record<string, boolean>>({});
+  const markers = useMemo(() => {
+    const mark = (t: string): Dirty => (d) => setDirtyTabs((m) => (m[t] === d ? m : { ...m, [t]: d }));
+    return { general: mark("general"), users: mark("users"), portfolios: mark("portfolios"), grants: mark("grants") };
+  }, []);
+  const anyDirty = Object.values(dirtyTabs).some(Boolean);
+  useEffect(() => { onDirtyChange(anyDirty); }, [anyDirty, onDirtyChange]);
   const title = isDefault ? "Default grants" : isNew ? "New group" : group?.name;
   const sub = isDefault ? "Applies to every user. Groups can only add to this." : group ? groupSummary(group) : "";
   return (
@@ -206,7 +239,7 @@ function Editor({ selected, group, onSelect }: { selected: string; group: GroupR
         <h2 className="text-sm font-semibold">{title}</h2>
         <span className="text-xs text-muted-foreground">{sub}</span>
       </div>
-      {isDefault ? <GrantsTab id={DEFAULT_ID} /> : (
+      {isDefault ? <GrantsTab id={DEFAULT_ID} onDirty={markers.grants} /> : (
         <Tabs value={tab} onValueChange={setTab}>
           <TabsList>
             <TabsTrigger value="general">General</TabsTrigger>
@@ -216,10 +249,10 @@ function Editor({ selected, group, onSelect }: { selected: string; group: GroupR
             {!isNew && <TabsTrigger value="preview">Preview</TabsTrigger>}
           </TabsList>
           <div className="mt-4">
-            <TabsContent value="general"><GeneralTab group={group} onSaved={(id) => onSelect(id)} onDeleted={() => onSelect(null)} /></TabsContent>
-            {group && <TabsContent value="users"><UsersTab group={group} /></TabsContent>}
-            {group && <TabsContent value="portfolios"><PortfoliosTab group={group} /></TabsContent>}
-            {group && <TabsContent value="grants"><GrantsTab id={group.id} /></TabsContent>}
+            <TabsContent forceMount value="general" className="data-[state=inactive]:hidden"><GeneralTab group={group} onSaved={(id) => onSelect(id)} onDeleted={() => onSelect(null)} onDirty={markers.general} /></TabsContent>
+            {group && <TabsContent forceMount value="users" className="data-[state=inactive]:hidden"><UsersTab group={group} onDirty={markers.users} /></TabsContent>}
+            {group && <TabsContent forceMount value="portfolios" className="data-[state=inactive]:hidden"><PortfoliosTab group={group} onDirty={markers.portfolios} /></TabsContent>}
+            {group && <TabsContent forceMount value="grants" className="data-[state=inactive]:hidden"><GrantsTab id={group.id} onDirty={markers.grants} /></TabsContent>}
             {group && <TabsContent value="preview"><PreviewTab id={group.id} /></TabsContent>}
           </div>
         </Tabs>
@@ -232,11 +265,15 @@ function Editor({ selected, group, onSelect }: { selected: string; group: GroupR
 export function GroupsPage() {
   const list = useList<GroupRow>(PATH);
   const [selected, setSelected] = useState<string>(DEFAULT_ID);
+  const [dirty, setDirty] = useState(false);
+  const [pending, setPending] = useState<string | null>(null);
   const groups = list.data ?? [];
   const group = groups.find((g) => g.id === selected) ?? null;
   const effective = selected === DEFAULT_ID || selected === "new" || group ? selected : DEFAULT_ID;
+  // Switching away from unsaved edits asks first.
+  const go = (id: string) => { if (id === effective) return; if (dirty) setPending(id); else setSelected(id); };
   const row = (id: string, name: React.ReactNode, sub: React.ReactNode, extra?: string) => (
-    <button key={id} type="button" onClick={() => setSelected(id)} aria-current={effective === id}
+    <button key={id} type="button" onClick={() => go(id)} aria-current={effective === id || undefined}
       className={cn("flex min-h-12 flex-col items-start justify-center rounded-md border border-transparent px-2.5 py-1.5 text-left hover:bg-muted/50",
         effective === id && "border-border bg-muted", extra)}>
       <span>{name}</span>
@@ -249,16 +286,29 @@ export function GroupsPage() {
         <section aria-label="Groups" className="flex w-full shrink-0 flex-col gap-1 md:w-64">
           <div className="mb-1 flex items-center justify-between">
             <h2 className="text-sm font-semibold">Groups</h2>
-            <Button size="sm" onClick={() => setSelected("new")}>New group</Button>
+            <Button size="sm" onClick={() => go("new")}>New group</Button>
           </div>
+          {list.error && <p className="text-destructive">Could not load groups: {errText(list.error)}</p>}
           {row(DEFAULT_ID, "Default grants", "Every user starts here", "mb-1 border-b-border")}
           {groups.map((g) => row(g.id,
             <>{g.name}{g.strategy_code && <Pill tone="info" className="ml-1.5">strategy {g.strategy_code}{g.strategy_archived ? " · archived" : ""}</Pill>}</>,
             groupSummary(g)))}
-          {groups.length === 0 && <p className="px-2.5 text-muted-foreground">No groups yet.</p>}
+          {!list.error && groups.length === 0 && <p className="px-2.5 text-muted-foreground">No groups yet.</p>}
         </section>
-        <Editor key={effective} selected={effective} group={group} onSelect={(id) => setSelected(id ?? DEFAULT_ID)} />
+        <Editor key={effective} selected={effective} group={group} onSelect={(id) => setSelected(id ?? DEFAULT_ID)} onDirtyChange={setDirty} />
       </div>
+      <AlertDialog open={pending !== null} onOpenChange={(o) => !o && setPending(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Discard unsaved changes?</AlertDialogTitle>
+            <AlertDialogDescription>Edits you have not saved will be lost.</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep editing</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => { setSelected(pending!); setPending(null); }}>Discard</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
