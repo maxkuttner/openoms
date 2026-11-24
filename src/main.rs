@@ -1015,6 +1015,10 @@ fn build_app(
             axum::routing::patch(admin::update_portfolio).get(admin::get_portfolio),
         )
         .route(
+            "/admin/portfolios/:id/grants",
+            get(grants::store::get_grants).put(grants::store::put_grants),
+        )
+        .route(
             "/admin/accounts",
             post(admin::create_account).get(admin::list_accounts),
         )

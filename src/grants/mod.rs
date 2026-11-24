@@ -78,6 +78,8 @@ impl Grant {
 
 /// For each registered kind: if the portfolio holds grants of that kind, at
 /// least one must admit the order; if it holds none, `when_absent` decides.
+pub mod store;
+
 pub fn check(f: &OrderFacts, grants: &[Grant]) -> Result<(), Denied> {
     for kind in KINDS {
         let mut of_kind = grants.iter().filter(|g| g.kind() == *kind).peekable();
