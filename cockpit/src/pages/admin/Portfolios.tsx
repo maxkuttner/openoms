@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -13,6 +13,9 @@ import { useApiMutation, useList } from "../../api/hooks";
 import type { Portfolio } from "../../api/types";
 import { Select, TextField } from "../../components/form";
 import { Pill } from "../../components/status";
+import { CopyText } from "../../components/common";
+import { historyLabel, type HistoryEvent } from "../../portfolioHistory";
+import { fmtLocal } from "../../tradeTimes";
 import { PortfolioAccess, accessPath } from "../../components/admin/PortfolioAccess";
 import { PortfolioVenues, grantsPath, savedVenues, type GrantsResponse } from "../../components/admin/PortfolioVenues";
 import { statusOptions } from "../../lifecycle";
@@ -56,6 +59,54 @@ function GeneralTab({ portfolio, onSaved, onDirty }: { portfolio: Portfolio | nu
   );
 }
 
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+function InfoTab({ portfolio }: { portfolio: Portfolio }) {
+  const venues = useQuery({ queryKey: [grantsPath(portfolio.id)], queryFn: () => api.get<GrantsResponse>(grantsPath(portfolio.id)) });
+  const access = useQuery({ queryKey: [accessPath(portfolio.id)], queryFn: () => api.get<AccessEntry[]>(accessPath(portfolio.id)) });
+  const count = (q: { data?: unknown[]; error: unknown }) => (q.error ? "?" : q.data ? String(q.data.length) : "…");
+  const facts: [string, string][] = [
+    ["Code", portfolio.code],
+    ["Name", portfolio.name],
+    ["Status", portfolio.status],
+    ["Base currency", portfolio.base_currency ?? "—"],
+    ["Created", fmtLocal(portfolio.created_at)],
+    ["Last updated", fmtLocal(portfolio.updated_at)],
+    ["Granted venues", count({ data: venues.data ? savedVenues(venues.data) : undefined, error: venues.error })],
+    ["Access entries", count(access)],
+  ];
+  return (
+    <div className="flex flex-col gap-3">
+      <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-sm">
+        {facts.map(([k, v]) => (<div key={k} className="contents"><dt className="text-muted-foreground">{k}</dt><dd className="font-mono">{v}</dd></div>))}
+      </dl>
+      <CopyText label="Id" value={portfolio.id} />
+    </div>
+  );
+}
+
+function HistoryTab({ portfolioId }: { portfolioId: string }) {
+  const path = `/admin/portfolios/${portfolioId}/history`;
+  const q = useQuery({ queryKey: [path], queryFn: () => api.get<HistoryEvent[]>(path) });
+  if (q.error) return <p className="text-destructive">Could not load history: {errText(q.error)}</p>;
+  if (!q.data) return <p className="text-muted-foreground">Loading…</p>;
+  return (
+    <Table>
+      <TableHeader><TableRow><TableHead>Time</TableHead><TableHead>Who</TableHead><TableHead>What</TableHead></TableRow></TableHeader>
+      <TableBody>
+        {q.data.map((e, i) => (
+          <TableRow key={i}>
+            <TableCell className="whitespace-nowrap text-muted-foreground">{fmtLocal(e.at)}</TableCell>
+            <TableCell className="font-mono">{e.actor}</TableCell>
+            <TableCell>{historyLabel(e)}</TableCell>
+          </TableRow>
+        ))}
+        {q.data.length === 0 && <TableRow><TableCell colSpan={3} className="text-center text-muted-foreground">No changes recorded yet.</TableCell></TableRow>}
+      </TableBody>
+    </Table>
+  );
+}
+
 function Editor({ selected, portfolio, onSelect, onDirtyChange }: {
   selected: string; portfolio: Portfolio | null; onSelect: (id: string) => void; onDirtyChange: Dirty;
 }) {
@@ -79,11 +130,15 @@ function Editor({ selected, portfolio, onSelect, onDirtyChange }: {
           {!isNew && <TabsTrigger value="access">Access</TabsTrigger>}
           {!isNew && <TabsTrigger value="venues">Venues</TabsTrigger>}
           <TabsTrigger value="general">General</TabsTrigger>
+          {!isNew && <TabsTrigger value="info">Info</TabsTrigger>}
+          {!isNew && <TabsTrigger value="history">History</TabsTrigger>}
         </TabsList>
         <div className="mt-4">
           {portfolio && <TabsContent forceMount value="access" className="data-[state=inactive]:hidden"><PortfolioAccess portfolioId={portfolio.id} onDirty={markers.access} /></TabsContent>}
           {portfolio && <TabsContent forceMount value="venues" className="data-[state=inactive]:hidden"><PortfolioVenues portfolioId={portfolio.id} onDirty={markers.venues} /></TabsContent>}
           <TabsContent forceMount value="general" className="data-[state=inactive]:hidden"><GeneralTab portfolio={portfolio} onSaved={onSelect} onDirty={markers.general} /></TabsContent>
+          {portfolio && tab === "info" && <TabsContent value="info"><InfoTab portfolio={portfolio} /></TabsContent>}
+          {portfolio && tab === "history" && <TabsContent value="history"><HistoryTab portfolioId={portfolio.id} /></TabsContent>}
         </div>
       </Tabs>
     </section>
@@ -105,7 +160,6 @@ export function PortfoliosPage() {
   const effective = selected === "new" ? "new" : portfolio ? portfolio.id : first;
   // Switching away from unsaved edits asks first.
   const go = (id: string) => { if (id === effective) return; if (dirty) setPending(id); else setSelected(id); };
-  const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
