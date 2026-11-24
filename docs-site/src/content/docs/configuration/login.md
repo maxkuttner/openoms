@@ -56,7 +56,7 @@ needs portfolio access to trade. The last active admin cannot be removed.
 
 ### Grants
 
-Open **People → Groups → Default grants** to set what every user gets. A group adds
+Open **Organisation → Groups → Default grants** to set what every user gets. A group adds
 grants on top of that. A grant counts if it is on in the defaults or in any of the
 person's groups. Nothing can take a grant away.
 
@@ -76,7 +76,7 @@ Strategy tokens and the host CLI token are not grant-checked.
 
 ### Edit a group
 
-Open a group on **People → Groups**. Its tabs:
+Open a group on **Organisation → Groups**. Its tabs:
 
 - **General:** name and description.
 - **Users:** the members.
@@ -95,7 +95,7 @@ Only admins create portfolios. Creating one also creates the group `portfolio <c
 with the creating admin as its only member, at **view** access. It is an ordinary
 group: raise it, add people, or delete it.
 
-Open one under **Trading setup → Portfolios**. Its tabs:
+Open one under **Trading → Portfolios**. Its tabs:
 
 - **Access:** who may use it. Add groups or single people, each at View, Trade or
   Manage. The highest level wins.
@@ -125,7 +125,7 @@ client_id = "openoms"
 ```
 
 Put the secret in `OMS_OIDC_CLIENT_SECRET`, register the redirect URI
-`{public_base_url}/auth/callback` with the provider, and restart. **People → Sign-in**
+`{public_base_url}/auth/callback` with the provider, and restart. **Security → Sign-in**
 shows whether discovery works.
 
 An SSO login is matched by issuer and subject. An unknown one gets in only if:

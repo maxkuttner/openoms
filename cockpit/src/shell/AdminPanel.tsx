@@ -1,6 +1,5 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { ADMIN_TABS, adminTabFor } from "../nav";
-import { SetupChecklist } from "../components/SetupChecklist";
 import { cn } from "@/lib/utils";
 import { useSession } from "./session";
 import { useOpenBreaks } from "../pages/admin/Breaks";
@@ -23,7 +22,7 @@ function CountBadge({ n }: { n: number }) {
   );
 }
 
-/** The Admin Panel: four tabs across the top, a sub-nav per tab, the page below. */
+/** The Admin Panel: the section is picked in the sidebar; a sub-nav for its pages, the page below. */
 export function AdminPanel() {
   const { admin } = useSession();
   const { pathname } = useLocation();
@@ -33,22 +32,6 @@ export function AdminPanel() {
   const active = adminTabFor(pathname) ?? ADMIN_TABS[0];
   return (
     <div className="flex flex-col gap-3">
-      <SetupChecklist />
-      <nav className="flex gap-1 border-b" aria-label="Admin sections">
-        {ADMIN_TABS.map((t) => (
-          <NavLink
-            key={t.id}
-            to={t.pages[0].path}
-            className={cn(
-              "-mb-px border-b-2 border-transparent px-3 py-1.5 text-foreground-2 hover:text-foreground",
-              t.id === active.id && "border-primary text-foreground",
-            )}
-          >
-            {t.title}
-            {t.id === "monitoring" && <CountBadge n={openBreaks} />}
-          </NavLink>
-        ))}
-      </nav>
       {active.pages.length > 1 && (
         <nav className="flex gap-1" aria-label={`${active.title} pages`}>
           {active.pages.map((p) => (

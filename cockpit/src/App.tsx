@@ -25,7 +25,6 @@ import { RiskLimitsPage } from "./pages/admin/RiskLimits";
 import { InstrumentsPage } from "./pages/admin/Instruments";
 import { BrokerConnectionsPage } from "./pages/admin/BrokerConnections";
 import { DataFeedsPage } from "./pages/admin/DataFeeds";
-import { BlotterPage } from "./pages/admin/Blotter";
 import { BreaksPage } from "./pages/admin/Breaks";
 
 function Trade() {
@@ -72,7 +71,6 @@ export function App() {
           <Route path="instruments" element={<InstrumentsPage />} />
           <Route path="broker-connections" element={<BrokerConnectionsPage />} />
           <Route path="data-feeds" element={<DataFeedsPage />} />
-          <Route path="blotter" element={<BlotterPage />} />
           <Route path="breaks" element={<BreaksPage />} />
           <Route path="*" element={<Navigate to="users" replace />} />
         </Route>

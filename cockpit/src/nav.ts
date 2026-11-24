@@ -4,7 +4,7 @@
 // Paths are relative to the router base (/app/ in production).
 
 export type Page = { id: string; title: string; path: string };
-export type AdminTab = { id: "people" | "setup" | "connectivity" | "monitoring"; title: string; pages: Page[] };
+export type AdminTab = { id: "people" | "setup" | "connectivity" | "monitoring" | "security"; title: string; pages: Page[] };
 
 export type NavGroup = { id: "trade" | "admin"; title: string; pages: Page[] };
 
@@ -32,10 +32,10 @@ export const ACCOUNT_PAGES: Page[] = [
 const admin = (id: string, title: string): Page => ({ id, title, path: `/admin/${id}` });
 
 export const ADMIN_TABS: AdminTab[] = [
-  { id: "people", title: "People", pages: [admin("users", "Users"), admin("groups", "Groups"), admin("sign-in", "Sign-in"), admin("api", "API")] },
+  { id: "people", title: "Organisation", pages: [admin("users", "Users"), admin("groups", "Groups"), admin("api", "API")] },
   {
     id: "setup",
-    title: "Trading setup",
+    title: "Trading",
     pages: [
       admin("portfolios", "Portfolios"),
       admin("strategies", "Strategies"),
@@ -44,7 +44,8 @@ export const ADMIN_TABS: AdminTab[] = [
     ],
   },
   { id: "connectivity", title: "Connectivity", pages: [admin("broker-connections", "Broker connections"), admin("data-feeds", "Data feeds")] },
-  { id: "monitoring", title: "Monitoring", pages: [admin("blotter", "Blotter"), admin("breaks", "Breaks")] },
+  { id: "monitoring", title: "Reconciliation", pages: [admin("breaks", "Breaks")] },
+  { id: "security", title: "Security", pages: [admin("sign-in", "Sign-in")] },
 ];
 
 /** One sidebar entry per Admin Panel tab, opening the tab's first page. */
@@ -58,7 +59,7 @@ export function sidebarFor(isAdmin: boolean): { groups: NavGroup[]; pages: Page[
   return { groups: isAdmin ? [TRADE_GROUP, ADMIN_GROUP] : [TRADE_GROUP], pages: MAIN_PAGES };
 }
 
-const LEGACY: Record<string, string> = { "/positions": "/portfolios", "/reported": "/strategies" };
+const LEGACY: Record<string, string> = { "/positions": "/portfolios", "/reported": "/strategies", "/admin/blotter": "/orders" };
 
 /** Where a pre-redesign path now lives, or null. */
 export function legacyRedirect(path: string): string | null {
