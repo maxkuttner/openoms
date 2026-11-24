@@ -3,6 +3,7 @@ title: Architecture
 description: How orders, fills, prices and strategies move through OpenOMS, and how the instrument catalog ties them together.
 ---
 
+import ArchitectureDiagram from "../../../components/ArchitectureDiagram.astro";
 import Mermaid from "../../../components/Mermaid.astro";
 import overview from "../../../diagrams/overview.mmd?raw";
 import er from "../../../diagrams/er.mmd?raw";
@@ -11,6 +12,8 @@ import runtime from "../../../diagrams/runtime.mmd?raw";
 The central OMS is one program. Its core owns durable accounting state in
 Postgres. Two embedded gateways connect it to venues: one for orders and fills,
 one for prices. Strategies run elsewhere and report their fills over HTTP.
+
+<ArchitectureDiagram />
 
 ## The order path
 
