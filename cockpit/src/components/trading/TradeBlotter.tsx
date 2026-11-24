@@ -263,7 +263,7 @@ export function TradeBlotter({
                     <TableCell className={numeric}>{o.avg_px ?? "—"}</TableCell>
                     <TableCell className={numeric}>{formatFees(o.fees)}</TableCell>
                     <TableCell className="text-right">
-                      {(mayCancelAny || o.principal_id === me.principal_id) && <Button
+                      {(mayCancelAny || o.principal_id === me?.principal_id) && <Button
                         size="xs"
                         variant="destructive"
                         disabled={!canCancel}

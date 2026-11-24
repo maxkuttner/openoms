@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQueries } from "@tanstack/react-query";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -26,6 +26,7 @@ function GeneralTab({ portfolio, onSaved, onDirty }: { portfolio: Portfolio | nu
   const [codeDraft, setCode] = useState<string | null>(null);
   const [nameDraft, setName] = useState<string | null>(null);
   const [statusDraft, setStatus] = useState<string | null>(null);
+  const qc = useQueryClient();
   const code = codeDraft ?? portfolio?.code ?? "";
   const name = nameDraft ?? portfolio?.name ?? "";
   const status = statusDraft ?? portfolio?.status ?? "ACTIVE";
@@ -36,7 +37,11 @@ function GeneralTab({ portfolio, onSaved, onDirty }: { portfolio: Portfolio | nu
       if (portfolio) { await api.patch(`${PATH}/${portfolio.id}`, { name: name.trim(), status }); return portfolio.id; }
       return (await api.post<{ id: string }>(PATH, { code: code.trim(), name: name.trim(), status })).id;
     },
-    { invalidate: [PATH], success: "Portfolio saved", onDone: (id) => { setCode(null); setName(null); setStatus(null); onSaved(id as string); } },
+    { invalidate: [PATH], success: "Portfolio saved", onDone: async (id) => {
+      // Wait for the refreshed list so the editor has the new row before it is selected.
+      await qc.refetchQueries({ queryKey: [PATH] });
+      setCode(null); setName(null); setStatus(null); onSaved(id as string);
+    } },
   );
   return (
     <div className="flex flex-col gap-3">
