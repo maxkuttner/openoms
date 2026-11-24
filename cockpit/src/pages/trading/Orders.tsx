@@ -17,9 +17,7 @@ export function OrdersPage({ me }: { me: Me }) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center gap-2">
-        {viewable.length > 1 && (
-          <PortfolioPicker portfolios={viewable} value={portfolioId} onChange={setPortfolioId} allLabel="All portfolios" />
-        )}
+        <PortfolioPicker portfolios={viewable} value={portfolioId} onChange={setPortfolioId} allLabel="All portfolios" />
         <Tabs value={filter} onValueChange={(v) => setFilter(v as StatusFilter)}>
           <TabsList>{FILTERS.map(([v, l]) => <TabsTrigger key={v} value={v}>{l}</TabsTrigger>)}</TabsList>
         </Tabs>
