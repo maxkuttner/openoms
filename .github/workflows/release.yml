@@ -46,14 +46,14 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: cockpit/package-lock.json
+          cache-dependency-path: clients/web/package-lock.json
 
       - name: build the cockpit bundle
-        working-directory: cockpit
+        working-directory: clients/web
         run: npm ci && npm run build
 
       - name: the bundle must exist before cargo embeds it
-        run: test -s cockpit/dist/index.html
+        run: test -s clients/web/dist/index.html
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

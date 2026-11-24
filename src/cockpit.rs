@@ -5,7 +5,7 @@
 //! second process. Mirrors how `setup/database/assets.rs` carries the migrations.
 //!
 //! Unlike the migrations embed, an *empty* embed here is legitimate: it is what
-//! every source build produces, because `cockpit/dist` is a gitignored build
+//! every source build produces, because `clients/web/dist` is a gitignored build
 //! output. So there is no release assert — the routes explain where the dev UI is.
 
 use axum::{
@@ -17,7 +17,7 @@ use axum::{
 };
 use include_dir::{include_dir, Dir};
 
-static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/cockpit/dist");
+static DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/clients/web/dist");
 
 /// Vite emits content-hashed asset filenames, so a given URL's bytes never change.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";

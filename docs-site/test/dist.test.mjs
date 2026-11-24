@@ -42,11 +42,11 @@ test("phones can switch the theme on the landing page", () => {
   assert.equal(count("getting-started/index.html"), 2, "a docs page should keep its two: header and ☰ menu");
 });
 
-// The web app (cockpit/src/styles/tokens.css) draws its brand colours from the
+// The web app (clients/web/src/styles/tokens.css) draws its brand colours from the
 // docs' --oms-* tokens; CSS cannot import across the two builds, so this keeps
 // each shared colour equal.
 test("the app's colour tokens match the docs' brand colours", () => {
-  const app = readFileSync(new URL("../../cockpit/src/styles/tokens.css", import.meta.url), "utf8");
+  const app = readFileSync(new URL("../../clients/web/src/styles/tokens.css", import.meta.url), "utf8");
   const css = readFileSync(new URL("../src/styles/theme.css", import.meta.url), "utf8");
   const hex = (src, name) => src.match(new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`, "i"))?.[1]?.toLowerCase();
   const pairs = {
@@ -68,7 +68,7 @@ test("the app's colour tokens match the docs' brand colours", () => {
 // folder), so they must stay byte-equal to brand/logo.svg.
 test("the favicons are copies of brand/logo.svg", () => {
   const logo = readFileSync(new URL("../../brand/logo.svg", import.meta.url), "utf8");
-  for (const f of ["../../cockpit/public/favicon.svg", "../public/favicon.svg"])
+  for (const f of ["../../clients/web/public/favicon.svg", "../public/favicon.svg"])
     assert.equal(readFileSync(new URL(f, import.meta.url), "utf8"), logo, `${f} differs from brand/logo.svg`);
 });
 

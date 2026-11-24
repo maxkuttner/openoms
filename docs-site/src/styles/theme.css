@@ -1,4 +1,4 @@
-/* The openoms brand colours. The web app (cockpit/src/styles/tokens.css) uses
+/* The openoms brand colours. The web app (clients/web/src/styles/tokens.css) uses
    the same values; a docs test keeps them equal. The landing page's glows
    (GrainBackground.astro) are glow-green and orange. */
 :root {

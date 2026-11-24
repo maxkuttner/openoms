@@ -8,7 +8,9 @@ export function useMarketTick(source: MarketDataSource, instrumentId: string): n
   return tick;
 }
 
-/** Reads a theme colour (e.g. `--buy`) so canvas-drawn charts match the CSS theme. */
+/** Reads a theme colour (e.g. `--buy`) so canvas-drawn charts match the CSS theme.
+ *  Every name passed is defined in tokens.css; the fallback only keeps a canvas
+ *  drawable if one ever is not. */
 export function cssVar(name: string): string {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#888";
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "gray";
 }

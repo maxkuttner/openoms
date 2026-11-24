@@ -138,19 +138,19 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: cockpit/package-lock.json
+          cache-dependency-path: clients/web/package-lock.json
 
       - name: build the bundle
-        working-directory: cockpit
+        working-directory: clients/web
         run: npm ci && npm run build
 
       - name: the bundle calls the OMS same-origin
-        run: ./cockpit/check-api-base.sh
+        run: ./clients/web/check-api-base.sh
       - name: cockpit unit tests
-        working-directory: cockpit
+        working-directory: clients/web
         run: npm test
       - name: every cockpit colour comes from the palette
-        run: ./cockpit/check-palette.sh
+        run: ./clients/web/check-palette.sh
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -160,8 +160,8 @@ jobs:
 
       - name: and the embed is genuinely non-empty
         run: |
-          test -s cockpit/dist/index.html \
-            || { echo "cockpit/dist/index.html missing — the embed tests all no-op'd"; exit 1; }
+          test -s clients/web/dist/index.html \
+            || { echo "clients/web/dist/index.html missing — the embed tests all no-op'd"; exit 1; }
 
   shellcheck:
     name: shellcheck install.sh
@@ -169,7 +169,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # shellcheck is preinstalled on the GitHub Ubuntu images.
-      - run: shellcheck install.sh test/install_test.sh cockpit/check-api-base.sh cockpit/check-palette.sh docker/entrypoint.sh docker/entrypoint_test.sh
+      - run: shellcheck install.sh test/install_test.sh clients/web/check-api-base.sh clients/web/check-palette.sh docker/entrypoint.sh docker/entrypoint_test.sh
       - name: the image start script sets up, then serves
         run: sh docker/entrypoint_test.sh
       - name: install.sh puts oms on PATH

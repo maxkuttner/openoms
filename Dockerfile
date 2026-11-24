@@ -7,9 +7,9 @@
 
 FROM node:22-bookworm-slim AS cockpit
 WORKDIR /src/cockpit
-COPY cockpit/package.json cockpit/package-lock.json ./
+COPY clients/web/package.json clients/web/package-lock.json ./
 RUN npm ci
-COPY cockpit/ ./
+COPY clients/web/ ./
 RUN npm run build
 
 FROM rust:1-bookworm AS builder
@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
-COPY --from=cockpit /src/cockpit/dist ./cockpit/dist
+COPY --from=cockpit /src/cockpit/dist ./clients/web/dist
 RUN cargo build --release && strip target/release/oms
 
 FROM debian:bookworm-slim
