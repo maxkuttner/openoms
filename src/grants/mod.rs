@@ -3,6 +3,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod store;
+
 /// One thing a portfolio is allowed to do. Stored as `{"kind", "params"}`.
 ///
 /// Future shapes: `InstrumentClass { connection, class }` and
@@ -78,8 +80,6 @@ impl Grant {
 
 /// For each registered kind: if the portfolio holds grants of that kind, at
 /// least one must admit the order; if it holds none, `when_absent` decides.
-pub mod store;
-
 pub fn check(f: &OrderFacts, grants: &[Grant]) -> Result<(), Denied> {
     for kind in KINDS {
         let mut of_kind = grants.iter().filter(|g| g.kind() == *kind).peekable();

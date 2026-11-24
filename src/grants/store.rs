@@ -145,7 +145,12 @@ pub async fn set_for_portfolio(
                 .bind(portfolio)
                 .execute(&mut **tx)
                 .await
-                .map_err(db)?;
+                .map_err(|e| match &e {
+                    sqlx::Error::Database(d) if d.is_unique_violation() => {
+                        api_error(StatusCode::CONFLICT, format!("account code {code}-{connection} already exists"))
+                    }
+                    _ => db(e),
+                })?;
             }
         }
     }
@@ -394,8 +399,25 @@ mod tests {
             assert_eq!(rejected.into_response().status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
         // An unknown connection fails inside the transaction; nothing changes.
-        assert!(put(&st, pf, vec![venue("nope")]).await.is_err());
+        let err = put(&st, pf, vec![venue("nope")]).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(get(&st, pf).await, vec![venue(&c)]);
         assert_eq!(account(&pool, pf, &c).await.unwrap().2, "ACTIVE");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn clashing_account_code_is_a_conflict() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let pf = portfolio(&pool).await;
+        let (c, d) = (connection(&pool, "ALPACA").await, connection(&pool, "BINANCE").await);
+        put(&st, pf, vec![venue(&c)]).await.unwrap();
+        let code = format!("{}-{d}", pcode(&pool, pf).await);
+        sqlx::query("INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) VALUES ($1, $2, $3, 'x', 'ACTIVE')")
+            .bind(Uuid::new_v4()).bind(&code).bind(&d).execute(&pool).await.unwrap();
+        let err = put(&st, pf, vec![venue(&c), venue(&d)]).await.unwrap_err();
+        assert_eq!((err.status, err.message), (StatusCode::CONFLICT, format!("account code {code} already exists")));
+        assert_eq!(get(&st, pf).await, vec![venue(&c)]);
     }
 }
