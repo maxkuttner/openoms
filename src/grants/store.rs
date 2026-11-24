@@ -421,3 +421,50 @@ mod tests {
         assert_eq!(get(&st, pf).await, vec![venue(&c)]);
     }
 }
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use crate::authz_schema_tests::migrated_db;
+    use crate::groups_api::tests::{admin, portfolio};
+
+    async fn account_on(pool: &sqlx::PgPool, pf: Uuid, broker: &str, ext: &str, status: &str) -> String {
+        let c = format!("c-{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO broker_connection (code, broker_code) VALUES ($1, $2)")
+            .bind(&c).bind(broker).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(Uuid::new_v4()).bind(format!("a-{c}")).bind(&c).bind(ext).bind(status).bind(pf)
+            .execute(pool).await.unwrap();
+        c
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn backfill_grants_existing_active_accounts() {
+        let pool = migrated_db().await;
+        let pf = portfolio(&pool).await;
+        let plain = account_on(&pool, pf, "ALPACA", "", "ACTIVE").await;
+        let ibkr = account_on(&pool, pf, "IBKR", "U123", "ACTIVE").await;
+        let closed = account_on(&pool, pf, "BINANCE", "", "CLOSED").await;
+        sqlx::raw_sql(include_str!("../../db/migrations/ods/oms/0074_BACKFILL_VENUE_GRANTS.sql"))
+            .execute(&pool).await.unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        let got = active_for_portfolio(&mut conn, pf).await.unwrap();
+        drop(conn);
+        assert_eq!(got.len(), 2, "{got:?} (closed {closed})");
+        assert!(got.contains(&Grant::Venue { connection: plain.clone(), account_ref: None }));
+        assert!(got.contains(&Grant::Venue { connection: ibkr.clone(), account_ref: Some("U123".into()) }));
+
+        // A later PUT with the same grants reuses the rows.
+        let mut tx = pool.begin().await.unwrap();
+        set_for_portfolio(&mut tx, &admin(), pf, got.clone()).await.unwrap();
+        tx.commit().await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM trading_grant WHERE subject_id = $1").bind(pf).fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 2);
+        // Re-running the backfill is a no-op.
+        sqlx::raw_sql(include_str!("../../db/migrations/ods/oms/0074_BACKFILL_VENUE_GRANTS.sql"))
+            .execute(&pool).await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM trading_grant WHERE subject_id = $1").bind(pf).fetch_one(&pool).await.unwrap();
+        assert_eq!(rows, 2);
+    }
+}
