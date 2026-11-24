@@ -76,14 +76,10 @@ FIGI enrichment through OpenFIGI is a separate job,
 `POST /admin/broker-connections/alpaca-paper/universe/enrich` — slow without an
 `OPENFIGI_API_KEY`.
 
-## Accounts
+## Trading on Alpaca
 
-An OMS account points at a broker connection. For Alpaca, `external_account_ref` can be
-any label for the Alpaca account — it must be unique per connection:
-
-```json
-{"code":"alpaca-paper-main","broker_connection_code":"alpaca-paper","external_account_ref":"paper","status":"ACTIVE"}
-```
+An admin grants a portfolio the Alpaca connection under **Portfolios → Grants**; see
+[Grants](/configuration/login/#grants). Without it, the portfolio cannot trade on Alpaca.
 
 ## Limits
 

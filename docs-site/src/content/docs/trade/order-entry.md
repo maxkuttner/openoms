@@ -7,11 +7,15 @@ Open **Trade → Order entry**.
 
 1. Pick the instrument with the search field (press `/`). Star it to add it to your
    watchlist.
-2. In the ticket, choose the **portfolio** and **venue**, **Buy** or **Sell**, the
+2. In the ticket, choose the **portfolio** and **venue** (only the venues the portfolio is granted; with
+   one, it is preselected), **Buy** or **Sell**, the
    **quantity**, **Market** or **Limit** (with a limit price) and the time in force
    (Day, GTC, IOC, FOK).
 3. Submit. The order passes the portfolio's pre-trade checks (size, notional, price
    band); a rejection shows the reason.
+
+A portfolio with no granted venue cannot trade; ask an admin to
+[grant one](/configuration/login/#grants).
 
 Working orders, fills and positions show below the chart. Cancel an order from the
 blotter. Drag the handles to resize the chart and side column.

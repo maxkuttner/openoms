@@ -56,8 +56,8 @@ Saving the credentials offers to load Coinbase's spot products as a background j
 **Load** / **Reload**. From a terminal: `oms setup sync-broker --broker coinbase --no-enrich`.
 
 Coinbase products are their own instruments: `BTC-USD` on Coinbase is a different entry
-from `BTCUSDT` on Binance. To trade on Coinbase, the order's account must be linked to the
-`coinbase-live` connection.
+from `BTCUSDT` on Binance. To trade on Coinbase, an admin grants the portfolio the
+`coinbase-live` connection under **Portfolios → Grants**.
 
 Coinbase quotes products in USD, USDC, USDT, EUR, GBP and a few other currencies, but not
 CHF; trade the pairs your account holds a balance in.

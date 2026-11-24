@@ -56,6 +56,25 @@ A group has members and, per portfolio, an access level:
 Several groups give the highest level per portfolio. **Admin** is separate: a switch on
 the Users page. The last active admin cannot be removed.
 
+## Portfolios and grants
+
+Only admins create portfolios. Creating one also creates the group `portfolio <code>`
+with the creating admin as its only member, at **view** access. It is an ordinary
+group: raise it to trade or manage, add people, or delete it.
+
+### Grants
+
+A grant says what a portfolio may do. Venues (broker connections) are the first kind;
+others, such as instrument classes or trading hours, may follow.
+
+1. Open **Portfolios → Grants** on the portfolio.
+2. Tick the venues it may trade on. IBKR also asks for the IBKR account.
+
+- A portfolio with no venue granted cannot trade anywhere.
+- The order ticket offers only the granted venues.
+- Revoking a grant keeps history. Orders already placed keep booking fills.
+- For any other kind, no grants means no restriction.
+
 ## Single sign-on
 
 ```toml

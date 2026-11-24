@@ -102,7 +102,8 @@ If a break grows (more fills arrive), adopting re-reads it first.
 
 Only IBKR supports several accounts: one login can cover several accounts, and
 the accounts list is shown only for IBKR connections. Orders are tagged with the
-account they were placed on, which is what attribution rules match.
+IBKR account they were placed on, which is what attribution rules match. The account is
+chosen when an admin grants the portfolio the IBKR connection.
 
 Binance sub-accounts are not listed under one connection. A sub-account is its
 own API key; today there is one Binance connection per environment.

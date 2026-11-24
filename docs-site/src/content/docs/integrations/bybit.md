@@ -48,8 +48,8 @@ Saving the credentials offers to load Bybit's spot pairs as a background job; th
 **Load** / **Reload**. From a terminal: `oms setup sync-broker --broker bybit --no-enrich`.
 
 Bybit pairs are their own instruments: `BTCUSDT` on Bybit and `BTCUSDT` on Binance are
-two entries in the instrument picker, one per venue. To trade on Bybit, the order's
-account must be linked to the `bybit-paper` (or `bybit-live`) connection.
+two entries in the instrument picker, one per venue. To trade on Bybit, an admin grants the
+portfolio the `bybit-paper` (or `bybit-live`) connection under **Portfolios → Grants**.
 
 ## Paper or live
 

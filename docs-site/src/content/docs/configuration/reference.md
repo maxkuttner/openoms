@@ -4,7 +4,7 @@ description: Every setting in oms.toml, its environment variable and flag, and w
 ---
 
 `oms.toml` holds only what the OMS needs before it can reach its database — the
-connection, the secrets, the listen address. Everything else (brokers, accounts,
+connection, the secrets, the listen address. Everything else (brokers,
 portfolios, credentials, risk limits) lives in Postgres and is managed from the web app's Admin Panel
 or the admin API.
 

@@ -38,7 +38,7 @@ migrations: 61 applied, 0 pending
 
 One role, `oms`, owns everything. The `public` schema holds shared reference data —
 instruments, venues, currencies. The `oms` schema holds the OMS's own tables — orders and
-their events, portfolios, users, strategies, roles, accounts, positions, and encrypted credentials.
+their events, portfolios, users, strategies, roles, grants, positions, and encrypted credentials.
 
 Users and access are a small cluster in the `oms` schema. Every person and every strategy
 has one row in the identity record that orders and audit entries point at:

@@ -48,8 +48,8 @@ Saving the credentials offers to load OKX's spot pairs as a background job; the
 **Load** / **Reload**. From a terminal: `oms setup sync-broker --broker okx --no-enrich`.
 
 OKX pairs are their own instruments: `BTC-USDT` on OKX and `BTCUSDT` on Binance are two
-entries in the instrument picker, one per venue. To trade on OKX, the order's account
-must be linked to the `okx-paper` (or `okx-live`) connection.
+entries in the instrument picker, one per venue. To trade on OKX, an admin grants the portfolio the
+`okx-paper` (or `okx-live`) connection under **Portfolios → Grants**.
 
 ## Paper or live
 
