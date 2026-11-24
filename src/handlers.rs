@@ -1712,15 +1712,15 @@ pub(crate) mod tests {
 
         let portfolio_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO portfolio (id, code, name, status, default_account_id) \
-             VALUES ($1, $2, 'Actor attribution test portfolio', 'ACTIVE', $3)",
+            "INSERT INTO portfolio (id, code, name, status) \
+             VALUES ($1, $2, 'Actor attribution test portfolio', 'ACTIVE')",
         )
         .bind(portfolio_id)
         .bind(format!("actor-test-portfolio-{suffix}"))
-        .bind(account_id)
         .execute(&pool)
         .await
         .expect("seed portfolio");
+        crate::order_entry::tests::grant_venues(&pool, portfolio_id, &[&connection_code]).await;
 
         sqlx::query(
             "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade) \
@@ -1879,6 +1879,8 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .expect("seed grant");
+        // B is granted the same venue: the account is still A's, not B's.
+        crate::order_entry::tests::grant_venues(&pool, portfolio_b, &[&conn_code]).await;
 
         let state = test_app_state(pool);
         let _ = principal_code; // unused here; kept for symmetry with other tests' destructuring
@@ -1909,32 +1911,19 @@ pub(crate) mod tests {
         let err = result.err().unwrap();
         assert_eq!(
             err.status,
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNPROCESSABLE_ENTITY,
             "expected rejection for cross-portfolio account, got: {}",
             err.message
         );
-        assert!(
-            err.message.contains("does not belong to this portfolio"),
-            "expected an ownership-mismatch message, got: {}",
-            err.message
-        );
+        assert_eq!(err.message, "venue not granted to this portfolio");
     }
 
-    /// Regression guard: a request with no `account_id`, whose default
-    /// account has no `portfolio_id` set (NULL — the pre-backfill state most
-    /// existing default accounts are in), must still take the same
-    /// `default_account_id` fallback path as before Task 4/I1: the ownership
-    /// check on this path (see `orders_submit`) treats NULL as "not yet
-    /// backfilled, trust it" rather than rejecting. Mirrors the
-    /// actor-attribution test's seeding (a portfolio with a
-    /// `default_account_id`, an empty `BrokerRegistry` so nothing can
-    /// actually route) — the point is that the failure here is the
-    /// pre-existing "no adapter registered" routing failure, not the
-    /// ownership rejection covered separately by
-    /// `default_account_belonging_to_another_portfolio_is_rejected` below.
+    /// Omitting `account_id` routes through the portfolio's single granted
+    /// venue; with no adapter registered the failure is the routing one (503),
+    /// not a grant refusal.
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn omitting_account_id_is_completely_unaffected() {
+    async fn omitting_account_id_routes_to_the_granted_venue() {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "default-account-test").await;
         let instrument_id = seed_instrument(&pool, "DEFACCT").await;
@@ -1968,15 +1957,15 @@ pub(crate) mod tests {
 
         let portfolio_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO portfolio (id, code, name, status, default_account_id) \
-             VALUES ($1, $2, 'Default account test portfolio', 'ACTIVE', $3)",
+            "INSERT INTO portfolio (id, code, name, status) \
+             VALUES ($1, $2, 'Default account test portfolio', 'ACTIVE')",
         )
         .bind(portfolio_id)
         .bind(format!("defacct-test-portfolio-{portfolio_id}"))
-        .bind(account_id)
         .execute(&pool)
         .await
         .expect("seed portfolio");
+        crate::order_entry::tests::grant_venues(&pool, portfolio_id, &[&conn_code]).await;
 
         sqlx::query(
             "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade) VALUES ($1, $2, $3, true)",
@@ -2012,124 +2001,7 @@ pub(crate) mod tests {
         assert_eq!(
             err.status,
             StatusCode::SERVICE_UNAVAILABLE,
-            "no new ownership rejection should appear here — expected the pre-existing \
-             no-adapter routing failure, got: {}",
-            err.message
-        );
-        assert!(
-            !err.message.contains("does not belong to this portfolio"),
-            "the default_account_id fallback path must not trigger the explicit-path ownership check, got: {}",
-            err.message
-        );
-    }
-
-    /// I1 regression: `account.portfolio_id` and `portfolio.default_account_id`
-    /// are two independent, both-mutable sources of truth — admin CRUD can
-    /// repoint a portfolio's `default_account_id` at an account that actually
-    /// belongs (via `account.portfolio_id`) to some OTHER portfolio, without
-    /// anything enforcing they stay in sync. Before this fix, an omitted
-    /// `account_id` blindly trusted `default_account_id` and never re-checked
-    /// ownership, so this state let an order silently misroute across
-    /// portfolios via the default path — exactly the class of bug the
-    /// explicit-path check (`an_account_from_another_portfolio_is_rejected`)
-    /// exists to prevent, just reachable a different way.
-    #[tokio::test]
-    #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn default_account_belonging_to_another_portfolio_is_rejected() {
-        let pool = test_pool().await;
-        let (principal_id, principal_code) = seed_principal(&pool, "default-misroute-test").await;
-        let instrument_id = seed_instrument(&pool, "DEFMISROUTE").await;
-
-        let broker_code = format!("DEFMISROUTE{}", Uuid::new_v4().simple());
-        let conn_code = format!("defmisroute-test-conn-{}", Uuid::new_v4());
-        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
-            .bind(&conn_code)
-            .bind(&broker_code)
-            .execute(&pool)
-            .await
-            .expect("seed broker_connection");
-        sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'DEFMISROUTE', true)")
-            .bind(instrument_id)
-            .bind(&broker_code)
-            .execute(&pool)
-            .await
-            .expect("seed broker_instrument");
-
-        // The account actually belongs to portfolio_owner...
-        let portfolio_owner = Uuid::new_v4();
-        sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, 'Owner portfolio', 'ACTIVE')")
-            .bind(portfolio_owner)
-            .bind(format!("defmisroute-owner-{portfolio_owner}"))
-            .execute(&pool)
-            .await
-            .expect("seed owner portfolio");
-        let account_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
-             VALUES ($1, $2, $3, 'EXT-DEFMISROUTE', 'ACTIVE', $4)",
-        )
-        .bind(account_id)
-        .bind(format!("defmisroute-account-{account_id}"))
-        .bind(&conn_code)
-        .bind(portfolio_owner)
-        .execute(&pool)
-        .await
-        .expect("seed account");
-
-        // ...but portfolio_requester's default_account_id was (mis)pointed at
-        // it anyway — the drift this fix catches.
-        let portfolio_requester = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO portfolio (id, code, name, status, default_account_id) \
-             VALUES ($1, $2, 'Requester portfolio', 'ACTIVE', $3)",
-        )
-        .bind(portfolio_requester)
-        .bind(format!("defmisroute-requester-{portfolio_requester}"))
-        .bind(account_id)
-        .execute(&pool)
-        .await
-        .expect("seed requester portfolio");
-
-        sqlx::query(
-            "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade) VALUES ($1, $2, $3, true)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(principal_id)
-        .bind(portfolio_requester)
-        .execute(&pool)
-        .await
-        .expect("seed grant");
-
-        let state = test_app_state(pool);
-        let auth = AuthContext::machine(principal_id, principal_code);
-
-        let request = SubmitOrderRequest {
-            order_id: Uuid::new_v4().to_string(),
-            client_order_id: "default-misroute-test-1".to_string(),
-            portfolio_id: portfolio_requester.to_string(),
-            account_id: None,
-            instrument_id: Some(instrument_id.to_string()),
-            symbol: None,
-            venue: None,
-            side: OrderSide::Buy,
-            order_type: OrderType::Market,
-            time_in_force: TimeInForce::Day,
-            limit_price: None,
-            quantity: 1.0,
-        };
-
-        let result = orders_submit(State(state), Extension(auth), Json(request)).await;
-
-        let err = result.err().expect("cross-portfolio default account must be rejected");
-        assert_eq!(
-            err.status,
-            StatusCode::BAD_REQUEST,
-            "expected rejection for a default account owned by another portfolio, got: {}",
-            err.message
-        );
-        assert!(
-            err.message.contains("belongs to a different portfolio"),
-            "expected an ownership-mismatch message, got: {}",
+            "expected the no-adapter routing failure, got: {}",
             err.message
         );
     }
@@ -2682,12 +2554,12 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[ignore = "needs a live Postgres; run with --ignored"]
-    async fn venues_reports_eligible_and_ineligible_rows_with_reasons() {
+    async fn venues_lists_the_granted_venue_and_hides_the_rest() {
         let pool = test_pool().await;
         let (principal_id, principal_code) = seed_principal(&pool, "venues-test").await;
         let instrument_id = seed_instrument(&pool, "VENUETEST").await;
 
-        // Broker A: active connection, this portfolio HAS an account on it -> eligible.
+        // Broker A: active connection granted to this portfolio -> listed, eligible.
         let broker_a = format!("VENUEA{}", Uuid::new_v4().simple());
         let conn_a = format!("venue-test-conn-a-{}", Uuid::new_v4());
         sqlx::query(
@@ -2716,17 +2588,7 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .expect("seed portfolio");
-        sqlx::query(
-            "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
-             VALUES ($1, $2, $3, 'EXT', 'ACTIVE', $4)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(format!("venues-test-account-{portfolio_id}"))
-        .bind(&conn_a)
-        .bind(portfolio_id)
-        .execute(&pool)
-        .await
-        .expect("seed account");
+        crate::order_entry::tests::grant_venues(&pool, portfolio_id, &[&conn_a]).await;
         sqlx::query(
             "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view) VALUES ($1, $2, $3, true)",
         )
@@ -2737,7 +2599,7 @@ pub(crate) mod tests {
         .await
         .expect("seed grant");
 
-        // Broker B: also cataloged, but no account for this portfolio -> ineligible.
+        // Broker B: also cataloged, but not granted -> not listed.
         let broker_b = format!("VENUEB{}", Uuid::new_v4().simple());
         let conn_b = format!("venue-test-conn-b-{}", Uuid::new_v4());
         sqlx::query(
@@ -2770,13 +2632,11 @@ pub(crate) mod tests {
         .expect("should succeed")
         .0;
 
-        assert_eq!(result.len(), 2);
-        let a = result.iter().find(|v| v.broker_code == broker_a).expect("broker a present");
+        assert_eq!(result.len(), 1);
+        let a = &result[0];
+        assert_eq!(a.broker_code, broker_a);
         assert!(a.eligible);
         assert_eq!(a.reason, None);
-        let b = result.iter().find(|v| v.broker_code == broker_b).expect("broker b present");
-        assert!(!b.eligible);
-        assert_eq!(b.reason.as_deref(), Some("no account on this connection for this portfolio"));
     }
 
     /// `broker_connection` is UNIQUE(broker_code, environment), not UNIQUE(broker_code)
@@ -2828,6 +2688,7 @@ pub(crate) mod tests {
         .execute(&pool)
         .await
         .expect("seed portfolio");
+        crate::order_entry::tests::grant_venues(&pool, portfolio_id, &[&conn_paper, &conn_live]).await;
         sqlx::query(
             "INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view) VALUES ($1, $2, $3, true)",
         )

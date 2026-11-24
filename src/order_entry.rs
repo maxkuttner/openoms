@@ -84,8 +84,10 @@ async fn strategy_route(pool: &sqlx::PgPool, strategy: &Strategy, req: &SubmitOr
     Ok(Some((account, instrument_id)))
 }
 
-/// The portfolio's account to route a non-strategy order through: one of its
-/// ACTIVE accounts on a granted venue. An explicit `account_id` must be one of
+/// The portfolio's account to route a non-strategy order through: the ACTIVE
+/// account a venue grant maintains. `account_portfolio_connection` allows one
+/// account per (portfolio, connection), and a grant adopts a pre-existing one
+/// (keeping its code), so the code is deliberately not matched. An explicit `account_id` must be one of
 /// them; without one, the single such venue that lists the instrument.
 async fn granted_account(
     pool: &sqlx::PgPool,
@@ -1187,7 +1189,7 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1312,7 +1314,7 @@ mod tests {
             .bind(instrument).bind(broker).execute(pool).await.unwrap();
     }
 
-    async fn g_grant(pool: &sqlx::PgPool, pf: Uuid, conns: &[&str]) {
+    pub(crate) async fn grant_venues(pool: &sqlx::PgPool, pf: Uuid, conns: &[&str]) {
         let grants = conns.iter().map(|c| crate::grants::Grant::Venue { connection: c.to_string(), account_ref: None }).collect();
         let mut tx = pool.begin().await.unwrap();
         crate::grants::store::set_for_portfolio(&mut tx, &crate::groups_api::tests::admin(), pf, grants).await.unwrap();
@@ -1358,7 +1360,7 @@ mod tests {
         let (a, b) = (g_connection(&pool, "GTA").await, g_connection(&pool, "GTB").await);
         g_list(&pool, inst, "GTA").await;
         // b is granted but does not list the instrument
-        g_grant(&pool, pf, &[&a, &b]).await;
+        grant_venues(&pool, pf, &[&a, &b]).await;
         let r = submit(&state, &me, g_request(pf, inst), Origin::Api).await;
         if let Err(e) = &r {
             assert!(!e.message.contains("venue"), "{}", e.message);
@@ -1377,7 +1379,7 @@ mod tests {
         let (a, b) = (g_connection(&pool, "GTA").await, g_connection(&pool, "GTB").await);
         g_list(&pool, inst, "GTA").await;
         g_list(&pool, inst, "GTB").await;
-        g_grant(&pool, pf, &[&a, &b]).await;
+        grant_venues(&pool, pf, &[&a, &b]).await;
         let e = submit(&state, &me, g_request(pf, inst), Origin::Api).await.unwrap_err();
         assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "choose a venue"));
         // naming one of them routes there
@@ -1404,11 +1406,11 @@ mod tests {
         let inst = g_instrument(&pool, "GC").await;
         let a = g_connection(&pool, "GTA").await;
         g_list(&pool, inst, "GTA").await;
-        g_grant(&pool, pf, &[&a]).await;
+        grant_venues(&pool, pf, &[&a]).await;
         let r = submit(&state, &me, g_request(pf, inst), Origin::Api).await;
         assert!(r.is_err_and(|e| !e.message.contains("venue")));
         assert_eq!(g_order_conn(&pool, pf).await, vec![a.clone()]);
-        g_grant(&pool, pf, &[]).await;
+        grant_venues(&pool, pf, &[]).await;
         let e = submit(&state, &me, g_request(pf, inst), Origin::Api).await.unwrap_err();
         assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "venue not granted to this portfolio"));
         assert_eq!(g_order_conn(&pool, pf).await, vec![a], "the earlier order stays");
@@ -1425,7 +1427,7 @@ mod tests {
         let (a, b) = (g_connection(&pool, "GTA").await, g_connection(&pool, "GTB").await);
         g_list(&pool, inst, "GTA").await;
         g_list(&pool, inst, "GTB").await;
-        g_grant(&pool, pf, &[&a]).await;
+        grant_venues(&pool, pf, &[&a]).await;
         let viewer = g_trader(&pool, pf).await;
         let list = |st: AppState| crate::handlers::get_portfolio_venues(
             State(st), Extension(viewer.clone()), Path(pf),
@@ -1435,7 +1437,54 @@ mod tests {
         assert_eq!(v.iter().map(|o| o.broker_connection_code.clone().unwrap()).collect::<Vec<_>>(), vec![a.clone()]);
         assert!(v[0].eligible && v[0].account_id.is_some());
         let _ = b;
-        g_grant(&pool, pf, &[]).await;
+        grant_venues(&pool, pf, &[]).await;
         assert!(list(state).await.unwrap().0.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn a_pre_existing_account_is_adopted_by_the_grant() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let me = g_trader(&pool, pf).await;
+        let inst = g_instrument(&pool, "GE").await;
+        let a = g_connection(&pool, "GTA").await;
+        g_list(&pool, inst, "GTA").await;
+        // an admin-created account on the connection, before any grant
+        let old = Uuid::new_v4();
+        sqlx::query("INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) VALUES ($1, $2, $3, 'X', 'ACTIVE', $4)")
+            .bind(old).bind(format!("old-{old}")).bind(&a).bind(pf).execute(&pool).await.unwrap();
+        let e = submit(&state, &me, g_request(pf, inst), Origin::Api).await.unwrap_err();
+        assert_eq!(e.message, "venue not granted to this portfolio", "an account alone is not a grant");
+        grant_venues(&pool, pf, &[&a]).await;
+        let r = submit(&state, &me, g_request(pf, inst), Origin::Api).await;
+        assert!(r.is_err_and(|e| !e.message.contains("venue")));
+        let routed: Uuid = sqlx::query_scalar("SELECT account_id FROM order_state WHERE portfolio_id = $1").bind(pf).fetch_one(&pool).await.unwrap();
+        assert_eq!(routed, old, "the one account on the connection is the grant's");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn a_strategy_order_skips_grants() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let code = test_support::seed_strategy(&pool).await;
+        let (pf, service): (Uuid, Uuid) = sqlx::query_as("SELECT portfolio_id, principal_id FROM strategy WHERE code = $1")
+            .bind(&code).fetch_one(&pool).await.unwrap();
+        let account = test_support::seed_account(&pool, pf).await;
+        let conn: String = sqlx::query_scalar("SELECT broker_connection_code FROM account WHERE id = $1").bind(account).fetch_one(&pool).await.unwrap();
+        let inst = g_instrument(&pool, "GS").await;
+        sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'SSYM', true)")
+            .bind(inst).bind(&conn).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO strategy_connection (strategy_code, broker_code, account_id) VALUES ($1, $2, $3)")
+            .bind(&code).bind(&conn).bind(account).execute(&pool).await.unwrap();
+        state.strategies().reload(&pool).await.unwrap();
+        // no venue grant at all on the strategy's portfolio
+        assert!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM trading_grant WHERE subject_id = $1").bind(pf).fetch_one(&pool).await.unwrap() == 0);
+        let auth = AuthContext::machine(service, "svc".into());
+        let r = submit(&state, &auth, request(pf, "SSYM", &conn), Origin::Api).await;
+        assert!(r.as_ref().is_err_and(|e| !e.message.contains("venue")), "{r:?}");
+        assert_eq!(g_order_conn(&pool, pf).await, vec![conn]);
     }
 }

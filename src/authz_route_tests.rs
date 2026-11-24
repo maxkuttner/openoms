@@ -78,7 +78,7 @@ async fn portfolio_of(pool: &PgPool, order_id: Uuid) -> Uuid {
         .unwrap()
 }
 
-/// A portfolio whose default account routes to a broker no adapter serves, and
+/// A portfolio granted one venue that routes to a broker no adapter serves, and
 /// an instrument tradeable there: a permitted submit stores the order and then
 /// fails routing with 503.
 pub(crate) async fn tradeable_portfolio(pool: &PgPool) -> (Uuid, i64) {
@@ -97,30 +97,14 @@ pub(crate) async fn tradeable_portfolio(pool: &PgPool) -> (Uuid, i64) {
         .execute(pool)
         .await
         .unwrap();
-    let account = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status) \
-         VALUES ($1, $2, $2, $2, 'ACTIVE')",
-    )
-    .bind(account)
-    .bind(&broker)
-    .execute(pool)
-    .await
-    .unwrap();
     let portfolio = Uuid::new_v4();
-    sqlx::query("INSERT INTO portfolio (id, code, name, status, default_account_id) VALUES ($1, $2, $2, 'ACTIVE', $3)")
+    sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, $2, 'ACTIVE')")
         .bind(portfolio)
         .bind(format!("authz-{s}"))
-        .bind(account)
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE account SET portfolio_id = $2 WHERE id = $1")
-        .bind(account)
-        .bind(portfolio)
-        .execute(pool)
-        .await
-        .unwrap();
+    crate::order_entry::tests::grant_venues(pool, portfolio, &[&broker]).await;
     (portfolio, instrument)
 }
 
