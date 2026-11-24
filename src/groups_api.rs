@@ -35,7 +35,7 @@ impl Access {
         }
     }
 
-    fn parse(s: &str) -> Access {
+    pub(crate) fn parse(s: &str) -> Access {
         match s {
             "manage" => Access::Manage,
             "trade" => Access::Trade,
@@ -131,7 +131,7 @@ fn owner_stays() -> ApiError {
     api_error(StatusCode::UNPROCESSABLE_ENTITY, "owner must stay in strategy group")
 }
 
-fn announce(state: &AppState, who: impl IntoIterator<Item = Uuid>) {
+pub(crate) fn announce(state: &AppState, who: impl IntoIterator<Item = Uuid>) {
     for id in who {
         state.event_bus().publish_auth_changed(id);
     }

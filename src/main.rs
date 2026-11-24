@@ -25,6 +25,7 @@ mod auth_api;
 mod accounts;
 mod users_api;
 mod groups_api;
+mod portfolio_access_api;
 mod admin_bootstrap;
 mod authz;
 mod limits_api;
@@ -1018,6 +1019,10 @@ fn build_app(
         .route(
             "/admin/portfolios/:id/grants",
             get(grants::store::get_grants).put(grants::store::put_grants),
+        )
+        .route(
+            "/admin/portfolios/:id/access",
+            get(portfolio_access_api::get_access).put(portfolio_access_api::put_access),
         )
         .route(
             "/admin/accounts",
