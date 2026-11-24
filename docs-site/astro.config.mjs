@@ -61,7 +61,6 @@ export default defineConfig({
             "operations/service",
             "operations/database",
             "operations/master-key-and-backups",
-            "operations/troubleshooting",
           ],
         },
         { label: "Changelog", slug: "changelog" },

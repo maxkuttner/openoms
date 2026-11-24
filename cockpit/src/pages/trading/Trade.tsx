@@ -166,29 +166,29 @@ function TradeLayout({ chart, book, ticket, bottom }: { chart: ReactNode; book: 
     return (
       <>
         <div className="h-[420px] min-w-0">{chart}</div>
-        {book}
         {ticket}
+        {book}
         {bottom}
       </>
     );
   }
   return (
-    // Tall enough for a readable book plus the whole ticket, so the right column never scrolls.
+    // Tall enough for a readable book plus the whole ticket, so the side column never scrolls.
     <ResizablePanelGroup orientation="horizontal" className="h-[calc(100svh-11rem)] min-h-[780px]"
       defaultLayout={row.defaultLayout} onLayoutChanged={row.onLayoutChanged}>
-      <ResizablePanel id="left" defaultSize="70" minSize="30" className="pr-1.5">
+      <ResizablePanel id="side" defaultSize="30" minSize={300} className="pr-1.5">
+        <div className="flex h-full flex-col gap-3">
+          <div className="shrink-0">{ticket}</div>
+          <div className="min-h-[300px] flex-1 overflow-hidden">{book}</div>
+        </div>
+      </ResizablePanel>
+      <ResizableHandle withHandle />
+      <ResizablePanel id="left" defaultSize="70" minSize="30" className="pl-1.5">
         <ResizablePanelGroup orientation="vertical" defaultLayout={left.defaultLayout} onLayoutChanged={left.onLayoutChanged}>
           <ResizablePanel id="chart" defaultSize="62" minSize={280} className="pb-1.5">{chart}</ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel id="bottom" defaultSize="38" minSize={140} className="overflow-auto pt-3">{bottom}</ResizablePanel>
         </ResizablePanelGroup>
-      </ResizablePanel>
-      <ResizableHandle withHandle />
-      <ResizablePanel id="side" defaultSize="30" minSize={300} className="pl-1.5">
-        <div className="flex h-full flex-col gap-3">
-          <div className="min-h-[300px] flex-1 overflow-hidden">{book}</div>
-          <div className="shrink-0">{ticket}</div>
-        </div>
       </ResizablePanel>
     </ResizablePanelGroup>
   );
