@@ -594,3 +594,33 @@ async fn last_trade_at_tracks_latest_fill() {
     assert_eq!(position_last_trade(&w).await, Some(at(later)));
     assert_eq!(position(&w).await, 3.0);
 }
+
+/// A second portfolio's hidden account on the world's connection, same ref.
+pub(crate) async fn shared_ref_account(w: &World, code: &str, status: &str) -> Uuid {
+    let pf = Uuid::new_v4();
+    sqlx::query("INSERT INTO portfolio (id, code, name, status) VALUES ($1, $2, $2, 'ACTIVE')")
+        .bind(pf).bind(code).execute(&w.pool).await.unwrap();
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO account (id, code, broker_connection_code, external_account_ref, status, portfolio_id) \
+         VALUES ($1, $2, $3, 'acc', $4, $5)",
+    )
+    .bind(id).bind(code).bind(&w.conn).bind(status).bind(pf).execute(&w.pool).await.unwrap();
+    id
+}
+
+/// Two portfolios granted one connection share its ref: the ACTIVE, oldest
+/// account wins every time, whatever the physical row order.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn resolve_account_is_deterministic_with_shared_ref() {
+    let w = world().await;
+    sqlx::query("UPDATE account SET status = 'CLOSED' WHERE id = $1").bind(w.account).execute(&w.pool).await.unwrap();
+    let first = shared_ref_account(&w, "P2", "ACTIVE").await;
+    let _later = shared_ref_account(&w, "P3", "ACTIVE").await;
+    for _ in 0..3 {
+        assert_eq!(super::resolve_account(&w.pool, &w.conn, "acc").await.unwrap(), first);
+    }
+    // One distinct ref across several rows still serves as the single-account fallback.
+    assert_eq!(super::resolve_account(&w.pool, &w.conn, "other").await.unwrap(), first);
+}

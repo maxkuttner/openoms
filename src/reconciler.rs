@@ -313,13 +313,15 @@ impl Reconciler {
         match self.scope {
             Accounts::Unfollowed => {
                 sqlx::query_as(
-                    "SELECT a.id, a.external_account_ref FROM account a \
+                    "SELECT id, external_account_ref FROM ( \
+                     SELECT DISTINCT ON (a.external_account_ref) a.id, a.external_account_ref, a.code FROM account a \
                      WHERE a.broker_connection_code = $1 AND a.external_account_ref IS NOT NULL \
                        AND NOT EXISTS ( \
                          SELECT 1 FROM strategy_connection sc JOIN strategy s ON s.code = sc.strategy_code \
                          WHERE sc.account_id = a.id AND s.mode = 'COLOCATED' \
                            AND s.follow_credentials IS NOT NULL AND s.follow_environment IS NOT NULL) \
-                     ORDER BY a.code",
+                     ORDER BY a.external_account_ref, (a.status = 'ACTIVE') DESC, a.created_at, a.id) r \
+                     ORDER BY code",
                 )
                 .bind(&self.connection)
                 .fetch_all(&self.pool)

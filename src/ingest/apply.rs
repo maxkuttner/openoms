@@ -197,7 +197,10 @@ fn actor(connection: &str) -> String {
 /// account maps every reference to it.
 async fn resolve_account(pool: &PgPool, connection: &str, account_ref: &str) -> Result<Uuid, IngestError> {
     let exact: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM account WHERE broker_connection_code = $1 AND external_account_ref = $2")
+        sqlx::query_scalar(
+            "SELECT id FROM account WHERE broker_connection_code = $1 AND external_account_ref = $2 \
+             ORDER BY (status = 'ACTIVE') DESC, created_at, id LIMIT 1",
+        )
             .bind(connection)
             .bind(account_ref)
             .fetch_optional(pool)
@@ -205,10 +208,18 @@ async fn resolve_account(pool: &PgPool, connection: &str, account_ref: &str) -> 
     if let Some(id) = exact {
         return Ok(id);
     }
-    let all: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM account WHERE broker_connection_code = $1 LIMIT 2")
-        .bind(connection)
-        .fetch_all(pool)
-        .await?;
+    // Portfolios sharing a venue grant have one row each with the same ref:
+    // count distinct refs, and take the same representative as above.
+    let all: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM ( \
+           SELECT DISTINCT ON (external_account_ref) id, external_account_ref FROM account \
+           WHERE broker_connection_code = $1 \
+           ORDER BY external_account_ref, (status = 'ACTIVE') DESC, created_at, id) r \
+         LIMIT 2",
+    )
+    .bind(connection)
+    .fetch_all(pool)
+    .await?;
     match all.as_slice() {
         [only] => Ok(*only),
         _ => Err(IngestError::UnknownAccount { connection: connection.into(), account_ref: account_ref.into() }),

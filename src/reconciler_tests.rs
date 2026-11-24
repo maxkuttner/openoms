@@ -453,6 +453,28 @@ async fn cursor_accounts(w: &World) -> Vec<Uuid> {
         .bind(&w.conn).bind(w.account).fetch_all(&w.pool).await.unwrap()
 }
 
+/// Portfolios sharing a venue grant have one account row each with the same
+/// ref: the reconciler pulls that ref once.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn reconciler_pulls_shared_ref_once() {
+    let w = world().await;
+    crate::ingest::apply::tests::shared_ref_account(&w, "P2", "ACTIVE").await;
+    crate::ingest::apply::tests::shared_ref_account(&w, "P3", "CLOSED").await;
+    let (engine, _) = fake_engine(ok);
+    let (main, _tx) = start(&w, Arc::new(FakeSource::default()), engine);
+    main.pull_now();
+    for _ in 0..500 {
+        if !cursor_accounts(&w).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(cursor_accounts(&w).await, [w.account], "one pull for the shared ref, on the oldest active account");
+    drop(main);
+}
+
 /// The connection's key cannot see a followed sub-account's trades, and its
 /// fills would be tagged with the sub-account: only the follow pulls it.
 #[tokio::test]
