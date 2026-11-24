@@ -91,6 +91,7 @@ pub async fn create(
     Json(p): Json<CreateReported>,
 ) -> Result<Json<ReportedCreated>, ApiError> {
     crate::authz::require_mfa(&auth)?;
+    crate::authz::require_grant(state.pool(), &auth, crate::access_grants::GrantKey::Strategies).await?;
     let code = p.code.trim().to_string();
     let name = p.name.trim().to_string();
     if code.is_empty() || name.is_empty() {
@@ -161,6 +162,7 @@ pub async fn rotate_token(
     Path(code): Path<String>,
 ) -> Result<Json<TokenCreated>, ApiError> {
     crate::authz::require_mfa(&auth)?;
+    crate::authz::require_grant(state.pool(), &auth, crate::access_grants::GrantKey::StrategyTokens).await?;
     require_owner(state.pool(), auth.principal_id, &code).await?;
     let mut tx = state.pool().begin().await.map_err(db)?;
     let archived: bool = sqlx::query_scalar("SELECT archived_at IS NOT NULL FROM strategy WHERE code = $1 FOR UPDATE")
@@ -199,6 +201,7 @@ pub async fn revoke_token(
     Path(code): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     crate::authz::require_mfa(&auth)?;
+    crate::authz::require_grant(state.pool(), &auth, crate::access_grants::GrantKey::StrategyTokens).await?;
     require_owner(state.pool(), auth.principal_id, &code).await?;
     sqlx::query("UPDATE strategy_reporting_token SET revoked_at = now() WHERE strategy_code = $1 AND revoked_at IS NULL")
         .bind(&code)
@@ -216,6 +219,7 @@ pub async fn archive(
     Path(code): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     crate::authz::require_mfa(&auth)?;
+    crate::authz::require_grant(state.pool(), &auth, crate::access_grants::GrantKey::StrategyTokens).await?;
     require_owner(state.pool(), auth.principal_id, &code).await?;
     let mut tx = state.pool().begin().await.map_err(db)?;
     sqlx::query("UPDATE strategy SET archived_at = COALESCE(archived_at, now()) WHERE code = $1")

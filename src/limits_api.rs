@@ -116,6 +116,10 @@ mod tests {
             .bind(id).bind(&code).execute(pool).await.unwrap();
         sqlx::query("INSERT INTO principal_role (principal_id, role_code) VALUES ($1, $2)")
             .bind(id).bind(role).execute(pool).await.unwrap();
+        if role == "pm" {
+            // limits_set is not a default grant: an admin grants it.
+            crate::access_grants::grant_via_group(pool, id, &[crate::access_grants::GrantKey::LimitsSet]).await;
+        }
         AuthContext::machine(id, code)
     }
 

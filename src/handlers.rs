@@ -214,11 +214,22 @@ pub(crate) async fn require_order_grant(
         return Err(ApiError { status: StatusCode::NOT_FOUND, message: "order not found".to_string() });
     };
     let (any, own) = access.permissions();
-    let check = |perm| authz::allowed(pool, principal_id, perm, portfolio_id);
-    let ok = check(any).await.map_err(|err| internal("failed to check grant", err))?
-        || (owner == principal_id
-            && check(own).await.map_err(|err| internal("failed to check grant", err))?);
-    if ok { Ok(()) } else { Err(forbidden()) }
+    let check = |perm| authz::check(pool, principal_id, perm, portfolio_id);
+    let fail = |err| internal("failed to check grant", err);
+    // `any` first; the caller's own order falls back to `own`. A missing
+    // access grant says which one (`not granted: <key>`).
+    let denied = match check(any).await.map_err(fail)? {
+        Ok(()) => return Ok(()),
+        Err(denied) if owner != principal_id => denied,
+        Err(_) => match check(own).await.map_err(fail)? {
+            Ok(()) => return Ok(()),
+            Err(denied) => denied,
+        },
+    };
+    Err(match denied {
+        authz::Denied::Access => forbidden(),
+        authz::Denied::Grant(key) => authz::not_granted(key),
+    })
 }
 
 /// Split the `Symbol@Venue` shorthand into its parts. `None` when there is no `@`.
@@ -844,6 +855,7 @@ pub async fn create_allocations(
     if !can_allocate || !may_trade {
         return Err(forbidden());
     }
+    authz::require_grant(pool, &auth, crate::access_grants::GrantKey::Allocate).await?;
     require_order_grant(pool, auth.principal_id, order_id, OrderAccess::View).await?;
     // ...and every target portfolio must be one the caller can see.
     let mut target_ids: Vec<Uuid> = req.splits.iter().map(|s| s.portfolio_id).collect();

@@ -180,6 +180,10 @@ mod tests {
         let st = state(pool.clone());
         let (me, pf) = (person(&pool).await, portfolio(&pool).await);
         let g = new_group(&pool, &[me]).await;
+        // limits_set is not a default grant; this test is about access levels.
+        let mut tx = pool.begin().await.unwrap();
+        crate::access_grants::set_group_grants(&mut tx, &admin(), g, &[crate::access_grants::GrantKey::LimitsSet]).await.unwrap();
+        tx.commit().await.unwrap();
         put_access(State(st.clone()), Extension(admin()), Path(pf), Json(vec![entry(EntryKind::Group, g, Access::View), entry(EntryKind::Person, me, Access::Trade)]))
             .await
             .unwrap();

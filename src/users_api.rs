@@ -523,6 +523,7 @@ pub async fn create_own_key(
     body: Json<CreateKey>,
 ) -> Result<Json<ApiKeyRecord>, ApiError> {
     own_keys_session(&ctx, true)?;
+    crate::authz::require_grant(state.pool(), &ctx, crate::access_grants::GrantKey::ApiKeys).await?;
     let id = ctx.principal_id;
     create_key(state, Extension(ctx), Path(id), body).await
 }

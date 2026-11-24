@@ -187,6 +187,8 @@ async fn pm_can_cancel_any_order_in_portfolio() {
     let pm = user(&pool, "pm", "HUMAN").await;
     let (order_id, portfolio) = order(&pool, trader.principal_id).await;
     grant(&pool, pm.principal_id, portfolio, true).await;
+    // cancel_any is not a default grant: an admin grants it.
+    crate::access_grants::grant_via_group(&pool, pm.principal_id, &[crate::access_grants::GrantKey::CancelAny]).await;
 
     assert_eq!(may_cancel(&pool, &pm, order_id).await, Ok(true));
 }

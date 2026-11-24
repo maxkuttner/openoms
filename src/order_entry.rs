@@ -734,18 +734,19 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     let principal_id = auth.principal_id;
     info!(principal_id = %principal_id, "resolved principal");
 
-    // orders.create on the target portfolio: the role allows it and the grant has can_trade.
-    let has_grant = crate::authz::allowed(&pool, principal_id, crate::authz::Permission::OrdersCreate, portfolio_id)
+    // orders.create on the target portfolio: the role allows it, the access
+    // row has can_trade, and the person holds the `orders` grant.
+    let decision = crate::authz::check(&pool, principal_id, crate::authz::Permission::OrdersCreate, portfolio_id)
         .await
         .map_err(|err| crate::handlers::internal("failed to check grant", err))?;
 
-    info!(has_grant, portfolio_id = %portfolio_id, account_id = %account_id, "checked trade grant");
+    info!(?decision, portfolio_id = %portfolio_id, account_id = %account_id, "checked trade grant");
 
-    if !has_grant {
-        return Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            message: "unauthorized".to_string(),
-        });
+    decision.map_err(|denied| denied.into_api("unauthorized"))?;
+    // An option needs the `options` grant too. The catalog has no combo
+    // instrument class, so OPTION is the only class this covers.
+    if instrument_class == "OPTION" {
+        crate::authz::require_grant(&pool, auth, crate::access_grants::GrantKey::Options).await?;
     }
 
     // Pre-trade risk check. Runs inside TX1 so the FOR UPDATE lock on the
@@ -1347,6 +1348,55 @@ pub(crate) mod tests {
         sqlx::query("INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view, can_trade) VALUES ($1, $2, $3, true, true)")
             .bind(Uuid::new_v4()).bind(me).bind(pf).execute(pool).await.unwrap();
         AuthContext::machine(me, code)
+    }
+
+    async fn g_defaults(pool: &sqlx::PgPool, keys: &[crate::access_grants::GrantKey]) {
+        let mut tx = pool.begin().await.unwrap();
+        crate::access_grants::set_default_grants(&mut tx, &crate::groups_api::tests::admin(), keys).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn orders_grant_off_blocks_submit() {
+        use crate::access_grants::GrantKey;
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let me = g_trader(&pool, pf).await;
+        let inst = g_instrument(&pool, "GO").await;
+        let a = g_connection(&pool, "GTA").await;
+        g_list(&pool, inst, "GTA").await;
+        grant_venues(&pool, pf, &[&a]).await;
+        g_defaults(&pool, &[GrantKey::Options]).await;
+        let e = submit(&state, &me, g_request(pf, inst), Origin::Api).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::FORBIDDEN, "not granted: orders"));
+        assert!(g_order_conn(&pool, pf).await.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn options_grant_blocks_option_order() {
+        use crate::access_grants::GrantKey;
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let me = g_trader(&pool, pf).await;
+        let (spot, opt) = (g_instrument(&pool, "GS").await, g_instrument(&pool, "GP").await);
+        sqlx::query("UPDATE instrument SET instrument_class = 'OPTION' WHERE id = $1").bind(opt).execute(&pool).await.unwrap();
+        let a = g_connection(&pool, "GTA").await;
+        g_list(&pool, spot, "GTA").await;
+        g_list(&pool, opt, "GTA").await;
+        grant_venues(&pool, pf, &[&a]).await;
+        g_defaults(&pool, &[GrantKey::Orders]).await;
+        let mut req = g_request(pf, opt);
+        req.time_in_force = TimeInForce::Day;
+        let e = submit(&state, &me, req, Origin::Api).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::FORBIDDEN, "not granted: options"));
+        // a non-option order is not affected
+        let r = submit(&state, &me, g_request(pf, spot), Origin::Api).await;
+        assert!(r.as_ref().map_or_else(|e| !e.message.starts_with("not granted"), |_| true), "{r:?}");
+        assert_eq!(g_order_conn(&pool, pf).await, vec![a]);
     }
 
     #[tokio::test]

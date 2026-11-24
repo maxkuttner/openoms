@@ -5700,7 +5700,8 @@
           "auth_method",
           "role",
           "must_change_password",
-          "totp_enrolled"
+          "totp_enrolled",
+          "grants"
         ],
         "properties": {
           "auth_method": {
@@ -5713,6 +5714,13 @@
           "display_name": {
             "type": "string",
             "nullable": true
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Effective access grant keys (`orders`, `cancel_any`, …): defaults ∪\nthe person's groups; every key for an admin."
           },
           "must_change_password": {
             "type": "boolean",

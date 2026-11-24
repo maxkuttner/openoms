@@ -403,7 +403,7 @@ pub(crate) mod tests {
         id
     }
 
-    async fn group(st: &AppState, name: &str, members: &[Uuid], access: &[(Uuid, Access)]) -> Uuid {
+    pub(crate) async fn group(st: &AppState, name: &str, members: &[Uuid], access: &[(Uuid, Access)]) -> Uuid {
         let (status, out) = create_group(State(st.clone()), Extension(admin()), Json(GroupBody { name: name.into(), description: None }))
             .await
             .unwrap();
@@ -435,6 +435,10 @@ pub(crate) mod tests {
         assert!(!allowed(&pool, me, Permission::OrdersCancelAny, pf).await.unwrap(), "trade is not manage");
 
         let pms = group(&st, "pms", &[me], &[(pf, Access::Manage)]).await;
+        // A group created after migration 0075 gets no cancel_any/limits_set: grant them.
+        let mut tx = pool.begin().await.unwrap();
+        crate::access_grants::set_group_grants(&mut tx, &admin(), pms, &[crate::access_grants::GrantKey::CancelAny, crate::access_grants::GrantKey::LimitsSet]).await.unwrap();
+        tx.commit().await.unwrap();
         assert!(allowed(&pool, me, Permission::OrdersCancelAny, pf).await.unwrap());
         assert!(allowed(&pool, me, Permission::LimitsManage, pf).await.unwrap());
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM portfolio_access WHERE principal_id = $1").bind(me).fetch_one(&pool).await.unwrap();

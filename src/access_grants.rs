@@ -150,6 +150,28 @@ pub async fn set_group_grants(tx: &mut Transaction<'_, Postgres>, ctx: &AuthCont
     crate::groups_api::audit(tx, ctx, "grants.group_set", group, serde_json::json!({ "grants": names })).await
 }
 
+/// Test fixture: give `principal` `keys` through a fresh one-member group (as
+/// an admin would), for tests whose setup predates access grants.
+#[cfg(test)]
+pub(crate) async fn grant_via_group(pool: &PgPool, principal: Uuid, keys: &[GrantKey]) {
+    let group = Uuid::new_v4();
+    sqlx::query("INSERT INTO user_group (id, name) VALUES ($1, $2)")
+        .bind(group)
+        .bind(format!("grants-{}", group.simple()))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_group_member (group_id, principal_id) VALUES ($1, $2)")
+        .bind(group)
+        .bind(principal)
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    set_group_grants(&mut tx, &AuthContext::machine(Uuid::nil(), "test".into()), group, keys).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

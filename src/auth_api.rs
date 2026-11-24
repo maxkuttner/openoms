@@ -533,6 +533,9 @@ pub struct MeResponse {
     pub must_change_password: bool,
     /// A local account with an authenticator app enrolled.
     pub totp_enrolled: bool,
+    /// Effective access grant keys (`orders`, `cancel_any`, …): defaults ∪
+    /// the person's groups; every key for an admin.
+    pub grants: Vec<String>,
 }
 
 /// Who the caller is signed in as, and what they can act on.
@@ -603,6 +606,12 @@ pub async fn me(
         "admin" => "admin",
         _ => "user",
     };
+    let grants = crate::access_grants::grants_for(state.pool(), auth.principal_id)
+        .await
+        .map_err(|err| db_error("load access grants", err))?
+        .into_iter()
+        .map(|k| k.as_str().to_string())
+        .collect();
     let local = auth.auth_method == crate::auth::AuthMethod::Local;
     let (totp_enrolled, must_change_password) = (totp_enrolled && local, must_change_password && local);
 
@@ -615,6 +624,7 @@ pub async fn me(
         role,
         must_change_password,
         totp_enrolled,
+        grants,
     }))
 }
 
