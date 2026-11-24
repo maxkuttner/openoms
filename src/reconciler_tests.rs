@@ -461,6 +461,7 @@ async fn reconciler_pulls_shared_ref_once() {
     let w = world().await;
     crate::ingest::apply::tests::shared_ref_account(&w, "P2", "ACTIVE").await;
     crate::ingest::apply::tests::shared_ref_account(&w, "P3", "CLOSED").await;
+    sqlx::query("UPDATE account SET status = 'CLOSED' WHERE id = $1").bind(w.account).execute(&w.pool).await.unwrap();
     let (engine, _) = fake_engine(ok);
     let (main, _tx) = start(&w, Arc::new(FakeSource::default()), engine);
     main.pull_now();
@@ -471,7 +472,7 @@ async fn reconciler_pulls_shared_ref_once() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(cursor_accounts(&w).await, [w.account], "one pull for the shared ref, on the oldest active account");
+    assert_eq!(cursor_accounts(&w).await, [w.account], "one pull for the shared ref, on the oldest account, even closed");
     drop(main);
 }
 

@@ -609,18 +609,34 @@ pub(crate) async fn shared_ref_account(w: &World, code: &str, status: &str) -> U
     id
 }
 
-/// Two portfolios granted one connection share its ref: the ACTIVE, oldest
-/// account wins every time, whatever the physical row order.
+/// Two portfolios granted one connection share its ref: the oldest account
+/// wins every time, even once it is closed (recon cursors hang on it).
 #[tokio::test]
 #[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
 async fn resolve_account_is_deterministic_with_shared_ref() {
     let w = world().await;
+    let _p2 = shared_ref_account(&w, "P2", "ACTIVE").await;
+    let _p3 = shared_ref_account(&w, "P3", "ACTIVE").await;
     sqlx::query("UPDATE account SET status = 'CLOSED' WHERE id = $1").bind(w.account).execute(&w.pool).await.unwrap();
-    let first = shared_ref_account(&w, "P2", "ACTIVE").await;
-    let _later = shared_ref_account(&w, "P3", "ACTIVE").await;
     for _ in 0..3 {
-        assert_eq!(super::resolve_account(&w.pool, &w.conn, "acc").await.unwrap(), first);
+        assert_eq!(super::resolve_account(&w.pool, &w.conn, "acc").await.unwrap(), w.account);
     }
     // One distinct ref across several rows still serves as the single-account fallback.
-    assert_eq!(super::resolve_account(&w.pool, &w.conn, "other").await.unwrap(), first);
+    assert_eq!(super::resolve_account(&w.pool, &w.conn, "other").await.unwrap(), w.account);
+}
+
+/// A rule on a sibling account of the shared ref still attributes.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn rule_on_non_representative_shared_account_attributes() {
+    let w = world().await;
+    let sib = shared_ref_account(&w, "P2", "ACTIVE").await;
+    let sib_pf: Uuid = sqlx::query_scalar("SELECT portfolio_id FROM account WHERE id = $1").bind(sib).fetch_one(&w.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO attribution_rule (id, broker_connection_code, account_id, portfolio_id, priority) VALUES ($1, $2, $3, $4, 1)",
+    )
+    .bind(Uuid::new_v4()).bind(&w.conn).bind(sib).bind(sib_pf).execute(&w.pool).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, fill("e1", "v1", None, 2.0), None).await.unwrap();
+    let (_, _, portfolio, _, _, _) = only_order(&w.pool).await;
+    assert_eq!(portfolio, sib_pf);
 }

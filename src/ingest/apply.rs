@@ -199,7 +199,7 @@ async fn resolve_account(pool: &PgPool, connection: &str, account_ref: &str) -> 
     let exact: Option<Uuid> =
         sqlx::query_scalar(
             "SELECT id FROM account WHERE broker_connection_code = $1 AND external_account_ref = $2 \
-             ORDER BY (status = 'ACTIVE') DESC, created_at, id LIMIT 1",
+             ORDER BY created_at, id LIMIT 1",
         )
             .bind(connection)
             .bind(account_ref)
@@ -209,12 +209,14 @@ async fn resolve_account(pool: &PgPool, connection: &str, account_ref: &str) -> 
         return Ok(id);
     }
     // Portfolios sharing a venue grant have one row each with the same ref:
-    // count distinct refs, and take the same representative as above.
+    // count distinct refs, and take the same representative as above: the
+    // oldest row whatever its status (rows are never deleted, so recon
+    // cursors keyed by account id never lose their account).
     let all: Vec<Uuid> = sqlx::query_scalar(
         "SELECT id FROM ( \
            SELECT DISTINCT ON (external_account_ref) id, external_account_ref FROM account \
            WHERE broker_connection_code = $1 \
-           ORDER BY external_account_ref, (status = 'ACTIVE') DESC, created_at, id) r \
+           ORDER BY external_account_ref, created_at, id) r \
          LIMIT 2",
     )
     .bind(connection)
@@ -234,6 +236,8 @@ async fn broker_code(pool: &PgPool, connection: &str) -> Result<String, IngestEr
 }
 
 /// The connection's external-order policy, default book and attribution rules.
+/// An account-scoped rule is re-pointed at the representative of its account's
+/// shared ref (see `resolve_account`), so rules on any sibling account fire.
 pub async fn load_policy(pool: &PgPool, connection: &str) -> Result<ConnPolicy, sqlx::Error> {
     let row = sqlx::query("SELECT external_policy, default_portfolio_id FROM broker_connection WHERE code = $1")
         .bind(connection)
@@ -244,7 +248,11 @@ pub async fn load_policy(pool: &PgPool, connection: &str) -> Result<ConnPolicy, 
         _ => Policy::Adopt,
     };
     let rules = sqlx::query(
-        "SELECT account_id, client_id_prefix, portfolio_id, priority FROM attribution_rule \
+        "SELECT COALESCE((SELECT b.id FROM account a JOIN account b \
+                            ON b.broker_connection_code = a.broker_connection_code \
+                           AND b.external_account_ref = a.external_account_ref \
+                          WHERE a.id = r.account_id ORDER BY b.created_at, b.id LIMIT 1), r.account_id) AS account_id, \
+                client_id_prefix, portfolio_id, priority FROM attribution_rule r \
          WHERE broker_connection_code = $1 ORDER BY priority",
     )
     .bind(connection)
