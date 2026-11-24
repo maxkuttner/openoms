@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "../common";
 import { api } from "../../api/client";
 import { useApiMutation } from "../../api/hooks";
-import { needsRef, venueGrants, type Grant, type GrantConnection } from "../../grants";
+import { missingRefs, needsRef, venueGrants, type Grant, type GrantConnection } from "../../grants";
 
 type GrantsResponse = { grants: Grant[]; connections: GrantConnection[] };
 
@@ -48,7 +48,9 @@ const SECTIONS: Section[] = [
               {on && needsRef(c.broker_code) && (
                 <Input
                   className="h-8 w-44"
-                  placeholder="IBKR account"
+                  aria-invalid={!(draft.refs[c.code] ?? "").trim()}
+                  title={!(draft.refs[c.code] ?? "").trim() ? "IBKR account required" : undefined}
+                  placeholder="IBKR account required"
                   aria-label={`IBKR account for ${c.code}`}
                   value={draft.refs[c.code] ?? ""}
                   onChange={(e) => setDraft({ ...draft, refs: { ...draft.refs, [c.code]: e.target.value } })}
@@ -79,8 +81,13 @@ export function PortfolioGrants({ portfolio, onClose }: { portfolio: { id: strin
   const path = `/admin/portfolios/${portfolio.id}/grants`;
   const query = useQuery<GrantsResponse>({ queryKey: [path], queryFn: () => api.get<GrantsResponse>(path) });
   const [draft, setDraft] = useState<Draft>({ picked: new Set(), refs: {} });
+  // Seed once: a background refetch must not wipe unsaved edits.
+  const seeded = useRef(false);
   useEffect(() => {
-    if (query.data) setDraft(initialDraft(query.data));
+    if (query.data && !seeded.current) {
+      seeded.current = true;
+      setDraft(initialDraft(query.data));
+    }
   }, [query.data]);
 
   const save = useApiMutation(
@@ -108,7 +115,7 @@ export function PortfolioGrants({ portfolio, onClose }: { portfolio: { id: strin
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
           <Button
-            disabled={!data || save.isPending}
+            disabled={!data || save.isPending || missingRefs(data.connections, draft.picked, draft.refs).length > 0}
             onClick={() => data && save.mutate(SECTIONS.flatMap((s) => s.toGrants(draft, data)))}
           >
             Save

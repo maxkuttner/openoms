@@ -18,3 +18,10 @@ export function venueGrants(picked: Set<string>, refs: Record<string, string>, b
     },
   }));
 }
+
+// Picked connections that need an account but have none typed yet.
+export function missingRefs(connections: GrantConnection[], picked: Set<string>, refs: Record<string, string>): string[] {
+  return connections
+    .filter((c) => picked.has(c.code) && needsRef(c.broker_code) && !(refs[c.code] ?? "").trim())
+    .map((c) => c.code);
+}

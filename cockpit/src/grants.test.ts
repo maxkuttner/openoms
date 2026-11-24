@@ -1,7 +1,7 @@
 // Run with `npm test` (node --test).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { needsRef, venueGrants } from "./grants.ts";
+import { missingRefs, needsRef, venueGrants } from "./grants.ts";
 
 const brokers = { "alpaca-paper": "ALPACA", "ibkr-paper": "IBKR" };
 
@@ -25,4 +25,15 @@ test("venueGrants sends an empty IBKR ref as empty string", () => {
 });
 test("venueGrants is empty when nothing is picked", () => {
   assert.deepEqual(venueGrants(new Set(), {}, brokers), []);
+});
+
+test("missingRefs lists picked IBKR connections with a blank ref", () => {
+  const conns = [
+    { code: "alpaca-paper", broker_code: "ALPACA", environment: "paper" },
+    { code: "ibkr-paper", broker_code: "IBKR", environment: "paper" },
+    { code: "ibkr-tws", broker_code: "IBKR_TWS", environment: "paper" },
+  ];
+  assert.deepEqual(missingRefs(conns, new Set(["alpaca-paper", "ibkr-paper", "ibkr-tws"]), { "ibkr-paper": "  " }), ["ibkr-paper", "ibkr-tws"]);
+  assert.deepEqual(missingRefs(conns, new Set(["ibkr-paper"]), { "ibkr-paper": "DU1" }), []);
+  assert.deepEqual(missingRefs(conns, new Set(), {}), []);
 });
