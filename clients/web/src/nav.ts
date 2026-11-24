@@ -32,7 +32,7 @@ export const ACCOUNT_PAGES: Page[] = [
 const admin = (id: string, title: string): Page => ({ id, title, path: `/admin/${id}` });
 
 export const ADMIN_TABS: AdminTab[] = [
-  { id: "people", title: "Organisation", pages: [admin("users", "Users"), admin("groups", "Groups"), admin("api", "API")] },
+  { id: "people", title: "Organisation", pages: [admin("users", "Users"), admin("groups", "Groups")] },
   {
     id: "setup",
     title: "Trading",
@@ -41,6 +41,7 @@ export const ADMIN_TABS: AdminTab[] = [
       admin("strategies", "Strategies"),
       admin("risk-limits", "Risk limits"),
       admin("instruments", "Instruments"),
+      admin("api", "API"),
     ],
   },
   { id: "connectivity", title: "Connectivity", pages: [admin("broker-connections", "Broker connections"), admin("data-feeds", "Data feeds")] },

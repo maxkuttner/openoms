@@ -32,12 +32,14 @@ test("account pages are settings only; /access is the refused-sign-in landing, n
 test("admin tabs group the twelve admin pages", () => {
   assert.deepEqual(ADMIN_TABS.map((t) => t.title), ["Organisation", "Trading", "Connectivity", "Reconciliation", "Security"]);
   assert.equal(ADMIN_TABS.flatMap((t) => t.pages).length, 11);
-  assert.deepEqual(ADMIN_TABS[0].pages.map((p) => p.title), ["Users", "Groups", "API"]);
+  assert.deepEqual(ADMIN_TABS[0].pages.map((p) => p.title), ["Users", "Groups"]);
+  assert.deepEqual(ADMIN_TABS[1].pages.map((p) => p.title), ["Portfolios", "Strategies", "Risk limits", "Instruments", "API"]);
   assert.deepEqual(ADMIN_TABS[3].pages.map((p) => p.path), ["/admin/breaks"]);
 });
 test("tab lookup", () => {
   assert.equal(adminTabFor("/admin/data-feeds")?.id, "connectivity");
   assert.equal(adminTabFor("/admin/risk-limits/")?.id, "setup");
+  assert.equal(adminTabFor("/admin/api")?.id, "setup");
   assert.equal(adminTabFor("/positions"), null);
 });
 test("non-admin may not open admin routes", () => {
