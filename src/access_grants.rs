@@ -172,8 +172,8 @@ pub struct PreviewEntry {
     pub key: &'static str,
     pub label: &'static str,
     pub granted: bool,
-    /// Where it comes from: "default" (everyone has it) or "group".
-    pub from: &'static str,
+    /// Where it comes from: "default" (everyone has it), "group", or null when not granted.
+    pub from: Option<&'static str>,
 }
 
 fn category(k: GrantKey) -> &'static str {
@@ -281,7 +281,13 @@ pub async fn preview(State(state): State<AppState>, Path(id): Path<Uuid>) -> Res
             key: k.as_str(),
             label: k.label(),
             granted: default.contains(&k) || group.contains(&k),
-            from: if default.contains(&k) { "default" } else { "group" },
+            from: if default.contains(&k) {
+                Some("default")
+            } else if group.contains(&k) {
+                Some("group")
+            } else {
+                None
+            },
         })
         .collect();
     Ok(Json(serde_json::json!({ "grants": grants })))
@@ -389,6 +395,11 @@ mod tests {
         assert!(group_grants(&pool, g).await.unwrap().is_empty());
         let err = put_group(State(st), Extension(admin()), Path(Uuid::new_v4()), body(&["orders"])).await.unwrap_err();
         assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+        let st = crate::groups_api::tests::state(pool.clone());
+        let err = get_group(State(st.clone()), Path(Uuid::new_v4())).await.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+        let err = preview(State(st), Path(Uuid::new_v4())).await.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -406,6 +417,7 @@ mod tests {
         assert_eq!((row("orders")["granted"].clone(), row("orders")["from"].clone()), (true.into(), "default".into()));
         assert_eq!((row("options")["granted"].clone(), row("options")["from"].clone()), (true.into(), "group".into()));
         assert_eq!(row("limits_set")["granted"], false);
+        assert!(row("limits_set")["from"].is_null());
         assert_eq!(row("orders")["label"], "Place and cancel own orders");
     }
 
