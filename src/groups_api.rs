@@ -61,6 +61,8 @@ pub struct Group {
     pub portfolios: Vec<GroupPortfolio>,
     /// Set when a reported strategy owns the group.
     pub strategy_code: Option<String>,
+    /// The owning strategy is archived, so the group may be deleted.
+    pub strategy_archived: bool,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -138,7 +140,8 @@ fn announce(state: &AppState, who: impl IntoIterator<Item = Uuid>) {
 /// `GET /admin/groups`, by name.
 pub async fn list_groups(State(state): State<AppState>) -> Result<Json<Vec<Group>>, ApiError> {
     let pool = state.pool();
-    let groups = sqlx::query("SELECT id, name, description, strategy_code FROM user_group ORDER BY lower(name), name")
+    let groups = sqlx::query("SELECT g.id, g.name, g.description, g.strategy_code, s.archived_at IS NOT NULL AS strategy_archived \
+           FROM user_group g LEFT JOIN strategy s ON s.code = g.strategy_code ORDER BY lower(g.name), g.name")
         .fetch_all(pool)
         .await
         .map_err(db)?;
@@ -160,6 +163,7 @@ pub async fn list_groups(State(state): State<AppState>) -> Result<Json<Vec<Group
                     name: g.get("name"),
                     description: g.get("description"),
                     strategy_code: g.get("strategy_code"),
+                    strategy_archived: g.get("strategy_archived"),
                     members: members.iter().filter(|m| m.get::<Uuid, _>("group_id") == id).map(|m| m.get("principal_id")).collect(),
                     portfolios: access
                         .iter()
@@ -227,7 +231,8 @@ pub async fn update_group(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /admin/groups/:id`: its members lose what it gave them.
+/// `DELETE /admin/groups/:id`: its members lose what it gave them. A strategy's
+/// group only once the strategy is archived.
 pub async fn delete_group(
     State(state): State<AppState>,
     Extension(ctx): Extension<AuthContext>,
@@ -235,8 +240,15 @@ pub async fn delete_group(
 ) -> Result<StatusCode, ApiError> {
     let mut tx = state.pool().begin().await.map_err(db)?;
     lock_group(&mut tx, id).await?;
-    if strategy_of(&mut tx, id).await?.is_some() {
-        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "a strategy group cannot be deleted"));
+    let live_strategy: Option<(bool,)> = sqlx::query_as(
+        "SELECT s.archived_at IS NULL FROM user_group g JOIN strategy s ON s.code = g.strategy_code WHERE g.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db)?;
+    if live_strategy.is_some_and(|(live,)| live) {
+        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "a strategy group cannot be deleted until the strategy is archived"));
     }
     let affected = members_of(&mut tx, id).await?;
     sqlx::query("DELETE FROM user_group WHERE id = $1").bind(id).execute(&mut *tx).await.map_err(db)?;
@@ -681,6 +693,29 @@ mod tests {
             assert_eq!(err.message, "owner must stay in strategy group");
         }
         assert_eq!(members_of(&mut pool.begin().await.unwrap(), g).await.unwrap(), vec![owner]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn archived_strategy_group_can_be_deleted() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (g, _, _) = strategy_group(&st).await;
+        let row = list_groups(State(st.clone())).await.unwrap().0.into_iter().find(|x| x.id == g).unwrap();
+        assert!(!row.strategy_archived);
+        sqlx::query("UPDATE strategy SET archived_at = now() WHERE code = (SELECT strategy_code FROM user_group WHERE id = $1)")
+            .bind(g).execute(&pool).await.unwrap();
+        let row = list_groups(State(st.clone())).await.unwrap().0.into_iter().find(|x| x.id == g).unwrap();
+        assert!(row.strategy_archived, "the list says the owning strategy is archived");
+        delete_group(State(st.clone()), Extension(admin()), Path(g)).await.unwrap();
+        let gone: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM user_group WHERE id = $1").bind(g).fetch_optional(&pool).await.unwrap();
+        assert!(gone.is_none());
+        let (members, grants): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM user_group_member WHERE group_id = $1), \
+                    (SELECT count(*) FROM user_group_portfolio WHERE group_id = $1)",
+        )
+        .bind(g).fetch_one(&pool).await.unwrap();
+        assert_eq!((members, grants), (0, 0), "memberships and portfolio grants go with the group");
     }
 
     #[tokio::test]
