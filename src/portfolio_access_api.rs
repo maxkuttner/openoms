@@ -106,6 +106,15 @@ pub async fn put_access(
     }
     let mut tx = state.pool().begin().await.map_err(db)?;
     require_portfolio(&mut tx, id, true).await?;
+    let people: Vec<Uuid> = list.iter().filter(|e| e.kind == EntryKind::Person).map(|e| e.id).collect();
+    let humans: i64 = sqlx::query_scalar("SELECT count(*) FROM principal WHERE id = ANY($1) AND principal_type = 'HUMAN'")
+        .bind(&people)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+    if humans != people.len() as i64 {
+        return Err(api_error(StatusCode::UNPROCESSABLE_ENTITY, "only people can be listed"));
+    }
     // A strategy group keeps its strategy portfolio (as groups_api::set_portfolios).
     let keep: Vec<Uuid> = sqlx::query_scalar(
         "SELECT g.id FROM user_group g JOIN strategy s ON s.code = g.strategy_code \
@@ -233,5 +242,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_access(State(st.clone()), Path(pf)).await.unwrap().0.len(), 2);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn strategy_principal_cannot_be_listed() {
+        let pool = migrated_db().await;
+        let st = state(pool.clone());
+        let (me, pf) = (person(&pool).await, portfolio(&pool).await);
+        put_access(State(st.clone()), Extension(admin()), Path(pf), Json(vec![entry(EntryKind::Person, me, Access::View)])).await.unwrap();
+        let bot = Uuid::new_v4();
+        sqlx::query("INSERT INTO principal (id, code, principal_type, status) VALUES ($1, $2, 'STRATEGY', 'ACTIVE')")
+            .bind(bot).bind(format!("s-{}", bot.simple())).execute(&pool).await.unwrap();
+        let err = put_access(State(st.clone()), Extension(admin()), Path(pf), Json(vec![entry(EntryKind::Person, bot, Access::Manage)])).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(err.message, "only people can be listed");
+        let listed = get_access(State(st.clone()), Path(pf)).await.unwrap().0;
+        assert_eq!(listed.iter().map(|e| e.id).collect::<Vec<_>>(), vec![me], "nothing written");
+        // Even a row written directly gives a strategy nothing.
+        sqlx::query("INSERT INTO portfolio_person_access (portfolio_id, principal_id, access) VALUES ($1, $2, 'manage')").bind(pf).bind(bot).execute(&pool).await.unwrap();
+        assert!(!allowed(&pool, bot, Permission::PositionsView, pf).await.unwrap());
     }
 }

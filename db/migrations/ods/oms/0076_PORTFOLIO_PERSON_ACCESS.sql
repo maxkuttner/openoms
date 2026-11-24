@@ -1,6 +1,7 @@
 -- A portfolio's access list can name a single person as well as groups.
 -- A person's effective access is the highest across their groups and their
--- own row. Strategies' direct grants still win over both.
+-- own row. Strategies' direct grants still win over both; a person row only
+-- counts for a HUMAN principal (strategies get access only by direct grant).
 CREATE TABLE portfolio_person_access (
     portfolio_id UUID NOT NULL REFERENCES portfolio(id) ON DELETE CASCADE,
     principal_id UUID NOT NULL REFERENCES principal(id) ON DELETE CASCADE,
@@ -26,7 +27,8 @@ SELECT s.principal_id, s.portfolio_id,
                   JOIN user_group_portfolio gp ON gp.group_id = m.group_id
                 UNION ALL
                 SELECT pa.principal_id, pa.portfolio_id, pa.access
-                  FROM portfolio_person_access pa) x) s
+                  FROM portfolio_person_access pa
+                  JOIN principal p ON p.id = pa.principal_id AND p.principal_type = 'HUMAN') x) s
  WHERE NOT EXISTS (SELECT 1 FROM principal_portfolio_grant d
                     WHERE d.principal_id = s.principal_id AND d.portfolio_id = s.portfolio_id)
  GROUP BY s.principal_id, s.portfolio_id;
