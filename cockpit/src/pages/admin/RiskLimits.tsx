@@ -1,4 +1,6 @@
 import { CrudResource } from "../../components/CrudResource";
+import { hasGrant } from "../../accessGrants";
+import { useSession } from "../../shell/session";
 
 const TRADING_STATE = [
   { value: "ACTIVE", label: "ACTIVE" },
@@ -7,12 +9,16 @@ const TRADING_STATE = [
 ];
 
 export function RiskLimitsPage() {
+  const { me } = useSession();
+  if (!hasGrant(me, "limits_view")) return <p className="text-muted-foreground">You are not granted to view risk limits.</p>;
+  const canSet = hasGrant(me, "limits_set");
   return (
     <CrudResource
       title="Risk limits"
       path="/admin/risk-limits"
-      editable
-      deletable
+      creatable={canSet}
+      editable={canSet}
+      deletable={canSet}
       columns={[
         { key: "portfolio_id", label: "Portfolio" },
         { key: "instrument_id", label: "Instrument" },

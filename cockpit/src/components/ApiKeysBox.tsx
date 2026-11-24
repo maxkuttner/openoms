@@ -21,7 +21,7 @@ export type ApiKeysSource = {
  * user's group access. Used by Trade → API (your own keys) and the Admin Panel's
  * API page (any user's keys).
  */
-export function ApiKeysBox({ source, intro, idPrefix = "key" }: { source: ApiKeysSource; intro: ReactNode; idPrefix?: string }) {
+export function ApiKeysBox({ source, intro, idPrefix = "key", canCreate = true }: { source: ApiKeysSource; intro: ReactNode; idPrefix?: string; canCreate?: boolean }) {
   const [keys, setKeys] = useState<ApiKey[] | null>(null);
   const [name, setName] = useState("");
   const [created, setCreated] = useState<ApiKey | null>(null);
@@ -48,13 +48,13 @@ export function ApiKeysBox({ source, intro, idPrefix = "key" }: { source: ApiKey
           <CopyText value={`${created.key_id}.${created.secret}`} />
         </Notice>
       )}
-      <form className="flex items-end gap-2"
+      {canCreate && <form className="flex items-end gap-2"
         onSubmit={(e) => { e.preventDefault(); void act(async () => { setCreated(await src.current.create(name.trim())); setName(""); }); }}>
         <FormRow label="Name" htmlFor={`${idPrefix}-name`}>
           <Input id={`${idPrefix}-name`} value={name} onChange={(e) => setName(e.currentTarget.value)} />
         </FormRow>
         <Button type="submit">Create key</Button>
-      </form>
+      </form>}
       {keys === null ? <Spinner /> : keys.length === 0 ? <p className="text-muted-foreground">No keys.</p> : (
         <Table>
           <TableBody>

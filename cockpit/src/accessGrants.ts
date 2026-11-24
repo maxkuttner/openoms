@@ -14,3 +14,9 @@ export function toggleGrant(grants: string[], key: string, on: boolean): string[
   const rest = grants.filter((g) => g !== key);
   return on ? [...rest, key] : rest;
 }
+
+/** Whether the session may use a feature: admins always, others by their effective grants (the server still enforces). */
+export function hasGrant(me: { role?: string; grants?: string[] } | null | undefined, key: string): boolean {
+  if (!me) return false;
+  return me.role === "admin" || (me.grants ?? []).includes(key);
+}

@@ -18,6 +18,8 @@ import { fmtLocal, placedCell, tradeTimeCell } from "../../tradeTimes";
 import { formatFees } from "../../fees";
 import { TERMINAL, filterOrders, type StatusFilter } from "../../orders";
 import type { BlotterRow } from "../../api/types";
+import { hasGrant } from "../../accessGrants";
+import { useSession } from "../../shell/session";
 import type { GrantedPortfolio } from "../../access";
 
 // Statuses the OMS will never move on from. Mirrors the terminal check in
@@ -70,6 +72,8 @@ export function TradeBlotter({
   // can_view for exactly this reason, and the two must not disagree.
   followOrderId?: string | null;
 }) {
+  const { me } = useSession();
+  const mayCancelAny = hasGrant(me, "cancel_any");
   const viewable = portfolios.filter((p) => p.can_view);
   const [ownId, setOwnId] = useState<string | null>(null);
   const controlled = onPortfolioChange !== undefined;
@@ -259,7 +263,7 @@ export function TradeBlotter({
                     <TableCell className={numeric}>{o.avg_px ?? "—"}</TableCell>
                     <TableCell className={numeric}>{formatFees(o.fees)}</TableCell>
                     <TableCell className="text-right">
-                      <Button
+                      {(mayCancelAny || o.principal_id === me.principal_id) && <Button
                         size="xs"
                         variant="destructive"
                         disabled={!canCancel}
@@ -269,7 +273,7 @@ export function TradeBlotter({
                         }}
                       >
                         {isCancelling ? "Cancelling…" : "Cancel"}
-                      </Button>
+                      </Button>}
                     </TableCell>
                   </TableRow>
                 );

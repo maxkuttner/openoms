@@ -60,6 +60,8 @@ type Props = {
   onCreated?: (row: any) => void;
   // Show only some rows of the list.
   rowFilter?: (row: any) => boolean;
+  // Hide the New button (default true).
+  creatable?: boolean;
 };
 
 type Form = { values: Record<string, any>; set: (name: string, value: unknown) => void };
@@ -107,7 +109,7 @@ function FieldInput({ field, form }: { field: Field; form: Form }) {
 }
 
 export function CrudResource({
-  title, path, idKey = "id", columns, fields, editable, deletable, rowAction, lifecycle, derive, onCreated, rowFilter,
+  title, path, idKey = "id", columns, fields, editable, deletable, rowAction, lifecycle, derive, onCreated, rowFilter, creatable = true,
 }: Props) {
   const list = useList<any>(path);
   const life = useLifecycle(list.data, {
@@ -165,7 +167,7 @@ export function CrudResource({
         <h2 className="text-sm font-semibold">{title}</h2>
         <div className="flex items-center gap-3">
           {lifecycle && life.switchControl}
-          <Button size="sm" onClick={() => open(null)}>New</Button>
+          {creatable && <Button size="sm" onClick={() => open(null)}>New</Button>}
         </div>
       </div>
       {lifecycle && life.selectionBar}

@@ -1,4 +1,6 @@
 import { ApiKeysBox, type ApiKeysSource } from "../../components/ApiKeysBox";
+import { hasGrant } from "../../accessGrants";
+import { useSession } from "../../shell/session";
 import { authApi, authErrorText } from "../../login/api";
 
 /** Your own keys, through the session's `/auth/keys`. */
@@ -11,10 +13,12 @@ const ownKeys: ApiKeysSource = {
 
 /** Your own API keys: a key acts as you, with your portfolio access. */
 export function ApiKeysPage() {
+  const { me } = useSession();
   return (
     <div className="flex max-w-3xl flex-col gap-4">
       <ApiKeysBox
         source={ownKeys}
+        canCreate={hasGrant(me, "api_keys")}
         intro={<>A key acts as you, with your portfolio access. Use it as <code className="num">Authorization: Bearer key_id.secret</code>.</>}
       />
     </div>

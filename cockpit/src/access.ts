@@ -32,6 +32,8 @@ export type Me = SessionInfo & {
   code: string;
   display_name: string | null;
   portfolios: GrantedPortfolio[];
+  /** Effective access grant keys; admins get them all. */
+  grants?: string[];
 };
 
 export type AccessState = "signed_out" | "pending" | "change_password" | "ready" | "unavailable";

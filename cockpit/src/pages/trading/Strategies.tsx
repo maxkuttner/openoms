@@ -8,6 +8,8 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/co
 import { cn } from "@/lib/utils";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "../../api/client";
+import { hasGrant } from "../../accessGrants";
+import { useSession } from "../../shell/session";
 import { notifyError, notifyOk } from "../../api/hooks";
 import { CopyText, Notice, Section } from "../../components/common";
 import { ConfirmButton } from "../../components/ConfirmButton";
@@ -159,6 +161,8 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 /** One strategy: health, token state and actions; fills, batches and settings open in a sheet. */
 function StrategyCard({ row, onToken }: { row: ReportedStrategy; onToken: (code: string, token: string) => void }) {
   const qc = useQueryClient();
+  const { me } = useSession();
+  const canTokens = hasGrant(me, "strategy_tokens");
   const status = useQuery({ queryKey: [BASE, row.code, "status"], queryFn: () => getStatus(api.get, row.code), refetchInterval: 30_000 });
   const s = status.data;
   const label = s ? staleLabel(s) : "…";
@@ -191,7 +195,7 @@ function StrategyCard({ row, onToken }: { row: ReportedStrategy; onToken: (code:
           {archived ? (
             <span className="ml-auto text-xs text-muted-foreground">Archived {new Date(row.archived_at!).toLocaleDateString()}</span>
           ) : (
-          <div className="ml-auto flex gap-1.5">
+          canTokens && <div className="ml-auto flex gap-1.5">
             <ConfirmButton size="xs" variant="secondary" title={`${actions.rotateLabel} for ${row.code}?`} description="Any current token stops working."
               confirmLabel={actions.rotateLabel} onConfirm={rotate}>{actions.rotateLabel}</ConfirmButton>
             {actions.canRevoke && (
@@ -231,6 +235,7 @@ export function StrategiesPage() {
   const [token, setToken] = useState<{ code: string; token: string } | null>(null);
   const show = (code: string, t: string) => setToken({ code, token: t });
   const [showArchived, setShowArchived] = useState(false);
+  const { me } = useSession();
   const all = list.data ?? [];
   const rows = visibleStrategies(all, showArchived);
   const archivedCount = all.length - visibleStrategies(all, false).length;
@@ -240,10 +245,12 @@ export function StrategiesPage() {
         These strategies trade on their own and report fills here. The OMS books what they report but does not see the venue:
         positions are self-managed and unverified.
       </p>
-      <Section title="New strategy">
-        <CreateForm onCreated={show} />
-        <p className="mt-2 text-xs text-muted-foreground">Creates the strategy, a private portfolio and a reporting token (shown once).</p>
-      </Section>
+      {hasGrant(me, "strategies") && (
+        <Section title="New strategy">
+          <CreateForm onCreated={show} />
+          <p className="mt-2 text-xs text-muted-foreground">Creates the strategy, a private portfolio and a reporting token (shown once).</p>
+        </Section>
+      )}
       {archivedCount > 0 && (
         <div className="flex items-center gap-2">
           <Switch id="show-archived" checked={showArchived} onCheckedChange={setShowArchived} />
