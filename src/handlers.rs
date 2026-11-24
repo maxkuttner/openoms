@@ -849,11 +849,13 @@ pub async fn create_allocations(
     .fetch_one(pool)
     .await
     .map_err(fail)?;
-    let may_trade = authz::allowed(pool, auth.principal_id, Permission::OrdersCreate, from_portfolio)
+    let may_trade = authz::check(pool, auth.principal_id, Permission::OrdersCreate, from_portfolio)
         .await
         .map_err(fail)?;
-    if !can_allocate || !may_trade {
-        return Err(forbidden());
+    match may_trade {
+        Ok(()) if can_allocate => {}
+        Err(authz::Denied::Grant(key)) if can_allocate => return Err(authz::not_granted(key)),
+        _ => return Err(forbidden()),
     }
     authz::require_grant(pool, &auth, crate::access_grants::GrantKey::Allocate).await?;
     require_order_grant(pool, auth.principal_id, order_id, OrderAccess::View).await?;

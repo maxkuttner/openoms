@@ -149,6 +149,15 @@ pub async fn create(
         .execute(&mut *tx)
         .await
         .map_err(db)?;
+    // The owner's group manages the portfolio: give it the manage-level
+    // grants migration 0075 gave every existing manage group.
+    crate::access_grants::set_group_grants(
+        &mut tx,
+        &auth,
+        group_id,
+        &[crate::access_grants::GrantKey::CancelAny, crate::access_grants::GrantKey::LimitsSet],
+    )
+    .await?;
     let token = token::issue(&mut tx, &code).await?;
     tx.commit().await.map_err(db)?;
     Ok(Json(ReportedCreated { code, portfolio_id, group_id, token }))
@@ -333,6 +342,9 @@ mod tests {
         let (pool, state, me) = setup().await;
         let Json(c) = create(State(state.clone()), ctx(me), req("beta")).await.unwrap();
         assert_eq!(token::authenticate(&pool, &c.token).await.unwrap(), "beta");
+        // the owner's group carries the manage-level grants
+        crate::authz::require(&pool, me, crate::authz::Permission::LimitsManage, c.portfolio_id).await.unwrap();
+        crate::authz::require(&pool, me, crate::authz::Permission::OrdersCancelAny, c.portfolio_id).await.unwrap();
         assert!(token::authenticate(&pool, "nonsense").await.is_err());
         let Json(mine) = list_mine(State(state), ctx(me)).await.unwrap();
         assert_eq!(mine.len(), 1);

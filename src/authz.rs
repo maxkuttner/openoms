@@ -87,11 +87,13 @@ pub async fn visible_portfolios(
 }
 
 /// Does `principal_id` hold `key`? Only people are grant-checked: a strategy
-/// (any non-HUMAN principal) and the host token (no principal row) pass.
+/// (any non-HUMAN principal) passes; an unknown id is denied. The host token
+/// (nil id) is exempted by `require_grant`, and `check` never reaches here
+/// without a portfolio access row.
 /// Active admins hold every key. One query.
 pub async fn has_grant(pool: &PgPool, principal_id: Uuid, key: GrantKey) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT NOT EXISTS (SELECT 1 FROM principal WHERE id = $1 AND principal_type = 'HUMAN') \
+        "SELECT EXISTS (SELECT 1 FROM principal WHERE id = $1 AND principal_type <> 'HUMAN') \
              OR EXISTS (SELECT 1 FROM principal_admin a JOIN principal p ON p.id = a.principal_id \
                          WHERE a.principal_id = $1 AND p.status = 'ACTIVE') \
              OR EXISTS (SELECT 1 FROM access_grant WHERE subject_type = 'default' AND grant_key = $2) \
@@ -566,6 +568,16 @@ mod grant_tests {
         assert!(allowed(&pool, s, Permission::OrdersCreate, pf).await.unwrap());
         require_grant(&pool, &AuthContext::machine(s, "s".into()), GrantKey::Options).await.unwrap();
         require_grant(&pool, &crate::admin_bootstrap::host_context(), GrantKey::ApiKeys).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn unknown_principal_is_denied_grants() {
+        let pool = migrated_db().await;
+        defaults(&pool, &[]).await;
+        assert!(!has_grant(&pool, Uuid::new_v4(), GrantKey::Orders).await.unwrap());
+        let e = require_grant(&pool, &AuthContext::machine(Uuid::new_v4(), "ghost".into()), GrantKey::ApiKeys).await.unwrap_err();
+        assert_eq!(e.message, "not granted: api_keys");
     }
 
     #[tokio::test]
