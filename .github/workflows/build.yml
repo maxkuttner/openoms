@@ -169,11 +169,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # shellcheck is preinstalled on the GitHub Ubuntu images.
-      - run: shellcheck install.sh install_test.sh cockpit/check-api-base.sh cockpit/check-palette.sh docker/entrypoint.sh docker/entrypoint_test.sh
+      - run: shellcheck install.sh test/install_test.sh cockpit/check-api-base.sh cockpit/check-palette.sh docker/entrypoint.sh docker/entrypoint_test.sh
       - name: the image start script sets up, then serves
         run: sh docker/entrypoint_test.sh
       - name: install.sh puts oms on PATH
-        run: sh install_test.sh
+        run: sh test/install_test.sh
 
   docs-site:
     name: docs site build and checks

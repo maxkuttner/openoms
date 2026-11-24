@@ -185,5 +185,5 @@ offer_init() {
 	fi
 }
 
-# install_test.sh sources this file for its functions.
+# test/install_test.sh sources this file for its functions.
 [ "${OMS_INSTALL_SH_NO_MAIN:-}" = "1" ] || main "$@"

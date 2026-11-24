@@ -1,11 +1,11 @@
 #!/bin/sh
 # Tests install.sh's PATH setup: add_to_path, run against a throwaway $HOME.
 #
-#   sh install_test.sh
+#   sh test/install_test.sh
 # shellcheck disable=SC2016 # literal $PATH in expected file contents
 
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 fails=0
 fail() {
