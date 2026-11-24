@@ -29,3 +29,10 @@ export function groupSummary(g: { members: unknown[]; portfolios: unknown[] }): 
   const n = (k: number, one: string) => `${k} ${one}${k === 1 ? "" : "s"}`;
   return `${n(g.members.length, "member")} · ${n(g.portfolios.length, "portfolio")}`;
 }
+
+/** Groups whose name or strategy code contains the query (case-insensitive); blank keeps all. */
+export function filterGroups<G extends { name: string; strategy_code: string | null }>(groups: G[], query: string): G[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return groups;
+  return groups.filter((g) => g.name.toLowerCase().includes(q) || (g.strategy_code ?? "").toLowerCase().includes(q));
+}

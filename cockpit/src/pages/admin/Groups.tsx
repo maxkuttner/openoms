@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Check, ChevronsUpDown, Plus, Search } from "lucide-react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
@@ -6,6 +7,8 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -14,10 +17,9 @@ import { api } from "../../api/client";
 import { useApiMutation, useList } from "../../api/hooks";
 import type { Portfolio } from "../../api/types";
 import { resolveGrants, toggleGrant } from "../../accessGrants";
-import { ACCESS_OPTIONS, accessTableBody, groupSummary, type Access } from "../../groups";
+import { ACCESS_OPTIONS, accessTableBody, filterGroups, groupSummary, type Access } from "../../groups";
 import { ConfirmButton } from "../../components/ConfirmButton";
 import { MultiSelect, Select, TextField } from "../../components/form";
-import { Pill } from "../../components/status";
 
 const PATH = "/admin/groups";
 const DEFAULT_PATH = "/admin/grants/default";
@@ -232,9 +234,10 @@ function Editor({ selected, group, onSelect, onDirtyChange }: { selected: string
   const anyDirty = Object.values(dirtyTabs).some(Boolean);
   useEffect(() => { onDirtyChange(anyDirty); }, [anyDirty, onDirtyChange]);
   const title = isDefault ? "Default grants" : isNew ? "New group" : group?.name;
-  const sub = isDefault ? "Applies to every user. Groups can only add to this." : group ? groupSummary(group) : "";
+  const sub = isDefault ? "Applies to every user; groups can only add to it." : group ? groupSummary(group) : "";
   return (
-    <section aria-label="Group editor" className="min-w-0 flex-1 rounded-md border p-4">
+    <section aria-label={isDefault ? "Default grants editor" : "Group editor"}
+      className={cn("w-full min-w-0 max-w-4xl rounded-md border p-4", isDefault && "border-warn bg-warn/5")}>
       <div className="mb-3 flex items-baseline gap-3">
         <h2 className="text-sm font-semibold">{title}</h2>
         <span className="text-xs text-muted-foreground">{sub}</span>
@@ -261,42 +264,94 @@ function Editor({ selected, group, onSelect, onDirtyChange }: { selected: string
   );
 }
 
+function GroupPicker({ groups, value, onChange }: { groups: GroupRow[]; value: GroupRow | null; onChange: (id: string) => void }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const shown = filterGroups(groups, query);
+  return (
+    <Popover open={open} onOpenChange={(o) => { setOpen(o); if (!o) setQuery(""); }}>
+      <PopoverTrigger asChild>
+        <Button variant="outline" role="combobox" aria-expanded={open} aria-label="Group" className="h-auto min-h-9 w-full max-w-md justify-start gap-2 py-1.5">
+          <Search className="text-muted-foreground" />
+          <span className="flex min-w-0 flex-1 flex-col items-start text-left">
+            <span className="max-w-full truncate">{value ? value.name : "New group"}</span>
+            {value && <span className="text-xs font-normal text-muted-foreground">{groupSummary(value)}</span>}
+          </span>
+          <ChevronsUpDown className="text-muted-foreground" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
+        <Command shouldFilter={false}>
+          <CommandInput placeholder="Group name…" value={query} onValueChange={setQuery} />
+          <CommandList>
+            <CommandEmpty>No group matches.</CommandEmpty>
+            <CommandGroup>
+              {shown.map((g) => (
+                <CommandItem key={g.id} value={g.id} onSelect={() => { setOpen(false); onChange(g.id); }}>
+                  <Check className={cn(value?.id === g.id ? "opacity-100" : "opacity-0")} />
+                  <span className="flex min-w-0 flex-1 flex-col">
+                    <span className="truncate">{g.name}</span>
+                    <span className="text-xs text-muted-foreground">{groupSummary(g)}</span>
+                  </span>
+                  {g.strategy_code && <Badge variant="secondary">strategy{g.strategy_archived ? " · archived" : ""}</Badge>}
+                </CommandItem>
+              ))}
+            </CommandGroup>
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+type View = "groups" | "default";
+type Target = { view: View; group: string | null };
+
 /** Groups: who gets which portfolio access and which grants (a person's highest access and any "on" grant wins). */
 export function GroupsPage() {
   const list = useList<GroupRow>(PATH);
-  const [selected, setSelected] = useState<string>(DEFAULT_ID);
+  const [view, setView] = useState<View>("groups");
+  const [selected, setSelected] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
-  const [pending, setPending] = useState<string | null>(null);
+  const [pending, setPending] = useState<Target | null>(null);
   const groups = list.data ?? [];
   const group = groups.find((g) => g.id === selected) ?? null;
-  const effective = selected === DEFAULT_ID || selected === "new" || group ? selected : DEFAULT_ID;
+  // The chosen group, or the first one; "new" stays until saved or abandoned.
+  const effective = selected === "new" ? "new" : group ? group.id : (groups[0]?.id ?? null);
+  const current = groups.find((g) => g.id === effective) ?? null;
+  const apply = (t: Target) => { setView(t.view); setSelected(t.group); };
   // Switching away from unsaved edits asks first.
-  const go = (id: string) => { if (id === effective) return; if (dirty) setPending(id); else setSelected(id); };
-  const row = (id: string, name: React.ReactNode, sub: React.ReactNode, extra?: string) => (
-    <button key={id} type="button" onClick={() => go(id)} aria-current={effective === id || undefined}
-      className={cn("flex min-h-12 flex-col items-start justify-center rounded-md border border-transparent px-2.5 py-1.5 text-left hover:bg-muted/50",
-        effective === id && "border-border bg-muted", extra)}>
-      <span>{name}</span>
-      <span className="text-xs text-muted-foreground">{sub}</span>
-    </button>
-  );
+  const go = (t: Target) => {
+    if (t.view === view && (t.view === "default" || t.group === effective)) return;
+    if (dirty) setPending(t); else apply(t);
+  };
   return (
-    <div className="flex flex-col gap-3">
-      <div className="flex flex-col gap-4 md:flex-row md:items-start">
-        <section aria-label="Groups" className="flex w-full shrink-0 flex-col gap-1 md:w-64">
-          <div className="mb-1 flex items-center justify-between">
-            <h2 className="text-sm font-semibold">Groups</h2>
-            <Button size="sm" onClick={() => go("new")}>New group</Button>
+    <div className="flex flex-col gap-4">
+      <Tabs value={view} onValueChange={(v) => go({ view: v as View, group: selected })}>
+        <TabsList>
+          <TabsTrigger value="groups">Groups</TabsTrigger>
+          <TabsTrigger value="default">Default grants</TabsTrigger>
+        </TabsList>
+      </Tabs>
+      {list.error && <p className="text-destructive">Could not load groups: {errText(list.error)}</p>}
+      {view === "default" ? (
+        <Editor key="default" selected={DEFAULT_ID} group={null} onSelect={() => {}} onDirtyChange={setDirty} />
+      ) : (
+        <>
+          <div className="flex flex-wrap items-center gap-2">
+            {(groups.length > 0 || effective === "new") && (
+              <GroupPicker groups={groups} value={current} onChange={(id) => go({ view: "groups", group: id })} />
+            )}
+            <Button size="sm" onClick={() => go({ view: "groups", group: "new" })}><Plus /> New group</Button>
           </div>
-          {list.error && <p className="text-destructive">Could not load groups: {errText(list.error)}</p>}
-          {row(DEFAULT_ID, "Default grants", "Every user starts here", "mb-1 border-b-border")}
-          {groups.map((g) => row(g.id,
-            <>{g.name}{g.strategy_code && <Pill tone="info" className="ml-1.5">strategy {g.strategy_code}{g.strategy_archived ? " · archived" : ""}</Pill>}</>,
-            groupSummary(g)))}
-          {!list.error && groups.length === 0 && <p className="px-2.5 text-muted-foreground">No groups yet.</p>}
-        </section>
-        <Editor key={effective} selected={effective} group={group} onSelect={(id) => setSelected(id ?? DEFAULT_ID)} onDirtyChange={setDirty} />
-      </div>
+          {effective ? (
+            <Editor key={effective} selected={effective} group={current}
+              onSelect={(id) => setSelected(id)} onDirtyChange={setDirty} />
+          ) : !list.error && !list.isLoading && (
+            <p className="text-muted-foreground">No groups yet. Create the first one with New group.</p>
+          )}
+        </>
+      )}
       <AlertDialog open={pending !== null} onOpenChange={(o) => !o && setPending(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -305,7 +360,7 @@ export function GroupsPage() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Keep editing</AlertDialogCancel>
-            <AlertDialogAction variant="destructive" onClick={() => { setSelected(pending!); setPending(null); }}>Discard</AlertDialogAction>
+            <AlertDialogAction variant="destructive" onClick={() => { apply(pending!); setPending(null); }}>Discard</AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
