@@ -84,6 +84,48 @@ async fn strategy_route(pool: &sqlx::PgPool, strategy: &Strategy, req: &SubmitOr
     Ok(Some((account, instrument_id)))
 }
 
+/// The portfolio's account to route a non-strategy order through: one of its
+/// ACTIVE accounts on a granted venue. An explicit `account_id` must be one of
+/// them; without one, the single such venue that lists the instrument.
+async fn granted_account(
+    pool: &sqlx::PgPool,
+    portfolio_id: Uuid,
+    instrument_id: i64,
+    explicit: Option<&str>,
+    grants: &[crate::grants::Grant],
+) -> Result<Uuid, ApiError> {
+    let unprocessable = |m: &str| ApiError { status: StatusCode::UNPROCESSABLE_ENTITY, message: m.to_string() };
+    let explicit = explicit
+        .map(|a| Uuid::parse_str(a).map_err(|_| ApiError { status: StatusCode::BAD_REQUEST, message: "account_id must be a UUID".to_string() }))
+        .transpose()?;
+    let connections: Vec<String> = grants
+        .iter()
+        .map(|g| match g {
+            crate::grants::Grant::Venue { connection, .. } => connection.clone(),
+        })
+        .collect();
+    let rows: Vec<(Uuid, bool)> = sqlx::query_as(
+        "SELECT a.id, EXISTS (SELECT 1 FROM broker_instrument bi \
+                              WHERE bi.instrument_id = $3 AND bi.broker_code = bc.broker_code) \
+         FROM account a JOIN broker_connection bc ON bc.code = a.broker_connection_code \
+         WHERE a.portfolio_id = $1 AND a.status = 'ACTIVE' AND a.broker_connection_code = ANY($2)",
+    )
+    .bind(portfolio_id)
+    .bind(&connections)
+    .bind(instrument_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| crate::handlers::internal("failed to load granted accounts", e))?;
+    if let Some(id) = explicit {
+        return rows.iter().any(|(a, _)| *a == id).then_some(id).ok_or_else(|| unprocessable("venue not granted to this portfolio"));
+    }
+    match rows.iter().filter(|(_, lists)| *lists).map(|(a, _)| *a).collect::<Vec<_>>()[..] {
+        [] => Err(unprocessable("venue not granted to this portfolio")),
+        [one] => Ok(one),
+        _ => Err(unprocessable("choose a venue")),
+    }
+}
+
 /// Insert an order's state row (status and quantities as `s` has them).
 pub(crate) async fn insert_order_state(
     conn: &mut sqlx::PgConnection,
@@ -488,38 +530,31 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         None => None,
     };
 
-    // Resolve the account: explicit override if given, else the portfolio's default route.
-    // Captured before `req` is moved into `cmd` below; drives the ownership
-    // check further down (an explicit account_id must belong to portfolio_id).
-    let account_id_was_explicit = req.account_id.is_some() || strategy_route.is_some();
-    let account_id: Uuid = match (strategy_route, req.account_id.as_deref()) {
-        (Some((account, _)), _) => account,
-        (None, Some(a)) => Uuid::parse_str(a).map_err(|_| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: "account_id must be a UUID".to_string(),
-        })?,
-        (None, None) => query_scalar::<_, Option<Uuid>>(
-            "SELECT default_account_id FROM portfolio WHERE id = $1",
-        )
-        .bind(portfolio_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|err| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("failed to load portfolio default account: {:?}", err),
-        })?
-        .flatten()
-        .ok_or_else(|| ApiError {
-            status: StatusCode::BAD_REQUEST,
-            message: "no account_id given and portfolio has no default account".to_string(),
-        })?,
-    };
     // instrument.id is a BIGINT surrogate key (the mdm master instrument), not a UUID.
     // The request may have named the instrument by symbol instead; either way the
     // command below carries only the id.
     let instrument_id_bigint = match strategy_route {
         Some((_, instrument_id)) => instrument_id,
         None => resolve_instrument_ref(&pool, &req).await?,
+    };
+    // A strategy's order keeps its own route. Anything else trades only through
+    // the portfolio's venue grants: an explicit account_id must be one of them,
+    // otherwise the single granted venue listing the instrument.
+    let grants = match strategy_route {
+        Some(_) => None,
+        None => {
+            let mut conn = pool.acquire().await.map_err(|e| crate::handlers::internal("database error", e))?;
+            Some(
+                crate::grants::store::active_for_portfolio(&mut conn, portfolio_id)
+                    .await
+                    .map_err(|e| crate::handlers::internal("failed to load trading grants", e))?,
+            )
+        }
+    };
+    let account_id: Uuid = match (strategy_route, &grants) {
+        (Some((account, _)), _) => account,
+        (None, Some(grants)) => granted_account(&pool, portfolio_id, instrument_id_bigint, req.account_id.as_deref(), grants).await?,
+        (None, None) => unreachable!("grants are loaded for every non-strategy order"),
     };
     let fix_cl_ord_id = match &origin {
         Origin::Fix { cl_ord_id } => Some(cl_ord_id.clone()),
@@ -534,7 +569,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // mapping before committing anything to the event store. Requires an ACTIVE connection.
     let account_row_pre = sqlx::query(
         "SELECT bc.broker_code, bc.environment, bc.code AS broker_connection_code, \
-                a.external_account_ref, a.portfolio_id AS account_portfolio_id \
+                a.external_account_ref \
          FROM account a \
          JOIN broker_connection bc ON bc.code = a.broker_connection_code \
          WHERE a.id = $1 AND bc.status = 'ACTIVE'"
@@ -550,36 +585,6 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         status: StatusCode::BAD_REQUEST,
         message: "account not found or its broker connection is not active".to_string(),
     })?;
-
-    // account.portfolio_id and portfolio.default_account_id are two
-    // independent, both-mutable sources of truth (admin CRUD can repoint
-    // either one without touching the other) — so both paths that can land
-    // here need the ownership check, not just the explicit one.
-    let account_portfolio_id: Option<Uuid> = account_row_pre.get("account_portfolio_id");
-    if account_id_was_explicit {
-        // Explicit account_id: must belong to this portfolio. NULL (not yet
-        // backfilled) does not count as belonging — an explicit pick is a
-        // deliberate cross-check, so require an exact match.
-        if account_portfolio_id != Some(portfolio_id) {
-            return Err(ApiError {
-                status: StatusCode::BAD_REQUEST,
-                message: "account does not belong to this portfolio".to_string(),
-            });
-        }
-    } else if let Some(other_portfolio_id) = account_portfolio_id {
-        // Default-account path (portfolio.default_account_id). Unlike the
-        // explicit path, NULL is fine here — it means this account predates
-        // the portfolio_id backfill, not that it belongs to someone else — so
-        // only reject a default account that is affirmatively owned by a
-        // DIFFERENT portfolio, which is the exact cross-portfolio misroute
-        // this check exists to catch.
-        if other_portfolio_id != portfolio_id {
-            return Err(ApiError {
-                status: StatusCode::BAD_REQUEST,
-                message: "portfolio's default account belongs to a different portfolio".to_string(),
-            });
-        }
-    }
 
     let broker_code: String = account_row_pre.get("broker_code");
     let environment: String = account_row_pre.get("environment");
@@ -616,6 +621,18 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     }
     let instrument_class: String = instrument_row.get("instrument_class");
     let contract_size: f64 = instrument_row.get("contract_size");
+    if let Some(grants) = &grants {
+        let facts = crate::grants::OrderFacts {
+            connection: broker_connection_code.clone(),
+            broker_code: broker_code.clone(),
+            instrument_class: Some(instrument_class.clone()),
+            at: chrono::Utc::now(),
+        };
+        crate::grants::check(&facts, grants).map_err(|crate::grants::Denied(message)| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message,
+        })?;
+    }
 
     // Options route to Alpaca as single-leg contract orders, which only accept
     // a `day` time-in-force. Reject anything else up front with a clear message.
@@ -1273,5 +1290,152 @@ mod tests {
         assert_eq!(e.message, "portfolio belongs to a self-managed reported strategy");
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM order_state").fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ── Trading grants (reload DB) ───────────────────────────────────────────
+
+    async fn g_connection(pool: &sqlx::PgPool, broker: &str) -> String {
+        let code = format!("c-{}", Uuid::new_v4().simple());
+        sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
+            .bind(&code).bind(broker).execute(pool).await.unwrap();
+        code
+    }
+
+    async fn g_instrument(pool: &sqlx::PgPool, suffix: &str) -> i64 {
+        sqlx::query("INSERT INTO venue (code, name) VALUES ('CRYPTO', 'c') ON CONFLICT DO NOTHING").execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO currency (code, name) VALUES ('USDT', 'tether') ON CONFLICT DO NOTHING").execute(pool).await.unwrap();
+        crate::handlers::tests::seed_instrument(pool, suffix).await
+    }
+
+    async fn g_list(pool: &sqlx::PgPool, instrument: i64, broker: &str) {
+        sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, is_tradeable) VALUES ($1, $2, 'GT', true)")
+            .bind(instrument).bind(broker).execute(pool).await.unwrap();
+    }
+
+    async fn g_grant(pool: &sqlx::PgPool, pf: Uuid, conns: &[&str]) {
+        let grants = conns.iter().map(|c| crate::grants::Grant::Venue { connection: c.to_string(), account_ref: None }).collect();
+        let mut tx = pool.begin().await.unwrap();
+        crate::grants::store::set_for_portfolio(&mut tx, &crate::groups_api::tests::admin(), pf, grants).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    fn g_request(pf: Uuid, instrument: i64) -> SubmitOrderRequest {
+        serde_json::from_value(serde_json::json!({
+            "order_id": Uuid::new_v4().to_string(),
+            "client_order_id": "g",
+            "portfolio_id": pf.to_string(),
+            "instrument_id": instrument.to_string(),
+            "side": "buy",
+            "order_type": "limit",
+            "time_in_force": "gtc",
+            "limit_price": 1.0,
+            "quantity": 1.0,
+        }))
+        .unwrap()
+    }
+
+    async fn g_order_conn(pool: &sqlx::PgPool, pf: Uuid) -> Vec<String> {
+        sqlx::query_scalar("SELECT broker_connection_code FROM order_state WHERE portfolio_id = $1")
+            .bind(pf).fetch_all(pool).await.unwrap()
+    }
+
+    /// A trader who may trade (and view) the portfolio.
+    async fn g_trader(pool: &sqlx::PgPool, pf: Uuid) -> AuthContext {
+        let (me, code) = crate::handlers::tests::seed_principal(pool, "gt").await;
+        sqlx::query("INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view, can_trade) VALUES ($1, $2, $3, true, true)")
+            .bind(Uuid::new_v4()).bind(me).bind(pf).execute(pool).await.unwrap();
+        AuthContext::machine(me, code)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn submit_routes_to_single_venue() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let me = g_trader(&pool, pf).await;
+        let inst = g_instrument(&pool, "GA").await;
+        let (a, b) = (g_connection(&pool, "GTA").await, g_connection(&pool, "GTB").await);
+        g_list(&pool, inst, "GTA").await;
+        // b is granted but does not list the instrument
+        g_grant(&pool, pf, &[&a, &b]).await;
+        let r = submit(&state, &me, g_request(pf, inst), Origin::Api).await;
+        if let Err(e) = &r {
+            assert!(!e.message.contains("venue"), "{}", e.message);
+        }
+        assert_eq!(g_order_conn(&pool, pf).await, vec![a]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn submit_with_two_venues_needs_choice() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let me = g_trader(&pool, pf).await;
+        let inst = g_instrument(&pool, "GB").await;
+        let (a, b) = (g_connection(&pool, "GTA").await, g_connection(&pool, "GTB").await);
+        g_list(&pool, inst, "GTA").await;
+        g_list(&pool, inst, "GTB").await;
+        g_grant(&pool, pf, &[&a, &b]).await;
+        let e = submit(&state, &me, g_request(pf, inst), Origin::Api).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "choose a venue"));
+        // naming one of them routes there
+        let acct: Uuid = sqlx::query_scalar("SELECT id FROM account WHERE portfolio_id = $1 AND broker_connection_code = $2")
+            .bind(pf).bind(&b).fetch_one(&pool).await.unwrap();
+        let mut req = g_request(pf, inst);
+        req.account_id = Some(acct.to_string());
+        let _ = submit(&state, &me, req, Origin::Api).await;
+        assert_eq!(g_order_conn(&pool, pf).await, vec![b]);
+        // an account outside the portfolio's grants is refused
+        let mut req = g_request(pf, inst);
+        req.account_id = Some(Uuid::new_v4().to_string());
+        let e = submit(&state, &me, req, Origin::Api).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "venue not granted to this portfolio"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn revoked_venue_refuses_submit_but_keeps_history() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let me = g_trader(&pool, pf).await;
+        let inst = g_instrument(&pool, "GC").await;
+        let a = g_connection(&pool, "GTA").await;
+        g_list(&pool, inst, "GTA").await;
+        g_grant(&pool, pf, &[&a]).await;
+        let r = submit(&state, &me, g_request(pf, inst), Origin::Api).await;
+        assert!(r.is_err_and(|e| !e.message.contains("venue")));
+        assert_eq!(g_order_conn(&pool, pf).await, vec![a.clone()]);
+        g_grant(&pool, pf, &[]).await;
+        let e = submit(&state, &me, g_request(pf, inst), Origin::Api).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "venue not granted to this portfolio"));
+        assert_eq!(g_order_conn(&pool, pf).await, vec![a], "the earlier order stays");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn venues_lists_only_granted() {
+        use axum::extract::{Extension, Path, Query, State};
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let inst = g_instrument(&pool, "GD").await;
+        let (a, b) = (g_connection(&pool, "GTA").await, g_connection(&pool, "GTB").await);
+        g_list(&pool, inst, "GTA").await;
+        g_list(&pool, inst, "GTB").await;
+        g_grant(&pool, pf, &[&a]).await;
+        let viewer = g_trader(&pool, pf).await;
+        let list = |st: AppState| crate::handlers::get_portfolio_venues(
+            State(st), Extension(viewer.clone()), Path(pf),
+            Query(crate::handlers::VenuesQuery { instrument_id: inst.to_string() }),
+        );
+        let v = list(state.clone()).await.unwrap().0;
+        assert_eq!(v.iter().map(|o| o.broker_connection_code.clone().unwrap()).collect::<Vec<_>>(), vec![a.clone()]);
+        assert!(v[0].eligible && v[0].account_id.is_some());
+        let _ = b;
+        g_grant(&pool, pf, &[]).await;
+        assert!(list(state).await.unwrap().0.is_empty());
     }
 }

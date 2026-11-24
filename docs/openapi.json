@@ -6859,7 +6859,7 @@
       },
       "SubmitOrderRequest": {
         "type": "object",
-        "description": "Wire payload for POST /orders/submit. `account_id` is optional — when omitted it is\nresolved from the portfolio's `default_account_id`; when present it overrides.",
+        "description": "Wire payload for POST /orders/submit. `account_id` is optional — when omitted it is\nresolved to the portfolio's single granted venue listing the instrument; when present it\nmust be one of the portfolio's granted venue accounts.",
         "required": [
           "order_id",
           "client_order_id",
@@ -6872,7 +6872,7 @@
         "properties": {
           "account_id": {
             "type": "string",
-            "description": "Optional account UUID; omit to use the portfolio's default account.",
+            "description": "Optional account UUID; omit to use the portfolio's single granted venue.",
             "example": null,
             "nullable": true
           },

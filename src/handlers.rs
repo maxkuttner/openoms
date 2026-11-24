@@ -102,7 +102,8 @@ pub async fn health() -> &'static str {
 
 
 /// Wire payload for POST /orders/submit. `account_id` is optional — when omitted it is
-/// resolved from the portfolio's `default_account_id`; when present it overrides.
+/// resolved to the portfolio's single granted venue listing the instrument; when present it
+/// must be one of the portfolio's granted venue accounts.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SubmitOrderRequest {
     /// Client-generated UUID; also the idempotency key (a repeat is a 409).
@@ -114,7 +115,7 @@ pub struct SubmitOrderRequest {
     /// Portfolio UUID the order books against.
     #[schema(example = "b2c3d4e5-6f70-4812-93a4-556677889900")]
     pub portfolio_id: String,
-    /// Optional account UUID; omit to use the portfolio's default account.
+    /// Optional account UUID; omit to use the portfolio's single granted venue.
     #[schema(example = json!(null))]
     pub account_id: Option<String>,
     /// Instrument surrogate key (BIGINT as string), not a UUID. Omit when naming the
@@ -700,17 +701,31 @@ pub async fn get_portfolio_venues(
         return Ok(Json(Vec::new()));
     };
 
+    // Only venues granted to the portfolio: their hidden account is ACTIVE
+    // exactly while the grant is.
+    let granted: Vec<String> = {
+        let mut conn = state.pool().acquire().await.map_err(|e| internal("database error", e))?;
+        crate::grants::store::active_for_portfolio(&mut conn, portfolio_id)
+            .await
+            .map_err(|e| internal("failed to load trading grants", e))?
+            .into_iter()
+            .map(|g| match g {
+                crate::grants::Grant::Venue { connection, .. } => connection,
+            })
+            .collect()
+    };
     let rows = sqlx::query(
         "SELECT bi.broker_code, bi.is_tradeable, bc.environment, \
                 bc.code AS broker_connection_code, bc.status AS connection_status, \
                 a.id AS account_id \
          FROM broker_instrument bi \
-         LEFT JOIN broker_connection bc ON bc.broker_code = bi.broker_code \
-         LEFT JOIN account a ON a.broker_connection_code = bc.code AND a.portfolio_id = $2 \
-         WHERE bi.instrument_id = $1",
+         JOIN broker_connection bc ON bc.broker_code = bi.broker_code \
+         JOIN account a ON a.broker_connection_code = bc.code AND a.portfolio_id = $2 AND a.status = 'ACTIVE' \
+         WHERE bi.instrument_id = $1 AND bc.code = ANY($3)",
     )
     .bind(instrument_id)
     .bind(portfolio_id)
+    .bind(&granted)
     .fetch_all(state.pool())
     .await
     .map_err(|err| ApiError {
