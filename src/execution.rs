@@ -157,7 +157,7 @@ async fn apply_once(
 
     let state = match load_state(&mut tx, order_id).await? {
         Some(s) => s,
-        // TODO: If the OMS is supposed to act as a projection for colocated quoting engines,
+        // TODO: If the OMS is supposed to act as a projection for external quoting engines,
         //  trading algorithms, etc., we should be able to handle the case where the order is
         //  not found in the DB.
         None => {

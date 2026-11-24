@@ -374,7 +374,6 @@ pub async fn restart_exec_stream(stream: &ExecStreamStart, deps: &RegistrationDe
                 pool.clone(),
                 Some(stream.adapter.clone()),
                 instruments.clone(),
-                crate::reconciler::Accounts::Unfollowed,
             );
             let run = start(health, tx);
             tokio::spawn(async move {

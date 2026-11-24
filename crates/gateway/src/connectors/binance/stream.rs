@@ -300,7 +300,7 @@ async fn connect_and_run(
 /// the order: a `TRADE` is a fill (its commission `n`/`N` rides along), and
 /// every report is also the order's current state. The stream does not know
 /// the account's reference: the connection's reconciler stamps it (its only
-/// account), and a co-located follow sets its sub-account's.
+/// account).
 pub(crate) fn venue_events(event: &serde_json::Value) -> Vec<VEvent> {
     let mut out = Vec::new();
     // On a cancel, Binance puts the cancel-request's id in `c` and the original

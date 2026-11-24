@@ -24,15 +24,6 @@
 //!   with `from = None, since = updated_at - 60s`; a non-empty returned cursor is
 //!   stored, an empty one leaves the row (and its stamp) untouched.
 //!
-//! **Accounts:** a connection's reconciler covers its accounts except those a
-//! co-located strategy's follow covers ([`Accounts::Unfollowed`]). A follow
-//! is a reconciler of its own on the same connection code, scoped to the one
-//! account ([`Accounts::Only`]), pulling with the strategy's follow key: the
-//! connection's key cannot see a sub-account's trades, and pulling with it
-//! for the sub-account would book the main account's trades there. An account
-//! counts as followed while its COLOCATED strategy has a follow credential,
-//! even when that follow failed to start (it is then pulled by nobody).
-//!
 //! **Account ref:** a stream event without one (Binance's user-data stream,
 //! which does not know it) gets the ref of the reconciler's only account;
 //! with several, it is left empty and ingest refuses it (unknown account).
@@ -96,29 +87,8 @@ impl SweepReport {
     }
 }
 
-/// Which of the connection's accounts a reconciler covers.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Accounts {
-    /// Every account of the connection that no co-located follow covers.
-    Unfollowed,
-    /// One account, followed with its own key.
-    Only(Uuid),
-}
-
-impl Accounts {
-    /// The reconciler's name in the live registry: the connection code, or
-    /// `"<connection>#<account id>"` for a follow.
-    pub fn key(&self, connection: &str) -> String {
-        match self {
-            Self::Unfollowed => connection.to_string(),
-            Self::Only(id) => format!("{connection}#{id}"),
-        }
-    }
-}
-
 pub struct Reconciler {
     connection: String,
-    scope: Accounts,
     source: Arc<dyn ExecutionSource>,
     engine: EngineHandle,
     pool: PgPool,
@@ -188,7 +158,7 @@ struct WeakHandle {
 static LIVE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, WeakHandle>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// The running reconciler under `key` ([`Accounts::key`]), if any. Hold the result only briefly.
+/// The running reconciler of connection `key`, if any. Hold the result only briefly.
 pub fn live(key: &str) -> Option<ReconcilerHandle> {
     let mut live = LIVE.lock().unwrap();
     let up = live.get(key).and_then(|w| Some(ReconcilerHandle { inner: w.inner.upgrade()?, _tasks: w.tasks.upgrade()? }));
@@ -198,12 +168,9 @@ pub fn live(key: &str) -> Option<ReconcilerHandle> {
     up
 }
 
-/// Every running reconciler of `connection`: its own and its follows'.
+/// Every running reconciler of `connection` (zero or one).
 pub fn live_all(connection: &str) -> Vec<ReconcilerHandle> {
-    let follow = format!("{connection}#");
-    let keys: Vec<String> =
-        LIVE.lock().unwrap().keys().filter(|k| *k == connection || k.starts_with(&follow)).cloned().collect();
-    keys.iter().filter_map(|k| live(k)).collect()
+    live(connection).into_iter().collect()
 }
 
 /// Start a reconciler without an adapter (no synthetic closes) or instrument provider.
@@ -215,11 +182,11 @@ pub fn spawn(
     engine: EngineHandle,
     pool: PgPool,
 ) -> ReconcilerHandle {
-    spawn_with(connection, source, events, engine, pool, None, None, Accounts::Unfollowed)
+    spawn_with(connection, source, events, engine, pool, None, None)
 }
 
 /// `adapter` answers `order_status` for OMS orders gone from the snapshot;
-/// `instruments` resolves symbols ingest does not know; `scope` picks the accounts.
+/// `instruments` resolves symbols ingest does not know.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with(
     connection: String,
@@ -229,10 +196,9 @@ pub fn spawn_with(
     pool: PgPool,
     adapter: Option<Arc<dyn BrokerAdapter>>,
     instruments: Option<Arc<dyn InstrumentProvider>>,
-    scope: Accounts,
 ) -> ReconcilerHandle {
-    let name = scope.key(&connection);
-    let inner = Arc::new(Reconciler { connection, scope, source, engine, pool, adapter, instruments, trigger: Notify::new(), discover: AtomicBool::new(false), failures: Default::default() });
+    let name = connection.clone();
+    let inner = Arc::new(Reconciler { connection, source, engine, pool, adapter, instruments, trigger: Notify::new(), discover: AtomicBool::new(false), failures: Default::default() });
     let mut set = JoinSet::new();
 
     let r = inner.clone();
@@ -308,38 +274,19 @@ impl Reconciler {
         configured.map(|s| s as u64).unwrap_or_else(|| self.source.hints().intraday_secs)
     }
 
-    /// The accounts this reconciler covers (see [`Accounts`]). One row per ref:
-    /// the oldest, as in ingest's `resolve_account`; only a followed oldest row
-    /// (excluded before the pick) could make the two differ.
+    /// The accounts this reconciler covers: one row per ref, the oldest, as
+    /// in ingest's `resolve_account`.
     async fn accounts(&self) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
-        match self.scope {
-            Accounts::Unfollowed => {
-                sqlx::query_as(
-                    "SELECT id, external_account_ref FROM ( \
-                     SELECT DISTINCT ON (a.external_account_ref) a.id, a.external_account_ref, a.code FROM account a \
-                     WHERE a.broker_connection_code = $1 AND a.external_account_ref IS NOT NULL \
-                       AND NOT EXISTS ( \
-                         SELECT 1 FROM strategy_connection sc JOIN strategy s ON s.code = sc.strategy_code \
-                         WHERE sc.account_id = a.id AND s.mode = 'COLOCATED' \
-                           AND s.follow_credentials IS NOT NULL AND s.follow_environment IS NOT NULL) \
-                     ORDER BY a.external_account_ref, a.created_at, a.id) r \
-                     ORDER BY code",
-                )
-                .bind(&self.connection)
-                .fetch_all(&self.pool)
-                .await
-            }
-            Accounts::Only(id) => {
-                sqlx::query_as(
-                    "SELECT id, external_account_ref FROM account \
-                     WHERE broker_connection_code = $1 AND id = $2 AND external_account_ref IS NOT NULL",
-                )
-                .bind(&self.connection)
-                .bind(id)
-                .fetch_all(&self.pool)
-                .await
-            }
-        }
+        sqlx::query_as(
+            "SELECT id, external_account_ref FROM ( \
+             SELECT DISTINCT ON (a.external_account_ref) a.id, a.external_account_ref, a.code FROM account a \
+             WHERE a.broker_connection_code = $1 AND a.external_account_ref IS NOT NULL \
+             ORDER BY a.external_account_ref, a.created_at, a.id) r \
+             ORDER BY code",
+        )
+        .bind(&self.connection)
+        .fetch_all(&self.pool)
+        .await
     }
 
     /// Give a stream event without an account ref the ref of this

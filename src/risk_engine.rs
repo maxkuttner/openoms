@@ -387,10 +387,10 @@ mod tests {
     }
 
     /// A disposable database selected explicitly, never the shared dev config.
-    /// Run with `COLO_TEST_DATABASE_URL=postgres://… cargo test -- --ignored`.
+    /// Run with `OMS_TEST_DATABASE_URL=postgres://… cargo test -- --ignored`.
     async fn isolated_pool() -> sqlx::PgPool {
-        let url = std::env::var("COLO_TEST_DATABASE_URL")
-            .expect("set COLO_TEST_DATABASE_URL to a disposable database");
+        let url = std::env::var("OMS_TEST_DATABASE_URL")
+            .expect("set OMS_TEST_DATABASE_URL to a disposable database");
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .after_connect(|conn, _| {
@@ -507,7 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn directional_exposure_reads_one_snapshot() {
         let pool = isolated_pool().await;
         let fixture = seed_fixture(&pool).await;
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn concurrent_submits_share_capacity() {
         let pool = isolated_pool().await;
         let fixture = seed_fixture(&pool).await;

@@ -35,36 +35,10 @@ pub struct StrategyRow {
     pub max_position_notional: Option<f64>,
     pub price_band_pct: Option<f64>,
     pub last_logon_error: Option<String>,
-    pub mode: String,
-    pub follow_environment: Option<String>,
-    pub has_follow_credentials: bool,
-    pub dead_man_secs: i32,
     pub max_orders_per_sec: Option<i32>,
-    pub kill_when_unmonitored: bool,
-    pub limits_version: i64,
     /// Whether its FIX session is logged on right now.
     #[sqlx(default)]
     pub session_live: bool,
-    /// Co-located strategies: the control link and the followed account.
-    #[sqlx(default)]
-    pub link_connected: bool,
-    #[sqlx(default)]
-    pub last_heard_secs: Option<i64>,
-    #[sqlx(default)]
-    pub acked_limits_version: i64,
-    #[sqlx(default)]
-    pub open_orders: i64,
-    #[sqlx(default)]
-    pub placed_per_min: i64,
-    #[sqlx(default)]
-    pub cancelled_per_min: i64,
-    #[sqlx(default)]
-    pub alarm: Option<String>,
-    #[sqlx(default)]
-    pub fighting: bool,
-    /// Killed, and the strategy has not acknowledged it within 5 s.
-    #[sqlx(default)]
-    pub kill_ack_late: bool,
     /// The responsible user, shown on the strategy.
     #[sqlx(skip)]
     pub responsible: Option<Responsible>,
@@ -97,9 +71,7 @@ const ROW_SELECT: &str = "code, name, portfolio_id, owner_principal_id, principa
     max_order_notional::double precision AS max_order_notional, \
     max_position_quantity::double precision AS max_position_quantity, \
     max_position_notional::double precision AS max_position_notional, \
-    price_band_pct::double precision AS price_band_pct, last_logon_error, mode, follow_environment, \
-    follow_credentials IS NOT NULL AS has_follow_credentials, dead_man_secs, max_orders_per_sec, \
-    kill_when_unmonitored, limits_version";
+    price_band_pct::double precision AS price_band_pct, last_logon_error, max_orders_per_sec";
 
 #[derive(Debug, Default, Deserialize, utoipa::ToSchema)]
 pub struct CreateStrategy {
@@ -121,12 +93,7 @@ pub struct CreateStrategy {
     pub max_position_quantity: Option<f64>,
     pub max_position_notional: Option<f64>,
     pub price_band_pct: Option<f64>,
-    /// `VIA_OMS` (default) or `COLOCATED`.
-    pub mode: Option<String>,
-    pub follow_environment: Option<String>,
-    pub dead_man_secs: Option<i32>,
     pub max_orders_per_sec: Option<i32>,
-    pub kill_when_unmonitored: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
@@ -141,12 +108,7 @@ pub struct UpdateStrategy {
     pub max_position_quantity: Option<f64>,
     pub max_position_notional: Option<f64>,
     pub price_band_pct: Option<f64>,
-    /// `VIA_OMS` (default) or `COLOCATED`.
-    pub mode: Option<String>,
-    pub follow_environment: Option<String>,
-    pub dead_man_secs: Option<i32>,
     pub max_orders_per_sec: Option<i32>,
-    pub kill_when_unmonitored: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, sqlx::FromRow, utoipa::ToSchema)]
@@ -165,69 +127,10 @@ pub(crate) async fn reload(state: &AppState) {
     if let Err(e) = state.strategies().reload(state.pool()).await {
         warn!(error = %e, "strategies: registry reload failed; the snapshot keeps its last state");
     }
-    crate::colo::follow::sync_follows(state).await;
 }
 
 fn bad_request(message: impl Into<String>) -> AdminError {
     AdminError::new(StatusCode::BAD_REQUEST, message)
-}
-
-/// Whether an update changes a limit the strategy enforces (so its version moves).
-fn changes_limits(p: &UpdateStrategy) -> bool {
-    p.max_order_quantity.is_some()
-        || p.max_order_notional.is_some()
-        || p.max_position_quantity.is_some()
-        || p.max_position_notional.is_some()
-        || p.price_band_pct.is_some()
-        || p.max_orders_per_sec.is_some()
-}
-
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct FollowCredentials {
-    /// The OMS's own key on the strategy's venue account (read + cancel).
-    pub api_key: String,
-    /// Its Ed25519 private key (PEM).
-    pub private_key: String,
-}
-
-/// The sealing context of a strategy's follow credential.
-pub(crate) fn follow_aad(code: &str) -> String {
-    format!("strategy:{code}:follow")
-}
-
-/// Store the OMS's follow-only key for a co-located strategy, sealed with the
-/// master key. It is never returned.
-#[utoipa::path(
-    put, path = "/admin/strategies/{code}/follow-credentials", tag = "admin",
-    params(("code" = String, Path, description = "Strategy code")),
-    request_body = FollowCredentials,
-    responses((status = 204, description = "Stored"), (status = 404, description = "Not found"), (status = 503, description = "No master key")),
-    security(("bearer_token" = []))
-)]
-pub async fn put_follow_credentials(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-    Json(p): Json<FollowCredentials>,
-) -> Result<StatusCode, AdminError> {
-    info!(%code, "admin store strategy follow credentials");
-    let key = crate::admin::resolve_master_key()?
-        .ok_or_else(|| AdminError::new(StatusCode::SERVICE_UNAVAILABLE, "no master key is configured; cannot store credentials"))?;
-    let plain = serde_json::to_vec(&serde_json::json!({ "api_key": p.api_key, "private_key": p.private_key }))
-        .map_err(|e| AdminError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let sealed = crate::secrets::seal(&key, &follow_aad(&code), &plain);
-    let done = sqlx::query(
-        "UPDATE strategy SET follow_credentials = $2, follow_since = COALESCE(follow_since, now()), updated_at = now() WHERE code = $1",
-    )
-        .bind(&code)
-        .bind(sealed)
-        .execute(state.pool())
-        .await
-        .map_err(map_db_error)?;
-    if done.rows_affected() == 0 {
-        return Err(AdminError::not_found("strategy"));
-    }
-    reload(&state).await;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// "1.2.3.4, 5.6.7.8" → the addresses, blanks dropped.
@@ -261,32 +164,9 @@ pub(crate) async fn list_rows(state: &AppState, portfolios: Option<&[Uuid]>) -> 
         .fetch_all(state.pool())
         .await
         .map_err(map_db_error)?;
-    // v2 deployments report kill stages to the database, not the hub.
-    let stalled = match crate::colo::deployment::stalled_kills(state.pool()).await {
-        Ok(stalled) => stalled,
-        Err(e) => {
-            tracing::warn!(error = %e, "strategies: could not check deployment kill acknowledgements");
-            Default::default()
-        }
-    };
     fill_responsible(state.pool(), &mut rows).await?;
     for row in &mut rows {
         row.session_live = state.fix_sessions().is_live(&row.code);
-        if row.mode == "COLOCATED" {
-            let hub = state.colo();
-            let link = hub.link_status(&row.code);
-            let flow = hub.flow(&row.code);
-            row.link_connected = link.connected;
-            row.last_heard_secs = link.last_heard_secs.map(|s| s as i64);
-            row.acked_limits_version = link.acked_version;
-            row.open_orders = hub.open_orders(&row.code) as i64;
-            row.placed_per_min = flow.placed as i64;
-            row.cancelled_per_min = flow.cancelled as i64;
-            row.alarm = hub.alarm(&row.code);
-            row.fighting = hub.fighting(&row.code);
-            row.kill_ack_late =
-                (row.state == "HALTED" && hub.kill_ack_late(&row.code)) || stalled.contains(&row.code);
-        }
     }
     Ok(rows)
 }
@@ -413,10 +293,8 @@ pub(crate) async fn create_strategy_inner(
     let mut row = sqlx::query_as::<_, StrategyRow>(&format!(
         "INSERT INTO strategy (code, name, portfolio_id, owner_principal_id, principal_id, sender_comp_id, \
             target_comp_id, allowed_addresses, max_order_quantity, max_order_notional, max_position_quantity, \
-            max_position_notional, price_band_pct, mode, follow_environment, dead_man_secs, max_orders_per_sec, \
-            kill_when_unmonitored) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, COALESCE($14, 'VIA_OMS'), $15, \
-            COALESCE($16, 5), $17, COALESCE($18, false)) RETURNING {ROW_SELECT}"
+            max_position_notional, price_band_pct, max_orders_per_sec) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING {ROW_SELECT}"
     ))
     .bind(&p.code)
     .bind(&p.name)
@@ -431,11 +309,7 @@ pub(crate) async fn create_strategy_inner(
     .bind(p.max_position_quantity)
     .bind(p.max_position_notional)
     .bind(p.price_band_pct)
-    .bind(p.mode)
-    .bind(p.follow_environment)
-    .bind(p.dead_man_secs)
     .bind(p.max_orders_per_sec)
-    .bind(p.kill_when_unmonitored)
     .fetch_one(&mut *tx)
     .await
     .map_err(map_db_error)?;
@@ -518,7 +392,6 @@ pub async fn update_strategy(
     Json(p): Json<UpdateStrategy>,
 ) -> Result<Json<StrategyRow>, AdminError> {
     info!(%code, "admin update strategy");
-    let bump = changes_limits(&p);
     let row = sqlx::query_as::<_, StrategyRow>(&format!(
         "UPDATE strategy SET \
             name = COALESCE($2, name), \
@@ -530,12 +403,7 @@ pub async fn update_strategy(
             max_position_quantity = COALESCE($8, max_position_quantity), \
             max_position_notional = COALESCE($9, max_position_notional), \
             price_band_pct = COALESCE($10, price_band_pct), \
-            mode = COALESCE($11, mode), \
-            follow_environment = COALESCE($12, follow_environment), \
-            dead_man_secs = COALESCE($13, dead_man_secs), \
-            max_orders_per_sec = COALESCE($14, max_orders_per_sec), \
-            kill_when_unmonitored = COALESCE($15, kill_when_unmonitored), \
-            limits_version = limits_version + CASE WHEN $16 THEN 1 ELSE 0 END, \
+            max_orders_per_sec = COALESCE($11, max_orders_per_sec), \
             updated_at = now() \
          WHERE code = $1 AND mode <> 'REPORTED' RETURNING {ROW_SELECT}"
     ))
@@ -549,12 +417,7 @@ pub async fn update_strategy(
     .bind(p.max_position_quantity)
     .bind(p.max_position_notional)
     .bind(p.price_band_pct)
-    .bind(p.mode)
-    .bind(p.follow_environment)
-    .bind(p.dead_man_secs)
     .bind(p.max_orders_per_sec)
-    .bind(p.kill_when_unmonitored)
-    .bind(bump)
     .fetch_optional(state.pool())
     .await
     .map_err(map_db_error)?
@@ -563,16 +426,6 @@ pub async fn update_strategy(
     let mut row = row;
     fill_responsible(state.pool(), std::slice::from_mut(&mut row)).await?;
     reload(&state).await;
-    if row.mode == "COLOCATED" {
-        if bump {
-            if let Some(s) = state.strategies().by_code(&code) {
-                state.colo().push(&code, colo_link::proto::ToStrategy::Limits { limits: s.risk_limits(), limits_version: s.limits_version.max(0) as u64 });
-            }
-        }
-        if let Err(e) = crate::colo::deployment::publish_policy(&state, &code).await {
-            warn!(%code, error = %e, "strategies: could not publish the v2 policy snapshot");
-        }
-    }
     Ok(Json(row))
 }
 
@@ -682,9 +535,6 @@ pub async fn put_connections(
     }
     tx.commit().await.map_err(map_db_error)?;
     reload(&state).await;
-    if let Err(e) = crate::colo::deployment::publish_policy(&state, &code).await {
-        warn!(%code, error = %e, "strategies: could not publish the v2 policy snapshot");
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -753,37 +603,6 @@ pub async fn kill_strategy(State(state): State<AppState>, Path(code): Path<Strin
 pub async fn enable_strategy(State(state): State<AppState>, Path(code): Path<String>) -> Result<StatusCode, AdminError> {
     info!(%code, "admin enable strategy");
     super::control::enable(&state, &code).await.map(|_| StatusCode::NO_CONTENT).map_err(control_error)
-}
-
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct RebaselineIssued {
-    /// The command the runtime acknowledges: RECEIVED, then CONFIRMED_CLEAR
-    /// once it has taken the venue's balances as its expected inventory.
-    pub command_id: String,
-}
-
-/// Approve a co-located strategy's current venue balances as its expected
-/// inventory, after a withdrawal, deposit or manual trade. Clears an
-/// inventory shortfall that stopped its orders.
-#[utoipa::path(
-    post, path = "/admin/strategies/{code}/rebaseline", tag = "admin",
-    params(("code" = String, Path, description = "Strategy code")),
-    responses(
-        (status = 202, description = "Sent to the runtime", body = RebaselineIssued),
-        (status = 400, description = "Not co-located, or no active deployment"),
-        (status = 404, description = "Not found"),
-    ),
-    security(("bearer_token" = []))
-)]
-pub async fn rebaseline_strategy(
-    State(state): State<AppState>,
-    Path(code): Path<String>,
-) -> Result<(StatusCode, Json<RebaselineIssued>), AdminError> {
-    info!(%code, "admin rebaseline strategy inventory");
-    super::control::rebaseline(&state, &code)
-        .await
-        .map(|command_id| (StatusCode::ACCEPTED, Json(RebaselineIssued { command_id })))
-        .map_err(control_error)
 }
 
 /// Kill, leave the strategy reducing only, and close every position with a
@@ -863,16 +682,6 @@ mod tests {
 
     fn entry(broker: &str) -> ConnectionEntry {
         ConnectionEntry { broker_code: broker.into(), account_id: Uuid::nil() }
-    }
-
-    #[test]
-    fn a_limit_change_bumps_the_limits_version() {
-        let none: UpdateStrategy = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
-        let limit: UpdateStrategy = serde_json::from_str(r#"{"max_order_notional":5}"#).unwrap();
-        let rate: UpdateStrategy = serde_json::from_str(r#"{"max_orders_per_sec":10}"#).unwrap();
-        assert!(!changes_limits(&none));
-        assert!(changes_limits(&limit));
-        assert!(changes_limits(&rate));
     }
 
     #[test]

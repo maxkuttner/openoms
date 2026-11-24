@@ -1297,7 +1297,7 @@ mod tests {
 
         #[tokio::test]
         #[ignore = "needs a live Postgres; run with --ignored"]
-        async fn rebuild_includes_colo_transfers() {
+        async fn rebuild_includes_transfers() {
             let pool = test_pool().await;
             let b = book(&pool).await;
             let fund = Uuid::new_v4();

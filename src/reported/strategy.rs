@@ -444,7 +444,7 @@ mod tests {
         }
     }
 
-    /// The FIX/REST/colo registry and the admin strategy list skip REPORTED
+    /// The FIX/REST registry and the admin strategy list skip REPORTED
     /// rows (no principal or comp ids); the admin delete refuses them.
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]

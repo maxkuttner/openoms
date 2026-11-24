@@ -706,7 +706,7 @@ mod tests {
             if qty * limit > free.get(&quote).copied().unwrap_or(0.0) * 0.8 {
                 continue;
             }
-            let client_id = format!("colo-smoke-{}", &Uuid::new_v4().simple().to_string()[..20]);
+            let client_id = format!("smoke-{}", &Uuid::new_v4().simple().to_string()[..20]);
             let request = BrokerOrderRequest {
                 order_id: client_id.clone(),
                 symbol: symbol.clone(),

@@ -2185,337 +2185,6 @@
         ]
       }
     },
-    "/admin/strategies/{code}/deployments": {
-      "get": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "list",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Deployments",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/Deployment"
-                  }
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      },
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "register",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DeploymentRegistration"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Registered",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Deployment"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid deployment"
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          },
-          "409": {
-            "description": "Account already registered"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/strategies/{code}/deployments/{id}": {
-      "get": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "get",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Deployment id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Deployment",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Deployment"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/strategies/{code}/deployments/{id}/adjustments": {
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "adjustment",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Deployment id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AdjustmentRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Adjusted"
-          },
-          "400": {
-            "description": "Deployment not stopped or invalid"
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/strategies/{code}/deployments/{id}/retire": {
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "operationId": "retire",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Deployment id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RetireRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Retired",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Deployment"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Shutdown not verified"
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/strategies/{code}/deployments/{id}/verified-stop": {
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "summary": "Record that the deployment's runtime is verifiably stopped, so a",
-        "description": "replacement runtime may take over at the next epoch. The deployment stays\nactive; pass the new epoch to the replacement.",
-        "operationId": "verified_stop",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "id",
-            "in": "path",
-            "description": "Deployment id",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RetireRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Stop recorded",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Deployment"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Shutdown not verified"
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
     "/admin/strategies/{code}/enable": {
       "post": {
         "tags": [
@@ -2590,56 +2259,6 @@
           },
           "404": {
             "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/strategies/{code}/follow-credentials": {
-      "put": {
-        "tags": [
-          "admin"
-        ],
-        "summary": "Store the OMS's follow-only key for a co-located strategy, sealed with the",
-        "description": "master key. It is never returned.",
-        "operationId": "put_follow_credentials",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/FollowCredentials"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Stored"
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          },
-          "404": {
-            "description": "Not found"
-          },
-          "503": {
-            "description": "No master key"
           }
         },
         "security": [
@@ -2776,53 +2395,6 @@
                 }
               }
             }
-          },
-          "403": {
-            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
-          },
-          "404": {
-            "description": "Not found"
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/admin/strategies/{code}/rebaseline": {
-      "post": {
-        "tags": [
-          "admin"
-        ],
-        "summary": "Approve a co-located strategy's current venue balances as its expected",
-        "description": "inventory, after a withdrawal, deposit or manual trade. Clears an\ninventory shortfall that stopped its orders.",
-        "operationId": "rebaseline_strategy",
-        "parameters": [
-          {
-            "name": "code",
-            "in": "path",
-            "description": "Strategy code",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "description": "Sent to the runtime",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RebaselineIssued"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Not co-located, or no active deployment"
           },
           "403": {
             "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
@@ -4293,26 +3865,6 @@
           }
         }
       },
-      "AdjustmentRequest": {
-        "type": "object",
-        "required": [
-          "asset",
-          "amount",
-          "reason"
-        ],
-        "properties": {
-          "amount": {
-            "type": "number",
-            "format": "double"
-          },
-          "asset": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          }
-        }
-      },
       "Allocation": {
         "type": "object",
         "required": [
@@ -4407,22 +3959,6 @@
           "secret": {
             "type": "string",
             "nullable": true
-          }
-        }
-      },
-      "AssetHolding": {
-        "type": "object",
-        "required": [
-          "asset",
-          "quantity"
-        ],
-        "properties": {
-          "asset": {
-            "type": "string"
-          },
-          "quantity": {
-            "type": "number",
-            "format": "double"
           }
         }
       },
@@ -5008,19 +4544,6 @@
           "code": {
             "type": "string"
           },
-          "dead_man_secs": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "follow_environment": {
-            "type": "string",
-            "nullable": true
-          },
-          "kill_when_unmonitored": {
-            "type": "boolean",
-            "nullable": true
-          },
           "max_order_notional": {
             "type": "number",
             "format": "double",
@@ -5044,11 +4567,6 @@
           "max_position_quantity": {
             "type": "number",
             "format": "double",
-            "nullable": true
-          },
-          "mode": {
-            "type": "string",
-            "description": "`VIA_OMS` (default) or `COLOCATED`.",
             "nullable": true
           },
           "name": {
@@ -5111,238 +4629,6 @@
         "description": "A submitted credential form: field name to raw string value, exactly as\nan HTML form or a JSON object would hand it over. Untyped on purpose —\ngiving each broker its own typed request struct would just move the\n\"which fields did they actually send\" question from here into the\nhandler, where the merge rule would have to be reimplemented per broker.\n\n`#[serde(flatten)]` so the wire body is the field map itself\n(`{\"host\": \"...\", \"port\": \"4101\"}`), not `{\"fields\": {...}}` — the shape\nthe cockpit form naturally produces.",
         "additionalProperties": {
           "type": "string"
-        }
-      },
-      "Deployment": {
-        "type": "object",
-        "required": [
-          "id",
-          "strategy_code",
-          "account_id",
-          "venue",
-          "environment",
-          "external_account_ref",
-          "epoch",
-          "status",
-          "authority_secs",
-          "market_data_max_age_secs",
-          "heartbeat_secs",
-          "allocation_quote_asset",
-          "allocation_max_notional",
-          "allocation_fee_allowance_bps",
-          "policy_revision",
-          "created_at",
-          "updated_at"
-        ],
-        "properties": {
-          "account_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "acked_policy_revision": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Newest policy revision the runtime reports as installed.",
-            "nullable": true
-          },
-          "allocation_fee_allowance_bps": {
-            "type": "number",
-            "format": "double"
-          },
-          "allocation_max_notional": {
-            "type": "number",
-            "format": "double"
-          },
-          "allocation_max_position_qty": {
-            "type": "number",
-            "format": "double",
-            "nullable": true
-          },
-          "allocation_quote_asset": {
-            "type": "string"
-          },
-          "authority_secs": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "created_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "environment": {
-            "type": "string"
-          },
-          "epoch": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "external_account_ref": {
-            "type": "string"
-          },
-          "heartbeat_secs": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "inventory_reported_at": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "inventory_shortfall": {
-            "type": "string",
-            "description": "Venue balances the runtime found short of its expected inventory, one\nasset per line; trading is stopped until a rebaseline. NULL when clean.",
-            "nullable": true
-          },
-          "kill_ack_stage": {
-            "type": "string",
-            "description": "How far the runtime has acknowledged the active kill:\nRECEIVED, ADMISSION_STOPPED, CANCELS_SENT or CONFIRMED_CLEAR.",
-            "nullable": true
-          },
-          "kill_command_id": {
-            "type": "string",
-            "nullable": true
-          },
-          "kill_epoch": {
-            "type": "integer",
-            "format": "int64",
-            "nullable": true
-          },
-          "market_data_max_age_secs": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "policy_revision": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "recovery_missing": {
-            "type": "string",
-            "nullable": true
-          },
-          "recovery_ready": {
-            "type": "boolean",
-            "description": "The runtime's last recovery report: ready to trade, and what was\nmissing if not (one item per line).",
-            "nullable": true
-          },
-          "recovery_reported_at": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "retired_at": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "shutdown_evidence": {
-            "type": "string",
-            "nullable": true
-          },
-          "status": {
-            "type": "string"
-          },
-          "strategy_code": {
-            "type": "string"
-          },
-          "updated_at": {
-            "type": "string",
-            "format": "date-time"
-          },
-          "venue": {
-            "type": "string"
-          },
-          "verified_stop_at": {
-            "type": "string",
-            "format": "date-time",
-            "nullable": true
-          },
-          "verified_stop_epoch": {
-            "type": "integer",
-            "format": "int64",
-            "nullable": true
-          }
-        }
-      },
-      "DeploymentRegistration": {
-        "type": "object",
-        "required": [
-          "account_id",
-          "venue",
-          "environment",
-          "external_account_ref",
-          "authority_secs",
-          "market_data_max_age_secs",
-          "allocation_quote_asset",
-          "allocation_max_notional",
-          "allocation_fee_allowance_bps",
-          "instruments",
-          "assets"
-        ],
-        "properties": {
-          "account_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "allocation_fee_allowance_bps": {
-            "type": "number",
-            "format": "double",
-            "description": "Fee headroom held back on every buy, in basis points of its notional\n(0 to 1000). Required: e.g. 10 for a 0.1% taker fee."
-          },
-          "allocation_max_notional": {
-            "type": "number",
-            "format": "double"
-          },
-          "allocation_max_position_qty": {
-            "type": "number",
-            "format": "double",
-            "nullable": true
-          },
-          "allocation_quote_asset": {
-            "type": "string"
-          },
-          "assets": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AssetHolding"
-            },
-            "description": "Explicit per-asset opening holdings; never inferred from instrument pairs."
-          },
-          "authority_secs": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "environment": {
-            "type": "string"
-          },
-          "external_account_ref": {
-            "type": "string"
-          },
-          "heartbeat_secs": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "instruments": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/InstrumentBaseline"
-            },
-            "description": "Explicit allowed universe, each with its opening position/cost baseline."
-          },
-          "market_data_max_age_secs": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "strategy_code": {
-            "type": "string"
-          },
-          "venue": {
-            "type": "string"
-          }
         }
       },
       "ExpirySweepResult": {
@@ -5448,23 +4734,6 @@
           }
         }
       },
-      "FollowCredentials": {
-        "type": "object",
-        "required": [
-          "api_key",
-          "private_key"
-        ],
-        "properties": {
-          "api_key": {
-            "type": "string",
-            "description": "The OMS's own key on the strategy's venue account (read + cancel)."
-          },
-          "private_key": {
-            "type": "string",
-            "description": "Its Ed25519 private key (PEM)."
-          }
-        }
-      },
       "GrantedPortfolio": {
         "type": "object",
         "description": "One portfolio the caller is entitled to, with the entitlement itself.\n\nThe flags are returned rather than filtered on, so a client can grey out what it\ncannot do instead of discovering it from a 403 mid-order.",
@@ -5548,28 +4817,6 @@
           "csv": {
             "type": "string",
             "description": "CSV text with a header: `symbol`, `exchange`, `currency`, `conid` (any order)."
-          }
-        }
-      },
-      "InstrumentBaseline": {
-        "type": "object",
-        "required": [
-          "instrument_id",
-          "quantity",
-          "cost_basis"
-        ],
-        "properties": {
-          "cost_basis": {
-            "type": "number",
-            "format": "double"
-          },
-          "instrument_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "quantity": {
-            "type": "number",
-            "format": "double"
           }
         }
       },
@@ -6246,18 +5493,6 @@
           }
         }
       },
-      "RebaselineIssued": {
-        "type": "object",
-        "required": [
-          "command_id"
-        ],
-        "properties": {
-          "command_id": {
-            "type": "string",
-            "description": "The command the runtime acknowledges: RECEIVED, then CONFIRMED_CLEAR\nonce it has taken the venue's balances as its expected inventory."
-          }
-        }
-      },
       "RecoveryCodes": {
         "type": "object",
         "required": [
@@ -6529,21 +5764,6 @@
           }
         }
       },
-      "RetireRequest": {
-        "type": "object",
-        "required": [
-          "shutdown_evidence",
-          "verified_shutdown"
-        ],
-        "properties": {
-          "shutdown_evidence": {
-            "type": "string"
-          },
-          "verified_shutdown": {
-            "type": "boolean"
-          }
-        }
-      },
       "RiskLimit": {
         "type": "object",
         "required": [
@@ -6719,81 +5939,23 @@
           "allowed_addresses",
           "state",
           "rest_enabled",
-          "mode",
-          "has_follow_credentials",
-          "dead_man_secs",
-          "kill_when_unmonitored",
-          "limits_version",
           "session_live",
-          "link_connected",
-          "acked_limits_version",
-          "open_orders",
-          "placed_per_min",
-          "cancelled_per_min",
-          "fighting",
-          "kill_ack_late",
           "needs_responsible"
         ],
         "properties": {
-          "acked_limits_version": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "alarm": {
-            "type": "string",
-            "nullable": true
-          },
           "allowed_addresses": {
             "type": "string",
             "description": "Comma-separated IP addresses; empty means any."
           },
-          "cancelled_per_min": {
-            "type": "integer",
-            "format": "int64"
-          },
           "code": {
             "type": "string"
-          },
-          "dead_man_secs": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "fighting": {
-            "type": "boolean"
-          },
-          "follow_environment": {
-            "type": "string",
-            "nullable": true
           },
           "has_fix_password": {
             "type": "boolean"
           },
-          "has_follow_credentials": {
-            "type": "boolean"
-          },
-          "kill_ack_late": {
-            "type": "boolean",
-            "description": "Killed, and the strategy has not acknowledged it within 5 s."
-          },
-          "kill_when_unmonitored": {
-            "type": "boolean"
-          },
-          "last_heard_secs": {
-            "type": "integer",
-            "format": "int64",
-            "nullable": true
-          },
           "last_logon_error": {
             "type": "string",
             "nullable": true
-          },
-          "limits_version": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "link_connected": {
-            "type": "boolean",
-            "description": "Co-located strategies: the control link and the followed account."
           },
           "max_order_notional": {
             "type": "number",
@@ -6820,9 +5982,6 @@
             "format": "double",
             "nullable": true
           },
-          "mode": {
-            "type": "string"
-          },
           "name": {
             "type": "string"
           },
@@ -6830,17 +5989,9 @@
             "type": "boolean",
             "description": "The responsible user is not ACTIVE: the strategy cannot be (re)started\nuntil it is handed over."
           },
-          "open_orders": {
-            "type": "integer",
-            "format": "int64"
-          },
           "owner_principal_id": {
             "type": "string",
             "format": "uuid"
-          },
-          "placed_per_min": {
-            "type": "integer",
-            "format": "int64"
           },
           "portfolio_id": {
             "type": "string",
@@ -7317,19 +6468,6 @@
             "description": "Comma-separated IP addresses; empty means any.",
             "nullable": true
           },
-          "dead_man_secs": {
-            "type": "integer",
-            "format": "int32",
-            "nullable": true
-          },
-          "follow_environment": {
-            "type": "string",
-            "nullable": true
-          },
-          "kill_when_unmonitored": {
-            "type": "boolean",
-            "nullable": true
-          },
           "max_order_notional": {
             "type": "number",
             "format": "double",
@@ -7353,11 +6491,6 @@
           "max_position_quantity": {
             "type": "number",
             "format": "double",
-            "nullable": true
-          },
-          "mode": {
-            "type": "string",
-            "description": "`VIA_OMS` (default) or `COLOCATED`.",
             "nullable": true
           },
           "name": {

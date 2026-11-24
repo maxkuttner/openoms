@@ -1,31 +1,19 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
-import { CopyText, FormRow } from "../../components/common";
-import { MultiSelect, Select, TextField } from "../../components/form";
+import { CopyText } from "../../components/common";
+import { MultiSelect, Select } from "../../components/form";
 import { Modal } from "../../components/overlay";
 import { Pill } from "../../components/status";
 import { CrudResource } from "../../components/CrudResource";
-import { DeploymentPanel } from "../../components/DeploymentPanel";
 import { api } from "../../api/client";
 import { notifyError, notifyOk, useList } from "../../api/hooks";
 import { useQueryClient } from "@tanstack/react-query";
-import { connectionEntries, isColocated, killLabel, reportSummary, savedAccounts, type ControlReport } from "../../strategies";
+import { connectionEntries, killLabel, reportSummary, savedAccounts, type ControlReport } from "../../strategies";
 
 const PATH = "/admin/strategies";
 
 type Strategy = {
   code: string;
-  mode: string;
-  has_follow_credentials: boolean;
-  link_connected: boolean;
-  limits_version: number;
-  acked_limits_version: number;
-  open_orders: number;
-  placed_per_min: number;
-  alarm: string | null;
-  fighting: boolean;
-  kill_ack_late: boolean;
   name: string;
   portfolio_id: string;
   state: string;
@@ -59,33 +47,6 @@ function HandoverForm({ strategy, users, onClose }: { strategy: Strategy; users:
     <Modal open onClose={onClose} title={`Hand over — ${strategy.code}`} footer={<Button onClick={save} disabled={!to}>Hand over</Button>}>
       <p>Responsible now: {strategy.responsible ? userLabel(strategy.responsible) : "nobody"}</p>
       <Select label="New responsible user" data={activeUserOptions(users)} value={to} onChange={setTo} />
-    </Modal>
-  );
-}
-
-const MODES = [
-  { value: "VIA_OMS", label: "Through the OMS" },
-  { value: "COLOCATED", label: "Co-located" },
-];
-const ENVIRONMENTS = [
-  { value: "PAPER", label: "PAPER" },
-  { value: "LIVE", label: "LIVE" },
-];
-
-function FollowKeyForm({ code, onClose }: { code: string; onClose: () => void }) {
-  const [apiKey, setApiKey] = useState("");
-  const [privateKey, setPrivateKey] = useState("");
-  const save = () =>
-    api
-      .put(`${PATH}/${code}/follow-credentials`, { api_key: apiKey, private_key: privateKey })
-      .then(() => { notifyOk("Follow key stored"); onClose(); })
-      .catch(notifyError);
-  return (
-    <Modal open onClose={onClose} title={`Follow key — ${code}`} footer={<Button onClick={save} disabled={!apiKey || !privateKey}>Save</Button>}>
-      <TextField label="API key" type="password" value={apiKey} onChange={setApiKey} />
-      <FormRow label="Private key (PEM)">
-        <Textarea className="num min-h-24 text-xs" value={privateKey} onChange={(e) => setPrivateKey(e.currentTarget.value)} />
-      </FormRow>
     </Modal>
   );
 }
@@ -133,8 +94,6 @@ export function StrategiesPage() {
   const [password, setPassword] = useState<{ code: string; value: string } | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; body: string; run: () => void } | null>(null);
   const [editing, setEditing] = useState<Strategy | null>(null);
-  const [followKey, setFollowKey] = useState<string | null>(null);
-  const [runtime, setRuntime] = useState<string | null>(null);
   const [handover, setHandover] = useState<Strategy | null>(null);
   const users = useList<User>("/admin/users").data ?? [];
 
@@ -205,14 +164,6 @@ export function StrategiesPage() {
             >
               Flatten
             </Button>
-            {isColocated(row) && (
-              <Button size="xs" variant="outline" onClick={() => setRuntime(row.code)}>Runtime</Button>
-            )}
-            {isColocated(row) && (
-              <Button size="xs" variant="outline" onClick={() => setFollowKey(row.code)}>
-                {row.has_follow_credentials ? "Replace follow key" : "Follow key"}
-              </Button>
-            )}
             <Button size="xs" variant="outline" onClick={() => resetPassword(row.code)}>Reset password</Button>
             <Button size="xs" variant="outline" onClick={() => setEditing(row)}>Connections</Button>
             <Button size="xs" variant="outline" onClick={() => setHandover(row)}>Hand over</Button>
@@ -221,7 +172,6 @@ export function StrategiesPage() {
         columns={[
           { key: "code", label: "Code" },
           { key: "name", label: "Name" },
-          { key: "mode", label: "Mode", render: (r: Strategy) => (isColocated(r) ? "co-located" : "through OMS") },
           { key: "state", label: "State" },
           {
             key: "responsible",
@@ -234,32 +184,6 @@ export function StrategiesPage() {
             ),
           },
           { key: "rest_enabled", label: "REST", render: (r: Strategy) => (r.rest_enabled ? "on" : "off") },
-          {
-            key: "link_connected",
-            label: "Control link",
-            render: (r: Strategy) =>
-              isColocated(r) ? (
-                <span className="flex items-center gap-1">
-                  <Pill tone={r.link_connected ? "buy" : "muted"}>{r.link_connected ? "connected" : "down"}</Pill>
-                  <span className="num text-xs">limits {r.acked_limits_version}/{r.limits_version}</span>
-                </span>
-              ) : null,
-          },
-          {
-            key: "open_orders",
-            label: "Orders",
-            render: (r: Strategy) => (isColocated(r) ? `${r.open_orders} open · ${r.placed_per_min}/min` : null),
-          },
-          {
-            key: "alarm",
-            label: "Alarm",
-            render: (r: Strategy) => (
-              <span className="flex items-center gap-1">
-                {r.fighting ? <Pill tone="sell">killed, still fighting</Pill> : r.alarm ? <Pill tone="sell">{r.alarm}</Pill> : null}
-                {r.kill_ack_late ? <Pill tone="warn">kill not acknowledged</Pill> : null}
-              </span>
-            ),
-          },
           {
             key: "session_live",
             label: "FIX session",
@@ -282,19 +206,13 @@ export function StrategiesPage() {
           { name: "max_position_quantity", label: "Max position quantity", type: "number" },
           { name: "max_position_notional", label: "Max position notional", type: "number" },
           { name: "price_band_pct", label: "Price band %", type: "number" },
-          { name: "mode", label: "Mode", type: "select", options: MODES, default: "VIA_OMS" },
-          { name: "follow_environment", label: "Followed account environment", type: "select", options: ENVIRONMENTS },
-          { name: "dead_man_secs", label: "Dead man's switch (s)", type: "number", default: "5" },
           { name: "max_orders_per_sec", label: "Max orders per second", type: "number" },
-          { name: "kill_when_unmonitored", label: "Kill when unmonitored", type: "checkbox" },
         ]}
       />
 
       {confirm && <Confirm title={confirm.title} body={confirm.body} onConfirm={confirm.run} onClose={() => setConfirm(null)} />}
       {editing && <ConnectionsEditor strategy={editing} onClose={() => setEditing(null)} />}
-      {followKey && <FollowKeyForm code={followKey} onClose={() => setFollowKey(null)} />}
       {handover && <HandoverForm strategy={handover} users={users} onClose={() => setHandover(null)} />}
-      {runtime && <DeploymentPanel code={runtime} onClose={() => setRuntime(null)} />}
       {password && (
         <Modal open onClose={() => setPassword(null)} title={`FIX password — ${password.code}`}>
           <CopyText value={password.value} />

@@ -140,7 +140,7 @@ async fn migration_seeds_venue_fill_from_existing_fills() {
 
 #[tokio::test]
 #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
-async fn legacy_colo_per_trade_rows_survive_and_are_seeded() {
+async fn legacy_per_trade_rows_survive_and_are_seeded() {
     let pool = fresh_db().await;
     migrate::ensure_tracking(&pool).await.unwrap();
     migrate::apply_matching(&pool, |schema, file| schema != "oms" || file < RECON_MIGRATION)

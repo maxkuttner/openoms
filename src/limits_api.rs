@@ -7,7 +7,7 @@ use axum::Json;
 use uuid::Uuid;
 
 use crate::admin::{
-    republish_colo_policy, validate_trading_state, RiskLimit, UpdateRiskLimit, RISK_LIMIT_SELECT,
+    validate_trading_state, RiskLimit, UpdateRiskLimit, RISK_LIMIT_SELECT,
 };
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
@@ -99,7 +99,6 @@ pub async fn put_limit(
         .await
         .map_err(|e| internal(ctx, e))?;
     tx.commit().await.map_err(|e| internal(ctx, e))?;
-    republish_colo_policy(&state, portfolio_id).await;
     Ok(Json(after))
 }
 

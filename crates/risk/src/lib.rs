@@ -1,5 +1,4 @@
-//! Pure pre-trade risk rules shared by the OMS and the embedded co-located
-//! runtime. No I/O, no clock, no storage: callers own rate windows,
+//! Pure pre-trade risk rules used by the OMS. No I/O, no clock, no storage: callers own rate windows,
 //! reservations, and persistence.
 
 mod evaluate;

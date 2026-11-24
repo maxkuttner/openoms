@@ -80,7 +80,6 @@ mod daily_stats;
 
 mod market_data;
 mod order_entry;
-mod colo;
 mod strategies;
 mod mark_router;
 mod daily_stats_poller;
@@ -177,20 +176,12 @@ mod first_run_tests;
         strategies::admin::put_connections,
         strategies::admin::get_connections,
         strategies::admin::reset_password,
-        strategies::admin::put_follow_credentials,
         strategies::admin::restart_acceptor,
         strategies::admin::strategy_securities,
         strategies::admin::kill_strategy,
         strategies::admin::enable_strategy,
         strategies::admin::handover,
-        strategies::admin::rebaseline_strategy,
         strategies::admin::flatten_strategy,
-        colo::deployment::register,
-        colo::deployment::list,
-        colo::deployment::get,
-        colo::deployment::retire,
-        colo::deployment::verified_stop,
-        colo::ingest::adjustment,
         auth_api::login,
         auth_api::callback,
         auth_api::logout,
@@ -244,11 +235,8 @@ mod first_run_tests;
         local_auth_api::RecoveryCodes,
         local_auth_api::ChangePasswordBody,
         strategies::admin::StrategyRow, strategies::admin::Responsible, strategies::admin::Handover, strategies::admin::CreateStrategy, strategies::admin::UpdateStrategy,
-        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::FollowCredentials, strategies::admin::AcceptorRestarted, strategies::admin::RebaselineIssued,
+        strategies::admin::ConnectionEntry, strategies::admin::NewPassword, strategies::admin::AcceptorRestarted,
         strategies::admin::TradeableInstrument, strategies::control::ControlReport,
-        colo::deployment::Deployment, colo::deployment::DeploymentRegistration,
-        colo::deployment::InstrumentBaseline, colo::deployment::AssetHolding,
-        colo::deployment::RetireRequest, colo::ingest::AdjustmentRequest,
     )),
     modifiers(&SecurityAddon, &MfaAddon),
     tags(
@@ -1114,30 +1102,11 @@ fn build_app(
             axum::routing::put(strategies::admin::put_connections).get(strategies::admin::get_connections),
         )
         .route("/admin/strategies/:code/password", post(strategies::admin::reset_password))
-        .route("/admin/strategies/:code/follow-credentials", axum::routing::put(strategies::admin::put_follow_credentials))
         .route("/admin/fix-acceptor/restart", post(strategies::admin::restart_acceptor))
         .route("/admin/strategies/:code/kill", post(strategies::admin::kill_strategy))
         .route("/admin/strategies/:code/enable", post(strategies::admin::enable_strategy))
         .route("/admin/strategies/:code/handover", post(strategies::admin::handover))
-        .route("/admin/strategies/:code/rebaseline", post(strategies::admin::rebaseline_strategy))
         .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
-        .route(
-            "/admin/strategies/:code/deployments",
-            post(colo::deployment::register).get(colo::deployment::list),
-        )
-        .route("/admin/strategies/:code/deployments/:id", get(colo::deployment::get))
-        .route(
-            "/admin/strategies/:code/deployments/:id/retire",
-            post(colo::deployment::retire),
-        )
-        .route(
-            "/admin/strategies/:code/deployments/:id/verified-stop",
-            post(colo::deployment::verified_stop),
-        )
-        .route(
-            "/admin/strategies/:code/deployments/:id/adjustments",
-            post(colo::ingest::adjustment),
-        )
         .route("/admin/instruments", get(admin::list_instruments))
         .merge(instruments_import::routes())
         .route("/admin/feeds", get(admin::list_feeds))
@@ -1434,7 +1403,7 @@ async fn serve() {
     let event_bus = event_bus::EventBus::new();
 
     // Rebuild an empty position projection from the event log before anything
-    // that can book a fill starts: the order engine, colo ingest, the FIX
+    // that can book a fill starts: the order engine, the FIX
     // acceptor, exec streams and reconcilers all start below. Migration 0067
     // empties it so every row carries its trade-time key. No-op on a fresh install.
     match positions::rebuild_if_empty(&pool).await {
@@ -1573,22 +1542,6 @@ async fn serve() {
     state.swap_registries(registry, daily_stats);
     if let Err(e) = state.strategies().reload(state.pool()).await {
         error!(error = %e, "strategies: could not load the registry; no strategy can log on or trade");
-    }
-    // Co-located strategies: consume what their follow streams report, then
-    // start following their accounts.
-    {
-        let (hub, s) = (state.colo().clone(), state.clone());
-        tokio::spawn(async move { hub.run(s).await });
-    }
-    tokio::spawn(colo::control::positions_loop(state.clone()));
-    tokio::spawn(colo::control::sweep_loop(state.clone()));
-    tokio::spawn(colo::ingest::drain_loop(state.clone()));
-    colo::follow::sync_follows(&state).await;
-    match file_cfg.and_then(|f| f.control_link()) {
-        Some(settings) => {
-            tokio::spawn(colo::link_server::serve(state.clone(), settings));
-        }
-        None => info!("control link: not configured"),
     }
 
     // Before the acceptor opens: a strategy that reconnects at once must not
@@ -2092,7 +2045,7 @@ mod tests {
                 }
             }
         }
-        assert!(gated > 40, "{gated}");
+        assert!(gated > 30, "{gated}");
         assert!(missing.is_empty(), "no 403 mfa_required on: {missing:?}");
     }
 

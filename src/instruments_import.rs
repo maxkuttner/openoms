@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn a_vanished_con_id_becomes_untradeable_not_deleted() {
         let _serial = REFRESH_TESTS.lock().await;
         let pool = isolated_pool().await;
@@ -627,7 +627,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn a_con_id_ibkr_refuses_is_skipped_and_the_rest_refreshed() {
         let _serial = REFRESH_TESTS.lock().await;
         let pool = isolated_pool().await;
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn a_changed_min_tick_is_updated() {
         let _serial = REFRESH_TESTS.lock().await;
         let pool = isolated_pool().await;
@@ -674,7 +674,7 @@ mod tests {
 
     /// A disposable, already-migrated database (never the dev one).
     async fn isolated_pool() -> PgPool {
-        let url = std::env::var("COLO_TEST_DATABASE_URL").expect("set COLO_TEST_DATABASE_URL to a disposable database");
+        let url = std::env::var("OMS_TEST_DATABASE_URL").expect("set OMS_TEST_DATABASE_URL to a disposable database");
         sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .after_connect(|conn, _| {
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "needs COLO_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn saving_twice_is_idempotent() {
         let pool = isolated_pool().await;
         // A conId no real run would use, so reruns and the shared CI database agree.

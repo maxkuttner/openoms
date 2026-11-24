@@ -1,14 +1,12 @@
 //! Guards on the line between the OMS and the gateway crate.
 
 /// The gateway runs beside the core with no database and no Kafka, and so do
-/// the crates a co-located strategy links in.
+/// the risk crate.
 #[test]
 fn gateway_depends_on_no_database_or_kafka() {
     for (krate, manifest) in [
         ("gateway", include_str!("../crates/gateway/Cargo.toml")),
         ("risk", include_str!("../crates/risk/Cargo.toml")),
-        ("colo-runtime", include_str!("../crates/colo-runtime/Cargo.toml")),
-        ("colo-link", include_str!("../crates/colo-link/Cargo.toml")),
     ] {
         for dep in ["sqlx", "rdkafka", "axum"] {
             assert!(!manifest.contains(dep), "crates/{krate} depends on {dep}");

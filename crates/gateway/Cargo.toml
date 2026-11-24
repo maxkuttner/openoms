@@ -36,7 +36,7 @@ quickfix = { version = "0.2", features = ["build-with-ssl"], optional = true }
 
 [features]
 # FIX sessions (IBKR, Binance FIX, the strategy acceptor). Off, the gateway
-# builds without the C++ engine and OpenSSL: what a co-located program needs.
+# builds without the C++ engine and OpenSSL.
 default = ["fix"]
 fix = ["dep:quickfix"]
 

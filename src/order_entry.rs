@@ -33,7 +33,7 @@ pub enum Origin {
     Fix { cl_ord_id: String },
     Flatten,
     /// Any order the OMS did not place: adopted from a venue's report (a
-    /// manual or third-party order, or a co-located strategy's fill).
+    /// manual or third-party order).
     External,
 }
 

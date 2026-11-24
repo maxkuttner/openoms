@@ -1,4 +1,4 @@
-//! The richer venue contract a co-located runtime needs: instrument rules,
+//! The richer venue contract: instrument rules,
 //! balances, complete order/execution recovery and a push stream.
 //!
 //! The existing [`BrokerAdapter`] stays the path-① order transport. This trait

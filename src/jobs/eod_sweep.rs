@@ -64,8 +64,7 @@ fn next_run(now: DateTime<Utc>) -> DateTime<Utc> {
     if today > now { today } else { today + Duration::days(1) }
 }
 
-/// Sweep one connection now: its own reconciler and its co-located follows',
-/// as one report. `None` when it has no live reconciler.
+/// Sweep one connection now, as one report. `None` when it has no live reconciler.
 pub async fn run_connection(pool: &PgPool, connection: &str, lookback: Lookback) -> Option<SweepReport> {
     let handles = crate::reconciler::live_all(connection);
     let mut report: Option<SweepReport> = None;

@@ -15,7 +15,7 @@ use crate::order_entry::{self, Origin};
 
 use super::guard::{self, MarkLookup};
 use super::session::{auth, session_key};
-use super::{Mode, Strategy};
+use super::Strategy;
 
 /// What a control action did, for the cockpit.
 #[derive(Debug, Default, Serialize, utoipa::ToSchema)]
@@ -94,53 +94,9 @@ async fn set_state(state: &AppState, code: &str, trading_state: &str, rest_enabl
     state.strategies().by_code(code).ok_or(ApiError { status: axum::http::StatusCode::NOT_FOUND, message: "strategy not found".into() })
 }
 
-/// Whether phase 7's automatic cancels (on session end, at boot) apply: not to
-/// co-located strategies, whose own dead man's switch does that job.
-pub fn phase7_cancels_apply(mode: Mode) -> bool {
-    mode == Mode::ViaOms
-}
-
-/// Flatten is for strategies trading through the OMS only.
-pub fn flatten_allowed(mode: Mode) -> Result<(), ApiError> {
-    match mode {
-        Mode::ViaOms => Ok(()),
-        Mode::Colocated => Err(ApiError { status: axum::http::StatusCode::BAD_REQUEST, message: "co-located strategies have no Flatten".into() }),
-    }
-}
-
-fn deployment_error(e: crate::colo::deployment::DeploymentError) -> ApiError {
-    let status = if matches!(e, crate::colo::deployment::DeploymentError::Database(_)) {
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    } else {
-        axum::http::StatusCode::BAD_REQUEST
-    };
-    ApiError { status, message: e.to_string() }
-}
-
-/// Halt, stop REST, cancel every open order, log the session out. A
-/// co-located strategy is cancelled at its venue and told over its link. The
-/// durable kill command is written before the link is told, so an ACK cannot
-/// outlive the latch.
+/// Halt, stop REST, cancel every open order, log the session out.
 pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiError> {
-    let mode = state.strategies().by_code(code).map(|s| s.mode);
-    if mode == Some(Mode::Colocated) {
-        if let Some(receipt) = crate::colo::deployment::record_kill_for_strategy(state.pool(), code)
-            .await
-            .map_err(deployment_error)?
-        {
-            state.colo().push_v2_control(
-                receipt.deployment_id,
-                colo_link::v2::ToRuntime::Kill {
-                    kill: colo_link::v2::Kill { command_id: receipt.command_id },
-                },
-            );
-        }
-    }
-    crate::colo::control::announce_kill(state.colo(), mode, code);
     let strategy = set_state(state, code, "HALTED", false).await?;
-    if strategy.mode == Mode::Colocated {
-        return Ok(crate::colo::control::kill(state, &strategy).await);
-    }
     let report = cancel_open(state, &strategy, false, "strategy killed").await;
     state.fix_sessions().logout(&session_key(&strategy), "killed");
     Ok(report)
@@ -149,65 +105,13 @@ pub async fn kill(state: &AppState, code: &str) -> Result<ControlReport, ApiErro
 pub async fn enable(state: &AppState, code: &str) -> Result<(), ApiError> {
     super::admin::require_responsible(state.pool(), code).await?;
     let strategy = set_state(state, code, "ACTIVE", true).await?;
-    if strategy.mode == Mode::Colocated {
-        if let Some(receipt) = crate::colo::deployment::record_enable_for_strategy(state.pool(), code)
-            .await
-            .map_err(deployment_error)?
-        {
-            state.colo().push_v2_control(
-                receipt.deployment_id,
-                colo_link::v2::ToRuntime::Enable {
-                    enable: colo_link::v2::Enable {
-                        stopped_epoch: receipt.stopped_epoch.unwrap_or(0),
-                        command_id: receipt.command_id,
-                    },
-                },
-            );
-        }
-        crate::colo::control::enable(state, &strategy).await;
-        return Ok(());
-    }
     state.fix_sessions().enable(&session_key(&strategy));
     Ok(())
-}
-
-/// Approve the venue's current balances as a co-located strategy's expected
-/// inventory, after a withdrawal, deposit or manual trade. Lifts an inventory
-/// suspension once the runtime confirms.
-pub async fn rebaseline(state: &AppState, code: &str) -> Result<String, ApiError> {
-    let mode = state.strategies().by_code(code).map(|s| s.mode);
-    let not_found = || ApiError { status: axum::http::StatusCode::NOT_FOUND, message: format!("strategy {code} not found") };
-    match mode {
-        None => return Err(not_found()),
-        Some(Mode::ViaOms) => {
-            return Err(ApiError {
-                status: axum::http::StatusCode::BAD_REQUEST,
-                message: "only co-located strategies keep an inventory to rebaseline".into(),
-            })
-        }
-        Some(Mode::Colocated) => {}
-    }
-    let receipt = crate::colo::deployment::record_rebaseline_for_strategy(state.pool(), code)
-        .await
-        .map_err(deployment_error)?
-        .ok_or_else(|| ApiError {
-            status: axum::http::StatusCode::BAD_REQUEST,
-            message: format!("strategy {code} has no active deployment"),
-        })?;
-    state.colo().push_v2_control(
-        receipt.deployment_id,
-        colo_link::v2::ToRuntime::Rebaseline {
-            rebaseline: colo_link::v2::Rebaseline { command_id: receipt.command_id.clone() },
-        },
-    );
-    Ok(receipt.command_id)
 }
 
 /// Kill, but leave the strategy reducing only, then close every position
 /// with a limit order inside the price band.
 pub async fn flatten(state: &AppState, code: &str) -> Result<ControlReport, ApiError> {
-    let mode = state.strategies().by_code(code).map_or(Mode::ViaOms, |s| s.mode);
-    flatten_allowed(mode)?;
     let strategy = set_state(state, code, "REDUCING", false).await?;
     let mut report = cancel_open(state, &strategy, false, "strategy flattened").await;
     state.fix_sessions().logout(&session_key(&strategy), "flattened");
@@ -287,9 +191,6 @@ pub async fn flatten(state: &AppState, code: &str) -> Result<ControlReport, ApiE
 /// A strategy's FIX session ended: cancel its working orders (Flatten's stay)
 /// and stop pricing what only it wanted.
 pub async fn on_session_end(state: &AppState, strategy: &Strategy) -> ControlReport {
-    if !phase7_cancels_apply(strategy.mode) {
-        return ControlReport::default();
-    }
     let report = cancel_open(state, strategy, true, "FIX session ended").await;
     state.market_data().handle().unsubscribe_owner(&guard::md_owner(&strategy.code));
     report
@@ -298,7 +199,7 @@ pub async fn on_session_end(state: &AppState, strategy: &Strategy) -> ControlRep
 /// At boot no strategy has a session, so none may have working orders
 /// (Flatten's excepted).
 pub async fn boot_recovery(state: &AppState) {
-    for strategy in state.strategies().all().iter().filter(|s| phase7_cancels_apply(s.mode)) {
+    for strategy in state.strategies().all().iter() {
         let report = cancel_open(state, strategy, true, "OMS restarted").await;
         if !report.cancel_failures.is_empty() {
             warn!(strategy = %strategy.code, failures = ?report.cancel_failures, "strategy: some open orders were not cancelled at boot");
@@ -318,19 +219,6 @@ mod tests {
         let recovery = main.find("strategies::control::boot_recovery(&state)").expect("boot recovery is called");
         let acceptor = main.find("state.fix_sessions().start(").expect("the acceptor is started");
         assert!(recovery < acceptor);
-    }
-
-    #[test]
-    fn colo_strategies_get_no_phase7_cancels() {
-        assert!(phase7_cancels_apply(crate::strategies::Mode::ViaOms));
-        assert!(!phase7_cancels_apply(crate::strategies::Mode::Colocated));
-    }
-
-    #[test]
-    fn flatten_refuses_a_colocated_strategy() {
-        let e = flatten_allowed(crate::strategies::Mode::Colocated).unwrap_err();
-        assert_eq!(e.message, "co-located strategies have no Flatten");
-        assert!(flatten_allowed(crate::strategies::Mode::ViaOms).is_ok());
     }
 
     #[test]

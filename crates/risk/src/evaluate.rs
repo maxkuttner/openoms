@@ -80,8 +80,8 @@ pub fn evaluate(input: &RiskInput) -> Result<(), Reject> {
 
 /// Refuses an order when a configured limit needs a price that is missing.
 /// `evaluate` skips such a limit instead (the OMS lets a market order without
-/// a mark through its notional check); callers that must not trade unchecked,
-/// like the co-located runtime, call this first.
+/// a mark through its notional check); callers that must not trade unchecked
+/// call this first.
 pub fn require_prices(input: &RiskInput) -> Result<(), Reject> {
     let limits = &input.limits;
     let order = &input.order;

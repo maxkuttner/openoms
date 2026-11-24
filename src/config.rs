@@ -74,12 +74,11 @@ pub struct FileConfig {
     pub auth: AuthSection,
     #[serde(default)]
     pub fix_acceptor: FixAcceptorSection,
-    #[serde(default)]
-    pub control_link: FixAcceptorSection,
+    /// Removed with co-located strategies. Still accepted (and dropped) so an
+    /// oms.toml written before then keeps loading.
+    #[serde(default, skip_serializing)]
+    control_link: Option<toml::Value>,
 }
-
-/// Where co-located strategies' control links connect (TLS only).
-pub type ControlLinkSettings = FixAcceptorSettings;
 
 /// Where strategies log on over FIX (TLS only). All three set, or no acceptor.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -481,17 +480,6 @@ fn public_base_url_from(env: Option<&str>, file: Option<String>) -> Option<Strin
 }
 
 impl FileConfig {
-    /// The co-located strategies' control-link listener, or `None` when it is
-    /// not configured. Same shape as the FIX acceptor's section.
-    pub fn control_link(&self) -> Option<ControlLinkSettings> {
-        let s = &self.control_link;
-        Some(ControlLinkSettings {
-            port: s.port?,
-            certificate: s.certificate.clone()?,
-            private_key: s.private_key.clone()?,
-        })
-    }
-
     /// The FIX acceptor's settings, or `None` when it is not configured.
     /// Incomplete counts as absent, like `oidc()`.
     pub fn fix_acceptor(&self) -> Option<FixAcceptorSettings> {

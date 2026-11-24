@@ -1991,22 +1991,6 @@ pub(crate) fn validate_trading_state(s: &str) -> Result<(), AdminError> {
     }
 }
 
-pub(crate) async fn republish_colo_policy(state: &AppState, portfolio_id: Uuid) {
-    let code: Option<String> = sqlx::query_scalar(
-        "SELECT code FROM strategy WHERE portfolio_id = $1 AND mode = 'COLOCATED'",
-    )
-    .bind(portfolio_id)
-    .fetch_optional(state.pool())
-    .await
-    .ok()
-    .flatten();
-    if let Some(code) = code {
-        if let Err(e) = crate::colo::deployment::publish_policy(state, &code).await {
-            tracing::warn!(%code, error = %e, "risk limits: could not publish the v2 policy snapshot");
-        }
-    }
-}
-
 #[utoipa::path(
     post, path = "/admin/risk-limits", tag = "admin",
     request_body = CreateRiskLimit,
@@ -2031,7 +2015,6 @@ pub async fn create_risk_limit(
          VALUES ($1, $2, $3, $4, $5, $6, $7) \
          RETURNING {RISK_LIMIT_SELECT}"
     );
-    let portfolio_id = payload.portfolio_id;
     let record = sqlx::query_as::<_, RiskLimit>(&sql)
         .bind(payload.portfolio_id)
         .bind(payload.instrument_id)
@@ -2043,7 +2026,6 @@ pub async fn create_risk_limit(
         .fetch_one(state.pool())
         .await
         .map_err(map_db_error)?;
-    republish_colo_policy(&state, portfolio_id).await;
     Ok(Json(record))
 }
 
@@ -2135,7 +2117,6 @@ pub async fn update_risk_limit(
         .await
         .map_err(map_db_error)?
         .ok_or_else(|| AdminError::not_found("risk_limit"))?;
-    republish_colo_policy(&state, record.portfolio_id).await;
     Ok(Json(record))
 }
 
@@ -2153,12 +2134,6 @@ pub async fn delete_risk_limit(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AdminError> {
     info!(risk_limit_id = %id, "admin delete risk limit");
-    let portfolio_id: Option<Uuid> =
-        sqlx::query_scalar("SELECT portfolio_id FROM risk_limits WHERE id = $1")
-            .bind(id)
-            .fetch_optional(state.pool())
-            .await
-            .map_err(map_db_error)?;
     let result = sqlx::query("DELETE FROM risk_limits WHERE id = $1")
         .bind(id)
         .execute(state.pool())
@@ -2166,9 +2141,6 @@ pub async fn delete_risk_limit(
         .map_err(map_db_error)?;
     if result.rows_affected() == 0 {
         return Err(AdminError::not_found("risk_limit"));
-    }
-    if let Some(portfolio_id) = portfolio_id {
-        republish_colo_policy(&state, portfolio_id).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }

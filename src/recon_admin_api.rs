@@ -1,11 +1,5 @@
 //! Admin API for external-order reconciliation: a connection's recon settings,
 //! its attribution rules, an on-demand sweep, and the breaks a person resolves.
-//!
-//! Attribution rules and colo: registering a co-located deployment replaces the
-//! account's prefix-less rules (`colo::deployment`), so an account-only rule
-//! made here for a colo account is overwritten at the next registration.
-//! Deleting such a rule is allowed; the account then falls back to the
-//! connection's default portfolio until the next registration.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -1011,6 +1005,8 @@ mod tests {
         let pm = principal(&w, Some("pm")).await;
         sqlx::query("INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_trade, can_view) VALUES ($1, $2, $3, true, true)")
             .bind(Uuid::new_v4()).bind(pm.principal_id).bind(w.portfolio).execute(&w.pool).await.unwrap();
+        // cancel_any is not a default grant: an admin grants it.
+        crate::access_grants::grant_via_group(&w.pool, pm.principal_id, &[crate::access_grants::GrantKey::CancelAny]).await;
 
         let outcome = crate::order_entry::cancel(&st, &pm, order_id, None).await.unwrap();
         assert!(matches!(outcome, crate::order_entry::CancelOutcome::Requested));
