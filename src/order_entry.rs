@@ -636,6 +636,17 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         })?;
     }
 
+    // A connector refuses the instrument classes it cannot trade (the FIX
+    // IBKR connector has no futures path). An unknown connector is not blocked.
+    if let Some(c) = gateway::connectors::by_code(&broker_code) {
+        if !c.manifest().instrument_classes.contains(&instrument_class.as_str()) {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("{broker_code} cannot trade {instrument_class} instruments"),
+            });
+        }
+    }
+
     // Options route to Alpaca as single-leg contract orders, which only accept
     // a `day` time-in-force. Reject anything else up front with a clear message.
     if instrument_class == "OPTION" && !matches!(cmd.time_in_force, TimeInForce::Day) {
@@ -1397,6 +1408,38 @@ pub(crate) mod tests {
         let r = submit(&state, &me, g_request(pf, spot), Origin::Api).await;
         assert!(r.as_ref().map_or_else(|e| !e.message.starts_with("not granted"), |_| true), "{r:?}");
         assert_eq!(g_order_conn(&pool, pf).await, vec![a]);
+    }
+
+    /// Venue grants for IBKR-family connections, which carry an account ref.
+    async fn grant_ibkr(pool: &sqlx::PgPool, pf: Uuid, conns: &[&str]) {
+        let grants = conns.iter().map(|c| crate::grants::Grant::Venue { connection: c.to_string(), account_ref: Some("U1".into()) }).collect();
+        let mut tx = pool.begin().await.unwrap();
+        crate::grants::store::set_for_portfolio(&mut tx, &crate::groups_api::tests::admin(), pf, grants).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn fix_ibkr_refuses_a_future() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let state = test_support::state(pool.clone());
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        let me = g_trader(&pool, pf).await;
+        let fut = g_instrument(&pool, "GF").await;
+        sqlx::query("UPDATE instrument SET instrument_class = 'FUTURE' WHERE id = $1").bind(fut).execute(&pool).await.unwrap();
+        let fix = g_connection(&pool, "IBKR").await;
+        g_list(&pool, fut, "IBKR").await;
+        grant_ibkr(&pool, pf, &[&fix]).await;
+        g_defaults(&pool, &[crate::access_grants::GrantKey::Orders]).await;
+        let e = submit(&state, &me, g_request(pf, fut), Origin::Api).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "IBKR cannot trade FUTURE instruments"));
+        assert!(g_order_conn(&pool, pf).await.is_empty());
+        // the same instrument on IBKR_TWS passes the gate
+        let tws = g_connection(&pool, "IBKR_TWS").await;
+        g_list(&pool, fut, "IBKR_TWS").await;
+        grant_ibkr(&pool, pf, &[&fix, &tws]).await;
+        let r = submit(&state, &me, g_request(pf, fut), Origin::Api).await;
+        assert!(r.as_ref().map_or_else(|e| !e.message.contains("cannot trade"), |_| true), "{r:?}");
     }
 
     #[tokio::test]

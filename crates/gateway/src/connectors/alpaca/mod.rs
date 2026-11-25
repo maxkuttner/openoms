@@ -38,6 +38,7 @@ static MANIFEST: Manifest = Manifest {
     price_band_exempt: false,
     per_currency_notional: false,
     multi_account: false,
+    instrument_classes: &["SPOT","OPTION"],
 };
 
 impl Connector for Alpaca {

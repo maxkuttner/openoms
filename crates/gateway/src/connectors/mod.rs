@@ -81,6 +81,9 @@ pub struct Manifest {
     /// One credential reaches several venue accounts (IBKR), so every venue
     /// event names the account it belongs to.
     pub multi_account: bool,
+    /// The `instrument.instrument_class` values this connector can trade;
+    /// order entry refuses any other.
+    pub instrument_classes: &'static [&'static str],
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential

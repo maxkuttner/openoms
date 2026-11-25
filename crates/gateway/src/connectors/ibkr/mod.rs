@@ -37,6 +37,7 @@ static MANIFEST: Manifest = Manifest {
     price_band_exempt: false,
     per_currency_notional: false,
     multi_account: true,
+    instrument_classes: &["SPOT"],
 };
 
 impl Connector for Ibkr {

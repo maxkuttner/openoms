@@ -88,6 +88,7 @@ static MANIFEST: Manifest = Manifest {
     price_band_exempt: true,
     per_currency_notional: true,
     multi_account: true,
+    instrument_classes: &["SPOT","FUTURE","OPTION"],
 };
 
 impl Connector for IbkrTws {
