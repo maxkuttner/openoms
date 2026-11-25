@@ -4858,7 +4858,8 @@
         "required": [
           "code",
           "name",
-          "venue"
+          "venue",
+          "roll_warn_days"
         ],
         "properties": {
           "code": {
@@ -4882,6 +4883,11 @@
               }
             ],
             "nullable": true
+          },
+          "roll_warn_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Days before a contract's roll date from which the cockpit flags a held position."
           },
           "venue": {
             "type": "string"

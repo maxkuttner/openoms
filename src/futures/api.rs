@@ -12,6 +12,8 @@ pub struct FutureRootView {
     pub code: String,
     pub name: String,
     pub venue: String,
+    /// Days before a contract's roll date from which the cockpit flags a held position.
+    pub roll_warn_days: i32,
     pub front: Option<FutureContract>,
     pub next: Option<FutureContract>,
 }
@@ -30,16 +32,16 @@ pub async fn list_roots(State(state): State<AppState>) -> Result<Json<Vec<Future
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: format!("failed to list futures roots: {e:?}"),
     };
-    let roots: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT code, name, venue FROM future_root WHERE status = 'ACTIVE' ORDER BY code")
+    let roots: Vec<(String, String, String, i32)> =
+        sqlx::query_as("SELECT code, name, venue, roll_warn_days FROM future_root WHERE status = 'ACTIVE' ORDER BY code")
             .fetch_all(state.pool())
             .await
             .map_err(fail)?;
     let today = venue_today(chrono::Utc::now());
     let mut out = Vec::with_capacity(roots.len());
-    for (code, name, venue) in roots {
+    for (code, name, venue, roll_warn_days) in roots {
         let (front, next) = front_and_next(state.pool(), &code, today).await.map_err(fail)?;
-        out.push(FutureRootView { code, name, venue, front, next });
+        out.push(FutureRootView { code, name, venue, roll_warn_days, front, next });
     }
     Ok(Json(out))
 }

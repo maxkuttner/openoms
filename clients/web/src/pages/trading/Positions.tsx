@@ -11,6 +11,11 @@ import type { Me } from "../../access";
 import type { MarkRow } from "../../components/trading/types";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { positionLabel } from "../../tradeTimes";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { useAlerts, useFutureRoots } from "../../api/hooks";
+import { daysUntil, rollOffer, venueToday } from "../../futures";
+import { RollDialog, type RollTarget } from "../../components/trading/RollDialog";
 import { totalsByCurrency } from "../../positions";
 import type { PositionRow } from "../../positions";
 
@@ -38,6 +43,15 @@ export function PositionsPage({ me, portfolioId: controlled }: { me: Me; portfol
 
   const rows = positions.data ?? [];
 
+  // Futures: a held contract near its roll date gets a badge and a Roll action.
+  const roots = useFutureRoots();
+  const alerts = useAlerts(live);
+  const [rollTarget, setRollTarget] = useState<RollTarget | null>(null);
+  const today = venueToday();
+  const offerFor = (p: PositionRow) =>
+    rollOffer(p, roots.data ?? [], (alerts.data ?? []).filter((a) => a.portfolio_id === p.portfolio_id), today);
+  const portfolioCode = me.portfolios.find((x) => x.portfolio_id === portfolioId)?.code ?? "";
+
   const heldInstrumentIds = rows.map((p) => p.instrument_id);
   const marks = useQuery<MarkRow[]>({
     queryKey: ["/marks", heldInstrumentIds],
@@ -61,7 +75,7 @@ export function PositionsPage({ me, portfolioId: controlled }: { me: Me; portfol
   const tone = (v: number) => (v < 0 ? "neg" : v > 0 ? "pos" : undefined);
   const COLS: [string, boolean][] = [
     ["Instrument", false], ["Net qty", true], ["Avg cost", true], ["Mark", true], ["Market value", true],
-    ["Unrealized P&L", true], ["Realized P&L", true], ["Other fees", true], ["Mark time", false],
+    ["Unrealized P&L", true], ["Realized P&L", true], ["Other fees", true], ["Mark time", false], ["", false],
   ];
 
   return (
@@ -132,6 +146,16 @@ export function PositionsPage({ me, portfolioId: controlled }: { me: Me; portfol
                         <span>{l.text}</span>
                       );
                     })()}
+                    {(() => {
+                      const o = offerFor(p);
+                      if (!o?.due) return null;
+                      const d = daysUntil(today, o.rollDate);
+                      return (
+                        <Badge variant="outline" className="ml-2 border-warn/50 text-warn">
+                          {d > 0 ? `Roll in ${d}d` : d === 0 ? "Roll today" : "Roll overdue"}
+                        </Badge>
+                      );
+                    })()}
                   </TableCell>
                   <TableCell className={numeric}>{p.net_qty}</TableCell>
                   <TableCell className={numeric}>{p.avg_cost}</TableCell>
@@ -141,17 +165,31 @@ export function PositionsPage({ me, portfolioId: controlled }: { me: Me; portfol
                   <TableCell className={numeric}>{p.realized_pnl}</TableCell>
                   <TableCell className={numeric}>{formatFees(p.other_fees)}</TableCell>
                   <TableCell className="num">{p.mark_ts ? new Date(p.mark_ts).toLocaleString() : "—"}</TableCell>
+                  <TableCell className="text-right">
+                    {(() => {
+                      const o = offerFor(p);
+                      if (!o) return null;
+                      return (
+                        <Button size="xs" variant={o.due ? "default" : "secondary"} onClick={() => setRollTarget({
+                          portfolioId: p.portfolio_id, portfolioCode, netQty: p.net_qty,
+                          nearInstrumentId: o.nearInstrumentId, nearSymbol: o.nearSymbol,
+                          farInstrumentId: o.farInstrumentId, farSymbol: o.farSymbol,
+                        })}>Roll</Button>
+                      );
+                    })()}
+                  </TableCell>
                 </TableRow>
               ))}
               {rows.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={9} className="py-4 text-center text-muted-foreground">No positions.</TableCell>
+                  <TableCell colSpan={10} className="py-4 text-center text-muted-foreground">No positions.</TableCell>
                 </TableRow>
               )}
             </TableBody>
           </Table>
         </div>
       )}
+      <RollDialog target={rollTarget} onClose={() => setRollTarget(null)} />
     </div>
   );
 }

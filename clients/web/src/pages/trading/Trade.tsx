@@ -8,6 +8,7 @@ import { TradeBlotter } from "../../components/trading/TradeBlotter";
 import { OrderTicket } from "../../components/trading/OrderTicket";
 import { StrategyTicket } from "../../components/trading/StrategyTicket";
 import { InstrumentSearchModal } from "../../components/trading/InstrumentSearchModal";
+import { AlertBanner } from "../../components/trading/AlertBanner";
 import { InstrumentHeader } from "../../components/trading/InstrumentHeader";
 import { OrderBook } from "../../components/market/OrderBook";
 import { PriceChart } from "../../components/market/PriceChart";
@@ -73,6 +74,7 @@ export function TradePage({ me }: { me: Me }) {
         onPickLegs={(legs) => setPendingLegs(legs)}
       />
       <div className="flex flex-col gap-3">
+        <AlertBanner me={me} />
         <InstrumentHeader
           source={sampleMarketData}
           instrument={selectedInstrument}

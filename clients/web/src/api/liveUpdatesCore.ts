@@ -8,6 +8,7 @@
 export type UiNotice =
   | { type: "orders" }
   | { type: "positions" }
+  | { type: "alerts" }
   | { type: "resync" }
   | { type: "heartbeat" }
   | { type: "marks"; instrument_ids: number[] };
@@ -22,6 +23,7 @@ export const WATCHDOG_MS = 40_000;
 //   ["/portfolios", id, "positions"]  positions
 //   ["/marks", ids[]]                 watchlist and positions marks (ids as strings)
 const isOrders = (key: readonly unknown[]) => key[0] === "/orders";
+const isAlerts = (key: readonly unknown[]) => key[0] === "/alerts";
 const isPositions = (key: readonly unknown[]) => key[0] === "/portfolios" && key[2] === "positions";
 
 export function staleFor(n: UiNotice): (queryKey: readonly unknown[]) => boolean {
@@ -30,6 +32,8 @@ export function staleFor(n: UiNotice): (queryKey: readonly unknown[]) => boolean
       return isOrders;
     case "positions":
       return isPositions;
+    case "alerts":
+      return isAlerts;
     case "resync":
       return () => true;
     case "heartbeat":

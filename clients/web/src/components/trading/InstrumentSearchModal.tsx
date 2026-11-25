@@ -9,6 +9,8 @@ import { useDebounced } from "@/lib/useDebounced";
 import { Notice, Spinner } from "../common";
 import { Pill } from "../status";
 import { api, ApiError } from "../../api/client";
+import { useFutureRoots } from "../../api/hooks";
+import { searchRootEntries } from "../../futures";
 import type { SearchInstrument, ChainRow, StrategyLeg } from "./types";
 
 type Step = "search" | "underlying" | "chain";
@@ -87,6 +89,10 @@ export function InstrumentSearchModal({
     queryFn: () => api.get<SearchInstrument[]>(`/instruments?search=${encodeURIComponent(debounced)}&limit=50`),
     enabled: step === "search" && debounced.length > 0,
   });
+
+  // Futures roots first: "es" offers "ES → ESZ6 (Dec 2026)", which trades the front contract.
+  const roots = useFutureRoots();
+  const rootEntries = step === "search" ? searchRootEntries(debounced, roots.data ?? []) : [];
 
   const expiries = useQuery<string[]>({
     queryKey: ["/instruments/options/expiries", underlying?.symbol],
@@ -310,13 +316,23 @@ export function InstrumentSearchModal({
             {results.isLoading && <Spinner />}
             {results.error && <Notice>{notifyableMessage(results.error)}</Notice>}
             {debounced.length === 0 && <p className="text-muted-foreground">Type a symbol or name to search.</p>}
-            {debounced.length > 0 && !results.isLoading && (results.data ?? []).length === 0 && (
+            {debounced.length > 0 && !results.isLoading && (results.data ?? []).length === 0 && rootEntries.length === 0 && (
               <p className="text-muted-foreground">No instruments match "{debounced}".</p>
             )}
             {/* One list, in the server's ranked order (see search_instruments
                 in src/instruments_api.rs) — never regrouped here, or the exact
                 match can be pushed below a section header. */}
             <ul className="flex flex-col gap-1">
+              {rootEntries.map((r) => (
+                <li key={`root-${r.root}`} className="flex items-center justify-between rounded-md border hover:bg-accent">
+                  <button type="button"
+                    onClick={() => { onPickSingle({ id: String(r.instrument_id), symbol: r.symbol, venue: r.venue, name: r.name }); resetAndClose(); }}
+                    className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left">
+                    <span className="font-semibold">{r.label}</span>
+                    <span className="truncate text-muted-foreground">{r.name} · {r.venue}</span>
+                  </button>
+                </li>
+              ))}
               {(results.data ?? []).map((r) => (
                 <li key={r.id} className="flex items-center justify-between rounded-md border hover:bg-accent">
                   <button type="button" onClick={() => pickInstrument(r)} className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left">

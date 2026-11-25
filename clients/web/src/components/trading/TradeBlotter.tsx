@@ -251,6 +251,7 @@ export function TradeBlotter({
                         ) : (
                           <span>{o.instrument_symbol ?? o.instrument_id}</span>
                         )}
+                        {o.parent_order_id && <Pill className="num" tone="info">roll leg</Pill>}
                         {o.client_order_id.startsWith("combo-") && <Pill className="num">{o.client_order_id}</Pill>}
                       </div>
                     </TableCell>

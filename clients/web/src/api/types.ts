@@ -182,6 +182,8 @@ export interface BlotterRow {
   /** True when the venue sent no execution time and trade_time is the booking time. */
   trade_time_estimated: boolean;
   updated_at: string;
+  /** Set on a leg of a futures roll: the roll's parent (spread) order. */
+  parent_order_id?: string | null;
 }
 
 /** One entry in an order's audit trail (GET /admin/orders/:id/events). */
@@ -211,4 +213,48 @@ export interface InstrumentSummary {
   venue: string;
   asset_class: string;
   status: string;
+}
+
+/** One listed futures contract of a root (GET /futures/roots). */
+export interface FutureContract {
+  instrument_id: number;
+  symbol: string;
+  expiry_date: string;
+  roll_date: string;
+  contract_size: number;
+}
+
+/** GET /futures/roots. `front`/`next` are null when the root lists no such contract. */
+export interface FutureRoot {
+  code: string;
+  name: string;
+  venue: string;
+  roll_warn_days: number;
+  front: FutureContract | null;
+  next: FutureContract | null;
+}
+
+/** GET /alerts; `payload` is kind-specific (ROLL_DUE: see RollDuePayload). */
+export interface AlertRow {
+  id: string;
+  kind: string;
+  portfolio_id: string;
+  instrument_id: number | null;
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+/** POST /orders/roll */
+export interface RollRequest {
+  portfolio_id: string;
+  from_instrument_id: number;
+  to_instrument_id: number;
+  qty: number;
+  order_type: "market" | "limit";
+  limit_price?: number;
+  time_in_force: "day";
+}
+export interface RollIds {
+  parent_order_id: string;
+  child_order_ids: string[];
 }
