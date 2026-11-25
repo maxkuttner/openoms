@@ -20,6 +20,7 @@ const TABLE: &[(&str, &str)] = &[
     ("SEHK", "XHKG"),
     ("ASX", "XASX"),
     ("TSEJ", "XTKS"),
+    ("CME", "XCME"),
 ];
 
 pub fn to_mic(ibkr: &str) -> Option<&'static str> {

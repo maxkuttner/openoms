@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use futures_util::StreamExt;
-use ibapi::contracts::{Contract, Currency, Exchange, Symbol};
+use ibapi::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
 use ibapi::market_data::historical::{BarSize, BarTimestamp, WhatToShow};
 use ibapi::market_data::realtime::{Quote, TickTypes};
 use ibapi::market_data::MarketDataType;
@@ -64,6 +64,46 @@ pub enum Tif {
     Gtc,
 }
 
+/// The IBKR security types the OMS trades. `Bag` is a multi-leg combo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SecType {
+    #[default]
+    Stk,
+    Fut,
+    Opt,
+    Bag,
+}
+
+impl SecType {
+    pub fn as_ibkr(self) -> &'static str {
+        match self {
+            SecType::Stk => "STK",
+            SecType::Fut => "FUT",
+            SecType::Opt => "OPT",
+            SecType::Bag => "BAG",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<SecType> {
+        match s {
+            "STK" => Some(SecType::Stk),
+            "FUT" => Some(SecType::Fut),
+            "OPT" => Some(SecType::Opt),
+            "BAG" => Some(SecType::Bag),
+            _ => None,
+        }
+    }
+
+    fn to_ibapi(self) -> SecurityType {
+        match self {
+            SecType::Stk => SecurityType::Stock,
+            SecType::Fut => SecurityType::Future,
+            SecType::Opt => SecurityType::Option,
+            SecType::Bag => SecurityType::Spread,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TwsContract {
     pub con_id: i64,
@@ -75,6 +115,26 @@ pub struct TwsContract {
     pub lot_size: Option<f64>,
     pub name: String,
     pub isin: Option<String>,
+    pub sec_type: SecType,
+    /// IBKR `localSymbol` (`ESZ6`): the OMS symbol of a derivative. `symbol` is the root (`ES`).
+    pub local_symbol: String,
+    /// Contract multiplier; 1.0 for stocks.
+    pub multiplier: f64,
+    /// Last trading day, when the contract has one.
+    pub last_trade: Option<NaiveDate>,
+    /// Last trading instant (day + time in the contract's zone), when known.
+    pub last_trade_at: Option<DateTime<Utc>>,
+    pub strike: Option<f64>,
+    /// `"C"` or `"P"` for options.
+    pub right: Option<String>,
+}
+
+/// One leg of a combo order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwsLeg {
+    pub con_id: i64,
+    pub ratio: i32,
+    pub buy: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +150,9 @@ pub struct TwsOrder {
     pub tif: Tif,
     pub order_ref: String,
     pub account: String,
+    pub sec_type: SecType,
+    /// Empty for single-instrument orders.
+    pub legs: Vec<TwsLeg>,
 }
 
 /// One order as the broker reports it: status, fills, and the order echoed back
@@ -134,13 +197,15 @@ pub struct TwsExecution {
     pub time: DateTime<Utc>,
 }
 
-/// A stock lookup; sec type is always STK, exchange defaults to SMART.
+/// A contract lookup; sec type defaults to STK, exchange to SMART.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ContractQuery {
     pub symbol: Option<String>,
     pub exchange: Option<String>,
     pub currency: Option<String>,
     pub con_id: Option<i64>,
+    pub sec_type: SecType,
+    pub include_expired: bool,
 }
 
 /// One IB Gateway API session. Connected as the master client id 0, the
@@ -389,9 +454,12 @@ fn con_id_i32(con_id: i64) -> Result<i32, TwsError> {
     i32::try_from(con_id).map_err(|_| TwsError::Other(format!("conId {con_id} does not fit the TWS API's 32-bit contract id")))
 }
 
-fn stock_contract(con_id: i64, exchange: &str, primary: &str, currency: &str) -> Result<Contract, TwsError> {
+/// A contract by conId. STK routes via the given exchange (SMART) with a
+/// primary; FUT/OPT carry the exchange itself (CME), never SMART.
+fn ib_contract(con_id: i64, sec_type: SecType, exchange: &str, primary: &str, currency: &str) -> Result<Contract, TwsError> {
     Ok(Contract {
         contract_id: con_id_i32(con_id)?,
+        security_type: sec_type.to_ibapi(),
         exchange: Exchange::new(exchange),
         primary_exchange: Exchange::new(primary),
         currency: Currency::new(currency),
@@ -399,7 +467,19 @@ fn stock_contract(con_id: i64, exchange: &str, primary: &str, currency: &str) ->
     })
 }
 
+/// A contract's last trade day + time in its own zone as a UTC instant.
+/// `date` is `YYYYMMDD` (a bare `YYYYMM` month is `None`); `time` is `HH:MM`
+/// or `HH:MM:SS`. No time -> `None`.
+pub(crate) fn last_trade_instant(date: &str, time: Option<&str>, tz: &str) -> Option<DateTime<Utc>> {
+    let time = time.map(str::trim).filter(|t| !t.is_empty())?;
+    let d = NaiveDate::parse_from_str(date, "%Y%m%d").ok()?;
+    let t = chrono::NaiveTime::parse_from_str(time, "%H:%M:%S").or_else(|_| chrono::NaiveTime::parse_from_str(time, "%H:%M")).ok()?;
+    let zone: chrono_tz::Tz = tz.parse().ok()?;
+    Some(zone.from_local_datetime(&d.and_time(t)).earliest()?.with_timezone(&Utc))
+}
+
 fn to_tws_contract(c: &Contract, min_tick: f64, lot_size: Option<f64>, name: String, isin: Option<String>) -> TwsContract {
+    let sec_type = SecType::parse(c.security_type.as_str()).unwrap_or_default();
     TwsContract {
         con_id: c.contract_id as i64,
         symbol: c.symbol.to_string(),
@@ -410,6 +490,13 @@ fn to_tws_contract(c: &Contract, min_tick: f64, lot_size: Option<f64>, name: Str
         lot_size,
         name,
         isin,
+        sec_type,
+        local_symbol: c.local_symbol.clone(),
+        multiplier: c.multiplier.parse().unwrap_or(1.0),
+        last_trade: NaiveDate::parse_from_str(&c.last_trade_date_or_contract_month, "%Y%m%d").ok(),
+        last_trade_at: None,
+        strike: (c.strike != 0.0).then_some(c.strike),
+        right: c.right.as_ref().map(|r| r.as_str().to_string()),
     }
 }
 
@@ -447,6 +534,8 @@ fn to_tws_order_state(d: &OrderData, completed: bool, status: Option<(f64, f64, 
         tif: if matches!(o.tif, TimeInForce::GoodTillCanceled) { Tif::Gtc } else { Tif::Day },
         order_ref: o.order_ref.clone(),
         account: o.account.clone(),
+        sec_type: SecType::parse(d.contract.security_type.as_str()).unwrap_or_default(),
+        legs: vec![],
     };
     let state = TwsOrderState {
         status: d.order_state.status.as_str().to_string(),
@@ -504,7 +593,10 @@ impl TwsClient for IbapiClient {
         };
         order.order_ref = o.order_ref.clone();
         order.account = o.account.clone();
-        let contract = stock_contract(o.con_id, &o.exchange, &o.primary_exchange, &o.currency)?;
+        if !o.legs.is_empty() {
+            return Err(TwsError::Other("multi-leg orders are not wired yet".into()));
+        }
+        let contract = ib_contract(o.con_id, o.sec_type, &o.exchange, &o.primary_exchange, &o.currency)?;
         self.order_refs.lock().unwrap().insert(o.order_id, o.order_ref.clone());
         self.client.submit_order(o.order_id, &contract, &order).await?;
         Ok(())
@@ -560,6 +652,8 @@ impl TwsClient for IbapiClient {
             exchange: Exchange::new(q.exchange.as_deref().unwrap_or("SMART")),
             currency: Currency::new(q.currency.clone().unwrap_or_default()),
             primary_exchange: Exchange::new(""),
+            security_type: q.sec_type.to_ibapi(),
+            include_expired: q.include_expired,
             ..Contract::default()
         };
         let details = self.client.contract_details(&contract).await?;
@@ -567,7 +661,10 @@ impl TwsClient for IbapiClient {
             .into_iter()
             .map(|d| {
                 let isin = d.sec_id_list.iter().find(|t| t.tag == "ISIN").map(|t| t.value.clone());
-                to_tws_contract(&d.contract, d.min_tick, d.size_increment, d.long_name, isin)
+                let mut c = to_tws_contract(&d.contract, d.min_tick, d.size_increment, d.long_name.clone(), isin);
+                let time = d.last_trade_time.split_whitespace().next();
+                c.last_trade_at = last_trade_instant(&d.contract.last_trade_date_or_contract_month, time, &d.time_zone_id);
+                c
             })
             .collect())
     }
@@ -583,7 +680,7 @@ impl TwsClient for IbapiClient {
 
     async fn prev_close(&self, con_id: i64) -> Result<Option<f64>, TwsError> {
         self.ensure_connected()?;
-        let contract = stock_contract(con_id, "SMART", "", "")?;
+        let contract = ib_contract(con_id, SecType::Stk, "SMART", "", "")?;
         if let Ok(ticks) = self.client.market_data(&contract).snapshot_once(REQUEST_TIMEOUT).await {
             if let Some(close) = Quote::from_ticks(ticks.iter().filter(|t| matches!(t, TickTypes::Price(_)))).close {
                 return Ok(Some(close));
@@ -634,6 +731,8 @@ pub(crate) struct FakeTws {
     pub connected: AtomicBool,
     next_id: AtomicI32,
     pub details: Mutex<HashMap<ContractQuery, Vec<TwsContract>>>,
+    /// Contracts registered with `add_contract`; answer any query they match.
+    pub contracts: Mutex<Vec<TwsContract>>,
     pub symbols: Mutex<HashMap<String, Vec<TwsContract>>>,
     pub prev_closes: Mutex<HashMap<i64, f64>>,
     pub accounts: Mutex<Vec<String>>,
@@ -652,6 +751,7 @@ impl FakeTws {
             connected: AtomicBool::new(true),
             next_id: AtomicI32::new(100),
             details: Mutex::default(),
+            contracts: Mutex::default(),
             symbols: Mutex::default(),
             prev_closes: Mutex::default(),
             accounts: Mutex::default(),
@@ -662,6 +762,10 @@ impl FakeTws {
             cancelled: Mutex::default(),
             events_tx: broadcast::channel(EVENT_CAPACITY).0,
         }
+    }
+
+    pub fn add_contract(&self, c: TwsContract) {
+        self.contracts.lock().unwrap().push(c);
     }
 
     pub fn set_connected(&self, up: bool) {
@@ -713,7 +817,23 @@ impl TwsClient for FakeTws {
 
     async fn contract_details(&self, q: &ContractQuery) -> Result<Vec<TwsContract>, TwsError> {
         self.up()?;
-        Ok(self.details.lock().unwrap().get(q).cloned().unwrap_or_default())
+        if let Some(found) = self.details.lock().unwrap().get(q) {
+            return Ok(found.clone());
+        }
+        Ok(self
+            .contracts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c.sec_type == q.sec_type
+                    && q.symbol.as_ref().is_none_or(|s| *s == c.symbol)
+                    && q.exchange.as_ref().is_none_or(|e| *e == c.exchange)
+                    && q.currency.as_ref().is_none_or(|u| *u == c.currency)
+                    && q.con_id.is_none_or(|i| i == c.con_id)
+            })
+            .cloned()
+            .collect())
     }
 
     async fn matching_symbols(&self, pattern: &str) -> Result<Vec<TwsContract>, TwsError> {
@@ -800,6 +920,67 @@ mod tests {
         assert_eq!(order_quantities(true, 6.0, 4.0, None), (10.0, 4.0, 6.0, 0.0));
         // An OrderStatus row wins for fills and price.
         assert_eq!(order_quantities(false, 10.0, 0.0, Some((4.0, 6.0, Some(9.5)))), (10.0, 4.0, 6.0, 9.5));
+    }
+
+    fn fut(con_id: i64, local: &str) -> TwsContract {
+        TwsContract {
+            con_id,
+            symbol: "ES".into(),
+            exchange: "CME".into(),
+            primary_exchange: String::new(),
+            currency: "USD".into(),
+            min_tick: 0.25,
+            lot_size: None,
+            name: "E-mini S&P 500".into(),
+            isin: None,
+            sec_type: SecType::Fut,
+            local_symbol: local.into(),
+            multiplier: 50.0,
+            last_trade: None,
+            last_trade_at: None,
+            strike: None,
+            right: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fut_query_asks_for_fut_on_cme() {
+        let fake = FakeTws::new();
+        fake.add_contract(fut(1, "ESZ6"));
+        fake.add_contract(fut(2, "ESH7"));
+        let q = ContractQuery { symbol: Some("ES".into()), exchange: Some("CME".into()), sec_type: SecType::Fut, ..Default::default() };
+        let found = fake.contract_details(&q).await.unwrap();
+        assert_eq!(found.iter().map(|c| c.local_symbol.as_str()).collect::<Vec<_>>(), ["ESZ6", "ESH7"]);
+        assert!(found.iter().all(|c| c.sec_type == SecType::Fut));
+        // A stock query does not see futures.
+        let stk = ContractQuery { symbol: Some("ES".into()), ..Default::default() };
+        assert!(fake.contract_details(&stk).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn last_trade_converts_contract_zone_to_utc() {
+        let utc = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(last_trade_instant("20261218", Some("08:30"), "US/Central"), Some(utc("2026-12-18T14:30:00Z")));
+        assert_eq!(last_trade_instant("20261218", None, "US/Central"), None);
+        assert_eq!(last_trade_instant("202612", Some("08:30"), "US/Central"), None);
+        assert_eq!(last_trade_instant("20261218", Some("08:30"), "Mars/Olympus"), None);
+    }
+
+    #[test]
+    fn ib_contract_for_fut_uses_exchange_not_smart() {
+        let c = ib_contract(1, SecType::Fut, "CME", "", "USD").unwrap();
+        assert_eq!(c.security_type.as_str(), "FUT");
+        assert_eq!(c.exchange.to_string(), "CME");
+        let s = ib_contract(265598, SecType::Stk, "SMART", "NASDAQ", "USD").unwrap();
+        assert_eq!(s.security_type.as_str(), "STK");
+    }
+
+    #[test]
+    fn sec_type_round_trips() {
+        for t in [SecType::Stk, SecType::Fut, SecType::Opt, SecType::Bag] {
+            assert_eq!(SecType::parse(t.as_ibkr()), Some(t));
+        }
+        assert_eq!(SecType::parse("CASH"), None);
     }
 
     #[test]

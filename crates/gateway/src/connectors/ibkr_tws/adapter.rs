@@ -16,7 +16,7 @@ use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 use crate::md::daily_stats::DailyStats;
 use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
-use super::client::{ContractQuery, OrderKind, Side, Tif, TwsClient, TwsContract, TwsError, TwsEvent, TwsExecution, TwsOrder, TwsOrderState};
+use super::client::{ContractQuery, OrderKind, SecType, Side, Tif, TwsClient, TwsContract, TwsError, TwsEvent, TwsExecution, TwsOrder, TwsOrderState};
 
 /// How far back `reqExecutions` reaches.
 const MAX_HISTORY_DAYS: i64 = 7;
@@ -224,7 +224,7 @@ impl BrokerAdapter for IbkrTwsAdapter {
         let order = TwsOrder {
             order_id,
             con_id,
-            exchange: "SMART".into(),
+            exchange: if contract.sec_type == SecType::Stk { "SMART".into() } else { contract.exchange.clone() },
             primary_exchange: contract.primary_exchange.clone(),
             currency: contract.currency.clone(),
             action,
@@ -233,6 +233,8 @@ impl BrokerAdapter for IbkrTwsAdapter {
             tif,
             order_ref: req.order_id.clone(),
             account: req.external_account_ref.clone(),
+            sec_type: contract.sec_type,
+            legs: vec![],
         };
         self.refs.lock().unwrap().insert(order_id, req.order_id.clone());
         let state = TwsOrderState {
@@ -547,6 +549,13 @@ pub(crate) mod tests {
             lot_size: None,
             name: "APPLE INC".into(),
             isin: None,
+            sec_type: SecType::Stk,
+            local_symbol: String::new(),
+            multiplier: 1.0,
+            last_trade: None,
+            last_trade_at: None,
+            strike: None,
+            right: None,
         }
     }
 
@@ -594,6 +603,8 @@ pub(crate) mod tests {
                 tif: Tif::Day,
                 order_ref: "7d3c1a52-0000-4000-8000-000000000001".into(),
                 account: "DU123".into(),
+                sec_type: SecType::Stk,
+                legs: vec![],
             }]
         );
         // A second order takes a fresh id and reuses the cached contract.
@@ -652,6 +663,8 @@ pub(crate) mod tests {
                 tif: Tif::Day,
                 order_ref: ref_.into(),
                 account: "DU123".into(),
+                sec_type: SecType::Stk,
+                legs: vec![],
             },
         };
         fake.completed.lock().unwrap().push((5, "oms-a".into(), state("Filled", "oms-a")));
@@ -776,6 +789,8 @@ pub(crate) mod tests {
                 tif: Tif::Day,
                 order_ref: order_ref.into(),
                 account: "U1".into(),
+                sec_type: SecType::Stk,
+                legs: vec![],
             },
         }
     }

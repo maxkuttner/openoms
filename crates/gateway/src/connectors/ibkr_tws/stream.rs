@@ -328,7 +328,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::adapter::tests::rig;
-    use super::super::client::{OrderKind, Side, Tif, TwsExecution, TwsOrder, TwsOrderState};
+    use super::super::client::{OrderKind, SecType, Side, Tif, TwsExecution, TwsOrder, TwsOrderState};
     use super::*;
     use crate::stream_health::{StreamHealthRegistry, StreamKind};
     use crate::venue_event::VenueFill;
@@ -462,6 +462,8 @@ mod tests {
                 tif: Tif::Day,
                 order_ref: order_ref.into(),
                 account: "U2".into(),
+                sec_type: SecType::Stk,
+                legs: vec![],
             },
         };
         (id, order_ref.into(), st)

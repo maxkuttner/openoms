@@ -6,7 +6,7 @@
 
 use dataprovider::{InstrumentDef};
 
-use super::client::{ContractQuery, TwsClient, TwsContract};
+use super::client::{ContractQuery, SecType, TwsClient, TwsContract};
 use super::exchanges::{from_mic, to_mic};
 use crate::adapter::BrokerInstrument;
 
@@ -87,6 +87,7 @@ pub async fn resolve(client: &dyn TwsClient, row: &CsvRow) -> Resolution {
         exchange: None,
         currency: row.currency.clone(),
         con_id: row.con_id,
+        ..ContractQuery::default()
     };
     let mut found = match client.contract_details(&query).await {
         Ok(found) => found,
@@ -172,6 +173,13 @@ mod tests {
             lot_size: None,
             name: "SAP SE".into(),
             isin: Some("DE0007164600".into()),
+            sec_type: SecType::Stk,
+            local_symbol: String::new(),
+            multiplier: 1.0,
+            last_trade: None,
+            last_trade_at: None,
+            strike: None,
+            right: None,
         }
     }
 
