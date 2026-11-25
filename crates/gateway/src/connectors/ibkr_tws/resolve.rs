@@ -6,7 +6,7 @@
 
 use dataprovider::{InstrumentDef};
 
-use super::client::{ContractQuery, SecType, TwsClient, TwsContract};
+use super::client::{ContractQuery, TwsClient, TwsContract};
 use super::exchanges::{from_mic, to_mic};
 use crate::adapter::BrokerInstrument;
 
@@ -160,7 +160,7 @@ fn decimals(tick: f64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::ibkr_tws::client::FakeTws;
+    use crate::connectors::ibkr_tws::client::{FakeTws, SecType};
 
     fn contract(con_id: i64, primary: &str, currency: &str) -> TwsContract {
         TwsContract {
