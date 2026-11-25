@@ -108,6 +108,37 @@ as untradeable.
 Prices are delayed (IBKR market data type 3). A subscription for real-time data is not
 used.
 
+### Futures
+
+CME index futures trade through the TWS API connection: **ES**, **MES** and **NQ** on
+CME (`XCME`). The OMS loads their contracts from IBKR once a day and on demand with
+`POST /admin/futures/sync` (admin). Each root is a row in the `future_root` table, so
+adding another root means adding a row there.
+
+**Front month.** Type the root, for example `ES`, in instrument search to get the
+current front contract. The front contract switches on the roll date, which is the last
+trade date minus 8 days, in Chicago time.
+
+**Roll warnings.** When you hold a contract, the OMS raises a `ROLL_DUE` alert
+`roll_warn_days` (3) days before its roll date. The cockpit shows a badge on the
+position and a banner. Alerts are also published to the Kafka `alerts` topic (change it
+with `KAFKA_ALERTS_TOPIC`), listed by `GET /alerts` and acknowledged with
+`POST /alerts/{id}/ack`.
+
+**One-click roll.** The roll dialog sends one IBKR combo (BAG) order on the calendar
+spread, selling the held contract and buying the next. The legs appear as child orders
+of the roll order. The spread price is the net debit per spread, buy-leg prices minus
+sell-leg prices, and it can be negative. A roll is never automatic; you start it.
+
+Limits:
+
+- Market data is IBKR's delayed feed; live CME data needs an IBKR subscription.
+- The [FIX session](#fix-session-experimental) refuses futures.
+- When IBKR gives no last-trade time, the expiry instant is approximated from the
+  venue's calendar.
+- Options route through IBKR, but there is no option chain browsing yet.
+- Perpetual futures are not supported yet.
+
 ### Currencies, P&L and limits
 
 Amounts stay in each instrument's own currency; nothing is converted. Positions and
