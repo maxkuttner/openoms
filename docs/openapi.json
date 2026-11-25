@@ -1103,6 +1103,52 @@
         ]
       }
     },
+    "/admin/futures/sync": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "operationId": "sync_now",
+        "parameters": [
+          {
+            "name": "env",
+            "in": "query",
+            "description": "Connection environment whose gateway to ask: `PAPER` (default) or `LIVE`.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Contracts synced from IBKR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncReport"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
+          "502": {
+            "description": "IBKR or the database failed"
+          },
+          "503": {
+            "description": "IBKR gateway is not connected"
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/admin/instruments": {
       "get": {
         "tags": [
@@ -5847,6 +5893,34 @@
             "description": "Venue (MIC) qualifying `symbol`. Omit when `symbol` already carries `@VENUE`,\nor when the symbol is unique across venues.",
             "example": null,
             "nullable": true
+          }
+        }
+      },
+      "SyncReport": {
+        "type": "object",
+        "description": "What one sync did.",
+        "required": [
+          "roots",
+          "contracts",
+          "skipped"
+        ],
+        "properties": {
+          "contracts": {
+            "type": "integer",
+            "description": "Contracts saved.",
+            "minimum": 0
+          },
+          "roots": {
+            "type": "integer",
+            "description": "Active roots asked about.",
+            "minimum": 0
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Contracts IBKR listed that could not be mapped, with the reason."
           }
         }
       },

@@ -89,6 +89,7 @@ mod secrets;
 mod credentials;
 mod credentials_api;
 mod expiry;
+mod futures;
 mod jobs;
 mod reload;
 mod cockpit;
@@ -162,6 +163,7 @@ mod first_run_tests;
         instruments_import::resolve_csv,
         instruments_import::save,
         instruments_import::search,
+        futures::sync::sync_now,
         admin::list_feeds,
         admin::expiry_sweep,
         users_api::setup_status,
@@ -207,7 +209,7 @@ mod first_run_tests;
         admin::RedactedCredentials, crate::credentials::RedactedField,
         jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
         instruments_import::Contract, instruments_import::ImportResolveRequest, instruments_import::ResolvedRow,
-        instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
+        futures::sync::SyncReport, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
         jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted, jobs::api::JobDetail,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
@@ -1094,6 +1096,7 @@ fn build_app(
         .route("/admin/strategies/:code/flatten", post(strategies::admin::flatten_strategy))
         .route("/admin/instruments", get(admin::list_instruments))
         .merge(instruments_import::routes())
+        .route("/admin/futures/sync", post(futures::sync::sync_now))
         .route("/admin/feeds", get(admin::list_feeds))
         .route("/admin/instruments/expiry-sweep", post(admin::expiry_sweep))
         .layer(middleware::from_fn_with_state(state.clone(), auth::admin_middleware));
@@ -1567,6 +1570,8 @@ async fn serve() {
 
     // Re-resolve imported IBKR instruments daily at 06:00 UTC while a TWS session is live.
     tokio::spawn(instruments_import::run_nightly(state.pool().clone()));
+    // Pull every listed contract of each future_root from IBKR daily.
+    tokio::spawn(futures::sync::run(state.pool().clone()));
 
     // Delete browser sessions past their absolute cap. Idle expiry is already
     // enforced on read (`sessions::lookup_session`'s join to `principal`), so

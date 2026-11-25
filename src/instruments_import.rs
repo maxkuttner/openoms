@@ -117,7 +117,7 @@ fn with_body_limit<S: Clone + Send + Sync + 'static>(r: axum::Router<S>) -> axum
     r.layer(axum::extract::DefaultBodyLimit::max(BODY_LIMIT))
 }
 
-fn live(env: Option<&str>) -> Result<std::sync::Arc<dyn TwsClient>, AdminError> {
+pub(crate) fn live(env: Option<&str>) -> Result<std::sync::Arc<dyn TwsClient>, AdminError> {
     let env = env.unwrap_or("PAPER").to_uppercase();
     live_client(&connection_code(&env)).ok_or_else(not_connected)
 }
