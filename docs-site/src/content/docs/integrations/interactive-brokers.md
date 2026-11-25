@@ -55,58 +55,35 @@ The connection's status shows `connecting`, `live` or `down`. While it is `down`
 
 When the OMS runs in a container (the [Docker Compose install](/getting-started/installation/),
 or any container platform), it cannot start IB Gateway: there is no Docker inside its
-container. Run IB Gateway as a service next to it and give the connection its address.
+container. Run IB Gateway yourself, however you like, and give the connection its address.
 
-With the official `compose.yaml`, add your IBKR login to `.env`:
+1. Run IB Gateway (or TWS) where the OMS can reach it, logged into your IBKR account,
+   with the API enabled. One option is the image the OMS itself uses,
+   `ghcr.io/gnzsnz/ib-gateway`, as a service on the same private network as the OMS
+   with `TWS_USERID`, `TWS_PASSWORD` and `TRADING_MODE` (`paper` or `live`) set; it
+   serves the API on port 4004 (paper) or 4003 (live).
+2. In the admin UI, open the IBKR TWS connection's credentials and set **Gateway
+   address** to `host:port`, e.g. `ib-gateway:4004`. Leave username and password empty:
+   the login lives in your gateway, not in the OMS.
 
-```sh
-TWS_USERID=your-ibkr-username
-TWS_PASSWORD='your-ibkr-password'
-TRADING_MODE=paper   # or live
-```
-
-Keep the password in single quotes: Docker Compose would otherwise expand a `$` in it.
-
-and start with the `ibkr` profile:
-
-```sh
-docker compose --profile ibkr up -d
-```
-
-This adds an `ib-gateway` service, the same pinned image the OMS would start itself.
-Its API is reachable only from the other services in the compose project; no port is
-published. Then, in the connection's credentials drawer, set **Gateway address** to
-`ib-gateway:4004` for paper or `ib-gateway:4003` for live, and leave username and
-password empty: the login lives in the gateway service, not in the OMS. Without the
-profile, `docker compose up -d` starts the OMS and PostgreSQL only, as before.
-
-- **Two-factor.** On the first login, and about once a week after, IBKR sends a push to
-  the IBKR Mobile app. Approve it; until then the connection shows `connecting` with
-  `IB Gateway at … not reachable`. `docker compose logs ib-gateway` shows the login.
+- **Two-factor.** The gateway's login may need approval in the IBKR Mobile app. Until it
+  is logged in, the connection shows `connecting` with `IB Gateway at … not reachable`.
 - **Daily restart.** IBKR restarts its gateways once a day. The OMS reconnects when the
   gateway is back; nothing to do.
-- **Wrong password or 2FA timeout.** First stop the gateway, `docker compose stop
-  ib-gateway`, so it does not log in again with the wrong login: repeated failures can
-  lock the account. Docker restarts the service at most 3 times after it fails
-  (`restart: on-failure:3`). Then fix `.env` and run `docker compose --profile ibkr up -d`.
-- **One environment per gateway.** `TRADING_MODE` decides paper or live for the whole
-  service. A PAPER connection takes port 4004 and a LIVE one 4003; saving the other port
-  is refused. On connecting, the OMS also checks the accounts the gateway is logged into
-  (paper account ids start with `D`): a PAPER connection on a live account, or a LIVE
-  connection on a paper one, goes `down` with `IB Gateway at … is logged into a live
-  account but this connection is PAPER` (or the reverse) and stops retrying until you
-  fix it and save the credentials again.
-- **Switching an existing connection to a gateway service.** On a host where the OMS ran
+- **Wrong password.** Repeated failed logins can lock the account: give your gateway a
+  capped restart policy, not "always", and stop it before fixing a bad login.
+- **One environment per gateway.** A PAPER connection takes port 4004 and a LIVE one
+  4003 when you use the ports above; saving the other one is refused. On connecting,
+  the OMS also checks the accounts the gateway is logged into (paper account ids start
+  with `D`): a PAPER connection on a live account, or a LIVE connection on a paper one,
+  goes `down` with `IB Gateway at … is logged into a live account but this connection
+  is PAPER` (or the reverse) and stops retrying until you fix it and save the
+  credentials again.
+- **Switching an existing connection to your own gateway.** On a host where the OMS ran
   IB Gateway itself, its old container keeps running. Remove it by hand:
   `docker rm -f oms-ibgw-<connection>` (`docker ps` lists it).
 
-On another container platform, run the image `ghcr.io/gnzsnz/ib-gateway` (the tag
-`compose.yaml` pins) as a service on the same private network as the OMS, with
-`TWS_USERID`, `TWS_PASSWORD` and `TRADING_MODE` set, and no public port. The image
-also reads the password from a file (`TWS_PASSWORD_FILE`), for platforms with secrets.
-Give it a capped restart policy, not "always". Set the
-connection's Gateway address to that service's name and port 4004 (paper) or 4003
-(live). Never expose the API port to the internet: anyone who reaches it can trade on
+Never expose the API port to the internet: anyone who reaches it can trade on
 the account.
 
 ### Instruments
