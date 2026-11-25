@@ -5,6 +5,53 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.16.0 (2026-11-25)
+
+### Feat
+
+- **web**: API page under the Trading admin tab
+- **cockpit**: users list with side editor, orders portfolio filter always shown
+- **cockpit**: light theme, logo in app font, brand folder
+- **cockpit**: groups picker and separate default grants
+- **cockpit**: simplify admin navigation
+- **cockpit**: portfolio Info and History tabs
+- **admin**: audit portfolio changes and expose history
+- **cockpit**: portfolio access editor, hide ungranted features
+- **cockpit**: groups and grants editor
+- **grants**: admin grants API
+- **authz**: enforce access grants
+- **access**: person-level portfolio access
+- **grants**: default and group access grants
+- **cockpit**: portfolio grants replace accounts
+- **orders**: enforce trading grants
+- **grants**: store and admin API, venue grants route orders
+- **grants**: generic grant model and check
+- **admin**: new portfolio gets its own view group
+- **groups**: delete an archived strategy's group
+- **cockpit**: order entry and book on the left, entry above book
+
+### Fix
+
+- **cockpit**: guard blotter owner check, await list before select
+- **cockpit**: keep group drafts and confirm discard
+- **grants**: preview from is null when not granted
+- **authz**: deny grants to unknown principals; grant strategy owner group
+- **access**: only people can hold person-level access
+- **grants**: return 500 instead of panicking; test every kind has a spec arm
+- **grants**: backfill venue grants for existing portfolio accounts
+- **cockpit**: require IBKR account before saving grants
+- **recon**: stable shared-account representative and sibling attribution rules
+- **recon**: shared venue account resolves to one row
+- **orders**: grant-based tests, strategy and adoption coverage
+- **grants**: account code clash is a 409, tighter tests
+- **grants**: single per-kind spec and fail-open tests
+
+### Refactor
+
+- move cockpit to clients/web; fix palette check
+- remove instrument enrichment and OpenFIGI symbology
+- remove co-located strategies
+
 ## v0.15.1 (2026-11-23)
 
 ## v0.15.0 (2026-11-23)
