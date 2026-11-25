@@ -73,11 +73,11 @@ test("the favicons are copies of brand/logo.svg", () => {
 });
 
 // Env vars win over oms.toml. An install from before env-only setup keeps its
-// role password, master key and URL in oms.toml: the compose file must pass these
+// role password and master key in oms.toml: the compose file must pass these
 // through only when set, never require or default them.
-test("compose.yaml never forces OMS_PASSWORD, OMS_MASTER_KEY or OMS_PUBLIC_BASE_URL", () => {
+test("compose.yaml never forces OMS_PASSWORD or OMS_MASTER_KEY", () => {
   const compose = readFileSync(new URL("../../compose.yaml", import.meta.url), "utf8");
-  for (const v of ["OMS_PASSWORD", "OMS_MASTER_KEY", "OMS_PUBLIC_BASE_URL"]) {
+  for (const v of ["OMS_PASSWORD", "OMS_MASTER_KEY"]) {
     const line = compose.split("\n").find((l) => l.trim().startsWith(`${v}:`));
     assert.ok(line, `compose.yaml does not pass ${v}`);
     assert.ok(line.includes(`\${${v}:-}`), `${v} must be passed as \${${v}:-}: ${line.trim()}`);

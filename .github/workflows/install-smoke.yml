@@ -59,8 +59,11 @@ jobs:
         run: |
           mkdir openoms && cd openoms
           curl -fsSLO https://github.com/maxkuttner/openoms/releases/latest/download/compose.yaml
-          [ -f .env ] || echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)" > .env
-          docker compose run --rm oms init --non-interactive
+          [ -f .env ] || {
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 24)"
+            echo "OMS_PASSWORD=$(openssl rand -hex 24)"
+            echo "OMS_MASTER_KEY=base64:$(openssl rand -base64 32)"
+          } > .env
           docker compose up -d
 
       # `/` redirects to the web app on every release (/cockpit/ before the
