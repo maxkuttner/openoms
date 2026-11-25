@@ -16,6 +16,7 @@ pub struct FutureRootView {
     pub next: Option<FutureContract>,
 }
 
+/// List futures roots with their front and next contract
 #[utoipa::path(
     get, path = "/futures/roots", tag = "orders",
     responses(
