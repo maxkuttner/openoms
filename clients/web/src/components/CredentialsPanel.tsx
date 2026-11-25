@@ -11,7 +11,7 @@ import { Modal } from "./overlay";
 import { Pill, type Tone } from "./status";
 import { api, ApiError } from "../api/client";
 import { notifyError, notifyOk, useList } from "../api/hooks";
-import { groupFields, initialValues, sectionStartsOpen, type Venue, type VenueField } from "../venues";
+import { groupFields, initialValues, missingFields, sectionStartsOpen, type Venue, type VenueField } from "../venues";
 import type { ConnectionOutcome, RedactedCredentials, SaveResponse, TestResponse } from "../api/types";
 import type { UniverseStatus } from "../api/jobs";
 import { loadUniverse } from "./UniverseStatus";
@@ -110,12 +110,7 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
   // validator. It fires only when there is nothing stored to fall back on —
   // once a credential is configured, an empty field means "keep", which is
   // the whole point of the merge rule and must not be flagged as missing.
-  const validate = (vals: Record<string, string>) =>
-    Object.fromEntries(
-      specs
-        .filter((spec) => spec.input !== "checkbox" && isFreshRef.current && !(vals[spec.name] ?? "").trim())
-        .map((spec) => [spec.name, "required"]),
-    );
+  const validate = (vals: Record<string, string>) => missingFields(specs, vals, isFreshRef.current);
   const [lastTest, setLastTest] = useState<TestResponse | null>(null);
   const [lastSave, setLastSave] = useState<SaveResponse | null>(null);
 
@@ -228,7 +223,7 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
       );
     }
     return (
-      <TextField key={spec.name} label={spec.label} required={isFresh} type={spec.secret ? "password" : "text"}
+      <TextField key={spec.name} label={spec.label} required={isFresh && !spec.optional} type={spec.secret ? "password" : "text"}
         placeholder={spec.secret ? placeholder : undefined} value={values[spec.name] ?? ""}
         onChange={(v) => setField(spec.name, v)} error={errors[spec.name]} autoComplete="off" />
     );

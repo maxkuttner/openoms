@@ -100,6 +100,24 @@ fn field<'a>(
     }
 }
 
+/// A text field's value under the merge rule, plus optional fields: one
+/// omitted with nothing stored is `""`, and a non-secret one submitted empty
+/// is cleared (the form echoes it, so empty is what the operator asked for).
+/// A secret is never echoed, so submitted empty it still keeps what is stored.
+fn text_field(
+    sub: &CredentialSubmission,
+    f: &gateway::venue::CredentialField,
+    existing: Option<&str>,
+) -> Result<String, CredentialError> {
+    if !f.optional {
+        return field(sub, f.name, existing).map(str::to_string);
+    }
+    match sub.fields.get(f.name).map(|v| v.trim()) {
+        Some(v) if !v.is_empty() || !f.secret => Ok(v.to_string()),
+        _ => Ok(existing.unwrap_or("").to_string()),
+    }
+}
+
 fn parse_port(sub: &CredentialSubmission, name: &'static str, existing: Option<u16>) -> Result<u16, CredentialError> {
     match sub.get(name) {
         Some(v) => v.parse::<u16>().map_err(|_| CredentialError::BadField {
@@ -148,7 +166,7 @@ pub fn parse_broker(
     let mut fields = serde_json::Map::new();
     for f in (m.venue)().fields {
         let value = match m.field_types.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t) {
-            None => Value::String(field(sub, f.name, stored_value(f.name).and_then(Value::as_str))?.to_string()),
+            None => Value::String(text_field(sub, &f, stored_value(f.name).and_then(Value::as_str))?),
             Some(FieldType::Port) => {
                 let existing = stored_value(f.name).and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
                 Value::from(parse_port(sub, f.name, existing)?)
@@ -471,6 +489,44 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    // ── optional fields ─────────────────────────────────────────────────
+
+    fn optional_text() -> gateway::venue::CredentialField {
+        gateway::venue::field("gateway", "Gateway address").optional()
+    }
+
+    #[test]
+    fn optional_field_may_be_missing() {
+        assert_eq!(text_field(&sub(&[]), &optional_text(), None).unwrap(), "");
+        assert_eq!(text_field(&sub(&[]), &optional_text().secret(), None).unwrap(), "");
+        // omitted keeps what is stored
+        assert_eq!(text_field(&sub(&[]), &optional_text(), Some("ib-gateway:4004")).unwrap(), "ib-gateway:4004");
+    }
+
+    /// Clearing a non-secret optional field in the form must clear it: that is
+    /// how an external-gateway IBKR connection goes back to managed mode.
+    #[test]
+    fn optional_text_field_submitted_empty_clears() {
+        let s = sub(&[("gateway", "")]);
+        assert_eq!(text_field(&s, &optional_text(), Some("ib-gateway:4004")).unwrap(), "");
+        let s = sub(&[("gateway", " ib-gateway:4003 ")]);
+        assert_eq!(text_field(&s, &optional_text(), Some("ib-gateway:4004")).unwrap(), "ib-gateway:4003", "trimmed");
+    }
+
+    /// A secret is never echoed into the form, so an empty one means "keep".
+    #[test]
+    fn optional_secret_submitted_empty_keeps() {
+        let s = sub(&[("gateway", "")]);
+        assert_eq!(text_field(&s, &optional_text().secret(), Some("p")).unwrap(), "p");
+    }
+
+    #[test]
+    fn a_required_field_is_still_missing() {
+        let required = gateway::venue::field("gateway", "Gateway address");
+        assert!(matches!(text_field(&sub(&[]), &required, None), Err(CredentialError::MissingField("gateway"))));
+        assert!(matches!(text_field(&sub(&[("gateway", "")]), &required, None), Err(CredentialError::MissingField("gateway"))));
     }
 
     #[test]

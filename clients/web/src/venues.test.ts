@@ -1,7 +1,7 @@
 // Run with `npm test` (node --test; Node strips the types itself).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { autoCode, connectionCode, environmentOptions, groupFields, initialValues, sectionStartsOpen, venueOptions } from "./venues.ts";
+import { autoCode, connectionCode, environmentOptions, groupFields, initialValues, missingFields, sectionStartsOpen, venueOptions } from "./venues.ts";
 import type { Venue } from "./venues.ts";
 
 const binance: Venue = {
@@ -73,4 +73,17 @@ test("a section starts closed when everything in it is filled in", () => {
   const fix = groupFields(binance.fields).sections[0].fields;
   assert.equal(sectionStartsOpen(fix, { host: "testnet.host", ssl: "false" }), false);
   assert.equal(sectionStartsOpen(fix, { host: "", ssl: "true" }), true);
+});
+
+test("a fresh form flags empty required fields, never optional ones or checkboxes", () => {
+  const fields = [
+    ...binance.fields,
+    { name: "gateway", label: "Gateway address", secret: false, input: "text" as const, section: null, paper: null, live: null, optional: true },
+  ];
+  assert.deepEqual(missingFields(fields, { api_key: " ", host: "h", ssl: "", gateway: "" }, true), { api_key: "required" });
+  assert.deepEqual(missingFields(fields, {}, true), { api_key: "required", host: "required" });
+});
+
+test("a stored credential flags nothing: an empty field keeps what is stored", () => {
+  assert.deepEqual(missingFields(binance.fields, {}, false), {});
 });

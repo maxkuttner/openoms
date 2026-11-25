@@ -55,10 +55,13 @@ pub struct CredentialField {
     /// everyone, such as a testnet host. Never a secret.
     pub paper: Option<&'static str>,
     pub live: Option<&'static str>,
+    /// May be left empty: stored as `""`, never a missing field. Submitted
+    /// empty, a non-secret one is cleared; a secret one keeps what is stored.
+    pub optional: bool,
 }
 
 pub fn field(name: &'static str, label: &'static str) -> CredentialField {
-    CredentialField { name, label, secret: false, input: Input::Text, section: None, paper: None, live: None }
+    CredentialField { name, label, secret: false, input: Input::Text, section: None, paper: None, live: None, optional: false }
 }
 
 impl CredentialField {
@@ -68,6 +71,10 @@ impl CredentialField {
     }
     pub fn input(mut self, input: Input) -> Self {
         self.input = input;
+        self
+    }
+    pub fn optional(mut self) -> Self {
+        self.optional = true;
         self
     }
     pub fn fix(mut self) -> Self {

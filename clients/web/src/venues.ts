@@ -13,6 +13,8 @@ export type VenueField = {
   // Pre-fill for a PAPER / LIVE connection (e.g. a testnet host); never a secret.
   paper: string | null;
   live: string | null;
+  // May be left empty even on a fresh credential (no asterisk, not flagged).
+  optional?: boolean;
 };
 
 export type VenueEnvironment = { code: string; label: string; keys_url: string | null };
@@ -93,4 +95,16 @@ export function groupFields(fields: VenueField[]): {
 // something in it still needs typing.
 export function sectionStartsOpen(fields: VenueField[], values: Record<string, string>): boolean {
   return fields.some((f) => f.input !== "checkbox" && !(values[f.name] ?? "").trim());
+}
+
+// The form's "required" errors. Only a fresh credential has any: once one is
+// stored, an empty field means "keep" (the server's merge rule). Checkboxes
+// and optional fields are never missing.
+export function missingFields(fields: VenueField[], values: Record<string, string>, fresh: boolean): Record<string, string> {
+  if (!fresh) return {};
+  return Object.fromEntries(
+    fields
+      .filter((f) => f.input !== "checkbox" && !f.optional && !(values[f.name] ?? "").trim())
+      .map((f) => [f.name, "required"]),
+  );
 }
