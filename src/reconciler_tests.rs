@@ -499,8 +499,11 @@ async fn held_assets_failure_keeps_existing_scopes_and_retries_discovery() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(*source.pulled_scopes.lock().unwrap(), ["ETHUSDT"], "the known scope is pulled despite the failure");
 
+    // Scopes are pulled in sorted order, BTCUSDT then ETHUSDT: wait for both, or
+    // the ETHUSDT pull lands in the sweep's tally below.
     h.pull_now();
-    eventually(|| source.pulled_scopes.lock().unwrap().contains(&"BTCUSDT".to_string())).await;
+    eventually(|| source.pulled_scopes.lock().unwrap().len() == 3).await;
+    assert_eq!(*source.pulled_scopes.lock().unwrap(), ["ETHUSDT", "BTCUSDT", "ETHUSDT"]);
     assert_eq!(*source.held_calls.lock().unwrap(), 2, "discovery retried on the next pull");
 
     // EOD sweep: same, the account is not skipped.
