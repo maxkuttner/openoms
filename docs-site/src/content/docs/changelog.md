@@ -5,6 +5,12 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.16.1 (2026-11-25)
+
+### Fix
+
+- **docker**: default OMS_PUBLIC_BASE_URL so compose starts as documented
+
 ## v0.16.0 (2026-11-25)
 
 ### Feat
