@@ -22,7 +22,7 @@ use crate::domain::orders::errors::{CommandRejection, RejectionCode};
 use crate::domain::orders::events::OrderDomainEvent;
 use crate::auth::AuthContext;
 use crate::authz::{self, Permission};
-use crate::positions::{value as value_position, Position};
+use crate::positions::{value as value_position, InstrumentClass, Position};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderStatus, OrderType, TimeInForce};
 use crate::event_store::NewOrderEvent;
 
@@ -586,6 +586,7 @@ async fn load_positions(state: &AppState, portfolio_id: Uuid) -> Result<Vec<Posi
                 p.realized_pnl::double precision AS realized_pnl, \
                 p.updated_at, \
                 COALESCE(i.contract_size, 1)::double precision AS contract_size, \
+                COALESCE(i.instrument_class, '') AS instrument_class, \
                 COALESCE(i.currency, 'XXX') AS currency, \
                 i.symbol AS instrument_symbol, i.name AS instrument_name \
          FROM position p \
@@ -619,10 +620,11 @@ async fn load_positions(state: &AppState, portfolio_id: Uuid) -> Result<Vec<Posi
             let net_qty: f64 = r.get("net_qty");
             let avg_cost: f64 = r.get("avg_cost");
             let contract_size: f64 = r.get("contract_size");
+            let class = InstrumentClass::from_db(&r.get::<String, _>("instrument_class"));
 
             let mark = instrument_id.parse::<i64>().ok().and_then(|id| marks.get(id));
             let mid = mark.map(|m| m.mid());
-            let valuation = mid.map(|mid| value_position(net_qty, avg_cost, contract_size, mid));
+            let valuation = mid.map(|mid| value_position(class, net_qty, avg_cost, contract_size, mid));
 
             Position {
                 portfolio_id: r.get("portfolio_id"),

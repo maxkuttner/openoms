@@ -96,15 +96,49 @@ impl PositionMath {
     }
 }
 
+/// Instrument class, as stored in `instrument.instrument_class`. Selects the
+/// valuation formula in [`value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstrumentClass {
+    Spot,
+    Future,
+    Option,
+    Perpetual,
+    Other,
+}
+
+impl InstrumentClass {
+    /// Map the DB code; unknown codes fall back to `Other`.
+    pub fn from_db(code: &str) -> InstrumentClass {
+        match code {
+            "SPOT" => InstrumentClass::Spot,
+            "FUTURE" => InstrumentClass::Future,
+            "OPTION" => InstrumentClass::Option,
+            "PERPETUAL" => InstrumentClass::Perpetual,
+            _ => InstrumentClass::Other,
+        }
+    }
+}
+
 /// Mark-to-market valuation of an open position.
 ///
 /// Both figures are signed through `net_qty`, so a short (`net_qty < 0`) yields a
 /// negative market value and profits when the mark falls below `avg_cost`.
-/// `contract_size` scales into money — 100 for an option, 1 for spot.
-pub fn value(net_qty: f64, avg_cost: f64, contract_size: f64, mid: f64) -> Valuation {
-    Valuation {
-        market_value: net_qty * mid * contract_size,
-        unrealized_pnl: (mid - avg_cost) * net_qty * contract_size,
+/// `contract_size` scales into money — 100 for an option, 1 for spot. Dispatches on
+/// `class`; every class is linear today.
+pub fn value(class: InstrumentClass, net_qty: f64, avg_cost: f64, contract_size: f64, mid: f64) -> Valuation {
+    match class {
+        // Inverse (coin-margined) perpetuals will need a separate arm here:
+        // qty × size × (1/avg − 1/mark) for unrealized P&L, with market value
+        // in the base coin. Until then they fall through to the linear formula.
+        InstrumentClass::Spot
+        | InstrumentClass::Future
+        | InstrumentClass::Option
+        | InstrumentClass::Perpetual
+        | InstrumentClass::Other => Valuation {
+            market_value: net_qty * mid * contract_size,
+            unrealized_pnl: (mid - avg_cost) * net_qty * contract_size,
+        },
     }
 }
 
@@ -756,7 +790,7 @@ mod tests {
     #[test]
     fn value_long_option_scales_by_contract_size() {
         // 1 contract, paid 2.00, now marked 3.28 -> +1.28 x 100.
-        let v = value(1.0, 2.00, 100.0, 3.28);
+        let v = value(InstrumentClass::Option, 1.0, 2.00, 100.0, 3.28);
         approx(v.market_value, 328.0);
         approx(v.unrealized_pnl, 128.0);
     }
@@ -764,29 +798,47 @@ mod tests {
     #[test]
     fn value_short_is_signed_correct() {
         // Short 1 contract at 3.00; mark falls to 2.00 -> the short PROFITS.
-        let v = value(-1.0, 3.00, 100.0, 2.00);
+        let v = value(InstrumentClass::Option, -1.0, 3.00, 100.0, 2.00);
         approx(v.market_value, -200.0); // liability
         approx(v.unrealized_pnl, 100.0); // gain
     }
 
     #[test]
     fn value_short_loses_when_mark_rises() {
-        let v = value(-1.0, 3.00, 100.0, 4.00);
+        let v = value(InstrumentClass::Option, -1.0, 3.00, 100.0, 4.00);
         approx(v.unrealized_pnl, -100.0);
     }
 
     #[test]
     fn value_spot_uses_unit_contract_size() {
         // 0.1 SOL bought at 100, marked 150.
-        let v = value(0.1, 100.0, 1.0, 150.0);
+        let v = value(InstrumentClass::Spot, 0.1, 100.0, 1.0, 150.0);
         approx(v.market_value, 15.0);
         approx(v.unrealized_pnl, 5.0);
     }
 
     #[test]
     fn value_at_cost_is_flat() {
-        let v = value(10.0, 42.0, 1.0, 42.0);
+        let v = value(InstrumentClass::Spot, 10.0, 42.0, 1.0, 42.0);
         approx(v.unrealized_pnl, 0.0);
+    }
+
+    #[test]
+    fn future_values_with_multiplier() {
+        // 2 contracts at 6000, multiplier 50, marked 6010 -> +10 x 2 x 50.
+        let v = value(InstrumentClass::Future, 2.0, 6000.0, 50.0, 6010.0);
+        approx(v.market_value, 601000.0);
+        approx(v.unrealized_pnl, 1000.0);
+    }
+
+    #[test]
+    fn instrument_class_from_db_maps_known_codes() {
+        assert_eq!(InstrumentClass::from_db("SPOT"), InstrumentClass::Spot);
+        assert_eq!(InstrumentClass::from_db("FUTURE"), InstrumentClass::Future);
+        assert_eq!(InstrumentClass::from_db("OPTION"), InstrumentClass::Option);
+        assert_eq!(InstrumentClass::from_db("PERPETUAL"), InstrumentClass::Perpetual);
+        assert_eq!(InstrumentClass::from_db("STOCK"), InstrumentClass::Other);
+        assert_eq!(InstrumentClass::from_db(""), InstrumentClass::Other);
     }
 
     #[test]
