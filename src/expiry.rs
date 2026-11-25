@@ -181,4 +181,44 @@ mod tests {
         assert_eq!(job.status, crate::jobs::JobStatus::Succeeded);
         assert_eq!(job.result.unwrap()["expired"], 2);
     }
+    #[tokio::test]
+    #[ignore = "needs a live Postgres; run with --ignored"]
+    async fn futures_reference_rows_exist() {
+        dotenvy::dotenv().ok();
+        let cfg = crate::setup::database::config::resolve(Default::default());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("SET search_path TO oms, public").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&cfg.url())
+            .await
+            .unwrap();
+        let es: (i32, i32) = sqlx::query_as("SELECT roll_offset_days, roll_warn_days FROM future_root WHERE code = 'ES'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(es, (8, 3));
+        let cme: (i64,) = sqlx::query_as("SELECT count(*) FROM future_root WHERE broker_exchange = 'CME' AND code IN ('ES','MES','NQ')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cme.0, 3);
+        let tz: (String,) = sqlx::query_as("SELECT c.timezone FROM calendar c JOIN venue v ON v.id = c.venue_id WHERE v.code = 'XCME'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tz.0, "America/Chicago");
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO instrument (symbol, venue, name, asset_class, instrument_class, currency, price_precision, price_increment) \
+             VALUES ('PERP-TEST', 'XCME', 'perp', 'INDEX', 'PERPETUAL', 'USD', 2, 0.25)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("PERPETUAL is an allowed instrument_class");
+        tx.rollback().await.unwrap();
+    }
 }

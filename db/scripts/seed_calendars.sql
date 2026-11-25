@@ -41,6 +41,7 @@ FROM (VALUES
     ('BATS',    'America/New_York', TIME '16:00', 'Cboe BZX'),
     ('IEXG',    'America/New_York', TIME '16:00', 'IEX'),
     ('OTCM',    'America/New_York', TIME '16:00', 'OTC Markets'),
+    ('XCME',    'America/Chicago',  TIME '16:00', 'CME Globex index futures'),
     ('BINANCE', 'UTC',              NULL,         'Binance — 24/7, no close'),
     ('BYBIT',   'UTC',              NULL,         'Bybit — 24/7, no close')
 ) AS c(code, timezone, close_time, description)
