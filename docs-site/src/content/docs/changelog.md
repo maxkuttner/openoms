@@ -5,6 +5,39 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.17.0 (2026-11-25)
+
+### Feat
+
+- **futures**: spread tick, server-side roll targets, ack needs trade right
+- **cockpit**: futures roots in search, roll badge, alerts and roll dialog
+- **orders**: derive a roll parent's fill progress from its legs
+- **ingest**: book leg fills to children, cascade parent closes, recon exemptions
+- **ibkr_tws**: route rolls as one BAG order with directional legs
+- **orders**: futures roll as parent order with two leg children
+- **alerts**: generic alert channel and futures roll warnings
+- **order-entry**: refuse instrument classes a connector cannot trade
+- **futures**: front-month resolution and roots endpoint
+- **futures**: daily IBKR contract sync for future roots
+- **ibkr_tws**: map FUT and OPT contracts to catalog instruments
+- **ibkr_tws**: generic security types in contract lookup and routing
+- **db**: futures reference data (XCME, future_root, future_spread)
+
+### Fix
+
+- **futures**: lock roll parent before its leg, per-symbol prev close, keep spreads and futures out of stock paths
+- **orders**: roll review round 1
+- **futures**: summary for the roots operation
+- **ibkr_tws**: futures never join a same-named stock; drop stray backup file
+- **ibkr_tws**: drop combo executions on the live stream; price futures by local symbol on a cold cache
+- **ibkr_tws**: key fills by localSymbol so futures expiries stay apart
+- **ibkr_tws**: futures last-trade time, prev_close sec type, strict multiplier
+- **db**: perpetuals are derivatives; seed USD for fresh installs
+
+### Refactor
+
+- **positions**: dispatch valuation on instrument class
+
 ## v0.16.1 (2026-11-25)
 
 ### Fix
