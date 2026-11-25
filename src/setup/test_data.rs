@@ -117,6 +117,7 @@ pub fn spy_chain_defs(today: NaiveDate) -> Vec<InstrumentDef> {
                         option_kind: Some(kind),
                         strike_price: Some(strike),
                         expiry_date: Some(expiry),
+                        expires_at: None,
                         activation_date: None,
                     }),
                 });

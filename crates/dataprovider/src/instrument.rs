@@ -36,5 +36,8 @@ pub struct DerivativeDef {
     pub option_kind: Option<OptionKind>,
     pub strike_price: Option<f64>,
     pub expiry_date: Option<chrono::NaiveDate>,
+    /// The instant the contract stops trading, when the source states it. `None`
+    /// leaves the stored value (or the venue-calendar derivation) alone.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub activation_date: Option<chrono::NaiveDate>,
 }

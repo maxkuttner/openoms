@@ -4,9 +4,9 @@
 //! Identity is the IBKR conId. A symbol that matches more than one contract is
 //! reported with every candidate, never guessed.
 
-use dataprovider::{InstrumentDef};
+use dataprovider::{DerivativeDef, InstrumentDef, OptionKind};
 
-use super::client::{ContractQuery, TwsClient, TwsContract};
+use super::client::{ContractQuery, SecType, TwsClient, TwsContract};
 use super::exchanges::{from_mic, to_mic};
 use crate::adapter::BrokerInstrument;
 
@@ -115,16 +115,28 @@ pub async fn resolve(client: &dyn TwsClient, row: &CsvRow) -> Resolution {
     }
 }
 
-/// The OMS's record of a resolved contract: `symbol@MIC`, routed by conId.
-/// Mirrors Alpaca's equities (`EQUITY` / `SPOT`).
-pub fn to_broker_instrument(c: &TwsContract) -> Result<BrokerInstrument, String> {
-    let mic = to_mic(&c.primary_exchange)
-        .ok_or_else(|| format!("{} trades on '{}', an exchange the OMS has no MIC for", c.symbol, c.primary_exchange))?;
+/// The futures root a FUT contract belongs to (a `future_root` row): its code
+/// is the derivative's underlying, its asset class the instrument's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RootSpec {
+    pub code: String,
+    pub asset_class: String,
+}
+
+/// The OMS's record of a resolved contract, routed by conId.
+/// STK: `symbol@MIC`, `EQUITY` / `SPOT`. FUT: `localSymbol@MIC`, `FUTURE`, with the
+/// multiplier and last-trade date IBKR gave. OPT: `EQUITY` / `OPTION`.
+/// `root` is required for FUT and ignored otherwise.
+pub fn to_broker_instrument(c: &TwsContract, root: Option<&RootSpec>) -> Result<BrokerInstrument, String> {
+    // Futures have no primary exchange; they trade where they are routed.
+    let mic_of = if c.sec_type == SecType::Fut || c.primary_exchange.is_empty() { &c.exchange } else { &c.primary_exchange };
+    let mic = to_mic(mic_of)
+        .ok_or_else(|| format!("{} trades on '{}', an exchange the OMS has no MIC for", c.symbol, mic_of))?;
     if c.min_tick <= 0.0 {
         return Err(format!("IBKR gave no minimum tick for {} (conId {})", c.symbol, c.con_id));
     }
     let lot_size = c.lot_size.filter(|l| *l > 0.0);
-    let definition = InstrumentDef {
+    let mut definition = InstrumentDef {
         symbol: c.symbol.clone(),
         venue: mic.to_string(),
         currency: c.currency.clone(),
@@ -140,9 +152,63 @@ pub fn to_broker_instrument(c: &TwsContract) -> Result<BrokerInstrument, String>
         provider_exchange: Some(mic.to_string()),
         derivative: None,
     };
+    let (broker_symbol, broker_exchange) = match c.sec_type {
+        SecType::Stk => (c.symbol.clone(), c.primary_exchange.clone()),
+        SecType::Fut | SecType::Opt => {
+            if c.local_symbol.is_empty() {
+                return Err(format!("IBKR gave no local symbol for {} (conId {})", c.symbol, c.con_id));
+            }
+            if c.multiplier <= 0.0 {
+                return Err(format!("IBKR gave no multiplier for {} (conId {})", c.local_symbol, c.con_id));
+            }
+            let Some(expiry) = c.last_trade else {
+                return Err(format!("IBKR gave no last trade date for {} (conId {})", c.local_symbol, c.con_id));
+            };
+            definition.symbol = c.local_symbol.clone();
+            definition.contract_size = c.multiplier;
+            if c.sec_type == SecType::Fut {
+                let root = root.ok_or_else(|| {
+                    format!("{} (conId {}) is a future but its root is not configured", c.local_symbol, c.con_id)
+                })?;
+                definition.asset_class = root.asset_class.clone();
+                definition.instrument_class = "FUTURE".to_string();
+                definition.derivative = Some(DerivativeDef {
+                    underlying_symbol: root.code.clone(),
+                    option_kind: None,
+                    strike_price: None,
+                    expiry_date: Some(expiry),
+                    expires_at: c.last_trade_at,
+                    activation_date: None,
+                });
+            } else {
+                let kind = match c.right.as_deref() {
+                    Some("C") | Some("CALL") => OptionKind::Call,
+                    Some("P") | Some("PUT") => OptionKind::Put,
+                    other => {
+                        return Err(format!("IBKR gave option right {other:?} for conId {}", c.con_id));
+                    }
+                };
+                let strike = c
+                    .strike
+                    .filter(|s| *s > 0.0)
+                    .ok_or_else(|| format!("IBKR gave no strike for {} (conId {})", c.local_symbol, c.con_id))?;
+                definition.instrument_class = "OPTION".to_string();
+                definition.derivative = Some(DerivativeDef {
+                    underlying_symbol: c.symbol.clone(),
+                    option_kind: Some(kind),
+                    strike_price: Some(strike),
+                    expiry_date: Some(expiry),
+                    expires_at: c.last_trade_at,
+                    activation_date: None,
+                });
+            }
+            (c.local_symbol.clone(), c.exchange.clone())
+        }
+        SecType::Bag => return Err(format!("conId {} is a combo, which the OMS does not import", c.con_id)),
+    };
     Ok(BrokerInstrument {
-        broker_symbol: c.symbol.clone(),
-        broker_exchange: Some(c.primary_exchange.clone()),
+        broker_symbol,
+        broker_exchange: Some(broker_exchange),
         is_tradeable: true,
         min_quantity: None,
         max_quantity: None,
@@ -160,7 +226,7 @@ fn decimals(tick: f64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::ibkr_tws::client::{FakeTws, SecType};
+    use crate::connectors::ibkr_tws::client::FakeTws;
 
     fn contract(con_id: i64, primary: &str, currency: &str) -> TwsContract {
         TwsContract {
@@ -205,6 +271,102 @@ mod tests {
             both[1..].to_vec(),
         );
         fake
+    }
+
+    fn es_contract() -> TwsContract {
+        TwsContract {
+            con_id: 495512563,
+            symbol: "ES".into(),
+            exchange: "CME".into(),
+            primary_exchange: String::new(),
+            currency: "USD".into(),
+            min_tick: 0.25,
+            lot_size: None,
+            name: "E-mini S&P 500".into(),
+            isin: None,
+            sec_type: SecType::Fut,
+            local_symbol: "ESZ6".into(),
+            multiplier: 50.0,
+            last_trade: chrono::NaiveDate::from_ymd_opt(2026, 12, 18),
+            last_trade_at: None,
+            strike: None,
+            right: None,
+        }
+    }
+
+    fn es_root() -> RootSpec {
+        RootSpec { code: "ES".into(), asset_class: "INDEX".into() }
+    }
+
+    #[test]
+    fn fut_maps_to_future_with_multiplier_and_expiry() {
+        let b = to_broker_instrument(&es_contract(), Some(&es_root())).unwrap();
+        let d = &b.definition;
+        assert_eq!(
+            (d.symbol.as_str(), d.venue.as_str(), d.asset_class.as_str(), d.instrument_class.as_str()),
+            ("ESZ6", "XCME", "INDEX", "FUTURE")
+        );
+        assert_eq!(d.contract_size, 50.0);
+        assert_eq!(d.native_id.as_deref(), Some("495512563"));
+        assert_eq!(b.broker_symbol, "ESZ6");
+        assert_eq!(b.broker_exchange.as_deref(), Some("CME"));
+        let dv = d.derivative.as_ref().unwrap();
+        assert_eq!(dv.underlying_symbol, "ES");
+        assert_eq!(dv.expiry_date, chrono::NaiveDate::from_ymd_opt(2026, 12, 18));
+        assert_eq!(dv.expires_at, None);
+
+        let mut c = es_contract();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-12-18T14:30:00Z").unwrap().with_timezone(&chrono::Utc);
+        c.last_trade_at = Some(at);
+        let b = to_broker_instrument(&c, Some(&es_root())).unwrap();
+        assert_eq!(b.definition.derivative.unwrap().expires_at, Some(at));
+    }
+
+    #[test]
+    fn fut_without_root_is_refused() {
+        let err = to_broker_instrument(&es_contract(), None).err().unwrap();
+        assert!(err.contains("495512563"), "{err}");
+    }
+
+    #[test]
+    fn fut_without_last_trade_or_multiplier_is_refused() {
+        let mut c = es_contract();
+        c.last_trade = None;
+        assert!(to_broker_instrument(&c, Some(&es_root())).err().unwrap().contains("495512563"));
+        let mut c = es_contract();
+        c.multiplier = 0.0;
+        assert!(to_broker_instrument(&c, Some(&es_root())).err().unwrap().contains("495512563"));
+    }
+
+    #[test]
+    fn opt_maps_to_option_with_strike_and_kind() {
+        let c = TwsContract {
+            con_id: 700,
+            symbol: "AAPL".into(),
+            exchange: "SMART".into(),
+            primary_exchange: "NASDAQ".into(),
+            currency: "USD".into(),
+            min_tick: 0.01,
+            lot_size: None,
+            name: "APPLE".into(),
+            isin: None,
+            sec_type: SecType::Opt,
+            local_symbol: "AAPL  261218C00200000".into(),
+            multiplier: 100.0,
+            last_trade: chrono::NaiveDate::from_ymd_opt(2026, 12, 18),
+            last_trade_at: None,
+            strike: Some(200.0),
+            right: Some("C".into()),
+        };
+        let b = to_broker_instrument(&c, None).unwrap();
+        let d = &b.definition;
+        assert_eq!((d.asset_class.as_str(), d.instrument_class.as_str()), ("EQUITY", "OPTION"));
+        assert_eq!(d.symbol, "AAPL  261218C00200000");
+        assert_eq!(d.contract_size, 100.0);
+        let dv = d.derivative.as_ref().unwrap();
+        assert_eq!(dv.underlying_symbol, "AAPL");
+        assert_eq!(dv.strike_price, Some(200.0));
+        assert!(matches!(dv.option_kind, Some(dataprovider::OptionKind::Call)));
     }
 
     #[test]
@@ -280,12 +442,12 @@ mod tests {
             Resolution::NotFound(m) => assert!(m.contains("MOON"), "{m}"),
             other => panic!("expected NotFound, got {other:?}"),
         }
-        assert!(to_broker_instrument(&contract(7, "MOON", "USD")).is_err());
+        assert!(to_broker_instrument(&contract(7, "MOON", "USD"), None).is_err());
     }
 
     #[test]
     fn broker_instrument_is_keyed_by_con_id_on_the_mic() {
-        let bi = to_broker_instrument(&contract(2, "IBIS", "EUR")).unwrap();
+        let bi = to_broker_instrument(&contract(2, "IBIS", "EUR"), None).unwrap();
         let d = &bi.definition;
         assert_eq!((d.symbol.as_str(), d.venue.as_str()), ("SAP", "XETR"));
         assert_eq!(d.native_id.as_deref(), Some("2"));

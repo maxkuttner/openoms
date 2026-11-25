@@ -224,7 +224,7 @@ pub async fn save(
             [one] => one,
             _ => return Err(unprocessable(format!("conId {con_id}: IBKR has no single contract for it"))),
         };
-        instruments.push(to_broker_instrument(contract).map_err(|e| unprocessable(format!("conId {con_id}: {e}")))?);
+        instruments.push(to_broker_instrument(contract, None).map_err(|e| unprocessable(format!("conId {con_id}: {e}")))?);
     }
     dropped(client.as_ref())?;
     let report = save_instruments(state.pool(), instruments)
@@ -333,7 +333,7 @@ async fn refresh(pool: &PgPool, client: &dyn TwsClient) -> Result<RefreshReport,
         let q = ContractQuery { con_id: Some(con_id), ..Default::default() };
         match client.contract_details(&q).await {
             Ok(found) => match found.first() {
-                Some(c) => match to_broker_instrument(c) {
+                Some(c) => match to_broker_instrument(c, None) {
                     Ok(bi) => current.push(bi),
                     Err(e) => tracing::warn!(con_id, error = %e, "IBKR instrument refresh: contract not savable; left alone"),
                 },
@@ -487,6 +487,13 @@ mod tests {
             lot_size: None,
             name: "SAP SE".into(),
             isin: None,
+            sec_type: gateway::connectors::ibkr_tws::client::SecType::Stk,
+            local_symbol: String::new(),
+            multiplier: 1.0,
+            last_trade: None,
+            last_trade_at: None,
+            strike: None,
+            right: None,
         }
     }
 
@@ -581,7 +588,7 @@ mod tests {
         async fn completed_orders(&self) -> Result<Vec<(i32, String, gateway::connectors::ibkr_tws::client::TwsOrderState)>, TwsError> { unimplemented!() }
         async fn executions(&self, _: &str, _: chrono::DateTime<chrono::Utc>) -> Result<Vec<gateway::connectors::ibkr_tws::client::TwsEvent>, TwsError> { unimplemented!() }
         async fn matching_symbols(&self, _: &str) -> Result<Vec<TwsContract>, TwsError> { unimplemented!() }
-        async fn prev_close(&self, _: i64) -> Result<Option<f64>, TwsError> { unimplemented!() }
+        async fn prev_close(&self, _: i64, _: gateway::connectors::ibkr_tws::client::SecType, _: &str) -> Result<Option<f64>, TwsError> { unimplemented!() }
         async fn managed_accounts(&self) -> Result<Vec<String>, TwsError> { unimplemented!() }
         fn events(&self) -> tokio::sync::broadcast::Receiver<gateway::connectors::ibkr_tws::client::TwsEvent> { unimplemented!() }
         fn connected(&self) -> bool { !self.down }
@@ -609,7 +616,7 @@ mod tests {
         let (mut a, mut b) = (contract(kept, "IBIS"), contract(gone, "IBIS"));
         a.symbol = "ZKEEP".into();
         b.symbol = "ZGONE".into();
-        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()])
+        save_instruments(&pool, vec![to_broker_instrument(&a, None).unwrap(), to_broker_instrument(&b, None).unwrap()])
             .await
             .unwrap();
 
@@ -634,7 +641,7 @@ mod tests {
         let (mut a, mut b) = (contract(refused, "IBIS"), contract(ok, "IBIS"));
         a.symbol = "ZREFUSED".into();
         b.symbol = "ZOKTICK".into();
-        save_instruments(&pool, vec![to_broker_instrument(&a).unwrap(), to_broker_instrument(&b).unwrap()])
+        save_instruments(&pool, vec![to_broker_instrument(&a, None).unwrap(), to_broker_instrument(&b, None).unwrap()])
             .await
             .unwrap();
 
@@ -658,7 +665,7 @@ mod tests {
         let con_id = 990_000_021_i64;
         let mut c = contract(con_id, "IBIS");
         c.symbol = "ZTICK".into();
-        save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()]).await.unwrap();
+        save_instruments(&pool, vec![to_broker_instrument(&c, None).unwrap()]).await.unwrap();
 
         c.min_tick = 0.05;
         let client = Scripted { details: [(con_id, c)].into(), ..Default::default() };
@@ -689,6 +696,50 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn a_future_is_saved_with_its_broker_expiry_and_resaves_keep_it() {
+        use gateway::connectors::ibkr_tws::client::SecType;
+        use gateway::connectors::ibkr_tws::resolve::RootSpec;
+        let pool = isolated_pool().await;
+        let at = chrono::DateTime::parse_from_rfc3339("2026-12-18T14:30:00Z").unwrap().with_timezone(&chrono::Utc);
+        let mut c = TwsContract {
+            con_id: 990_000_041,
+            symbol: "ES".into(),
+            exchange: "CME".into(),
+            primary_exchange: String::new(),
+            currency: "USD".into(),
+            min_tick: 0.25,
+            lot_size: None,
+            name: "E-mini S&P 500".into(),
+            isin: None,
+            sec_type: SecType::Fut,
+            local_symbol: "ESZ6".into(),
+            multiplier: 50.0,
+            last_trade: chrono::NaiveDate::from_ymd_opt(2026, 12, 18),
+            last_trade_at: Some(at),
+            strike: None,
+            right: None,
+        };
+        let root = RootSpec { code: "ES".into(), asset_class: "INDEX".into() };
+        save_instruments(&pool, vec![to_broker_instrument(&c, Some(&root)).unwrap()]).await.unwrap();
+        let read = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                "SELECT d.expires_at FROM instrument_derivative d JOIN instrument i ON i.id = d.instrument_id \
+                 WHERE i.symbol = 'ESZ6' AND i.venue = 'XCME'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(read(pool.clone()).await, Some(at));
+
+        // IBKR sometimes sends no time: the stored instant stays.
+        c.last_trade_at = None;
+        save_instruments(&pool, vec![to_broker_instrument(&c, Some(&root)).unwrap()]).await.unwrap();
+        assert_eq!(read(pool.clone()).await, Some(at));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn saving_twice_is_idempotent() {
         let pool = isolated_pool().await;
         // A conId no real run would use, so reruns and the shared CI database agree.
@@ -711,9 +762,9 @@ mod tests {
                 .unwrap()
         };
 
-        let first = save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()]).await.unwrap();
+        let first = save_instruments(&pool, vec![to_broker_instrument(&c, None).unwrap()]).await.unwrap();
         assert_eq!((first.mapped, first.skipped), (1, 0), "{first:?}");
-        let second = save_instruments(&pool, vec![to_broker_instrument(&c).unwrap()]).await.unwrap();
+        let second = save_instruments(&pool, vec![to_broker_instrument(&c, None).unwrap()]).await.unwrap();
         assert_eq!((second.mapped, second.skipped), (1, 0));
         assert_eq!(count(pool.clone()).await, 1);
         assert_eq!(master(pool.clone()).await, 1);

@@ -56,6 +56,9 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 /// every contract on that venue at the next tick. `IS DISTINCT FROM` rather than `<>`
 /// so a row that has never been computed (NULL) also matches.
 ///
+/// A FUTURE keeps an `expires_at` the broker gave (IBKR states the last trade instant);
+/// only a NULL one is filled from the calendar.
+///
 /// A contract whose venue has no calendar row, or whose calendar has no `close_time`,
 /// is skipped and keeps a NULL `expires_at` — it can never be swept, so preflight
 /// reports it rather than this function inventing an hour for it.
@@ -69,6 +72,7 @@ pub async fn recompute_expires_at(pool: &PgPool) -> Result<u64, sqlx::Error> {
          WHERE  d.instrument_id = i.id \
            AND  d.expiry_date IS NOT NULL \
            AND  c.close_time IS NOT NULL \
+           AND  (i.instrument_class <> 'FUTURE' OR d.expires_at IS NULL) \
            AND  d.expires_at IS DISTINCT FROM \
                 (d.expiry_date + c.close_time) AT TIME ZONE c.timezone",
     )

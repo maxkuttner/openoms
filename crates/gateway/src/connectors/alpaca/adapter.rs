@@ -270,6 +270,7 @@ impl AlpacaAdapter {
                     expiry_date: c["expiration_date"]
                         .as_str()
                         .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()),
+                    expires_at: None,
                     activation_date: None,
                 };
                 let definition = InstrumentDef {

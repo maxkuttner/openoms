@@ -214,7 +214,9 @@ async fn bulk_upsert_derivatives(
     let mut option_kind: Vec<Option<String>> = Vec::with_capacity(chunk.len());
     let mut strike_price: Vec<Option<f64>> = Vec::with_capacity(chunk.len());
     let mut expiry_date: Vec<Option<chrono::NaiveDate>> = Vec::with_capacity(chunk.len());
+    let mut expires_at: Vec<Option<chrono::DateTime<chrono::Utc>>> = Vec::with_capacity(chunk.len());
     let mut activation_date: Vec<Option<chrono::NaiveDate>> = Vec::with_capacity(chunk.len());
+    let mut untracked_ok: Vec<bool> = Vec::with_capacity(chunk.len());
     for d in chunk {
         let (Some(&id), Some(dv)) =
             (ids.get(&(d.symbol.clone(), d.venue.clone())), d.derivative.as_ref())
@@ -229,6 +231,10 @@ async fn bulk_upsert_derivatives(
         }));
         strike_price.push(dv.strike_price);
         expiry_date.push(dv.expiry_date);
+        expires_at.push(dv.expires_at);
+        // A futures root (ES) is not itself an instrument; its contracts keep
+        // the root as `underlying_symbol` with no `underlying_id`.
+        untracked_ok.push(d.instrument_class == "FUTURE");
         activation_date.push(dv.activation_date);
     }
     if instrument_id.is_empty() {
@@ -238,17 +244,20 @@ async fn bulk_upsert_derivatives(
     let affected = sqlx::query(
         "INSERT INTO instrument_derivative \
             (instrument_id, underlying_id, underlying_symbol, \
-             option_kind, strike_price, expiry_date, activation_date) \
-         SELECT t.iid, u.id, t.us, t.ok, t.strike, t.exp, t.act \
+             option_kind, strike_price, expiry_date, expires_at, activation_date) \
+         SELECT t.iid, u.id, t.us, t.ok, t.strike, t.exp, t.exat, t.act \
          FROM UNNEST($1::bigint[], $2::text[], $3::text[], $4::float8[], \
-                     $5::date[], $6::date[]) AS t(iid, us, ok, strike, exp, act) \
-         JOIN instrument u ON u.symbol = t.us AND u.instrument_class = 'SPOT' \
+                     $5::date[], $6::timestamptz[], $7::date[], $8::bool[]) \
+              AS t(iid, us, ok, strike, exp, exat, act, orphan_ok) \
+         LEFT JOIN instrument u ON u.symbol = t.us AND u.instrument_class = 'SPOT' \
+         WHERE u.id IS NOT NULL OR t.orphan_ok \
          ON CONFLICT (instrument_id) DO UPDATE SET \
             underlying_id = EXCLUDED.underlying_id, \
             underlying_symbol = EXCLUDED.underlying_symbol, \
             option_kind = EXCLUDED.option_kind, \
             strike_price = EXCLUDED.strike_price, \
             expiry_date = EXCLUDED.expiry_date, \
+            expires_at = COALESCE(EXCLUDED.expires_at, instrument_derivative.expires_at), \
             activation_date = EXCLUDED.activation_date",
     )
     .bind(&instrument_id)
@@ -256,7 +265,9 @@ async fn bulk_upsert_derivatives(
     .bind(&option_kind)
     .bind(&strike_price)
     .bind(&expiry_date)
+    .bind(&expires_at)
     .bind(&activation_date)
+    .bind(&untracked_ok)
     .execute(&mut **tx)
     .await?
     .rows_affected();
