@@ -1,7 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./client";
 import { notify } from "../components/notify";
-import type { AlertRow, FutureRoot, RollIds, RollRequest } from "./types";
+import type { AlertRow, FutureRoot, RollIds, RollRequest, RollTargetRow } from "./types";
 
 export function useList<T>(path: string, enabled = true) {
   return useQuery<T[]>({ queryKey: [path], queryFn: () => api.get<T[]>(path), enabled });
@@ -37,6 +37,16 @@ export function useFutureRoots() {
   return useQuery<FutureRoot[]>({ queryKey: ["/futures/roots"], queryFn: () => api.get<FutureRoot[]>("/futures/roots"), staleTime: 60_000 });
 }
 
+/** Held futures positions of one portfolio with the contract each rolls into; follows the live `positions` notice. */
+export function useRollTargets(portfolioId: string | null, live: boolean) {
+  return useQuery<RollTargetRow[]>({
+    queryKey: ["/futures/roll-targets", portfolioId],
+    queryFn: () => api.get<RollTargetRow[]>(`/futures/roll-targets?portfolio_id=${portfolioId}`),
+    enabled: portfolioId !== null,
+    refetchInterval: live ? false : 30_000,
+  });
+}
+
 /** Unacknowledged alerts on the portfolios the caller can view; refreshed by the live `alerts` notice. */
 export function useAlerts(live: boolean) {
   return useQuery<AlertRow[]>({
@@ -52,7 +62,7 @@ export function useAckAlert() {
 
 export function useSubmitRoll(onDone?: () => void) {
   return useApiMutation((req: RollRequest) => api.post<RollIds>("/orders/roll", req), {
-    invalidate: ["/orders", "/portfolios", "/alerts"],
+    invalidate: ["/orders", "/portfolios", "/alerts", "/futures/roll-targets"],
     success: "Roll submitted",
     onDone,
   });

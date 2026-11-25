@@ -65,6 +65,7 @@ export function AlertBanner({ me }: { me: Me }) {
                     <Button size="sm" onClick={() => setTarget({
                       portfolioId: a.portfolio_id,
                       portfolioCode: codeOf(a.portfolio_id),
+                      root: offer.root,
                       netQty,
                       nearInstrumentId: offer.nearInstrumentId,
                       nearSymbol: offer.nearSymbol,

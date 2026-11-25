@@ -178,11 +178,15 @@ pub async fn list_alerts(
 }
 
 /// Acknowledge an alert so it stops being listed
+///
+/// Dismissing a roll warning is a trading decision on the portfolio, so it
+/// takes `OrdersCreate` there, not just the right to see it.
 #[utoipa::path(
     post, path = "/alerts/{id}/ack", tag = "orders",
     params(("id" = Uuid, Path, description = "Alert ID")),
     responses(
         (status = 204, description = "Acknowledged (also when it already was)"),
+        (status = 403, description = "The caller can see the alert but may not trade its portfolio"),
         (status = 404, description = "No such alert, or on a portfolio the caller cannot view"),
     ),
     security(("basic_auth" = []), ("bearer_token" = []))
@@ -192,22 +196,27 @@ pub async fn ack_alert(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
+    let not_found = || ApiError { status: StatusCode::NOT_FOUND, message: "alert not found".into() };
+    let portfolio: Option<Uuid> = sqlx::query_scalar("SELECT portfolio_id FROM alert WHERE id = $1")
+        .bind(id)
+        .fetch_optional(state.pool())
+        .await
+        .map_err(|e| internal("failed to load alert", e))?;
+    let Some(portfolio) = portfolio else { return Err(not_found()) };
+    // seen exactly as `list_alerts` sees it
     let visible = authz::visible_portfolios(state.pool(), auth.principal_id, Permission::PositionsView)
         .await
         .map_err(|e| internal("failed to load portfolio access", e))?;
-    let found: Option<Uuid> = sqlx::query_scalar(
-        "UPDATE alert SET acknowledged_at = COALESCE(acknowledged_at, now()) \
-         WHERE id = $1 AND portfolio_id = ANY($2) RETURNING id",
-    )
-    .bind(id)
-    .bind(&visible)
-    .fetch_optional(state.pool())
-    .await
-    .map_err(|e| internal("failed to acknowledge alert", e))?;
-    match found {
-        Some(_) => Ok(StatusCode::NO_CONTENT),
-        None => Err(ApiError { status: StatusCode::NOT_FOUND, message: "alert not found".into() }),
+    if !visible.contains(&portfolio) {
+        return Err(not_found());
     }
+    authz::require(state.pool(), auth.principal_id, Permission::OrdersCreate, portfolio).await?;
+    sqlx::query("UPDATE alert SET acknowledged_at = COALESCE(acknowledged_at, now()) WHERE id = $1")
+        .bind(id)
+        .execute(state.pool())
+        .await
+        .map_err(|e| internal("failed to acknowledge alert", e))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -358,5 +367,47 @@ mod tests {
         // a second drain sends nothing more
         drain(&pool, &sink, &topics, 100).await.unwrap();
         assert_eq!(sink.0.lock().unwrap().iter().filter(|r| r.topic == "alerts").count(), 1);
+    }
+
+    /// A principal on `pf` with the given access (no access when `None`).
+    async fn person(pool: &PgPool, pf: Uuid, access: Option<(bool, bool)>) -> AuthContext {
+        let (me, code) = crate::handlers::tests::seed_principal(pool, "ack").await;
+        if let Some((view, trade)) = access {
+            sqlx::query("INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view, can_trade) VALUES ($1, $2, $3, $4, $5)")
+                .bind(Uuid::new_v4()).bind(me).bind(pf).bind(view).bind(trade).execute(pool).await.unwrap();
+        }
+        AuthContext::machine(me, code)
+    }
+
+    async fn ack(pool: &PgPool, who: &AuthContext, id: Uuid) -> Result<StatusCode, ApiError> {
+        ack_alert(State(crate::strategies::test_support::state(pool.clone())), Extension(who.clone()), Path(id)).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn acking_takes_the_right_to_trade_the_portfolio() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let pf = crate::groups_api::tests::portfolio(&pool).await;
+        crate::order_entry::tests::g_defaults(&pool, &[crate::access_grants::GrantKey::Orders]).await;
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO alert (id, kind, portfolio_id, dedupe_key) VALUES ($1, 'ROLL_DUE', $2, $3)")
+            .bind(id).bind(pf).bind(format!("ROLL_DUE:{id}")).execute(&pool).await.unwrap();
+        let acked = |pool: PgPool| async move {
+            sqlx::query_scalar::<_, bool>("SELECT acknowledged_at IS NOT NULL FROM alert WHERE id = $1").bind(id).fetch_one(&pool).await.unwrap()
+        };
+        // cannot see the portfolio: no such alert, for them
+        let outsider = person(&pool, pf, None).await;
+        assert_eq!(ack(&pool, &outsider, id).await.unwrap_err().status, StatusCode::NOT_FOUND);
+        // sees it, may not trade it: forbidden
+        let viewer = person(&pool, pf, Some((true, false))).await;
+        assert_eq!(ack(&pool, &viewer, id).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        assert!(!acked(pool.clone()).await);
+        // an unknown id is a 404 for anyone
+        let trader = person(&pool, pf, Some((true, true))).await;
+        assert_eq!(ack(&pool, &trader, Uuid::new_v4()).await.unwrap_err().status, StatusCode::NOT_FOUND);
+        assert_eq!(ack(&pool, &trader, id).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(acked(pool.clone()).await);
+        // again: still fine
+        assert_eq!(ack(&pool, &trader, id).await.unwrap(), StatusCode::NO_CONTENT);
     }
 }

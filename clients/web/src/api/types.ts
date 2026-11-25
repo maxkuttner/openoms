@@ -230,8 +230,22 @@ export interface FutureRoot {
   name: string;
   venue: string;
   roll_warn_days: number;
+  /** Price increment of the root's calendar spreads, i.e. a roll's limit price (ES: 0.05). */
+  spread_tick: number;
   front: FutureContract | null;
   next: FutureContract | null;
+}
+
+/** GET /futures/roll-targets: a held futures position and the contract it rolls into. */
+export interface RollTargetRow {
+  portfolio_id: string;
+  instrument_id: number;
+  symbol: string;
+  root: string;
+  net_qty: number;
+  roll_date: string;
+  roll_warn_days: number;
+  next: { instrument_id: number; symbol: string };
 }
 
 /** GET /alerts; `payload` is kind-specific (ROLL_DUE: see RollDuePayload). */

@@ -92,7 +92,7 @@ mod tests {
     /// `init` report success having created no schema at all.
     #[test]
     fn embeds_every_migration() {
-        assert_eq!(migrations(&TARGETS[0]).len(), 28, "public migrations");
+        assert_eq!(migrations(&TARGETS[0]).len(), 29, "public migrations");
         assert_eq!(migrations(&TARGETS[1]).len(), 81, "oms migrations");
         for t in &TARGETS {
             for (name, sql) in migrations(t) {

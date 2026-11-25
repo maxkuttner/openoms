@@ -22,16 +22,18 @@ export const WATCHDOG_MS = 40_000;
 //   ["/orders", …]                    blotter list and the followed order
 //   ["/portfolios", id, "positions"]  positions
 //   ["/marks", ids[]]                 watchlist and positions marks (ids as strings)
+//   ["/futures/roll-targets", id]     what each held future rolls into (follows positions)
 const isOrders = (key: readonly unknown[]) => key[0] === "/orders";
 const isAlerts = (key: readonly unknown[]) => key[0] === "/alerts";
 const isPositions = (key: readonly unknown[]) => key[0] === "/portfolios" && key[2] === "positions";
+const isRollTargets = (key: readonly unknown[]) => key[0] === "/futures/roll-targets";
 
 export function staleFor(n: UiNotice): (queryKey: readonly unknown[]) => boolean {
   switch (n.type) {
     case "orders":
       return isOrders;
     case "positions":
-      return isPositions;
+      return (key) => isPositions(key) || isRollTargets(key);
     case "alerts":
       return isAlerts;
     case "resync":

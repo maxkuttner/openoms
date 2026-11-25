@@ -2,18 +2,18 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   rollLegs, searchRootEntries, rollBadgeDue, bannerText, defaultSpreadPrice, clampQty, defaultQty,
-  venueToday, visibleRollAlerts, rollOffer, daysUntil,
-  type FutureRoot, type AlertRow,
+  venueToday, visibleRollAlerts, rollOffer, daysUntil, spreadTickOf,
+  type FutureRoot, type AlertRow, type RollTargetRow,
 } from "./futures.ts";
 import { staleFor } from "./api/liveUpdatesCore.ts";
 
 const es: FutureRoot = {
-  code: "ES", name: "E-mini S&P 500", venue: "CME", roll_warn_days: 5,
+  code: "ES", name: "E-mini S&P 500", venue: "CME", roll_warn_days: 5, spread_tick: 0.05,
   front: { instrument_id: 11, symbol: "ESZ6", expiry_date: "2026-12-18", roll_date: "2026-12-10", contract_size: 50 },
   next: { instrument_id: 12, symbol: "ESH7", expiry_date: "2027-03-19", roll_date: "2027-03-11", contract_size: 50 },
 };
 const nq: FutureRoot = {
-  code: "NQ", name: "E-mini Nasdaq-100", venue: "CME", roll_warn_days: 5,
+  code: "NQ", name: "E-mini Nasdaq-100", venue: "CME", roll_warn_days: 5, spread_tick: 0.05,
   front: { instrument_id: 21, symbol: "NQZ6", expiry_date: "2026-12-18", roll_date: "2026-12-10", contract_size: 20 },
   next: null,
 };
@@ -76,6 +76,21 @@ test("default spread price is net debit (buy mids minus sell mids)", () => {
   assert.equal(defaultSpreadPrice(4, 5000, 5000), 0);
 });
 
+test("default spread price rounds to the nearest spread tick", () => {
+  // a one-tick book on each leg: mids sit on half ticks of the legs' 0.25
+  assert.equal(defaultSpreadPrice(4, 5000.125, 5040.375, 0.05), 40.25);
+  assert.equal(defaultSpreadPrice(4, 5000.125, 5040.25, 0.05), 40.15); // 40.125 -> nearest 0.05
+  assert.equal(defaultSpreadPrice(-2, 5000.125, 5040.375, 0.05), -40.25);
+  assert.equal(defaultSpreadPrice(4, 5000.12, 5040.14, 0.05), 40);
+  assert.equal(defaultSpreadPrice(4, 5000, 5000.01, 0.05), 0);
+  assert.equal(defaultSpreadPrice(4, 5000, 5000.03, 0.25), 0);
+  assert.equal(defaultSpreadPrice(4, 5000, 5000.13, 0.25), 0.25);
+  // no tick known: unrounded
+  assert.equal(defaultSpreadPrice(4, 5000.125, 5040.25, null), 40.125);
+  assert.equal(spreadTickOf("ES", [es, nq]), 0.05);
+  assert.equal(spreadTickOf("ZZ", [es]), null);
+});
+
 test("qty defaults to the full position and clamps to it", () => {
   assert.equal(defaultQty(-4), 4);
   assert.equal(clampQty(10, 4), 4);
@@ -83,7 +98,10 @@ test("qty defaults to the full position and clamps to it", () => {
   assert.equal(clampQty(0, 4), null);
   assert.equal(clampQty(-1, 4), null);
   assert.equal(clampQty(Number.NaN, 4), null);
-  assert.equal(clampQty(1.5, 4), 1.5);
+  // whole contracts only
+  assert.equal(clampQty(1.5, 4), null);
+  assert.equal(clampQty(0.5, 4), null);
+  assert.equal(clampQty(3, 4), 3);
 });
 
 const alert = (over: Partial<AlertRow> = {}): AlertRow => ({
@@ -104,17 +122,29 @@ test("banner hides alerts whose position is now flat or gone", () => {
   assert.equal(visibleRollAlerts([alert({ kind: "OTHER" })], open).length, 0);
 });
 
-test("rollOffer from roots, falling back to the alert for an overdue contract", () => {
+const target = (over: Partial<RollTargetRow> = {}): RollTargetRow => ({
+  portfolio_id: "p1", instrument_id: 11, symbol: "ESZ6", root: "ES", net_qty: 4,
+  roll_date: "2026-12-10", roll_warn_days: 5, next: { instrument_id: 12, symbol: "ESH7" }, ...over,
+});
+test("rollOffer from the OMS's roll target, overdue (and alert dismissed) included", () => {
   const pos = { portfolio_id: "p1", instrument_id: "11", net_qty: 4 };
-  const o = rollOffer(pos, [es], [], "2026-12-06");
-  assert.deepEqual([o?.nearSymbol, o?.farSymbol, o?.farInstrumentId, o?.due], ["ESZ6", "ESH7", 12, true]);
-  assert.equal(rollOffer(pos, [es], [], "2026-11-01")?.due, false);
-  assert.equal(rollOffer({ ...pos, instrument_id: "99" }, [es], [], "2026-12-06"), null);
-  assert.equal(rollOffer({ ...pos, instrument_id: "21" }, [nq], [], "2026-12-06"), null);
-  const late = { ...es, front: es.next, next: null };
-  const f = rollOffer(pos, [late], [alert()], "2026-12-12");
-  assert.deepEqual([f?.nearSymbol, f?.farInstrumentId, f?.due], ["ESZ6", 12, true]);
-  assert.equal(rollOffer({ ...pos, net_qty: 0 }, [es], [], "2026-12-06"), null);
+  const o = rollOffer(pos, [target()], "2026-12-06");
+  assert.deepEqual([o?.root, o?.nearSymbol, o?.farSymbol, o?.farInstrumentId, o?.due], ["ES", "ESZ6", "ESH7", 12, true]);
+  assert.equal(rollOffer(pos, [target()], "2026-11-01")?.due, false);
+  // past the roll date, no alert anywhere: still offered, and due
+  const late = rollOffer(pos, [target()], "2026-12-12");
+  assert.deepEqual([late?.nearSymbol, late?.farInstrumentId, late?.due], ["ESZ6", 12, true]);
+  assert.equal(rollOffer({ ...pos, instrument_id: "99" }, [target()], "2026-12-06"), null);
+  assert.equal(rollOffer({ ...pos, portfolio_id: "p2" }, [target()], "2026-12-06"), null);
+  assert.equal(rollOffer({ ...pos, net_qty: 0 }, [target()], "2026-12-06"), null);
+  assert.equal(rollOffer(pos, [], "2026-12-06"), null);
+});
+
+test("a positions notice stales positions and roll targets", () => {
+  const stale = staleFor({ type: "positions" });
+  assert.equal(stale(["/portfolios", "p1", "positions"]), true);
+  assert.equal(stale(["/futures/roll-targets", "p1"]), true);
+  assert.equal(stale(["/futures/roots"]), false);
 });
 
 test("an alerts notice stales the alerts query only", () => {

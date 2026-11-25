@@ -62,9 +62,11 @@ fn unprocessable(message: String) -> ApiError {
 }
 
 /// The spread instrument for `near_id`/`far_id`, created on first use:
-/// symbol `<NEAR>-<FAR>`, venue `XCME`, class `FUTURE`, the near leg's tick,
-/// precision, currency and contract size; no derivative row and no
-/// broker_instrument row (routing builds the combo from the legs).
+/// symbol `<NEAR>-<FAR>`, venue `XCME`, class `FUTURE`, the root's spread tick
+/// (`future_root.spread_tick`, finer than the legs': 0.05 for ES) as price
+/// increment and precision, the near leg's currency and contract size; no
+/// derivative row and no broker_instrument row (routing builds the combo from
+/// the legs).
 pub async fn ensure_spread(pool: &PgPool, near_id: i64, far_id: i64) -> Result<i64, sqlx::Error> {
     if let Some(id) = sqlx::query_scalar("SELECT instrument_id FROM future_spread WHERE near_id = $1 AND far_id = $2")
         .bind(near_id)
@@ -80,8 +82,13 @@ pub async fn ensure_spread(pool: &PgPool, near_id: i64, far_id: i64) -> Result<i
                                  price_precision, size_precision, price_increment, size_increment, contract_size) \
          SELECT n.symbol || '-' || f.symbol, 'XCME', n.symbol || '-' || f.symbol || ' calendar spread', \
                 n.asset_class, 'FUTURE', n.currency, 'ACTIVE', \
-                n.price_precision, n.size_precision, n.price_increment, n.size_increment, n.contract_size \
-         FROM instrument n, instrument f WHERE n.id = $1 AND f.id = $2 \
+                COALESCE(scale(r.spread_tick), n.price_precision), n.size_precision, \
+                COALESCE(r.spread_tick, n.price_increment), n.size_increment, n.contract_size \
+         FROM instrument n \
+         JOIN instrument f ON f.id = $2 \
+         LEFT JOIN instrument_derivative d ON d.instrument_id = n.id \
+         LEFT JOIN future_root r ON r.code = d.underlying_symbol \
+         WHERE n.id = $1 \
          ON CONFLICT (symbol, venue) DO NOTHING",
     )
     .bind(near_id)
@@ -109,6 +116,15 @@ pub async fn ensure_spread(pool: &PgPool, near_id: i64, far_id: i64) -> Result<i
         .bind(far_id)
         .fetch_one(pool)
         .await
+}
+
+/// Whether `price` is a whole number of `tick`s (negative prices included).
+fn on_tick(price: f64, tick: f64) -> bool {
+    if !(tick > 0.0) {
+        return true;
+    }
+    let ticks = price / tick;
+    (ticks - ticks.round()).abs() < 1e-6
 }
 
 /// One leg contract as a roll needs it.
@@ -256,6 +272,17 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
 
     let spread = ensure_spread(&pool, from.id, to.id).await.map_err(|e| internal("failed to create the spread instrument", e))?;
     let spread_symbol = format!("{}-{}", from.symbol, to.symbol);
+    // A limit roll is priced on the spread's own tick (0.05 for ES), not the legs'.
+    if let Some(px) = req.limit_price {
+        let tick: f64 = sqlx::query_scalar("SELECT price_increment::float8 FROM instrument WHERE id = $1")
+            .bind(spread)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| internal("failed to load the spread tick", e))?;
+        if !on_tick(px, tick) {
+            return Err(unprocessable(format!("roll limit price {px} is not a multiple of the {spread_symbol} spread tick {tick}")));
+        }
+    }
 
     // The three orders. The parent carries the spread price; the children are
     // unpriced (they fill at the leg prices of the one combo order).
@@ -437,7 +464,7 @@ pub async fn route_children(
         (status = 400, description = "Validation error"),
         (status = 403, description = "No trade grant for principal/portfolio"),
         (status = 409, description = "Strategy portfolio"),
-        (status = 422, description = "No such position, quantity above it, not a later contract of the same root, no tradeable mapping, or rejected by pre-trade risk (then the roll and both legs are rejected)"),
+        (status = 422, description = "No such position, quantity above it, not a later contract of the same root, a limit price off the spread tick, no tradeable mapping, or rejected by pre-trade risk (then the roll and both legs are rejected)"),
         (status = 502, description = "Broker rejected the roll, or did not answer"),
         (status = 503, description = "No broker adapter configured"),
     ),
@@ -708,6 +735,30 @@ mod tests {
         assert_eq!(status(&w.pool, ids.parent_order_id).await, "routed");
     }
 
+    #[test]
+    fn prices_on_the_spread_tick() {
+        assert!(on_tick(12.25, 0.05) && on_tick(-1.35, 0.05) && on_tick(0.0, 0.05) && on_tick(40.1, 0.05));
+        assert!(!on_tick(12.27, 0.05) && !on_tick(-0.01, 0.05));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn a_limit_off_the_spread_tick_is_refused() {
+        let w = world(4.0, false).await;
+        let mut r = roll(&w, 1.0);
+        r.limit_price = Some(12.27);
+        let e = submit_roll(&w.state, &w.me, r).await.unwrap_err();
+        assert_eq!(
+            (e.status, e.message.as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, "roll limit price 12.27 is not a multiple of the ESZ6-ESH7 spread tick 0.05")
+        );
+        assert_eq!(order_count(&w.pool, w.pf).await, 0);
+        // 0.05 steps the legs' 0.25 tick cannot price are fine
+        let mut r = roll(&w, 1.0);
+        r.limit_price = Some(12.35);
+        submit_roll(&w.state, &w.me, r).await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
     async fn a_leg_below_the_broker_minimum_is_refused() {
@@ -806,7 +857,10 @@ mod tests {
         .unwrap();
         assert_eq!(spreads.len(), 1);
         let (id, venue, class, size, tick) = spreads[0].clone();
-        assert_eq!((venue.as_str(), class.as_str(), size, tick), ("XCME", "FUTURE", 50.0, 0.25));
+        // the root's spread tick, not the legs' 0.25
+        assert_eq!((venue.as_str(), class.as_str(), size, tick), ("XCME", "FUTURE", 50.0, 0.05));
+        let precision: i32 = sqlx::query_scalar("SELECT price_precision FROM instrument WHERE id = $1").bind(id).fetch_one(&w.pool).await.unwrap();
+        assert_eq!(precision, 2);
         let legs: Vec<(i64, i64, i64)> = sqlx::query_as("SELECT instrument_id, near_id, far_id FROM future_spread").fetch_all(&w.pool).await.unwrap();
         assert_eq!(legs, vec![(id, w.near, w.far)]);
         assert_eq!(ensure_spread(&w.pool, w.near, w.far).await.unwrap(), id);

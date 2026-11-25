@@ -2550,6 +2550,7 @@
           "orders"
         ],
         "summary": "Acknowledge an alert so it stops being listed",
+        "description": "Dismissing a roll warning is a trading decision on the portfolio, so it\ntakes `OrdersCreate` there, not just the right to see it.",
         "operationId": "ack_alert",
         "parameters": [
           {
@@ -2566,6 +2567,9 @@
         "responses": {
           "204": {
             "description": "Acknowledged (also when it already was)"
+          },
+          "403": {
+            "description": "The caller can see the alert but may not trade its portfolio"
           },
           "404": {
             "description": "No such alert, or on a portfolio the caller cannot view"
@@ -3024,6 +3028,54 @@
         }
       }
     },
+    "/futures/roll-targets": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "summary": "List the roll target of each held futures position",
+        "operationId": "list_roll_targets",
+        "parameters": [
+          {
+            "name": "portfolio_id",
+            "in": "path",
+            "description": "Only this portfolio's positions (default: every portfolio the caller can view).",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "nullable": true
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Held futures positions on the portfolios the caller can view, each with the contract it rolls into (overdue contracts included)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RollTargetView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/futures/roots": {
       "get": {
         "tags": [
@@ -3451,7 +3503,7 @@
             "description": "Strategy portfolio"
           },
           "422": {
-            "description": "No such position, quantity above it, not a later contract of the same root, no tradeable mapping, or rejected by pre-trade risk (then the roll and both legs are rejected)"
+            "description": "No such position, quantity above it, not a later contract of the same root, a limit price off the spread tick, no tradeable mapping, or rejected by pre-trade risk (then the roll and both legs are rejected)"
           },
           "502": {
             "description": "Broker rejected the roll, or did not answer"
@@ -4438,6 +4490,23 @@
           }
         }
       },
+      "ContractRef": {
+        "type": "object",
+        "description": "A listed contract, by id and symbol.",
+        "required": [
+          "instrument_id",
+          "symbol"
+        ],
+        "properties": {
+          "instrument_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
       "ControlReport": {
         "type": "object",
         "description": "What a control action did, for the cockpit.",
@@ -4859,7 +4928,8 @@
           "code",
           "name",
           "venue",
-          "roll_warn_days"
+          "roll_warn_days",
+          "spread_tick"
         ],
         "properties": {
           "code": {
@@ -4888,6 +4958,11 @@
             "type": "integer",
             "format": "int32",
             "description": "Days before a contract's roll date from which the cockpit flags a held position."
+          },
+          "spread_tick": {
+            "type": "number",
+            "format": "double",
+            "description": "Price increment of the root's calendar spreads (a roll's limit price), e.g. 0.05 for ES."
           },
           "venue": {
             "type": "string"
@@ -5908,6 +5983,54 @@
             "type": "integer",
             "format": "int64",
             "description": "A later contract of the same root (the far leg)."
+          }
+        }
+      },
+      "RollTargetView": {
+        "type": "object",
+        "description": "A held futures position and the contract it rolls into.",
+        "required": [
+          "portfolio_id",
+          "instrument_id",
+          "symbol",
+          "root",
+          "net_qty",
+          "roll_date",
+          "roll_warn_days",
+          "next"
+        ],
+        "properties": {
+          "instrument_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The held contract."
+          },
+          "net_qty": {
+            "type": "number",
+            "format": "double"
+          },
+          "next": {
+            "$ref": "#/components/schemas/ContractRef"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "roll_date": {
+            "type": "string",
+            "format": "date",
+            "description": "The held contract's roll date (venue-local); past it the roll is overdue."
+          },
+          "roll_warn_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Days before `roll_date` from which the cockpit flags the position."
+          },
+          "root": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
           }
         }
       },

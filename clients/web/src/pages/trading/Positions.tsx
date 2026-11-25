@@ -13,7 +13,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { positionLabel } from "../../tradeTimes";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useAlerts, useFutureRoots } from "../../api/hooks";
+import { useRollTargets } from "../../api/hooks";
 import { daysUntil, rollOffer, venueToday } from "../../futures";
 import { RollDialog, type RollTarget } from "../../components/trading/RollDialog";
 import { totalsByCurrency } from "../../positions";
@@ -44,12 +44,11 @@ export function PositionsPage({ me, portfolioId: controlled }: { me: Me; portfol
   const rows = positions.data ?? [];
 
   // Futures: a held contract near its roll date gets a badge and a Roll action.
-  const roots = useFutureRoots();
-  const alerts = useAlerts(live);
+  // The OMS names each held contract's roll target, overdue ones included.
+  const targets = useRollTargets(portfolioId, live);
   const [rollTarget, setRollTarget] = useState<RollTarget | null>(null);
   const today = venueToday();
-  const offerFor = (p: PositionRow) =>
-    rollOffer(p, roots.data ?? [], (alerts.data ?? []).filter((a) => a.portfolio_id === p.portfolio_id), today);
+  const offerFor = (p: PositionRow) => rollOffer(p, targets.data ?? [], today);
   const portfolioCode = me.portfolios.find((x) => x.portfolio_id === portfolioId)?.code ?? "";
 
   const heldInstrumentIds = rows.map((p) => p.instrument_id);
@@ -171,7 +170,7 @@ export function PositionsPage({ me, portfolioId: controlled }: { me: Me; portfol
                       if (!o) return null;
                       return (
                         <Button size="xs" variant={o.due ? "default" : "secondary"} onClick={() => setRollTarget({
-                          portfolioId: p.portfolio_id, portfolioCode, netQty: p.net_qty,
+                          portfolioId: p.portfolio_id, portfolioCode, root: o.root, netQty: p.net_qty,
                           nearInstrumentId: o.nearInstrumentId, nearSymbol: o.nearSymbol,
                           farInstrumentId: o.farInstrumentId, farSymbol: o.farSymbol,
                         })}>Roll</Button>

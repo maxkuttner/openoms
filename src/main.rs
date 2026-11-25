@@ -168,6 +168,7 @@ mod first_run_tests;
         instruments_import::search,
         futures::sync::sync_now,
         futures::api::list_roots,
+        futures::api::list_roll_targets,
         alerts::list_alerts,
         alerts::ack_alert,
         admin::list_feeds,
@@ -215,7 +216,7 @@ mod first_run_tests;
         admin::RedactedCredentials, crate::credentials::RedactedField,
         jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
         instruments_import::Contract, instruments_import::ImportResolveRequest, instruments_import::ResolvedRow,
-        futures::sync::SyncReport, futures::api::FutureRootView, futures::front::FutureContract, rolls::RollRequest, rolls::RollIds, alerts::AlertView, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
+        futures::sync::SyncReport, futures::api::FutureRootView, futures::api::RollTargetView, futures::api::ContractRef, futures::front::FutureContract, rolls::RollRequest, rolls::RollIds, alerts::AlertView, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
         jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted, jobs::api::JobDetail,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
@@ -960,6 +961,7 @@ fn build_app(
         .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
         .route("/instruments/options/chain", get(instruments_api::get_option_chain))
         .route("/futures/roots", get(futures::api::list_roots))
+        .route("/futures/roll-targets", get(futures::api::list_roll_targets))
         .route("/alerts", get(alerts::list_alerts))
         .route("/alerts/:id/ack", post(alerts::ack_alert))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));

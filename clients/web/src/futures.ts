@@ -2,9 +2,9 @@
 // the alert banner and the roll dialog's defaults. Kept free of React so
 // `node --test` covers it (the web package has no DOM test setup).
 
-import type { AlertRow, FutureContract, FutureRoot } from "./api/types.ts";
+import type { AlertRow, FutureContract, FutureRoot, RollTargetRow } from "./api/types.ts";
 
-export type { AlertRow, FutureContract, FutureRoot };
+export type { AlertRow, FutureContract, FutureRoot, RollTargetRow };
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
@@ -64,18 +64,32 @@ export function rollLegs(netQty: number, near: string, far: string, qty: number 
   return netQty > 0 ? `Sell ${q} ${near} · Buy ${q} ${far}` : `Buy ${q} ${near} · Sell ${q} ${far}`;
 }
 
-/** Net debit per spread: buy-leg mids minus sell-leg mids. Null when either mid is unknown. */
-export function defaultSpreadPrice(netQty: number, nearMid: number | null, farMid: number | null): number | null {
+/** Decimal places of a tick (0.05 -> 2, 0.25 -> 2, 1 -> 0). */
+const tickDecimals = (tick: number) => {
+  const t = String(tick);
+  return t.includes("e-") ? Number(t.split("e-")[1]) : (t.split(".")[1] ?? "").length;
+};
+
+/**
+ * Net debit per spread: buy-leg mids minus sell-leg mids, rounded to the
+ * nearest spread tick when one is known (the OMS refuses a limit off it).
+ * Null when either mid is unknown.
+ */
+export function defaultSpreadPrice(netQty: number, nearMid: number | null, farMid: number | null, tick?: number | null): number | null {
   if (nearMid == null || farMid == null) return null;
   const v = netQty > 0 ? farMid - nearMid : nearMid - farMid;
+  if (tick != null && tick > 0) {
+    const r = Number((Math.round(v / tick) * tick).toFixed(tickDecimals(tick)));
+    return r === 0 ? 0 : r; // no -0
+  }
   return Math.round(v * 1e8) / 1e8;
 }
 
 export const defaultQty = (netQty: number) => Math.abs(netQty);
 
-/** The qty to send: capped at the position, null when not a positive number. */
+/** The qty to send: whole contracts, capped at the position; null when not a positive whole number. */
 export function clampQty(raw: number, netQty: number): number | null {
-  if (!Number.isFinite(raw) || raw <= 0) return null;
+  if (!Number.isInteger(raw) || raw <= 0) return null;
   return Math.min(raw, Math.abs(netQty));
 }
 
@@ -117,34 +131,32 @@ export interface RollOffer {
 
 /**
  * What rolling this position would do, or null when it cannot be rolled: the
- * held contract is a root's front contract with a next one, or (overdue
- * contracts are no longer front) a ROLL_DUE alert names its target.
+ * OMS's roll target for the held contract (GET /futures/roll-targets). That
+ * covers overdue contracts too (no longer front), whether or not their alert
+ * was dismissed.
  */
 export function rollOffer(
   position: { portfolio_id: string; instrument_id: string; net_qty: number },
-  roots: FutureRoot[],
-  alerts: AlertRow[],
+  targets: RollTargetRow[],
   today: string,
 ): RollOffer | null {
   if (position.net_qty === 0) return null;
-  for (const r of roots) {
-    if (r.front && String(r.front.instrument_id) === position.instrument_id) {
-      if (!r.next) return null;
-      return {
-        root: r.code,
-        nearInstrumentId: r.front.instrument_id,
-        nearSymbol: r.front.symbol,
-        farInstrumentId: r.next.instrument_id,
-        farSymbol: r.next.symbol,
-        rollDate: r.front.roll_date,
-        due: rollBadgeDue(today, r.front.roll_date, r.roll_warn_days),
-      };
-    }
-  }
-  const a = alerts.find(
-    (x) => x.kind === "ROLL_DUE" && x.portfolio_id === position.portfolio_id && String(x.instrument_id) === position.instrument_id,
-  );
-  return a ? offerFromAlert(a) : null;
+  const t = targets.find((x) => x.portfolio_id === position.portfolio_id && String(x.instrument_id) === position.instrument_id);
+  if (!t) return null;
+  return {
+    root: t.root,
+    nearInstrumentId: t.instrument_id,
+    nearSymbol: t.symbol,
+    farInstrumentId: t.next.instrument_id,
+    farSymbol: t.next.symbol,
+    rollDate: t.roll_date,
+    due: rollBadgeDue(today, t.roll_date, t.roll_warn_days),
+  };
+}
+
+/** The spread tick of `root`, or null when the root is unknown (no rounding then). */
+export function spreadTickOf(root: string, roots: FutureRoot[]): number | null {
+  return roots.find((r) => r.code === root)?.spread_tick ?? null;
 }
 
 /** The roll an alert's payload describes, or null if the payload is not the shape this client knows. */

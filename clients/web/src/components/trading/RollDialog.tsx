@@ -4,13 +4,15 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { NumberInput, Select } from "../form";
 import { api } from "../../api/client";
-import { useSubmitRoll } from "../../api/hooks";
-import { clampQty, defaultQty, defaultSpreadPrice, rollLegs } from "../../futures";
+import { useFutureRoots, useSubmitRoll } from "../../api/hooks";
+import { clampQty, defaultQty, defaultSpreadPrice, rollLegs, spreadTickOf } from "../../futures";
 import type { MarkRow } from "./types";
 
 export interface RollTarget {
   portfolioId: string;
   portfolioCode: string;
+  /** Futures root (ES): its spread tick prices the roll. */
+  root: string;
   /** Signed position in the near contract. */
   netQty: number;
   nearInstrumentId: number;
@@ -43,7 +45,8 @@ function RollForm({ target, onClose }: { target: RollTarget; onClose: () => void
     queryFn: () => api.get<MarkRow[]>(`/marks?instrument_ids=${ids.join(",")}`),
   });
   const mid = (id: number) => marks.data?.find((m) => m.instrument_id === id)?.mid ?? null;
-  const suggested = defaultSpreadPrice(netQty, mid(nearInstrumentId), mid(farInstrumentId));
+  const tick = spreadTickOf(target.root, useFutureRoots().data ?? []);
+  const suggested = defaultSpreadPrice(netQty, mid(nearInstrumentId), mid(farInstrumentId), tick);
   // Follow the marks until the trader types their own price.
   useEffect(() => {
     if (!edited && suggested !== null) setPrice(suggested);
@@ -53,7 +56,10 @@ function RollForm({ target, onClose }: { target: RollTarget; onClose: () => void
   const qtyNum = clampQty(typeof qty === "number" ? qty : Number.NaN, netQty);
   const priceNum = typeof price === "number" ? price : null;
   const limit = type === "limit";
-  const qtyError = qty !== "" && typeof qty === "number" && qty > Math.abs(netQty) ? `At most ${Math.abs(netQty)}` : undefined;
+  const qtyError =
+    qty === "" || typeof qty !== "number" ? undefined
+    : !Number.isInteger(qty) ? "Whole contracts only"
+    : qty > Math.abs(netQty) ? `At most ${Math.abs(netQty)}` : undefined;
   const ready = qtyNum !== null && qtyError === undefined && (!limit || priceNum !== null) && !roll.isPending;
 
   function submit() {
@@ -77,10 +83,10 @@ function RollForm({ target, onClose }: { target: RollTarget; onClose: () => void
       </DialogHeader>
       <p className="num font-medium" data-testid="roll-legs">{rollLegs(netQty, target.nearSymbol, target.farSymbol, qtyNum ?? defaultQty(netQty))}</p>
       <div className="grid grid-cols-2 gap-3">
-        <NumberInput label="Quantity" value={qty} onChange={setQty} min={0} max={Math.abs(netQty)} error={qtyError} />
+        <NumberInput label="Quantity" value={qty} onChange={setQty} min={1} max={Math.abs(netQty)} step={1} error={qtyError} />
         <Select label="Type" data={TYPES} value={type} onChange={(v) => v && setType(v)} />
         {limit && (
-          <NumberInput className="col-span-2" label="Spread price (net debit per spread)" value={price}
+          <NumberInput className="col-span-2" label={`Spread price (net debit per spread${tick ? `, tick ${tick}` : ""})`} value={price} step={tick ?? "any"}
             onChange={(v) => { setEdited(true); setPrice(v); }}
             placeholder={marks.isLoading ? "Loading marks…" : "No mid available — enter a price"} />
         )}
