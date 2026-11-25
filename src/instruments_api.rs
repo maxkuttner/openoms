@@ -66,6 +66,7 @@ pub async fn search_instruments(
                         WHERE d.underlying_id = i.id OR d.underlying_symbol = i.symbol) AS has_options \
          FROM public.instrument i \
          WHERE i.status = 'ACTIVE' \
+           AND NOT EXISTS (SELECT 1 FROM public.future_spread s WHERE s.instrument_id = i.id) \
            AND ($1::text IS NULL OR i.symbol ILIKE '%' || $1 || '%' OR i.name ILIKE '%' || $1 || '%') \
          ORDER BY \
            CASE \
@@ -265,6 +266,35 @@ mod tests {
 
         assert!(ids.contains(&active), "an ACTIVE instrument must be findable");
         assert!(!ids.contains(&inactive), "an INACTIVE instrument must not be");
+    }
+
+    /// A roll's calendar-spread instrument is traded only through
+    /// `POST /orders/roll`: search never offers it, its legs it does.
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn spread_instruments_are_not_searchable() {
+        let pool = crate::authz_schema_tests::migrated_db().await;
+        let mut ids = vec![];
+        for symbol in ["ESZ6", "ESH7", "ESZ6-ESH7"] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO instrument (symbol, venue, name, asset_class, instrument_class, currency, status, price_precision, price_increment) \
+                 VALUES ($1, 'XCME', $1, 'INDEX', 'FUTURE', 'USD', 'ACTIVE', 2, 0.25) RETURNING id",
+            )
+            .bind(symbol)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            ids.push(id);
+        }
+        sqlx::query("INSERT INTO future_spread (instrument_id, near_id, far_id) VALUES ($3, $1, $2)")
+            .bind(ids[0])
+            .bind(ids[1])
+            .bind(ids[2])
+            .execute(&pool)
+            .await
+            .unwrap();
+        let found: Vec<String> = search_instruments(&pool, Some("ESZ6"), None, None).await.unwrap().into_iter().map(|r| r.symbol).collect();
+        assert_eq!(found, vec!["ESZ6".to_string()]);
     }
 
     /// No database: exercises `clamp_limit` directly so the clamp itself is

@@ -835,6 +835,8 @@ pub(crate) struct FakeTws {
     pub contracts: Mutex<Vec<TwsContract>>,
     pub symbols: Mutex<HashMap<String, Vec<TwsContract>>>,
     pub prev_closes: Mutex<HashMap<i64, f64>>,
+    /// conIds whose previous-close request fails (say no market data permission).
+    pub prev_close_errors: Mutex<Vec<i64>>,
     pub accounts: Mutex<Vec<String>>,
     pub open: Mutex<Vec<(i32, String, TwsOrderState)>>,
     pub completed: Mutex<Vec<(i32, String, TwsOrderState)>>,
@@ -854,6 +856,7 @@ impl FakeTws {
             contracts: Mutex::default(),
             symbols: Mutex::default(),
             prev_closes: Mutex::default(),
+            prev_close_errors: Mutex::default(),
             accounts: Mutex::default(),
             open: Mutex::default(),
             completed: Mutex::default(),
@@ -944,6 +947,9 @@ impl TwsClient for FakeTws {
 
     async fn prev_close(&self, con_id: i64, _sec_type: SecType, _exchange: &str) -> Result<Option<f64>, TwsError> {
         self.up()?;
+        if self.prev_close_errors.lock().unwrap().contains(&con_id) {
+            return Err(TwsError::Other(format!("no market data permissions for {con_id}")));
+        }
         Ok(self.prev_closes.lock().unwrap().get(&con_id).copied())
     }
 

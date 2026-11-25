@@ -618,8 +618,12 @@ impl DailyStats for IbkrTwsAdapter {
                 }
             };
             let exchange = if contract.sec_type == SecType::Stk { "SMART".to_string() } else { contract.exchange.clone() };
-            if let Some(px) = client.prev_close(con_id, contract.sec_type, &exchange).await.map_err(broker_error)? {
-                out.push((s.clone(), px));
+            // One symbol's failure (say a future without a CME data
+            // subscription) must not cost the rest of the batch their close.
+            match client.prev_close(con_id, contract.sec_type, &exchange).await {
+                Ok(Some(px)) => out.push((s.clone(), px)),
+                Ok(None) => {}
+                Err(e) => warn!(symbol = %s, error = %e, "previous close failed; skipping"),
             }
         }
         Ok(out)
@@ -940,6 +944,18 @@ pub(crate) mod tests {
         // The cache is keyed by localSymbol, not the root.
         assert_eq!(adapter.con_id_for(client.as_ref(), "ESZ6").await, Some(111));
         assert_eq!(adapter.con_id_for(client.as_ref(), "ES").await, None);
+    }
+
+    #[tokio::test]
+    async fn daily_stats_skips_a_symbol_whose_previous_close_fails() {
+        let (fake, adapter) = rig();
+        fake.add_contract(aapl());
+        let es = TwsContract { con_id: 111, symbol: "ES".into(), exchange: "CME".into(), primary_exchange: String::new(), sec_type: SecType::Fut, local_symbol: "ESZ6".into(), multiplier: 50.0, ..aapl() };
+        fake.add_contract(es);
+        fake.prev_closes.lock().unwrap().insert(265598, 190.0);
+        fake.prev_close_errors.lock().unwrap().push(111);
+        let out = adapter.daily_stats(&["ESZ6".to_string(), "AAPL".to_string()]).await.unwrap();
+        assert_eq!(out, vec![("AAPL".to_string(), 190.0)]);
     }
 
     #[tokio::test]

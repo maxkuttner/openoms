@@ -300,7 +300,8 @@ pub struct RefreshReport {
     pub untradeable: usize,
 }
 
-/// Re-resolves every stored `IBKR_TWS` instrument by conId and re-saves what
+/// Re-resolves every stored `IBKR_TWS` instrument but futures (the futures
+/// sync owns those) by conId and re-saves what
 /// IBKR still lists (new tick size, lot size, name). A conId IBKR no longer
 /// has details for gets `broker_instrument.is_tradeable = false` (the flag the
 /// order path reads), never a delete. Requests go one at a time. Any other
@@ -317,8 +318,12 @@ pub async fn refresh_ibkr_instruments(pool: &PgPool, client: &dyn TwsClient) -> 
 }
 
 async fn refresh(pool: &PgPool, client: &dyn TwsClient) -> Result<RefreshReport, Box<dyn std::error::Error>> {
+    // Futures are left to the futures sync (`futures::sync`), which knows
+    // their root: re-saving one here would need it too.
     let stored: Vec<String> = sqlx::query_scalar(
-        "SELECT native_id FROM broker_instrument WHERE broker_code = 'IBKR_TWS' AND native_id IS NOT NULL ORDER BY native_id",
+        "SELECT bi.native_id FROM broker_instrument bi JOIN instrument i ON i.id = bi.instrument_id \
+         WHERE bi.broker_code = 'IBKR_TWS' AND bi.native_id IS NOT NULL AND i.instrument_class <> 'FUTURE' \
+         ORDER BY bi.native_id",
     )
     .fetch_all(pool)
     .await?;
@@ -736,6 +741,24 @@ mod tests {
         c.last_trade_at = None;
         save_instruments(&pool, vec![to_broker_instrument(&c, Some(&root)).unwrap()]).await.unwrap();
         assert_eq!(read(pool.clone()).await, Some(at));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn the_refresh_leaves_futures_to_the_futures_sync() {
+        use gateway::connectors::ibkr_tws::resolve::RootSpec;
+        let _serial = REFRESH_TESTS.lock().await;
+        let pool = isolated_pool().await;
+        let fut = es_future(990_000_061, "ESM7", None);
+        let root = RootSpec { code: "ES".into(), asset_class: "INDEX".into() };
+        save_instruments(&pool, vec![to_broker_instrument(&fut, Some(&root)).unwrap()]).await.unwrap();
+        // IBKR "knows" nothing: a stock would turn untradeable; the future is not even asked about.
+        let client = Scripted { refused: [990_000_061].into(), ..Default::default() };
+        refresh_ibkr_instruments(&pool, &client).await;
+        assert!(tradeable(&pool, 990_000_061).await);
+        let client = Scripted::default();
+        refresh_ibkr_instruments(&pool, &client).await;
+        assert!(tradeable(&pool, 990_000_061).await, "a future is never marked by the stock refresh");
     }
 
     fn es_future(con_id: i64, local: &str, last_trade_at: Option<chrono::DateTime<chrono::Utc>>) -> TwsContract {

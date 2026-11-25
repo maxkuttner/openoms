@@ -923,3 +923,57 @@ async fn a_leg_fill_found_by_the_parents_venue_order_id_lands_on_its_child() {
     assert_eq!(position_of(&w, r.near).await, 0.0);
     assert_eq!(state_of(&w, r.parent).await, ("routed".to_string(), 0.0));
 }
+
+/// Leg fills take the parent's row lock before the leg's: while another
+/// transaction holds the parent (a cancel cascading to its legs), a leg fill
+/// waits without having locked its leg, so the two can never deadlock.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn a_leg_fill_locks_the_parent_before_its_leg() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    let mut holder = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM order_state WHERE order_id = $1 FOR UPDATE")
+        .bind(r.parent).execute(&mut *holder).await.unwrap();
+    let (pool, bus, conn, fill) = (w.pool.clone(), w.bus.clone(), w.conn.clone(), leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0));
+    let task = tokio::spawn(async move { ingest(&pool, &bus, &conn, fill, None).await });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!task.is_finished(), "the leg fill waits for the parent");
+    // ...holding no lock on its leg meanwhile
+    let mut probe = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM order_state WHERE order_id = $1 FOR UPDATE NOWAIT")
+        .bind(r.near_child).execute(&mut *probe).await.expect("leg row must be unlocked while the parent is held");
+    probe.rollback().await.unwrap();
+    holder.commit().await.unwrap();
+    let d = task.await.unwrap().unwrap().decision;
+    assert_eq!(d, Decision::Apply { order_id: r.near_child });
+    assert_eq!(state_of(&w, r.near_child).await, ("filled".to_string(), 4.0));
+}
+
+/// A leg fill (found by the BAG's order id) racing the BAG's cancel (found by
+/// its permId, so under a different venue-order lock) both complete.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn a_leg_fill_racing_a_parent_cancel_completes() {
+    for _ in 0..5 {
+        let w = world().await;
+        let r = roll_world(&w).await;
+        let VenueEvent::Fill(mut f) = leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0) else { unreachable!() };
+        f.client_order_id = None;
+        f.venue_order_id = "100".into();
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(
+                ingest(&w.pool, &w.bus, &w.conn, VenueEvent::Fill(f), None),
+                ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 0.0, VenueOrderStatus::Canceled), None),
+            )
+        })
+        .await
+        .expect("no deadlock");
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(state_of(&w, r.parent).await.0, "canceled");
+        assert_eq!(state_of(&w, r.far_child).await, ("canceled".to_string(), 0.0));
+        let near = state_of(&w, r.near_child).await.0;
+        assert!(near == "filled" || near == "canceled", "{near}");
+    }
+}

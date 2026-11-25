@@ -328,6 +328,14 @@ pub async fn load_lookup(
         let named = by_client_uuid.as_ref().or(by_venue_id.as_ref()).map(|k| k.order_id);
         if let Some(parent) = named {
             if is_parent(conn, parent).await? {
+                // Lock the parent before the leg: every path that touches
+                // both (the terminal cascade in `close_legs`, the progress
+                // event after a leg fill) then takes them parent -> child,
+                // so a leg fill never deadlocks a parent close.
+                sqlx::query("SELECT 1 FROM order_state WHERE order_id = $1 FOR UPDATE")
+                    .bind(parent)
+                    .execute(&mut *conn)
+                    .await?;
                 // A leg execution of a combo order (IBKR reports one per leg,
                 // under the combo's order ref): it books on the leg order for
                 // its contract and side, never on the parent.
