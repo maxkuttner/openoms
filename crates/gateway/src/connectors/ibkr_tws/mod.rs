@@ -5,7 +5,7 @@ pub mod gateway;
 pub mod resolve;
 pub mod stream;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -44,6 +44,23 @@ pub(crate) fn set_live_client(connection_code: &str, client: Option<Arc<dyn clie
         Some(c) => map.insert(connection_code.to_string(), c),
         None => map.remove(connection_code),
     };
+}
+
+/// Connection codes last connected to an external gateway, so removing one
+/// leaves Docker alone (`on_removed` gets no credential).
+static EXTERNAL: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn set_external(connection_code: &str, external: bool) {
+    let mut set = EXTERNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if external {
+        set.insert(connection_code.to_string());
+    } else {
+        set.remove(connection_code);
+    }
+}
+
+fn is_external(connection_code: &str) -> bool {
+    EXTERNAL.lock().unwrap_or_else(|e| e.into_inner()).contains(connection_code)
 }
 
 /// An IBKR login for the IB Gateway container, or the address of an IB
@@ -155,7 +172,14 @@ impl Connector for IbkrTws {
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
         let creds: IbkrTwsCredentials = typed(creds, MANIFEST.credential_kind)?;
         creds.check()?;
-        let state_dir = state_dir().ok_or("no HOME or XDG_STATE_HOME to keep the IB Gateway env file under")?;
+        let external = creds.external()?.is_some();
+        set_external(&connection_code(env), external);
+        // An external gateway needs no env file: no state dir either.
+        let state_dir = if external {
+            PathBuf::new()
+        } else {
+            state_dir().ok_or("no HOME or XDG_STATE_HOME to keep the IB Gateway env file under")?
+        };
         let slot: adapter::ClientSlot = Arc::new(RwLock::new(None));
         let adapter = Arc::new(adapter::IbkrTwsAdapter::new(slot.clone()));
         let stream_adapter = adapter.clone();
@@ -187,9 +211,14 @@ impl Connector for IbkrTws {
         Box::pin(async { TestOutcome::NotTestable("checked when the gateway logs in") })
     }
 
-    /// Stops and removes the connection's IB Gateway container.
+    /// Stops and removes the connection's IB Gateway container; nothing for
+    /// an external gateway, which the OMS neither started nor may stop.
     fn on_removed(&self, env: &str) -> BoxFuture<'static, ()> {
-        Box::pin(gateway::remove(Arc::new(gateway::DockerCli), connection_code(env)))
+        let code = connection_code(env);
+        if is_external(&code) {
+            return Box::pin(async {});
+        }
+        Box::pin(gateway::remove(Arc::new(gateway::DockerCli), code))
     }
 }
 
@@ -271,6 +300,16 @@ mod tests {
         assert!(creds("", "", "ib-gateway:4004").check().is_ok());
         assert!(creds("u", "p", "ib-gateway:4003").check().is_ok());
         assert!(creds("", "", "ib-gateway").check().is_err());
+    }
+
+    #[test]
+    fn an_external_connection_is_remembered_until_it_goes_managed() {
+        let code = "IBKR_TWS-EXTTEST";
+        assert!(!is_external(code));
+        set_external(code, true);
+        assert!(is_external(code));
+        set_external(code, false);
+        assert!(!is_external(code));
     }
 
     #[test]

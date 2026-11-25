@@ -283,11 +283,11 @@ pub struct IbapiClient {
 }
 
 impl IbapiClient {
-    /// Connects to IB Gateway on `127.0.0.1:<port>` as `client_id` and asks for
-    /// delayed (type 3) market data. As the master client id 0 it also binds
+    /// Connects to IB Gateway at `addr` (`host:port`) as `client_id` and asks
+    /// for delayed (type 3) market data. As the master client id 0 it also binds
     /// orders entered in TWS (`reqAutoOpenOrders(true)`), so they stream too.
-    pub async fn connect(port: u16, client_id: i32) -> Result<Self, TwsError> {
-        let client = Client::connect(&format!("127.0.0.1:{port}"), client_id).await?;
+    pub async fn connect(addr: &str, client_id: i32) -> Result<Self, TwsError> {
+        let client = Client::connect(addr, client_id).await?;
         client.switch_market_data_type(MarketDataType::Delayed).await?;
         let client = Arc::new(client);
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
