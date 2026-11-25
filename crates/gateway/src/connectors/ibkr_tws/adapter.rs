@@ -16,7 +16,7 @@ use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 use crate::md::daily_stats::DailyStats;
 use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
-use super::client::{ContractQuery, OrderKind, SecType, Side, Tif, TwsClient, TwsContract, TwsError, TwsEvent, TwsExecution, TwsOrder, TwsOrderState};
+use super::client::{pick_local, ContractQuery, OrderKind, SecType, Side, Tif, TwsClient, TwsContract, TwsError, TwsEvent, TwsExecution, TwsOrder, TwsOrderState};
 
 /// How far back `reqExecutions` reaches.
 const MAX_HISTORY_DAYS: i64 = 7;
@@ -157,7 +157,7 @@ impl IbkrTwsAdapter {
             .ok_or_else(|| BrokerError::BrokerRejected(format!("IBKR knows no contract {con_id}")))?;
         self.contracts.lock().unwrap().insert(con_id, c.clone());
         // Keyed by localSymbol (`ESZ6`): `symbol` is only the root of a future.
-        let key = if c.local_symbol.is_empty() { c.symbol.clone() } else { c.local_symbol.clone() };
+        let key = pick_local(&c.local_symbol, &c.symbol);
         self.symbols.lock().unwrap().insert(key, con_id);
         Ok(c)
     }
@@ -176,7 +176,12 @@ impl IbkrTwsAdapter {
             return Some(*id);
         }
         let q = ContractQuery { symbol: Some(symbol.to_string()), ..ContractQuery::default() };
-        let found = client.contract_details(&q).await.ok()?;
+        let mut found = client.contract_details(&q).await.ok()?;
+        if found.is_empty() {
+            // Not a stock: a derivative's local symbol (`ESZ6`) names one contract of any type.
+            let q = ContractQuery { local_symbol: Some(symbol.to_string()), ..ContractQuery::default() };
+            found = client.contract_details(&q).await.ok()?;
+        }
         let first = found.first()?.con_id;
         if found.iter().any(|c| c.con_id != first) {
             debug!(symbol, "ticker is ambiguous at IBKR; no previous close");
@@ -373,7 +378,7 @@ pub(crate) fn fill_from_exec(e: &TwsExecution, client_order_id: Option<String>) 
         venue_order_id: venue_order_id(e.perm_id, e.order_id),
         client_order_id,
         account_ref: e.account.clone(),
-        symbol: if e.local_symbol.is_empty() { e.symbol.clone() } else { e.local_symbol.clone() },
+        symbol: pick_local(&e.local_symbol, &e.symbol),
         buy: e.buy,
         qty: e.qty,
         price: e.price,
@@ -800,6 +805,16 @@ pub(crate) mod tests {
         // The cache is keyed by localSymbol, not the root.
         assert_eq!(adapter.con_id_for(client.as_ref(), "ESZ6").await, Some(111));
         assert_eq!(adapter.con_id_for(client.as_ref(), "ES").await, None);
+    }
+
+    #[tokio::test]
+    async fn a_cold_adapter_prices_a_future_by_its_local_symbol() {
+        let (fake, adapter) = rig();
+        let es = TwsContract { con_id: 111, symbol: "ES".into(), exchange: "CME".into(), primary_exchange: String::new(), sec_type: SecType::Fut, local_symbol: "ESZ6".into(), multiplier: 50.0, ..aapl() };
+        fake.add_contract(es);
+        fake.prev_closes.lock().unwrap().insert(111, 5000.25);
+        let out = adapter.daily_stats(&["ESZ6".to_string()]).await.unwrap();
+        assert_eq!(out, vec![("ESZ6".to_string(), 5000.25)]);
     }
 
     #[tokio::test]

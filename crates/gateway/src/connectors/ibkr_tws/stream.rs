@@ -28,13 +28,13 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::stream_health::StreamHandle;
 use crate::venue_event::{VenueEvent, VenueOrderStatus, VenueOrderUpdate};
 
 use super::adapter::{commission_fee, correction_warning, exec_base, fill_from_exec, map_error, order_update, ClientSlot, ErrorClass, IbkrTwsAdapter};
-use super::client::{IbapiClient, TwsClient, TwsEvent};
+use super::client::{IbapiClient, SecType, TwsClient, TwsEvent};
 use super::gateway::{classify_logs, container_name, ensure_running, GatewayDocker, GatewayState};
 use super::IbkrTwsCredentials;
 
@@ -55,6 +55,8 @@ pub struct Seen {
     /// Last state per IBKR order id, so a reject (which names only the id) has an order.
     orders: HashMap<i32, VenueOrderUpdate>,
     rejected: HashSet<i32>,
+    /// Exec ids of combo (BAG) executions: not fills, so their commissions are not fees.
+    bag_execs: HashSet<String>,
 }
 
 /// Everything one session needs besides the client.
@@ -68,6 +70,12 @@ pub struct Ctx {
 /// reconciler for a pull (a corrected execution).
 pub fn handle(ev: TwsEvent, adapter: &IbkrTwsAdapter, seen: &mut Seen) -> Vec<VenueEvent> {
     match ev {
+        TwsEvent::Execution(e) if e.sec_type == SecType::Bag => {
+            // The combo's own row; its legs arrive as ordinary executions.
+            debug!(exec_id = %e.exec_id, "IBKR combo execution is not a fill");
+            seen.bag_execs.insert(e.exec_id.clone());
+            vec![]
+        }
         TwsEvent::Execution(e) => {
             let client = adapter.client_ref(e.order_id, &e.order_ref);
             let fill = match fill_from_exec(&e, client) {
@@ -95,6 +103,7 @@ pub fn handle(ev: TwsEvent, adapter: &IbkrTwsAdapter, seen: &mut Seen) -> Vec<Ve
                 }
             }
         }
+        TwsEvent::Commission { exec_id, .. } if seen.bag_execs.contains(&exec_id) => vec![],
         TwsEvent::Commission { exec_id, amount, currency } => {
             let Some((amount, currency)) = commission_fee(amount, currency) else { return vec![] };
             let Some(account_ref) = seen.exec_accounts.get(&exec_id).cloned() else {
@@ -328,7 +337,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::adapter::tests::rig;
-    use super::super::client::{OrderKind, SecType, Side, Tif, TwsExecution, TwsOrder, TwsOrderState};
+    use super::super::client::{OrderKind, Side, Tif, TwsExecution, TwsOrder, TwsOrderState};
     use super::*;
     use crate::stream_health::{StreamHealthRegistry, StreamKind};
     use crate::venue_event::VenueFill;
@@ -364,6 +373,21 @@ mod tests {
 
     fn fills(events: &[VenueEvent]) -> Vec<VenueFill> {
         events.iter().filter_map(|e| if let VenueEvent::Fill(f) = e { Some(f.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn a_combo_execution_and_its_commission_produce_no_events() {
+        let (_fake, adapter) = rig();
+        let mut seen = Seen::default();
+        let mut bag = execution("b1.01", 7, "", "U1");
+        bag.sec_type = SecType::Bag;
+        bag.symbol = "ES".into();
+        bag.local_symbol = "ES-ZN".into();
+        assert!(handle(TwsEvent::Execution(bag), &adapter, &mut seen).is_empty());
+        let fee = TwsEvent::Commission { exec_id: "b1.01".into(), amount: 2.0, currency: "USD".into() };
+        assert!(handle(fee, &adapter, &mut seen).is_empty());
+        // A leg is still a fill.
+        assert_eq!(handle(exec("l1.01", 8, ""), &adapter, &mut seen).len(), 1);
     }
 
     #[tokio::test]

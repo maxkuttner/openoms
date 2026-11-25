@@ -210,6 +210,8 @@ pub struct ContractQuery {
     pub exchange: Option<String>,
     pub currency: Option<String>,
     pub con_id: Option<i64>,
+    /// IBKR `localSymbol` (`ESZ6`); like a conId it names one contract, so no type or exchange is implied.
+    pub local_symbol: Option<String>,
     pub sec_type: Option<SecType>,
     pub include_expired: bool,
 }
@@ -219,7 +221,7 @@ impl ContractQuery {
     /// set, so a conId lookup must not name a type (it may be a future); a
     /// symbol search without one is a stock search.
     fn wire_sec_type(&self) -> Option<SecType> {
-        self.sec_type.or(if self.con_id.is_none() { Some(SecType::Stk) } else { None })
+        self.sec_type.or(if self.con_id.is_none() && self.local_symbol.is_none() { Some(SecType::Stk) } else { None })
     }
 }
 
@@ -407,7 +409,12 @@ fn update_events(update: OrderUpdate, refs: &OrderRefs, orders: &OrderCache) -> 
 
 /// The contract's `localSymbol`, or its `symbol` when IBKR sent none.
 fn local_or_symbol(c: &Contract) -> String {
-    if c.local_symbol.is_empty() { c.symbol.to_string() } else { c.local_symbol.clone() }
+    pick_local(&c.local_symbol, c.symbol.as_str())
+}
+
+/// `local` unless empty, else `symbol`: the OMS symbol of an IBKR contract.
+pub(crate) fn pick_local(local: &str, symbol: &str) -> String {
+    if local.is_empty() { symbol } else { local }.to_string()
 }
 
 fn to_tws_execution(d: ibapi::orders::ExecutionData) -> TwsExecution {
@@ -706,7 +713,8 @@ impl TwsClient for IbapiClient {
         let contract = Contract {
             contract_id: con_id_i32(q.con_id.unwrap_or(0))?,
             symbol: Symbol::new(q.symbol.clone().unwrap_or_default()),
-            exchange: Exchange::new(q.exchange.as_deref().unwrap_or("SMART")),
+            local_symbol: q.local_symbol.clone().unwrap_or_default(),
+            exchange: Exchange::new(q.exchange.as_deref().unwrap_or(if q.local_symbol.is_some() { "" } else { "SMART" })),
             currency: Currency::new(q.currency.clone().unwrap_or_default()),
             primary_exchange: Exchange::new(""),
             security_type: q.wire_sec_type().map_or_else(|| SecurityType::Other(String::new()), SecType::to_ibapi),
@@ -885,6 +893,7 @@ impl TwsClient for FakeTws {
                     && q.exchange.as_ref().is_none_or(|e| *e == c.exchange)
                     && q.currency.as_ref().is_none_or(|u| *u == c.currency)
                     && q.con_id.is_none_or(|i| i == c.con_id)
+                    && q.local_symbol.as_ref().is_none_or(|l| *l == c.local_symbol)
             })
             .cloned()
             .collect())
@@ -1060,7 +1069,10 @@ mod tests {
         for t in [SecType::Stk, SecType::Fut, SecType::Opt, SecType::Bag] {
             assert_eq!(SecType::parse(t.as_ibkr()), Some(t));
         }
+        assert_eq!(SecType::parse("BAG"), Some(SecType::Bag));
         assert_eq!(SecType::parse("CASH"), None);
+        assert_eq!(pick_local("ESZ6", "ES"), "ESZ6");
+        assert_eq!(pick_local("", "AAPL"), "AAPL");
     }
 
     #[test]
