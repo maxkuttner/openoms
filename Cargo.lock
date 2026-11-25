@@ -3401,6 +3401,7 @@ dependencies = [
  "base64 0.22.1",
  "bcrypt",
  "chrono",
+ "chrono-tz",
  "clap",
  "csv",
  "databento",

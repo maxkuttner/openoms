@@ -2952,6 +2952,40 @@
         }
       }
     },
+    "/futures/roots": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "operationId": "list_roots",
+        "responses": {
+          "200": {
+            "description": "Active futures roots with front and next contract",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/FutureRootView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/health": {
       "get": {
         "tags": [
@@ -4613,6 +4647,73 @@
             "type": "integer",
             "format": "int32",
             "description": "Ranked failover preference within the class; lower wins."
+          }
+        }
+      },
+      "FutureContract": {
+        "type": "object",
+        "description": "One listed contract of a root.",
+        "required": [
+          "instrument_id",
+          "symbol",
+          "expiry_date",
+          "roll_date",
+          "contract_size"
+        ],
+        "properties": {
+          "contract_size": {
+            "type": "number",
+            "format": "double"
+          },
+          "expiry_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "instrument_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "roll_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        }
+      },
+      "FutureRootView": {
+        "type": "object",
+        "required": [
+          "code",
+          "name",
+          "venue"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "front": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FutureContract"
+              }
+            ],
+            "nullable": true
+          },
+          "name": {
+            "type": "string"
+          },
+          "next": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/FutureContract"
+              }
+            ],
+            "nullable": true
+          },
+          "venue": {
+            "type": "string"
           }
         }
       },

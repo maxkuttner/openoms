@@ -30,6 +30,7 @@ tower = { version = "0.4", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 reqwest = { version = "0.13.1", features = ["json"] }
 # `openidconnect` pulls in reqwest 0.12 and enables only `webpki-roots` on it,
 # so the OIDC client trusts Mozilla's bundled roots and nothing else — an IdP

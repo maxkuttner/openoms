@@ -164,6 +164,7 @@ mod first_run_tests;
         instruments_import::save,
         instruments_import::search,
         futures::sync::sync_now,
+        futures::api::list_roots,
         admin::list_feeds,
         admin::expiry_sweep,
         users_api::setup_status,
@@ -209,7 +210,7 @@ mod first_run_tests;
         admin::RedactedCredentials, crate::credentials::RedactedField,
         jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
         instruments_import::Contract, instruments_import::ImportResolveRequest, instruments_import::ResolvedRow,
-        futures::sync::SyncReport, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
+        futures::sync::SyncReport, futures::api::FutureRootView, futures::front::FutureContract, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
         jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted, jobs::api::JobDetail,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
@@ -952,6 +953,7 @@ fn build_app(
         .route("/instruments", get(instruments_api::list_instruments_for_trader))
         .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
         .route("/instruments/options/chain", get(instruments_api::get_option_chain))
+        .route("/futures/roots", get(futures::api::list_roots))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes: a named admin's session, or the legacy shared
