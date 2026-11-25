@@ -1021,7 +1021,7 @@ pub async fn put_broker_connection_credentials(
     let environment = test_environment(conn.environment.as_deref()).to_string();
 
     // Parse merged.
-    let parsed = credentials_api::parse_broker(&conn.kind, existing, &submission)
+    let parsed = credentials_api::parse_broker(&conn.kind, &environment, existing, &submission)
         .map_err(|e| AdminError { status: StatusCode::BAD_REQUEST, message: e.to_string() })?;
 
     // Test.
@@ -2635,7 +2635,7 @@ mod tests {
         };
 
         // decrypt existing (none yet) → parse merged → test → persist
-        let parsed = credentials_api::parse_broker("IBKR", None, &submission).expect("parse_broker");
+        let parsed = credentials_api::parse_broker("IBKR", "PAPER", None, &submission).expect("parse_broker");
         let outcome = credentials_api::test_broker(&parsed, "PAPER").await;
         assert!(
             should_persist(&persist_gate(&outcome)),

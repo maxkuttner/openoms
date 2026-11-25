@@ -818,5 +818,6 @@ mod tests {
         assert!(service.contains(&format!("image: {IMAGE}\n")), "{service}");
         assert!(service.contains(r#"profiles: ["ibkr"]"#), "{service}");
         assert!(!service.contains("ports:"), "the gateway API must not be published: {service}");
+        assert!(service.lines().any(|l| l.trim() == "restart: on-failure:3"), "capped restarts, so a bad login cannot lock the account: {service}");
     }
 }

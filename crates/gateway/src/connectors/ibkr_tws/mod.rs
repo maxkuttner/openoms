@@ -101,12 +101,28 @@ impl IbkrTwsCredentials {
         };
         let bad = || "gateway address must be host:port, e.g. ib-gateway:4004".to_string();
         let (host, port) = addr.rsplit_once(':').ok_or_else(bad)?;
-        if host.is_empty() || host.chars().any(char::is_whitespace) {
+        // An IPv6 host needs brackets ([::1]:4004), or its port is ambiguous.
+        let bracketed = host.starts_with('[') && host.ends_with(']');
+        if host.is_empty() || host.chars().any(char::is_whitespace) || (host.contains(':') && !bracketed) {
             return Err(bad());
         }
         match port.parse::<u16>() {
             Ok(p) if p > 0 => Ok(Some((host.to_string(), p))),
             _ => Err("gateway port must be a number from 1 to 65535".into()),
+        }
+    }
+
+    /// An external gateway's port is the gnzsnz image's port for this
+    /// environment's trading mode, when it is one of the two: a PAPER
+    /// connection on the live port (or the reverse) is refused. Another port
+    /// passes; the accounts check on connect still guards it.
+    pub fn check_environment(&self, env: &str) -> Result<(), String> {
+        use gateway::{CONTAINER_PORT_LIVE as LIVE, CONTAINER_PORT_PAPER as PAPER};
+        let Some((_, port)) = self.external()? else { return Ok(()) };
+        match (env.eq_ignore_ascii_case("live"), port) {
+            (false, LIVE) => Err(format!("port {LIVE} is IB Gateway's live port; a PAPER connection uses {PAPER}")),
+            (true, PAPER) => Err(format!("port {PAPER} is IB Gateway's paper port; a LIVE connection uses {LIVE}")),
+            _ => Ok(()),
         }
     }
 
@@ -124,11 +140,14 @@ impl IbkrTwsCredentials {
 }
 
 /// Save-time check for [`Manifest::validate`]: names the field to fix.
-fn validate(creds: &BrokerCredentials) -> Result<(), (&'static str, String)> {
+fn validate(creds: &BrokerCredentials, env: &str) -> Result<(), (&'static str, String)> {
     // Every other field is text, so only the client id can fail to decode;
     // serde's message would echo the value, so it is not passed on.
     let c: IbkrTwsCredentials = creds.parse().map_err(|_| ("master_client_id", "not a whole number".to_string()))?;
-    let field = if c.gateway.is_some() { "gateway" } else { "username" };
+    if c.gateway.is_some() {
+        return c.check().and_then(|()| c.check_environment(env)).map_err(|why| ("gateway", why));
+    }
+    let field = if c.username.trim().is_empty() { "username" } else { "password" };
     c.check().map_err(|why| (field, why))
 }
 
@@ -172,6 +191,7 @@ impl Connector for IbkrTws {
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
         let creds: IbkrTwsCredentials = typed(creds, MANIFEST.credential_kind)?;
         creds.check()?;
+        creds.check_environment(env)?;
         let external = creds.external()?.is_some();
         set_external(&connection_code(env), external);
         // An external gateway needs no env file: no state dir either.
@@ -278,7 +298,8 @@ mod tests {
         assert_eq!(ext(" ib-gateway:4004 ").unwrap(), Some(("ib-gateway".into(), 4004)), "trimmed");
         assert_eq!(ext("").unwrap(), None);
         assert_eq!(ext("   ").unwrap(), None);
-        for bad in ["ib-gateway", "ib-gateway:99999", ":4004", "ib-gateway:0", "ib-gateway:", "ib gateway:4004"] {
+        assert_eq!(ext("[::1]:4004").unwrap(), Some(("[::1]".into(), 4004)), "bracketed IPv6");
+        for bad in ["ib-gateway", "ib-gateway:99999", ":4004", "ib-gateway:0", "ib-gateway:", "ib gateway:4004", "::1:4004", "fe80::1:4004"] {
             assert!(ext(bad).is_err(), "{bad:?} accepted");
         }
         // Stored without the field (older credential): managed.

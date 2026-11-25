@@ -102,7 +102,7 @@ fn field<'a>(
 
 /// A text field's value under the merge rule, plus optional fields: one
 /// omitted with nothing stored is `""`, and a non-secret one submitted empty
-/// is cleared (the form echoes it, so empty is what the operator asked for).
+/// (or blank; non-secret values are trimmed) is cleared (the form echoes it, so empty is what the operator asked for).
 /// A secret is never echoed, so submitted empty it still keeps what is stored.
 fn text_field(
     sub: &CredentialSubmission,
@@ -112,7 +112,8 @@ fn text_field(
     if !f.optional {
         return field(sub, f.name, existing).map(str::to_string);
     }
-    match sub.fields.get(f.name).map(|v| v.trim()) {
+    // A secret is kept as typed (spaces can be part of a password).
+    match sub.fields.get(f.name).map(|v| if f.secret { v.as_str() } else { v.trim() }) {
         Some(v) if !v.is_empty() || !f.secret => Ok(v.to_string()),
         _ => Ok(existing.unwrap_or("").to_string()),
     }
@@ -151,6 +152,7 @@ fn parse_bool(
 /// `MissingField`.
 pub fn parse_broker(
     kind: &str,
+    environment: &str,
     existing: Option<&BrokerCredentials>,
     sub: &CredentialSubmission,
 ) -> Result<BrokerCredentials, CredentialError> {
@@ -178,7 +180,7 @@ pub fn parse_broker(
         fields.insert(f.name.to_string(), value);
     }
     let creds = BrokerCredentials::new(m.credential_kind, fields);
-    (m.validate)(&creds).map_err(|(name, why)| CredentialError::BadField { name, why })?;
+    (m.validate)(&creds, environment).map_err(|(name, why)| CredentialError::BadField { name, why })?;
     Ok(creds)
 }
 
@@ -360,7 +362,7 @@ mod tests {
                 })
                 .collect();
             let full_sub = CredentialSubmission { fields: full.iter().cloned().collect() };
-            let stored = parse_broker(m.code, None, &full_sub).expect(m.code);
+            let stored = parse_broker(m.code, "PAPER", None, &full_sub).expect(m.code);
             // A non-secret optional field submitted blank is cleared on purpose
             // (`optional_text_field_submitted_empty_clears`); the form echoes
             // it, so here it is left out, as an untouched field would be.
@@ -369,7 +371,7 @@ mod tests {
             let blank = CredentialSubmission {
                 fields: full.iter().filter(|(k, _)| !cleared(k)).map(|(k, _)| (k.clone(), String::new())).collect(),
             };
-            let kept = parse_broker(m.code, Some(&stored), &blank).expect(m.code);
+            let kept = parse_broker(m.code, "PAPER", Some(&stored), &blank).expect(m.code);
             assert_eq!(serde_json::to_value(&kept).unwrap(), serde_json::to_value(&stored).unwrap(), "{}", m.code);
         }
     }
@@ -380,7 +382,7 @@ mod tests {
         let with = |extra: (&'static str, &'static str)| {
             let mut pairs = base.to_vec();
             pairs.push(extra);
-            parse_broker("IBKR", None, &sub(&pairs))
+            parse_broker("IBKR", "PAPER", None, &sub(&pairs))
         };
         assert!(matches!(
             with(("port", "x")),
@@ -389,7 +391,7 @@ mod tests {
         let mut pairs = base.to_vec();
         pairs.extend([("port", "4001"), ("ssl", "maybe")]);
         assert!(matches!(
-            parse_broker("IBKR", None, &sub(&pairs)),
+            parse_broker("IBKR", "PAPER", None, &sub(&pairs)),
             Err(CredentialError::BadField { name: "ssl", why }) if why == "not a valid boolean (expected \"true\" or \"false\")"
         ));
     }
@@ -401,7 +403,7 @@ mod tests {
     #[test]
     fn a_full_submission_replaces_everything() {
         {
-            let c = parse_broker("ALPACA", None, &sub(&[("key", "NEWKEY"), ("secret", "NEWSECRET")])).expect("parse");
+            let c = parse_broker("ALPACA", "PAPER", None, &sub(&[("key", "NEWKEY"), ("secret", "NEWSECRET")])).expect("parse");
             assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
             let gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
             {
@@ -417,7 +419,7 @@ mod tests {
     #[test]
     fn an_omitted_secret_keeps_the_stored_one() {
         {
-            let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY")])).expect("parse");
+            let c = parse_broker("ALPACA", "PAPER", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY")])).expect("parse");
             assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
             let gateway::connectors::alpaca::adapter::AlpacaCredentials { key, secret } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
             {
@@ -432,7 +434,7 @@ mod tests {
     #[test]
     fn an_empty_secret_is_treated_as_omitted() {
         {
-            let c = parse_broker("ALPACA", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse");
+            let c = parse_broker("ALPACA", "PAPER", Some(&existing_alpaca()), &sub(&[("key", "NEWKEY"), ("secret", "")])).expect("parse");
             assert_eq!(c.kind, "Alpaca", "wrong kind: {c:?}");
             let gateway::connectors::alpaca::adapter::AlpacaCredentials { secret, .. } = c.parse::<gateway::connectors::alpaca::adapter::AlpacaCredentials>().unwrap();
             { assert_eq!(secret, "OLDSECRET"); }
@@ -459,6 +461,7 @@ mod tests {
     fn an_omitted_non_secret_field_keeps_the_stored_value_on_ibkr() {
         match parse_broker(
             "IBKR",
+            "PAPER",
             Some(&existing_ibkr()),
             &sub(&[
                 ("port", "4102"),
@@ -483,6 +486,7 @@ mod tests {
     fn an_empty_non_secret_field_keeps_the_stored_value_on_ibkr() {
         match parse_broker(
             "IBKR",
+            "PAPER",
             Some(&existing_ibkr()),
             &sub(&[
                 ("host", ""),
@@ -526,6 +530,14 @@ mod tests {
         assert_eq!(text_field(&s, &optional_text(), Some("ib-gateway:4004")).unwrap(), "ib-gateway:4003", "trimmed");
     }
 
+    /// Spaces can be part of a password: a secret is kept as typed.
+    #[test]
+    fn a_secret_is_not_trimmed() {
+        let s = sub(&[("gateway", " p w ")]);
+        assert_eq!(text_field(&s, &optional_text().secret(), None).unwrap(), " p w ");
+        assert_eq!(text_field(&s, &optional_text(), None).unwrap(), "p w");
+    }
+
     /// A secret is never echoed into the form, so an empty one means "keep".
     #[test]
     fn optional_secret_submitted_empty_keeps() {
@@ -543,42 +555,65 @@ mod tests {
     #[test]
     fn ibkr_tws_refuses_a_bad_gateway_address() {
         for bad in ["ib-gateway", "ib-gateway:99999", ":4004"] {
-            let r = parse_broker("IBKR_TWS", None, &sub(&[("gateway", bad), ("master_client_id", "0")]));
+            let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("gateway", bad), ("master_client_id", "0")]));
             assert!(matches!(&r, Err(CredentialError::BadField { name: "gateway", .. })), "{bad:?}: {r:?}");
         }
-        let ok = parse_broker("IBKR_TWS", None, &sub(&[("gateway", " ib-gateway:4004 "), ("master_client_id", "0")])).expect("external");
+        let ok = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("gateway", " ib-gateway:4004 "), ("master_client_id", "0")])).expect("external");
         assert_eq!(ok.text("gateway").as_deref(), Some("ib-gateway:4004"), "trimmed");
         assert_eq!(ok.text("username").as_deref(), Some(""));
     }
 
     #[test]
     fn ibkr_tws_managed_without_login_is_refused() {
-        let r = parse_broker("IBKR_TWS", None, &sub(&[("username", "u"), ("master_client_id", "0")]));
+        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("master_client_id", "0")]));
         assert!(
-            matches!(&r, Err(CredentialError::BadField { name: "username", why }) if why == "username and password are required unless a gateway address is set"),
+            matches!(&r, Err(CredentialError::BadField { name: "password", why }) if why == "username and password are required unless a gateway address is set"),
             "{r:?}"
         );
-        assert!(parse_broker("IBKR_TWS", None, &sub(&[("username", "u"), ("password", "p"), ("master_client_id", "0")])).is_ok());
+        assert!(parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("password", "p"), ("master_client_id", "0")])).is_ok());
     }
 
     #[test]
     fn ibkr_tws_bad_client_id_is_a_field_error_without_the_value() {
-        let r = parse_broker("IBKR_TWS", None, &sub(&[("gateway", "ib-gateway:4004"), ("master_client_id", "SECRETVALUE")]));
+        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("gateway", "ib-gateway:4004"), ("master_client_id", "SECRETVALUE")]));
         assert!(matches!(&r, Err(CredentialError::BadField { name: "master_client_id", .. })), "{r:?}");
         assert!(!format!("{r:?}").contains("SECRETVALUE"));
+    }
+
+    #[test]
+    fn ibkr_tws_gateway_port_must_match_the_environment() {
+        let save = |env: &str, addr: &str| parse_broker("IBKR_TWS", env, None, &sub(&[("gateway", addr), ("master_client_id", "0")]));
+        assert!(matches!(
+            save("PAPER", "ib-gateway:4003"),
+            Err(CredentialError::BadField { name: "gateway", why }) if why == "port 4003 is IB Gateway's live port; a PAPER connection uses 4004"
+        ));
+        assert!(matches!(
+            save("LIVE", "ib-gateway:4004"),
+            Err(CredentialError::BadField { name: "gateway", why }) if why == "port 4004 is IB Gateway's paper port; a LIVE connection uses 4003"
+        ));
+        assert!(save("PAPER", "ib-gateway:4004").is_ok());
+        assert!(save("LIVE", "ib-gateway:4003").is_ok());
+    }
+
+    #[test]
+    fn ibkr_tws_missing_password_points_at_password() {
+        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("master_client_id", "0")]));
+        assert!(matches!(&r, Err(CredentialError::BadField { name: "password", .. })), "{r:?}");
+        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("password", "p"), ("master_client_id", "0")]));
+        assert!(matches!(&r, Err(CredentialError::BadField { name: "username", .. })), "{r:?}");
     }
 
     /// Review focus: clearing the address of a stored external connection
     /// goes back to managed mode, which then needs a login.
     #[test]
     fn ibkr_tws_clearing_the_gateway_switches_to_managed() {
-        let stored = parse_broker("IBKR_TWS", None, &sub(&[("username", "u"), ("password", "p"), ("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
-        let managed = parse_broker("IBKR_TWS", Some(&stored), &sub(&[("username", "u"), ("password", ""), ("gateway", ""), ("master_client_id", "0")])).unwrap();
+        let stored = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("password", "p"), ("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
+        let managed = parse_broker("IBKR_TWS", "PAPER", Some(&stored), &sub(&[("username", "u"), ("password", ""), ("gateway", ""), ("master_client_id", "0")])).unwrap();
         assert_eq!(managed.text("gateway").as_deref(), Some(""));
         assert_eq!(managed.text("password").as_deref(), Some("p"), "blank secret keeps");
-        let external = parse_broker("IBKR_TWS", None, &sub(&[("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
+        let external = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
         assert!(matches!(
-            parse_broker("IBKR_TWS", Some(&external), &sub(&[("gateway", ""), ("master_client_id", "0")])),
+            parse_broker("IBKR_TWS", "PAPER", Some(&external), &sub(&[("gateway", ""), ("master_client_id", "0")])),
             Err(CredentialError::BadField { name: "username", .. })
         ));
     }
@@ -586,14 +621,14 @@ mod tests {
     #[test]
     fn an_omitted_secret_with_nothing_stored_is_an_error() {
         assert!(matches!(
-            parse_broker("ALPACA", None, &sub(&[("key", "NEWKEY")])),
+            parse_broker("ALPACA", "PAPER", None, &sub(&[("key", "NEWKEY")])),
             Err(CredentialError::MissingField("secret"))
         ));
     }
 
     #[test]
     fn an_unparseable_port_is_a_field_error_not_a_panic() {
-        let r = parse_broker("IBKR", None, &sub(&[
+        let r = parse_broker("IBKR", "PAPER", None, &sub(&[
             ("host", "h"), ("port", "not-a-number"), ("password", "p"),
         ]));
         assert!(matches!(r, Err(CredentialError::BadField { name: "port", .. })));
@@ -601,14 +636,14 @@ mod tests {
 
     #[test]
     fn an_unknown_broker_kind_is_rejected() {
-        assert!(matches!(parse_broker("NASDAQ", None, &sub(&[])), Err(CredentialError::UnknownKind(_))));
+        assert!(matches!(parse_broker("NASDAQ", "PAPER", None, &sub(&[])), Err(CredentialError::UnknownKind(_))));
     }
 
     /// THE regression that matters: an error message is shown to a user and
     /// logged. It must never contain what they submitted.
     #[test]
     fn no_error_message_echoes_a_submitted_value() {
-        let r = parse_broker("IBKR", None, &sub(&[
+        let r = parse_broker("IBKR", "PAPER", None, &sub(&[
             ("host", "h"), ("port", "SUPERSECRETVALUE"), ("password", "SUPERSECRETVALUE"),
         ]));
         let msg = format!("{:?}", r.unwrap_err());

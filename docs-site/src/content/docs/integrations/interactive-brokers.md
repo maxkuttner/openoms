@@ -48,7 +48,8 @@ The connection's status shows `connecting`, `live` or `down`. While it is `down`
 | down | IBKR login failed: ... | IBKR rejected the username or password. The OMS stops retrying, so it does not lock your account. Fix the password in the credentials drawer and save; the OMS logs in again with the new one. |
 | down | Docker is required for IBKR_TWS but is not running | The OMS can't reach Docker. It keeps retrying until Docker is back. |
 | down | IB Gateway is disconnected, or IB Gateway lost its connection to IBKR | The gateway dropped; the OMS reconnects. |
-| connecting | IB Gateway at ib-gateway:4004 not reachable: ... | Only with a [Gateway address](#ibkr-in-docker): the gateway service is not up or still logging in. The OMS keeps trying. |
+| connecting | IB Gateway at ib-gateway:4004 not reachable: ... | Only with a [Gateway address](#ibkr-in-docker): the gateway service is not up or still logging in (or did not answer within 15 seconds). The OMS keeps trying. |
+| down | IB Gateway at ... is logged into a live account but this connection is PAPER (or the reverse) | Only with a Gateway address: the gateway's `TRADING_MODE` does not match the connection's environment. The OMS stops retrying; fix it and save the credentials again. |
 
 ### IBKR in Docker
 
@@ -60,9 +61,11 @@ With the official `compose.yaml`, add your IBKR login to `.env`:
 
 ```sh
 TWS_USERID=your-ibkr-username
-TWS_PASSWORD=your-ibkr-password
+TWS_PASSWORD='your-ibkr-password'
 TRADING_MODE=paper   # or live
 ```
+
+Keep the password in single quotes: Docker Compose would otherwise expand a `$` in it.
 
 and start with the `ibkr` profile:
 
@@ -82,17 +85,26 @@ profile, `docker compose up -d` starts the OMS and PostgreSQL only, as before.
   `IB Gateway at … not reachable`. `docker compose logs ib-gateway` shows the login.
 - **Daily restart.** IBKR restarts its gateways once a day. The OMS reconnects when the
   gateway is back; nothing to do.
-- **Wrong password.** The gateway service, not the OMS, retries the login. Fix
-  `TWS_PASSWORD` in `.env` and run `docker compose --profile ibkr up -d` again, or stop
-  the service (`docker compose stop ib-gateway`) so repeated failures do not lock the
-  account.
+- **Wrong password or 2FA timeout.** First stop the gateway, `docker compose stop
+  ib-gateway`, so it does not log in again with the wrong login: repeated failures can
+  lock the account. Docker restarts the service at most 3 times after it fails
+  (`restart: on-failure:3`). Then fix `.env` and run `docker compose --profile ibkr up -d`.
 - **One environment per gateway.** `TRADING_MODE` decides paper or live for the whole
-  service. Use the paper connection with a paper gateway, and the live one with a live
-  gateway.
+  service. A PAPER connection takes port 4004 and a LIVE one 4003; saving the other port
+  is refused. On connecting, the OMS also checks the accounts the gateway is logged into
+  (paper account ids start with `D`): a PAPER connection on a live account, or a LIVE
+  connection on a paper one, goes `down` with `IB Gateway at … is logged into a live
+  account but this connection is PAPER` (or the reverse) and stops retrying until you
+  fix it and save the credentials again.
+- **Switching an existing connection to a gateway service.** On a host where the OMS ran
+  IB Gateway itself, its old container keeps running. Remove it by hand:
+  `docker rm -f oms-ibgw-<connection>` (`docker ps` lists it).
 
 On another container platform, run the image `ghcr.io/gnzsnz/ib-gateway` (the tag
 `compose.yaml` pins) as a service on the same private network as the OMS, with
-`TWS_USERID`, `TWS_PASSWORD` and `TRADING_MODE` set, and no public port. Set the
+`TWS_USERID`, `TWS_PASSWORD` and `TRADING_MODE` set, and no public port. The image
+also reads the password from a file (`TWS_PASSWORD_FILE`), for platforms with secrets.
+Give it a capped restart policy, not "always". Set the
 connection's Gateway address to that service's name and port 4004 (paper) or 4003
 (live). Never expose the API port to the internet: anyone who reaches it can trade on
 the account.

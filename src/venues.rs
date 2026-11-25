@@ -80,7 +80,7 @@ mod tests {
                 })
                 .collect();
             let sub = CredentialSubmission { fields: filled };
-            let parsed = parse_broker(venue.code, None, &sub)
+            let parsed = parse_broker(venue.code, "PAPER", None, &sub)
                 .unwrap_or_else(|e| panic!("{}: the listed fields do not make a credential: {e}", venue.code));
             let carried: BTreeSet<_> = redacted_fields(&parsed).into_iter().map(|f| f.name).collect();
             let listed: BTreeSet<_> = venue.fields.iter().map(|f| f.name.to_string()).collect();

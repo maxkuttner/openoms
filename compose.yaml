@@ -16,8 +16,8 @@
 # the only key to stored broker credentials.
 #
 # Interactive Brokers (TWS API): the OMS container cannot start IB Gateway
-# itself, so run it here. Add TWS_USERID, TWS_PASSWORD and TRADING_MODE (paper
-# or live) to .env, start with `docker compose --profile ibkr up -d`, and set the
+# itself, so run it here. Add TWS_USERID, TWS_PASSWORD (single-quoted) and
+# TRADING_MODE (paper or live) to .env, start with `docker compose --profile ibkr up -d`, and set the
 # connection's Gateway address to ib-gateway:4004 (paper) or ib-gateway:4003 (live).
 # https://openoms.dev/integrations/interactive-brokers/
 
@@ -69,7 +69,9 @@ services:
       TRADING_MODE: ${TRADING_MODE:-paper}
       READ_ONLY_API: "no"
       EXISTING_SESSION_DETECTED_ACTION: primary
-    restart: unless-stopped
+    # Capped: a bad password or a missed 2FA prompt must not log in again and
+    # again (repeated failures can lock the IBKR account).
+    restart: on-failure:3
 
 volumes:
   oms-pgdata:

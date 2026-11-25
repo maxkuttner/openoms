@@ -286,12 +286,26 @@ pub async fn attempt<C, E: std::fmt::Display, F: std::future::Future<Output = Re
     gw: &Gateway,
     connect: impl FnOnce(String) -> F,
 ) -> Result<C, Next> {
+    attempt_within(gw, EXTERNAL_CONNECT_TIMEOUT, connect).await
+}
+
+/// How long a connect to an external gateway may take before it counts as unreachable.
+const EXTERNAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// [`attempt`] with the external connect bounded by `limit`.
+pub async fn attempt_within<C, E: std::fmt::Display, F: std::future::Future<Output = Result<C, E>>>(
+    gw: &Gateway,
+    limit: Duration,
+    connect: impl FnOnce(String) -> F,
+) -> Result<C, Next> {
     match gw.creds.external() {
         Err(why) => return Err(Next::Stop(format!("IBKR_TWS gateway address: {why}"))),
         Ok(Some((host, port))) => {
-            return connect(format!("{host}:{port}"))
-                .await
-                .map_err(|e| Next::Wait(format!("IB Gateway at {host}:{port} not reachable: {e}")));
+            let unreachable = |e: &dyn std::fmt::Display| Next::Wait(format!("IB Gateway at {host}:{port} not reachable: {e}"));
+            return match tokio::time::timeout(limit, connect(format!("{host}:{port}"))).await {
+                Ok(r) => r.map_err(|e| unreachable(&e)),
+                Err(_) => Err(unreachable(&"timed out")),
+            };
         }
         Ok(None) => {}
     }
@@ -312,6 +326,33 @@ pub async fn attempt<C, E: std::fmt::Display, F: std::future::Future<Output = Re
     }
 }
 
+/// For an external gateway: what to do instead of trading when the accounts it
+/// is logged into do not belong to the connection's environment (IBKR paper
+/// account ids start with "D": DU…, DF…). The OMS did not log it in, so the
+/// address alone says nothing about paper or live. `None` = go ahead; always
+/// for a managed gateway, which the OMS logged in with this environment's mode.
+pub async fn external_mismatch(gw: &Gateway, client: &dyn TwsClient) -> Option<Next> {
+    let Ok(Some((host, port))) = gw.creds.external() else { return None };
+    let addr = format!("{host}:{port}");
+    let accounts = match client.managed_accounts().await {
+        Ok(a) => a,
+        Err(e) => return Some(Next::Retry(format!("IB Gateway at {addr}: could not read its accounts: {e}"))),
+    };
+    if accounts.is_empty() {
+        return Some(Next::Retry(format!("IB Gateway at {addr} reported no accounts")));
+    }
+    let paper = |a: &String| a.starts_with('D');
+    if gw.env.eq_ignore_ascii_case("live") {
+        accounts.iter().all(paper).then(|| {
+            Next::Stop(format!("IB Gateway at {addr} is logged into a paper account but this connection is LIVE"))
+        })
+    } else {
+        (!accounts.iter().all(paper)).then(|| {
+            Next::Stop(format!("IB Gateway at {addr} is logged into a live account but this connection is PAPER"))
+        })
+    }
+}
+
 /// Keeps IB Gateway up and the stream running, backing off 1s -> 60s. A failed
 /// login stops it: retrying a bad password risks locking the account.
 pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
@@ -324,8 +365,17 @@ pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
         let next = match attempt(&gw, |addr| async move { IbapiClient::connect(&addr, client_id).await }).await {
             Err(next) => next,
             Ok(client) => {
-                let r = session(&gw.code, &slot, Arc::new(client), &ctx, &mut seen).await;
-                Next::Retry(r.err().unwrap_or_else(|| "IBKR session ended".into()))
+                let client: Arc<dyn TwsClient> = Arc::new(client);
+                match external_mismatch(&gw, client.as_ref()).await {
+                    Some(next) => {
+                        client.shutdown();
+                        next
+                    }
+                    None => {
+                        let r = session(&gw.code, &slot, client, &ctx, &mut seen).await;
+                        Next::Retry(r.err().unwrap_or_else(|| "IBKR session ended".into()))
+                    }
+                }
             }
         };
         match next {
@@ -364,6 +414,7 @@ mod tests {
 
     use super::super::adapter::tests::rig;
     use super::super::client::{OrderKind, Side, Tif, TwsExecution, TwsOrder, TwsOrderState};
+    use super::super::client::FakeTws;
     use super::super::gateway::{ContainerInfo, RunSpec};
     use super::*;
     use crate::stream_health::{StreamHealthRegistry, StreamKind};
@@ -702,5 +753,40 @@ mod tests {
         let next = attempt(&gw, |_: String| async { Err::<(), _>("refused") }).await;
         assert!(matches!(next, Err(Next::Stop(m)) if m.contains("login failed")), "managed path classifies logs");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_hung_external_connect_times_out_and_waits() {
+        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+        let next = attempt_within(&gw, Duration::from_millis(20), |_: String| std::future::pending::<Result<(), String>>()).await;
+        assert_eq!(next, Err(Next::Wait("IB Gateway at ib-gateway:4004 not reachable: timed out".into())));
+    }
+
+    fn with_accounts(accounts: &[&str]) -> Arc<FakeTws> {
+        let fake = Arc::new(FakeTws::new());
+        *fake.accounts.lock().unwrap() = accounts.iter().map(|a| a.to_string()).collect();
+        fake
+    }
+
+    /// Real money: a PAPER connection must never trade through a gateway
+    /// logged into a live account, nor LIVE through a paper one.
+    #[tokio::test]
+    async fn an_external_gateway_must_match_the_environment() {
+        let paper = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+        let live = Gateway { env: "LIVE", ..gw(Arc::new(NoDocker), "", Some("ib-gateway:4003"), PathBuf::from("/nonexistent")) };
+        assert_eq!(
+            external_mismatch(&paper, with_accounts(&["U123", "DU456"]).as_ref()).await,
+            Some(Next::Stop("IB Gateway at ib-gateway:4004 is logged into a live account but this connection is PAPER".into()))
+        );
+        assert_eq!(
+            external_mismatch(&live, with_accounts(&["DU456", "DF7"]).as_ref()).await,
+            Some(Next::Stop("IB Gateway at ib-gateway:4003 is logged into a paper account but this connection is LIVE".into()))
+        );
+        assert_eq!(external_mismatch(&paper, with_accounts(&["DU456", "DF7"]).as_ref()).await, None);
+        assert_eq!(external_mismatch(&live, with_accounts(&["U123"]).as_ref()).await, None);
+        assert!(matches!(external_mismatch(&paper, with_accounts(&[]).as_ref()).await, Some(Next::Retry(_))), "no accounts: not trusted");
+        // Managed: the OMS logged in itself with this environment's mode.
+        let managed = gw(Arc::new(NoDocker), "trader1", None, PathBuf::from("/nonexistent"));
+        assert_eq!(external_mismatch(&managed, with_accounts(&["U123"]).as_ref()).await, None);
     }
 }
