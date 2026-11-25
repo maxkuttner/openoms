@@ -40,7 +40,7 @@ impl KafkaConfig {
         let positions_topic = or_default(env::var("KAFKA_POSITIONS_TOPIC"), "oms.positions");
         info!("KAFKA_POSITIONS_TOPIC: {}", positions_topic);
 
-        let alerts_topic = or_default(env::var("KAFKA_ALERTS_TOPIC"), "alerts");
+        let alerts_topic = or_default(env::var("KAFKA_ALERTS_TOPIC"), "oms.alerts");
         info!("KAFKA_ALERTS_TOPIC: {}", alerts_topic);
 
         let client_id = env::var("KAFKA_CLIENT_ID").

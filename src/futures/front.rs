@@ -145,4 +145,45 @@ mod tests {
         assert_eq!(front.map(|c| c.symbol), Some("ESH7".to_string()));
         assert!(next.is_none());
     }
+
+    /// The migration's reference rows (0028, 0029).
+    #[tokio::test]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn futures_reference_rows_exist() {
+        let pool = isolated_pool().await;
+        let es: (i32, i32) = sqlx::query_as("SELECT roll_offset_days, roll_warn_days FROM future_root WHERE code = 'ES'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(es, (8, 3));
+        let cme: (i64,) = sqlx::query_as("SELECT count(*) FROM future_root WHERE broker_exchange = 'CME' AND code IN ('ES','MES','NQ')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cme.0, 3);
+        let ticks: Vec<f64> = sqlx::query_scalar("SELECT spread_tick::float8 FROM future_root WHERE code IN ('ES','MES','NQ') ORDER BY code")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ticks, vec![0.05; 3]);
+        let tz: (String,) = sqlx::query_as("SELECT c.timezone FROM calendar c JOIN venue v ON v.id = c.venue_id WHERE v.code = 'XCME'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tz.0, "America/Chicago");
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO instrument (symbol, venue, name, asset_class, instrument_class, currency, price_precision, price_increment) \
+             VALUES ('PERP-TEST', 'XCME', 'perp', 'INDEX', 'PERPETUAL', 'USD', 2, 0.25)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("PERPETUAL is an allowed instrument_class");
+        let (is_deriv,): (bool,) = sqlx::query_as("SELECT is_derivative FROM instrument WHERE symbol = 'PERP-TEST' AND venue = 'XCME'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert!(is_deriv, "a perpetual is a derivative");
+        tx.rollback().await.unwrap();
+    }
 }

@@ -1,10 +1,12 @@
 # IBKR futures: manual paper check
 
 Run against an IBKR paper account with MES. Fill in each result line (pass/fail plus notes).
+"Current" and "next" below mean the MES front contract and the one after it on the day
+you run this (look them up with `GET /futures/roots`).
 
 ## 1. Sync and contract size
 Do: `POST /admin/futures/sync`, then look up MES contracts.
-Pass: MESZ6 and MESH7 exist with `contract_size 5`.
+Pass: the current and next MES contracts exist with `contract_size 5`.
 Result:
 
 ## 2. Buy the front month
@@ -13,13 +15,19 @@ Pass: the order fills; position P&L moves by 5 x the price change.
 Result:
 
 ## 3. Roll warning
-Do: temporarily set `roll_warn_days` high for MES while holding the position.
-Pass: cockpit badge and banner appear, and a `ROLL_DUE` record reaches the Kafka `alerts` topic.
+Do: temporarily set `roll_warn_days` high for MES while holding the position
+(`UPDATE future_root SET roll_warn_days = 60 WHERE code = 'MES'`), then run the expiry
+sweep, which raises roll warnings (`POST /admin/instruments/expiry-sweep`, admin; it also
+runs hourly).
+Pass: cockpit badge and banner appear, and a `ROLL_DUE` record reaches the Kafka
+`oms.alerts` topic (key = portfolio id, value = the alert JSON).
+Then: reset it (`UPDATE future_root SET roll_warn_days = 3 WHERE code = 'MES'`).
 Result:
 
 ## 4. Roll
 Do: press Roll and submit.
-Pass: one BAG order at IBKR, child orders filled, positions MESZ6 0 and MESH7 1.
+Pass: one BAG order at IBKR, child orders filled, positions in the current contract 0 and
+in the next contract 1.
 Result:
 
 ## 5. Restart mid-roll
@@ -33,7 +41,12 @@ Pass: IBKR accepts a lookup by local symbol only, with an empty exchange; prev c
 Result:
 
 ## 7. BAG with directional legs and negative price
-Do: submit a roll BAG with directional legs and a negative limit price.
+Do: submit a roll BAG with directional legs and a negative limit price. A negative net
+debit comes from rolling a short (buy the current contract back, sell the next) when the
+next contract trades above the current one, which is usual for index futures: hold a
+short of 1 in the current contract, open the roll dialog, and the suggested price is
+already negative. Or, for a long, type a price below zero by hand (far from the market,
+so it rests).
 Pass: IBKR accepts the order.
 Result:
 
@@ -49,5 +62,37 @@ Result:
 
 ## 10. Cockpit in a browser
 Do: search "MES"; check the badge and banner; open the roll dialog (try a negative price and a quantity); check the roll legs pill in the blotter.
-Pass: all render and behave as described.
+Pass: all render and behave as described; the quantity takes whole contracts only; no
+calendar-spread instrument (`MES…-MES…`) shows up in instrument search.
+Result:
+
+## 11. CME calendar spread tick
+Do: in TWS, open the MES (and if possible ES and NQ) calendar spread of the current and
+next contracts and read its price increment.
+Pass: it is 0.05 index points, matching `future_root.spread_tick`. If not, update the row
+(`UPDATE future_root SET spread_tick = <tick> WHERE code = '<root>'`) and record it here.
+Result:
+
+## 12. Default spread price on a one-tick book
+Do: with each leg quoted one tick wide (mid on a half tick, e.g. x.125), open the roll
+dialog and submit the suggested limit price unchanged.
+Pass: the suggested price is a multiple of the spread tick (0.05) and IBKR accepts it;
+the OMS does not answer 422.
+Result:
+
+## 13. Dismissed alert on an overdue contract
+Do: hold the current contract past its roll date (or set `roll_offset_days` so the roll
+date is yesterday), run the expiry sweep so the alert is raised, dismiss its banner alert, then look at the
+position.
+Pass: the position still shows the Roll action (badge "Roll overdue"), and the roll
+dialog opens on the next contract.
+Then: reset `roll_offset_days` to 8 if you changed it.
+Result:
+
+## 14. Futures prev close without CME data
+Do: on an account with no CME market data subscription, hold a stock and a future, and
+open Positions.
+Pass: the stock still has a previous close and its Day P&L; only the future is listed
+as missing a previous close. The OMS log shows one warning for the future's previous
+close, not a failed batch.
 Result:

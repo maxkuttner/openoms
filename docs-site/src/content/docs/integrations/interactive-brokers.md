@@ -121,14 +121,20 @@ trade date minus 8 days, in Chicago time.
 
 **Roll warnings.** When you hold a contract, the OMS raises a `ROLL_DUE` alert
 `roll_warn_days` (3) days before its roll date. The cockpit shows a badge on the
-position and a banner. Alerts are also published to the Kafka `alerts` topic (change it
-with `KAFKA_ALERTS_TOPIC`), listed by `GET /alerts` and acknowledged with
-`POST /alerts/{id}/ack`.
+position and a banner. Alerts are also published to the Kafka `oms.alerts` topic
+(change it with `KAFKA_ALERTS_TOPIC`; key = portfolio id, value = the alert as JSON),
+listed by `GET /alerts` and acknowledged with `POST /alerts/{id}/ack`, which needs the
+right to trade the portfolio. Dismissing an alert hides the banner only: the position
+keeps its Roll action, past the roll date too.
 
 **One-click roll.** The roll dialog sends one IBKR combo (BAG) order on the calendar
-spread, selling the held contract and buying the next. The legs appear as child orders
-of the roll order. The spread price is the net debit per spread, buy-leg prices minus
-sell-leg prices, and it can be negative. A roll is never automatic; you start it.
+spread. For a long position it sells the held contract and buys the next; for a short
+position it buys the held contract back and sells the next. The legs appear as child
+orders of the roll order. The spread price is the net debit per spread, buy-leg prices
+minus sell-leg prices, and it can be negative. It must be a multiple of the root's
+spread tick (`future_root.spread_tick`, 0.05 index points for ES, MES and NQ); the
+dialog's suggested price is rounded to it. Quantities are whole contracts. A roll is
+never automatic; you start it.
 
 Limits:
 
