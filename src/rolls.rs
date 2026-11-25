@@ -14,7 +14,7 @@ use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use gateway::adapter::BrokerOrderRequest;
+use gateway::adapter::{BrokerLeg, BrokerOrderRequest};
 
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
@@ -231,10 +231,13 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
     };
     crate::grants::check(&facts, &grants).map_err(|crate::grants::Denied(message)| unprocessable(message))?;
     order_entry::connector_trades(&route.broker_code, "FUTURE")?;
+    // Each leg's broker-native id (an IBKR conId): the combo is built from them.
+    let mut native_ids = Vec::with_capacity(2);
     for l in [&from, &to] {
-        // Some(min_quantity) when listed and tradeable.
-        let listed: Option<Option<f64>> = sqlx::query_scalar(
-            "SELECT min_quantity::float8 FROM broker_instrument WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true",
+        // (min_quantity, native_id) when listed and tradeable.
+        let listed: Option<(Option<f64>, Option<String>)> = sqlx::query_as(
+            "SELECT min_quantity::float8, native_id FROM broker_instrument \
+             WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true",
         )
         .bind(l.id)
         .bind(&route.broker_code)
@@ -243,10 +246,11 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
         .map_err(|e| internal("failed to validate broker instrument mapping", e))?;
         match listed {
             None => return Err(unprocessable(format!("no tradeable mapping for {} on broker {}", l.symbol, route.broker_code))),
-            Some(Some(min)) if req.qty < min => {
+            Some((Some(min), _)) if req.qty < min => {
                 return Err(unprocessable(format!("quantity {} below broker minimum {min} for {}", req.qty, l.symbol)));
             }
-            Some(_) => {}
+            // No native id: the adapter refuses the leg with its own message.
+            Some((_, native_id)) => native_ids.push(native_id.unwrap_or_default()),
         }
     }
 
@@ -285,7 +289,7 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
     let mut tx = pool.begin().await.map_err(|e| internal("failed to start transaction", e))?;
     // One roll of a (portfolio, contract) at a time, and only what is not already
     // being closed: a second click or a retry must not roll the position twice
-    // (and so flip it). Working closing-side orders on `from`, legs of rolls in
+    // (and so flip it). Working (or suspended) closing-side orders on `from`, legs of rolls in
     // flight included, use up the position.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!("roll:{pf}:{}", from.id))
@@ -295,7 +299,7 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
     let (net_now, closing): (f64, f64) = sqlx::query_as(
         "SELECT COALESCE((SELECT net_qty::float8 FROM position WHERE portfolio_id = $1 AND instrument_id = $2), 0)::float8, \
                 COALESCE((SELECT SUM(leaves_qty)::float8 FROM order_state WHERE portfolio_id = $1 AND instrument_id = $2 \
-                          AND side = $3 AND status IN ('submitted', 'routed', 'partially_filled')), 0)::float8",
+                          AND side = $3 AND status IN ('submitted', 'routed', 'partially_filled', 'suspended')), 0)::float8",
     )
     .bind(pf)
     .bind(from.id.to_string())
@@ -361,8 +365,15 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
         return Err(order_entry::risk_api_error(parent_id, rejection));
     }
 
-    // TX2: only the parent goes to the broker.
-    // Task 11: carry the legs (conIds, actions, ratio 1) so the adapter can send a BAG.
+    // TX2: only the parent goes to the broker, as one combo order carrying the
+    // legs with their own directions (ratio 1 each). The parent is a BUY at the
+    // net price as entered; see `RollRequest::limit_price` and the IBKR
+    // adapter's `submit_bag` for the convention.
+    let broker_legs = legs
+        .iter()
+        .zip(native_ids)
+        .map(|((_, side), native_id)| BrokerLeg { native_id, side: side.as_str().to_string(), ratio: 1 })
+        .collect();
     let broker_req = BrokerOrderRequest {
         order_id: parent_id.to_string(),
         symbol: spread_symbol,
@@ -373,6 +384,7 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
         time_in_force: req.time_in_force.as_str().to_string(),
         limit_price: req.limit_price,
         external_account_ref: route.external_account_ref.clone(),
+        legs: broker_legs,
     };
     match order_entry::route_stored(state, auth, parent_id, &route.broker_code, &route.environment, &broker_req, "").await? {
         Routing::Taken(RouteResult::Terminal(status), _) => {
@@ -445,12 +457,14 @@ mod tests {
     use crate::order_entry::tests::{g_connection, g_defaults, g_trader, grant_ibkr};
     use crate::order_entry::{cancel, CancelOutcome};
     use crate::strategies::test_support;
-    use gateway::adapter::{BrokerAdapter, BrokerError, BrokerOrderRequest, BrokerOrderResponse, BrokerRegistry};
+    use gateway::adapter::{BrokerAdapter, BrokerError, BrokerLeg, BrokerOrderRequest, BrokerOrderResponse, BrokerRegistry};
     use std::sync::{Arc, Mutex};
 
     /// A broker that records what it was sent and answers as told.
     struct Bag {
         sent: Mutex<Vec<(String, String, f64)>>,
+        /// The legs of each request sent.
+        legs: Mutex<Vec<Vec<BrokerLeg>>>,
         fail: bool,
     }
 
@@ -458,6 +472,7 @@ mod tests {
     impl BrokerAdapter for Bag {
         async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
             self.sent.lock().unwrap().push((req.order_id.clone(), req.side.clone(), req.quantity));
+            self.legs.lock().unwrap().push(req.legs.clone());
             if self.fail {
                 return Err(BrokerError::Network("timeout".into()));
             }
@@ -523,7 +538,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let bag = Arc::new(Bag { sent: Mutex::default(), fail });
+        let bag = Arc::new(Bag { sent: Mutex::default(), legs: Mutex::default(), fail });
         let mut registry = BrokerRegistry::new();
         registry.register("IBKR_TWS", "PAPER", bag.clone());
         state.swap_registries(registry, Default::default());
@@ -604,6 +619,35 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(named, Some(ids.parent_order_id.to_string()));
+    }
+
+    fn leg(native_id: &str, side: &str) -> BrokerLeg {
+        BrokerLeg { native_id: native_id.into(), side: side.into(), ratio: 1 }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn the_roll_goes_to_the_broker_with_its_directional_legs() {
+        let w = world(4.0, false).await;
+        submit_roll(&w.state, &w.me, roll(&w, 4.0)).await.unwrap();
+        assert_eq!(*w.bag.legs.lock().unwrap(), vec![vec![leg("1001", "sell"), leg("1002", "buy")]]);
+        let w = world(-2.0, false).await;
+        submit_roll(&w.state, &w.me, roll(&w, 2.0)).await.unwrap();
+        assert_eq!(*w.bag.legs.lock().unwrap(), vec![vec![leg("1001", "buy"), leg("1002", "sell")]]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn a_suspended_closing_order_uses_up_the_position() {
+        let w = world(4.0, false).await;
+        let ids = submit_roll(&w.state, &w.me, roll(&w, 4.0)).await.unwrap();
+        sqlx::query("UPDATE order_state SET status = 'suspended' WHERE order_id = $1")
+            .bind(ids.child_order_ids[0])
+            .execute(&w.pool)
+            .await
+            .unwrap();
+        let err = submit_roll(&w.state, &w.me, roll(&w, 1.0)).await.err().unwrap();
+        assert_eq!((err.status, err.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "roll quantity 1 exceeds the 0 ESZ6 not already being closed"));
     }
 
     #[tokio::test]

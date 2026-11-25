@@ -147,6 +147,7 @@ async fn await_correlated_reply<T>(
 #[async_trait::async_trait]
 impl BrokerAdapter for FixBrokerAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        crate::adapter::refuse_legs(req, self.dialect.venue())?;
         // Register the ack waiter before sending, so a fast ack can't race us.
         let (tx, rx) = oneshot::channel();
         {

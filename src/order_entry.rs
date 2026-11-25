@@ -1037,6 +1037,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         time_in_force: state_after_submit.time_in_force.as_str().to_string(),
         limit_price: state_after_submit.limit_price,
         external_account_ref,
+        legs: vec![],
     };
     match route_stored(state, auth, order_id, &broker_code, &environment, &broker_req, &broker_symbol).await? {
         Routing::Taken(..) => {}

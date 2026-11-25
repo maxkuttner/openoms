@@ -575,6 +575,7 @@ impl ExecutionSource for CoinbaseAdapter {
 #[async_trait::async_trait]
 impl BrokerAdapter for CoinbaseAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        crate::adapter::refuse_legs(req, "COINBASE")?;
         let body = order_body(req)?;
         info!(symbol = %req.symbol, side = %req.side, "submitting order to Coinbase");
         let external_order_id = parse_create(&self.post("/orders", &body).await?)?;
@@ -683,6 +684,7 @@ mod tests {
             time_in_force: tif.into(),
             limit_price,
             external_account_ref: String::new(),
+            legs: vec![],
         }
     }
 

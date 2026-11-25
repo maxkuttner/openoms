@@ -326,6 +326,7 @@ impl InstrumentProvider for AlpacaAdapter {
 #[async_trait::async_trait]
 impl BrokerAdapter for AlpacaAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        crate::adapter::refuse_legs(req, "ALPACA")?;
         let url = format!("{}/v2/orders", self.base_url);
 
         let (order_type_str, final_limit_price) = match req.order_type.as_str() {
@@ -636,6 +637,30 @@ impl ExecutionSource for AlpacaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legs_on_a_single_leg_connector_are_refused() {
+        let mut adapter = AlpacaAdapter::new("k".into(), "s".into(), "PAPER");
+        // Nothing listens here: a request that went out would be a network error.
+        adapter.base_url = "http://127.0.0.1:9";
+        let req = BrokerOrderRequest {
+            order_id: "o-1".into(),
+            symbol: "ESZ6-ESH7".into(),
+            native_id: None,
+            quantity: 1.0,
+            side: "buy".into(),
+            order_type: "market".into(),
+            time_in_force: "day".into(),
+            limit_price: None,
+            external_account_ref: "acc".into(),
+            legs: vec![crate::adapter::BrokerLeg { native_id: "1".into(), side: "sell".into(), ratio: 1 }],
+        };
+        let err = adapter.submit_order(&req).await.err().unwrap();
+        assert!(
+            matches!(err, BrokerError::BrokerRejected(ref m) if m == "multi-leg orders are not supported on ALPACA"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn the_open_orders_snapshot_asks_for_every_open_order() {

@@ -592,6 +592,7 @@ impl ExecutionSource for OkxAdapter {
 #[async_trait::async_trait]
 impl BrokerAdapter for OkxAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        crate::adapter::refuse_legs(req, "OKX")?;
         let body = order_body(req)?;
         info!(symbol = %req.symbol, side = %req.side, "submitting order to OKX");
         let data = self.post("/api/v5/trade/order", &body).await?;
@@ -707,6 +708,7 @@ mod tests {
             time_in_force: tif.into(),
             limit_price,
             external_account_ref: String::new(),
+            legs: vec![],
         }
     }
 

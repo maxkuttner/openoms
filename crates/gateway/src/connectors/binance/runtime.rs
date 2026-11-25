@@ -717,6 +717,7 @@ mod tests {
                 time_in_force: "gtc".into(),
                 limit_price: Some(limit),
                 external_account_ref: String::new(),
+                legs: vec![],
             };
             match adapter.submit_order(&request).await {
                 Ok(response) => {

@@ -571,6 +571,7 @@ impl ExecutionSource for BybitAdapter {
 #[async_trait::async_trait]
 impl BrokerAdapter for BybitAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        crate::adapter::refuse_legs(req, "BYBIT")?;
         let body = order_body(req)?;
         info!(symbol = %req.symbol, side = %req.side, "submitting order to Bybit");
         let result = self.post("/v5/order/create", &body).await?;
@@ -677,6 +678,7 @@ mod tests {
             time_in_force: tif.into(),
             limit_price,
             external_account_ref: String::new(),
+            legs: vec![],
         }
     }
 

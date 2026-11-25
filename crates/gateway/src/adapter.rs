@@ -24,6 +24,31 @@ pub struct BrokerOrderRequest {
     pub limit_price: Option<f64>,
     /// The broker's own account identifier (account.external_account_ref).
     pub external_account_ref: String,
+    /// The legs of a multi-leg (combo) order; empty for a single-instrument
+    /// order. Only IBKR TWS routes legs (as one BAG order); every other
+    /// connector refuses a request that has any ([`refuse_legs`]).
+    pub legs: Vec<BrokerLeg>,
+}
+
+/// One leg of a multi-leg order: the leg's broker-native id, its direction and
+/// its ratio to the order's quantity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrokerLeg {
+    /// The leg instrument's `broker_instrument.native_id` (an IBKR conId).
+    pub native_id: String,
+    /// "buy" | "sell": the leg's own direction.
+    pub side: String,
+    pub ratio: u32,
+}
+
+/// For a connector that sends single-instrument orders only: refuses a
+/// request carrying legs, so a combo never goes out as one leg's order.
+pub fn refuse_legs(req: &BrokerOrderRequest, connector: &str) -> Result<(), BrokerError> {
+    if req.legs.is_empty() {
+        Ok(())
+    } else {
+        Err(BrokerError::BrokerRejected(format!("multi-leg orders are not supported on {connector}")))
+    }
 }
 
 /// Successful response from a broker after order submission.

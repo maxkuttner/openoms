@@ -330,6 +330,7 @@ pub(crate) mod tests {
             time_in_force: "gtc".to_string(),
             limit_price: limit,
             external_account_ref: "acct".to_string(),
+            legs: vec![],
         }
     }
 

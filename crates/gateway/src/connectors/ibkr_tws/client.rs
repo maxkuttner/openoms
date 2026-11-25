@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use futures_util::StreamExt;
-use ibapi::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
+use ibapi::contracts::{ComboLeg, Contract, Currency, Exchange, LegAction, SecurityType, Symbol};
 use ibapi::market_data::historical::{BarSize, BarTimestamp, WhatToShow};
 use ibapi::market_data::realtime::{Quote, TickTypes};
 use ibapi::market_data::MarketDataType;
@@ -140,7 +140,11 @@ pub struct TwsLeg {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TwsOrder {
     pub order_id: i32,
+    /// 0 for a BAG: its legs name the contracts.
     pub con_id: i64,
+    /// IBKR `symbol` (the root, `ES`). Sent only for a BAG, which IBKR names by
+    /// its underlying; a single contract goes by its conId.
+    pub symbol: String,
     pub exchange: String,
     pub primary_exchange: String,
     pub currency: String,
@@ -497,6 +501,33 @@ fn ib_contract(con_id: i64, sec_type: SecType, exchange: &str, primary: &str, cu
     })
 }
 
+/// A combo (BAG) contract: the root symbol, currency and exchange, and one
+/// combo leg per conId with its own action. IBKR's order action applies on top
+/// (always BUY from the adapter; see `IbkrTwsAdapter::submit_bag`).
+fn bag_contract(o: &TwsOrder) -> Result<Contract, TwsError> {
+    let combo_legs = o
+        .legs
+        .iter()
+        .map(|l| {
+            Ok(ComboLeg {
+                contract_id: con_id_i32(l.con_id)?,
+                ratio: l.ratio,
+                action: if l.buy { LegAction::Buy } else { LegAction::Sell },
+                exchange: o.exchange.clone(),
+                ..ComboLeg::default()
+            })
+        })
+        .collect::<Result<Vec<_>, TwsError>>()?;
+    Ok(Contract {
+        symbol: Symbol::new(o.symbol.clone()),
+        security_type: SecurityType::Spread,
+        exchange: Exchange::new(&o.exchange),
+        currency: Currency::new(&o.currency),
+        combo_legs,
+        ..Contract::default()
+    })
+}
+
 /// A contract's last trade day + time in its own zone as a UTC instant.
 /// `date` is `YYYYMMDD` (a bare `YYYYMM` month is `None`); `time` is `HH:MM`
 /// or `HH:MM:SS`. No time -> `None`.
@@ -586,6 +617,7 @@ fn to_tws_order_state(d: &OrderData, completed: bool, status: Option<(f64, f64, 
     let order = TwsOrder {
         order_id: d.order_id,
         con_id: d.contract.contract_id as i64,
+        symbol: d.contract.symbol.to_string(),
         exchange: d.contract.exchange.to_string(),
         primary_exchange: d.contract.primary_exchange.to_string(),
         currency: d.contract.currency.to_string(),
@@ -599,7 +631,12 @@ fn to_tws_order_state(d: &OrderData, completed: bool, status: Option<(f64, f64, 
         order_ref: o.order_ref.clone(),
         account: o.account.clone(),
         sec_type: SecType::parse(d.contract.security_type.as_str()).unwrap_or_default(),
-        legs: vec![],
+        legs: d
+            .contract
+            .combo_legs
+            .iter()
+            .map(|l| TwsLeg { con_id: l.contract_id as i64, ratio: l.ratio, buy: l.action == LegAction::Buy })
+            .collect(),
     };
     let state = TwsOrderState {
         status: d.order_state.status.as_str().to_string(),
@@ -657,10 +694,11 @@ impl TwsClient for IbapiClient {
         };
         order.order_ref = o.order_ref.clone();
         order.account = o.account.clone();
-        if !o.legs.is_empty() {
-            return Err(TwsError::Other("multi-leg orders are not wired yet".into()));
-        }
-        let contract = ib_contract(o.con_id, o.sec_type, &o.exchange, &o.primary_exchange, &o.currency)?;
+        let contract = if o.legs.is_empty() {
+            ib_contract(o.con_id, o.sec_type, &o.exchange, &o.primary_exchange, &o.currency)?
+        } else {
+            bag_contract(o)?
+        };
         self.order_refs.lock().unwrap().insert(o.order_id, o.order_ref.clone());
         self.client.submit_order(o.order_id, &contract, &order).await?;
         Ok(())
@@ -1027,6 +1065,31 @@ mod tests {
         assert_eq!(last_trade_instant("20261218", None, "US/Central"), None);
         assert_eq!(last_trade_instant("202612", Some("08:30"), "US/Central"), None);
         assert_eq!(last_trade_instant("20261218", Some("08:30"), "Mars/Olympus"), None);
+    }
+
+    #[test]
+    fn a_bag_names_its_root_and_carries_directional_legs() {
+        let o = TwsOrder {
+            order_id: 1,
+            con_id: 0,
+            symbol: "ES".into(),
+            exchange: "CME".into(),
+            primary_exchange: String::new(),
+            currency: "USD".into(),
+            action: Side::Buy,
+            qty: 4.0,
+            order_type: OrderKind::Lmt(-1.25),
+            tif: Tif::Day,
+            order_ref: "p".into(),
+            account: "DU1".into(),
+            sec_type: SecType::Bag,
+            legs: vec![TwsLeg { con_id: 11, ratio: 1, buy: false }, TwsLeg { con_id: 22, ratio: 1, buy: true }],
+        };
+        let c = bag_contract(&o).unwrap();
+        assert_eq!(c.security_type.as_str(), "BAG");
+        assert_eq!((c.symbol.to_string(), c.exchange.to_string(), c.currency.to_string(), c.contract_id), ("ES".into(), "CME".into(), "USD".into(), 0));
+        let legs: Vec<_> = c.combo_legs.iter().map(|l| (l.contract_id, l.ratio, l.action, l.exchange.as_str())).collect();
+        assert_eq!(legs, vec![(11, 1, LegAction::Sell, "CME"), (22, 1, LegAction::Buy, "CME")]);
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::app_state::AppState;
 use crate::credentials::{CredentialState, FeedCredentials};
 use gateway::connectors::RegistrationDeps;
 use crate::reload::RegistrationOutput;
-use crate::domain::orders::commands::{SubmitOrder, CancelOrder};
+use crate::domain::orders::commands::CancelOrder;
 use crate::handlers::{SubmitOrderRequest, Allocation, CreateAllocations, AllocationSplit, BlotterRow};
 use crate::domain::orders::state::{OrderAggregateState, OrderSide, OrderType, TimeInForce};
 use crate::domain::identity::{Principal, Portfolio, Account, BrokerConnection};
@@ -201,7 +201,7 @@ mod first_run_tests;
         local_auth_api::methods,
     ),
     components(schemas(
-        SubmitOrder, SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState, handlers::OrderDetail, handlers::OrderTimes,
+        SubmitOrderRequest, CancelOrder, OrderSide, OrderType, TimeInForce, OrderAggregateState, handlers::OrderDetail, handlers::OrderTimes,
         crate::domain::orders::state::OrderStatus,
         crate::positions::Position,
         handlers::VenueOption,

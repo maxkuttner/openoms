@@ -16,7 +16,7 @@ use crate::contract::{BrokerOpenOrder, BrokerOrderOutcome, BrokerOrderState};
 use crate::md::daily_stats::DailyStats;
 use crate::venue_event::{Cursor, ExecutionSource, PullHints, PullPage, VenueFill, VenueOrderStatus, VenueOrderUpdate};
 
-use super::client::{pick_local, ContractQuery, OrderKind, SecType, Side, Tif, TwsClient, TwsContract, TwsError, TwsEvent, TwsExecution, TwsOrder, TwsOrderState};
+use super::client::{pick_local, ContractQuery, OrderKind, SecType, Side, Tif, TwsClient, TwsContract, TwsError, TwsEvent, TwsExecution, TwsLeg, TwsOrder, TwsOrderState};
 
 /// How far back `reqExecutions` reaches.
 const MAX_HISTORY_DAYS: i64 = 7;
@@ -162,6 +162,96 @@ impl IbkrTwsAdapter {
         Ok(c)
     }
 
+    /// Records the order as placed (for a reject that beats IBKR's own report)
+    /// and sends it.
+    async fn place(&self, client: &dyn TwsClient, order: TwsOrder, symbol: String) -> Result<BrokerOrderResponse, BrokerError> {
+        let order_id = order.order_id;
+        self.refs.lock().unwrap().insert(order_id, order.order_ref.clone());
+        let state = TwsOrderState {
+            status: "PendingSubmit".into(),
+            filled: 0.0,
+            remaining: order.qty,
+            avg_fill_price: 0.0,
+            symbol,
+            perm_id: 0,
+            order: order.clone(),
+        };
+        let mut placed = order_update(order_id, &state);
+        placed.client_order_id = Some(order.order_ref.clone());
+        self.placed.lock().unwrap().insert(order_id, placed);
+        info!(order_id, con_id = order.con_id, sec_type = order.sec_type.as_ibkr(), legs = order.legs.len(), order_ref = %order.order_ref, "placing IBKR order");
+        client.place(&order).await.map_err(|e| {
+            let e = broker_error(e);
+            if matches!(e, BrokerError::BrokerRejected(_)) {
+                self.rejected_on_submit.lock().unwrap().insert(order_id);
+            }
+            e
+        })?;
+        Ok(BrokerOrderResponse { external_order_id: order_id.to_string() })
+    }
+
+    /// A multi-leg order (a futures roll) as ONE IBKR BAG order: two combo legs
+    /// by conId on the legs' exchange, the OMS parent id as the order ref, so it
+    /// trades as the exchange-listed spread rather than two legged orders.
+    ///
+    /// Side convention: the BAG's action is always BUY and each leg carries its
+    /// own direction (a long roll: SELL the near leg, BUY the far). The CME
+    /// "buy the spread = buy near / sell far" convention never comes into it.
+    /// The limit is the parent's net price as entered (buy-leg price minus
+    /// sell-leg price, a net debit; zero or negative is a credit) and is passed
+    /// through unchanged: it is exactly the price of buying this combo.
+    async fn submit_bag(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        if parse_side(&req.side)? != Side::Buy {
+            return Err(BrokerError::BrokerRejected(
+                "a multi-leg order is sent as BUY with directional legs; a SELL combo is not supported".into(),
+            ));
+        }
+        let mut legs = Vec::with_capacity(req.legs.len());
+        for l in &req.legs {
+            let con_id: i64 = l
+                .native_id
+                .parse()
+                .map_err(|_| BrokerError::BrokerRejected(format!("leg {:?} has no IBKR conId; import it first", l.native_id)))?;
+            let ratio = i32::try_from(l.ratio)
+                .ok()
+                .filter(|r| *r > 0)
+                .ok_or_else(|| BrokerError::BrokerRejected(format!("leg {con_id}: ratio must be at least 1")))?;
+            legs.push(TwsLeg { con_id, ratio, buy: parse_side(&l.side)? == Side::Buy });
+        }
+        let (order_type, tif) = (parse_kind(req)?, parse_tif(&req.time_in_force)?);
+        let client = self.client()?;
+        // The legs' contracts: they name the combo's root, currency and exchange.
+        let mut contracts = Vec::with_capacity(legs.len());
+        for l in &legs {
+            contracts.push(self.contract(client.as_ref(), l.con_id).await?);
+        }
+        let first = &contracts[0];
+        if contracts.iter().any(|c| c.symbol != first.symbol || c.exchange != first.exchange || c.currency != first.currency) {
+            return Err(BrokerError::BrokerRejected(
+                "the legs of a combo must share one root, exchange and currency".into(),
+            ));
+        }
+        let order_id = client.next_order_id().await.map_err(broker_error)?;
+        let order = TwsOrder {
+            order_id,
+            con_id: 0,
+            symbol: first.symbol.clone(),
+            exchange: first.exchange.clone(),
+            primary_exchange: String::new(),
+            currency: first.currency.clone(),
+            action: Side::Buy,
+            qty: req.quantity,
+            order_type,
+            tif,
+            order_ref: req.order_id.clone(),
+            account: req.external_account_ref.clone(),
+            sec_type: SecType::Bag,
+            legs,
+        };
+        let symbol = first.symbol.clone();
+        self.place(client.as_ref(), order, symbol).await
+    }
+
     /// Every order IB reports, working ones first.
     async fn all_orders(&self, client: &dyn TwsClient) -> Result<Vec<(i32, String, TwsOrderState)>, BrokerError> {
         let mut all = client.open_orders().await.map_err(broker_error)?;
@@ -220,6 +310,9 @@ fn parse_kind(req: &BrokerOrderRequest) -> Result<OrderKind, BrokerError> {
 #[async_trait::async_trait]
 impl BrokerAdapter for IbkrTwsAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        if !req.legs.is_empty() {
+            return self.submit_bag(req).await;
+        }
         let con_id: i64 = req
             .native_id
             .as_deref()
@@ -232,6 +325,7 @@ impl BrokerAdapter for IbkrTwsAdapter {
         let order = TwsOrder {
             order_id,
             con_id,
+            symbol: contract.symbol.clone(),
             exchange: if contract.sec_type == SecType::Stk { "SMART".into() } else { contract.exchange.clone() },
             primary_exchange: contract.primary_exchange.clone(),
             currency: contract.currency.clone(),
@@ -244,28 +338,7 @@ impl BrokerAdapter for IbkrTwsAdapter {
             sec_type: contract.sec_type,
             legs: vec![],
         };
-        self.refs.lock().unwrap().insert(order_id, req.order_id.clone());
-        let state = TwsOrderState {
-            status: "PendingSubmit".into(),
-            filled: 0.0,
-            remaining: order.qty,
-            avg_fill_price: 0.0,
-            symbol: contract.symbol.clone(),
-            perm_id: 0,
-            order: order.clone(),
-        };
-        let mut placed = order_update(order_id, &state);
-        placed.client_order_id = Some(req.order_id.clone());
-        self.placed.lock().unwrap().insert(order_id, placed);
-        info!(order_id, con_id, order_ref = %req.order_id, "placing IBKR order");
-        client.place(&order).await.map_err(|e| {
-            let e = broker_error(e);
-            if matches!(e, BrokerError::BrokerRejected(_)) {
-                self.rejected_on_submit.lock().unwrap().insert(order_id);
-            }
-            e
-        })?;
-        Ok(BrokerOrderResponse { external_order_id: order_id.to_string() })
+        self.place(client.as_ref(), order, contract.symbol.clone()).await
     }
 
     /// The id is an OMS order's API order id, or (adopted / from the stream)
@@ -557,6 +630,7 @@ impl DailyStats for IbkrTwsAdapter {
 pub(crate) mod tests {
     use super::super::client::FakeTws;
     use super::*;
+    use crate::adapter::BrokerLeg;
     use uuid::Uuid;
 
     pub(crate) fn aapl() -> TwsContract {
@@ -601,6 +675,7 @@ pub(crate) mod tests {
             time_in_force: "day".into(),
             limit_price: Some(190.5),
             external_account_ref: "DU123".into(),
+            legs: vec![],
         }
     }
 
@@ -615,6 +690,7 @@ pub(crate) mod tests {
             vec![TwsOrder {
                 order_id: 100,
                 con_id: 265598,
+                symbol: "AAPL".into(),
                 exchange: "SMART".into(),
                 primary_exchange: "NASDAQ".into(),
                 currency: "USD".into(),
@@ -653,6 +729,64 @@ pub(crate) mod tests {
         assert_eq!(placed[0].sec_type, SecType::Fut);
         assert_eq!(placed[0].exchange, "CME");
         assert!(placed[0].legs.is_empty());
+    }
+
+    fn es_leg(con_id: i64, local: &str) -> TwsContract {
+        TwsContract {
+            con_id,
+            symbol: "ES".into(),
+            exchange: "CME".into(),
+            primary_exchange: String::new(),
+            sec_type: SecType::Fut,
+            local_symbol: local.into(),
+            multiplier: 50.0,
+            ..aapl()
+        }
+    }
+
+    fn roll_req(legs: &[(&str, &str)]) -> BrokerOrderRequest {
+        BrokerOrderRequest {
+            symbol: "ESZ6-ESH7".into(),
+            native_id: None,
+            quantity: 4.0,
+            limit_price: Some(-1.25),
+            legs: legs
+                .iter()
+                .map(|(id, side)| BrokerLeg { native_id: id.to_string(), side: side.to_string(), ratio: 1 })
+                .collect(),
+            ..req(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_roll_goes_out_as_one_bag_with_two_legs() {
+        let (fake, adapter) = rig();
+        for (id, local) in [(1, "ESZ6"), (2, "ESH7")] {
+            fake.details.lock().unwrap().insert(ContractQuery { con_id: Some(id), ..ContractQuery::default() }, vec![es_leg(id, local)]);
+        }
+        let resp = adapter.submit_order(&roll_req(&[("1", "sell"), ("2", "buy")])).await.unwrap();
+        assert_eq!(resp.external_order_id, "100");
+        let placed = fake.placed.lock().unwrap().clone();
+        assert_eq!(placed.len(), 1, "one BAG order, not one per leg");
+        let bag = &placed[0];
+        assert_eq!(bag.sec_type, SecType::Bag);
+        assert_eq!(bag.order_ref, "7d3c1a52-0000-4000-8000-000000000001");
+        assert_eq!(bag.exchange, "CME");
+        assert_eq!((bag.symbol.as_str(), bag.currency.as_str(), bag.con_id), ("ES", "USD", 0));
+        assert_eq!(bag.legs, vec![TwsLeg { con_id: 1, ratio: 1, buy: false }, TwsLeg { con_id: 2, ratio: 1, buy: true }]);
+        // Always BUY: the legs carry the direction, the limit is the net price as entered.
+        assert_eq!(bag.action, Side::Buy);
+        assert_eq!((bag.qty, bag.order_type), (4.0, OrderKind::Lmt(-1.25)));
+    }
+
+    #[tokio::test]
+    async fn a_bag_leg_without_a_con_id_or_a_sell_bag_is_refused() {
+        let (fake, adapter) = rig();
+        let err = adapter.submit_order(&roll_req(&[("", "sell"), ("2", "buy")])).await.err().unwrap();
+        assert!(matches!(err, BrokerError::BrokerRejected(ref m) if m.contains("conId")), "{err}");
+        let sell = BrokerOrderRequest { side: "sell".into(), ..roll_req(&[("1", "sell"), ("2", "buy")]) };
+        assert!(matches!(adapter.submit_order(&sell).await, Err(BrokerError::BrokerRejected(_))));
+        assert!(fake.placed.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -697,6 +831,7 @@ pub(crate) mod tests {
             order: TwsOrder {
                 order_id: 5,
                 con_id: 265598,
+                symbol: "AAPL".into(),
                 exchange: "SMART".into(),
                 primary_exchange: "NASDAQ".into(),
                 currency: "USD".into(),
@@ -891,6 +1026,7 @@ pub(crate) mod tests {
             order: TwsOrder {
                 order_id: id,
                 con_id: 265598,
+                symbol: "AAPL".into(),
                 exchange: "SMART".into(),
                 primary_exchange: "NASDAQ".into(),
                 currency: "USD".into(),

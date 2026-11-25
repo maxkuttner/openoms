@@ -19,7 +19,8 @@ pub struct SubmitOrder {
     #[serde(default)]
     pub parent_order_id: Option<String>,
     /// The limit is a net spread price (a roll's parent order): any finite
-    /// value, zero or negative included.
+    /// value, zero or negative included. Set by the OMS only (a roll); this
+    /// internal command is not in the API schema (no endpoint takes it).
     #[serde(default)]
     pub spread_price: bool,
 }

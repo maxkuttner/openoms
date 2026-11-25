@@ -480,6 +480,7 @@ mod tests {
             order: TwsOrder {
                 order_id: id,
                 con_id: 265598,
+                symbol: "AAPL".into(),
                 exchange: "SMART".into(),
                 primary_exchange: "NASDAQ".into(),
                 currency: "USD".into(),

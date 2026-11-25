@@ -6118,64 +6118,6 @@
           }
         }
       },
-      "SubmitOrder": {
-        "type": "object",
-        "required": [
-          "order_id",
-          "client_order_id",
-          "portfolio_id",
-          "account_id",
-          "instrument_id",
-          "side",
-          "order_type",
-          "time_in_force",
-          "quantity"
-        ],
-        "properties": {
-          "account_id": {
-            "type": "string"
-          },
-          "client_order_id": {
-            "type": "string"
-          },
-          "instrument_id": {
-            "type": "string"
-          },
-          "limit_price": {
-            "type": "number",
-            "format": "double",
-            "nullable": true
-          },
-          "order_id": {
-            "type": "string"
-          },
-          "order_type": {
-            "$ref": "#/components/schemas/OrderType"
-          },
-          "parent_order_id": {
-            "type": "string",
-            "description": "The roll (or other multi-leg) order this one is a leg of.",
-            "nullable": true
-          },
-          "portfolio_id": {
-            "type": "string"
-          },
-          "quantity": {
-            "type": "number",
-            "format": "double"
-          },
-          "side": {
-            "$ref": "#/components/schemas/OrderSide"
-          },
-          "spread_price": {
-            "type": "boolean",
-            "description": "The limit is a net spread price (a roll's parent order): any finite\nvalue, zero or negative included."
-          },
-          "time_in_force": {
-            "$ref": "#/components/schemas/TimeInForce"
-          }
-        }
-      },
       "SubmitOrderRequest": {
         "type": "object",
         "description": "Wire payload for POST /orders/submit. `account_id` is optional — when omitted it is\nresolved to the portfolio's single granted venue listing the instrument; when present it\nmust be one of the portfolio's granted venue accounts.",

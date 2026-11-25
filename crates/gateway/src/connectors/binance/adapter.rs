@@ -236,6 +236,7 @@ fn decimal(value: f64) -> String {
 #[async_trait::async_trait]
 impl BrokerAdapter for BinanceAdapter {
     async fn submit_order(&self, req: &BrokerOrderRequest) -> Result<BrokerOrderResponse, BrokerError> {
+        crate::adapter::refuse_legs(req, "BINANCE")?;
         let side = req.side.to_uppercase(); // "buy"/"sell" -> BUY/SELL
         let mut params: Vec<(&str, String)> = vec![
             ("symbol", req.symbol.clone()), // the Binance pair, e.g. BTCUSDT
