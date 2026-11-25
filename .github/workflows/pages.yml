@@ -23,11 +23,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-22.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     defaults:
       run:
         working-directory: docs-site
@@ -53,5 +50,14 @@ jobs:
         with:
           path: docs-site/dist
 
+  # Separate job: deploy-pages in the same job as the upload intermittently
+  # found no github-pages artifact yet.
+  deploy:
+    needs: build
+    runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
       - id: deploy
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
