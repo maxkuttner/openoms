@@ -18,6 +18,10 @@ pub struct SubmitOrder {
     /// The roll (or other multi-leg) order this one is a leg of.
     #[serde(default)]
     pub parent_order_id: Option<String>,
+    /// The limit is a net spread price (a roll's parent order): any finite
+    /// value, zero or negative included.
+    #[serde(default)]
+    pub spread_price: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -4201,6 +4201,12 @@
             "type": "number",
             "format": "double"
           },
+          "parent_order_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Set on a leg of a roll: the roll's parent order (the spread order).",
+            "nullable": true
+          },
           "placed_at": {
             "type": "string",
             "format": "date-time",
@@ -5339,6 +5345,12 @@
               "updated_at"
             ],
             "properties": {
+              "parent_order_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Set on a leg of a roll: the roll's parent order (the spread order).",
+                "nullable": true
+              },
               "updated_at": {
                 "type": "string",
                 "format": "date-time"
@@ -5866,7 +5878,7 @@
           "limit_price": {
             "type": "number",
             "format": "double",
-            "description": "The spread price, for a `limit` roll.",
+            "description": "For a `limit` roll: the net debit per spread, i.e. the buy leg's price\nminus the sell leg's (the price of a combo bought with the legs' own\ndirections). May be zero or negative (e.g. a short roll in contango is\nusually a credit). Omit for `market`.",
             "example": null,
             "nullable": true
           },
@@ -6154,6 +6166,10 @@
           },
           "side": {
             "$ref": "#/components/schemas/OrderSide"
+          },
+          "spread_price": {
+            "type": "boolean",
+            "description": "The limit is a net spread price (a roll's parent order): any finite\nvalue, zero or negative included."
           },
           "time_in_force": {
             "$ref": "#/components/schemas/TimeInForce"

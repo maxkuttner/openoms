@@ -158,6 +158,7 @@ impl SubmitOrderRequest {
             limit_price: self.limit_price,
             quantity: self.quantity,
             parent_order_id: None,
+            spread_price: false,
         }
     }
 }
@@ -403,6 +404,8 @@ pub struct OrderDetail {
     #[serde(flatten)]
     pub times: OrderTimes,
     pub updated_at: DateTime<Utc>,
+    /// Set on a leg of a roll: the roll's parent order (the spread order).
+    pub parent_order_id: Option<Uuid>,
 }
 
 /// Get an order's current state
@@ -441,7 +444,7 @@ async fn load_order_detail(pool: &PgPool, order_id: Uuid) -> Result<OrderDetail,
             os.leaves_qty::double precision AS leaves_qty,
             os.cum_qty::double precision AS cum_qty,
             os.avg_px::double precision AS avg_px,
-            os.status, os.resume_to_status, os.version, os.origin,
+            os.status, os.resume_to_status, os.version, os.origin, os.parent_order_id,
             os.created_at, os.updated_at, {TIMES_SELECT}
         FROM order_state os
         {TIMES_LATERAL}
@@ -483,7 +486,7 @@ async fn load_order_detail(pool: &PgPool, order_id: Uuid) -> Result<OrderDetail,
         observed: row.get::<String, _>("origin") == "EXTERNAL",
     };
 
-    Ok(OrderDetail { state, times: OrderTimes::from_row(&row), updated_at: row.get("updated_at") })
+    Ok(OrderDetail { state, times: OrderTimes::from_row(&row), updated_at: row.get("updated_at"), parent_order_id: row.get("parent_order_id") })
 }
 
 /// One portfolio the caller is entitled to, with the entitlement itself.
@@ -1104,6 +1107,8 @@ pub struct BlotterRow {
     pub trade_time_estimated: bool,
     /// Venue fees booked on the order, summed per currency (never FX-converted).
     pub fees: Vec<FeeAmount>,
+    /// Set on a leg of a roll: the roll's parent order (the spread order).
+    pub parent_order_id: Option<Uuid>,
 }
 
 /// Who a blotter query is allowed to see.
@@ -1137,7 +1142,7 @@ async fn load_blotter(
                 os.leaves_qty::double precision   AS leaves_qty, \
                 os.cum_qty::double precision      AS cum_qty, \
                 os.avg_px::double precision       AS avg_px, \
-                os.created_at, os.updated_at, {TIMES_SELECT} \
+                os.created_at, os.updated_at, os.parent_order_id, {TIMES_SELECT} \
          FROM (SELECT * FROM order_state os WHERE TRUE",
     ));
     // Scope first, so it can never be widened by a filter appended after it.
@@ -1193,6 +1198,7 @@ async fn load_blotter(
         .iter()
         .map(|r| BlotterRow {
             fees: fees.remove(&r.get::<Uuid, _>("order_id")).unwrap_or_default(),
+            parent_order_id: r.get("parent_order_id"),
             order_id: r.get("order_id"),
             client_order_id: r.get("client_order_id"),
             principal_id: r.get("principal_id"),

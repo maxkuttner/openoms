@@ -69,7 +69,7 @@ impl OrderAggregate {
 
         match command {
             OrderCommand::SubmitOrder(cmd) => {
-                invariants::validate_submit(cmd.quantity, cmd.order_type, cmd.limit_price)?;
+                invariants::validate_priced_submit(cmd.quantity, cmd.order_type, cmd.limit_price, cmd.spread_price)?;
 
                 Ok(vec![OrderDomainEvent {
                     event_id: metadata.event_id,
@@ -1124,6 +1124,7 @@ mod tests {
                     limit_price: Some(100.0),
                     quantity: 10.0,
                     parent_order_id: None,
+                    spread_price: false,
                 }),
                 metadata("ev-1"),
             )

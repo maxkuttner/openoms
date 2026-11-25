@@ -39,7 +39,10 @@ pub struct RollRequest {
     #[schema(example = 4.0)]
     pub qty: f64,
     pub order_type: OrderType,
-    /// The spread price, for a `limit` roll.
+    /// For a `limit` roll: the net debit per spread, i.e. the buy leg's price
+    /// minus the sell leg's (the price of a combo bought with the legs' own
+    /// directions). May be zero or negative (e.g. a short roll in contango is
+    /// usually a credit). Omit for `market`.
     #[schema(example = json!(null))]
     pub limit_price: Option<f64>,
     /// `day` only.
@@ -168,7 +171,8 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
     if req.time_in_force != TimeInForce::Day {
         return Err(unprocessable("a roll is a day order (time_in_force=day)".into()));
     }
-    crate::domain::orders::invariants::validate_submit(req.qty, req.order_type, req.limit_price).map_err(map_rejection_to_api_error)?;
+    crate::domain::orders::invariants::validate_priced_submit(req.qty, req.order_type, req.limit_price, true)
+        .map_err(map_rejection_to_api_error)?;
     // A strategy's portfolio is traded by its strategy only (and a reported
     // one not through the OMS at all).
     let strategy: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM strategy WHERE portfolio_id = $1)")
@@ -228,16 +232,21 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
     crate::grants::check(&facts, &grants).map_err(|crate::grants::Denied(message)| unprocessable(message))?;
     order_entry::connector_trades(&route.broker_code, "FUTURE")?;
     for l in [&from, &to] {
-        let listed: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM broker_instrument WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true)",
+        // Some(min_quantity) when listed and tradeable.
+        let listed: Option<Option<f64>> = sqlx::query_scalar(
+            "SELECT min_quantity::float8 FROM broker_instrument WHERE instrument_id = $1 AND broker_code = $2 AND is_tradeable = true",
         )
         .bind(l.id)
         .bind(&route.broker_code)
-        .fetch_one(&pool)
+        .fetch_optional(&pool)
         .await
         .map_err(|e| internal("failed to validate broker instrument mapping", e))?;
-        if !listed {
-            return Err(unprocessable(format!("no tradeable mapping for {} on broker {}", l.symbol, route.broker_code)));
+        match listed {
+            None => return Err(unprocessable(format!("no tradeable mapping for {} on broker {}", l.symbol, route.broker_code))),
+            Some(Some(min)) if req.qty < min => {
+                return Err(unprocessable(format!("quantity {} below broker minimum {min} for {}", req.qty, l.symbol)));
+            }
+            Some(_) => {}
         }
     }
 
@@ -260,6 +269,8 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
         limit_price,
         quantity: req.qty,
         parent_order_id: parent.map(|p| p.to_string()),
+        // only the parent is priced, as a net spread price
+        spread_price: parent.is_none(),
     };
     let parent_cmd = order(parent_id, parent_id.to_string(), spread, OrderSide::Buy, req.order_type, req.limit_price, None);
     let legs = [(&from, from_side), (&to, to_side)];
@@ -272,6 +283,33 @@ pub async fn submit_roll(state: &AppState, auth: &AuthContext, req: RollRequest)
 
     // TX1: risk on each child, then all three orders, or none.
     let mut tx = pool.begin().await.map_err(|e| internal("failed to start transaction", e))?;
+    // One roll of a (portfolio, contract) at a time, and only what is not already
+    // being closed: a second click or a retry must not roll the position twice
+    // (and so flip it). Working closing-side orders on `from`, legs of rolls in
+    // flight included, use up the position.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("roll:{pf}:{}", from.id))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| internal("failed to lock the position for the roll", e))?;
+    let (net_now, closing): (f64, f64) = sqlx::query_as(
+        "SELECT COALESCE((SELECT net_qty::float8 FROM position WHERE portfolio_id = $1 AND instrument_id = $2), 0)::float8, \
+                COALESCE((SELECT SUM(leaves_qty)::float8 FROM order_state WHERE portfolio_id = $1 AND instrument_id = $2 \
+                          AND side = $3 AND status IN ('submitted', 'routed', 'partially_filled')), 0)::float8",
+    )
+    .bind(pf)
+    .bind(from.id.to_string())
+    .bind(from_side.as_str())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| internal("failed to load the position", e))?;
+    let free = if net_now * net > 0.0 { (net_now.abs() - closing).max(0.0) } else { 0.0 };
+    if req.qty > free {
+        return Err(unprocessable(format!(
+            "roll quantity {} exceeds the {free} {} not already being closed",
+            req.qty, from.symbol
+        )));
+    }
     let mut refused: Option<(usize, RiskRejection)> = None;
     for (i, cmd) in child_cmds.iter().enumerate() {
         let l = legs[i].0;
@@ -593,6 +631,72 @@ mod tests {
         let e = submit_roll(&w.state, &w.me, roll(&w, 5.0)).await.unwrap_err();
         assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "roll quantity 5 exceeds the position of 4"));
         assert_eq!(order_count(&w.pool, w.pf).await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn rolling_the_full_position_twice_refuses_the_second() {
+        let w = world(4.0, false).await;
+        submit_roll(&w.state, &w.me, roll(&w, 4.0)).await.unwrap();
+        let e = submit_roll(&w.state, &w.me, roll(&w, 4.0)).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "roll quantity 4 exceeds the 0 ESZ6 not already being closed"));
+        // a roll whose broker call went unanswered still holds its quantity
+        let w = world(4.0, true).await;
+        submit_roll(&w.state, &w.me, roll(&w, 3.0)).await.unwrap_err();
+        let e = submit_roll(&w.state, &w.me, roll(&w, 2.0)).await.unwrap_err();
+        assert_eq!(e.message, "roll quantity 2 exceeds the 1 ESZ6 not already being closed");
+        assert_eq!(order_count(&w.pool, w.pf).await, 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn a_limit_roll_may_have_a_negative_spread_price() {
+        let w = world(-2.0, false).await;
+        let mut r = roll(&w, 2.0);
+        r.limit_price = Some(-1.25);
+        let ids = submit_roll(&w.state, &w.me, r).await.unwrap();
+        let px: Option<f64> = sqlx::query_scalar("SELECT limit_price::float8 FROM order_state WHERE order_id = $1")
+            .bind(ids.parent_order_id)
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+        assert_eq!(px, Some(-1.25));
+        assert_eq!(status(&w.pool, ids.parent_order_id).await, "routed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn a_leg_below_the_broker_minimum_is_refused() {
+        let w = world(4.0, false).await;
+        sqlx::query("UPDATE broker_instrument SET min_quantity = 2 WHERE instrument_id = $1").bind(w.far).execute(&w.pool).await.unwrap();
+        let e = submit_roll(&w.state, &w.me, roll(&w, 1.0)).await.unwrap_err();
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::UNPROCESSABLE_ENTITY, "quantity 1 below broker minimum 2 for ESH7"));
+        assert_eq!(order_count(&w.pool, w.pf).await, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable Postgres via OMS_RELOAD_TEST_DATABASE_URL"]
+    async fn the_order_views_name_a_legs_parent() {
+        let w = world(4.0, false).await;
+        let ids = submit_roll(&w.state, &w.me, roll(&w, 1.0)).await.unwrap();
+        let axum::Json(leg) = crate::handlers::get_order(
+            axum::extract::State(w.state.clone()),
+            axum::extract::Extension(w.me.clone()),
+            axum::extract::Path(ids.child_order_ids[0].to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(leg.parent_order_id, Some(ids.parent_order_id));
+        let axum::Json(rows) = crate::handlers::list_orders(
+            axum::extract::State(w.state.clone()),
+            axum::extract::Extension(w.me.clone()),
+            axum::extract::Query(serde_json::from_value(serde_json::json!({})).unwrap()),
+        )
+        .await
+        .unwrap();
+        let parents: Vec<Option<Uuid>> = rows.iter().filter(|r| r.order_id != ids.parent_order_id).map(|r| r.parent_order_id).collect();
+        assert_eq!(parents, vec![Some(ids.parent_order_id); 2]);
+        assert!(rows.iter().any(|r| r.order_id == ids.parent_order_id && r.parent_order_id.is_none()));
     }
 
     #[tokio::test]

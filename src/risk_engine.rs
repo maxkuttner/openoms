@@ -252,6 +252,7 @@ mod tests {
             limit_price,
             quantity,
             parent_order_id: None,
+            spread_price: false,
         }
     }
 
@@ -574,6 +575,7 @@ mod tests {
             limit_price: Some(100.0),
             quantity: 60.0,
             parent_order_id: None,
+            spread_price: false,
         };
 
         let first_pool = pool.clone();

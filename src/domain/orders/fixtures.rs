@@ -48,6 +48,7 @@ impl OrderTestData {
             limit_price,
             quantity,
             parent_order_id: None,
+            spread_price: false,
         }
     }
 
