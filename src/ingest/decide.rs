@@ -45,6 +45,10 @@ pub struct Lookup {
     pub fill_seen: bool,
     /// An open break already exists for this venue order.
     pub open_break: bool,
+    /// A leg execution of a multi-leg order (it names the parent) whose
+    /// contract and side match none of the parent's leg orders (fill-only).
+    /// The parent never books fills, so it cannot take it either.
+    pub unmatched_leg: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +100,9 @@ pub fn decide(event: &VenueEvent, account_id: Uuid, lookup: &Lookup, policy: &Co
     }
     if lookup.open_break {
         return Decision::AttachToBreak;
+    }
+    if is_fill && lookup.unmatched_leg {
+        return Decision::Break(BreakKind::UnknownInstrument);
     }
     if let Some(known) = lookup.by_client_uuid.as_ref().or(lookup.by_venue_id.as_ref()) {
         return match event {
@@ -168,7 +175,7 @@ mod tests {
     }
 
     fn lookup() -> Lookup {
-        Lookup { by_client_uuid: None, by_venue_id: None, fill_seen: false, open_break: false }
+        Lookup { by_client_uuid: None, by_venue_id: None, fill_seen: false, open_break: false, unmatched_leg: false }
     }
 
     fn adopt(default: Option<Uuid>, rules: Vec<Rule>) -> ConnPolicy {
@@ -183,6 +190,16 @@ mod tests {
     fn seen_fill_is_duplicate() {
         let l = Lookup { fill_seen: true, by_venue_id: Some(known(10.0, 0.0, false)), ..lookup() };
         assert_eq!(decide(&fill(None, 1.0), Uuid::new_v4(), &l, &adopt(None, vec![])), Decision::Duplicate);
+    }
+
+    #[test]
+    fn a_leg_fill_matching_no_leg_order_is_an_unknown_instrument_break() {
+        let l = Lookup { unmatched_leg: true, ..lookup() };
+        let pol = adopt(Some(Uuid::new_v4()), vec![]);
+        assert_eq!(decide(&fill(Some("p"), 1.0), Uuid::new_v4(), &l, &pol), Decision::Break(BreakKind::UnknownInstrument));
+        // a redelivered fill is still a duplicate, and an open break still collects it
+        assert_eq!(decide(&fill(None, 1.0), Uuid::new_v4(), &Lookup { fill_seen: true, ..l.clone() }, &pol), Decision::Duplicate);
+        assert_eq!(decide(&fill(None, 1.0), Uuid::new_v4(), &Lookup { open_break: true, ..l }, &pol), Decision::AttachToBreak);
     }
 
     #[test]

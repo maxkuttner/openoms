@@ -63,7 +63,9 @@ impl From<sqlx::Error> for IngestError {
 
 /// An attempt lost a race on the order's version; run it again.
 enum Attempt {
-    Done(Decision, Option<Booked>),
+    /// What was decided, and what committed (the order's booking, then any
+    /// leg orders it closed).
+    Done(Decision, Vec<Booked>),
     Retry,
 }
 
@@ -144,7 +146,7 @@ async fn ingest_as(
     for attempt in 1..=MAX_ATTEMPTS {
         match attempt_once(pool, connection, &broker, account, &event, &policy, instruments, forced.is_some()).await? {
             Attempt::Done(decision, booked) => {
-                if let Some(b) = booked {
+                for b in booked {
                     publish(bus, &b);
                     if let Some(fee) = b.fee {
                         book_fill_fee(pool, bus, b.order_id, fee, connection).await;
@@ -173,12 +175,15 @@ async fn ingest_as(
 }
 
 /// Whether the venue's cum for the order is ahead of what the OMS booked on it.
+/// Never for the parent of a multi-leg order: it books no fills (its legs do,
+/// from their own executions), so its spread cum is not a gap to pull.
 async fn fill_gap(pool: &PgPool, connection: &str, account: Uuid, o: &VenueOrderUpdate) -> Result<bool, IngestError> {
     let by_client = o.client_order_id.as_deref().and_then(|c| Uuid::parse_str(c).ok());
     let booked: Option<f64> = sqlx::query_scalar(
-        "SELECT cum_qty::float8 FROM order_state WHERE broker_connection_code = $1 \
-         AND (order_id = $4 OR (account_id = $2 AND external_order_id = $3 AND venue_trade_id IS NULL)) \
-         ORDER BY order_id = $4 DESC NULLS LAST LIMIT 1",
+        "SELECT o.cum_qty::float8 FROM order_state o WHERE o.broker_connection_code = $1 \
+         AND (o.order_id = $4 OR (o.account_id = $2 AND o.external_order_id = $3 AND o.venue_trade_id IS NULL)) \
+         AND NOT EXISTS (SELECT 1 FROM order_state leg WHERE leg.parent_order_id = o.order_id) \
+         ORDER BY o.order_id = $4 DESC NULLS LAST LIMIT 1",
     )
     .bind(connection)
     .bind(account)
@@ -318,6 +323,21 @@ pub async fn load_lookup(
     .fetch_optional(&mut *conn)
     .await?
     .map(known);
+    let (mut by_client_uuid, mut by_venue_id, mut unmatched_leg) = (by_client_uuid, by_venue_id, false);
+    if let VenueEvent::Fill(f) = event {
+        let named = by_client_uuid.as_ref().or(by_venue_id.as_ref()).map(|k| k.order_id);
+        if let Some(parent) = named {
+            if is_parent(conn, parent).await? {
+                // A leg execution of a combo order (IBKR reports one per leg,
+                // under the combo's order ref): it books on the leg order for
+                // its contract and side, never on the parent.
+                let leg = leg_order(conn, connection, parent, f).await?;
+                unmatched_leg = leg.is_none();
+                by_client_uuid = leg;
+                by_venue_id = None;
+            }
+        }
+    }
     let fill_seen = match exec_id {
         Some(exec) => sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM venue_fill WHERE broker_connection_code = $1 AND account_id = $2 AND exec_id = $3)",
@@ -338,7 +358,39 @@ pub async fn load_lookup(
     .bind(venue_order_id)
     .fetch_one(&mut *conn)
     .await?;
-    Ok(Lookup { by_client_uuid, by_venue_id, fill_seen, open_break })
+    Ok(Lookup { by_client_uuid, by_venue_id, fill_seen, open_break, unmatched_leg })
+}
+
+/// Whether the order is the parent of leg orders (a futures roll).
+async fn is_parent(conn: &mut PgConnection, order_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM order_state WHERE parent_order_id = $1)")
+        .bind(order_id)
+        .fetch_one(&mut *conn)
+        .await
+}
+
+/// The leg order of `parent` a leg execution books on: the one whose
+/// instrument the connection's broker lists under the fill's symbol, on the
+/// fill's side. `None` when no leg matches.
+async fn leg_order(
+    conn: &mut PgConnection,
+    connection: &str,
+    parent: Uuid,
+    f: &VenueFill,
+) -> Result<Option<KnownOrder>, sqlx::Error> {
+    Ok(sqlx::query(&format!(
+        "{KNOWN_SQL} WHERE parent_order_id = $1 AND side = $3 AND EXISTS ( \
+           SELECT 1 FROM broker_instrument bi JOIN broker_connection bc ON bc.broker_code = bi.broker_code \
+           WHERE bc.code = $2 AND bi.instrument_id = order_state.instrument_id::bigint AND bi.broker_symbol = $4) \
+         ORDER BY client_order_id LIMIT 1"
+    ))
+    .bind(parent)
+    .bind(connection)
+    .bind(if f.buy { "buy" } else { "sell" })
+    .bind(&f.symbol)
+    .fetch_optional(&mut *conn)
+    .await?
+    .map(known))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,14 +421,14 @@ async fn attempt_once(
     let ctx = Ctx { pool, connection, broker, account };
     let is_break = matches!(decision, Decision::AttachToBreak | Decision::Break(_));
     let outcome = match &decision {
-        Decision::Duplicate | Decision::Ignore => return Ok(Attempt::Done(decision, None)),
+        Decision::Duplicate | Decision::Ignore => return Ok(Attempt::Done(decision, vec![])),
         Decision::AttachToBreak => {
             record_break(&mut tx, &ctx, venue_order_id, None, event).await?;
-            Attempt::Done(decision.clone(), None)
+            Attempt::Done(decision.clone(), vec![])
         }
         Decision::Break(kind) => {
             record_break(&mut tx, &ctx, venue_order_id, Some(*kind), event).await?;
-            Attempt::Done(decision.clone(), None)
+            Attempt::Done(decision.clone(), vec![])
         }
         Decision::Adopt { portfolio_id } => {
             let instrument = match adopt::ensure_instrument(pool, broker, instruments, symbol(event)).await? {
@@ -385,7 +437,7 @@ async fn attempt_once(
                     let kind = BreakKind::UnknownInstrument;
                     record_break(&mut tx, &ctx, venue_order_id, Some(kind), event).await?;
                     tx.commit().await?;
-                    return Ok(Attempt::Done(Decision::Break(kind), None));
+                    return Ok(Attempt::Done(Decision::Break(kind), vec![]));
                 }
             };
             let Some(principal) = adopt::owner(&mut tx, *portfolio_id).await? else {
@@ -393,7 +445,7 @@ async fn attempt_once(
                 let kind = BreakKind::NoBook;
                 record_break(&mut tx, &ctx, venue_order_id, Some(kind), event).await?;
                 tx.commit().await?;
-                return Ok(Attempt::Done(Decision::Break(kind), None));
+                return Ok(Attempt::Done(Decision::Break(kind), vec![]));
             };
             let order_id = Uuid::new_v4();
             // the observed status already says what an order update reports;
@@ -419,13 +471,16 @@ async fn attempt_once(
                     let kind = BreakKind::Overfill;
                     record_break(&mut tx, &ctx, venue_order_id, Some(kind), event).await?;
                     tx.commit().await?;
-                    return Ok(Attempt::Done(Decision::Break(kind), None));
+                    return Ok(Attempt::Done(Decision::Break(kind), vec![]));
                 }
                 // a closed order's status is final; only a filled external order may grow
                 (VenueEvent::Order(o), d) if terminal && !(reopenable && matches!(d, Decision::Grow { .. })) => {
                     note_venue_order(&mut tx, order_id, o).await?;
+                    let Some(legs) = close_legs(&mut tx, &ctx, order_id, o).await? else {
+                        return Ok(Attempt::Retry);
+                    };
                     tx.commit().await?;
-                    return Ok(Attempt::Done(decision, None));
+                    return Ok(Attempt::Done(decision, legs));
                 }
                 (_, Decision::Grow { new_qty, .. }) => commands.push(OrderCommand::ReplaceOrder(ReplaceOrder {
                     order_id: order_id.to_string(),
@@ -440,13 +495,25 @@ async fn attempt_once(
                     note_venue_order(&mut tx, order_id, o).await?;
                     tx.commit().await?;
                 }
-                return Ok(Attempt::Done(decision, None));
+                return Ok(Attempt::Done(decision, vec![]));
             }
-            book(&mut tx, &ctx, order_id, Some(state), commands, None, event).await?.attempt(decision.clone())
+            match book(&mut tx, &ctx, order_id, Some(state), commands, None, event).await? {
+                BookOutcome::Booked(b) => {
+                    let mut booked = vec![b];
+                    if let VenueEvent::Order(o) = event {
+                        let Some(legs) = close_legs(&mut tx, &ctx, order_id, o).await? else {
+                            return Ok(Attempt::Retry);
+                        };
+                        booked.extend(legs);
+                    }
+                    Attempt::Done(decision.clone(), booked)
+                }
+                other => other.attempt(decision.clone()),
+            }
         }
     };
     // a retry or a duplicate drops the transaction: nothing is written
-    if !matches!(outcome, Attempt::Done(_, Some(_))) && !is_break {
+    if !matches!(&outcome, Attempt::Done(_, booked) if !booked.is_empty()) && !is_break {
         return Ok(outcome);
     }
     tx.commit().await?;
@@ -490,6 +557,52 @@ async fn note_venue_order(
     Ok(())
 }
 
+/// The venue closed `parent` (canceled, rejected or expired): each of its leg
+/// orders not closed yet takes the same closing report on what it has left,
+/// in the parent's transaction. A filled parent closes nothing: legs fill only
+/// from their own executions. `None`: a leg's version moved, so retry.
+async fn close_legs(
+    tx: &mut Transaction<'_, Postgres>,
+    ctx: &Ctx<'_>,
+    parent: Uuid,
+    o: &VenueOrderUpdate,
+) -> Result<Option<Vec<Booked>>, IngestError> {
+    if !matches!(o.status, VenueOrderStatus::Canceled | VenueOrderStatus::Rejected { .. } | VenueOrderStatus::Expired) {
+        return Ok(Some(Vec::new()));
+    }
+    let legs: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT order_id FROM order_state WHERE parent_order_id = $1 \
+         AND status NOT IN ('filled', 'canceled', 'rejected', 'expired') ORDER BY client_order_id FOR UPDATE",
+    )
+    .bind(parent)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut booked = Vec::with_capacity(legs.len());
+    for leg in legs {
+        let Some(state) = load_state(tx, leg).await.map_err(|e| IngestError::Other(e.to_string()))? else {
+            return Err(IngestError::Other(format!("leg order {leg} vanished")));
+        };
+        // The parent's report, as the leg's own: the venue has no order for
+        // the leg, so its cum is what the leg booked from its executions.
+        let report = VenueEvent::Order(VenueOrderUpdate {
+            client_order_id: Some(leg.to_string()),
+            cum_qty: state.cum_qty,
+            created_at: None,
+            ..o.clone()
+        });
+        let commands = event_commands(leg, ctx.broker, &report);
+        match book(tx, ctx, leg, Some(state), commands, None, &report).await? {
+            BookOutcome::Booked(b) => {
+                info!(%parent, leg_order_id = %leg, "ingest: leg order closed with its parent");
+                booked.push(b);
+            }
+            BookOutcome::Retry => return Ok(None),
+            BookOutcome::Duplicate => {}
+        }
+    }
+    Ok(Some(booked))
+}
+
 enum BookOutcome {
     Booked(Booked),
     /// The order's version moved under us.
@@ -501,9 +614,9 @@ enum BookOutcome {
 impl BookOutcome {
     fn attempt(self, decision: Decision) -> Attempt {
         match self {
-            BookOutcome::Booked(b) => Attempt::Done(decision, Some(b)),
+            BookOutcome::Booked(b) => Attempt::Done(decision, vec![b]),
             BookOutcome::Retry => Attempt::Retry,
-            BookOutcome::Duplicate => Attempt::Done(Decision::Duplicate, None),
+            BookOutcome::Duplicate => Attempt::Done(Decision::Duplicate, vec![]),
         }
     }
 }

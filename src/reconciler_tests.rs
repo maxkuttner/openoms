@@ -33,6 +33,8 @@ struct FakeSource {
     held_calls: Mutex<usize>,
     /// The scope of each `fills_since` call.
     pulled_scopes: Mutex<Vec<String>>,
+    /// What `open_order_snapshot` answers.
+    open: Vec<VenueOrderUpdate>,
 }
 
 #[async_trait::async_trait]
@@ -49,7 +51,7 @@ impl ExecutionSource for FakeSource {
         })
     }
     async fn open_order_snapshot(&self, _: &str) -> Result<Vec<VenueOrderUpdate>, BrokerError> {
-        Ok(vec![])
+        Ok(self.open.clone())
     }
     async fn scopes(&self, _: &str) -> Result<Vec<String>, BrokerError> {
         *self.scopes_calls.lock().unwrap() += 1;
@@ -88,6 +90,26 @@ impl BrokerAdapter for ClosedAtVenue {
     }
     async fn order_status(&self, _: &str, _: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
         Ok(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 2.0, avg_px: 100.0 })
+    }
+}
+
+/// Answers every status lookup canceled, and records whose it was asked.
+#[derive(Default)]
+struct AskedAtVenue {
+    asked: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl BrokerAdapter for AskedAtVenue {
+    async fn submit_order(&self, _: &gateway::adapter::BrokerOrderRequest) -> Result<gateway::adapter::BrokerOrderResponse, BrokerError> {
+        unreachable!()
+    }
+    async fn cancel_order(&self, _: &str, _: &str) -> Result<(), BrokerError> {
+        unreachable!()
+    }
+    async fn order_status(&self, client_order_id: &str, _: &str, _: &str) -> Result<BrokerOrderState, BrokerError> {
+        self.asked.lock().unwrap().push(client_order_id.to_string());
+        Ok(BrokerOrderState { outcome: BrokerOrderOutcome::Canceled, executed_qty: 0.0, avg_px: 0.0 })
     }
 }
 
@@ -265,6 +287,57 @@ async fn working_order_missing_from_snapshot_is_resolved() {
     assert_eq!(o.symbol, "BTCUSDT");
     assert_eq!(o.status, VenueOrderStatus::Canceled);
     assert_eq!((o.qty, o.cum_qty, o.buy), (5.0, 2.0, true));
+}
+
+/// A roll on the venue as one BAG order, matched to its parent by order ref
+/// (the parent id); its leg orders are not venue orders and are never looked
+/// up as gone from the venue.
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn children_are_not_resolved_as_missing() {
+    use crate::ingest::apply::tests::insert_order;
+    let w = world().await;
+    set_cursor(&w, "c0").await;
+    let (parent, near, far) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    insert_order(&w, parent, &parent.to_string(), w.instrument, "buy", Some("100"), None).await;
+    insert_order(&w, near, &format!("{parent}-1"), w.instrument, "sell", None, Some(parent)).await;
+    insert_order(&w, far, &format!("{parent}-2"), w.instrument, "buy", None, Some(parent)).await;
+    // IBKR lists the BAG under its permId, with the parent id as order ref.
+    let bag = VenueOrderUpdate {
+        venue_order_id: "P1".into(),
+        client_order_id: Some(parent.to_string()),
+        account_ref: "acc".into(),
+        symbol: "ES".into(),
+        buy: true,
+        order_type: "limit".into(),
+        qty: 4.0,
+        limit_px: Some(1.0),
+        status: VenueOrderStatus::Working,
+        cum_qty: 0.0,
+        ts: None,
+        created_at: None,
+    };
+    let source = Arc::new(FakeSource { open: vec![bag], ..Default::default() });
+    let venue = Arc::new(AskedAtVenue::default());
+    let (engine, seen) = fake_engine(ok);
+    let (_tx, rx) = mpsc::channel(16);
+    let h = spawn_with(w.conn.clone(), source, rx, engine, w.pool.clone(), Some(venue.clone()), None);
+    h.pull_now();
+    eventually(|| seen.lock().unwrap().iter().any(|e| matches!(e, VenueEvent::Order(_)))).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(venue.asked.lock().unwrap().is_empty(), "looked up as gone: {:?}", venue.asked.lock().unwrap());
+    let orders: Vec<Option<String>> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| if let VenueEvent::Order(o) = e { Some(o.client_order_id.clone()) } else { None })
+        .collect();
+    assert_eq!(orders, vec![Some(parent.to_string())], "only the BAG itself is applied");
+    for id in [parent, near, far] {
+        let status: String = sqlx::query_scalar("SELECT status FROM order_state WHERE order_id = $1")
+            .bind(id).fetch_one(&w.pool).await.unwrap();
+        assert_eq!(status, "routed");
+    }
 }
 
 #[tokio::test]

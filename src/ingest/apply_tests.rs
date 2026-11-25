@@ -640,3 +640,220 @@ async fn rule_on_non_representative_shared_account_attributes() {
     let (_, _, portfolio, _, _, _) = only_order(&w.pool).await;
     assert_eq!(portfolio, sib_pf);
 }
+
+/// A futures roll as Task 10 stores it, on an IBKR_TWS connection: the parent
+/// (BUY 4 of the spread, routed as IBKR order 100) and its two leg children
+/// (SELL 4 ESZ6, BUY 4 ESH7, routed, no venue id), over a long 4 ESZ6.
+struct Roll {
+    parent: Uuid,
+    near_child: Uuid,
+    far_child: Uuid,
+    near: i64,
+    far: i64,
+}
+
+async fn future(pool: &PgPool, symbol: &str) -> i64 {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO instrument (symbol, venue, name, asset_class, instrument_class, currency, contract_size, status, \
+         price_precision, price_increment) \
+         VALUES ($1, 'XCME', $1, 'INDEX', 'FUTURE', 'USD', 50, 'ACTIVE', 2, 0.25) RETURNING id",
+    )
+    .bind(symbol).fetch_one(pool).await.unwrap();
+    sqlx::query("INSERT INTO broker_instrument (instrument_id, broker_code, broker_symbol, native_id) VALUES ($1, 'IBKR_TWS', $2, $3)")
+        .bind(id).bind(symbol).bind(id.to_string()).execute(pool).await.unwrap();
+    id
+}
+
+pub(crate) async fn insert_order(
+    w: &World,
+    order_id: Uuid,
+    client: &str,
+    instrument: i64,
+    side: &str,
+    external: Option<&str>,
+    parent: Option<Uuid>,
+) {
+    let principal: Uuid = sqlx::query_scalar("SELECT id FROM principal").fetch_one(&w.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO order_state (order_id, client_order_id, principal_id, portfolio_id, account_id, \
+         broker_connection_code, instrument_id, side, order_type, time_in_force, limit_price, original_qty, \
+         leaves_qty, cum_qty, status, version, origin, external_order_id, parent_order_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'market', 'day', NULL, 4, 4, 0, 'routed', 0, 'API', $9, $10)",
+    )
+    .bind(order_id).bind(client).bind(principal).bind(w.portfolio).bind(w.account).bind(&w.conn)
+    .bind(instrument.to_string()).bind(side).bind(external).bind(parent)
+    .execute(&w.pool).await.unwrap();
+}
+
+async fn roll_world(w: &World) -> Roll {
+    sqlx::query("UPDATE broker_connection SET broker_code = 'IBKR_TWS' WHERE code = $1")
+        .bind(&w.conn).execute(&w.pool).await.unwrap();
+    let near = future(&w.pool, "ESZ6").await;
+    let far = future(&w.pool, "ESH7").await;
+    let spread: i64 = sqlx::query_scalar(
+        "INSERT INTO instrument (symbol, venue, name, asset_class, instrument_class, currency, contract_size, status, \
+         price_precision, price_increment) \
+         VALUES ('ESZ6-ESH7', 'XCME', 'ESZ6-ESH7', 'INDEX', 'FUTURE', 'USD', 50, 'ACTIVE', 2, 0.25) RETURNING id",
+    )
+    .fetch_one(&w.pool).await.unwrap();
+    let (parent, near_child, far_child) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    insert_order(w, parent, &parent.to_string(), spread, "buy", Some("100"), None).await;
+    insert_order(w, near_child, &format!("{parent}-1"), near, "sell", None, Some(parent)).await;
+    insert_order(w, far_child, &format!("{parent}-2"), far, "buy", None, Some(parent)).await;
+    sqlx::query("INSERT INTO position (portfolio_id, instrument_id, net_qty) VALUES ($1, $2, 4)")
+        .bind(w.portfolio).bind(near.to_string()).execute(&w.pool).await.unwrap();
+    Roll { parent, near_child, far_child, near, far }
+}
+
+/// One leg execution of the roll's BAG: IBKR names the leg by its local symbol
+/// and the order by the BAG's permId and order ref (the parent id).
+fn leg_fill(r: &Roll, exec: &str, symbol: &str, buy: bool, qty: f64, price: f64) -> VenueEvent {
+    VenueEvent::Fill(VenueFill {
+        exec_id: exec.into(),
+        venue_order_id: "P1".into(),
+        client_order_id: Some(r.parent.to_string()),
+        account_ref: "acc".into(),
+        symbol: symbol.into(),
+        buy,
+        qty,
+        price,
+        fee: None,
+        executed_at: Some(chrono::Utc::now()),
+    })
+}
+
+/// IBKR's report on the BAG order itself (spread units).
+fn bag_update(r: &Roll, cum: f64, status: VenueOrderStatus) -> VenueEvent {
+    VenueEvent::Order(VenueOrderUpdate {
+        venue_order_id: "P1".into(),
+        client_order_id: Some(r.parent.to_string()),
+        account_ref: "acc".into(),
+        symbol: "ES".into(),
+        buy: true,
+        order_type: "limit".into(),
+        qty: 4.0,
+        limit_px: Some(40.0),
+        status,
+        cum_qty: cum,
+        ts: None,
+        created_at: None,
+    })
+}
+
+async fn position_of(w: &World, instrument: i64) -> f64 {
+    sqlx::query_scalar("SELECT net_qty::float8 FROM position WHERE portfolio_id = $1 AND instrument_id = $2")
+        .bind(w.portfolio)
+        .bind(instrument.to_string())
+        .fetch_optional(&w.pool)
+        .await
+        .unwrap()
+        .unwrap_or(0.0)
+}
+
+/// (status, cum) of one order.
+async fn state_of(w: &World, order_id: Uuid) -> (String, f64) {
+    sqlx::query_as("SELECT status, cum_qty::float8 FROM order_state WHERE order_id = $1")
+        .bind(order_id).fetch_one(&w.pool).await.unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn leg_fills_land_on_their_children() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    let d = ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0), None).await.unwrap().decision;
+    assert_eq!(d, Decision::Apply { order_id: r.near_child });
+    let d = ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x2", "ESH7", true, 4.0, 6040.0), None).await.unwrap().decision;
+    assert_eq!(d, Decision::Apply { order_id: r.far_child });
+    assert_eq!(position_of(&w, r.near).await, 0.0);
+    assert_eq!(position_of(&w, r.far).await, 4.0);
+    assert_eq!(state_of(&w, r.near_child).await, ("filled".to_string(), 4.0));
+    assert_eq!(state_of(&w, r.far_child).await, ("filled".to_string(), 4.0));
+    // the parent books no fills and holds no position
+    assert_eq!(state_of(&w, r.parent).await, ("routed".to_string(), 0.0));
+    assert_eq!(count(&w.pool, &format!("SELECT count(*) FROM order_event WHERE order_id = '{}'", r.parent)).await, 0);
+    let booked_to: Vec<Uuid> = sqlx::query_scalar("SELECT order_id FROM venue_fill ORDER BY exec_id").fetch_all(&w.pool).await.unwrap();
+    assert_eq!(booked_to, vec![r.near_child, r.far_child]);
+    // a redelivered leg fill is a duplicate
+    let d = ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0), None).await.unwrap().decision;
+    assert_eq!(d, Decision::Duplicate);
+    assert_eq!(position_of(&w, r.near).await, 0.0);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn a_leg_fill_matching_no_child_is_an_unknown_instrument_break() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    // another contract, and the right contract on the wrong side
+    for (exec, symbol, buy) in [("x1", "ESM7", false), ("x2", "ESZ6", true)] {
+        let d = ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, exec, symbol, buy, 4.0, 6000.0), None).await.unwrap().decision;
+        assert!(matches!(d, Decision::Break(BreakKind::UnknownInstrument) | Decision::AttachToBreak), "{d:?}");
+    }
+    let kind: String = sqlx::query_scalar("SELECT kind FROM recon_break").fetch_one(&w.pool).await.unwrap();
+    assert_eq!(kind, "unknown_instrument");
+    for id in [r.parent, r.near_child, r.far_child] {
+        assert_eq!(state_of(&w, id).await, ("routed".to_string(), 0.0));
+    }
+    assert_eq!(position_of(&w, r.near).await, 4.0);
+    assert_eq!(count(&w.pool, "SELECT count(*) FROM venue_fill").await, 0);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn parent_status_update_is_not_a_fill_gap() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    let done = ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 2.0, VenueOrderStatus::Working), None).await.unwrap();
+    assert_eq!(done.decision, Decision::Apply { order_id: r.parent });
+    assert!(!done.fill_gap, "a parent never books fills: nothing to pull for it");
+    let done = ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 4.0, VenueOrderStatus::Filled), None).await.unwrap();
+    assert!(!done.fill_gap);
+    // the venue's spread cum is on record; no fill was booked on the parent
+    let (cum, venue_cum): (f64, Option<f64>) =
+        sqlx::query_as("SELECT cum_qty::float8, venue_cum_qty::float8 FROM order_state WHERE order_id = $1")
+            .bind(r.parent).fetch_one(&w.pool).await.unwrap();
+    assert_eq!((cum, venue_cum), (0.0, Some(4.0)));
+    // and the parent's fill never forces the children filled
+    assert_eq!(state_of(&w, r.near_child).await, ("routed".to_string(), 0.0));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn cancelled_parent_cancels_unfilled_children() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    // the near leg filled, the far leg partly (a broken fill, for the test's sake)
+    ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x2", "ESH7", true, 1.0, 6040.0), None).await.unwrap();
+    let done = ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 1.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    assert_eq!(done.decision, Decision::Apply { order_id: r.parent });
+    assert_eq!(state_of(&w, r.parent).await, ("canceled".to_string(), 0.0));
+    assert_eq!(state_of(&w, r.near_child).await, ("filled".to_string(), 4.0));
+    assert_eq!(state_of(&w, r.far_child).await, ("canceled".to_string(), 1.0));
+    let leaves: f64 = sqlx::query_scalar("SELECT leaves_qty::float8 FROM order_state WHERE order_id = $1")
+        .bind(r.far_child).fetch_one(&w.pool).await.unwrap();
+    assert_eq!(leaves, 0.0);
+    let last: String = sqlx::query_scalar("SELECT event_type FROM order_event WHERE order_id = $1 ORDER BY version DESC LIMIT 1")
+        .bind(r.far_child).fetch_one(&w.pool).await.unwrap();
+    assert_eq!(last, "order_canceled");
+    // a repeated cancel report changes nothing
+    ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 1.0, VenueOrderStatus::Canceled), None).await.unwrap();
+    assert_eq!(count(&w.pool, &format!("SELECT count(*) FROM order_event WHERE order_id = '{}'", r.far_child)).await, 2);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn rejected_or_expired_parent_closes_its_children_the_same_way() {
+    for (status, want) in [
+        (VenueOrderStatus::Rejected { reason: "IBKR order inactive".into() }, "rejected"),
+        (VenueOrderStatus::Expired, "expired"),
+    ] {
+        let w = world().await;
+        let r = roll_world(&w).await;
+        ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 0.0, status), None).await.unwrap();
+        for id in [r.parent, r.near_child, r.far_child] {
+            assert_eq!(state_of(&w, id).await, (want.to_string(), 0.0), "{want}");
+        }
+    }
+}

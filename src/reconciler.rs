@@ -562,6 +562,9 @@ impl Reconciler {
     }
 
     /// Apply the venue's open orders, and close OMS-working orders it no longer lists.
+    /// Leg orders of a multi-leg order are not venue orders (the venue has the
+    /// parent, matched by its order ref like any OMS order): they close with
+    /// their parent in ingest, never by a lookup of their own.
     async fn snapshot(&self, account_id: Uuid, account_ref: &str, gap: &AtomicBool) -> Result<(), String> {
         let open = self.source.open_order_snapshot(account_ref).await.map_err(|e| e.to_string())?;
         for o in &open {
@@ -578,7 +581,8 @@ impl Reconciler {
              LEFT JOIN broker_instrument bi \
                ON bi.instrument_id = os.instrument_id::bigint AND bi.broker_code = bc.broker_code \
              WHERE os.broker_connection_code = $1 AND os.account_id = $2 \
-               AND os.status IN ('routed', 'partially_filled')",
+               AND os.status IN ('routed', 'partially_filled') \
+               AND os.parent_order_id IS NULL",
         )
         .bind(&self.connection)
         .bind(account_id)
