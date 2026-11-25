@@ -645,7 +645,7 @@ async fn book(
 
     match principal {
         Some(principal) => {
-            insert_order_state(tx, order_id, &state, principal, ctx.connection, &Origin::External, &None)
+            insert_order_state(tx, order_id, &state, principal, ctx.connection, &Origin::External, &None, None)
                 .await
                 .map_err(|e| IngestError::Other(e.message))?;
             let (venue_cum, venue_created) = match &events[0].payload {

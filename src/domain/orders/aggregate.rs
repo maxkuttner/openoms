@@ -88,6 +88,7 @@ impl OrderAggregate {
                         time_in_force: cmd.time_in_force,
                         limit_price: cmd.limit_price,
                         quantity: cmd.quantity,
+                        parent_order_id: cmd.parent_order_id,
                     },
                     version: 1,
                     status_after: OrderStatus::Submitted,
@@ -396,6 +397,7 @@ impl OrderAggregate {
                 time_in_force,
                 limit_price,
                 quantity,
+                ..
             } => {
                 self.state = Some(OrderAggregateState {
                     order_id: event.order_id.clone(),
@@ -1121,6 +1123,7 @@ mod tests {
                     time_in_force: TimeInForce::Day,
                     limit_price: Some(100.0),
                     quantity: 10.0,
+                    parent_order_id: None,
                 }),
                 metadata("ev-1"),
             )

@@ -157,6 +157,7 @@ impl SubmitOrderRequest {
             time_in_force: self.time_in_force,
             limit_price: self.limit_price,
             quantity: self.quantity,
+            parent_order_id: None,
         }
     }
 }

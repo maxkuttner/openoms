@@ -47,6 +47,7 @@ impl OrderTestData {
             time_in_force,
             limit_price,
             quantity,
+            parent_order_id: None,
         }
     }
 

@@ -3413,6 +3413,63 @@
         ]
       }
     },
+    "/orders/roll": {
+      "post": {
+        "tags": [
+          "orders"
+        ],
+        "summary": "Roll a futures position into a later contract",
+        "operationId": "orders_roll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RollRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Roll accepted: the parent (spread) order was routed; its two leg orders book the fills",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RollIds"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "403": {
+            "description": "No trade grant for principal/portfolio; or mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)"
+          },
+          "409": {
+            "description": "Strategy portfolio"
+          },
+          "422": {
+            "description": "No such position, quantity above it, not a later contract of the same root, no tradeable mapping, or rejected by pre-trade risk (then the roll and both legs are rejected)"
+          },
+          "502": {
+            "description": "Broker rejected the roll, or did not answer"
+          },
+          "503": {
+            "description": "No broker adapter configured"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/orders/submit": {
       "post": {
         "tags": [
@@ -5768,6 +5825,74 @@
           }
         }
       },
+      "RollIds": {
+        "type": "object",
+        "description": "The orders a roll created: the parent and its children (near leg, far leg).",
+        "required": [
+          "parent_order_id",
+          "child_order_ids"
+        ],
+        "properties": {
+          "child_order_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          "parent_order_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "RollRequest": {
+        "type": "object",
+        "description": "Wire payload for `POST /orders/roll`.",
+        "required": [
+          "portfolio_id",
+          "from_instrument_id",
+          "to_instrument_id",
+          "qty",
+          "order_type",
+          "time_in_force"
+        ],
+        "properties": {
+          "from_instrument_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The held contract (the near leg)."
+          },
+          "limit_price": {
+            "type": "number",
+            "format": "double",
+            "description": "The spread price, for a `limit` roll.",
+            "example": null,
+            "nullable": true
+          },
+          "order_type": {
+            "$ref": "#/components/schemas/OrderType"
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "qty": {
+            "type": "number",
+            "format": "double",
+            "description": "Contracts to roll: more than 0, at most the position.",
+            "example": 4.0
+          },
+          "time_in_force": {
+            "$ref": "#/components/schemas/TimeInForce"
+          },
+          "to_instrument_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "A later contract of the same root (the far leg)."
+          }
+        }
+      },
       "SaveRequest": {
         "type": "object",
         "required": [
@@ -6014,6 +6139,11 @@
           },
           "order_type": {
             "$ref": "#/components/schemas/OrderType"
+          },
+          "parent_order_id": {
+            "type": "string",
+            "description": "The roll (or other multi-leg) order this one is a leg of.",
+            "nullable": true
           },
           "portfolio_id": {
             "type": "string"

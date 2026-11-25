@@ -55,6 +55,10 @@ pub enum OrderEventPayload {
         time_in_force: TimeInForce,
         limit_price: Option<f64>,
         quantity: f64,
+        /// Set on a leg of a multi-leg order (a futures roll): the parent order.
+        /// Absent on every ordinary order, so their payload is unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_order_id: Option<String>,
     },
     OrderRejected {
         reason: String,

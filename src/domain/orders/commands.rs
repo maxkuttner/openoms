@@ -15,6 +15,9 @@ pub struct SubmitOrder {
     pub time_in_force: TimeInForce,
     pub limit_price: Option<f64>,
     pub quantity: f64,
+    /// The roll (or other multi-leg) order this one is a leg of.
+    #[serde(default)]
+    pub parent_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

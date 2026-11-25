@@ -79,6 +79,19 @@ impl<P: RiskDataProvider> RiskEngine<P> {
         cmd: &SubmitOrder,
         contract_size: f64,
     ) -> Result<(), RiskCheckError> {
+        self.check_submit_at(portfolio_id, cmd, contract_size, cmd.limit_price).await
+    }
+
+    /// `check_submit` valuing the order at `price` (a market order's mark, or a
+    /// roll leg's, which carries no limit price of its own). `None` skips the
+    /// notional checks, as for a market order without a price.
+    pub async fn check_submit_at(
+        &mut self,
+        portfolio_id: Uuid,
+        cmd: &SubmitOrder,
+        contract_size: f64,
+        price: Option<f64>,
+    ) -> Result<(), RiskCheckError> {
         let scope = RiskScope {
             portfolio_id,
             instrument_id: &cmd.instrument_id,
@@ -109,8 +122,8 @@ impl<P: RiskDataProvider> RiskEngine<P> {
             limits: config.limits,
             state: config.trading_state,
             valuation: risk::Valuation {
-                order_price: cmd.limit_price,
-                position_price: cmd.limit_price,
+                order_price: price,
+                position_price: price,
                 reference_price: None,
             },
         };
@@ -238,6 +251,7 @@ mod tests {
             time_in_force: TimeInForce::Day,
             limit_price,
             quantity,
+            parent_order_id: None,
         }
     }
 
@@ -559,6 +573,7 @@ mod tests {
             time_in_force: TimeInForce::Day,
             limit_price: Some(100.0),
             quantity: 60.0,
+            parent_order_id: None,
         };
 
         let first_pool = pool.clone();

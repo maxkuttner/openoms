@@ -91,6 +91,7 @@ mod credentials_api;
 mod expiry;
 mod alerts;
 mod futures;
+mod rolls;
 mod jobs;
 mod reload;
 mod cockpit;
@@ -111,6 +112,7 @@ mod first_run_tests;
     paths(
         handlers::health,
         handlers::orders_submit,
+        rolls::orders_roll,
         handlers::orders_cancel,
         handlers::get_order,
         handlers::list_orders,
@@ -213,7 +215,7 @@ mod first_run_tests;
         admin::RedactedCredentials, crate::credentials::RedactedField,
         jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
         instruments_import::Contract, instruments_import::ImportResolveRequest, instruments_import::ResolvedRow,
-        futures::sync::SyncReport, futures::api::FutureRootView, futures::front::FutureContract, alerts::AlertView, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
+        futures::sync::SyncReport, futures::api::FutureRootView, futures::front::FutureContract, rolls::RollRequest, rolls::RollIds, alerts::AlertView, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
         jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted, jobs::api::JobDetail,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
@@ -283,7 +285,7 @@ struct MfaAddon;
 impl utoipa::Modify for MfaAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
         use utoipa::openapi::{PathItemType, RefOr, ResponseBuilder};
-        const TRADING: [&str; 3] = ["/orders/submit", "/orders/cancel", "/orders/{id}/allocations"];
+        const TRADING: [&str; 4] = ["/orders/submit", "/orders/roll", "/orders/cancel", "/orders/{id}/allocations"];
         const NOTE: &str = "mfa_required: the session has not passed MFA (sign in again with TOTP or MFA-backed SSO)";
         for (path, item) in openapi.paths.paths.iter_mut() {
             for (method, op) in item.operations.iter_mut() {
@@ -917,6 +919,7 @@ fn build_app(
     // 1) Register order routes
     let orders_router = Router::new()
         .route("/orders/submit", post(handlers::orders_submit))
+        .route("/orders/roll", post(rolls::orders_roll))
         .route("/orders/cancel", post(handlers::orders_cancel))
         .route("/orders/:id", get(handlers::get_order))
         .route("/orders/:id/events", get(order_events::get_order_events))
@@ -1989,7 +1992,7 @@ mod tests {
     #[test]
     fn every_mfa_gated_route_documents_mfa_required() {
         let spec: serde_json::Value = serde_json::from_str(&super::openapi_json()).unwrap();
-        let trading = [("post", "/orders/submit"), ("post", "/orders/cancel"), ("post", "/orders/{id}/allocations")];
+        let trading = [("post", "/orders/submit"), ("post", "/orders/roll"), ("post", "/orders/cancel"), ("post", "/orders/{id}/allocations")];
         let mut missing = Vec::new();
         let mut gated = 0;
         for (path, ops) in spec["paths"].as_object().unwrap() {

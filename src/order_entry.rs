@@ -16,7 +16,7 @@ use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::{CancelOrder, ExecutionReport, OrderCommand, ReceiveExecutionReport, RouteOrder, SubmitOrder};
 use crate::domain::orders::state::{OrderAggregateState, OrderStatus, TimeInForce};
 use crate::event_bus::publish_appended;
-use crate::event_store::OrderEventStore;
+use crate::event_store::{NewOrderEvent, OrderEventStore};
 use crate::handlers::{
     actor_for, domain_event_to_new_event, map_rejection_to_api_error, parse_order_side, parse_order_status,
     parse_order_type, parse_time_in_force, require_order_grant, resolve_instrument_ref, ApiError, OrderAccess,
@@ -49,7 +49,7 @@ impl Origin {
 }
 
 /// A pre-trade rejection as the API reports it; the reason names the check.
-fn risk_api_error(order_id: Uuid, rejection: RiskRejection) -> ApiError {
+pub(crate) fn risk_api_error(order_id: Uuid, rejection: RiskRejection) -> ApiError {
     warn!(order_id = %order_id, code = %rejection.code, message = %rejection.message, "order rejected by pre-trade risk");
     ApiError {
         status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -89,7 +89,7 @@ async fn strategy_route(pool: &sqlx::PgPool, strategy: &Strategy, req: &SubmitOr
 /// account per (portfolio, connection), and a grant adopts a pre-existing one
 /// (keeping its code), so the code is deliberately not matched. An explicit `account_id` must be one of
 /// them; without one, the single such venue that lists the instrument.
-async fn granted_account(
+pub(crate) async fn granted_account(
     pool: &sqlx::PgPool,
     portfolio_id: Uuid,
     instrument_id: i64,
@@ -129,6 +129,7 @@ async fn granted_account(
 }
 
 /// Insert an order's state row (status and quantities as `s` has them).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_order_state(
     conn: &mut sqlx::PgConnection,
     order_id: Uuid,
@@ -137,6 +138,7 @@ pub(crate) async fn insert_order_state(
     broker_connection_code: &str,
     origin: &Origin,
     fix_cl_ord_id: &Option<String>,
+    parent_order_id: Option<Uuid>,
 ) -> Result<(), ApiError> {
     sqlx::query(
         r#"
@@ -161,11 +163,13 @@ pub(crate) async fn insert_order_state(
             broker_connection_code,
             origin,
             fix_cl_ord_id,
-            responsible_principal_id
+            responsible_principal_id,
+            parent_order_id
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
             -- a strategy's order answers to its responsible user; anyone else's to themselves
-            COALESCE((SELECT owner_principal_id FROM strategy WHERE principal_id = $3 LIMIT 1), $3)
+            COALESCE((SELECT owner_principal_id FROM strategy WHERE principal_id = $3 LIMIT 1), $3),
+            $21
         )
         "#
     )
@@ -189,6 +193,7 @@ pub(crate) async fn insert_order_state(
     .bind(broker_connection_code)
     .bind(origin.as_str())
     .bind(fix_cl_ord_id)
+    .bind(parent_order_id)
     .execute(&mut *conn)
     .await
     .map_err(|err| ApiError {
@@ -213,13 +218,34 @@ async fn record_rejection(
     rejection: &RiskRejection,
 ) -> Result<(), ApiError> {
     let internal = |what: &str, err: String| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to {what}: {err}") };
+    let (final_state, new_events) = rejected_order(auth, order_id, cmd, format!("{}: {}", rejection.code, rejection.message))?;
+    let mut tx = state.pool().begin().await.map_err(|e| internal("start transaction", e.to_string()))?;
+    insert_order_state(&mut tx, order_id, &final_state, auth.principal_id, broker_connection_code, origin, fix_cl_ord_id, None).await?;
+    let appended = OrderEventStore::new(state.pool().clone())
+        .append_events_in_tx(&mut tx, order_id, 0, &new_events)
+        .await
+        .map_err(|e| internal("append rejection events", format!("{e:?}")))?;
+    tx.commit().await.map_err(|e| internal("commit rejection", e.to_string()))?;
+    publish_appended(state.event_bus(), order_id, &new_events, &appended);
+    Ok(())
+}
+
+/// An order submitted and at once rejected with `reason`: its final state and
+/// the two events, for the caller to store.
+pub(crate) fn rejected_order(
+    auth: &AuthContext,
+    order_id: Uuid,
+    cmd: SubmitOrder,
+    reason: String,
+) -> Result<(OrderAggregateState, Vec<NewOrderEvent>), ApiError> {
+    let internal = |what: &str, err: String| ApiError { status: StatusCode::INTERNAL_SERVER_ERROR, message: format!("failed to {what}: {err}") };
     let mut aggregate = OrderAggregate::empty();
     let mut events = Vec::new();
     for command in [
         OrderCommand::SubmitOrder(cmd),
         OrderCommand::ReceiveExecutionReport(ReceiveExecutionReport {
             order_id: order_id.to_string(),
-            report: ExecutionReport::Reject { reason: format!("{}: {}", rejection.code, rejection.message), venue: None },
+            report: ExecutionReport::Reject { reason, venue: None },
         }),
     ] {
         let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor_for(auth), occurred_at: None };
@@ -231,16 +257,20 @@ async fn record_rejection(
     }
     let final_state = aggregate.state.clone().ok_or_else(|| internal("record rejection", "no state".into()))?;
     let new_events = events.iter().map(domain_event_to_new_event).collect::<Result<Vec<_>, _>>()?;
+    Ok((final_state, new_events))
+}
 
-    let mut tx = state.pool().begin().await.map_err(|e| internal("start transaction", e.to_string()))?;
-    insert_order_state(&mut tx, order_id, &final_state, auth.principal_id, broker_connection_code, origin, fix_cl_ord_id).await?;
-    let appended = OrderEventStore::new(state.pool().clone())
-        .append_events_in_tx(&mut tx, order_id, 0, &new_events)
-        .await
-        .map_err(|e| internal("append rejection events", format!("{e:?}")))?;
-    tx.commit().await.map_err(|e| internal("commit rejection", e.to_string()))?;
-    publish_appended(state.event_bus(), order_id, &new_events, &appended);
-    Ok(())
+/// A new order as submitted: its state and its `order_submitted` event.
+pub(crate) fn submitted_order(auth: &AuthContext, cmd: SubmitOrder) -> Result<(OrderAggregateState, Vec<NewOrderEvent>), ApiError> {
+    let metadata = EventMetadata { event_id: Uuid::new_v4().to_string(), timestamp: Utc::now(), actor: actor_for(auth), occurred_at: None };
+    let events = OrderAggregate::empty().decide(OrderCommand::SubmitOrder(cmd), metadata).map_err(map_rejection_to_api_error)?;
+    let mut applied = OrderAggregate::empty();
+    for event in &events {
+        applied.apply(event).map_err(|e| crate::handlers::internal("failed to apply domain event", e))?;
+    }
+    let state = applied.state.ok_or_else(|| crate::handlers::internal("missing aggregate state after submit", "no state"))?;
+    let new_events = events.iter().map(domain_event_to_new_event).collect::<Result<Vec<_>, _>>()?;
+    Ok((state, new_events))
 }
 
 /// What persisting a route found.
@@ -265,24 +295,70 @@ pub async fn persist_routed(
     external_order_id: &str,
     actor: &str,
 ) -> Result<RouteResult, ApiError> {
+    persist_route(pool, bus, order_id, venue, external_order_id, true, actor).await
+}
+
+/// Record that a leg of a multi-leg order went to the venue with its parent,
+/// which the venue knows as `parent_external_order_id`. The leg's own row keeps
+/// no venue id: the venue has no order of that id for it (and one venue order
+/// id belongs to one row).
+pub async fn persist_leg_routed(
+    pool: &sqlx::PgPool,
+    bus: &crate::event_bus::EventBus,
+    order_id: Uuid,
+    venue: &str,
+    parent_external_order_id: &str,
+    actor: &str,
+) -> Result<RouteResult, ApiError> {
+    persist_route(pool, bus, order_id, venue, parent_external_order_id, false, actor).await
+}
+
+/// The columns `state_from_row` reads.
+pub(crate) const STATE_COLUMNS: &str = "order_id, client_order_id, portfolio_id, account_id, instrument_id, \
+     side, order_type, time_in_force, \
+     limit_price::double precision AS limit_price, \
+     original_qty::double precision AS original_qty, \
+     leaves_qty::double precision AS leaves_qty, \
+     cum_qty::double precision AS cum_qty, \
+     avg_px::double precision AS avg_px, \
+     status, resume_to_status, version, origin";
+
+/// An order's aggregate state from its `order_state` row (`STATE_COLUMNS`).
+pub(crate) fn state_from_row(row: &sqlx::postgres::PgRow) -> Result<OrderAggregateState, ApiError> {
+    Ok(OrderAggregateState {
+        order_id: row.get::<Uuid, _>("order_id").to_string(),
+        client_order_id: row.get::<String, _>("client_order_id"),
+        portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
+        account_id: row.get::<Uuid, _>("account_id").to_string(),
+        instrument_id: row.get::<String, _>("instrument_id"),
+        side: parse_order_side(row.get::<String, _>("side"))?,
+        order_type: parse_order_type(row.get::<String, _>("order_type"))?,
+        time_in_force: parse_time_in_force(row.get::<String, _>("time_in_force"))?,
+        limit_price: row.get::<Option<f64>, _>("limit_price"),
+        original_qty: row.get::<f64, _>("original_qty"),
+        leaves_qty: row.get::<f64, _>("leaves_qty"),
+        cum_qty: row.get::<f64, _>("cum_qty"),
+        avg_px: row.get::<Option<f64>, _>("avg_px"),
+        status: parse_order_status(row.get::<String, _>("status"))?,
+        resume_to_status: row.get::<Option<String>, _>("resume_to_status").map(parse_order_status).transpose()?,
+        version: row.get::<i64, _>("version"),
+        observed: row.get::<String, _>("origin") == "EXTERNAL",
+    })
+}
+
+async fn persist_route(
+    pool: &sqlx::PgPool,
+    bus: &crate::event_bus::EventBus,
+    order_id: Uuid,
+    venue: &str,
+    external_order_id: &str,
+    store_external: bool,
+    actor: &str,
+) -> Result<RouteResult, ApiError> {
     let event_store = OrderEventStore::new(pool.clone());
     const MAX_ROUTE_ATTEMPTS: u32 = 5;
     for attempt in 1..=MAX_ROUTE_ATTEMPTS {
-        let row = sqlx::query(
-            r#"
-            SELECT
-                order_id, client_order_id, portfolio_id, account_id, instrument_id,
-                side, order_type, time_in_force,
-                limit_price::double precision AS limit_price,
-                original_qty::double precision AS original_qty,
-                leaves_qty::double precision AS leaves_qty,
-                cum_qty::double precision AS cum_qty,
-                avg_px::double precision AS avg_px,
-                status, resume_to_status, version, origin
-            FROM order_state
-            WHERE order_id = $1
-            "#,
-        )
+        let row = sqlx::query(&format!("SELECT {STATE_COLUMNS} FROM order_state WHERE order_id = $1"))
         .bind(order_id)
         .fetch_one(pool)
         .await
@@ -291,39 +367,15 @@ pub async fn persist_routed(
             message: format!("failed to re-read order state before routing: {:?}", err),
         })?;
 
-        let side = parse_order_side(row.get::<String, _>("side"))?;
-        let order_type = parse_order_type(row.get::<String, _>("order_type"))?;
-        let time_in_force = parse_time_in_force(row.get::<String, _>("time_in_force"))?;
-        let status = parse_order_status(row.get::<String, _>("status"))?;
-        let resume_to_status = row
-            .get::<Option<String>, _>("resume_to_status")
-            .map(parse_order_status)
-            .transpose()?;
-
-        let current_state = OrderAggregateState {
-            order_id: row.get::<Uuid, _>("order_id").to_string(),
-            client_order_id: row.get::<String, _>("client_order_id"),
-            portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
-            account_id: row.get::<Uuid, _>("account_id").to_string(),
-            instrument_id: row.get::<String, _>("instrument_id"),
-            side,
-            order_type,
-            time_in_force,
-            limit_price: row.get::<Option<f64>, _>("limit_price"),
-            original_qty: row.get::<f64, _>("original_qty"),
-            leaves_qty: row.get::<f64, _>("leaves_qty"),
-            cum_qty: row.get::<f64, _>("cum_qty"),
-            avg_px: row.get::<Option<f64>, _>("avg_px"),
-            status,
-            resume_to_status,
-            version: row.get::<i64, _>("version"),
-            observed: row.get::<String, _>("origin") == "EXTERNAL",
-        };
+        let current_state = state_from_row(&row)?;
 
         if current_state.status.is_terminal() {
             return Ok(RouteResult::Terminal(current_state.status));
         }
         if current_state.status != OrderStatus::Submitted {
+            if !store_external {
+                return Ok(RouteResult::NotSubmitted);
+            }
             // A fill landed first (partially filled, not closed): the venue's
             // id still has to be on record, or nothing could cancel or
             // reconcile the order.
@@ -389,7 +441,7 @@ pub async fn persist_routed(
         .bind(order_id)
         .bind(routed_state.status.as_str())
         .bind(routed_state.version)
-        .bind(external_order_id)
+        .bind(store_external.then_some(external_order_id))
         .bind(Utc::now())
         .bind(expected_version)
         .execute(&mut *tx2)
@@ -477,7 +529,7 @@ fn venue_rules(broker_code: &str) -> risk::VenueRules {
     })
 }
 
-async fn book_reject(state: &AppState, order_id: Uuid, reason: String) {
+pub(crate) async fn book_reject(state: &AppState, order_id: Uuid, reason: String) {
     state.engine().reject(order_id, reason, "oms").await;
 }
 
@@ -487,6 +539,145 @@ async fn book_reject(state: &AppState, order_id: Uuid, reason: String) {
 pub enum CancelOutcome {
     Requested,
     Canceled,
+}
+
+/// An account's routing coordinates (its ACTIVE broker connection).
+pub(crate) struct AccountRoute {
+    pub broker_code: String,
+    pub environment: String,
+    pub broker_connection_code: String,
+    pub external_account_ref: String,
+}
+
+/// Where orders of `account_id` go: its broker_connection (broker_code,
+/// environment) and the custodial ref. Requires an ACTIVE connection.
+pub(crate) async fn account_route(pool: &sqlx::PgPool, account_id: Uuid) -> Result<AccountRoute, ApiError> {
+    let row = sqlx::query(
+        "SELECT bc.broker_code, bc.environment, bc.code AS broker_connection_code, \
+                a.external_account_ref \
+         FROM account a \
+         JOIN broker_connection bc ON bc.code = a.broker_connection_code \
+         WHERE a.id = $1 AND bc.status = 'ACTIVE'"
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to load account: {:?}", err),
+    })?
+    .ok_or_else(|| ApiError {
+        status: StatusCode::BAD_REQUEST,
+        message: "account not found or its broker connection is not active".to_string(),
+    })?;
+    Ok(AccountRoute {
+        broker_code: row.get("broker_code"),
+        environment: row.get("environment"),
+        broker_connection_code: row.get("broker_connection_code"),
+        external_account_ref: row.get("external_account_ref"),
+    })
+}
+
+/// A connector refuses the instrument classes it cannot trade (the FIX
+/// IBKR connector has no futures path). An unknown connector is not blocked.
+pub(crate) fn connector_trades(broker_code: &str, instrument_class: &str) -> Result<(), ApiError> {
+    if let Some(c) = gateway::connectors::by_code(broker_code) {
+        if !c.manifest().instrument_classes.contains(&instrument_class) {
+            return Err(ApiError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("{broker_code} cannot trade {instrument_class} instruments"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// How the broker call for a stored, `submitted` order went.
+pub(crate) enum Routing {
+    /// The venue took it under this id; what persisting the route found.
+    Taken(RouteResult, String),
+    /// The venue (or a missing adapter) refused it; the reject is booked.
+    Rejected(ApiError),
+    /// No definite answer: left `submitted` for recon.
+    Unknown(ApiError),
+}
+
+/// Send a stored order to its broker and record the outcome (TX2). `cancel_symbol`
+/// is the broker symbol a cancel needs, should the order close while routing.
+pub(crate) async fn route_stored(
+    state: &AppState,
+    auth: &AuthContext,
+    order_id: Uuid,
+    broker_code: &str,
+    environment: &str,
+    broker_req: &BrokerOrderRequest,
+    cancel_symbol: &str,
+) -> Result<Routing, ApiError> {
+    // Find the adapter for this broker+environment combination.
+    let adapter = match state.registry().get(broker_code, environment) {
+        Some(a) => a,
+        None => {
+            warn!(broker_code = %broker_code, environment = %environment, "no adapter registered — order rejected");
+            book_reject(state, order_id, format!("no adapter configured for {broker_code}/{environment}")).await;
+            return Ok(Routing::Rejected(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("no adapter configured for {broker_code}/{environment}"),
+            }));
+        }
+    };
+
+    let broker_resp = match adapter.submit_order(broker_req).await {
+        Ok(resp) => resp,
+        Err(err) => match route_failure(&err) {
+            RouteFailure::Rejected(msg) => {
+                warn!(broker_code = %broker_code, error = %msg, "broker rejected order");
+                book_reject(state, order_id, msg.clone()).await;
+                return Ok(Routing::Rejected(ApiError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("broker rejected order: {msg}"),
+                }));
+            }
+            RouteFailure::Unknown => {
+                error!(broker_code = %broker_code, error = %err, "adapter error routing order — left as Submitted for recon");
+                return Ok(Routing::Unknown(ApiError {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: format!("failed to route order to {broker_code}: {err}"),
+                }));
+            }
+        },
+    };
+
+    info!(
+        order_id = %order_id,
+        external_order_id = %broker_resp.external_order_id,
+        broker = %broker_code,
+        "order routed to broker"
+    );
+
+    // Persist the OrderRouted event in TX2.
+    //
+    // A fast broker fill can race this: execution.rs's process_execution_report
+    // already retries on exactly this version conflict (a Binance market order
+    // can fill before we even get here), but until now this side of the same
+    // race just 500'd. Re-read + re-decide + retry, mirroring execution.rs's
+    // apply_once, instead of trusting the in-memory state from before the
+    // broker round-trip.
+    let result = persist_routed(state.pool(), state.event_bus(), order_id, broker_code, &broker_resp.external_order_id, &actor_for(auth)).await?;
+    if let RouteResult::Terminal(status) = &result {
+        // Cancelled locally while the broker call was in flight (a Kill, or a
+        // strategy's session ending): the venue has the order the OMS no
+        // longer tracks, so cancel it there too.
+        if *status == OrderStatus::Canceled {
+            warn!(order_id = %order_id, "order was cancelled while routing; cancelling it at the broker");
+            if let Err(err) = adapter.cancel_order(&broker_resp.external_order_id, cancel_symbol).await {
+                error!(order_id = %order_id, error = %err, "could not cancel at the broker an order cancelled while routing");
+            }
+        }
+        // A fast fill or a cancel closed it first: the broker call succeeded
+        // and the terminal event is persisted, so this is success.
+        info!(order_id = %order_id, status = ?status, "order reached a terminal state before routing could persist — treating as routed");
+    }
+    Ok(Routing::Taken(result, broker_resp.external_order_id))
 }
 
 /// Validate, risk-check, store and route one order; returns its OMS order id.
@@ -566,32 +757,9 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // Boundary → domain: fold the resolved account into the pure SubmitOrder command.
     let cmd = req.into_command(account_id.to_string(), instrument_id_bigint);
 
-    // Pre-flight: resolve the account's routing coordinates from its broker_connection
-    // (broker_code, environment) + the custodial ref, so we can validate the instrument
-    // mapping before committing anything to the event store. Requires an ACTIVE connection.
-    let account_row_pre = sqlx::query(
-        "SELECT bc.broker_code, bc.environment, bc.code AS broker_connection_code, \
-                a.external_account_ref \
-         FROM account a \
-         JOIN broker_connection bc ON bc.code = a.broker_connection_code \
-         WHERE a.id = $1 AND bc.status = 'ACTIVE'"
-    )
-    .bind(account_id)
-    .fetch_optional(&pool)
-    .await
-    .map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to load account: {:?}", err),
-    })?
-    .ok_or_else(|| ApiError {
-        status: StatusCode::BAD_REQUEST,
-        message: "account not found or its broker connection is not active".to_string(),
-    })?;
-
-    let broker_code: String = account_row_pre.get("broker_code");
-    let environment: String = account_row_pre.get("environment");
-    let broker_connection_code: String = account_row_pre.get("broker_connection_code");
-    let external_account_ref: String = account_row_pre.get("external_account_ref");
+    // Pre-flight: resolve the account's routing coordinates, so we can validate the
+    // instrument mapping before committing anything to the event store.
+    let AccountRoute { broker_code, environment, broker_connection_code, external_account_ref } = account_route(&pool, account_id).await?;
 
     // Validate instrument is ACTIVE.
     // Fetch the instrument's status plus the metadata the risk/routing path needs:
@@ -636,16 +804,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         })?;
     }
 
-    // A connector refuses the instrument classes it cannot trade (the FIX
-    // IBKR connector has no futures path). An unknown connector is not blocked.
-    if let Some(c) = gateway::connectors::by_code(&broker_code) {
-        if !c.manifest().instrument_classes.contains(&instrument_class.as_str()) {
-            return Err(ApiError {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                message: format!("{broker_code} cannot trade {instrument_class} instruments"),
-            });
-        }
-    }
+    connector_trades(&broker_code, &instrument_class)?;
 
     // Options route to Alpaca as single-leg contract orders, which only accept
     // a `day` time-in-force. Reject anything else up front with a clear message.
@@ -834,7 +993,7 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         message: "missing aggregate state after submit".to_string(),
     })?;
 
-    insert_order_state(&mut tx, order_id, &state_after_submit, auth.principal_id, &broker_connection_code, &origin, &fix_cl_ord_id).await?;
+    insert_order_state(&mut tx, order_id, &state_after_submit, auth.principal_id, &broker_connection_code, &origin, &fix_cl_ord_id, None).await?;
 
 
     // add events to be stored to db in order_event
@@ -868,21 +1027,6 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
     // --- TX2: route order to broker ---
     // broker_code, environment, external_account_ref, and broker_symbol were resolved in the
     // pre-flight validation block before TX1.
-
-    // Find the adapter for this broker+environment combination.
-    let adapter = match state.registry().get(&broker_code, &environment) {
-        Some(a) => a,
-        None => {
-            warn!(broker_code = %broker_code, environment = %environment, "no adapter registered — order rejected");
-            book_reject(state, order_id, format!("no adapter configured for {broker_code}/{environment}")).await;
-            return Err(ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!("no adapter configured for {broker_code}/{environment}"),
-            });
-        }
-    };
-
-    // Call the broker adapter.
     let broker_req = BrokerOrderRequest {
         order_id: order_id.to_string(),
         symbol: broker_symbol.clone(),
@@ -894,60 +1038,10 @@ pub async fn submit(state: &AppState, auth: &AuthContext, req: SubmitOrderReques
         limit_price: state_after_submit.limit_price,
         external_account_ref,
     };
-
-    let broker_resp = match adapter.submit_order(&broker_req).await {
-        Ok(resp) => resp,
-        Err(err) => match route_failure(&err) {
-            RouteFailure::Rejected(msg) => {
-                warn!(broker_code = %broker_code, error = %msg, "broker rejected order");
-                book_reject(state, order_id, msg.clone()).await;
-                return Err(ApiError {
-                    status: StatusCode::BAD_GATEWAY,
-                    message: format!("broker rejected order: {msg}"),
-                });
-            }
-            RouteFailure::Unknown => {
-                error!(broker_code = %broker_code, error = %err, "adapter error routing order — left as Submitted for recon");
-                return Err(ApiError {
-                    status: StatusCode::BAD_GATEWAY,
-                    message: format!("failed to route order to {broker_code}: {err}"),
-                });
-            }
-        },
-    };
-
-    info!(
-        order_id = %order_id,
-        external_order_id = %broker_resp.external_order_id,
-        broker = %broker_code,
-        "order routed to broker"
-    );
-
-    // Persist the OrderRouted event in TX2.
-    //
-    // A fast broker fill can race this: execution.rs's process_execution_report
-    // already retries on exactly this version conflict (a Binance market order
-    // can fill before we even get here), but until now this side of the same
-    // race just 500'd. Re-read + re-decide + retry, mirroring execution.rs's
-    // apply_once, instead of trusting the in-memory `state_after_submit` from
-    // before the broker round-trip.
-    if let RouteResult::Terminal(status) =
-        persist_routed(&pool, state.event_bus(), order_id, &broker_code, &broker_resp.external_order_id, &actor_for(auth)).await?
-    {
-        // Cancelled locally while the broker call was in flight (a Kill, or a
-        // strategy's session ending): the venue has the order the OMS no
-        // longer tracks, so cancel it there too.
-        if status == OrderStatus::Canceled {
-            warn!(order_id = %order_id, "order was cancelled while routing; cancelling it at the broker");
-            if let Err(err) = adapter.cancel_order(&broker_resp.external_order_id, &broker_symbol).await {
-                error!(order_id = %order_id, error = %err, "could not cancel at the broker an order cancelled while routing");
-            }
-        }
-        // A fast fill or a cancel closed it first: the broker call succeeded
-        // and the terminal event is persisted, so this is success.
-        info!(order_id = %order_id, status = ?status, "order reached a terminal state before routing could persist — treating as routed");
+    match route_stored(state, auth, order_id, &broker_code, &environment, &broker_req, &broker_symbol).await? {
+        Routing::Taken(..) => {}
+        Routing::Rejected(err) | Routing::Unknown(err) => return Err(err),
     }
-
 
     Ok(order_id)
 }
@@ -959,8 +1053,6 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
     crate::authz::require_mfa(auth)?;
 
     let pool = app_state.pool().clone();
-    let event_store = OrderEventStore::new(pool.clone());
-
 
     require_order_grant(&pool, auth.principal_id, order_id, OrderAccess::Cancel).await?;
 
@@ -991,7 +1083,8 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
             version,
             external_order_id,
             broker_connection_code,
-            origin
+            origin,
+            parent_order_id
         FROM order_state
         WHERE order_id = $1
         "#
@@ -1014,6 +1107,15 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
             })
         }
     };
+
+    // A leg of a roll is cancelled with its roll: the venue holds one order for
+    // the roll, not one per leg.
+    if row.get::<Option<Uuid>, _>("parent_order_id").is_some() {
+        return Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: "cancel the roll, not a leg".to_string(),
+        });
+    }
 
     // Already done: nothing to cancel.
     let status_str: String = row.get("status");
@@ -1078,42 +1180,53 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
         return Ok(CancelOutcome::Requested);
     }
 
-    // No external_order_id: the order never reached a broker — cancel locally (no race).
-    let side = parse_order_side(row.get::<String, _>("side"))?;
-    let order_type = parse_order_type(row.get::<String, _>("order_type"))?;
-    let time_in_force = parse_time_in_force(row.get::<String, _>("time_in_force"))?;
-    let status = parse_order_status(row.get::<String, _>("status"))?;
-    let resume_to_status = row
-        .get::<Option<String>, _>("resume_to_status")
-        .map(parse_order_status)
-        .transpose()?;
+    // No external_order_id: the order never reached a broker — cancel locally (no
+    // race), and with it any leg orders it is the parent of (same transaction).
+    let actor = actor_for(auth);
+    let store = OrderEventStore::new(pool.clone());
+    let mut published = vec![(order_id, cancel_locally(&store, &mut tx, state_from_row(&row)?, reason.clone(), &actor).await?)];
+    let legs = sqlx::query(&format!(
+        "SELECT {STATE_COLUMNS} FROM order_state \
+         WHERE parent_order_id = $1 AND status NOT IN ('filled', 'canceled', 'rejected', 'expired') \
+         ORDER BY order_id FOR UPDATE"
+    ))
+    .bind(order_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| crate::handlers::internal("failed to load leg orders", e))?;
+    for leg in &legs {
+        let leg_id: Uuid = leg.get("order_id");
+        published.push((leg_id, cancel_locally(&store, &mut tx, state_from_row(leg)?, reason.clone(), &actor).await?));
+    }
 
-    //FIXME: there must be a smarter way to instantiate the struct with sqlx
-    let state = OrderAggregateState {
-        order_id: row.get::<Uuid, _>("order_id").to_string(),
-        client_order_id: row.get::<String, _>("client_order_id"),
-        portfolio_id: row.get::<Uuid, _>("portfolio_id").to_string(),
-        account_id: row.get::<Uuid, _>("account_id").to_string(),
-        instrument_id: row.get::<String, _>("instrument_id"),
-        side,
-        order_type,
-        time_in_force,
-        limit_price: row.get::<Option<f64>, _>("limit_price"),
-        original_qty: row.get::<f64, _>("original_qty"),
-        leaves_qty: row.get::<f64, _>("leaves_qty"),
-        cum_qty: row.get::<f64, _>("cum_qty"),
-        avg_px: row.get::<Option<f64>, _>("avg_px"),
-        status,
-        resume_to_status,
-        version: row.get::<i64, _>("version"),
-        observed: row.get::<String, _>("origin") == "EXTERNAL",
-    };
+    tx.commit().await.map_err(|err| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: format!("failed to commit transaction: {:?}", err),
+    })?;
 
+    for (id, (new_events, appended)) in &published {
+        publish_appended(app_state.event_bus(), *id, new_events, appended);
+    }
+
+    // return response
+    Ok(CancelOutcome::Canceled)
+}
+
+/// Cancel an order that never reached a broker, inside `tx`: the state
+/// update and the event; the caller publishes after commit.
+async fn cancel_locally(
+    store: &OrderEventStore,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    state: OrderAggregateState,
+    reason: Option<String>,
+    actor: &str,
+) -> Result<(Vec<NewOrderEvent>, crate::event_store::AppendResult), ApiError> {
+    let order_id = Uuid::parse_str(&state.order_id).map_err(|e| crate::handlers::internal("bad order id", e))?;
     let aggregate = OrderAggregate::from_state(state.clone());
     let metadata = EventMetadata {
         event_id: Uuid::new_v4().to_string(),
         timestamp: Utc::now(),
-        actor: actor_for(&auth),
+        actor: actor.to_string(),
         occurred_at: None,
     };
 
@@ -1132,8 +1245,6 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
         })?;
     }
 
-
-    // return a Result (i.e. the value or an error)
     let state = applied.state.ok_or(ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: "missing aggregate state after cancel".to_string(),
@@ -1141,13 +1252,12 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
 
     let updated = sqlx::query(
         r#"
-        UPDATE order_state 
-        SET 
+        UPDATE order_state
+        SET
           status = $2,
           resume_to_status = $3,
           version = $4,
           updated_at = $5
-         
         WHERE order_id = $1 AND version = $6
         "#
     )
@@ -1157,7 +1267,7 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
     .bind(state.version)
     .bind(chrono::Utc::now())
     .bind(expected_version)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(|err| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1171,15 +1281,9 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
         });
     }
 
-
-    // add events to be stored to db in order_event
-    let mut new_events = Vec::with_capacity(events.len());
-    for event in &events {
-        new_events.push(domain_event_to_new_event(event)?);
-    }
-
-    let appended = event_store
-        .append_events_in_tx(&mut tx, order_id, expected_version, &new_events)
+    let new_events = events.iter().map(domain_event_to_new_event).collect::<Result<Vec<_>, _>>()?;
+    let appended = store
+        .append_events_in_tx(tx, order_id, expected_version, &new_events)
         .await
         .map_err(|err| {
             error!(error = ?err, order_id = %order_id, "failed to append order audit event");
@@ -1188,16 +1292,7 @@ pub async fn cancel(app_state: &AppState, auth: &AuthContext, order_id: Uuid, re
                 message: format!("failed to append order audit event: {:?}", err),
             }
         })?;
-
-    tx.commit().await.map_err(|err| ApiError {
-        status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("failed to commit transaction: {:?}", err),
-    })?;
-
-    publish_appended(app_state.event_bus(), order_id, &new_events, &appended);
-
-    // return response
-    Ok(CancelOutcome::Canceled)
+    Ok((new_events, appended))
 }
 
 #[cfg(test)]
@@ -1308,7 +1403,7 @@ pub(crate) mod tests {
 
     // ── Trading grants (reload DB) ───────────────────────────────────────────
 
-    async fn g_connection(pool: &sqlx::PgPool, broker: &str) -> String {
+    pub(crate) async fn g_connection(pool: &sqlx::PgPool, broker: &str) -> String {
         let code = format!("c-{}", Uuid::new_v4().simple());
         sqlx::query("INSERT INTO broker_connection (code, broker_code, environment, status) VALUES ($1, $2, 'PAPER', 'ACTIVE')")
             .bind(&code).bind(broker).execute(pool).await.unwrap();
@@ -1354,14 +1449,14 @@ pub(crate) mod tests {
     }
 
     /// A trader who may trade (and view) the portfolio.
-    async fn g_trader(pool: &sqlx::PgPool, pf: Uuid) -> AuthContext {
+    pub(crate) async fn g_trader(pool: &sqlx::PgPool, pf: Uuid) -> AuthContext {
         let (me, code) = crate::handlers::tests::seed_principal(pool, "gt").await;
         sqlx::query("INSERT INTO principal_portfolio_grant (id, principal_id, portfolio_id, can_view, can_trade) VALUES ($1, $2, $3, true, true)")
             .bind(Uuid::new_v4()).bind(me).bind(pf).execute(pool).await.unwrap();
         AuthContext::machine(me, code)
     }
 
-    async fn g_defaults(pool: &sqlx::PgPool, keys: &[crate::access_grants::GrantKey]) {
+    pub(crate) async fn g_defaults(pool: &sqlx::PgPool, keys: &[crate::access_grants::GrantKey]) {
         let mut tx = pool.begin().await.unwrap();
         crate::access_grants::set_default_grants(&mut tx, &crate::groups_api::tests::admin(), keys).await.unwrap();
         tx.commit().await.unwrap();
@@ -1411,7 +1506,7 @@ pub(crate) mod tests {
     }
 
     /// Venue grants for IBKR-family connections, which carry an account ref.
-    async fn grant_ibkr(pool: &sqlx::PgPool, pf: Uuid, conns: &[&str]) {
+    pub(crate) async fn grant_ibkr(pool: &sqlx::PgPool, pf: Uuid, conns: &[&str]) {
         let grants = conns.iter().map(|c| crate::grants::Grant::Venue { connection: c.to_string(), account_ref: Some("U1".into()) }).collect();
         let mut tx = pool.begin().await.unwrap();
         crate::grants::store::set_for_portfolio(&mut tx, &crate::groups_api::tests::admin(), pf, grants).await.unwrap();
