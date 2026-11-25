@@ -219,6 +219,11 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("PERPETUAL is an allowed instrument_class");
+        let (is_deriv,): (bool,) = sqlx::query_as("SELECT is_derivative FROM instrument WHERE symbol = 'PERP-TEST' AND venue = 'XCME'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert!(is_deriv, "a perpetual is a derivative");
         tx.rollback().await.unwrap();
     }
 }

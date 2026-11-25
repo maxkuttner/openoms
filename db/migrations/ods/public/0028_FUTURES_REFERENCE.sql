@@ -11,6 +11,11 @@
 --   * future_spread  — links a calendar-spread instrument to its two legs.
 --   * PERPETUAL      — a new instrument_class for perpetual swaps. SWAP stays valid.
 
+-- Migrations run before the seed scripts on a fresh install, and future_root FKs to
+-- currency, so USD must be here too (same row as seed_currencies.sql).
+INSERT INTO currency (code, name, numeric_code, minor_units) VALUES ('USD', 'US Dollar', '840', 2)
+ON CONFLICT (code) DO NOTHING;
+
 -- The venue exists on installs seeded from the MIC registry; this covers the rest.
 INSERT INTO venue (code, name, mic, status) VALUES ('XCME', 'Chicago Mercantile Exchange', 'XCME', 'ACTIVE')
 ON CONFLICT (code) DO NOTHING;
@@ -23,6 +28,13 @@ ON CONFLICT (code) DO NOTHING;
 ALTER TABLE instrument DROP CONSTRAINT IF EXISTS instrument_instrument_class_check;
 ALTER TABLE instrument ADD CONSTRAINT instrument_instrument_class_check
     CHECK (instrument_class IN ('SPOT','FUTURE','FORWARD','OPTION','SWAP','PERPETUAL','CFD','BOND','WARRANT'));
+
+-- is_derivative is generated from instrument_class (0003) and must follow the CHECK:
+-- a perpetual is a derivative. A generated expression cannot be altered in place, so
+-- the column is rebuilt. Nothing else references it (no view, index or code).
+ALTER TABLE instrument DROP COLUMN is_derivative;
+ALTER TABLE instrument ADD COLUMN is_derivative BOOLEAN GENERATED ALWAYS AS
+    (instrument_class IN ('FUTURE','FORWARD','OPTION','SWAP','PERPETUAL','CFD','WARRANT')) STORED;
 
 CREATE TABLE future_root (
     code             TEXT PRIMARY KEY,                       -- root symbol, e.g. ES
