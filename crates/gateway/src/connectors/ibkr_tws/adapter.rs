@@ -148,14 +148,17 @@ impl IbkrTwsAdapter {
         if let Some(c) = self.contracts.lock().unwrap().get(&con_id) {
             return Ok(c.clone());
         }
-        let q = ContractQuery { con_id: Some(con_id), ..ContractQuery::default() };
+        // No security type: IBKR matches every field set, and this may be a future.
+        let q = ContractQuery { con_id: Some(con_id), sec_type: None, ..ContractQuery::default() };
         let found = client.contract_details(&q).await.map_err(broker_error)?;
         let c = found
             .into_iter()
             .find(|c| c.con_id == con_id)
             .ok_or_else(|| BrokerError::BrokerRejected(format!("IBKR knows no contract {con_id}")))?;
         self.contracts.lock().unwrap().insert(con_id, c.clone());
-        self.symbols.lock().unwrap().insert(c.symbol.clone(), con_id);
+        // Keyed by localSymbol (`ESZ6`): `symbol` is only the root of a future.
+        let key = if c.local_symbol.is_empty() { c.symbol.clone() } else { c.local_symbol.clone() };
+        self.symbols.lock().unwrap().insert(key, con_id);
         Ok(c)
     }
 
@@ -370,7 +373,7 @@ pub(crate) fn fill_from_exec(e: &TwsExecution, client_order_id: Option<String>) 
         venue_order_id: venue_order_id(e.perm_id, e.order_id),
         client_order_id,
         account_ref: e.account.clone(),
-        symbol: e.symbol.clone(),
+        symbol: if e.local_symbol.is_empty() { e.symbol.clone() } else { e.local_symbol.clone() },
         buy: e.buy,
         qty: e.qty,
         price: e.price,
@@ -436,6 +439,11 @@ pub(crate) fn fills_from_executions(
             TwsEvent::Execution(e) if e.account == account => e,
             _ => continue,
         };
+        if e.sec_type == SecType::Bag {
+            // A combo's own row; its legs arrive as ordinary executions.
+            debug!(exec_id = %e.exec_id, "IBKR combo execution is not a fill");
+            continue;
+        }
         let fill = match fill_from_exec(&e, client_ref(e.order_id, &e.order_ref)) {
             Ok(f) => f,
             Err(missing) => {
@@ -524,7 +532,13 @@ impl DailyStats for IbkrTwsAdapter {
         let mut out = Vec::new();
         for s in symbols {
             let Some(con_id) = self.con_id_for(client.as_ref(), s).await else { continue };
-            let contract = self.contract(client.as_ref(), con_id).await?;
+            let contract = match self.contract(client.as_ref(), con_id).await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(symbol = %s, error = %e, "no contract for previous close; skipping");
+                    continue;
+                }
+            };
             let exchange = if contract.sec_type == SecType::Stk { "SMART".to_string() } else { contract.exchange.clone() };
             if let Some(px) = client.prev_close(con_id, contract.sec_type, &exchange).await.map_err(broker_error)? {
                 out.push((s.clone(), px));
@@ -734,11 +748,69 @@ pub(crate) mod tests {
             order_ref: "".into(),
             account: account.into(),
             symbol: "AAPL".into(),
+            local_symbol: "AAPL".into(),
+            con_id: 265598,
+            sec_type: SecType::Stk,
             buy: false,
             qty,
             price,
             time: Utc::now() - chrono::Duration::minutes(mins_ago),
         })
+    }
+
+    fn fut_ex(exec_id: &str, local: &str, sec_type: SecType) -> TwsEvent {
+        let TwsEvent::Execution(mut e) = ex(exec_id, "U1", 1.0, 5000.0, 1) else { unreachable!() };
+        e.symbol = "ES".into();
+        e.local_symbol = local.into();
+        e.sec_type = sec_type;
+        TwsEvent::Execution(e)
+    }
+
+    fn pulled(rows: Vec<TwsEvent>) -> Vec<VenueFill> {
+        fills_from_executions(rows, "U1", DateTime::<Utc>::MIN_UTC, |_, _| None, &mut HashSet::new())
+    }
+
+    #[test]
+    fn two_expiries_of_one_root_map_to_two_symbols() {
+        let fills = pulled(vec![fut_ex("e1.01", "ESZ6", SecType::Fut), fut_ex("e2.01", "ESH7", SecType::Fut)]);
+        assert_eq!(fills.iter().map(|f| f.symbol.as_str()).collect::<Vec<_>>(), ["ESZ6", "ESH7"]);
+    }
+
+    #[test]
+    fn stock_fill_symbol_is_unchanged() {
+        let fills = pulled(vec![ex("e1.01", "U1", 3.0, 190.0, 1)]);
+        assert_eq!(fills[0].symbol, "AAPL");
+    }
+
+    #[test]
+    fn bag_execution_is_not_a_fill() {
+        assert!(pulled(vec![fut_ex("e1.01", "ES-ZN", SecType::Bag)]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn con_id_lookup_of_a_future_sends_no_security_type() {
+        let fake = Arc::new(FakeTws::new());
+        let es = TwsContract { con_id: 111, symbol: "ES".into(), exchange: "CME".into(), primary_exchange: String::new(), sec_type: SecType::Fut, local_symbol: "ESZ6".into(), multiplier: 50.0, ..aapl() };
+        fake.add_contract(es);
+        let slot: ClientSlot = Arc::new(RwLock::new(Some(fake.clone() as Arc<dyn TwsClient>)));
+        let adapter = IbkrTwsAdapter::new(slot);
+        let client = adapter.client().unwrap();
+        let c = adapter.contract(client.as_ref(), 111).await.unwrap();
+        assert_eq!(c.local_symbol, "ESZ6");
+        // The cache is keyed by localSymbol, not the root.
+        assert_eq!(adapter.con_id_for(client.as_ref(), "ESZ6").await, Some(111));
+        assert_eq!(adapter.con_id_for(client.as_ref(), "ES").await, None);
+    }
+
+    #[tokio::test]
+    async fn daily_stats_skips_a_symbol_it_cannot_resolve() {
+        let (fake, adapter) = rig();
+        fake.add_contract(aapl());
+        fake.prev_closes.lock().unwrap().insert(265598, 190.0);
+        // GONE maps to a conId IBKR no longer knows: the lookup fails, the batch goes on.
+        adapter.symbols.lock().unwrap().insert("GONE".into(), 999);
+        let out = adapter.daily_stats(&["GONE".to_string(), "AAPL".to_string()]).await.unwrap();
+        assert_eq!(out, vec![("AAPL".to_string(), 190.0)]);
     }
 
     #[test]

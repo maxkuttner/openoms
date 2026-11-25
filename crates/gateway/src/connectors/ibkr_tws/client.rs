@@ -190,22 +190,37 @@ pub struct TwsExecution {
     pub perm_id: i64,
     pub order_ref: String,
     pub account: String,
+    /// IBKR `symbol`: the root for a future (`ES`).
     pub symbol: String,
+    /// IBKR `localSymbol` (`ESZ6`): what the OMS keys the fill by.
+    pub local_symbol: String,
+    pub con_id: i64,
+    pub sec_type: SecType,
     pub buy: bool,
     pub qty: f64,
     pub price: f64,
     pub time: DateTime<Utc>,
 }
 
-/// A contract lookup; sec type defaults to STK, exchange to SMART.
+/// A contract lookup; exchange defaults to SMART. `sec_type: None` leaves the
+/// security type unset: a conId lookup matches any type, a symbol search is STK.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ContractQuery {
     pub symbol: Option<String>,
     pub exchange: Option<String>,
     pub currency: Option<String>,
     pub con_id: Option<i64>,
-    pub sec_type: SecType,
+    pub sec_type: Option<SecType>,
     pub include_expired: bool,
+}
+
+impl ContractQuery {
+    /// The security type sent to IBKR, `None` for none. IBKR matches every field
+    /// set, so a conId lookup must not name a type (it may be a future); a
+    /// symbol search without one is a stock search.
+    fn wire_sec_type(&self) -> Option<SecType> {
+        self.sec_type.or(if self.con_id.is_none() { Some(SecType::Stk) } else { None })
+    }
 }
 
 /// One IB Gateway API session. Connected as the master client id 0, the
@@ -390,6 +405,11 @@ fn update_events(update: OrderUpdate, refs: &OrderRefs, orders: &OrderCache) -> 
     }
 }
 
+/// The contract's `localSymbol`, or its `symbol` when IBKR sent none.
+fn local_or_symbol(c: &Contract) -> String {
+    if c.local_symbol.is_empty() { c.symbol.to_string() } else { c.local_symbol.clone() }
+}
+
 fn to_tws_execution(d: ibapi::orders::ExecutionData) -> TwsExecution {
     let e = d.execution;
     TwsExecution {
@@ -400,6 +420,9 @@ fn to_tws_execution(d: ibapi::orders::ExecutionData) -> TwsExecution {
         order_ref: e.order_reference,
         account: e.account_number,
         symbol: d.contract.symbol.to_string(),
+        local_symbol: local_or_symbol(&d.contract),
+        con_id: i64::from(d.contract.contract_id),
+        sec_type: SecType::parse(d.contract.security_type.as_str()).unwrap_or_default(),
         buy: matches!(e.side, ibapi::orders::ExecutionSide::Bought),
         qty: e.shares,
         price: e.price,
@@ -576,7 +599,7 @@ fn to_tws_order_state(d: &OrderData, completed: bool, status: Option<(f64, f64, 
         filled,
         remaining,
         avg_fill_price,
-        symbol: d.contract.symbol.to_string(),
+        symbol: local_or_symbol(&d.contract),
         perm_id: o.perm_id,
         order,
     };
@@ -686,7 +709,7 @@ impl TwsClient for IbapiClient {
             exchange: Exchange::new(q.exchange.as_deref().unwrap_or("SMART")),
             currency: Currency::new(q.currency.clone().unwrap_or_default()),
             primary_exchange: Exchange::new(""),
-            security_type: q.sec_type.to_ibapi(),
+            security_type: q.wire_sec_type().map_or_else(|| SecurityType::Other(String::new()), SecType::to_ibapi),
             include_expired: q.include_expired,
             ..Contract::default()
         };
@@ -857,7 +880,7 @@ impl TwsClient for FakeTws {
             .unwrap()
             .iter()
             .filter(|c| {
-                c.sec_type == q.sec_type
+                q.wire_sec_type().is_none_or(|t| t == c.sec_type)
                     && q.symbol.as_ref().is_none_or(|s| *s == c.symbol)
                     && q.exchange.as_ref().is_none_or(|e| *e == c.exchange)
                     && q.currency.as_ref().is_none_or(|u| *u == c.currency)
@@ -979,7 +1002,7 @@ mod tests {
         let fake = FakeTws::new();
         fake.add_contract(fut(1, "ESZ6"));
         fake.add_contract(fut(2, "ESH7"));
-        let q = ContractQuery { symbol: Some("ES".into()), exchange: Some("CME".into()), sec_type: SecType::Fut, ..Default::default() };
+        let q = ContractQuery { symbol: Some("ES".into()), exchange: Some("CME".into()), sec_type: Some(SecType::Fut), ..Default::default() };
         let found = fake.contract_details(&q).await.unwrap();
         assert_eq!(found.iter().map(|c| c.local_symbol.as_str()).collect::<Vec<_>>(), ["ESZ6", "ESH7"]);
         assert!(found.iter().all(|c| c.sec_type == SecType::Fut));
