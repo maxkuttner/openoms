@@ -14,6 +14,12 @@
 # Reached at any other URL than http://localhost (a domain, a reverse proxy,
 # Tailscale)? Add OMS_PUBLIC_BASE_URL=https://your.url to .env. Back up .env: OMS_MASTER_KEY is
 # the only key to stored broker credentials.
+#
+# Interactive Brokers (TWS API): the OMS container cannot start IB Gateway
+# itself, so run it here. Add TWS_USERID, TWS_PASSWORD and TRADING_MODE (paper
+# or live) to .env, start with `docker compose --profile ibkr up -d`, and set the
+# connection's Gateway address to ib-gateway:4004 (paper) or ib-gateway:4003 (live).
+# https://openoms.dev/integrations/interactive-brokers/
 
 name: openoms
 
@@ -50,6 +56,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Opt-in (--profile ibkr). The same pinned image the OMS starts on a host
+  # (gateway::IMAGE). Reached by the OMS over this network only: no ports.
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:10.51.1e@sha256:85975f493bcacc8341cb42e6946c460868d165e5f64d9924b1958c8f03e7bee4
+    profiles: ["ibkr"]
+    environment:
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      READ_ONLY_API: "no"
+      EXISTING_SESSION_DETECTED_ACTION: primary
     restart: unless-stopped
 
 volumes:

@@ -808,4 +808,15 @@ mod tests {
         );
         assert!(fake.runs.lock().unwrap().is_empty());
     }
+
+    /// The opt-in compose service runs the very image the OMS would start.
+    #[test]
+    fn compose_ib_gateway_image_matches() {
+        let compose = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../compose.yaml")).unwrap();
+        let service = compose.split("\n  ib-gateway:\n").nth(1).expect("an ib-gateway service in compose.yaml");
+        let service = service.split("\n\n").next().unwrap();
+        assert!(service.contains(&format!("image: {IMAGE}\n")), "{service}");
+        assert!(service.contains(r#"profiles: ["ibkr"]"#), "{service}");
+        assert!(!service.contains("ports:"), "the gateway API must not be published: {service}");
+    }
 }

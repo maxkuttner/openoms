@@ -71,6 +71,8 @@ signed up is the admin). See
 - Reached at any other URL than `http://localhost:3001` (a domain, a reverse proxy,
   Tailscale)? Add `OMS_PUBLIC_BASE_URL=https://your.url` to `.env`, or sign-in is refused.
 - The database lives in the `openoms_oms-pgdata` volume.
+- Trading through Interactive Brokers (TWS API)? IB Gateway runs as an optional service:
+  see [IBKR in Docker](/integrations/interactive-brokers/#ibkr-in-docker).
 - **Upgrading an install set up with the earlier one-off init step?** Its role password and master key live in
   `oms.toml` in the `openoms_oms-config` volume, and keep working with the new
   `compose.yaml`. A URL other than `http://localhost` set there must move to

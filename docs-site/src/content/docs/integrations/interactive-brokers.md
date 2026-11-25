@@ -10,12 +10,15 @@ recommended one. The [FIX session](#fix-session-experimental) is experimental.
 
 The OMS runs IB Gateway for you in a Docker container, logs in with your IBKR
 username and password, and trades through the TWS API. Instruments come from IBKR's
-own contract search, so you can import what you want to trade.
+own contract search, so you can import what you want to trade. When the OMS itself
+runs in a container, run IB Gateway as its own service instead; see
+[IBKR in Docker](#ibkr-in-docker).
 
 ### What you need
 
 - Docker, running on the machine that runs the OMS. The OMS starts and watches the
-  container; it never needs you to run IB Gateway yourself.
+  container; it never needs you to run IB Gateway yourself. Or an IB Gateway you run
+  yourself, see [IBKR in Docker](#ibkr-in-docker).
 - An IBKR account. Start with a paper account.
 
 ### Create the connection
@@ -45,6 +48,54 @@ The connection's status shows `connecting`, `live` or `down`. While it is `down`
 | down | IBKR login failed: ... | IBKR rejected the username or password. The OMS stops retrying, so it does not lock your account. Fix the password in the credentials drawer and save; the OMS logs in again with the new one. |
 | down | Docker is required for IBKR_TWS but is not running | The OMS can't reach Docker. It keeps retrying until Docker is back. |
 | down | IB Gateway is disconnected, or IB Gateway lost its connection to IBKR | The gateway dropped; the OMS reconnects. |
+| connecting | IB Gateway at ib-gateway:4004 not reachable: ... | Only with a [Gateway address](#ibkr-in-docker): the gateway service is not up or still logging in. The OMS keeps trying. |
+
+### IBKR in Docker
+
+When the OMS runs in a container (the [Docker Compose install](/getting-started/installation/),
+or any container platform), it cannot start IB Gateway: there is no Docker inside its
+container. Run IB Gateway as a service next to it and give the connection its address.
+
+With the official `compose.yaml`, add your IBKR login to `.env`:
+
+```sh
+TWS_USERID=your-ibkr-username
+TWS_PASSWORD=your-ibkr-password
+TRADING_MODE=paper   # or live
+```
+
+and start with the `ibkr` profile:
+
+```sh
+docker compose --profile ibkr up -d
+```
+
+This adds an `ib-gateway` service, the same pinned image the OMS would start itself.
+Its API is reachable only from the other services in the compose project; no port is
+published. Then, in the connection's credentials drawer, set **Gateway address** to
+`ib-gateway:4004` for paper or `ib-gateway:4003` for live, and leave username and
+password empty: the login lives in the gateway service, not in the OMS. Without the
+profile, `docker compose up -d` starts the OMS and PostgreSQL only, as before.
+
+- **Two-factor.** On the first login, and about once a week after, IBKR sends a push to
+  the IBKR Mobile app. Approve it; until then the connection shows `connecting` with
+  `IB Gateway at … not reachable`. `docker compose logs ib-gateway` shows the login.
+- **Daily restart.** IBKR restarts its gateways once a day. The OMS reconnects when the
+  gateway is back; nothing to do.
+- **Wrong password.** The gateway service, not the OMS, retries the login. Fix
+  `TWS_PASSWORD` in `.env` and run `docker compose --profile ibkr up -d` again, or stop
+  the service (`docker compose stop ib-gateway`) so repeated failures do not lock the
+  account.
+- **One environment per gateway.** `TRADING_MODE` decides paper or live for the whole
+  service. Use the paper connection with a paper gateway, and the live one with a live
+  gateway.
+
+On another container platform, run the image `ghcr.io/gnzsnz/ib-gateway` (the tag
+`compose.yaml` pins) as a service on the same private network as the OMS, with
+`TWS_USERID`, `TWS_PASSWORD` and `TRADING_MODE` set, and no public port. Set the
+connection's Gateway address to that service's name and port 4004 (paper) or 4003
+(live). Never expose the API port to the internet: anyone who reaches it can trade on
+the account.
 
 ### Instruments
 
@@ -171,8 +222,9 @@ For the TWS API connection, in the connection's credentials drawer:
 
 | Field | What it is | Default |
 | --- | --- | --- |
-| IBKR username | Your IBKR login (for paper, the paper username from Client Portal) | |
-| Password | Its password. It reaches IB Gateway only through a short-lived file, never a command line or log. | |
+| IBKR username | Your IBKR login (for paper, the paper username from Client Portal). Leave empty with a Gateway address. | |
+| Password | Its password. It reaches IB Gateway only through a short-lived file, never a command line or log. Leave empty with a Gateway address. | |
+| Gateway address | `host:port` of an IB Gateway you run yourself, e.g. `ib-gateway:4004` (paper) or `ib-gateway:4003` (live); see [IBKR in Docker](#ibkr-in-docker). Set, the OMS never starts a container. Clear it to go back to the OMS-run gateway, which needs the username and password again. | empty |
 | API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value) | The client id the OMS connects with. With 0 it also sees orders entered by hand in TWS. To see orders placed by other API clients, set IB Gateway's **Master API client ID** to the same value. | `0` |
 
 The FIX session's fields are listed under [FIX session](#fix-session-experimental).

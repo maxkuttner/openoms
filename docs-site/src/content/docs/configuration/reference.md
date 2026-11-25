@@ -109,6 +109,7 @@ These have no `oms.toml` key.
 | `BINANCE_PAPER_TRANSPORT`, `BINANCE_LIVE_TRANSPORT` | `rest` (default) or `fix`: how Binance orders are sent. |
 | `KAFKA_BROKER`, `KAFKA_TOPIC` | Publish order events to Kafka. Optional; without them publishing is off. |
 | `KAFKA_ALERTS_TOPIC` | Topic for alerts such as futures roll warnings. Default `oms.alerts`. Each record's key is the portfolio id and its value the full alert as JSON. |
+| `TWS_USERID`, `TWS_PASSWORD`, `TRADING_MODE` | Docker Compose only: the login (and `paper` or `live`) of the optional `ib-gateway` service (`--profile ibkr`). Read by that service, not by the OMS. See [IBKR in Docker](/integrations/interactive-brokers/#ibkr-in-docker). |
 | `RUST_LOG` | Log filter, e.g. `RUST_LOG=debug`. Default `info`. Logs go to stderr. |
 
 Broker and feed API keys are **not** environment variables — they are stored encrypted in
