@@ -16,6 +16,7 @@ pub struct KafkaConfig {
     pub orders_topic: String,
     pub fills_topic: String,
     pub positions_topic: String,
+    pub alerts_topic: String,
     pub projector_group_id: String,
 }
 
@@ -39,6 +40,9 @@ impl KafkaConfig {
         let positions_topic = or_default(env::var("KAFKA_POSITIONS_TOPIC"), "oms.positions");
         info!("KAFKA_POSITIONS_TOPIC: {}", positions_topic);
 
+        let alerts_topic = or_default(env::var("KAFKA_ALERTS_TOPIC"), "alerts");
+        info!("KAFKA_ALERTS_TOPIC: {}", alerts_topic);
+
         let client_id = env::var("KAFKA_CLIENT_ID").
             unwrap_or_else(|_| "rust-oms".to_string());
         info!("KAFKA_CLIENT_ID: {}", client_id);
@@ -53,6 +57,7 @@ impl KafkaConfig {
             orders_topic,
             fills_topic,
             positions_topic,
+            alerts_topic,
             projector_group_id,
         })
     }
@@ -62,6 +67,7 @@ impl KafkaConfig {
             orders: self.orders_topic.clone(),
             fills: self.fills_topic.clone(),
             positions: self.positions_topic.clone(),
+            alerts: self.alerts_topic.clone(),
         }
     }
 

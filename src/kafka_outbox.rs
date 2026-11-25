@@ -117,6 +117,45 @@ pub async fn fetch_position_batch(pool: &PgPool, limit: i64) -> Result<Vec<Posit
         .collect())
 }
 
+/// One unpublished alert (`alert.published_at IS NULL`).
+pub struct AlertRow {
+    pub id: Uuid,
+    pub kind: String,
+    pub portfolio_id: Uuid,
+    pub instrument_id: Option<i64>,
+    pub payload: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn fetch_alert_batch(pool: &PgPool, limit: i64) -> Result<Vec<AlertRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, kind, portfolio_id, instrument_id, payload, created_at \
+         FROM alert WHERE published_at IS NULL ORDER BY created_at, id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| AlertRow {
+            id: r.get("id"),
+            kind: r.get("kind"),
+            portfolio_id: r.get("portfolio_id"),
+            instrument_id: r.get("instrument_id"),
+            payload: r.get("payload"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
+}
+
+pub async fn ack_alerts(pool: &PgPool, ids: &[Uuid]) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("UPDATE alert SET published_at = now() WHERE id = ANY($1) AND published_at IS NULL")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
 pub async fn ack_positions(pool: &PgPool, ids: &[i64]) -> Result<u64, sqlx::Error> {
     let r = sqlx::query("DELETE FROM kafka_position_outbox WHERE id = ANY($1)")
         .bind(ids)
@@ -135,7 +174,10 @@ pub async fn ack(pool: &PgPool, positions: &[i64]) -> Result<u64, sqlx::Error> {
 }
 
 pub async fn pending_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar("SELECT (SELECT count(*) FROM kafka_outbox) + (SELECT count(*) FROM kafka_position_outbox)")
+    sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM kafka_outbox) + (SELECT count(*) FROM kafka_position_outbox) \
+              + (SELECT count(*) FROM alert WHERE published_at IS NULL)",
+    )
         .fetch_one(pool)
         .await
 }
@@ -145,6 +187,7 @@ pub struct OutboxTopics {
     pub orders: String,
     pub fills: String,
     pub positions: String,
+    pub alerts: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -222,6 +265,24 @@ pub fn position_record(change: &PositionChange, topics: &OutboxTopics) -> Option
     })
 }
 
+/// An alert as one record on the alerts topic, keyed by portfolio so a portfolio's
+/// alerts stay in order on one partition.
+pub fn alert_record(a: &AlertRow, topics: &OutboxTopics) -> OutboxRecord {
+    OutboxRecord {
+        topic: topics.alerts.clone(),
+        key: a.portfolio_id.to_string(),
+        payload: serde_json::json!({
+            "id": a.id,
+            "kind": a.kind,
+            "portfolio_id": a.portfolio_id,
+            "instrument_id": a.instrument_id,
+            "payload": a.payload,
+            "created_at": a.created_at,
+        })
+        .to_string(),
+    }
+}
+
 #[async_trait::async_trait]
 pub trait OutboxSink: Send + Sync {
     /// Publish one record; Ok only once the broker has acked it.
@@ -232,7 +293,7 @@ pub trait OutboxSink: Send + Sync {
 /// batch overtakes it. Returns the global positions whose records were ALL acked,
 /// plus the failure, if any. An event that failed part-way is not acked: it is
 /// re-sent whole next time, and its already-sent records arrive twice.
-pub async fn deliver(batch: &[(i64, Vec<OutboxRecord>)], sink: &dyn OutboxSink) -> (Vec<i64>, Option<String>) {
+pub async fn deliver<K: Copy>(batch: &[(K, Vec<OutboxRecord>)], sink: &dyn OutboxSink) -> (Vec<K>, Option<String>) {
     let mut acked = Vec::with_capacity(batch.len());
     for (global_position, records) in batch {
         for record in records {
@@ -284,9 +345,9 @@ impl OutageLog {
 #[derive(Debug)]
 pub enum DrainError {
     Db(sqlx::Error),
-    /// `stuck_at` is the global position of the event that could not be sent, or
-    /// the `kafka_position_outbox` id of the position change.
-    Sink { published: usize, stuck_at: i64, error: String },
+    /// `stuck_at` is the global position of the event that could not be sent, the
+    /// `kafka_position_outbox` id of the position change, or the alert id.
+    Sink { published: usize, stuck_at: String, error: String },
 }
 
 /// Publish until the outbox is empty or the sink fails. Returns events published.
@@ -298,32 +359,42 @@ pub async fn drain(
 ) -> Result<usize, DrainError> {
     let mut published = 0;
     loop {
-        // Order events first, then position changes; each queue is acked by its own key.
+        // Order events first, then position changes, then alerts; each queue is
+        // acked by its own key.
         let rows = fetch_batch(pool, batch_size).await.map_err(DrainError::Db)?;
-        let from_orders = !rows.is_empty();
-        let batch: Vec<(i64, Vec<OutboxRecord>)> = if from_orders {
-            rows.iter().map(|r| (r.global_position, records_for(r, topics))).collect()
-        } else {
-            fetch_position_batch(pool, batch_size)
-                .await
-                .map_err(DrainError::Db)?
-                .iter()
-                .map(|c| (c.id, position_record(c, topics).into_iter().collect()))
-                .collect()
-        };
-        if batch.is_empty() {
+        if !rows.is_empty() {
+            let batch: Vec<(i64, Vec<OutboxRecord>)> =
+                rows.iter().map(|r| (r.global_position, records_for(r, topics))).collect();
+            let (acked, failure) = deliver(&batch, sink).await;
+            ack(pool, &acked).await.map_err(DrainError::Db)?;
+            published += acked.len();
+            if let Some(error) = failure {
+                return Err(DrainError::Sink { published, stuck_at: batch[acked.len()].0.to_string(), error });
+            }
+            continue;
+        }
+        let changes = fetch_position_batch(pool, batch_size).await.map_err(DrainError::Db)?;
+        if !changes.is_empty() {
+            let batch: Vec<(i64, Vec<OutboxRecord>)> =
+                changes.iter().map(|c| (c.id, position_record(c, topics).into_iter().collect())).collect();
+            let (acked, failure) = deliver(&batch, sink).await;
+            ack_positions(pool, &acked).await.map_err(DrainError::Db)?;
+            published += acked.len();
+            if let Some(error) = failure {
+                return Err(DrainError::Sink { published, stuck_at: batch[acked.len()].0.to_string(), error });
+            }
+            continue;
+        }
+        let alerts = fetch_alert_batch(pool, batch_size).await.map_err(DrainError::Db)?;
+        if alerts.is_empty() {
             return Ok(published);
         }
+        let batch: Vec<(Uuid, Vec<OutboxRecord>)> = alerts.iter().map(|a| (a.id, vec![alert_record(a, topics)])).collect();
         let (acked, failure) = deliver(&batch, sink).await;
-        if from_orders {
-            ack(pool, &acked).await.map_err(DrainError::Db)?;
-        } else {
-            ack_positions(pool, &acked).await.map_err(DrainError::Db)?;
-        }
+        ack_alerts(pool, &acked).await.map_err(DrainError::Db)?;
         published += acked.len();
         if let Some(error) = failure {
-            let stuck_at = batch[acked.len()].0;
-            return Err(DrainError::Sink { published, stuck_at, error });
+            return Err(DrainError::Sink { published, stuck_at: batch[acked.len()].0.to_string(), error });
         }
     }
 }
@@ -408,7 +479,7 @@ mod tests {
     }
 
     fn topics() -> OutboxTopics {
-        OutboxTopics { orders: "orders".into(), fills: "fills".into(), positions: "positions".into() }
+        OutboxTopics { orders: "orders".into(), fills: "fills".into(), positions: "positions".into(), alerts: "alerts".into() }
     }
 
     fn row(event_type: &str) -> OutboxRow {

@@ -21,6 +21,14 @@ use crate::event_store::{AppendResult, NewOrderEvent};
 pub const ORDER_LANE_CAPACITY: usize = 1024;
 pub const PRICE_LANE_CAPACITY: usize = 4096;
 pub const AUTH_LANE_CAPACITY: usize = 256;
+pub const ALERT_LANE_CAPACITY: usize = 256;
+
+/// An alert was raised on a portfolio. Sockets that may view that portfolio's
+/// alerts get an `alerts` notice and refetch `GET /alerts`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AlertRaised {
+    pub portfolio_id: Uuid,
+}
 
 /// A principal's access changed (disabled, role, portfolios, admin, logout-all,
 /// key revoked). Open live-update sockets of that principal re-check their
@@ -56,6 +64,7 @@ pub struct EventBus {
     order: broadcast::Sender<OrderLaneEvent>,
     price: broadcast::Sender<MarkUpdate>,
     auth: broadcast::Sender<AuthChanged>,
+    alert: broadcast::Sender<AlertRaised>,
 }
 
 impl EventBus {
@@ -63,7 +72,8 @@ impl EventBus {
         let (order, _) = broadcast::channel(ORDER_LANE_CAPACITY);
         let (price, _) = broadcast::channel(PRICE_LANE_CAPACITY);
         let (auth, _) = broadcast::channel(AUTH_LANE_CAPACITY);
-        Self { order, price, auth }
+        let (alert, _) = broadcast::channel(ALERT_LANE_CAPACITY);
+        Self { order, price, auth, alert }
     }
 
     // send only errs when nobody is subscribed, which is not a failure
@@ -78,6 +88,15 @@ impl EventBus {
     /// Call after the change has committed.
     pub fn publish_auth_changed(&self, principal_id: Uuid) {
         let _ = self.auth.send(AuthChanged { principal_id });
+    }
+
+    /// Call after the alert row has committed.
+    pub fn publish_alert(&self, portfolio_id: Uuid) {
+        let _ = self.alert.send(AlertRaised { portfolio_id });
+    }
+
+    pub fn subscribe_alert(&self) -> broadcast::Receiver<AlertRaised> {
+        self.alert.subscribe()
     }
 
     pub fn subscribe_auth(&self) -> broadcast::Receiver<AuthChanged> {

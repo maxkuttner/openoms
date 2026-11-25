@@ -2509,6 +2509,78 @@
         ]
       }
     },
+    "/alerts": {
+      "get": {
+        "tags": [
+          "orders"
+        ],
+        "summary": "List unacknowledged alerts on the portfolios the caller can view",
+        "operationId": "list_alerts",
+        "responses": {
+          "200": {
+            "description": "Open alerts, newest first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AlertView"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No credential"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/alerts/{id}/ack": {
+      "post": {
+        "tags": [
+          "orders"
+        ],
+        "summary": "Acknowledge an alert so it stops being listed",
+        "operationId": "ack_alert",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Alert ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Acknowledged (also when it already was)"
+          },
+          "404": {
+            "description": "No such alert, or on a portfolio the caller cannot view"
+          }
+        },
+        "security": [
+          {
+            "basic_auth": []
+          },
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/auth/local/login": {
       "post": {
         "tags": [
@@ -3816,6 +3888,41 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "AlertView": {
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "portfolio_id",
+          "payload",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "instrument_id": {
+            "type": "integer",
+            "format": "int64",
+            "nullable": true
+          },
+          "kind": {
+            "type": "string"
+          },
+          "payload": {
+            "description": "Kind-specific detail; `ROLL_DUE` carries root, contract, next_contract,\nnext_instrument_id, net_qty, roll_date and expires_at."
+          },
+          "portfolio_id": {
+            "type": "string",
+            "format": "uuid"
           }
         }
       },

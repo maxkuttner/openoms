@@ -118,6 +118,13 @@ pub async fn sweep_expired(pool: &PgPool) -> Result<u64, sqlx::Error> {
 pub async fn run_once(pool: &PgPool) -> Result<(u64, u64), sqlx::Error> {
     let recomputed = recompute_expires_at(pool).await?;
     let expired = sweep_expired(pool).await?;
+    // After the expiry step, so a contract that just expired is not warned about.
+    // A failure here must not discard the counts of the work already done.
+    match crate::alerts::roll_warnings(pool, chrono::Utc::now()).await {
+        Ok(0) => {}
+        Ok(n) => info!(raised = n, "roll warnings raised"),
+        Err(e) => error!(error = %e, "roll warnings failed; the expiry sweep itself is unaffected"),
+    }
     Ok((recomputed, expired))
 }
 

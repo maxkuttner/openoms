@@ -21,7 +21,7 @@ use tokio::time::{interval, Duration, MissedTickBehavior};
 use crate::app_state::AppState;
 use crate::auth::AuthContext;
 use crate::authz::{visible_portfolios, Permission};
-use crate::event_bus::{AuthChanged, MarkUpdate, OrderLaneEvent};
+use crate::event_bus::{AlertRaised, AuthChanged, MarkUpdate, OrderLaneEvent};
 use uuid::Uuid;
 
 /// How often pending order/position notices go out.
@@ -41,6 +41,8 @@ pub const AUTH_REVOKED_REASON: &str = r#"{"type":"auth_revoked"}"#;
 pub enum UiNotice {
     Orders,
     Positions,
+    /// An alert was raised on a portfolio the socket can view: refetch `GET /alerts`.
+    Alerts,
     Marks { instrument_ids: Vec<i64> },
     /// The socket fell behind the order lane: refetch everything.
     Resync,
@@ -56,6 +58,7 @@ pub enum UiNotice {
 pub struct Conflator {
     orders: bool,
     positions: bool,
+    alerts: bool,
     resync: bool,
     marks: BTreeSet<i64>,
 }
@@ -70,6 +73,10 @@ impl Conflator {
         }
     }
 
+    pub fn on_alert(&mut self) {
+        self.alerts = true;
+    }
+
     pub fn on_mark(&mut self, m: MarkUpdate) {
         self.marks.insert(m.instrument_id);
     }
@@ -79,12 +86,16 @@ impl Conflator {
         let notices = if self.resync {
             vec![UiNotice::Resync]
         } else {
-            [(self.orders, UiNotice::Orders), (self.positions, UiNotice::Positions)]
+            [
+                (self.orders, UiNotice::Orders),
+                (self.positions, UiNotice::Positions),
+                (self.alerts, UiNotice::Alerts),
+            ]
                 .into_iter()
                 .filter_map(|(pending, n)| pending.then_some(n))
                 .collect()
         };
-        (self.orders, self.positions, self.resync) = (false, false, false);
+        (self.orders, self.positions, self.alerts, self.resync) = (false, false, false, false);
         notices
     }
 
@@ -259,11 +270,12 @@ pub struct Lanes {
     pub order: broadcast::Receiver<OrderLaneEvent>,
     pub price: broadcast::Receiver<MarkUpdate>,
     pub auth: broadcast::Receiver<AuthChanged>,
+    pub alert: broadcast::Receiver<AlertRaised>,
 }
 
 impl Lanes {
     pub fn subscribe(bus: &crate::event_bus::EventBus) -> Self {
-        Self { order: bus.subscribe_order(), price: bus.subscribe_price(), auth: bus.subscribe_auth() }
+        Self { order: bus.subscribe_order(), price: bus.subscribe_price(), auth: bus.subscribe_auth(), alert: bus.subscribe_alert() }
     }
 }
 
@@ -273,7 +285,7 @@ impl Lanes {
 /// [`UiNotice::AuthRevoked`] and ends the pump. Only ever subscribes: a slow
 /// socket lags its own receivers, never the bus.
 pub async fn pump(lanes: Lanes, out: mpsc::Sender<UiNotice>, mut viewer: Viewer) {
-    let Lanes { order: mut order_rx, price: mut price_rx, auth: mut auth_rx } = lanes;
+    let Lanes { order: mut order_rx, price: mut price_rx, auth: mut auth_rx, alert: mut alert_rx } = lanes;
     let mut conflator = Conflator::default();
     let mut fast = interval(Duration::from_millis(FLUSH_MS));
     let mut slow = interval(Duration::from_millis(MARKS_FLUSH_MS));
@@ -281,7 +293,7 @@ pub async fn pump(lanes: Lanes, out: mpsc::Sender<UiNotice>, mut viewer: Viewer)
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + heartbeat_every, heartbeat_every);
     fast.set_missed_tick_behavior(MissedTickBehavior::Delay);
     slow.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let (mut order_open, mut price_open, mut auth_open) = (true, true, true);
+    let (mut order_open, mut price_open, mut auth_open, mut alert_open) = (true, true, true, true);
     let mut recheck_due = false;
 
     loop {
@@ -314,6 +326,16 @@ pub async fn pump(lanes: Lanes, out: mpsc::Sender<UiNotice>, mut viewer: Viewer)
                     }
                 }
                 conflator.on_order(r);
+                continue;
+            }
+            r = alert_rx.recv(), if alert_open => {
+                match r {
+                    Ok(AlertRaised { portfolio_id }) if viewer.scope.sees_positions(portfolio_id) => conflator.on_alert(),
+                    Ok(_) => {}
+                    // a missed alert might have been ours: refetch to be safe
+                    Err(broadcast::error::RecvError::Lagged(_)) => conflator.on_alert(),
+                    Err(broadcast::error::RecvError::Closed) => alert_open = false,
+                }
                 continue;
             }
             r = price_rx.recv(), if price_open => {
@@ -467,6 +489,15 @@ mod tests {
             c.on_order(Ok(position_changed()));
         }
         assert_eq!(c.take_fast(), vec![UiNotice::Orders, UiNotice::Positions]);
+        assert_eq!(c.take_fast(), vec![]);
+    }
+
+    #[test]
+    fn alerts_conflate_to_one_notice() {
+        let mut c = Conflator::default();
+        c.on_alert();
+        c.on_alert();
+        assert_eq!(c.take_fast(), vec![UiNotice::Alerts]);
         assert_eq!(c.take_fast(), vec![]);
     }
 
@@ -880,6 +911,7 @@ mod tests {
     #[test]
     fn notices_serialize_with_type_tag() {
         assert_eq!(serde_json::to_string(&UiNotice::Orders).unwrap(), r#"{"type":"orders"}"#);
+        assert_eq!(serde_json::to_string(&UiNotice::Alerts).unwrap(), r#"{"type":"alerts"}"#);
         assert_eq!(
             serde_json::to_string(&UiNotice::Marks { instrument_ids: vec![1, 3] }).unwrap(),
             r#"{"type":"marks","instrument_ids":[1,3]}"#

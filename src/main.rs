@@ -89,6 +89,7 @@ mod secrets;
 mod credentials;
 mod credentials_api;
 mod expiry;
+mod alerts;
 mod futures;
 mod jobs;
 mod reload;
@@ -165,6 +166,8 @@ mod first_run_tests;
         instruments_import::search,
         futures::sync::sync_now,
         futures::api::list_roots,
+        alerts::list_alerts,
+        alerts::ack_alert,
         admin::list_feeds,
         admin::expiry_sweep,
         users_api::setup_status,
@@ -210,7 +213,7 @@ mod first_run_tests;
         admin::RedactedCredentials, crate::credentials::RedactedField,
         jobs::JobRecord, jobs::JobStatus, jobs::JobLogLine,
         instruments_import::Contract, instruments_import::ImportResolveRequest, instruments_import::ResolvedRow,
-        futures::sync::SyncReport, futures::api::FutureRootView, futures::front::FutureContract, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
+        futures::sync::SyncReport, futures::api::FutureRootView, futures::front::FutureContract, alerts::AlertView, instruments_import::SaveRequest, setup::brokers::UniverseLoadReport,
         jobs::api::UniverseStatus, jobs::api::UniverseState, jobs::api::JobStarted, jobs::api::JobDetail,
         crate::credentials_api::CredentialSubmission, admin::SaveResponse, admin::TestResponse,
         CreateKey, ApiKeyRecord,
@@ -954,6 +957,8 @@ fn build_app(
         .route("/instruments/options/expiries", get(instruments_api::list_option_expiries))
         .route("/instruments/options/chain", get(instruments_api::get_option_chain))
         .route("/futures/roots", get(futures::api::list_roots))
+        .route("/alerts", get(alerts::list_alerts))
+        .route("/alerts/:id/ack", post(alerts::ack_alert))
         .layer(middleware::from_fn_with_state(state.clone(), auth::auth_middleware));
     
     // 2) Register admin routes: a named admin's session, or the legacy shared
@@ -1381,6 +1386,8 @@ async fn serve() {
     // subscribe to it to re-read the held set. One bus for the whole process,
     // held by `AppState` so a reload hands restarted streams the same one.
     let event_bus = event_bus::EventBus::new();
+    // Alerts raised anywhere (the hourly sweep, the admin trigger) announce on it.
+    alerts::install_bus(event_bus.clone());
 
     // Rebuild an empty position projection from the event log before anything
     // that can book a fill starts: the order engine, the FIX
