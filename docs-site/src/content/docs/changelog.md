@@ -5,6 +5,19 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.18.0 (2026-11-25)
+
+### Feat
+
+- **compose**: optional ib-gateway service; docs
+- **ibkr_tws**: connect to an external IB Gateway
+- **ibkr_tws**: gateway address field
+- **credentials**: optional credential fields
+
+### Fix
+
+- **ibkr_tws**: tie external gateway to environment; capped compose restarts
+
 ## v0.17.0 (2026-11-25)
 
 ### Feat
