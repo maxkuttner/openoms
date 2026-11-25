@@ -234,7 +234,7 @@ pub trait TwsClient: Send + Sync {
     /// follow up with `contract_details` for the tradable facts.
     async fn matching_symbols(&self, pattern: &str) -> Result<Vec<TwsContract>, TwsError>;
     /// Delayed snapshot close, else the last daily bar's close, else `None`.
-    async fn prev_close(&self, con_id: i64) -> Result<Option<f64>, TwsError>;
+    async fn prev_close(&self, con_id: i64, sec_type: SecType, exchange: &str) -> Result<Option<f64>, TwsError>;
     async fn managed_accounts(&self) -> Result<Vec<String>, TwsError>;
     fn events(&self) -> broadcast::Receiver<TwsEvent>;
     fn connected(&self) -> bool;
@@ -478,9 +478,43 @@ pub(crate) fn last_trade_instant(date: &str, time: Option<&str>, tz: &str) -> Op
     Some(zone.from_local_datetime(&d.and_time(t)).earliest()?.with_timezone(&Utc))
 }
 
-fn to_tws_contract(c: &Contract, min_tick: f64, lot_size: Option<f64>, name: String, isin: Option<String>) -> TwsContract {
+/// `(last trade day, last trade instant)` of a contract. `raw` is
+/// `last_trade_date_or_contract_month`, which TWS may send as `YYYYMMDD [HH:MM[:SS] [zone]]`;
+/// `last_trade_time` (only filled for some feeds) wins for the time, `tz_id` is the
+/// contract's zone when `raw` names none. A bare `YYYYMM` month has no day; no time gives no instant.
+pub(crate) fn last_trade_from(raw: &str, last_trade_time: &str, tz_id: &str) -> (Option<NaiveDate>, Option<DateTime<Utc>>) {
+    let mut parts = raw.split_whitespace();
+    let date_s = parts.next().unwrap_or("");
+    let Ok(date) = NaiveDate::parse_from_str(date_s, "%Y%m%d") else { return (None, None) };
+    let raw_time = parts.next();
+    let raw_zone = parts.next();
+    let time = last_trade_time.split_whitespace().next().or(raw_time);
+    let zone = raw_zone.unwrap_or(tz_id);
+    (Some(date), last_trade_instant(date_s, time, zone))
+}
+
+/// `None` (with a warning) for a derivative whose multiplier is missing or malformed:
+/// guessing 1.0 would misprice every notional. Stocks default to 1.0.
+fn to_tws_contract(
+    c: &Contract,
+    min_tick: f64,
+    lot_size: Option<f64>,
+    name: String,
+    isin: Option<String>,
+    last_trade_time: &str,
+    tz_id: &str,
+) -> Option<TwsContract> {
     let sec_type = SecType::parse(c.security_type.as_str()).unwrap_or_default();
-    TwsContract {
+    let multiplier = match (c.multiplier.trim().parse::<f64>(), sec_type) {
+        (Ok(m), _) if m > 0.0 => m,
+        (_, SecType::Stk) => 1.0,
+        _ => {
+            tracing::warn!(con_id = c.contract_id, symbol = %c.symbol, multiplier = %c.multiplier, "derivative contract without a usable multiplier; skipped");
+            return None;
+        }
+    };
+    let (last_trade, last_trade_at) = last_trade_from(&c.last_trade_date_or_contract_month, last_trade_time, tz_id);
+    Some(TwsContract {
         con_id: c.contract_id as i64,
         symbol: c.symbol.to_string(),
         exchange: c.exchange.to_string(),
@@ -492,12 +526,12 @@ fn to_tws_contract(c: &Contract, min_tick: f64, lot_size: Option<f64>, name: Str
         isin,
         sec_type,
         local_symbol: c.local_symbol.clone(),
-        multiplier: c.multiplier.parse().unwrap_or(1.0),
-        last_trade: NaiveDate::parse_from_str(&c.last_trade_date_or_contract_month, "%Y%m%d").ok(),
-        last_trade_at: None,
+        multiplier,
+        last_trade,
+        last_trade_at,
         strike: (c.strike != 0.0).then_some(c.strike),
         right: c.right.as_ref().map(|r| r.as_str().to_string()),
-    }
+    })
 }
 
 /// `(ordered qty, filled, remaining, avg fill price)` of one order report.
@@ -659,12 +693,9 @@ impl TwsClient for IbapiClient {
         let details = self.client.contract_details(&contract).await?;
         Ok(details
             .into_iter()
-            .map(|d| {
+            .filter_map(|d| {
                 let isin = d.sec_id_list.iter().find(|t| t.tag == "ISIN").map(|t| t.value.clone());
-                let mut c = to_tws_contract(&d.contract, d.min_tick, d.size_increment, d.long_name.clone(), isin);
-                let time = d.last_trade_time.split_whitespace().next();
-                c.last_trade_at = last_trade_instant(&d.contract.last_trade_date_or_contract_month, time, &d.time_zone_id);
-                c
+                to_tws_contract(&d.contract, d.min_tick, d.size_increment, d.long_name.clone(), isin, &d.last_trade_time, &d.time_zone_id)
             })
             .collect())
     }
@@ -674,13 +705,13 @@ impl TwsClient for IbapiClient {
         let found = self.client.matching_symbols(pattern).await?;
         Ok(found
             .into_iter()
-            .map(|d| to_tws_contract(&d.contract, 0.0, None, d.contract.description.clone(), None))
+            .filter_map(|d| to_tws_contract(&d.contract, 0.0, None, d.contract.description.clone(), None, "", ""))
             .collect())
     }
 
-    async fn prev_close(&self, con_id: i64) -> Result<Option<f64>, TwsError> {
+    async fn prev_close(&self, con_id: i64, sec_type: SecType, exchange: &str) -> Result<Option<f64>, TwsError> {
         self.ensure_connected()?;
-        let contract = ib_contract(con_id, SecType::Stk, "SMART", "", "")?;
+        let contract = ib_contract(con_id, sec_type, exchange, "", "")?;
         if let Ok(ticks) = self.client.market_data(&contract).snapshot_once(REQUEST_TIMEOUT).await {
             if let Some(close) = Quote::from_ticks(ticks.iter().filter(|t| matches!(t, TickTypes::Price(_)))).close {
                 return Ok(Some(close));
@@ -841,7 +872,7 @@ impl TwsClient for FakeTws {
         Ok(self.symbols.lock().unwrap().get(pattern).cloned().unwrap_or_default())
     }
 
-    async fn prev_close(&self, con_id: i64) -> Result<Option<f64>, TwsError> {
+    async fn prev_close(&self, con_id: i64, _sec_type: SecType, _exchange: &str) -> Result<Option<f64>, TwsError> {
         self.up()?;
         Ok(self.prev_closes.lock().unwrap().get(&con_id).copied())
     }
@@ -973,6 +1004,32 @@ mod tests {
         assert_eq!(c.exchange.to_string(), "CME");
         let s = ib_contract(265598, SecType::Stk, "SMART", "NASDAQ", "USD").unwrap();
         assert_eq!(s.security_type.as_str(), "STK");
+    }
+
+    #[test]
+    fn last_trade_from_reads_time_from_either_source() {
+        let utc = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 12, 18).unwrap();
+        // Time in last_trade_time, zone from the contract details.
+        assert_eq!(last_trade_from("20261218", "08:30", "US/Central"), (Some(d), Some(utc("2026-12-18T14:30:00Z"))));
+        // Time and zone inside the date string.
+        assert_eq!(last_trade_from("20261218 08:30:00 America/Chicago", "", "UTC"), (Some(d), Some(utc("2026-12-18T14:30:00Z"))));
+        // Date only: no instant.
+        assert_eq!(last_trade_from("20261218", "", "US/Central"), (Some(d), None));
+        // A bare contract month has no day.
+        assert_eq!(last_trade_from("202612", "", "US/Central"), (None, None));
+    }
+
+    #[test]
+    fn derivative_without_multiplier_is_skipped_stock_defaults_to_one() {
+        let mut c = ib_contract(1, SecType::Fut, "CME", "", "USD").unwrap();
+        assert!(to_tws_contract(&c, 0.25, None, String::new(), None, "", "").is_none());
+        c.multiplier = "abc".into();
+        assert!(to_tws_contract(&c, 0.25, None, String::new(), None, "", "").is_none());
+        c.multiplier = "50".into();
+        assert_eq!(to_tws_contract(&c, 0.25, None, String::new(), None, "", "").unwrap().multiplier, 50.0);
+        let stk = ib_contract(2, SecType::Stk, "SMART", "NASDAQ", "USD").unwrap();
+        assert_eq!(to_tws_contract(&stk, 0.01, None, String::new(), None, "", "").unwrap().multiplier, 1.0);
     }
 
     #[test]

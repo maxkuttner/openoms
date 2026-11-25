@@ -524,7 +524,9 @@ impl DailyStats for IbkrTwsAdapter {
         let mut out = Vec::new();
         for s in symbols {
             let Some(con_id) = self.con_id_for(client.as_ref(), s).await else { continue };
-            if let Some(px) = client.prev_close(con_id).await.map_err(broker_error)? {
+            let contract = self.contract(client.as_ref(), con_id).await?;
+            let exchange = if contract.sec_type == SecType::Stk { "SMART".to_string() } else { contract.exchange.clone() };
+            if let Some(px) = client.prev_close(con_id, contract.sec_type, &exchange).await.map_err(broker_error)? {
                 out.push((s.clone(), px));
             }
         }
@@ -610,6 +612,28 @@ pub(crate) mod tests {
         // A second order takes a fresh id and reuses the cached contract.
         fake.details.lock().unwrap().clear();
         assert_eq!(adapter.submit_order(&req(Some("265598"))).await.unwrap().external_order_id, "101");
+    }
+
+    #[tokio::test]
+    async fn a_future_order_goes_out_as_fut_on_its_own_exchange() {
+        let (fake, adapter) = rig();
+        let es = TwsContract {
+            con_id: 111,
+            symbol: "ES".into(),
+            exchange: "CME".into(),
+            primary_exchange: String::new(),
+            sec_type: SecType::Fut,
+            local_symbol: "ESZ6".into(),
+            multiplier: 50.0,
+            ..aapl()
+        };
+        fake.details.lock().unwrap().insert(ContractQuery { con_id: Some(111), ..ContractQuery::default() }, vec![es]);
+        adapter.submit_order(&req(Some("111"))).await.unwrap();
+        let placed = fake.placed.lock().unwrap().clone();
+        assert_eq!(placed.len(), 1);
+        assert_eq!(placed[0].sec_type, SecType::Fut);
+        assert_eq!(placed[0].exchange, "CME");
+        assert!(placed[0].legs.is_empty());
     }
 
     #[tokio::test]
