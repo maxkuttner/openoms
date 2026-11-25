@@ -650,6 +650,7 @@ struct Roll {
     far_child: Uuid,
     near: i64,
     far: i64,
+    spread: i64,
 }
 
 async fn future(pool: &PgPool, symbol: &str) -> i64 {
@@ -702,7 +703,7 @@ async fn roll_world(w: &World) -> Roll {
     insert_order(w, far_child, &format!("{parent}-2"), far, "buy", None, Some(parent)).await;
     sqlx::query("INSERT INTO position (portfolio_id, instrument_id, net_qty) VALUES ($1, $2, 4)")
         .bind(w.portfolio).bind(near.to_string()).execute(&w.pool).await.unwrap();
-    Roll { parent, near_child, far_child, near, far }
+    Roll { parent, near_child, far_child, near, far, spread }
 }
 
 /// One leg execution of the roll's BAG: IBKR names the leg by its local symbol
@@ -769,9 +770,13 @@ async fn leg_fills_land_on_their_children() {
     assert_eq!(position_of(&w, r.far).await, 4.0);
     assert_eq!(state_of(&w, r.near_child).await, ("filled".to_string(), 4.0));
     assert_eq!(state_of(&w, r.far_child).await, ("filled".to_string(), 4.0));
-    // the parent books no fills and holds no position
-    assert_eq!(state_of(&w, r.parent).await, ("routed".to_string(), 0.0));
-    assert_eq!(count(&w.pool, &format!("SELECT count(*) FROM order_event WHERE order_id = '{}'", r.parent)).await, 0);
+    // the parent books no fills: its progress follows the legs, as
+    // status-only events
+    assert_eq!(state_of(&w, r.parent).await, ("filled".to_string(), 4.0));
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT event_type FROM order_event WHERE order_id = $1 ORDER BY version")
+        .bind(r.parent).fetch_all(&w.pool).await.unwrap();
+    // one leg alone moves nothing; the second completes the spread
+    assert_eq!(kinds, ["order_legs_filled"]);
     let booked_to: Vec<Uuid> = sqlx::query_scalar("SELECT order_id FROM venue_fill ORDER BY exec_id").fetch_all(&w.pool).await.unwrap();
     assert_eq!(booked_to, vec![r.near_child, r.far_child]);
     // a redelivered leg fill is a duplicate
@@ -828,7 +833,7 @@ async fn cancelled_parent_cancels_unfilled_children() {
     ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x2", "ESH7", true, 1.0, 6040.0), None).await.unwrap();
     let done = ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 1.0, VenueOrderStatus::Canceled), None).await.unwrap();
     assert_eq!(done.decision, Decision::Apply { order_id: r.parent });
-    assert_eq!(state_of(&w, r.parent).await, ("canceled".to_string(), 0.0));
+    assert_eq!(state_of(&w, r.parent).await, ("canceled".to_string(), 1.0));
     assert_eq!(state_of(&w, r.near_child).await, ("filled".to_string(), 4.0));
     assert_eq!(state_of(&w, r.far_child).await, ("canceled".to_string(), 1.0));
     let leaves: f64 = sqlx::query_scalar("SELECT leaves_qty::float8 FROM order_state WHERE order_id = $1")
@@ -856,4 +861,65 @@ async fn rejected_or_expired_parent_closes_its_children_the_same_way() {
             assert_eq!(state_of(&w, id).await, (want.to_string(), 0.0), "{want}");
         }
     }
+}
+
+/// (status, cum, avg_px) of the parent.
+async fn parent_progress(w: &World, r: &Roll) -> (String, f64, Option<f64>) {
+    sqlx::query_as("SELECT status, cum_qty::float8, avg_px::float8 FROM order_state WHERE order_id = $1")
+        .bind(r.parent).fetch_one(&w.pool).await.unwrap()
+}
+
+async fn spread_positions(w: &World, r: &Roll) -> i64 {
+    count(&w.pool, &format!("SELECT count(*) FROM position WHERE instrument_id = '{}'", r.spread)).await
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn both_legs_filled_fill_the_parent_at_the_net_price() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0), None).await.unwrap();
+    // one leg alone fills nothing of the spread
+    assert_eq!(parent_progress(&w, &r).await, ("routed".to_string(), 0.0, None));
+    ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x2", "ESH7", true, 2.0, 6040.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x3", "ESH7", true, 2.0, 6042.0), None).await.unwrap();
+    // net debit: buy-leg avg 6041 - sell-leg avg 6000
+    assert_eq!(parent_progress(&w, &r).await, ("filled".to_string(), 4.0, Some(41.0)));
+    let leaves: f64 = sqlx::query_scalar("SELECT leaves_qty::float8 FROM order_state WHERE order_id = $1")
+        .bind(r.parent).fetch_one(&w.pool).await.unwrap();
+    assert_eq!(leaves, 0.0);
+    assert_eq!(spread_positions(&w, &r).await, 0, "the parent never holds a position");
+    // and positions rebuilt from the log agree: the legs only
+    let fills: i64 = count(&w.pool, &format!(
+        "SELECT count(*) FROM order_event WHERE order_id = '{}' AND event_type IN ('order_filled', 'order_partially_filled')", r.parent)).await;
+    assert_eq!(fills, 0);
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn one_leg_filled_the_other_partly_leaves_the_parent_partially_filled() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0), None).await.unwrap();
+    ingest(&w.pool, &w.bus, &w.conn, leg_fill(&r, "x2", "ESH7", true, 1.0, 6040.0), None).await.unwrap();
+    assert_eq!(parent_progress(&w, &r).await, ("partially_filled".to_string(), 1.0, Some(40.0)));
+    assert_eq!(spread_positions(&w, &r).await, 0);
+    // a venue Filled on the BAG moves nothing beyond its venue cum
+    ingest(&w.pool, &w.bus, &w.conn, bag_update(&r, 4.0, VenueOrderStatus::Filled), None).await.unwrap();
+    assert_eq!(parent_progress(&w, &r).await, ("partially_filled".to_string(), 1.0, Some(40.0)));
+}
+
+#[tokio::test]
+#[ignore = "needs OMS_RELOAD_TEST_DATABASE_URL"]
+async fn a_leg_fill_found_by_the_parents_venue_order_id_lands_on_its_child() {
+    let w = world().await;
+    let r = roll_world(&w).await;
+    let VenueEvent::Fill(mut f) = leg_fill(&r, "x1", "ESZ6", false, 4.0, 6000.0) else { unreachable!() };
+    f.client_order_id = None;
+    f.venue_order_id = "100".into();
+    let d = ingest(&w.pool, &w.bus, &w.conn, VenueEvent::Fill(f), None).await.unwrap().decision;
+    assert_eq!(d, Decision::Apply { order_id: r.near_child });
+    assert_eq!(state_of(&w, r.near_child).await, ("filled".to_string(), 4.0));
+    assert_eq!(position_of(&w, r.near).await, 0.0);
+    assert_eq!(state_of(&w, r.parent).await, ("routed".to_string(), 0.0));
 }

@@ -128,4 +128,16 @@ pub enum OrderCommand {
     ReceiveExecutionReport(ReceiveExecutionReport),
     ExpireOrder(ExpireOrder),
     ObserveOrder(ObserveOrder),
+    RecordLegsFilled(RecordLegsFilled),
+}
+
+/// How far the legs of a multi-leg (parent) order have filled, in the
+/// parent's own units: its progress is derived from its leg orders, which
+/// book the executions. Not a fill: no position, no fills record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordLegsFilled {
+    pub order_id: String,
+    pub cum_qty: f64,
+    /// Net price per unit: buy-leg average prices minus sell-leg ones.
+    pub avg_px: f64,
 }

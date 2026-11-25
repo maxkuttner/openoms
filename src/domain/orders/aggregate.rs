@@ -321,6 +321,34 @@ impl OrderAggregate {
                     }
                 }
             }
+            OrderCommand::RecordLegsFilled(cmd) => {
+                let state = invariants::require_existing_order(&self.state)?;
+                if !(cmd.cum_qty.is_finite() && cmd.cum_qty > 0.0 && cmd.avg_px.is_finite()) {
+                    return Err(CommandRejection::new(
+                        RejectionCode::InvalidExecutionReport,
+                        "legs progress needs a positive quantity and a finite price",
+                    ));
+                }
+                if cmd.cum_qty > state.original_qty + 1e-9 || cmd.cum_qty < state.cum_qty - 1e-9 {
+                    return Err(CommandRejection::new(
+                        RejectionCode::InvalidExecutionReport,
+                        "legs progress must lie between the booked quantity and the order quantity",
+                    ));
+                }
+                let cum_qty = cmd.cum_qty.min(state.original_qty);
+                let leaves_qty = (state.original_qty - cum_qty).max(0.0);
+                Ok(vec![OrderDomainEvent {
+                    event_id: metadata.event_id,
+                    event_type: OrderEventType::OrderLegsFilled,
+                    order_id: cmd.order_id,
+                    timestamp: metadata.timestamp,
+                    actor: metadata.actor,
+                    occurred_at: metadata.occurred_at,
+                    payload: OrderEventPayload::OrderLegsFilled { cum_qty, leaves_qty, avg_px: cmd.avg_px },
+                    version: state.version + 1,
+                    status_after: if leaves_qty <= 1e-9 { OrderStatus::Filled } else { OrderStatus::PartiallyFilled },
+                }])
+            }
             OrderCommand::ObserveOrder(cmd) => {
                 invariants::validate_submit(cmd.quantity, cmd.order_type, cmd.limit_price)?;
                 if matches!(cmd.observed_status, OrderStatus::Submitted | OrderStatus::Suspended) {
@@ -474,6 +502,11 @@ impl OrderAggregate {
                 leaves_qty,
                 avg_px,
                 ..
+            }
+            | OrderEventPayload::OrderLegsFilled {
+                cum_qty,
+                leaves_qty,
+                avg_px,
             }
             | OrderEventPayload::OrderFilled {
                 cum_qty,
@@ -1175,6 +1208,33 @@ mod tests {
         assert_eq!(state.leaves_qty, 7.0);
         assert_eq!(state.cum_qty, 5.0);
         assert_eq!(state.avg_px, Some(101.5));
+    }
+
+    #[test]
+    fn legs_progress_moves_a_parent_without_a_fill() {
+        let mut agg = submitted_aggregate();
+        let legs = |cum: f64, px: f64| {
+            OrderCommand::RecordLegsFilled(crate::domain::orders::commands::RecordLegsFilled {
+                order_id: "o-1".into(),
+                cum_qty: cum,
+                avg_px: px,
+            })
+        };
+        let qty = agg.state.as_ref().unwrap().original_qty;
+        let events = agg.decide(legs(qty / 2.0, -1.25), metadata("e-2")).expect("partial legs");
+        assert_eq!(events[0].event_type, OrderEventType::OrderLegsFilled);
+        assert_eq!(events[0].status_after, OrderStatus::PartiallyFilled);
+        agg.apply(&events[0]).unwrap();
+        let s = agg.state.clone().unwrap();
+        assert_eq!((s.cum_qty, s.leaves_qty, s.avg_px), (qty / 2.0, qty / 2.0, Some(-1.25)));
+        // never backwards, never past the quantity
+        assert!(agg.decide(legs(qty / 4.0, 1.0), metadata("e-3")).is_err());
+        assert!(agg.decide(legs(qty + 1.0, 1.0), metadata("e-3")).is_err());
+        let events = agg.decide(legs(qty, 2.0), metadata("e-3")).expect("all legs");
+        assert_eq!(events[0].status_after, OrderStatus::Filled);
+        agg.apply(&events[0]).unwrap();
+        // a filled parent takes no more
+        assert!(agg.decide(legs(qty, 2.0), metadata("e-4")).is_err());
     }
 
     #[test]

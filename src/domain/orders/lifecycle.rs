@@ -13,6 +13,7 @@ pub enum CommandKind {
     ReceiveExecutionReport,
     ExpireOrder,
     ObserveOrder,
+    RecordLegsFilled,
 }
 
 impl CommandKind {
@@ -27,6 +28,7 @@ impl CommandKind {
             Self::ReceiveExecutionReport => "receive_execution_report",
             Self::ExpireOrder => "expire_order",
             Self::ObserveOrder => "observe_order",
+            Self::RecordLegsFilled => "record_legs_filled",
         }
     }
 }
@@ -43,6 +45,7 @@ impl OrderCommand {
             OrderCommand::ReceiveExecutionReport(_) => CommandKind::ReceiveExecutionReport,
             OrderCommand::ExpireOrder(_) => CommandKind::ExpireOrder,
             OrderCommand::ObserveOrder(_) => CommandKind::ObserveOrder,
+            OrderCommand::RecordLegsFilled(_) => CommandKind::RecordLegsFilled,
         }
     }
 }
@@ -61,6 +64,7 @@ pub fn allowed_kinds_for_status(status: OrderStatus) -> &'static [CommandKind] {
             SuspendOrder,
             ReceiveExecutionReport,
             ExpireOrder,
+            RecordLegsFilled,
         ],
         Routed | PartiallyFilled => &[
             ReplaceOrder,
@@ -68,12 +72,14 @@ pub fn allowed_kinds_for_status(status: OrderStatus) -> &'static [CommandKind] {
             SuspendOrder,
             ReceiveExecutionReport,
             ExpireOrder,
+            RecordLegsFilled,
         ],
         Suspended => &[
             CancelOrder,
             ReleaseOrder,
             ReceiveExecutionReport,
             ExpireOrder,
+            RecordLegsFilled,
         ],
         Filled | Rejected | Canceled | Expired => &[],
     }

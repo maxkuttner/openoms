@@ -18,7 +18,7 @@ use super::adopt;
 use super::decide::{decide, BreakKind, ConnPolicy, Decision, KnownOrder, Lookup, Policy, Rule};
 use crate::domain::orders::aggregate::{EventMetadata, OrderAggregate};
 use crate::domain::orders::commands::{
-    ExecutionReport, ExpireOrder, OrderCommand, ReceiveExecutionReport, ReplaceOrder,
+    ExecutionReport, ExpireOrder, OrderCommand, ReceiveExecutionReport, RecordLegsFilled, ReplaceOrder,
 };
 use crate::domain::orders::events::{OrderDomainEvent, OrderEventPayload};
 use crate::domain::orders::state::{OrderAggregateState, OrderStatus};
@@ -372,6 +372,11 @@ async fn is_parent(conn: &mut PgConnection, order_id: Uuid) -> Result<bool, sqlx
 /// The leg order of `parent` a leg execution books on: the one whose
 /// instrument the connection's broker lists under the fill's symbol, on the
 /// fill's side. `None` when no leg matches.
+///
+/// The side must match as well as the contract (stricter than the contract
+/// alone, on purpose): a fill booked on a leg takes the leg's side, so a
+/// wrong-side execution (say a SELL combo entered by hand under an OMS ref)
+/// would book reversed. It breaks for a person instead.
 async fn leg_order(
     conn: &mut PgConnection,
     connection: &str,
@@ -500,11 +505,19 @@ async fn attempt_once(
             match book(&mut tx, &ctx, order_id, Some(state), commands, None, event).await? {
                 BookOutcome::Booked(b) => {
                     let mut booked = vec![b];
-                    if let VenueEvent::Order(o) = event {
-                        let Some(legs) = close_legs(&mut tx, &ctx, order_id, o).await? else {
-                            return Ok(Attempt::Retry);
-                        };
-                        booked.extend(legs);
+                    match event {
+                        VenueEvent::Order(o) => {
+                            let Some(legs) = close_legs(&mut tx, &ctx, order_id, o).await? else {
+                                return Ok(Attempt::Retry);
+                            };
+                            booked.extend(legs);
+                        }
+                        VenueEvent::Fill(_) => match progress_parent(&mut tx, &ctx, order_id).await? {
+                            Progress::Retry => return Ok(Attempt::Retry),
+                            Progress::Booked(p) => booked.push(p),
+                            Progress::Unchanged => {}
+                        },
+                        _ => {}
                     }
                     Attempt::Done(decision.clone(), booked)
                 }
@@ -601,6 +614,70 @@ async fn close_legs(
         }
     }
     Ok(Some(booked))
+}
+
+enum Progress {
+    Booked(Booked),
+    Unchanged,
+    Retry,
+}
+
+/// After a fill on a leg order: move its parent's progress to what all its
+/// legs have filled, as a status-only `order_legs_filled` event in the same
+/// transaction (the parent books no fills and holds no position).
+///
+/// Parent cum = min over legs of (leg cum / leg qty) x parent qty: the spread
+/// is done only as far as every leg is. Its price is the net per spread: buy
+/// legs' average prices minus sell legs'. Cancel, reject and expiry stay the
+/// venue's (see `close_legs`).
+async fn progress_parent(
+    tx: &mut Transaction<'_, Postgres>,
+    ctx: &Ctx<'_>,
+    leg: Uuid,
+) -> Result<Progress, IngestError> {
+    let parent: Option<Uuid> = sqlx::query_scalar("SELECT parent_order_id FROM order_state WHERE order_id = $1")
+        .bind(leg)
+        .fetch_one(&mut **tx)
+        .await?;
+    let Some(parent) = parent else { return Ok(Progress::Unchanged) };
+    let legs: Vec<(String, f64, f64, Option<f64>)> = sqlx::query_as(
+        "SELECT side, original_qty::float8, cum_qty::float8, avg_px::float8 FROM order_state \
+         WHERE parent_order_id = $1 ORDER BY client_order_id",
+    )
+    .bind(parent)
+    .fetch_all(&mut **tx)
+    .await?;
+    let Some(state) = load_state(tx, parent).await.map_err(|e| IngestError::Other(e.to_string()))? else {
+        return Err(IngestError::Other(format!("parent order {parent} vanished")));
+    };
+    let done = legs
+        .iter()
+        .map(|(_, qty, cum, _)| if *qty > EPS { cum / qty } else { 0.0 })
+        .fold(f64::INFINITY, f64::min)
+        .clamp(0.0, 1.0);
+    let cum_qty = done * state.original_qty;
+    if cum_qty <= EPS {
+        return Ok(Progress::Unchanged);
+    }
+    let avg_px: f64 = legs
+        .iter()
+        .map(|(side, _, _, avg)| {
+            let px = avg.unwrap_or(0.0);
+            if side == "buy" { px } else { -px }
+        })
+        .sum();
+    let same = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() <= EPS);
+    if (cum_qty - state.cum_qty).abs() <= EPS && same(state.avg_px, avg_px) {
+        return Ok(Progress::Unchanged);
+    }
+    let command = OrderCommand::RecordLegsFilled(RecordLegsFilled { order_id: parent.to_string(), cum_qty, avg_px });
+    // No venue event of its own: `Connected` carries no fill, order report or
+    // times, so `book` writes the order row and the event only.
+    match book(tx, ctx, parent, Some(state), vec![command], None, &VenueEvent::Connected).await? {
+        BookOutcome::Booked(b) => Ok(Progress::Booked(b)),
+        BookOutcome::Retry => Ok(Progress::Retry),
+        BookOutcome::Duplicate => Ok(Progress::Unchanged),
+    }
 }
 
 enum BookOutcome {

@@ -20,6 +20,7 @@ pub enum OrderEventType {
     OrderReleased,
     OrderFeeCharged,
     OrderObserved,
+    OrderLegsFilled,
 }
 
 impl OrderEventType {
@@ -38,6 +39,7 @@ impl OrderEventType {
             Self::OrderReleased => "order_released",
             Self::OrderFeeCharged => "order_fee_charged",
             Self::OrderObserved => "order_observed",
+            Self::OrderLegsFilled => "order_legs_filled",
         }
     }
 }
@@ -113,6 +115,15 @@ pub enum OrderEventPayload {
         amount: f64,
         currency: String,
         effect: FeeEffect,
+    },
+    /// A multi-leg (parent) order's progress, derived from its leg orders'
+    /// fills. Status-only: not a fill (positions and the fills topic read
+    /// `order_partially_filled` / `order_filled` only).
+    OrderLegsFilled {
+        cum_qty: f64,
+        leaves_qty: f64,
+        /// Net price per unit: buy-leg average prices minus sell-leg ones.
+        avg_px: f64,
     },
     /// Stream opened from the venue's view of an order; books no fills.
     OrderObserved {
