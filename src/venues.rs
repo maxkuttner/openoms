@@ -73,6 +73,7 @@ mod tests {
                     let value = f.paper.unwrap_or(match f.input {
                         Input::Checkbox => "true",
                         _ if f.name == "port" => "9000",
+                        _ if f.name == "gateway" => "ib-gateway:4004",
                         _ => "x",
                     });
                     (f.name.to_string(), value.to_string())

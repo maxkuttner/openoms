@@ -177,7 +177,9 @@ pub fn parse_broker(
         };
         fields.insert(f.name.to_string(), value);
     }
-    Ok(BrokerCredentials::new(m.credential_kind, fields))
+    let creds = BrokerCredentials::new(m.credential_kind, fields);
+    (m.validate)(&creds).map_err(|(name, why)| CredentialError::BadField { name, why })?;
+    Ok(creds)
 }
 
 /// Turns a submitted form into a typed feed credential, same merge rule as
@@ -350,14 +352,23 @@ mod tests {
                     let v = match m.field_types.iter().find(|(n, _)| *n == f.name).map(|(_, t)| *t) {
                         Some(gateway::connectors::FieldType::Port) => "1234".to_string(),
                         Some(gateway::connectors::FieldType::Bool { .. }) => "false".to_string(),
-                        None => format!("v-{}", f.name),
+                        // an address has a shape to pass (IBKR_TWS checks it)
+                        None if f.name == "gateway" => "ib-gateway:4004".to_string(),
+                        None => f.paper.map_or_else(|| format!("v-{}", f.name), str::to_string),
                     };
                     (f.name.to_string(), v)
                 })
                 .collect();
             let full_sub = CredentialSubmission { fields: full.iter().cloned().collect() };
             let stored = parse_broker(m.code, None, &full_sub).expect(m.code);
-            let blank = CredentialSubmission { fields: full.iter().map(|(k, _)| (k.clone(), String::new())).collect() };
+            // A non-secret optional field submitted blank is cleared on purpose
+            // (`optional_text_field_submitted_empty_clears`); the form echoes
+            // it, so here it is left out, as an untouched field would be.
+            let fields = (m.venue)().fields;
+            let cleared = |k: &str| fields.iter().any(|f| f.name == k && f.optional && !f.secret);
+            let blank = CredentialSubmission {
+                fields: full.iter().filter(|(k, _)| !cleared(k)).map(|(k, _)| (k.clone(), String::new())).collect(),
+            };
             let kept = parse_broker(m.code, Some(&stored), &blank).expect(m.code);
             assert_eq!(serde_json::to_value(&kept).unwrap(), serde_json::to_value(&stored).unwrap(), "{}", m.code);
         }
@@ -527,6 +538,49 @@ mod tests {
         let required = gateway::venue::field("gateway", "Gateway address");
         assert!(matches!(text_field(&sub(&[]), &required, None), Err(CredentialError::MissingField("gateway"))));
         assert!(matches!(text_field(&sub(&[("gateway", "")]), &required, None), Err(CredentialError::MissingField("gateway"))));
+    }
+
+    #[test]
+    fn ibkr_tws_refuses_a_bad_gateway_address() {
+        for bad in ["ib-gateway", "ib-gateway:99999", ":4004"] {
+            let r = parse_broker("IBKR_TWS", None, &sub(&[("gateway", bad), ("master_client_id", "0")]));
+            assert!(matches!(&r, Err(CredentialError::BadField { name: "gateway", .. })), "{bad:?}: {r:?}");
+        }
+        let ok = parse_broker("IBKR_TWS", None, &sub(&[("gateway", " ib-gateway:4004 "), ("master_client_id", "0")])).expect("external");
+        assert_eq!(ok.text("gateway").as_deref(), Some("ib-gateway:4004"), "trimmed");
+        assert_eq!(ok.text("username").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn ibkr_tws_managed_without_login_is_refused() {
+        let r = parse_broker("IBKR_TWS", None, &sub(&[("username", "u"), ("master_client_id", "0")]));
+        assert!(
+            matches!(&r, Err(CredentialError::BadField { name: "username", why }) if why == "username and password are required unless a gateway address is set"),
+            "{r:?}"
+        );
+        assert!(parse_broker("IBKR_TWS", None, &sub(&[("username", "u"), ("password", "p"), ("master_client_id", "0")])).is_ok());
+    }
+
+    #[test]
+    fn ibkr_tws_bad_client_id_is_a_field_error_without_the_value() {
+        let r = parse_broker("IBKR_TWS", None, &sub(&[("gateway", "ib-gateway:4004"), ("master_client_id", "SECRETVALUE")]));
+        assert!(matches!(&r, Err(CredentialError::BadField { name: "master_client_id", .. })), "{r:?}");
+        assert!(!format!("{r:?}").contains("SECRETVALUE"));
+    }
+
+    /// Review focus: clearing the address of a stored external connection
+    /// goes back to managed mode, which then needs a login.
+    #[test]
+    fn ibkr_tws_clearing_the_gateway_switches_to_managed() {
+        let stored = parse_broker("IBKR_TWS", None, &sub(&[("username", "u"), ("password", "p"), ("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
+        let managed = parse_broker("IBKR_TWS", Some(&stored), &sub(&[("username", "u"), ("password", ""), ("gateway", ""), ("master_client_id", "0")])).unwrap();
+        assert_eq!(managed.text("gateway").as_deref(), Some(""));
+        assert_eq!(managed.text("password").as_deref(), Some("p"), "blank secret keeps");
+        let external = parse_broker("IBKR_TWS", None, &sub(&[("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
+        assert!(matches!(
+            parse_broker("IBKR_TWS", Some(&external), &sub(&[("gateway", ""), ("master_client_id", "0")])),
+            Err(CredentialError::BadField { name: "username", .. })
+        ));
     }
 
     #[test]

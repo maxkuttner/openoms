@@ -33,6 +33,7 @@ static MANIFEST: Manifest = Manifest {
     per_currency_notional: false,
     multi_account: false,
     instrument_classes: &["SPOT"],
+    validate: super::no_validation,
 };
 
 impl Connector for Coinbase {

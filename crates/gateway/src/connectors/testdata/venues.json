@@ -252,7 +252,7 @@
   {
     "code": "IBKR_TWS",
     "name": "Interactive Brokers (TWS API)",
-    "description": "Stocks worldwide via IB Gateway (Docker)",
+    "description": "Stocks, futures and options via IB Gateway",
     "docs_url": "https://openoms.dev/integrations/interactive-brokers/",
     "universe": "Imported on demand from a CSV or search",
     "environments": [
@@ -276,7 +276,7 @@
         "section": null,
         "paper": null,
         "live": null,
-        "optional": false
+        "optional": true
       },
       {
         "name": "password",
@@ -286,7 +286,17 @@
         "section": null,
         "paper": null,
         "live": null,
-        "optional": false
+        "optional": true
+      },
+      {
+        "name": "gateway",
+        "label": "Gateway address (optional): host:port of an IB Gateway you run yourself, e.g. ib-gateway:4004 (paper) or :4003 (live). Leave empty to let the OMS start it with Docker.",
+        "secret": false,
+        "input": "text",
+        "section": null,
+        "paper": null,
+        "live": null,
+        "optional": true
       },
       {
         "name": "master_client_id",

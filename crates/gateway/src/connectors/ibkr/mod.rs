@@ -38,6 +38,7 @@ static MANIFEST: Manifest = Manifest {
     per_currency_notional: false,
     multi_account: true,
     instrument_classes: &["SPOT"],
+    validate: super::no_validation,
 };
 
 impl Connector for Ibkr {

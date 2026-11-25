@@ -84,6 +84,14 @@ pub struct Manifest {
     /// The `instrument.instrument_class` values this connector can trade;
     /// order entry refuses any other.
     pub instrument_classes: &'static [&'static str],
+    /// Save-time check of a whole credential beyond each field's type: the
+    /// field to point at and why ([`no_validation`] for most connectors).
+    pub validate: fn(&BrokerCredentials) -> Result<(), (&'static str, String)>,
+}
+
+/// [`Manifest::validate`] for a connector whose fields need no cross-check.
+pub fn no_validation(_: &BrokerCredentials) -> Result<(), (&'static str, String)> {
+    Ok(())
 }
 
 /// What the FIX starters and freshly-built adapters need beyond the credential

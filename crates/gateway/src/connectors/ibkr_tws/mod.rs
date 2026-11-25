@@ -46,12 +46,19 @@ pub(crate) fn set_live_client(connection_code: &str, client: Option<Arc<dyn clie
     };
 }
 
-/// An IBKR login for the IB Gateway container.
+/// An IBKR login for the IB Gateway container, or the address of an IB
+/// Gateway run as its own service (then the login lives there).
 /// Stored as `{"kind":"IbkrTws", …}` (see [`crate::credentials::BrokerCredentials`]).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct IbkrTwsCredentials {
+    #[serde(default)]
     pub username: String,
+    #[serde(default)]
     pub password: String,
+    /// `host:port` of an IB Gateway the OMS does not start (e.g. a compose
+    /// service); `None` (or empty) = the OMS runs it in Docker on 127.0.0.1.
+    #[serde(default, deserialize_with = "gateway_address", skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
     /// The TWS API client id the OMS connects as (default 0). Client 0 with
     /// `reqAutoOpenOrders(true)` also sees orders typed into TWS, so they are
     /// adopted. Orders and executions of *other API clients* reach only the
@@ -60,6 +67,52 @@ pub struct IbkrTwsCredentials {
     /// by hand to this value to see them.
     #[serde(default, deserialize_with = "client_id")]
     pub master_client_id: i32,
+}
+
+/// A gateway address trimmed; empty or whitespace = none.
+fn gateway_address<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v = Option::<String>::deserialize(d)?;
+    Ok(v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+}
+
+impl IbkrTwsCredentials {
+    /// The external gateway's `(host, port)`, or `None` for an OMS-managed one.
+    /// Errors never echo the address.
+    pub fn external(&self) -> Result<Option<(String, u16)>, String> {
+        let Some(addr) = self.gateway.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
+            return Ok(None);
+        };
+        let bad = || "gateway address must be host:port, e.g. ib-gateway:4004".to_string();
+        let (host, port) = addr.rsplit_once(':').ok_or_else(bad)?;
+        if host.is_empty() || host.chars().any(char::is_whitespace) {
+            return Err(bad());
+        }
+        match port.parse::<u16>() {
+            Ok(p) if p > 0 => Ok(Some((host.to_string(), p))),
+            _ => Err("gateway port must be a number from 1 to 65535".into()),
+        }
+    }
+
+    /// Complete enough to connect: a valid gateway address, or else a login
+    /// for the gateway the OMS starts.
+    pub fn check(&self) -> Result<(), String> {
+        if self.external()?.is_some() {
+            return Ok(());
+        }
+        if self.username.trim().is_empty() || self.password.is_empty() {
+            return Err("username and password are required unless a gateway address is set".into());
+        }
+        Ok(())
+    }
+}
+
+/// Save-time check for [`Manifest::validate`]: names the field to fix.
+fn validate(creds: &BrokerCredentials) -> Result<(), (&'static str, String)> {
+    // Every other field is text, so only the client id can fail to decode;
+    // serde's message would echo the value, so it is not passed on.
+    let c: IbkrTwsCredentials = creds.parse().map_err(|_| ("master_client_id", "not a whole number".to_string()))?;
+    let field = if c.gateway.is_some() { "gateway" } else { "username" };
+    c.check().map_err(|why| (field, why))
 }
 
 /// A client id stored as a number or as the form's text (empty = 0).
@@ -79,7 +132,7 @@ static MANIFEST: Manifest = Manifest {
     credential_kind: "IbkrTws",
     venue,
     field_types: &[],
-    redaction: &[("username", Clear), ("password", Hidden), ("master_client_id", Clear)],
+    redaction: &[("username", Clear), ("password", Hidden), ("gateway", Clear), ("master_client_id", Clear)],
     live_only: false,
     universe: false,
     quotes: QuoteScope::NonCrypto,
@@ -89,6 +142,7 @@ static MANIFEST: Manifest = Manifest {
     per_currency_notional: true,
     multi_account: true,
     instrument_classes: &["SPOT","FUTURE","OPTION"],
+    validate,
 };
 
 impl Connector for IbkrTws {
@@ -100,6 +154,7 @@ impl Connector for IbkrTws {
     /// or adopts the container, connects, and hands the client to the adapter.
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
         let creds: IbkrTwsCredentials = typed(creds, MANIFEST.credential_kind)?;
+        creds.check()?;
         let state_dir = state_dir().ok_or("no HOME or XDG_STATE_HOME to keep the IB Gateway env file under")?;
         let slot: adapter::ClientSlot = Arc::new(RwLock::new(None));
         let adapter = Arc::new(adapter::IbkrTwsAdapter::new(slot.clone()));
@@ -152,7 +207,7 @@ fn venue() -> Venue {
     Venue {
         code: "IBKR_TWS",
         name: "Interactive Brokers (TWS API)",
-        description: "Stocks worldwide via IB Gateway (Docker)",
+        description: "Stocks, futures and options via IB Gateway",
         docs_url: format!("{DOCS}/interactive-brokers/"),
         universe: Some("Imported on demand from a CSV or search"),
         environments: environments(
@@ -161,8 +216,9 @@ fn venue() -> Venue {
             Some("https://www.interactivebrokers.com/portal/"),
         ),
         fields: vec![
-            field("username", "IBKR username"),
-            field("password", "Password").secret(),
+            field("username", "IBKR username").optional(),
+            field("password", "Password").secret().optional(),
+            field("gateway", "Gateway address (optional): host:port of an IB Gateway you run yourself, e.g. ib-gateway:4004 (paper) or :4003 (live). Leave empty to let the OMS start it with Docker.").optional(),
             field("master_client_id", "API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value)").prefill("0", "0"),
         ],
     }
@@ -180,5 +236,46 @@ mod tests {
         assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": "12"})).unwrap(), 12);
         assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": ""})).unwrap(), 0);
         assert!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": "x"})).is_err());
+    }
+
+    fn creds(username: &str, password: &str, gateway: &str) -> IbkrTwsCredentials {
+        serde_json::from_value(serde_json::json!({"username": username, "password": password, "gateway": gateway})).unwrap()
+    }
+
+    #[test]
+    fn gateway_address_parses() {
+        let ext = |g: &str| creds("", "", g).external();
+        assert_eq!(ext("ib-gateway:4004").unwrap(), Some(("ib-gateway".into(), 4004)));
+        assert_eq!(ext(" ib-gateway:4004 ").unwrap(), Some(("ib-gateway".into(), 4004)), "trimmed");
+        assert_eq!(ext("").unwrap(), None);
+        assert_eq!(ext("   ").unwrap(), None);
+        for bad in ["ib-gateway", "ib-gateway:99999", ":4004", "ib-gateway:0", "ib-gateway:", "ib gateway:4004"] {
+            assert!(ext(bad).is_err(), "{bad:?} accepted");
+        }
+        // Stored without the field (older credential): managed.
+        let old: IbkrTwsCredentials = serde_json::from_value(serde_json::json!({"username": "u", "password": "p"})).unwrap();
+        assert_eq!(old.external().unwrap(), None);
+    }
+
+    #[test]
+    fn managed_needs_login() {
+        let why = "username and password are required unless a gateway address is set";
+        assert_eq!(creds("", "p", "").check().unwrap_err(), why);
+        assert_eq!(creds("u", "", "").check().unwrap_err(), why);
+        assert_eq!(creds(" ", "p", "").check().unwrap_err(), why);
+        assert!(creds("u", "p", "").check().is_ok());
+    }
+
+    #[test]
+    fn external_needs_no_login() {
+        assert!(creds("", "", "ib-gateway:4004").check().is_ok());
+        assert!(creds("u", "p", "ib-gateway:4003").check().is_ok());
+        assert!(creds("", "", "ib-gateway").check().is_err());
+    }
+
+    #[test]
+    fn gateway_errors_never_echo_the_address() {
+        let e = creds("", "", "SECRETHOST:99999").check().unwrap_err();
+        assert!(!e.contains("SECRETHOST"), "{e}");
     }
 }
