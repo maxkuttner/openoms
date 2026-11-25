@@ -738,6 +738,82 @@ mod tests {
         assert_eq!(read(pool.clone()).await, Some(at));
     }
 
+    fn es_future(con_id: i64, local: &str, last_trade_at: Option<chrono::DateTime<chrono::Utc>>) -> TwsContract {
+        TwsContract {
+            con_id,
+            symbol: "ES".into(),
+            exchange: "CME".into(),
+            primary_exchange: String::new(),
+            currency: "USD".into(),
+            min_tick: 0.25,
+            lot_size: None,
+            name: "E-mini S&P 500".into(),
+            isin: None,
+            sec_type: gateway::connectors::ibkr_tws::client::SecType::Fut,
+            local_symbol: local.into(),
+            multiplier: 50.0,
+            last_trade: chrono::NaiveDate::from_ymd_opt(2026, 12, 18),
+            last_trade_at,
+            strike: None,
+            right: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn a_future_never_links_to_a_stock_sharing_its_root_symbol() {
+        use gateway::connectors::ibkr_tws::resolve::RootSpec;
+        let pool = isolated_pool().await;
+        // Two SPOT rows called ES (Eversource-like), on different venues.
+        let (mut a, mut b) = (contract(990_000_051, "IBIS"), contract(990_000_052, "NASDAQ"));
+        a.symbol = "ES".into();
+        b.symbol = "ES".into();
+        save_instruments(&pool, vec![to_broker_instrument(&a, None).unwrap(), to_broker_instrument(&b, None).unwrap()])
+            .await
+            .unwrap();
+        let root = RootSpec { code: "ES".into(), asset_class: "INDEX".into() };
+        let f = es_future(990_000_053, "ESZ6", None);
+        save_instruments(&pool, vec![to_broker_instrument(&f, Some(&root)).unwrap()]).await.unwrap();
+        let (underlying_id, symbol): (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT d.underlying_id, d.underlying_symbol FROM instrument_derivative d \
+             JOIN instrument i ON i.id = d.instrument_id WHERE i.symbol = 'ESZ6' AND i.venue = 'XCME'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((underlying_id, symbol.as_deref()), (None, Some("ES")));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
+    async fn recompute_fills_a_null_future_expiry_and_keeps_a_broker_one() {
+        use gateway::connectors::ibkr_tws::resolve::RootSpec;
+        let pool = isolated_pool().await;
+        let at = chrono::DateTime::parse_from_rfc3339("2026-12-18T14:30:00Z").unwrap().with_timezone(&chrono::Utc);
+        let root = RootSpec { code: "ES".into(), asset_class: "INDEX".into() };
+        let set = to_broker_instrument(&es_future(990_000_061, "ESH7", Some(at)), Some(&root)).unwrap();
+        let unset = to_broker_instrument(&es_future(990_000_062, "ESM7", None), Some(&root)).unwrap();
+        save_instruments(&pool, vec![set, unset]).await.unwrap();
+        crate::expiry::recompute_expires_at(&pool).await.unwrap();
+        let read = |sym: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                    "SELECT d.expires_at FROM instrument_derivative d JOIN instrument i ON i.id = d.instrument_id \
+                     WHERE i.symbol = $1 AND i.venue = 'XCME'",
+                )
+                .bind(sym)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(read("ESH7").await, Some(at), "broker instant untouched");
+        // 2026-12-18 16:00 America/Chicago (CST, UTC-6)
+        let cal = chrono::DateTime::parse_from_rfc3339("2026-12-18T22:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(read("ESM7").await, Some(cal), "NULL filled from the calendar");
+    }
+
     #[tokio::test]
     #[ignore = "needs OMS_TEST_DATABASE_URL pointing at a disposable Postgres"]
     async fn saving_twice_is_idempotent() {

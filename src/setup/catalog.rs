@@ -250,6 +250,7 @@ async fn bulk_upsert_derivatives(
                      $5::date[], $6::timestamptz[], $7::date[], $8::bool[]) \
               AS t(iid, us, ok, strike, exp, exat, act, orphan_ok) \
          LEFT JOIN instrument u ON u.symbol = t.us AND u.instrument_class = 'SPOT' \
+                                 AND NOT t.orphan_ok \
          WHERE u.id IS NOT NULL OR t.orphan_ok \
          ON CONFLICT (instrument_id) DO UPDATE SET \
             underlying_id = EXCLUDED.underlying_id, \
