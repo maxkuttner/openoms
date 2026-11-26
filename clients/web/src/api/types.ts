@@ -27,10 +27,19 @@ export interface StreamHealth {
   environment: string;
   kind: "feed" | "execution";
   transport: "websocket" | "fix";
-  state: "connecting" | "live" | "down";
+  /** connecting: an attempt is running; live: heartbeat fresh; down: failed, a
+   *  retry is scheduled; stopped: no retry until credentials/config change. */
+  state: "connecting" | "live" | "down" | "stopped";
   connected_since: string | null;
+  /** Last order/fill event (a quote, for a feed); not the freshness signal. */
   last_event_at: string | null;
   last_error: string | null;
+  /** Last time the stream verified it is alive or made an attempt. */
+  last_checked_at: string | null;
+  /** When the next attempt runs; set while down. */
+  next_retry_at: string | null;
+  /** Expected liveness interval; live without a check for 2× this reads down. */
+  heartbeat_secs: number;
 }
 
 export interface FeedSummary {
