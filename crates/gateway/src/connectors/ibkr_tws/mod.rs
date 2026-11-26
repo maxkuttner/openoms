@@ -2,10 +2,11 @@ pub mod adapter;
 pub mod client;
 pub mod exchanges;
 pub mod gateway;
+pub mod probe;
 pub mod resolve;
 pub mod stream;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -46,21 +47,26 @@ pub(crate) fn set_live_client(connection_code: &str, client: Option<Arc<dyn clie
     };
 }
 
-/// Connection codes last connected to an external gateway, so removing one
-/// leaves Docker alone (`on_removed` gets no credential).
-static EXTERNAL: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// Connection codes last connected to an external gateway, with its
+/// `host:port`, so removing one leaves Docker alone (`on_removed` gets no
+/// credential) and a credential test knows which gateway the live client is on.
+static EXTERNAL: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
-fn set_external(connection_code: &str, external: bool) {
-    let mut set = EXTERNAL.lock().unwrap_or_else(|e| e.into_inner());
-    if external {
-        set.insert(connection_code.to_string());
-    } else {
-        set.remove(connection_code);
-    }
+fn set_external(connection_code: &str, addr: Option<String>) {
+    let mut map = EXTERNAL.lock().unwrap_or_else(|e| e.into_inner());
+    match addr {
+        Some(a) => map.insert(connection_code.to_string(), a),
+        None => map.remove(connection_code),
+    };
+}
+
+/// The external gateway `connection_code` was last connected to; `None` = managed.
+fn external_addr(connection_code: &str) -> Option<String> {
+    EXTERNAL.lock().unwrap_or_else(|e| e.into_inner()).get(connection_code).cloned()
 }
 
 fn is_external(connection_code: &str) -> bool {
-    EXTERNAL.lock().unwrap_or_else(|e| e.into_inner()).contains(connection_code)
+    external_addr(connection_code).is_some()
 }
 
 /// An IBKR login for the IB Gateway container, or the address of an IB
@@ -192,8 +198,9 @@ impl Connector for IbkrTws {
         let creds: IbkrTwsCredentials = typed(creds, MANIFEST.credential_kind)?;
         creds.check()?;
         creds.check_environment(env)?;
-        let external = creds.external()?.is_some();
-        set_external(&connection_code(env), external);
+        let external = creds.external()?.map(|(host, port)| format!("{host}:{port}"));
+        set_external(&connection_code(env), external.clone());
+        let external = external.is_some();
         // An external gateway needs no env file: no state dir either.
         let state_dir = if external {
             PathBuf::new()
@@ -227,8 +234,27 @@ impl Connector for IbkrTws {
         Err("IBKR instruments are imported from a CSV or search".into())
     }
 
-    fn verify<'a>(&'a self, _: &'a str, _: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
-        Box::pin(async { TestOutcome::NotTestable("checked when the gateway logs in") })
+    /// Says whether IB Gateway is up and logged in, and whether the OMS can
+    /// trade through it: the running session if there is one (on the same
+    /// gateway), else a short probe of the external address, else the state
+    /// of the OMS's own container. Never starts a container. See [`probe`].
+    fn verify<'a>(&'a self, env: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
+        Box::pin(async move {
+            let creds: IbkrTwsCredentials = match typed(creds, MANIFEST.credential_kind) {
+                Ok(c) => c,
+                Err(e) => return TestOutcome::Failed(e),
+            };
+            let code = connection_code(env);
+            let addr = creds.external().ok().flatten().map(|(host, port)| format!("{host}:{port}"));
+            // The session's client only speaks for these credentials when it
+            // is on the same gateway (an edited address is probed afresh).
+            let live = live_client(&code).filter(|_| external_addr(&code) == addr);
+            let target = probe::Target { env, code: &code, creds: &creds, live, docker: Arc::new(gateway::DockerCli) };
+            probe::test(target, crate::verify::TEST_TIMEOUT, |addr, client_id| async move {
+                client::IbapiClient::connect(&addr, client_id).await.map(|c| Arc::new(c) as Arc<dyn client::TwsClient>)
+            })
+            .await
+        })
     }
 
     /// Stops and removes the connection's IB Gateway container; nothing for
@@ -329,9 +355,10 @@ mod tests {
     fn an_external_connection_is_remembered_until_it_goes_managed() {
         let code = "IBKR_TWS-EXTTEST";
         assert!(!is_external(code));
-        set_external(code, true);
+        set_external(code, Some("ib-gateway:4004".into()));
         assert!(is_external(code));
-        set_external(code, false);
+        assert_eq!(external_addr(code).as_deref(), Some("ib-gateway:4004"));
+        set_external(code, None);
         assert!(!is_external(code));
     }
 

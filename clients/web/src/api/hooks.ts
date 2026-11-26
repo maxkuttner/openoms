@@ -16,6 +16,10 @@ export function notifyOk(message: string) {
   notify({ color: "green", message });
 }
 
+export function notifyWarn(message: string) {
+  notify({ color: "amber", message });
+}
+
 // Mutation that invalidates the given list paths and shows a toast on success/error.
 export function useApiMutation<TArgs>(
   fn: (args: TArgs) => Promise<unknown>,

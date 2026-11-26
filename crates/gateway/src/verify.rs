@@ -1,5 +1,6 @@
 //! How checking a credential against its venue before it is saved turns out.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 /// Outcome of attempting to verify a credential before it is saved.
@@ -14,13 +15,21 @@ use std::time::Duration;
 pub enum TestOutcome {
     /// The credential authenticated against the broker.
     Passed,
+    /// Passed, and here is what was found (say which account a gateway is
+    /// logged into) — worth showing instead of a bare "verified".
+    PassedWith(String),
     /// The credential was tested and the broker rejected it (or the attempt
     /// failed for a network reason). `String` is a message for operators and
     /// logs — built from the failure, never from the submitted credential.
     Failed(String),
+    /// Checked, and nothing says the credential is wrong, but the venue is not
+    /// ready for it yet (a gateway not running or not logged in). Does not
+    /// block saving — the address may well be saved before the gateway is up —
+    /// and is shown as a warning, never as a pass.
+    Warning(String),
     /// Nothing was attempted. Reserved for credentials with no cheap,
     /// side-effect-free way to test.
-    NotTestable(&'static str),
+    NotTestable(Cow<'static, str>),
 }
 
 /// How long a credential test may spend talking to a provider before it is

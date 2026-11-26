@@ -874,13 +874,18 @@ pub struct SaveResponse {
     /// so the UI reports "not testable" rather than implying a pass it never
     /// earned.
     pub tested: bool,
-    /// Present exactly when `tested` is `false`: `TestOutcome::NotTestable`'s
-    /// own explanation (e.g. "FIX credentials are validated at session
-    /// logon, not before save"), passed through so the cockpit renders the
-    /// server's reason instead of hardcoding its own guess at the wording.
-    /// Always `None` when `tested` is `true` — a `Failed` test never reaches
-    /// this response at all (422, before anything is written).
+    /// When `tested` is `false`: `TestOutcome::NotTestable`'s own
+    /// explanation (e.g. "FIX credentials are validated at session logon, not
+    /// before save"), passed through so the cockpit renders the server's
+    /// reason instead of hardcoding its own guess at the wording. When
+    /// `tested` is `true`: what the test found (a pass with detail, or the
+    /// `warning`), else `None`. A `Failed` test never reaches this response
+    /// at all (422, before anything is written).
     pub message: Option<String>,
+    /// The test found the venue not ready (say, IB Gateway not running yet):
+    /// saved anyway, with `message` saying what to do. Omitted when `false`.
+    #[serde(skip_serializing_if = "is_false")]
+    pub warning: bool,
     /// `None` only if the reload report (queried by this same connection's
     /// code, right after the save that triggered it) somehow lacks an entry
     /// for it — never expected in practice, but a missing key is safer to
@@ -897,9 +902,19 @@ pub struct TestResponse {
     /// Only meaningful when `tested` is `true`: whether it passed.
     pub ok: bool,
     /// Present on anything short of a clean pass: the broker's rejection
-    /// reason, or why nothing was attempted. Never derived from submitted
-    /// input — see `TestOutcome`'s own doc comment.
+    /// reason, the warning, or why nothing was attempted; and on a pass that
+    /// reports what it found. Never derived from submitted secrets — see
+    /// `TestOutcome`'s own doc comment.
     pub message: Option<String>,
+    /// `tested`, not `ok`, yet not a failure: the venue is not ready (say, IB
+    /// Gateway not running yet) and saving is allowed; shown as a warning.
+    /// Omitted when `false`, so other connectors' responses are unchanged.
+    #[serde(skip_serializing_if = "is_false")]
+    pub warning: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Maps a `TestOutcome` onto the wire shape both the `test` endpoint and the
@@ -907,20 +922,23 @@ pub struct TestResponse {
 /// what counts as tested.
 fn test_response(outcome: &TestOutcome) -> TestResponse {
     match outcome {
-        TestOutcome::Passed => TestResponse { tested: true, ok: true, message: None },
-        TestOutcome::Failed(msg) => TestResponse { tested: true, ok: false, message: Some(msg.clone()) },
-        TestOutcome::NotTestable(why) => TestResponse { tested: false, ok: false, message: Some((*why).to_string()) },
+        TestOutcome::Passed => TestResponse { tested: true, ok: true, message: None, warning: false },
+        TestOutcome::PassedWith(msg) => TestResponse { tested: true, ok: true, message: Some(msg.clone()), warning: false },
+        TestOutcome::Failed(msg) => TestResponse { tested: true, ok: false, message: Some(msg.clone()), warning: false },
+        TestOutcome::Warning(msg) => TestResponse { tested: true, ok: false, message: Some(msg.clone()), warning: true },
+        TestOutcome::NotTestable(why) => TestResponse { tested: false, ok: false, message: Some(why.to_string()), warning: false },
     }
 }
 
 /// Whether `outcome` permits the write to proceed, as `Ok(())` / `Err(reason)`
 /// so the 422 body can reuse the broker's own message with no reformatting.
 /// `NotTestable` permits the write — see `credentials_api::test_broker` for
-/// why "we didn't check" is not the same as "it failed" — only `Failed` does
-/// not.
+/// why "we didn't check" is not the same as "it failed" — and so does a
+/// `Warning` (the venue is not ready yet, which saving cannot make worse);
+/// only `Failed` does not.
 fn persist_gate(outcome: &TestOutcome) -> Result<(), String> {
     match outcome {
-        TestOutcome::Passed | TestOutcome::NotTestable(_) => Ok(()),
+        TestOutcome::Passed | TestOutcome::PassedWith(_) | TestOutcome::Warning(_) | TestOutcome::NotTestable(_) => Ok(()),
         TestOutcome::Failed(msg) => Err(msg.clone()),
     }
 }
@@ -1026,7 +1044,7 @@ pub async fn put_broker_connection_credentials(
 
     // Test.
     let outcome = credentials_api::test_broker(&parsed, &environment).await;
-    let TestResponse { tested, message, .. } = test_response(&outcome);
+    let TestResponse { tested, message, warning, .. } = test_response(&outcome);
     let gate = persist_gate(&outcome);
     if !should_persist(&gate) {
         return Err(AdminError {
@@ -1052,7 +1070,7 @@ pub async fn put_broker_connection_credentials(
         .find(|c| c.code == code)
         .ok_or_else(|| AdminError::not_found("broker_connection"))?;
 
-    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, reload }))
+    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, warning, reload }))
 }
 
 /// Clear a broker connection's stored credential.
@@ -1606,7 +1624,7 @@ pub async fn put_feed_connection_credentials(
 
     // Test.
     let outcome = credentials_api::test_feed(&parsed).await;
-    let TestResponse { tested, message, .. } = test_response(&outcome);
+    let TestResponse { tested, message, warning, .. } = test_response(&outcome);
     let gate = persist_gate(&outcome);
     if !should_persist(&gate) {
         return Err(AdminError {
@@ -1632,7 +1650,7 @@ pub async fn put_feed_connection_credentials(
         .find(|c| c.code == code)
         .ok_or_else(|| AdminError::not_found("feed_connection"))?;
 
-    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, reload }))
+    Ok(Json(SaveResponse { redacted: redact_connection(conn), tested, message, warning, reload }))
 }
 
 /// Clear a feed connection's stored credential. See
@@ -2471,7 +2489,9 @@ mod tests {
     #[test]
     fn passed_and_not_testable_permit_the_write_only_failed_blocks_it() {
         assert!(should_persist(&persist_gate(&TestOutcome::Passed)));
-        assert!(should_persist(&persist_gate(&TestOutcome::NotTestable("checked at session logon"))));
+        assert!(should_persist(&persist_gate(&TestOutcome::NotTestable("checked at session logon".into()))));
+        assert!(should_persist(&persist_gate(&TestOutcome::PassedWith("logged into DU1".into()))));
+        assert!(should_persist(&persist_gate(&TestOutcome::Warning("IB Gateway is not reachable".into()))), "a warning saves");
         assert!(!should_persist(&persist_gate(&TestOutcome::Failed("401 unauthorized".into()))));
     }
 
@@ -2522,6 +2542,7 @@ mod tests {
             redacted: redact_connection(conn),
             tested: true,
             message: None,
+            warning: false,
             reload: None,
         })
         .expect("serialize");
@@ -2542,6 +2563,7 @@ mod tests {
             redacted: redact_connection(conn),
             tested: true,
             message: None,
+            warning: false,
             reload: None,
         })
         .expect("serialize");
@@ -2564,7 +2586,7 @@ mod tests {
     /// both `false`, with the reason carried in `message`.
     #[test]
     fn test_response_reports_not_testable_honestly() {
-        let r = test_response(&TestOutcome::NotTestable("checked at session logon"));
+        let r = test_response(&TestOutcome::NotTestable("checked at session logon".into()));
         assert!(!r.tested);
         assert!(!r.ok);
         assert_eq!(r.message.as_deref(), Some("checked at session logon"));
@@ -2578,6 +2600,27 @@ mod tests {
         assert!(r.tested);
         assert!(!r.ok);
         assert_eq!(r.message.as_deref(), Some("401 unauthorized"));
+    }
+
+    /// Only a warning carries `warning`, and the field is left out of every
+    /// other response, so connectors that never warn send the same JSON as before.
+    #[test]
+    fn test_response_marks_only_a_warning() {
+        let json = |o: TestOutcome| serde_json::to_value(test_response(&o)).unwrap();
+        assert_eq!(json(TestOutcome::Passed), serde_json::json!({"tested": true, "ok": true, "message": null}));
+        assert_eq!(json(TestOutcome::Failed("401".into())), serde_json::json!({"tested": true, "ok": false, "message": "401"}));
+        assert_eq!(
+            json(TestOutcome::NotTestable("at logon".into())),
+            serde_json::json!({"tested": false, "ok": false, "message": "at logon"})
+        );
+        assert_eq!(
+            json(TestOutcome::PassedWith("logged into DU1".into())),
+            serde_json::json!({"tested": true, "ok": true, "message": "logged into DU1"})
+        );
+        assert_eq!(
+            json(TestOutcome::Warning("not reachable".into())),
+            serde_json::json!({"tested": true, "ok": false, "message": "not reachable", "warning": true})
+        );
     }
 
     /// Exercises the real seal/save/load/redact path against Postgres — the

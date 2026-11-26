@@ -6060,7 +6060,7 @@
         "properties": {
           "message": {
             "type": "string",
-            "description": "Present exactly when `tested` is `false`: `TestOutcome::NotTestable`'s\nown explanation (e.g. \"FIX credentials are validated at session\nlogon, not before save\"), passed through so the cockpit renders the\nserver's reason instead of hardcoding its own guess at the wording.\nAlways `None` when `tested` is `true` — a `Failed` test never reaches\nthis response at all (422, before anything is written).",
+            "description": "When `tested` is `false`: `TestOutcome::NotTestable`'s own\nexplanation (e.g. \"FIX credentials are validated at session logon, not\nbefore save\"), passed through so the cockpit renders the server's\nreason instead of hardcoding its own guess at the wording. When\n`tested` is `true`: what the test found (a pass with detail, or the\n`warning`), else `None`. A `Failed` test never reaches this response\nat all (422, before anything is written).",
             "nullable": true
           },
           "redacted": {
@@ -6074,6 +6074,10 @@
           "tested": {
             "type": "boolean",
             "description": "Whether the credential was actually checked against the broker before\nbeing written — `false` for FIX (see `credentials_api::test_broker`),\nso the UI reports \"not testable\" rather than implying a pass it never\nearned."
+          },
+          "warning": {
+            "type": "boolean",
+            "description": "The test found the venue not ready (say, IB Gateway not running yet):\nsaved anyway, with `message` saying what to do. Omitted when `false`."
           }
         }
       },
@@ -6360,7 +6364,7 @@
         "properties": {
           "message": {
             "type": "string",
-            "description": "Present on anything short of a clean pass: the broker's rejection\nreason, or why nothing was attempted. Never derived from submitted\ninput — see `TestOutcome`'s own doc comment.",
+            "description": "Present on anything short of a clean pass: the broker's rejection\nreason, the warning, or why nothing was attempted; and on a pass that\nreports what it found. Never derived from submitted secrets — see\n`TestOutcome`'s own doc comment.",
             "nullable": true
           },
           "ok": {
@@ -6370,6 +6374,10 @@
           "tested": {
             "type": "boolean",
             "description": "Whether a check was actually attempted — `false` for FIX."
+          },
+          "warning": {
+            "type": "boolean",
+            "description": "`tested`, not `ok`, yet not a failure: the venue is not ready (say, IB\nGateway not running yet) and saving is allowed; shown as a warning.\nOmitted when `false`, so other connectors' responses are unchanged."
           }
         }
       },

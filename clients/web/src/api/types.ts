@@ -95,6 +95,9 @@ export interface TestResponse {
   tested: boolean;
   ok: boolean;
   message: string | null;
+  /** Tested, not ok, yet saving is allowed: the venue is not ready (say, IB
+   * Gateway not running yet). Absent when false. */
+  warning?: boolean;
 }
 
 // Serde external tagging on the Rust side (reload::ConnectionOutcome): unit
@@ -111,8 +114,10 @@ export interface SaveResponse {
   redacted: RedactedCredentials;
   /** false for FIX (IbkrFix/BinanceFix) — never checked before writing. */
   tested: boolean;
-  /** Present exactly when tested === false. */
+  /** Why it was not tested, or what the test found (a pass with detail, or the warning). */
   message: string | null;
+  /** The test found the venue not ready; saved anyway. Absent when false. */
+  warning?: boolean;
   /** null only if the reload report unexpectedly lacked an entry for this code. */
   reload: ConnectionOutcome | null;
 }

@@ -341,15 +341,22 @@ pub async fn external_mismatch(gw: &Gateway, client: &dyn TwsClient) -> Option<N
     if accounts.is_empty() {
         return Some(Next::Retry(format!("IB Gateway at {addr} reported no accounts")));
     }
-    let paper = |a: &String| a.starts_with('D');
-    if gw.env.eq_ignore_ascii_case("live") {
-        accounts.iter().all(paper).then(|| {
-            Next::Stop(format!("IB Gateway at {addr} is logged into a paper account but this connection is LIVE"))
-        })
+    account_mismatch(&format!("IB Gateway at {addr}"), gw.env, &accounts).map(Next::Stop)
+}
+
+/// Whether `accounts` (non-empty) are paper accounts: IBKR paper ids start with "D".
+pub fn paper_accounts(accounts: &[String]) -> bool {
+    accounts.iter().all(|a| a.starts_with('D'))
+}
+
+/// Why a gateway (`who`, e.g. "IB Gateway at ib-gateway:4004") logged into
+/// `accounts` must not trade for a connection in `env`; `None` = they match.
+pub fn account_mismatch(who: &str, env: &str, accounts: &[String]) -> Option<String> {
+    let paper = paper_accounts(accounts);
+    if env.eq_ignore_ascii_case("live") {
+        paper.then(|| format!("{who} is logged into a paper account but this connection is LIVE"))
     } else {
-        (!accounts.iter().all(paper)).then(|| {
-            Next::Stop(format!("IB Gateway at {addr} is logged into a live account but this connection is PAPER"))
-        })
+        (!paper).then(|| format!("{who} is logged into a live account but this connection is PAPER"))
     }
 }
 

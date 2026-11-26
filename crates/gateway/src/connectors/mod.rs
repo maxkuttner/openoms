@@ -189,7 +189,7 @@ async fn checked<T, E: std::fmt::Display>(
 /// A FIX credential is checked by logging on, which only the one running
 /// session per connection may do; so nothing is attempted before save.
 const FIX_NOT_TESTABLE: TestOutcome =
-    TestOutcome::NotTestable("FIX credentials are validated at session logon, not before save");
+    TestOutcome::NotTestable(std::borrow::Cow::Borrowed("FIX credentials are validated at session logon, not before save"));
 
 /// Read a connector's typed credential, worded the way a failed connection
 /// reports it. A credential of another kind is refused even when its fields

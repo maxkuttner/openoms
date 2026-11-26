@@ -10,7 +10,8 @@ import { TextField } from "./form";
 import { Modal } from "./overlay";
 import { Pill, type Tone } from "./status";
 import { api, ApiError } from "../api/client";
-import { notifyError, notifyOk, useList } from "../api/hooks";
+import { notifyError, notifyOk, notifyWarn, useList } from "../api/hooks";
+import { describeSaveTest, describeTest } from "../credentialTest";
 import { groupFields, initialValues, missingFields, sectionStartsOpen, type Venue, type VenueField } from "../venues";
 import type { ConnectionOutcome, RedactedCredentials, SaveResponse, TestResponse } from "../api/types";
 import type { UniverseStatus } from "../api/jobs";
@@ -67,11 +68,6 @@ function describeReload(outcome: ConnectionOutcome | null): string {
   return `saved, but the connection did not come up: ${outcome.Failed}`;
 }
 
-function describeTest(tested: boolean, ok: boolean, message: string | null): { tone: "info" | "success" | "error"; text: string } {
-  if (!tested) return { tone: "info", text: message ?? "not testable before save" };
-  if (ok) return { tone: "success", text: "credential verified" };
-  return { tone: "error", text: message ?? "credential test failed" };
-}
 
 const STATE_TONE: Record<RedactedCredentials["state"], Tone> = {
   configured: "buy",
@@ -150,8 +146,9 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
     mutationFn: () => api.post<TestResponse>(testPath, undefined),
     onSuccess: (resp) => {
       setLastTest(resp);
-      if (resp.tested && !resp.ok) notifyError(resp.message ?? "credential test failed");
-      else if (resp.tested) notifyOk("Credential test passed");
+      if (resp.tested && resp.warning) notifyWarn(resp.message ?? "The venue is not ready yet");
+      else if (resp.tested && !resp.ok) notifyError(resp.message ?? "credential test failed");
+      else if (resp.tested) notifyOk(resp.message ?? "Credential test passed");
       // tested === false: no toast — the inline banner below says why.
     },
     onError: notifyError,
@@ -163,8 +160,10 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
       setLastSave(resp);
       setLastTest(null);
       qc.invalidateQueries({ queryKey: [credPath] });
-      const testNote = resp.tested ? "Credential verified." : `Not tested before save (${resp.message}).`;
-      notifyOk(`Saved. ${testNote} ${describeReload(resp.reload)}.`);
+      const note = describeSaveTest(resp);
+      const text = `Saved. ${note.text} ${describeReload(resp.reload)}.`;
+      if (note.tone === "warning") notifyWarn(text);
+      else notifyOk(text);
       if (kind === "broker" && venue?.universe) {
         api
           .get<UniverseStatus>(`${basePath}/${code}/universe`)
@@ -293,15 +292,14 @@ export function CredentialsPanel({ kind, code, providerCode, environment = "PAPE
       </form>
 
       {lastTest && (
-        <Notice tone={describeTest(lastTest.tested, lastTest.ok, lastTest.message).tone} title="Test result">
-          {describeTest(lastTest.tested, lastTest.ok, lastTest.message).text}
+        <Notice tone={describeTest(lastTest).tone} title="Test result">
+          {describeTest(lastTest).text}
         </Notice>
       )}
 
       {lastSave && (
-        <Notice tone="info" title="Save result">
-          {lastSave.tested ? "Credential verified. " : `Not tested before save (${lastSave.message}). `}
-          {describeReload(lastSave.reload)}.
+        <Notice tone={describeSaveTest(lastSave).tone} title="Save result">
+          {describeSaveTest(lastSave).text} {describeReload(lastSave.reload)}.
         </Notice>
       )}
 

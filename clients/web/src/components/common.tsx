@@ -31,11 +31,11 @@ export function CopyText({ value, label }: { value: string; label?: string }) {
 }
 
 /** Error / success / info callouts. */
-export function Notice({ tone = "error", title, children }: { tone?: "error" | "success" | "info"; title?: ReactNode; children?: ReactNode }) {
+export function Notice({ tone = "error", title, children }: { tone?: "error" | "success" | "warning" | "info"; title?: ReactNode; children?: ReactNode }) {
   return (
     <Alert
       variant={tone === "error" ? "destructive" : "default"}
-      className={cn(tone === "success" && "border-buy/40 text-buy", tone === "info" && "text-foreground-2")}
+      className={cn(tone === "success" && "border-buy/40 text-buy", tone === "warning" && "border-warn/40 text-warn", tone === "info" && "text-foreground-2")}
     >
       {title && <AlertTitle>{title}</AlertTitle>}
       {children && <AlertDescription>{children}</AlertDescription>}
