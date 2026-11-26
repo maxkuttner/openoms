@@ -144,7 +144,7 @@ impl LiveQuoteFeed for DatabentoOpraFeed {
                 rec = client.next_record() => {
                     let rec = rec.map_err(|e| ProviderError::Request(e.to_string()))?;
                     let Some(rec) = rec else { break };
-                    health.on_event();
+                    health.on_check();
 
                     // Symbol mapping: the gateway's numeric id for this session.
                     // Handled in the loop, not once at startup, so symbols added
@@ -175,6 +175,7 @@ impl LiveQuoteFeed for DatabentoOpraFeed {
                             ts_recv: chrono::Utc::now(),
                             source_code: SOURCE_CODE,
                         };
+                        health.on_event();
                         if out.send(quote).await.is_err() {
                             warn!("OPRA feed: mark router gone, ending session");
                             return Ok(());

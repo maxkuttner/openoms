@@ -105,7 +105,7 @@ impl LiveQuoteFeed for BinanceFeed {
                 }
                 msg = ws.next() => {
                     let Some(msg) = msg else { break };
-                    health.on_event();
+                    health.on_check();
                     match msg.map_err(|e| ProviderError::Request(e.to_string()))? {
                         Message::Text(t) => t,
                         // Binance pings every few minutes and closes the socket if we
@@ -150,6 +150,7 @@ impl LiveQuoteFeed for BinanceFeed {
                 ts_recv: Utc::now(),
                 source_code: SOURCE_CODE,
             };
+            health.on_event();
             if out.send(quote).await.is_err() {
                 warn!("Binance feed: mark router gone, ending session");
                 return Ok(());

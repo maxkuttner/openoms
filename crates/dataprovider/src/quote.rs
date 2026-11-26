@@ -53,8 +53,11 @@ pub type SymbolAdds = HashMap<String, i64>;
 pub trait FeedHealth: Send + Sync {
     /// Subscribed and the venue accepted the session.
     fn on_connected(&self);
-    /// A frame arrived. Called per record, including ones we discard.
+    /// A quote arrived (the "last quote" clock; also proof of life).
     fn on_event(&self);
+    /// Any other frame arrived (keepalive, ack, a record we discard): proof
+    /// of life without a quote.
+    fn on_check(&self) {}
     /// How often a live session hears from the venue at the least (its
     /// keepalive cadence); a session silent for twice this is stale.
     fn on_heartbeat_every(&self, _secs: u64) {}

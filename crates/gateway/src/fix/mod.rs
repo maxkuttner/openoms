@@ -94,11 +94,24 @@ pub(crate) fn fix_log_health(msg: &str) -> Option<FixLogHealth> {
 /// Seconds QuickFIX waits between connect attempts (its `ReconnectInterval`).
 pub(crate) const RECONNECT_INTERVAL_SECS: u64 = 5;
 
+/// The Text(58) of the broker's last Logout (35=5), until a down reason uses it.
+pub(crate) type LogoutReason = Arc<Mutex<Option<String>>>;
+
+/// The down reason for a session that ended: the broker's Logout text when it
+/// sent one (taken, so it is used once), else `fallback`.
+pub(crate) fn take_logout_reason(reason: &LogoutReason, fallback: &str) -> String {
+    match reason.lock().ok().and_then(|mut r| r.take()) {
+        Some(text) => format!("logged out by the broker: {text}"),
+        None => fallback.to_string(),
+    }
+}
+
 /// [`TracingFixLog`] for an initiator session that also reports its connect
 /// attempts to the session's health: QuickFIX tells the application about a
 /// logon and a logout, but a refused or timed-out attempt only reaches the log.
 struct SessionHealthLog {
     health: StreamHandle,
+    logout: LogoutReason,
 }
 
 impl LogCallback for SessionHealthLog {
@@ -112,9 +125,14 @@ impl LogCallback for SessionHealthLog {
         TracingFixLog.on_event(session, msg);
         match fix_log_health(msg) {
             Some(FixLogHealth::Attempt(m)) => self.health.set_connecting_because(m),
-            Some(FixLogHealth::Failed(m)) => self
-                .health
-                .set_down_retrying(event_line(&m), std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS)),
+            Some(FixLogHealth::Failed(m)) => {
+                let why = if m == "Disconnecting" {
+                    take_logout_reason(&self.logout, "disconnected")
+                } else {
+                    event_line(&m)
+                };
+                self.health.set_down_retrying(why, std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS));
+            }
             None => {}
         }
     }
@@ -140,6 +158,26 @@ mod session_health_log_tests {
             assert_eq!(fix_log_health(failed), Some(FixLogHealth::Failed(failed.into())), "{failed}");
         }
         assert_eq!(fix_log_health("Initiated logon request"), None);
+    }
+
+    /// A logon the broker refuses never reaches on_logout; the session log's
+    /// "Disconnecting" then reports the broker's Logout text, not the raw event.
+    #[test]
+    fn a_refused_logon_is_down_with_the_brokers_reason() {
+        use quickfix::LogCallback;
+        use crate::stream_health::{StreamHealthRegistry, StreamState};
+        let reg = StreamHealthRegistry::new();
+        let reason = super::LogoutReason::default();
+        let log = super::SessionHealthLog { health: reg.fix_handle("IBKR", "PAPER"), logout: reason.clone() };
+        log.on_event(None, "Connecting to fix.example.com on port 4001 (Source :0) ReconnectInterval=5");
+        assert!(reg.snapshot()[0].state == StreamState::Connecting);
+        *reason.lock().unwrap() = Some("Invalid password".into());
+        log.on_event(None, "Disconnecting");
+        let h = reg.snapshot().remove(0);
+        assert!(h.state == StreamState::Down && h.next_retry_at.is_some());
+        assert_eq!(h.last_error.as_deref(), Some("logged out by the broker: Invalid password"));
+        log.on_event(None, "Disconnecting");
+        assert_eq!(reg.snapshot()[0].last_error.as_deref(), Some("disconnected"));
     }
 }
 
@@ -309,9 +347,10 @@ pub fn start_session(
                 Ok((s, _)) => s,
                 Err(e) => { error!(venue, error = %e, "FIX: settings build failed"); return; }
             };
-            let session_log = SessionHealthLog { health: health.clone() };
+            let logout = LogoutReason::default();
+            let session_log = SessionHealthLog { health: health.clone(), logout: logout.clone() };
             let app_cb =
-                FixApplication::new(dialect, health, pending, snapshots, statuses, venue_tx);
+                FixApplication::new(dialect, health, pending, snapshots, statuses, venue_tx).with_logout_reason(logout);
             let application = match Application::try_new(&app_cb) {
                 Ok(a) => a,
                 Err(e) => { error!(venue, error = %e, "FIX: application init failed"); return; }

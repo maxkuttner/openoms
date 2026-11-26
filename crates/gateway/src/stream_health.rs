@@ -26,16 +26,19 @@ pub const DEFAULT_HEARTBEAT_SECS: u64 = 60;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StreamState {
-    /// An attempt is in progress right now (dialing, authenticating, the
-    /// gateway logging in or waiting for two-factor approval).
+    /// An attempt is in progress right now (dialing, authenticating,
+    /// subscribing, or ibapi reconnecting a dropped IB Gateway socket).
     Connecting,
-    /// Connected and the heartbeat is fresh.
+    /// Connected and the heartbeat is fresh — or idle (a quote feed with
+    /// nothing to price), which `last_error` then says.
     Live,
     /// The last attempt or heartbeat failed; a retry is scheduled
     /// (`next_retry_at` when the stream knows when).
     Down,
     /// Will not retry until the user changes credentials or configuration
-    /// (login failed, paper/live mismatch, invalid stored config, disabled).
+    /// (no gateway address, the address on the other environment's port,
+    /// a gateway logged into the other kind of account). A disabled or
+    /// removed connection has no entry at all.
     Stopped,
 }
 
@@ -159,6 +162,17 @@ impl StreamHealthRegistry {
         StreamHandle { inner: self.inner.clone(), key }
     }
 
+    /// Forgets a stream: its connection was disabled, unconfigured or removed,
+    /// so it has no health to show (not "stopped", which asks for a fix).
+    pub fn remove(&self, broker_code: &str, environment: &str, kind: StreamKind) {
+        if let Ok(mut map) = self.inner.write() {
+            let key = (broker_code.to_string(), environment.to_string());
+            if map.get(&key).is_some_and(|h| h.kind == kind) {
+                map.remove(&key);
+            }
+        }
+    }
+
     /// All known streams as of now, sorted for stable rendering. A live stream
     /// that has not checked for two heartbeats reads `down`.
     pub fn snapshot(&self) -> Vec<StreamHealth> {
@@ -225,8 +239,8 @@ impl StreamHandle {
         self.enter(StreamState::Connecting, None, None);
     }
 
-    /// An attempt is in progress and this is where it is (the gateway is
-    /// starting, awaiting two-factor approval…); shown until it goes live.
+    /// An attempt is in progress and this is where it is (connecting to the
+    /// FIX host, IB Gateway's socket reconnecting…); shown until it goes live.
     pub fn set_connecting_because(&self, message: impl Into<String>) {
         self.enter(StreamState::Connecting, Some(message.into()), None);
     }
@@ -239,6 +253,20 @@ impl StreamHandle {
             h.connected_since = Some(now);
             h.last_checked_at = Some(now);
             h.last_error = None;
+            h.next_retry_at = None;
+        });
+    }
+
+    /// Nothing to connect for (a quote feed with nothing held): live, with
+    /// `reason` shown. The idle loop keeps checking in so it does not go stale.
+    pub fn set_idle(&self, reason: impl Into<String>) {
+        let now = Utc::now();
+        let reason = reason.into();
+        self.mutate(|h| {
+            h.state = StreamState::Live;
+            h.connected_since = None;
+            h.last_checked_at = Some(now);
+            h.last_error = Some(reason);
             h.next_retry_at = None;
         });
     }
@@ -286,6 +314,10 @@ impl dataprovider::FeedHealth for StreamHandle {
 
     fn on_event(&self) {
         self.record_event();
+    }
+
+    fn on_check(&self) {
+        self.record_check();
     }
 
     fn on_heartbeat_every(&self, secs: u64) {
@@ -359,10 +391,10 @@ mod tests {
         let reg = StreamHealthRegistry::new();
         let h = reg.handle("IBKR_TWS", "PAPER", StreamKind::Execution);
         h.set_down_retrying("x", Duration::from_secs(5));
-        h.set_stopped("IBKR login failed: bad password");
+        h.set_stopped("IB Gateway at gw:4004 is logged into a live account but this connection is PAPER");
         let s = one(&reg);
         assert!(s.state == StreamState::Stopped);
-        assert_eq!(s.last_error.as_deref(), Some("IBKR login failed: bad password"));
+        assert_eq!(s.last_error.as_deref(), Some("IB Gateway at gw:4004 is logged into a live account but this connection is PAPER"));
         assert_eq!(s.next_retry_at, None);
         assert_eq!(serde_json::to_value(s.state).unwrap(), "stopped");
     }
@@ -407,9 +439,51 @@ mod tests {
         assert_eq!(s.last_error.as_deref(), Some("no heartbeat for 75s"));
         assert_eq!(s.heartbeat_secs, 30);
         // Only live streams go stale: down/stopped/connecting keep their own reason.
-        h.set_stopped("bad password");
+        h.set_stopped("set the Gateway address");
         let s = reg.snapshot_at(Utc::now() + chrono::Duration::seconds(600)).remove(0);
         assert!(s.state == StreamState::Stopped);
+    }
+
+    /// A disabled or removed connection has no stream: its entry goes, rather
+    /// than lingering as a red "stopped" that asks for credentials.
+    #[test]
+    fn removing_a_stream_drops_its_entry_only() {
+        let reg = StreamHealthRegistry::new();
+        reg.handle("ALPACA", "PAPER", StreamKind::Execution).set_live();
+        reg.handle("DATABENTO", "OPRA", StreamKind::Feed).set_live();
+        reg.remove("ALPACA", "PAPER", StreamKind::Execution);
+        reg.remove("DATABENTO", "OPRA", StreamKind::Execution); // other kind: kept
+        let left: Vec<_> = reg.snapshot().into_iter().map(|h| h.broker_code).collect();
+        assert_eq!(left, ["DATABENTO"]);
+        reg.remove("DATABENTO", "OPRA", StreamKind::Feed);
+        assert!(reg.snapshot().is_empty());
+    }
+
+    /// A feed with nothing to subscribe is idle, not mid-attempt: live with
+    /// a reason, and it does not go stale while it keeps checking in.
+    #[test]
+    fn an_idle_stream_is_live_with_a_reason() {
+        let reg = StreamHealthRegistry::new();
+        let h = reg.handle("BINANCE", "SPOT", StreamKind::Feed);
+        h.set_idle("idle: nothing held to price");
+        let s = one(&reg);
+        assert!(s.state == StreamState::Live);
+        assert_eq!(s.last_error.as_deref(), Some("idle: nothing held to price"));
+        assert!(s.last_checked_at.is_some() && s.connected_since.is_none());
+        h.set_live();
+        assert_eq!(one(&reg).last_error, None);
+    }
+
+    #[test]
+    fn a_feed_check_is_not_a_quote() {
+        use dataprovider::FeedHealth;
+        let reg = StreamHealthRegistry::new();
+        let h = reg.handle("OKX", "SPOT", StreamKind::Feed);
+        h.on_check();
+        let s = one(&reg);
+        assert!(s.last_checked_at.is_some() && s.last_event_at.is_none());
+        h.on_event();
+        assert!(one(&reg).last_event_at.is_some());
     }
 
     #[test]

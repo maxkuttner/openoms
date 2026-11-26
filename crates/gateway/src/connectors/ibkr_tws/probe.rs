@@ -90,8 +90,14 @@ where
     Fut: Future<Output = Result<Arc<dyn TwsClient>, TwsError>>,
 {
     let deadline = Instant::now() + limit;
-    let client = match timeout_at(deadline, connect(addr.to_string(), probe_client_id(master_client_id))).await {
+    let id = probe_client_id(master_client_id);
+    let client = match timeout_at(deadline, connect(addr.to_string(), id)).await {
         Ok(Ok(c)) => c,
+        Ok(Err(TwsError::ClientIdInUse(_) | TwsError::Api { code: 326, .. })) => {
+            return TestOutcome::Warning(format!(
+                "IB Gateway at {addr} answers, but client id {id} is in use by another API client. The credential test connects as client id {id}; close that client (or change its id) and test again."
+            ))
+        }
         Ok(Err(e)) => return unreachable(addr, &e.to_string()),
         Err(_) => return unreachable(addr, &format!("no answer within {}s", limit.as_secs())),
     };
@@ -101,7 +107,7 @@ where
         Ok(accts) => match account_mismatch(&format!("IB Gateway at {addr}"), env, &accts) {
             Some(why) => TestOutcome::Failed(why),
             None => TestOutcome::PassedWith(format!(
-                "IB Gateway at {addr} is up, logged into {}. The OMS will connect within a minute.",
+                "IB Gateway at {addr} is up, logged into {}. The OMS connects within a minute after you save.",
                 describe_accounts(&accts)
             )),
         },
@@ -200,10 +206,24 @@ mod tests {
         .await;
         assert_eq!(
             out,
-            TestOutcome::PassedWith("IB Gateway at ib-gateway:4004 is up, logged into account DU1234567 (paper). The OMS will connect within a minute.".into())
+            TestOutcome::PassedWith("IB Gateway at ib-gateway:4004 is up, logged into account DU1234567 (paper). The OMS connects within a minute after you save.".into())
         );
         assert_eq!(*used.lock().unwrap(), Some(("ib-gateway:4004".to_string(), PROBE_CLIENT_ID)));
         assert!(!probe.connected(), "the probe client is shut down");
+    }
+
+    /// TWS error 326: another API client holds the probe's client id.
+    #[tokio::test]
+    async fn the_probes_client_id_in_use_says_so() {
+        let ext = creds("ib-gateway:4004");
+        for err in [TwsError::ClientIdInUse(PROBE_CLIENT_ID), TwsError::Api { code: 326, message: "in use".into() }] {
+            assert_eq!(
+                run("PAPER", &ext, None, Err(err)).await,
+                TestOutcome::Warning(
+                    "IB Gateway at ib-gateway:4004 answers, but client id 999 is in use by another API client. The credential test connects as client id 999; close that client (or change its id) and test again.".into()
+                )
+            );
+        }
     }
 
     #[test]

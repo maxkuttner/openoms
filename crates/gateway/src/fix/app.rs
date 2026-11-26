@@ -50,6 +50,8 @@ pub struct FixApplication {
     /// Venue events for the connection's reconciler (or forwarder): reports,
     /// plus `Connected` on each (re)logon and `Disconnected` on logout.
     venue_tx: mpsc::UnboundedSender<VenueEvent>,
+    /// The broker's last Logout text, the down reason when the session ends.
+    logout: crate::fix::LogoutReason,
 }
 
 impl FixApplication {
@@ -61,7 +63,14 @@ impl FixApplication {
         statuses: PendingStatus,
         venue_tx: mpsc::UnboundedSender<VenueEvent>,
     ) -> Self {
-        Self { dialect, health, pending, snapshots, statuses, venue_tx }
+        Self { dialect, health, pending, snapshots, statuses, venue_tx, logout: Default::default() }
+    }
+
+    /// Shares the Logout-text slot with the session's log, which reports a
+    /// refused logon (no `on_logout` for that).
+    pub(crate) fn with_logout_reason(mut self, logout: crate::fix::LogoutReason) -> Self {
+        self.logout = logout;
+        self
     }
 
     fn emit(&self, event: VenueEvent) {
@@ -130,7 +139,7 @@ impl ApplicationCallback for FixApplication {
         warn!(venue = self.dialect.venue(), ?session, "FIX logout");
         // QuickFIX reconnects on its own, every ReconnectInterval.
         self.health.set_down_retrying(
-            "logged out",
+            crate::fix::take_logout_reason(&self.logout, "logged out"),
             std::time::Duration::from_secs(crate::fix::RECONNECT_INTERVAL_SECS),
         );
         self.emit(VenueEvent::Disconnected);
@@ -155,6 +164,11 @@ impl ApplicationCallback for FixApplication {
     /// one goes stale.
     fn on_msg_from_admin(&self, msg: &Message, _session: &SessionId) -> Result<(), MsgFromAdminError> {
         self.health.record_check();
+        if msg.with_header(|h| h.get_field(tag::MSG_TYPE)).as_deref() == Some("5") {
+            if let (Some(text), Ok(mut slot)) = (msg.get_field(tag::TEXT).filter(|t| !t.is_empty()), self.logout.lock()) {
+                *slot = Some(text);
+            }
+        }
         // A session-level Reject (35=3) means the peer refused a message we sent
         // (bad tag, format, seqnum) — surface it rather than letting the caller
         // silently time out. It references the offending message by seqnum, not
@@ -245,6 +259,23 @@ mod tests {
         assert!(h.state == StreamState::Down);
         assert_eq!(h.last_error.as_deref(), Some("logged out"));
         assert!(h.next_retry_at.is_some(), "QuickFIX reconnects on its ReconnectInterval");
+    }
+
+    /// The broker's Logout Text(58) is the down reason, not a bare "logged out".
+    #[test]
+    fn a_logout_carries_the_brokers_reason() {
+        let (app, reg, sid) = app();
+        app.on_logon(&sid);
+        let mut logout = Message::new();
+        logout.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "5")).unwrap();
+        logout.set_field(tag::TEXT, "Invalid password").unwrap();
+        app.on_msg_from_admin(&logout, &sid).unwrap();
+        app.on_logout(&sid);
+        assert_eq!(reg.snapshot()[0].last_error.as_deref(), Some("logged out by the broker: Invalid password"));
+        // The reason is spent: the next plain logout says just that.
+        app.on_logon(&sid);
+        app.on_logout(&sid);
+        assert_eq!(reg.snapshot()[0].last_error.as_deref(), Some("logged out"));
     }
 
     #[test]

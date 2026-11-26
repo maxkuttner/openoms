@@ -17,6 +17,11 @@ use crate::connectors::QuoteSource;
 use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{Session, StreamResult};
 
+/// The health reason of a feed with nothing held to price.
+pub(crate) const IDLE: &str = "idle: nothing held to price";
+/// How often an idle feed checks in (well under any feed's heartbeat).
+const IDLE_CHECK: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct FeedSession {
     feed: Arc<dyn QuoteSource>,
     held: watch::Receiver<BTreeMap<i64, InstrumentRef>>,
@@ -60,13 +65,26 @@ impl Session for FeedSession {
         // Deliberately does not return to the supervisor while nothing is held:
         // an idle feed is not a closed stream, and reporting it as one would flap
         // the health badge and log a reconnect every time.
+        // Idle is live with a reason, not "connecting": no attempt is running.
+        // It re-checks in every IDLE_CHECK so it never reads stale.
+        let mut idle = false;
         let known = loop {
             let known = covered(self.feed.as_ref(), &self.held.borrow_and_update());
             if !known.is_empty() {
                 break known;
             }
-            changed(&mut self.held).await;
+            if !idle {
+                self.health.set_idle(IDLE);
+                idle = true;
+            }
+            tokio::select! {
+                _ = changed(&mut self.held) => {}
+                _ = tokio::time::sleep(IDLE_CHECK) => self.health.record_check(),
+            }
         };
+        if idle {
+            self.health.set_connecting();
+        }
         info!(source = self.feed.code(), count = known.len(), "quote feed: subscribing held set");
 
         let (add_tx, mut add_rx) = mpsc::channel::<SymbolAdds>(8);
@@ -205,6 +223,27 @@ mod tests {
 
         md.handle().subscribe("held", vec![held(2, "ABC", "X")]);
         assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2)])));
+    }
+
+    /// Nothing to subscribe is idle, not an attempt in progress: live with a
+    /// reason; once something is held the feed connects for real.
+    #[tokio::test]
+    async fn an_idle_feed_reads_live_idle_not_connecting() {
+        use crate::stream_health::StreamState;
+        let health = StreamHealthRegistry::new();
+        let (md, _quotes) = MarketDataGateway::new(health.clone());
+        let (seen, mut rx) = mpsc::unbounded_channel();
+        let h = health.handle("FAKE", "SPOT", StreamKind::Feed);
+        h.set_connecting();
+        let mut session = md.session(Arc::new(Fake { seen, end: Arc::new(Notify::new()) }), h);
+        tokio::spawn(async move { session.run_once().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let s = health.snapshot().remove(0);
+        assert!(s.state == StreamState::Live, "idle is not connecting");
+        assert_eq!(s.last_error.as_deref(), Some(super::IDLE));
+        md.handle().subscribe("held", vec![held(2, "ABC", "X")]);
+        assert_eq!(next(&mut rx).await, Seen::Session(symbols(&[("abc", 2)])));
+        assert!(health.snapshot()[0].state == StreamState::Connecting, "subscribing is an attempt");
     }
 
     #[tokio::test]

@@ -27,7 +27,8 @@ export function describeStream(s: StreamHealth, now = Date.now()): string {
   const checked = s.last_checked_at ? ` · checked ${ago(s.last_checked_at, now)}` : "";
   switch (s.state) {
     case "live":
-      return `live${checked}`;
+      // A live stream's reason is an idle note ("idle: nothing held to price").
+      return `live${s.last_error ? ` · ${s.last_error}` : ""}${checked}`;
     case "connecting":
       return s.last_error ? `connecting… ${s.last_error}` : "connecting…";
     case "down": {

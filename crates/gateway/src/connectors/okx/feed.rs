@@ -146,7 +146,7 @@ impl LiveQuoteFeed for OkxFeed {
                 }
                 msg = ws.next() => {
                     let Some(msg) = msg else { break };
-                    health.on_event();
+                    health.on_check();
                     match msg.map_err(|e| ProviderError::Request(e.to_string()))? {
                         Message::Text(t) => t,
                         Message::Ping(p) => {
@@ -187,6 +187,7 @@ impl LiveQuoteFeed for OkxFeed {
                     ts_recv: Utc::now(),
                     source_code: SOURCE_CODE,
                 };
+                health.on_event();
                 if out.send(quote).await.is_err() {
                     warn!("OKX feed: mark router gone, ending session");
                     return Ok(());

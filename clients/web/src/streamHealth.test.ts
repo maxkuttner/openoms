@@ -26,8 +26,16 @@ test("live says when it last checked", () => {
   assert.equal(describeStream(s, now), "live · checked 5s ago");
 });
 
+test("an idle live stream says so", () => {
+  const s = { ...base, kind: "feed" as const, state: "live" as const, last_error: "idle: nothing held to price", last_checked_at: at(4) };
+  assert.equal(describeStream(s, now), "live · idle: nothing held to price · checked 4s ago");
+});
+
 test("connecting shows the attempt's reason, or nothing", () => {
-  assert.equal(describeStream({ ...base, last_error: "waiting for two-factor approval" }, now), "connecting… waiting for two-factor approval");
+  assert.equal(
+    describeStream({ ...base, last_error: "IB Gateway connection lost; reconnecting" }, now),
+    "connecting… IB Gateway connection lost; reconnecting",
+  );
   assert.equal(describeStream(base, now), "connecting…");
 });
 
@@ -49,8 +57,11 @@ test("down shows why, when it retries and when it last checked", () => {
 });
 
 test("stopped tells the user what to do", () => {
-  const s = { ...base, state: "stopped" as const, last_error: "IBKR login failed: bad password" };
-  assert.equal(describeStream(s, now), "stopped: IBKR login failed: bad password — fix the credentials and save");
+  const s = { ...base, state: "stopped" as const, last_error: "IB Gateway at gw:4004 is logged into a live account but this connection is PAPER" };
+  assert.equal(
+    describeStream(s, now),
+    "stopped: IB Gateway at gw:4004 is logged into a live account but this connection is PAPER — fix the credentials and save",
+  );
 });
 
 test("the last event names what it was, and is absent when there was none", () => {

@@ -1413,18 +1413,15 @@ fn reload_store_error(error: sqlx::Error) -> AdminError {
 }
 
 /// Stops a connection's execution stream, if one is running.
+/// The connection is disabled, unconfigured or removed: no stream, no health entry.
 async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str, code: &str) {
-    if state.streams().abort_and_remove(code).await {
-        state.stream_health().handle(broker, environment, gateway::stream_health::StreamKind::Execution)
-            .set_stopped("connection disabled, unconfigured, or removed");
-    }
+    state.streams().abort_and_remove(code).await;
+    state.stream_health().remove(broker, environment, gateway::stream_health::StreamKind::Execution);
 }
 
 async fn stop_databento_feed(state: &AppState) {
-    if state.streams().abort_and_remove("databento-opra").await {
-        state.stream_health().handle("DATABENTO", "OPRA", gateway::stream_health::StreamKind::Feed)
-            .set_stopped("connection disabled, unconfigured, or removed");
-    }
+    state.streams().abort_and_remove("databento-opra").await;
+    state.stream_health().remove("DATABENTO", "OPRA", gateway::stream_health::StreamKind::Feed);
 }
 
 /// Whether `reload_connections` must refuse rather than swap: the same
@@ -2811,6 +2808,24 @@ mod tests {
         sqlx::query("DELETE FROM account WHERE id = $1").bind(account_id).execute(&pool_for_cleanup).await.expect("cleanup account");
         sqlx::query("DELETE FROM portfolio WHERE id = $1").bind(portfolio_id).execute(&pool_for_cleanup).await.expect("cleanup portfolio");
         sqlx::query("DELETE FROM broker_connection WHERE code = $1").bind(&conn_code).execute(&pool_for_cleanup).await.expect("cleanup broker_connection");
+    }
+
+    /// Disabling or removing a connection drops its health entry: no red
+    /// "stopped" left behind, and `oms status` does not count it as down.
+    #[tokio::test]
+    async fn stopping_a_connections_streams_removes_their_health() {
+        use gateway::stream_health::StreamKind;
+        let pool = sqlx::postgres::PgPoolOptions::new().connect_lazy("postgres://x@localhost/x").unwrap();
+        let state = test_app_state(pool);
+        state.stream_health().handle("ALPACA", "PAPER", StreamKind::Execution).set_live();
+        state.stream_health().handle("DATABENTO", "OPRA", StreamKind::Feed).set_live();
+        state.stream_health().handle("OKX", "LIVE", StreamKind::Execution).set_live();
+        state.streams().insert("alpaca-paper:exec", tokio::spawn(std::future::pending::<()>()));
+        state.streams().insert("databento-opra", tokio::spawn(std::future::pending::<()>()));
+        stop_execution_stream(&state, "ALPACA", "PAPER", "alpaca-paper:exec").await;
+        stop_databento_feed(&state).await;
+        let left: Vec<_> = state.stream_health().snapshot().into_iter().map(|h| h.broker_code).collect();
+        assert_eq!(left, ["OKX"]);
     }
 
     fn test_app_state(pool: sqlx::PgPool) -> AppState {

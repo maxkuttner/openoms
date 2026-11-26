@@ -41,6 +41,7 @@ beside it (hover the status) says why:
 
 | Status | Message | Meaning |
 |---|---|---|
+| connecting | IB Gateway connection lost; reconnecting | The socket to the gateway dropped and is being reconnected (up to two minutes). |
 | down | IB Gateway at ib-gateway:4004 not reachable: ... | The gateway is not running, not logged in yet, or did not answer within 15 seconds. The OMS keeps trying. |
 | down | IB Gateway lost its connection to IBKR | The gateway is up but lost IBKR (its daily restart, a network drop). The OMS resumes when it is back. |
 | down | IB Gateway did not answer the heartbeat ... | The gateway stopped answering; the OMS reconnects. |
@@ -61,6 +62,12 @@ beside it (hover the status) says why:
   is `stopped` until you fix it and save the credentials again.
 - **Test.** The credentials drawer's **Test** connects briefly to the address and says
   whether the gateway answers, whether it is logged in, and to which kind of account.
+  It connects as API client id 999 (998 when the connection itself uses 999); if
+  another API client holds that id, the test says so.
+- **Upgrading from the OMS-managed gateway.** On a host where an older OMS ran IB Gateway
+  for you, remove its container (`docker rm -f oms-ibgw-<connection code, lowercase>`;
+  `docker ps -a --filter name=oms-ibgw` lists it): IBKR allows one
+  session per user, so the old gateway would keep logging your own gateway out.
 
 Never expose the API port to the internet: anyone who reaches it can trade on
 the account.
@@ -190,7 +197,7 @@ For the TWS API connection, in the connection's credentials drawer:
 
 | Field | What it is | Default |
 | --- | --- | --- |
-| Gateway address | `host:port` of your IB Gateway or TWS, e.g. `ib-gateway:4004` (paper), `ib-gateway:4003` (live) or `127.0.0.1:4002` for a local gateway. Required. | |
+| Gateway address: host:port of your IB Gateway or TWS (e.g. ib-gateway:4004 paper / :4003 live, or 127.0.0.1:4002 for a local gateway) | `host:port` of your IB Gateway or TWS, e.g. `ib-gateway:4004` (paper), `ib-gateway:4003` (live) or `127.0.0.1:4002` for a local gateway. Required. | |
 | API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value) | The client id the OMS connects with. With 0 it also sees orders entered by hand in TWS. To see orders placed by other API clients, set IB Gateway's **Master API client ID** to the same value. | `0` |
 
 The FIX session's fields are listed under [FIX session](#fix-session-experimental).

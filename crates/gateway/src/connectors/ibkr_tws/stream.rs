@@ -33,7 +33,7 @@ use crate::stream_health::StreamHandle;
 use crate::venue_event::{VenueEvent, VenueOrderStatus, VenueOrderUpdate};
 
 use super::adapter::{commission_fee, correction_warning, exec_base, fill_from_exec, map_error, order_update, ClientSlot, ErrorClass, IbkrTwsAdapter};
-use super::client::{IbapiClient, SecType, TwsClient, TwsEvent};
+use super::client::{IbapiClient, SecType, TwsClient, TwsError, TwsEvent};
 use super::IbkrTwsCredentials;
 
 /// How long to wait for the client's own reconnect before connecting afresh.
@@ -44,15 +44,23 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 
 /// How a live session checks IB Gateway is still there: a server-time request
-/// `every`, which must answer within `timeout` or the session ends.
+/// `every`, which must answer within `timeout` or the session ends. While the
+/// gateway reports it lost IBKR (1100) failed pings are tolerated, but only
+/// for `lost_limit` without an answer.
 #[derive(Clone, Copy, Debug)]
 pub struct Heartbeat {
     pub every: Duration,
     pub timeout: Duration,
+    pub lost_limit: Duration,
 }
 
-/// The live session's heartbeat: a ping every 30s, answered within 10s.
-pub const HEARTBEAT: Heartbeat = Heartbeat { every: Duration::from_secs(30), timeout: Duration::from_secs(10) };
+/// The live session's heartbeat: a ping every 30s, answered within 10s; an
+/// IBKR outage without a single answer ends the session after 10 minutes.
+pub const HEARTBEAT: Heartbeat = Heartbeat {
+    every: Duration::from_secs(30),
+    timeout: Duration::from_secs(10),
+    lost_limit: Duration::from_secs(600),
+};
 
 /// What this stream has seen, kept across reconnects.
 #[derive(Default)]
@@ -184,13 +192,35 @@ async fn wait_reconnect(client: &dyn TwsClient, within: Duration) -> bool {
     client.connected()
 }
 
+/// What one heartbeat found.
+enum Beat {
+    Answered,
+    /// The socket is closed: ibapi is reconnecting, as after a `Disconnected`.
+    SocketLost,
+    Failed(String),
+}
+
 /// One heartbeat: IB Gateway must answer a server-time request within `hb.timeout`.
-async fn ping(client: &dyn TwsClient, hb: &Heartbeat) -> Result<(), String> {
+async fn ping(client: &dyn TwsClient, hb: &Heartbeat) -> Beat {
     match tokio::time::timeout(hb.timeout, client.ping()).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(format!("IB Gateway did not answer the heartbeat: {e}")),
-        Err(_) => Err(format!("IB Gateway did not answer the heartbeat within {}s", hb.timeout.as_secs())),
+        Ok(Ok(())) => Beat::Answered,
+        Ok(Err(TwsError::NotConnected)) => Beat::SocketLost,
+        Ok(Err(e)) => Beat::Failed(format!("IB Gateway did not answer the heartbeat: {e}")),
+        Err(_) => Beat::Failed(format!("IB Gateway did not answer the heartbeat within {}s", hb.timeout.as_secs())),
     }
+}
+
+/// The socket to IB Gateway dropped: wait for ibapi's own reconnect, then
+/// resume as after a connect. Err = it did not come back.
+async fn ride_out_reconnect(client: &dyn TwsClient, ctx: &Ctx) -> Result<(), String> {
+    // ibapi is reconnecting on its own: an attempt is in progress.
+    ctx.health.set_connecting_because("IB Gateway connection lost; reconnecting");
+    send(ctx, vec![VenueEvent::Disconnected]).await?;
+    warn!("IB Gateway connection lost; waiting for it to come back");
+    if !wait_reconnect(client, RECONNECT_WAIT).await {
+        return Err("IB Gateway connection lost".into());
+    }
+    on_connected(client, ctx).await
 }
 
 /// [`run_with`] on the production [`HEARTBEAT`].
@@ -209,31 +239,44 @@ pub async fn run_with(client: Arc<dyn TwsClient>, ctx: &Ctx, seen: &mut Seen, hb
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     beat.tick().await; // the first tick is immediate; on_connected just checked
     // IB Gateway reported (1100) it lost IBKR: the stream is already down and
-    // the gateway reconnects on its own, so a failed ping meanwhile is expected.
+    // the gateway reconnects on its own, so a failed ping meanwhile is expected
+    // — for up to `hb.lost_limit` since the last answer.
     let mut ibkr_lost = false;
+    let mut answered = Instant::now();
     loop {
         let ev = tokio::select! {
             ev = events.recv() => ev,
             _ = beat.tick() => {
                 match ping(client.as_ref(), hb).await {
-                    Ok(()) => ctx.health.record_check(),
-                    Err(e) if ibkr_lost => debug!(error = %e, "IB Gateway heartbeat failed while it is reconnecting to IBKR"),
-                    Err(e) => return Err(e),
+                    Beat::Answered => {
+                        answered = Instant::now();
+                        ctx.health.record_check();
+                    }
+                    Beat::SocketLost => {
+                        ride_out_reconnect(client.as_ref(), ctx).await?;
+                        ibkr_lost = false;
+                        answered = Instant::now();
+                        beat.reset();
+                    }
+                    Beat::Failed(e) if ibkr_lost && answered.elapsed() < hb.lost_limit => {
+                        debug!(error = %e, "IB Gateway heartbeat failed while it is reconnecting to IBKR");
+                    }
+                    Beat::Failed(_) if ibkr_lost => {
+                        return Err(format!(
+                            "IB Gateway lost IBKR and has not answered a heartbeat for {}s",
+                            answered.elapsed().as_secs()
+                        ));
+                    }
+                    Beat::Failed(e) => return Err(e),
                 }
                 continue;
             }
         };
         match ev {
             Ok(TwsEvent::Disconnected) => {
-                // ibapi is reconnecting on its own: an attempt is in progress.
-                ctx.health.set_connecting_because("IB Gateway connection lost; reconnecting");
-                send(ctx, vec![VenueEvent::Disconnected]).await?;
-                warn!("IB Gateway connection lost; waiting for it to come back");
-                if !wait_reconnect(client.as_ref(), RECONNECT_WAIT).await {
-                    return Err("IB Gateway connection lost".into());
-                }
+                ride_out_reconnect(client.as_ref(), ctx).await?;
                 ibkr_lost = false;
-                on_connected(client.as_ref(), ctx).await?;
+                answered = Instant::now();
                 beat.reset();
             }
             Ok(TwsEvent::Error { order_id: None, code: 1100, .. }) => {
@@ -733,7 +776,11 @@ mod tests {
 
     // ---- supervise: what the health shows after each pass ----
 
-    const FAST: Heartbeat = Heartbeat { every: Duration::from_millis(20), timeout: Duration::from_millis(20) };
+    const FAST: Heartbeat = Heartbeat {
+        every: Duration::from_millis(20),
+        timeout: Duration::from_millis(20),
+        lost_limit: Duration::from_millis(150),
+    };
 
     /// Polls the one stream's health until `ok` holds (or panics after ~2s).
     async fn until(reg: &StreamHealthRegistry, ok: impl Fn(&crate::stream_health::StreamHealth) -> bool) -> crate::stream_health::StreamHealth {
@@ -857,6 +904,61 @@ mod tests {
         let h = until(&reg, |h| h.state == StreamState::Down).await;
         assert!(h.last_error.as_deref().is_some_and(|m| m.contains("heartbeat")), "{:?}", h.last_error);
         assert!(h.next_retry_at.is_some());
+        task.abort();
+    }
+
+    /// A ping that finds the socket closed is a dropped connection, not a
+    /// silent gateway: ride out ibapi's reconnect like a `Disconnected` event.
+    #[tokio::test]
+    async fn a_ping_on_a_closed_socket_waits_for_the_reconnect() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        let (ctx, _rx, reg) = ctx(adapter);
+        let client: Arc<dyn TwsClient> = fake.clone();
+        let task = tokio::spawn(async move { run_with(client, &ctx, &mut Seen::default(), &FAST).await });
+        until(&reg, |h| h.state == StreamState::Live).await;
+        fake.set_connected(false);
+        let h = until(&reg, |h| h.state == StreamState::Connecting).await;
+        assert_eq!(h.last_error.as_deref(), Some("IB Gateway connection lost; reconnecting"));
+        assert!(!task.is_finished(), "the session waits for ibapi's reconnect");
+        fake.set_connected(true);
+        until(&reg, |h| h.state == StreamState::Live).await;
+        task.abort();
+    }
+
+    /// While IB Gateway reports it lost IBKR (1100) failed pings are expected,
+    /// but not forever: past `lost_limit` without an answer the session ends.
+    #[tokio::test]
+    async fn a_gateway_lost_to_ibkr_too_long_ends_the_session() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        let (ctx, _rx, reg) = ctx(adapter);
+        let client: Arc<dyn TwsClient> = fake.clone();
+        let task = tokio::spawn(async move { run_with(client, &ctx, &mut Seen::default(), &FAST).await });
+        until(&reg, |h| h.state == StreamState::Live).await;
+        *fake.ping_error.lock().unwrap() = Some("no answer".into());
+        fake.events_tx.send(TwsEvent::Error { order_id: None, code: 1100, message: "lost".into() }).unwrap();
+        until(&reg, |h| h.state == StreamState::Down).await;
+        let r = tokio::time::timeout(Duration::from_secs(2), task).await.expect("the session ends").unwrap();
+        assert!(r.unwrap_err().starts_with("IB Gateway lost IBKR and has not answered a heartbeat for"));
+    }
+
+    #[tokio::test]
+    async fn a_short_ibkr_outage_keeps_the_session() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        let (ctx, _rx, reg) = ctx(adapter);
+        let client: Arc<dyn TwsClient> = fake.clone();
+        let slow = Heartbeat { lost_limit: Duration::from_secs(60), ..FAST };
+        let task = tokio::spawn(async move { run_with(client, &ctx, &mut Seen::default(), &slow).await });
+        until(&reg, |h| h.state == StreamState::Live).await;
+        *fake.ping_error.lock().unwrap() = Some("no answer".into());
+        fake.events_tx.send(TwsEvent::Error { order_id: None, code: 1100, message: "lost".into() }).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished());
+        *fake.ping_error.lock().unwrap() = None;
+        fake.events_tx.send(TwsEvent::Error { order_id: None, code: 1102, message: "back".into() }).unwrap();
+        until(&reg, |h| h.state == StreamState::Live).await;
         task.abort();
     }
 }

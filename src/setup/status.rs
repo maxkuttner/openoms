@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(exit_code(&report(State::Down, State::Up, Streams::Unknown("OMS not running".into()))), 1);
         let dropped = Streams::List(vec![stream("ibkr-paper", StreamState::Down, Some("reset"))]);
         assert_eq!(exit_code(&report(State::Up, State::Up, dropped)), 1);
-        let stopped = Streams::List(vec![stream("ibkr-paper", StreamState::Stopped, Some("IBKR login failed"))]);
+        let stopped = Streams::List(vec![stream("ibkr-paper", StreamState::Stopped, Some("set the Gateway address"))]);
         assert_eq!(exit_code(&report(State::Up, State::Up, stopped)), 1);
     }
 
@@ -321,7 +321,7 @@ mod tests {
             Streams::List(vec![
                 stream("alpaca-paper", StreamState::Live, None),
                 stream("ibkr-paper", StreamState::Down, Some("connection reset")),
-                stream("tws-live", StreamState::Stopped, Some("IBKR login failed")),
+                stream("tws-live", StreamState::Stopped, Some("set the Gateway address")),
             ]),
         );
         let out = render(&r);
@@ -332,7 +332,7 @@ mod tests {
         assert!(line("Kafka").contains("down") && line("Kafka").contains("connection refused"));
         assert!(line("alpaca-paper").contains("live"));
         assert!(line("ibkr-paper").contains("down") && line("ibkr-paper").contains("connection reset"));
-        assert!(line("tws-live").contains("stopped") && line("tws-live").contains("IBKR login failed"));
+        assert!(line("tws-live").contains("stopped") && line("tws-live").contains("set the Gateway address"));
     }
 
     #[test]

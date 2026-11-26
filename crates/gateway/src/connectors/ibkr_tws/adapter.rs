@@ -59,6 +59,7 @@ fn broker_error(e: TwsError) -> BrokerError {
         },
         // Timeouts and decode failures say nothing about whether IB took the request.
         TwsError::Other(m) => BrokerError::Network(m),
+        e @ TwsError::ClientIdInUse(_) => BrokerError::Network(e.to_string()),
     }
 }
 

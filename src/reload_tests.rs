@@ -19,7 +19,7 @@ use crate::credentials::{self, FeedCredentials};
 use gateway::connectors::RegistrationDeps;
 use crate::reload::{self, ReloadStreams};
 use crate::secrets::{parse_master_key, MasterKey};
-use gateway::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
+use gateway::stream_health::{StreamHealthRegistry, StreamKind};
 
 fn key() -> MasterKey {
     parse_master_key("base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").unwrap()
@@ -312,7 +312,8 @@ async fn reload_http_lifecycle_against_postgres() {
     for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {
         assert_eq!(fake.count(code), 0);
     }
-    assert!(state.stream_health().snapshot().iter().all(|h| h.state == StreamState::Stopped));
+    // Disabled/unconfigured connections have no health entry left.
+    assert!(state.stream_health().snapshot().iter().all(|h| !["ALPACA", "BINANCE", "DATABENTO"].contains(&h.broker_code.as_str())));
 
     // Deleted rows have no report iteration, but their old tasks still stop.
     for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {

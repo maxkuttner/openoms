@@ -32,6 +32,9 @@ pub enum TwsError {
     NotConnected,
     #[error("IB error {code}: {message}")]
     Api { code: i32, message: String },
+    /// TWS error 326: another API client holds this client id.
+    #[error("client id {0} is already in use by another API client")]
+    ClientIdInUse(i32),
     #[error("{0}")]
     Other(String),
 }
@@ -40,6 +43,7 @@ impl From<ibapi::Error> for TwsError {
     fn from(e: ibapi::Error) -> Self {
         match e {
             ibapi::Error::Notice(n) => TwsError::Api { code: n.code, message: n.message },
+            ibapi::Error::ClientIdInUse { client_id } => TwsError::ClientIdInUse(client_id),
             e if e.is_connection_lost() => TwsError::NotConnected,
             e => TwsError::Other(e.to_string()),
         }
