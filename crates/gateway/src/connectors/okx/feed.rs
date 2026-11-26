@@ -116,6 +116,8 @@ impl LiveQuoteFeed for OkxFeed {
         info!(url = WS_URL, "OKX feed: connected");
 
         subscribe(&mut ws, sym_to_id.keys().cloned().collect()).await?;
+        // Liveness: each ping is answered.
+        health.on_heartbeat_every(PING_SECS);
         health.on_connected();
         info!(count = sym_to_id.len(), "OKX feed: live");
 

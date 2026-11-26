@@ -128,7 +128,11 @@ impl ApplicationCallback for FixApplication {
 
     fn on_logout(&self, session: &SessionId) {
         warn!(venue = self.dialect.venue(), ?session, "FIX logout");
-        self.health.set_down("logged out");
+        // QuickFIX reconnects on its own, every ReconnectInterval.
+        self.health.set_down_retrying(
+            "logged out",
+            std::time::Duration::from_secs(crate::fix::RECONNECT_INTERVAL_SECS),
+        );
         self.emit(VenueEvent::Disconnected);
     }
 
@@ -146,11 +150,11 @@ impl ApplicationCallback for FixApplication {
     }
 
     /// Inbound admin messages — Heartbeat (35=0), TestRequest, Logon/Logout, etc.
-    /// These carry no OMS state, but bumping freshness on them keeps the health
-    /// badge warm on a quiet-but-live session, matching the WS streams (which tick
-    /// on every keepalive frame). Without this, `last_event_at` only moves on fills.
+    /// These carry no OMS state, but each is a health check: the peer answers
+    /// every HeartBtInt, so a quiet-but-live session stays fresh while a stalled
+    /// one goes stale.
     fn on_msg_from_admin(&self, msg: &Message, _session: &SessionId) -> Result<(), MsgFromAdminError> {
-        self.health.record_event();
+        self.health.record_check();
         // A session-level Reject (35=3) means the peer refused a message we sent
         // (bad tag, format, seqnum) — surface it rather than letting the caller
         // silently time out. It references the offending message by seqnum, not
@@ -204,5 +208,56 @@ impl ApplicationCallback for FixApplication {
             self.emit(event);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::ibkr::fix::IbkrDialect;
+    use crate::stream_health::{StreamHealthRegistry, StreamState};
+
+    fn app() -> (FixApplication, StreamHealthRegistry, SessionId) {
+        let reg = StreamHealthRegistry::new();
+        let health = reg.fix_handle("IBKR", "PAPER");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = FixApplication::new(
+            Arc::new(IbkrDialect::new("pw".into())),
+            health,
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            tx,
+        );
+        (app, reg, SessionId::try_new("FIX.4.2", "OMS", "IB", "").unwrap())
+    }
+
+    #[test]
+    fn logon_is_live_and_logout_is_down_until_quickfix_reconnects() {
+        let (app, reg, sid) = app();
+        app.on_create(&sid);
+        assert!(reg.snapshot()[0].state == StreamState::Connecting);
+        app.on_logon(&sid);
+        let h = reg.snapshot().remove(0);
+        assert!(h.state == StreamState::Live && h.last_checked_at.is_some());
+        app.on_logout(&sid);
+        let h = reg.snapshot().remove(0);
+        assert!(h.state == StreamState::Down);
+        assert_eq!(h.last_error.as_deref(), Some("logged out"));
+        assert!(h.next_retry_at.is_some(), "QuickFIX reconnects on its ReconnectInterval");
+    }
+
+    #[test]
+    fn an_admin_heartbeat_is_a_check_not_an_order_event() {
+        let (app, reg, sid) = app();
+        app.on_logon(&sid);
+        let mut hb = Message::new();
+        hb.with_header_mut(|h| h.set_field(tag::MSG_TYPE, "0")).unwrap();
+        let before = reg.snapshot()[0].last_checked_at;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.on_msg_from_admin(&hb, &sid).unwrap();
+        let h = reg.snapshot().remove(0);
+        assert!(h.last_checked_at > before);
+        assert_eq!(h.last_event_at, None);
     }
 }

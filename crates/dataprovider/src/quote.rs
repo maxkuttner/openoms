@@ -55,6 +55,9 @@ pub trait FeedHealth: Send + Sync {
     fn on_connected(&self);
     /// A frame arrived. Called per record, including ones we discard.
     fn on_event(&self);
+    /// How often a live session hears from the venue at the least (its
+    /// keepalive cadence); a session silent for twice this is stale.
+    fn on_heartbeat_every(&self, _secs: u64) {}
 }
 
 /// A [`FeedHealth`] that reports nowhere — for tests and for hosts that don't

@@ -90,6 +90,8 @@ impl LiveQuoteFeed for BybitFeed {
         info!(url = WS_URL, "Bybit feed: connected");
 
         subscribe(&mut ws, sym_to_id.keys().cloned().collect()).await?;
+        // Liveness: each ping is answered.
+        health.on_heartbeat_every(PING_SECS);
         health.on_connected();
         info!(count = sym_to_id.len(), "Bybit feed: live");
 

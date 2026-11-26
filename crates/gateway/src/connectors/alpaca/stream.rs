@@ -57,6 +57,7 @@ async fn connect_and_run(
     health: &StreamHandle,
     tx: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    health.set_heartbeat_secs(HEARTBEAT_SECS);
     let (mut ws, _) = connect_async(ws_url).await?;
     info!("Alpaca stream connected url={ws_url}");
 
@@ -85,7 +86,7 @@ async fn connect_and_run(
             }
             msg = ws.next() => {
                 let Some(msg) = msg else { break };
-                health.record_event();
+                health.record_check();
                 match msg? {
                     Message::Text(t) => t,
                     Message::Binary(b) => {
@@ -128,7 +129,11 @@ async fn connect_and_run(
                 }
             }
             "trade_updates" => {
-                for event in venue_events(data) {
+                let events = venue_events(data);
+                if !events.is_empty() {
+                    health.record_event();
+                }
+                for event in events {
                     if tx.send(event).await.is_err() {
                         return Ok(());
                     }

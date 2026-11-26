@@ -83,6 +83,8 @@ impl LiveQuoteFeed for BinanceFeed {
 
         let mut req_id: u64 = 1;
         subscribe(&mut ws, sym_to_id.keys().cloned().collect(), &mut req_id).await?;
+        // Liveness: Binance pings every few minutes.
+        health.on_heartbeat_every(180);
         health.on_connected();
         info!(count = sym_to_id.len(), "Binance feed: live");
 

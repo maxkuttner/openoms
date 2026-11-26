@@ -67,10 +67,80 @@ impl LogCallback for TracingFixLog {
     }
 }
 
+/// What a QuickFIX session event says about the connection's health.
+#[derive(Debug, PartialEq)]
+pub(crate) enum FixLogHealth {
+    /// A connect attempt started ("connecting to <host> on port <port>").
+    Attempt(String),
+    /// The attempt or the session failed; QuickFIX retries on its ReconnectInterval.
+    Failed(String),
+}
+
+/// Reads a QuickFIX session event for health. QuickFIX reports connect
+/// attempts and their failures only through its log, not the application.
+pub(crate) fn fix_log_health(msg: &str) -> Option<FixLogHealth> {
+    if let Some(rest) = msg.strip_prefix("Connecting to ") {
+        let target = rest.split(" (Source").next().unwrap_or(rest);
+        return Some(FixLogHealth::Attempt(format!("connecting to {target}")));
+    }
+    let failed = msg == "Disconnecting"
+        || msg.starts_with("Timed out waiting for logon")
+        || msg.starts_with("SSL_connect failed")
+        || msg.starts_with("Failed to create ssl")
+        || msg.starts_with("BIO_new_socket failed");
+    failed.then(|| FixLogHealth::Failed(msg.to_string()))
+}
+
+/// Seconds QuickFIX waits between connect attempts (its `ReconnectInterval`).
+pub(crate) const RECONNECT_INTERVAL_SECS: u64 = 5;
+
+/// [`TracingFixLog`] for an initiator session that also reports its connect
+/// attempts to the session's health: QuickFIX tells the application about a
+/// logon and a logout, but a refused or timed-out attempt only reaches the log.
+struct SessionHealthLog {
+    health: StreamHandle,
+}
+
+impl LogCallback for SessionHealthLog {
+    fn on_incoming(&self, session: Option<&SessionId>, msg: &str) {
+        TracingFixLog.on_incoming(session, msg);
+    }
+    fn on_outgoing(&self, session: Option<&SessionId>, msg: &str) {
+        TracingFixLog.on_outgoing(session, msg);
+    }
+    fn on_event(&self, session: Option<&SessionId>, msg: &str) {
+        TracingFixLog.on_event(session, msg);
+        match fix_log_health(msg) {
+            Some(FixLogHealth::Attempt(m)) => self.health.set_connecting_because(m),
+            Some(FixLogHealth::Failed(m)) => self
+                .health
+                .set_down_retrying(event_line(&m), std::time::Duration::from_secs(RECONNECT_INTERVAL_SECS)),
+            None => {}
+        }
+    }
+}
+
 /// A session event as logged. QuickFIX quotes whole messages in some events
 /// ("Session not found for incoming message: …"), so secrets are redacted here too.
 fn event_line(msg: &str) -> String {
     redact_fix_secrets(msg).replace('\x01', "|")
+}
+
+#[cfg(test)]
+mod session_health_log_tests {
+    use super::{fix_log_health, FixLogHealth};
+
+    #[test]
+    fn a_connect_attempt_is_connecting_and_a_failed_one_is_down() {
+        assert_eq!(
+            fix_log_health("Connecting to fix.example.com on port 4001 (Source :0) ReconnectInterval=5"),
+            Some(FixLogHealth::Attempt("connecting to fix.example.com on port 4001".into()))
+        );
+        for failed in ["Disconnecting", "Timed out waiting for logon response", "SSL_connect failed with SSL error 1"] {
+            assert_eq!(fix_log_health(failed), Some(FixLogHealth::Failed(failed.into())), "{failed}");
+        }
+        assert_eq!(fix_log_health("Initiated logon request"), None);
+    }
 }
 
 #[cfg(test)]
@@ -151,7 +221,7 @@ fn build_settings(cfg: &FixConfig, begin_string: &str) -> Result<(SessionSetting
 
     let mut default = Dictionary::new();
     default.set("ConnectionType", "initiator".to_string()).map_err(cfg_err)?;
-    default.set("ReconnectInterval", 5i32).map_err(cfg_err)?;
+    default.set("ReconnectInterval", RECONNECT_INTERVAL_SECS as i32).map_err(cfg_err)?;
     default.set("HeartBtInt", cfg.heartbeat_secs as i32).map_err(cfg_err)?;
     default.set("SocketConnectHost", cfg.host.clone()).map_err(cfg_err)?;
     default.set("SocketConnectPort", cfg.port as i32).map_err(cfg_err)?;
@@ -193,6 +263,8 @@ pub fn start_session(
     // real SessionSettings is rebuilt inside the session thread because its FFI
     // handle is not Send.
     build_settings(&cfg, begin_string)?;
+    // QuickFIX answers our HeartBtInt with a Heartbeat (or a TestRequest) each interval.
+    health.set_heartbeat_secs(u64::from(cfg.heartbeat_secs));
 
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let snapshots = Arc::new(Mutex::new(HashMap::new()));
@@ -237,6 +309,7 @@ pub fn start_session(
                 Ok((s, _)) => s,
                 Err(e) => { error!(venue, error = %e, "FIX: settings build failed"); return; }
             };
+            let session_log = SessionHealthLog { health: health.clone() };
             let app_cb =
                 FixApplication::new(dialect, health, pending, snapshots, statuses, venue_tx);
             let application = match Application::try_new(&app_cb) {
@@ -244,7 +317,7 @@ pub fn start_session(
                 Err(e) => { error!(venue, error = %e, "FIX: application init failed"); return; }
             };
             let store = MemoryMessageStoreFactory::new();
-            let log = match LogFactory::try_new(&TracingFixLog) {
+            let log = match LogFactory::try_new(&session_log) {
                 Ok(l) => l,
                 Err(e) => { error!(venue, error = %e, "FIX: log factory init failed"); return; }
             };

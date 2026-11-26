@@ -210,6 +210,7 @@ async fn connect_and_run(
     health: &StreamHandle,
     sink: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    health.set_heartbeat_secs(HEARTBEAT_SECS);
     let (mut ws, _) = connect_async(adapter.ws_url()).await?;
     info!("Binance WS-API connected");
 
@@ -235,7 +236,7 @@ async fn connect_and_run(
             }
             msg = ws.next() => {
                 let Some(msg) = msg else { break };
-                health.record_event();
+                health.record_check();
                 match msg? {
                     Message::Text(t) => t,
                     Message::Binary(b) => match String::from_utf8(b) {
@@ -257,7 +258,11 @@ async fn connect_and_run(
         // Pushed user-data event: {"subscriptionId":N,"event":{...}}
         if v.get("event").is_some() {
             if v["event"]["e"].as_str() == Some("executionReport") {
-                for event in venue_events(&v["event"]) {
+                let events = venue_events(&v["event"]);
+                if !events.is_empty() {
+                    health.record_event();
+                }
+                for event in events {
                     if sink.send(event).await.is_err() {
                         return Ok(());
                     }

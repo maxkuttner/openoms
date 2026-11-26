@@ -119,6 +119,8 @@ impl LiveQuoteFeed for CoinbaseFeed {
         info!(url = WS_URL, "Coinbase feed: connected");
 
         subscribe(&mut ws, sym_to_id.keys().cloned().collect()).await?;
+        // Liveness: the heartbeats channel ticks every second.
+        health.on_heartbeat_every(15);
         health.on_connected();
         info!(count = sym_to_id.len(), "Coinbase feed: live");
 

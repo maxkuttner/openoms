@@ -110,6 +110,8 @@ impl LiveQuoteFeed for DatabentoOpraFeed {
             .start()
             .await
             .map_err(|e| ProviderError::Request(e.to_string()))?;
+        // Liveness: the Databento gateway sends a heartbeat every 30s by default.
+        health.on_heartbeat_every(30);
         health.on_connected();
         info!("OPRA feed: live");
 

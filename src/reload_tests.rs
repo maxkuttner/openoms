@@ -312,7 +312,7 @@ async fn reload_http_lifecycle_against_postgres() {
     for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {
         assert_eq!(fake.count(code), 0);
     }
-    assert!(state.stream_health().snapshot().iter().all(|h| h.state == StreamState::Down));
+    assert!(state.stream_health().snapshot().iter().all(|h| h.state == StreamState::Stopped));
 
     // Deleted rows have no report iteration, but their old tasks still stop.
     for code in ["alpaca-paper:exec", "binance-paper:exec", "bybit-paper:exec", "okx-paper:exec", "databento-opra"] {

@@ -86,7 +86,7 @@ pub fn ui_links(base: &str, bundled: bool) -> Vec<(String, String)> {
 
 pub fn exit_code(r: &Report) -> i32 {
     let streams_down = match &r.streams {
-        Streams::List(list) => list.iter().any(|s| s.state == StreamState::Down),
+        Streams::List(list) => list.iter().any(|s| matches!(s.state, StreamState::Down | StreamState::Stopped)),
         Streams::Unknown(_) => false,
     };
     let down = r.oms.state == State::Down || r.deps.iter().any(|c| c.state == State::Down) || streams_down;
@@ -126,8 +126,9 @@ pub fn render(r: &Report) -> String {
                     StreamState::Live => "live",
                     StreamState::Connecting => "connecting",
                     StreamState::Down => "down",
+                    StreamState::Stopped => "stopped",
                 };
-                let detail = if s.state == StreamState::Down { s.last_error.as_deref().unwrap_or("") } else { "" };
+                let detail = if s.state == StreamState::Live { "" } else { s.last_error.as_deref().unwrap_or("") };
                 out.push(row(&format!("  {}", s.broker_code), state, &format!("{} {kind}", s.environment), detail));
             }
         }
@@ -259,6 +260,9 @@ mod tests {
             connected_since: None,
             last_event_at: None,
             last_error: error.map(Into::into),
+            last_checked_at: None,
+            next_retry_at: None,
+            heartbeat_secs: 60,
         }
     }
 
@@ -305,6 +309,8 @@ mod tests {
         assert_eq!(exit_code(&report(State::Down, State::Up, Streams::Unknown("OMS not running".into()))), 1);
         let dropped = Streams::List(vec![stream("ibkr-paper", StreamState::Down, Some("reset"))]);
         assert_eq!(exit_code(&report(State::Up, State::Up, dropped)), 1);
+        let stopped = Streams::List(vec![stream("ibkr-paper", StreamState::Stopped, Some("IBKR login failed"))]);
+        assert_eq!(exit_code(&report(State::Up, State::Up, stopped)), 1);
     }
 
     #[test]
@@ -315,6 +321,7 @@ mod tests {
             Streams::List(vec![
                 stream("alpaca-paper", StreamState::Live, None),
                 stream("ibkr-paper", StreamState::Down, Some("connection reset")),
+                stream("tws-live", StreamState::Stopped, Some("IBKR login failed")),
             ]),
         );
         let out = render(&r);
@@ -325,6 +332,7 @@ mod tests {
         assert!(line("Kafka").contains("down") && line("Kafka").contains("connection refused"));
         assert!(line("alpaca-paper").contains("live"));
         assert!(line("ibkr-paper").contains("down") && line("ibkr-paper").contains("connection reset"));
+        assert!(line("tws-live").contains("stopped") && line("tws-live").contains("IBKR login failed"));
     }
 
     #[test]

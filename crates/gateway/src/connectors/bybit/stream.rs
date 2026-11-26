@@ -98,6 +98,7 @@ async fn connect_and_run(
     health: &StreamHandle,
     tx: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    health.set_heartbeat_secs(HEARTBEAT_SECS);
     let (mut ws, _) = connect_async(adapter.private_ws_url()).await?;
     info!("Bybit private WS connected");
     let expires = chrono::Utc::now().timestamp_millis() + AUTH_EXPIRY_MS;
@@ -114,7 +115,7 @@ async fn connect_and_run(
             }
             msg = ws.next() => {
                 let Some(msg) = msg else { break };
-                health.record_event();
+                health.record_check();
                 match msg? {
                     Message::Text(t) => t,
                     Message::Binary(b) => match String::from_utf8(b) {
@@ -134,7 +135,11 @@ async fn connect_and_run(
         };
 
         if v.get("topic").is_some() {
-            for event in venue_events(&v) {
+            let events = venue_events(&v);
+            if !events.is_empty() {
+                health.record_event();
+            }
+            for event in events {
                 if tx.send(event).await.is_err() {
                     return Ok(());
                 }

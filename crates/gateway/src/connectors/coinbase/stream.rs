@@ -23,6 +23,9 @@ use crate::stream_health::StreamHandle;
 use crate::stream_supervisor::{supervise, Session, StreamResult};
 use crate::venue_event::VenueEvent as VEvent;
 
+/// The `heartbeats` channel ticks every second; this much silence is a stall.
+const HEARTBEAT_SECS: u64 = 15;
+
 const WS_URL: &str = "wss://advanced-trade-ws-user.coinbase.com";
 
 struct CoinbaseSession {
@@ -80,6 +83,7 @@ async fn connect_and_run(
     health: &StreamHandle,
     tx: &mpsc::Sender<VEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    health.set_heartbeat_secs(HEARTBEAT_SECS);
     let (mut ws, _) = connect_async(WS_URL).await?;
     info!("Coinbase user WS connected");
     // Coinbase drops a connection that hasn't subscribed within 5 seconds.
@@ -90,7 +94,7 @@ async fn connect_and_run(
     let mut live = false;
     // The `heartbeats` channel keeps the socket alive, so nothing else wakes the loop.
     while let Some(msg) = ws.next().await {
-        health.record_event();
+        health.record_check();
         let text = match msg? {
             Message::Text(t) => t,
             Message::Binary(b) => match String::from_utf8(b) {
@@ -122,7 +126,11 @@ async fn connect_and_run(
                 return Ok(());
             }
         }
-        for event in venue_events(&v) {
+        let events = venue_events(&v);
+        if !events.is_empty() {
+            health.record_event();
+        }
+        for event in events {
             if tx.send(event).await.is_err() {
                 return Ok(());
             }

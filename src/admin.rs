@@ -1419,7 +1419,7 @@ async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str
     let stopped = state.streams().abort_and_remove(code).await;
     if stopped {
         state.stream_health().handle(broker, environment, gateway::stream_health::StreamKind::Execution)
-            .set_down("connection disabled, unconfigured, or removed");
+            .set_stopped("connection disabled, unconfigured, or removed");
     }
     stopped
 }
@@ -1427,7 +1427,7 @@ async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str
 async fn stop_databento_feed(state: &AppState) {
     if state.streams().abort_and_remove("databento-opra").await {
         state.stream_health().handle("DATABENTO", "OPRA", gateway::stream_health::StreamKind::Feed)
-            .set_down("connection disabled, unconfigured, or removed");
+            .set_stopped("connection disabled, unconfigured, or removed");
     }
 }
 

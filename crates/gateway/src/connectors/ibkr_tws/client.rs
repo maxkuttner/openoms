@@ -257,6 +257,11 @@ pub trait TwsClient: Send + Sync {
     /// Delayed snapshot close, else the last daily bar's close, else `None`.
     async fn prev_close(&self, con_id: i64, sec_type: SecType, exchange: &str) -> Result<Option<f64>, TwsError>;
     async fn managed_accounts(&self) -> Result<Vec<String>, TwsError>;
+    /// A round trip to IB Gateway (the server-time request): the session's
+    /// heartbeat. The default only checks the socket.
+    async fn ping(&self) -> Result<(), TwsError> {
+        self.connected().then_some(()).ok_or(TwsError::NotConnected)
+    }
     fn events(&self) -> broadcast::Receiver<TwsEvent>;
     fn connected(&self) -> bool;
     /// Closes the API socket so the client id is free for the next session.
@@ -803,6 +808,12 @@ impl TwsClient for IbapiClient {
         Ok(self.client.managed_accounts().await?)
     }
 
+    async fn ping(&self) -> Result<(), TwsError> {
+        self.ensure_connected()?;
+        self.client.server_time().await?;
+        Ok(())
+    }
+
     fn events(&self) -> broadcast::Receiver<TwsEvent> {
         self.events.subscribe()
     }
@@ -844,6 +855,12 @@ pub(crate) struct FakeTws {
     pub placed: Mutex<Vec<TwsOrder>>,
     pub cancelled: Mutex<Vec<i32>>,
     pub events_tx: broadcast::Sender<TwsEvent>,
+    /// Heartbeats answered.
+    pub pings: std::sync::atomic::AtomicUsize,
+    /// Set: every heartbeat fails with this.
+    pub ping_error: Mutex<Option<String>>,
+    /// Set: every heartbeat hangs.
+    pub ping_hangs: AtomicBool,
 }
 
 #[cfg(test)]
@@ -864,6 +881,9 @@ impl FakeTws {
             placed: Mutex::default(),
             cancelled: Mutex::default(),
             events_tx: broadcast::channel(EVENT_CAPACITY).0,
+            pings: Default::default(),
+            ping_error: Mutex::default(),
+            ping_hangs: AtomicBool::new(false),
         }
     }
 
@@ -956,6 +976,18 @@ impl TwsClient for FakeTws {
     async fn managed_accounts(&self) -> Result<Vec<String>, TwsError> {
         self.up()?;
         Ok(self.accounts.lock().unwrap().clone())
+    }
+
+    async fn ping(&self) -> Result<(), TwsError> {
+        if self.ping_hangs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        self.up()?;
+        if let Some(e) = self.ping_error.lock().unwrap().clone() {
+            return Err(TwsError::Other(e));
+        }
+        self.pings.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     fn events(&self) -> broadcast::Receiver<TwsEvent> {

@@ -2,7 +2,8 @@
 //!
 //! Every stream task — Alpaca and Binance order streams, the Databento OPRA marks
 //! feed — wants the same outer loop: mark the health badge `connecting`, run one
-//! session until it closes or errors, mark it `down`, wait, reconnect. Only the
+//! session until it closes or errors, mark it `down` with when it retries,
+//! wait, reconnect. Only the
 //! session body differs. This module owns the loop; [`Session`] is the seam.
 //!
 //! The streams are deliberately *not* unified beyond this. Order streams emit
@@ -47,19 +48,21 @@ pub async fn supervise<S: Session>(name: &'static str, health: StreamHandle, mut
         info!(stream = name, "connecting");
 
         let started = Instant::now();
-        match session.run_once().await {
-            Ok(()) => {
-                health.set_down("stream closed");
-                warn!(stream = name, "stream closed, reconnecting in {backoff_secs}s");
-            }
-            Err(e) => {
-                health.set_down(e.to_string());
-                warn!(stream = name, error = %e, "stream error, reconnecting in {backoff_secs}s");
-            }
-        }
+        let result = session.run_once().await;
 
         if started.elapsed() >= Duration::from_secs(STABLE_AFTER_SECS) {
             backoff_secs = INITIAL_BACKOFF_SECS;
+        }
+        let retry_in = Duration::from_secs(backoff_secs);
+        match result {
+            Ok(()) => {
+                health.set_down_retrying("stream closed", retry_in);
+                warn!(stream = name, "stream closed, reconnecting in {backoff_secs}s");
+            }
+            Err(e) => {
+                health.set_down_retrying(e.to_string(), retry_in);
+                warn!(stream = name, error = %e, "stream error, reconnecting in {backoff_secs}s");
+            }
         }
 
         sleep(Duration::from_secs(backoff_secs)).await;
@@ -117,6 +120,37 @@ mod tests {
 
         let stable = Duration::from_secs(STABLE_AFTER_SECS);
         assert_eq!(next_backoff(b, stable), 2, "a healthy session restarts the schedule");
+    }
+
+    struct Failing;
+
+    #[async_trait::async_trait]
+    impl Session for Failing {
+        async fn run_once(&mut self) -> StreamResult {
+            Err("connection refused".into())
+        }
+    }
+
+    /// A failed session is down with its reason and when it retries — never
+    /// left reading `connecting` between attempts.
+    #[tokio::test]
+    async fn a_failed_session_is_down_with_a_retry_time() {
+        use crate::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
+        let reg = StreamHealthRegistry::new();
+        let task = tokio::spawn(supervise("test", reg.handle("ALPACA", "PAPER", StreamKind::Execution), Failing));
+        let mut h = reg.snapshot().remove(0);
+        for _ in 0..100 {
+            if h.state == StreamState::Down {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            h = reg.snapshot().remove(0);
+        }
+        assert!(h.state == StreamState::Down);
+        assert_eq!(h.last_error.as_deref(), Some("connection refused"));
+        assert!(h.next_retry_at.is_some_and(|t| t > chrono::Utc::now()));
+        assert!(h.last_checked_at.is_some());
+        task.abort();
     }
 
     #[test]

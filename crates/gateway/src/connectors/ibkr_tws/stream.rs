@@ -45,6 +45,17 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// A session that lasted this long was healthy: the next failure retries quickly.
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 
+/// How a live session checks IB Gateway is still there: a server-time request
+/// `every`, which must answer within `timeout` or the session ends.
+#[derive(Clone, Copy, Debug)]
+pub struct Heartbeat {
+    pub every: Duration,
+    pub timeout: Duration,
+}
+
+/// The live session's heartbeat: a ping every 30s, answered within 10s.
+pub const HEARTBEAT: Heartbeat = Heartbeat { every: Duration::from_secs(30), timeout: Duration::from_secs(10) };
+
 /// What this stream has seen, kept across reconnects.
 #[derive(Default)]
 pub struct Seen {
@@ -175,34 +186,76 @@ async fn wait_reconnect(client: &dyn TwsClient, within: Duration) -> bool {
     client.connected()
 }
 
-/// Runs one connected client until it is lost for good. Rides out the
-/// client's own reconnects, asking for a pull after each.
+/// One heartbeat: IB Gateway must answer a server-time request within `hb.timeout`.
+async fn ping(client: &dyn TwsClient, hb: &Heartbeat) -> Result<(), String> {
+    match tokio::time::timeout(hb.timeout, client.ping()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("IB Gateway did not answer the heartbeat: {e}")),
+        Err(_) => Err(format!("IB Gateway did not answer the heartbeat within {}s", hb.timeout.as_secs())),
+    }
+}
+
+/// [`run_with`] on the production [`HEARTBEAT`].
 pub async fn run(client: Arc<dyn TwsClient>, ctx: &Ctx, seen: &mut Seen) -> Result<(), String> {
+    run_with(client, ctx, seen, &HEARTBEAT).await
+}
+
+/// Runs one connected client until it is lost for good. Rides out the
+/// client's own reconnects, asking for a pull after each, and pings IB Gateway
+/// every `hb.every`: an answer is a health check, a failure ends the session.
+pub async fn run_with(client: Arc<dyn TwsClient>, ctx: &Ctx, seen: &mut Seen, hb: &Heartbeat) -> Result<(), String> {
     // Subscribe first, so nothing between the connect and the loop is missed.
     let mut events = client.events();
     on_connected(client.as_ref(), ctx).await?;
+    let mut beat = tokio::time::interval(hb.every);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beat.tick().await; // the first tick is immediate; on_connected just checked
+    // IB Gateway reported (1100) it lost IBKR: the stream is already down and
+    // the gateway reconnects on its own, so a failed ping meanwhile is expected.
+    let mut ibkr_lost = false;
     loop {
-        match events.recv().await {
+        let ev = tokio::select! {
+            ev = events.recv() => ev,
+            _ = beat.tick() => {
+                match ping(client.as_ref(), hb).await {
+                    Ok(()) => ctx.health.record_check(),
+                    Err(e) if ibkr_lost => debug!(error = %e, "IB Gateway heartbeat failed while it is reconnecting to IBKR"),
+                    Err(e) => return Err(e),
+                }
+                continue;
+            }
+        };
+        match ev {
             Ok(TwsEvent::Disconnected) => {
-                ctx.health.set_connecting();
+                // ibapi is reconnecting on its own: an attempt is in progress.
+                ctx.health.set_connecting_because("IB Gateway connection lost; reconnecting");
                 send(ctx, vec![VenueEvent::Disconnected]).await?;
                 warn!("IB Gateway connection lost; waiting for it to come back");
                 if !wait_reconnect(client.as_ref(), RECONNECT_WAIT).await {
                     return Err("IB Gateway connection lost".into());
                 }
+                ibkr_lost = false;
                 on_connected(client.as_ref(), ctx).await?;
+                beat.reset();
             }
             Ok(TwsEvent::Error { order_id: None, code: 1100, .. }) => {
+                ibkr_lost = true;
                 ctx.health.set_down("IB Gateway lost its connection to IBKR");
             }
             Ok(TwsEvent::Error { order_id: None, code: code @ (1101 | 1102), .. }) => {
                 info!(code, "IB Gateway reconnected to IBKR; pulling");
+                ibkr_lost = false;
                 ctx.health.set_live();
                 send(ctx, vec![VenueEvent::Connected]).await?;
             }
             Ok(ev) => {
-                ctx.health.record_event();
-                send(ctx, handle(ev, &ctx.adapter, seen)).await?;
+                let out = handle(ev, &ctx.adapter, seen);
+                if out.is_empty() {
+                    ctx.health.record_check();
+                } else {
+                    ctx.health.record_event();
+                }
+                send(ctx, out).await?;
             }
             Err(RecvError::Lagged(n)) => {
                 warn!(missed = n, "IBKR event stream lagged; pulling");
@@ -216,10 +269,13 @@ pub async fn run(client: Arc<dyn TwsClient>, ctx: &Ctx, seen: &mut Seen) -> Resu
 /// What the supervisor does with a gateway state it can't connect past.
 #[derive(Debug, PartialEq)]
 pub enum Next {
-    /// Not up yet but nothing is wrong (starting, awaiting approval): connecting.
+    /// The gateway reports it is logging in (starting, awaiting two-factor
+    /// approval, taking over a session): still connecting.
     Wait(String),
-    /// Down: Docker missing or the session lost.
+    /// The attempt failed (unreachable, Docker missing, the session lost):
+    /// down until the next attempt.
     Retry(String),
+    /// Will not retry until the user changes the credentials or configuration.
     Stop(String),
 }
 
@@ -270,16 +326,23 @@ impl Drop for Published<'_> {
 }
 
 /// Runs one connected session with the client published to the adapter and the admin API.
-pub async fn session(code: &str, slot: &ClientSlot, client: Arc<dyn TwsClient>, ctx: &Ctx, seen: &mut Seen) -> Result<(), String> {
+pub async fn session(
+    code: &str,
+    slot: &ClientSlot,
+    client: Arc<dyn TwsClient>,
+    ctx: &Ctx,
+    seen: &mut Seen,
+    hb: &Heartbeat,
+) -> Result<(), String> {
     *slot.write().unwrap() = Some(client.clone());
     super::set_live_client(code, Some(client.clone()));
     let _published = Published { code, slot, client: client.clone() };
-    run(client, ctx, seen).await
+    run_with(client, ctx, seen, hb).await
 }
 
 /// One connect attempt: the connected client, or what the supervisor does
 /// instead. An external gateway (`gateway` set) is connected to directly, with
-/// no Docker call: unreachable is waited out, never read as a failed login
+/// no Docker call: unreachable is retried, never read as a failed login
 /// (its logs are not ours to read). A managed one is started or adopted first
 /// and reached on loopback; a refused connect reads its logs for why.
 pub async fn attempt<C, E: std::fmt::Display, F: std::future::Future<Output = Result<C, E>>>(
@@ -301,7 +364,7 @@ pub async fn attempt_within<C, E: std::fmt::Display, F: std::future::Future<Outp
     match gw.creds.external() {
         Err(why) => return Err(Next::Stop(format!("IBKR_TWS gateway address: {why}"))),
         Ok(Some((host, port))) => {
-            let unreachable = |e: &dyn std::fmt::Display| Next::Wait(format!("IB Gateway at {host}:{port} not reachable: {e}"));
+            let unreachable = |e: &dyn std::fmt::Display| Next::Retry(format!("IB Gateway at {host}:{port} not reachable: {e}"));
             return match tokio::time::timeout(limit, connect(format!("{host}:{port}"))).await {
                 Ok(r) => r.map_err(|e| unreachable(&e)),
                 Err(_) => Err(unreachable(&"timed out")),
@@ -320,7 +383,7 @@ pub async fn attempt_within<C, E: std::fmt::Display, F: std::future::Future<Outp
             let tail = tokio::task::spawn_blocking(move || docker.logs_tail(&name, 200)).await.unwrap_or_default();
             Err(match classify_logs(&tail) {
                 Some(state) => on_gateway_state(&state),
-                None => Next::Wait(format!("IB Gateway not reachable yet: {e}")),
+                None => Next::Retry(format!("IB Gateway not reachable yet: {e}")),
             })
         }
     }
@@ -363,52 +426,62 @@ pub fn account_mismatch(who: &str, env: &str, accounts: &[String]) -> Option<Str
 /// Keeps IB Gateway up and the stream running, backing off 1s -> 60s. A failed
 /// login stops it: retrying a bad password risks locking the account.
 pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
+    let client_id = gw.creds.master_client_id;
+    supervise_with(gw, slot, ctx, HEARTBEAT, move |addr: String| async move {
+        IbapiClient::connect(&addr, client_id).await.map(|c| Arc::new(c) as Arc<dyn TwsClient>)
+    })
+    .await
+}
+
+/// [`supervise`] with the connect and the heartbeat injected. What the health
+/// shows: `connecting` while an attempt runs (or the gateway reports it is
+/// logging in), `down` with the reason and the retry time between attempts,
+/// `stopped` when it will not retry.
+pub async fn supervise_with<C, E, F>(gw: Gateway, slot: ClientSlot, ctx: Ctx, hb: Heartbeat, connect: C)
+where
+    C: Fn(String) -> F,
+    E: std::fmt::Display,
+    F: std::future::Future<Output = Result<Arc<dyn TwsClient>, E>>,
+{
     let mut backoff = FIRST_BACKOFF;
     let mut seen = Seen::default();
-    let client_id = gw.creds.master_client_id;
+    ctx.health.set_heartbeat_secs(hb.every.as_secs());
     loop {
         ctx.health.set_connecting();
         let started = Instant::now();
-        let next = match attempt(&gw, |addr| async move { IbapiClient::connect(&addr, client_id).await }).await {
+        let next = match attempt(&gw, &connect).await {
             Err(next) => next,
-            Ok(client) => {
-                let client: Arc<dyn TwsClient> = Arc::new(client);
-                match external_mismatch(&gw, client.as_ref()).await {
-                    Some(next) => {
-                        client.shutdown();
-                        next
-                    }
-                    None => {
-                        let r = session(&gw.code, &slot, client, &ctx, &mut seen).await;
-                        Next::Retry(r.err().unwrap_or_else(|| "IBKR session ended".into()))
-                    }
+            Ok(client) => match external_mismatch(&gw, client.as_ref()).await {
+                Some(next) => {
+                    client.shutdown();
+                    next
                 }
-            }
+                None => {
+                    let r = session(&gw.code, &slot, client, &ctx, &mut seen, &hb).await;
+                    Next::Retry(r.err().unwrap_or_else(|| "IBKR session ended".into()))
+                }
+            },
         };
+        if started.elapsed() >= STABLE_AFTER {
+            backoff = FIRST_BACKOFF;
+        }
         match next {
             Next::Stop(m) => {
                 warn!(error = %m, "IBKR_TWS stream stopped");
-                ctx.health.set_down(m);
+                ctx.health.set_stopped(m);
                 return;
             }
-            next => {
-                if started.elapsed() >= STABLE_AFTER {
-                    backoff = FIRST_BACKOFF;
-                }
-                match next {
-                    Next::Wait(m) => {
-                        info!(status = %m, "IBKR_TWS: checking again in {}s", backoff.as_secs());
-                        ctx.health.set_connecting_because(m);
-                    }
-                    Next::Retry(m) | Next::Stop(m) => {
-                        warn!(error = %m, "IBKR_TWS: retrying in {}s", backoff.as_secs());
-                        ctx.health.set_down(m);
-                    }
-                }
-                tokio::time::sleep(backoff).await;
-                backoff = next_backoff(backoff);
+            Next::Wait(m) => {
+                info!(status = %m, "IBKR_TWS: checking again in {}s", backoff.as_secs());
+                ctx.health.set_connecting_because(m);
+            }
+            Next::Retry(m) => {
+                warn!(error = %m, "IBKR_TWS: retrying in {}s", backoff.as_secs());
+                ctx.health.set_down_retrying(m, backoff);
             }
         }
+        tokio::time::sleep(backoff).await;
+        backoff = next_backoff(backoff);
     }
 }
 
@@ -424,7 +497,7 @@ mod tests {
     use super::super::client::FakeTws;
     use super::super::gateway::{ContainerInfo, RunSpec};
     use super::*;
-    use crate::stream_health::{StreamHealthRegistry, StreamKind};
+    use crate::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
     use crate::venue_event::VenueFill;
 
     fn ctx(adapter: Arc<IbkrTwsAdapter>) -> (Ctx, mpsc::Receiver<VenueEvent>, StreamHealthRegistry) {
@@ -626,7 +699,7 @@ mod tests {
         let code = "IBKR_TWS-ABORTTEST";
         let task = {
             let (slot, client) = (slot.clone(), fake.clone() as Arc<dyn TwsClient>);
-            tokio::spawn(async move { session(code, &slot, client, &ctx, &mut Seen::default()).await })
+            tokio::spawn(async move { session(code, &slot, client, &ctx, &mut Seen::default(), &HEARTBEAT).await })
         };
         for _ in 0..100 {
             if super::super::live_client(code).is_some() {
@@ -713,13 +786,14 @@ mod tests {
         assert_eq!(addr, Ok("ib-gateway:4004".to_string()));
     }
 
-    /// Unreachable is transient (the gateway restarts daily) and must never
-    /// read the logs, whose "login failed" would stop the stream.
+    /// Unreachable is a failed attempt (down, retried; the gateway restarts
+    /// daily), never stopped, and must never read the logs, whose "login
+    /// failed" would stop the stream.
     #[tokio::test]
-    async fn unreachable_external_gateway_waits_not_stops() {
+    async fn unreachable_external_gateway_retries_not_stops() {
         let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
         let next = attempt(&gw, |_: String| async { Err::<(), _>("connection refused") }).await;
-        assert_eq!(next, Err(Next::Wait("IB Gateway at ib-gateway:4004 not reachable: connection refused".into())));
+        assert_eq!(next, Err(Next::Retry("IB Gateway at ib-gateway:4004 not reachable: connection refused".into())));
     }
 
     /// A running container of ours is adopted and reached on loopback.
@@ -763,10 +837,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_hung_external_connect_times_out_and_waits() {
+    async fn a_hung_external_connect_times_out_and_retries() {
         let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
         let next = attempt_within(&gw, Duration::from_millis(20), |_: String| std::future::pending::<Result<(), String>>()).await;
-        assert_eq!(next, Err(Next::Wait("IB Gateway at ib-gateway:4004 not reachable: timed out".into())));
+        assert_eq!(next, Err(Next::Retry("IB Gateway at ib-gateway:4004 not reachable: timed out".into())));
     }
 
     fn with_accounts(accounts: &[&str]) -> Arc<FakeTws> {
@@ -795,5 +869,132 @@ mod tests {
         // Managed: the OMS logged in itself with this environment's mode.
         let managed = gw(Arc::new(NoDocker), "trader1", None, PathBuf::from("/nonexistent"));
         assert_eq!(external_mismatch(&managed, with_accounts(&["U123"]).as_ref()).await, None);
+    }
+
+    // ---- supervise: what the health shows after each pass ----
+
+    const FAST: Heartbeat = Heartbeat { every: Duration::from_millis(20), timeout: Duration::from_millis(20) };
+
+    /// Polls the one stream's health until `ok` holds (or panics after ~2s).
+    async fn until(reg: &StreamHealthRegistry, ok: impl Fn(&crate::stream_health::StreamHealth) -> bool) -> crate::stream_health::StreamHealth {
+        for _ in 0..200 {
+            let h = reg.snapshot().remove(0);
+            if ok(&h) {
+                return h;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let h = reg.snapshot().remove(0);
+        panic!("never reached: {:?} {:?}", h.state, h.last_error);
+    }
+
+    fn slot() -> ClientSlot {
+        Arc::new(std::sync::RwLock::new(None))
+    }
+
+    /// The reported bug: an unreachable external gateway read "connecting".
+    #[tokio::test]
+    async fn an_unreachable_external_gateway_is_down_with_a_retry_time() {
+        let (_fake, adapter) = rig();
+        let (ctx, _rx, reg) = ctx(adapter);
+        let gw = gw(Arc::new(NoDocker), "", Some("openoms-ibgw:4004"), PathBuf::from("/nonexistent"));
+        let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, |_addr: String| async {
+            Err::<Arc<dyn TwsClient>, _>("failed to lookup address information".to_string())
+        }));
+        let h = until(&reg, |h| h.state == StreamState::Down).await;
+        assert_eq!(h.last_error.as_deref(), Some("IB Gateway at openoms-ibgw:4004 not reachable: failed to lookup address information"));
+        assert!(h.next_retry_at.is_some_and(|t| t > chrono::Utc::now()), "down says when it retries");
+        assert!(h.last_checked_at.is_some());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_paper_live_mismatch_stops_the_stream() {
+        let (_fake, adapter) = rig();
+        let (ctx, _rx, reg) = ctx(adapter);
+        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+        let live_account = with_accounts(&["U123"]);
+        let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, move |_addr: String| {
+            let c = live_account.clone() as Arc<dyn TwsClient>;
+            async move { Ok::<_, String>(c) }
+        }));
+        let h = until(&reg, |h| h.state == StreamState::Stopped).await;
+        assert!(h.last_error.as_deref().is_some_and(|m| m.contains("live account but this connection is PAPER")));
+        assert_eq!(h.next_retry_at, None);
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("a stopped stream ends its task").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_login_stops_the_stream() {
+        let (_fake, adapter) = rig();
+        let (ctx, _rx, reg) = ctx(adapter);
+        let dir = std::env::temp_dir().join(format!("oms-ibkr-stop-{}", Uuid::new_v4()));
+        let base = gw(Arc::new(NoDocker), "trader1", None, dir.clone());
+        let info = ContainerInfo {
+            running: true,
+            api_port: Some(4123),
+            container_port: Some(super::super::gateway::CONTAINER_PORT_PAPER),
+            loopback_only: true,
+            creds_tag: Some(super::super::gateway::creds_tag(&dir, &base.creds).unwrap()),
+        };
+        let gw = Gateway { docker: Arc::new(Adopt(info)), ..base };
+        let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, |_addr: String| async {
+            Err::<Arc<dyn TwsClient>, _>("refused".to_string())
+        }));
+        let h = until(&reg, |h| h.state == StreamState::Stopped).await;
+        assert!(h.last_error.as_deref().is_some_and(|m| m.starts_with("IBKR login failed")));
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("stopped").unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_live_session_pings_the_gateway_and_counts_it_as_a_check() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        let (ctx, _rx, reg) = ctx(adapter);
+        let client: Arc<dyn TwsClient> = fake.clone();
+        let task = tokio::spawn(async move { run_with(client, &ctx, &mut Seen::default(), &FAST).await });
+        let live = until(&reg, |h| h.state == StreamState::Live).await;
+        until(&reg, |h| h.last_checked_at > live.last_checked_at).await;
+        assert!(fake.pings.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(reg.snapshot()[0].last_event_at, None, "a ping is not an order/fill event");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_ping_ends_the_session() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        *fake.ping_error.lock().unwrap() = Some("socket closed".into());
+        let (ctx, _rx, _reg) = ctx(adapter);
+        let err = run_with(fake.clone(), &ctx, &mut Seen::default(), &FAST).await.unwrap_err();
+        assert_eq!(err, "IB Gateway did not answer the heartbeat: socket closed");
+    }
+
+    #[tokio::test]
+    async fn a_hung_ping_times_out_and_ends_the_session() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        fake.ping_hangs.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (ctx, _rx, _reg) = ctx(adapter);
+        let err = run_with(fake.clone(), &ctx, &mut Seen::default(), &FAST).await.unwrap_err();
+        assert_eq!(err, "IB Gateway did not answer the heartbeat within 0s");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_failure_leaves_the_stream_down_and_retrying() {
+        let (fake, adapter) = rig();
+        fake.accounts.lock().unwrap().push("DU1".into());
+        *fake.ping_error.lock().unwrap() = Some("socket closed".into());
+        let (ctx, _rx, reg) = ctx(adapter);
+        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+        let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, move |_addr: String| {
+            let c = fake.clone() as Arc<dyn TwsClient>;
+            async move { Ok::<_, String>(c) }
+        }));
+        let h = until(&reg, |h| h.state == StreamState::Down).await;
+        assert!(h.last_error.as_deref().is_some_and(|m| m.contains("heartbeat")), "{:?}", h.last_error);
+        assert!(h.next_retry_at.is_some());
+        task.abort();
     }
 }
