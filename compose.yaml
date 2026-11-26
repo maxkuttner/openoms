@@ -15,9 +15,8 @@
 # Tailscale)? Add OMS_PUBLIC_BASE_URL=https://your.url to .env. Back up .env: OMS_MASTER_KEY is
 # the only key to stored broker credentials.
 #
-# Interactive Brokers (TWS API): the OMS container cannot start IB Gateway
-# itself. Run IB Gateway yourself and enter its address (host:port) as the
-# connection's Gateway address in the admin UI.
+# Interactive Brokers (TWS API): run IB Gateway yourself and enter its
+# address (host:port) as the connection's Gateway address in the admin UI.
 # https://openoms.dev/integrations/interactive-brokers/
 
 name: openoms

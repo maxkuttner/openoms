@@ -111,7 +111,9 @@ mod tests {
                 venue.code
             );
             assert!(first_grouped > 0, "{}: no credential before the settings", venue.code);
-            assert!(venue.fields[..first_grouped].iter().any(|f| f.secret), "{}: no secret on top", venue.code);
+            // A venue with secrets has one on top (IBKR_TWS has none: just an address).
+            let has_secret = venue.fields.iter().any(|f| f.secret);
+            assert!(!has_secret || venue.fields[..first_grouped].iter().any(|f| f.secret), "{}: no secret on top", venue.code);
         }
     }
 

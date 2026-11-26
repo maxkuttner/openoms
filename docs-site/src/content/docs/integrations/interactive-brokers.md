@@ -8,80 +8,59 @@ recommended one. The [FIX session](#fix-session-experimental) is experimental.
 
 ## TWS API connection
 
-The OMS runs IB Gateway for you in a Docker container, logs in with your IBKR
-username and password, and trades through the TWS API. Instruments come from IBKR's
-own contract search, so you can import what you want to trade. When the OMS itself
-runs in a container, run IB Gateway as its own service instead; see
-[IBKR in Docker](#ibkr-in-docker).
+You run IB Gateway (or TWS), logged into your IBKR account; the OMS connects to it
+and trades through the TWS API. Instruments come from IBKR's own contract search, so
+you can import what you want to trade.
 
 ### What you need
 
-- Docker, running on the machine that runs the OMS. The OMS starts and watches the
-  container; it never needs you to run IB Gateway yourself. Or an IB Gateway you run
-  yourself, see [IBKR in Docker](#ibkr-in-docker).
 - An IBKR account. Start with a paper account.
+- IB Gateway or TWS, running where the OMS can reach it, logged in, with the API
+  enabled. Run it any way you like:
+  - the Docker image `ghcr.io/gnzsnz/ib-gateway`, with `TWS_USERID`, `TWS_PASSWORD`
+    and `TRADING_MODE` (`paper` or `live`) set. It serves the API on port 4004
+    (paper) or 4003 (live). When the OMS runs in Docker too (the
+    [Docker Compose install](/getting-started/installation/)), put it on the same
+    network and use its service name as the host;
+  - IBKR's IB Gateway installer, on the OMS's machine or another one;
+  - TWS, with **Enable ActiveX and Socket Clients** on (Configure > API > Settings).
+
+  IB Gateway installed from IBKR listens on 4002 (paper) or 4001 (live) by default; TWS
+  on 7497 (paper) or 7496 (live). Allow the OMS's address in the API settings
+  (**Trusted IPs**) when it is not on the same machine.
 
 ### Create the connection
 
 Create a broker connection with **Interactive Brokers (TWS API)** as the venue. Pick
-the **paper** environment first. Its credentials drawer asks for your IBKR username
-and password.
+the **paper** environment first. In its credentials drawer, set **Gateway address** to
+the gateway's `host:port`, for example `ib-gateway:4004` or `127.0.0.1:4002`. The IBKR
+login lives in your gateway, not in the OMS.
 
-The OMS starts one container per connection and environment, named
-`oms-ibgw-<connection>`. The API port is published on `127.0.0.1` only. After an OMS
-restart it picks the running container up again instead of starting a new one, as
-long as your credentials are unchanged. Saving new credentials replaces the container
-and logs in again; no OMS restart is needed. If the account is logged in somewhere
-else, the gateway takes the session over. The
-password is handed to the container through a short-lived file and is never put on a
-command line or in a log.
-
-The connection's status shows `connecting`, `live` or `down`. While it is `down` or
-`connecting`, the message beside it (hover the status) says why:
+The connection's status shows `connecting`, `live`, `down` or `stopped`. The message
+beside it (hover the status) says why:
 
 | Status | Message | Meaning |
 |---|---|---|
-| connecting | IB Gateway is starting | The container is up and logging in. |
-| connecting | IB Gateway not reachable yet: ... | The container is still starting its API. |
-| connecting | waiting for two-factor approval on the IBKR mobile app | Approve the login in the IBKR Mobile app. IBKR normally requires this for live logins, and asks again about once a week. |
-| connecting | IBKR account is logged in elsewhere; the gateway is taking over the session | Another TWS, IB Gateway or IBKR web session holds the login. The gateway takes over, which logs the other session out. |
-| down | IBKR login failed: ... | IBKR rejected the username or password. The OMS stops retrying, so it does not lock your account. Fix the password in the credentials drawer and save; the OMS logs in again with the new one. |
-| down | Docker is required for IBKR_TWS but is not running | The OMS can't reach Docker. It keeps retrying until Docker is back. |
-| down | IB Gateway is disconnected, or IB Gateway lost its connection to IBKR | The gateway dropped; the OMS reconnects. |
-| connecting | IB Gateway at ib-gateway:4004 not reachable: ... | Only with a [Gateway address](#ibkr-in-docker): the gateway service is not up or still logging in (or did not answer within 15 seconds). The OMS keeps trying. |
-| down | IB Gateway at ... is logged into a live account but this connection is PAPER (or the reverse) | Only with a Gateway address: the gateway's `TRADING_MODE` does not match the connection's environment. The OMS stops retrying; fix it and save the credentials again. |
-
-### IBKR in Docker
-
-When the OMS runs in a container (the [Docker Compose install](/getting-started/installation/),
-or any container platform), it cannot start IB Gateway: there is no Docker inside its
-container. Run IB Gateway yourself, however you like, and give the connection its address.
-
-1. Run IB Gateway (or TWS) where the OMS can reach it, logged into your IBKR account,
-   with the API enabled. One option is the image the OMS itself uses,
-   `ghcr.io/gnzsnz/ib-gateway`, as a service on the same private network as the OMS
-   with `TWS_USERID`, `TWS_PASSWORD` and `TRADING_MODE` (`paper` or `live`) set; it
-   serves the API on port 4004 (paper) or 4003 (live).
-2. In the admin UI, open the IBKR TWS connection's credentials and set **Gateway
-   address** to `host:port`, e.g. `ib-gateway:4004`. Leave username and password empty:
-   the login lives in your gateway, not in the OMS.
+| down | IB Gateway at ib-gateway:4004 not reachable: ... | The gateway is not running, not logged in yet, or did not answer within 15 seconds. The OMS keeps trying. |
+| down | IB Gateway lost its connection to IBKR | The gateway is up but lost IBKR (its daily restart, a network drop). The OMS resumes when it is back. |
+| down | IB Gateway did not answer the heartbeat ... | The gateway stopped answering; the OMS reconnects. |
+| stopped | set the Gateway address ... | The connection has no Gateway address. Set it and save. |
+| stopped | port 4003 is IB Gateway's live port; a PAPER connection uses 4004 (or the reverse) | The address points at the other environment's port. Fix it and save. |
+| stopped | IB Gateway at ... is logged into a live account but this connection is PAPER (or the reverse) | The gateway's trading mode does not match the connection's environment. Fix it and save the credentials again. |
 
 - **Two-factor.** The gateway's login may need approval in the IBKR Mobile app. Until it
-  is logged in, the connection shows `connecting` with `IB Gateway at … not reachable`.
+  is logged in, the connection shows `down` with `IB Gateway at … not reachable`.
 - **Daily restart.** IBKR restarts its gateways once a day. The OMS reconnects when the
   gateway is back; nothing to do.
-- **Wrong password.** Repeated failed logins can lock the account: give your gateway a
-  capped restart policy, not "always", and stop it before fixing a bad login.
-- **One environment per gateway.** A PAPER connection takes port 4004 and a LIVE one
-  4003 when you use the ports above; saving the other one is refused. On connecting,
+- **Wrong password.** Repeated failed logins can lock the account: give a gateway in
+  Docker a capped restart policy, not "always", and stop it before fixing a bad login.
+- **One environment per gateway.** With the Docker image's ports, a PAPER connection
+  takes port 4004 and a LIVE one 4003; saving the other one is refused. On connecting,
   the OMS also checks the accounts the gateway is logged into (paper account ids start
   with `D`): a PAPER connection on a live account, or a LIVE connection on a paper one,
-  goes `down` with `IB Gateway at … is logged into a live account but this connection
-  is PAPER` (or the reverse) and stops retrying until you fix it and save the
-  credentials again.
-- **Switching an existing connection to your own gateway.** On a host where the OMS ran
-  IB Gateway itself, its old container keeps running. Remove it by hand:
-  `docker rm -f oms-ibgw-<connection>` (`docker ps` lists it).
+  is `stopped` until you fix it and save the credentials again.
+- **Test.** The credentials drawer's **Test** connects briefly to the address and says
+  whether the gateway answers, whether it is logged in, and to which kind of account.
 
 Never expose the API port to the internet: anyone who reaches it can trade on
 the account.
@@ -211,9 +190,7 @@ For the TWS API connection, in the connection's credentials drawer:
 
 | Field | What it is | Default |
 | --- | --- | --- |
-| IBKR username | Your IBKR login (for paper, the paper username from Client Portal). Leave empty with a Gateway address. | |
-| Password | Its password. It reaches IB Gateway only through a short-lived file, never a command line or log. Leave empty with a Gateway address. | |
-| Gateway address | `host:port` of an IB Gateway you run yourself, e.g. `ib-gateway:4004` (paper) or `ib-gateway:4003` (live); see [IBKR in Docker](#ibkr-in-docker). Set, the OMS never starts a container. Clear it to go back to the OMS-run gateway, which needs the username and password again. | empty |
+| Gateway address | `host:port` of your IB Gateway or TWS, e.g. `ib-gateway:4004` (paper), `ib-gateway:4003` (live) or `127.0.0.1:4002` for a local gateway. Required. | |
 | API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value) | The client id the OMS connects with. With 0 it also sees orders entered by hand in TWS. To see orders placed by other API clients, set IB Gateway's **Master API client ID** to the same value. | `0` |
 
 The FIX session's fields are listed under [FIX session](#fix-session-experimental).

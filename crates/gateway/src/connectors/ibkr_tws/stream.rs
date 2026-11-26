@@ -1,7 +1,7 @@
 //! The IBKR_TWS execution stream and the gateway supervisor behind it.
 //!
-//! [`supervise`] keeps IB Gateway running and connected (Docker, then the TWS
-//! API; or straight to the address of a gateway run as its own service), swaps the client into the adapter's slot and runs [`run`] on it. [`run`]
+//! [`supervise`] keeps the connection to the user's IB Gateway (or TWS) at
+//! its address up, swaps the client into the adapter's slot and runs [`run`] on it. [`run`]
 //! turns the client's events into venue events for the reconciler: every
 //! execution it is shown is a fill carrying its IBKR account number, every
 //! `openOrder`/`orderStatus` an order state, every commission report a fee.
@@ -22,7 +22,6 @@
 //! for a pull instead, which dedupes on the base.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,10 +34,9 @@ use crate::venue_event::{VenueEvent, VenueOrderStatus, VenueOrderUpdate};
 
 use super::adapter::{commission_fee, correction_warning, exec_base, fill_from_exec, map_error, order_update, ClientSlot, ErrorClass, IbkrTwsAdapter};
 use super::client::{IbapiClient, SecType, TwsClient, TwsEvent};
-use super::gateway::{classify_logs, container_name, ensure_running, GatewayDocker, GatewayState};
 use super::IbkrTwsCredentials;
 
-/// How long to wait for the client's own reconnect before restarting from Docker.
+/// How long to wait for the client's own reconnect before connecting afresh.
 const RECONNECT_WAIT: Duration = Duration::from_secs(120);
 const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -266,45 +264,25 @@ pub async fn run_with(client: Arc<dyn TwsClient>, ctx: &Ctx, seen: &mut Seen, hb
     }
 }
 
-/// What the supervisor does with a gateway state it can't connect past.
+/// What the supervisor does when an attempt does not end in a session.
 #[derive(Debug, PartialEq)]
 pub enum Next {
-    /// The gateway reports it is logging in (starting, awaiting two-factor
-    /// approval, taking over a session): still connecting.
-    Wait(String),
-    /// The attempt failed (unreachable, Docker missing, the session lost):
-    /// down until the next attempt.
+    /// The attempt failed (unreachable, the session lost): down until the next attempt.
     Retry(String),
-    /// Will not retry until the user changes the credentials or configuration.
+    /// Will not retry until the user changes the credentials.
     Stop(String),
-}
-
-pub fn on_gateway_state(s: &GatewayState) -> Next {
-    match s {
-        GatewayState::LoginFailed(m) => Next::Stop(format!("IBKR login failed: {m}")),
-        GatewayState::AwaitingTwoFactor => Next::Wait("waiting for two-factor approval on the IBKR mobile app".into()),
-        GatewayState::ExistingSession => {
-            Next::Wait("IBKR account is logged in elsewhere; the gateway is taking over the session".into())
-        }
-        GatewayState::Starting | GatewayState::Connected => Next::Wait("IB Gateway is starting".into()),
-        GatewayState::Disconnected => Next::Retry("IB Gateway is disconnected".into()),
-        GatewayState::Unavailable(m) => Next::Retry(m.clone()),
-    }
 }
 
 pub fn next_backoff(d: Duration) -> Duration {
     (d * 2).min(MAX_BACKOFF)
 }
 
-/// Where the gateway lives and how to log in; `creds.gateway` set = an
-/// external gateway, and `docker` is never called.
+/// The gateway one connection trades through.
 pub struct Gateway {
-    pub docker: Arc<dyn GatewayDocker>,
-    /// Names the container: one per connection environment.
+    /// The connection code (`IBKR_TWS-PAPER`) the live client is published under.
     pub code: String,
     pub env: &'static str,
     pub creds: IbkrTwsCredentials,
-    pub state_dir: PathBuf,
 }
 
 /// Publishes a connected client for one session and withdraws it when the
@@ -341,62 +319,38 @@ pub async fn session(
 }
 
 /// One connect attempt: the connected client, or what the supervisor does
-/// instead. An external gateway (`gateway` set) is connected to directly, with
-/// no Docker call: unreachable is retried, never read as a failed login
-/// (its logs are not ours to read). A managed one is started or adopted first
-/// and reached on loopback; a refused connect reads its logs for why.
+/// instead. A missing or bad address (or a port for the other environment)
+/// stops the stream; unreachable is retried, never read as a failed login.
 pub async fn attempt<C, E: std::fmt::Display, F: std::future::Future<Output = Result<C, E>>>(
     gw: &Gateway,
     connect: impl FnOnce(String) -> F,
 ) -> Result<C, Next> {
-    attempt_within(gw, EXTERNAL_CONNECT_TIMEOUT, connect).await
+    attempt_within(gw, CONNECT_TIMEOUT, connect).await
 }
 
-/// How long a connect to an external gateway may take before it counts as unreachable.
-const EXTERNAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long a connect may take before the gateway counts as unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// [`attempt`] with the external connect bounded by `limit`.
+/// [`attempt`] with the connect bounded by `limit`.
 pub async fn attempt_within<C, E: std::fmt::Display, F: std::future::Future<Output = Result<C, E>>>(
     gw: &Gateway,
     limit: Duration,
     connect: impl FnOnce(String) -> F,
 ) -> Result<C, Next> {
-    match gw.creds.external() {
-        Err(why) => return Err(Next::Stop(format!("IBKR_TWS gateway address: {why}"))),
-        Ok(Some((host, port))) => {
-            let unreachable = |e: &dyn std::fmt::Display| Next::Retry(format!("IB Gateway at {host}:{port} not reachable: {e}"));
-            return match tokio::time::timeout(limit, connect(format!("{host}:{port}"))).await {
-                Ok(r) => r.map_err(|e| unreachable(&e)),
-                Err(_) => Err(unreachable(&"timed out")),
-            };
-        }
-        Ok(None) => {}
-    }
-    let port = ensure_running(gw.docker.clone(), &gw.code, gw.env, &gw.creds, &gw.state_dir)
-        .await
-        .map_err(|state| on_gateway_state(&state))?;
-    match connect(format!("127.0.0.1:{port}")).await {
-        Ok(client) => Ok(client),
-        Err(e) => {
-            let docker = gw.docker.clone();
-            let name = container_name(&gw.code);
-            let tail = tokio::task::spawn_blocking(move || docker.logs_tail(&name, 200)).await.unwrap_or_default();
-            Err(match classify_logs(&tail) {
-                Some(state) => on_gateway_state(&state),
-                None => Next::Retry(format!("IB Gateway not reachable yet: {e}")),
-            })
-        }
+    let (host, port) = gw.creds.address_for(gw.env).map_err(Next::Stop)?;
+    let unreachable = |e: &dyn std::fmt::Display| Next::Retry(format!("IB Gateway at {host}:{port} not reachable: {e}"));
+    match tokio::time::timeout(limit, connect(format!("{host}:{port}"))).await {
+        Ok(r) => r.map_err(|e| unreachable(&e)),
+        Err(_) => Err(unreachable(&"timed out")),
     }
 }
 
-/// For an external gateway: what to do instead of trading when the accounts it
-/// is logged into do not belong to the connection's environment (IBKR paper
-/// account ids start with "D": DU…, DF…). The OMS did not log it in, so the
-/// address alone says nothing about paper or live. `None` = go ahead; always
-/// for a managed gateway, which the OMS logged in with this environment's mode.
-pub async fn external_mismatch(gw: &Gateway, client: &dyn TwsClient) -> Option<Next> {
-    let Ok(Some((host, port))) = gw.creds.external() else { return None };
-    let addr = format!("{host}:{port}");
+/// What to do instead of trading when the accounts the gateway is logged into
+/// do not belong to the connection's environment (IBKR paper account ids start
+/// with "D": DU…, DF…). The OMS did not log it in, so the address alone says
+/// nothing about paper or live. `None` = go ahead.
+pub async fn account_check(gw: &Gateway, client: &dyn TwsClient) -> Option<Next> {
+    let addr = gw.creds.address().map(|(host, port)| format!("{host}:{port}")).unwrap_or_default();
     let accounts = match client.managed_accounts().await {
         Ok(a) => a,
         Err(e) => return Some(Next::Retry(format!("IB Gateway at {addr}: could not read its accounts: {e}"))),
@@ -423,8 +377,8 @@ pub fn account_mismatch(who: &str, env: &str, accounts: &[String]) -> Option<Str
     }
 }
 
-/// Keeps IB Gateway up and the stream running, backing off 1s -> 60s. A failed
-/// login stops it: retrying a bad password risks locking the account.
+/// Keeps the connection to IB Gateway and the stream running, backing off
+/// 1s -> 60s. A bad address or a paper/live mismatch stops it.
 pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
     let client_id = gw.creds.master_client_id;
     supervise_with(gw, slot, ctx, HEARTBEAT, move |addr: String| async move {
@@ -434,8 +388,8 @@ pub async fn supervise(gw: Gateway, slot: ClientSlot, ctx: Ctx) {
 }
 
 /// [`supervise`] with the connect and the heartbeat injected. What the health
-/// shows: `connecting` while an attempt runs (or the gateway reports it is
-/// logging in), `down` with the reason and the retry time between attempts,
+/// shows: `connecting` while an attempt runs, `down` with the reason and the
+/// retry time between attempts,
 /// `stopped` when it will not retry.
 pub async fn supervise_with<C, E, F>(gw: Gateway, slot: ClientSlot, ctx: Ctx, hb: Heartbeat, connect: C)
 where
@@ -451,7 +405,7 @@ where
         let started = Instant::now();
         let next = match attempt(&gw, &connect).await {
             Err(next) => next,
-            Ok(client) => match external_mismatch(&gw, client.as_ref()).await {
+            Ok(client) => match account_check(&gw, client.as_ref()).await {
                 Some(next) => {
                     client.shutdown();
                     next
@@ -470,10 +424,6 @@ where
                 warn!(error = %m, "IBKR_TWS stream stopped");
                 ctx.health.set_stopped(m);
                 return;
-            }
-            Next::Wait(m) => {
-                info!(status = %m, "IBKR_TWS: checking again in {}s", backoff.as_secs());
-                ctx.health.set_connecting_because(m);
             }
             Next::Retry(m) => {
                 warn!(error = %m, "IBKR_TWS: retrying in {}s", backoff.as_secs());
@@ -495,7 +445,6 @@ mod tests {
     use super::super::adapter::tests::rig;
     use super::super::client::{OrderKind, Side, Tif, TwsExecution, TwsOrder, TwsOrderState};
     use super::super::client::FakeTws;
-    use super::super::gateway::{ContainerInfo, RunSpec};
     use super::*;
     use crate::stream_health::{StreamHealthRegistry, StreamKind, StreamState};
     use crate::venue_event::VenueFill;
@@ -716,23 +665,6 @@ mod tests {
     }
 
     #[test]
-    fn gateway_states_retry_except_a_failed_login() {
-        assert!(matches!(on_gateway_state(&GatewayState::LoginFailed("bad password".into())), Next::Stop(_)));
-        // Not up yet but nothing wrong: connecting, not down.
-        assert!(matches!(on_gateway_state(&GatewayState::AwaitingTwoFactor), Next::Wait(m) if m.contains("two-factor")));
-        assert!(matches!(on_gateway_state(&GatewayState::Starting), Next::Wait(_)));
-        assert_eq!(
-            on_gateway_state(&GatewayState::ExistingSession),
-            Next::Wait("IBKR account is logged in elsewhere; the gateway is taking over the session".into())
-        );
-        assert!(matches!(on_gateway_state(&GatewayState::Disconnected), Next::Retry(_)));
-        assert_eq!(
-            on_gateway_state(&GatewayState::Unavailable("Docker is required for IBKR_TWS but is not running".into())),
-            Next::Retry("Docker is required for IBKR_TWS but is not running".into())
-        );
-    }
-
-    #[test]
     fn backoff_doubles_to_a_minute() {
         let mut d = FIRST_BACKOFF;
         let mut seen = vec![];
@@ -743,102 +675,33 @@ mod tests {
         assert_eq!(seen, vec![1, 2, 4, 8, 16, 32, 60, 60]);
     }
 
-    /// Any docker call is a bug on an external gateway's path.
-    struct NoDocker;
-
-    impl GatewayDocker for NoDocker {
-        fn inspect(&self, _: &str) -> Option<ContainerInfo> {
-            panic!("docker inspect on an external gateway")
-        }
-        fn run(&self, _: &RunSpec) -> Result<(), String> {
-            panic!("docker run on an external gateway")
-        }
-        fn stop_rm(&self, _: &str) -> Result<(), String> {
-            panic!("docker rm on an external gateway")
-        }
-        fn logs_tail(&self, _: &str, _: usize) -> String {
-            panic!("docker logs on an external gateway")
-        }
-        fn available(&self) -> bool {
-            panic!("docker info on an external gateway")
-        }
-    }
-
-    fn gw(docker: Arc<dyn GatewayDocker>, username: &str, gateway: Option<&str>, state_dir: PathBuf) -> Gateway {
+    fn gw(gateway: Option<&str>) -> Gateway {
         Gateway {
-            docker,
             code: "IBKR_TWS-PAPER".into(),
             env: "PAPER",
-            creds: IbkrTwsCredentials {
-                username: username.into(),
-                password: if username.is_empty() { String::new() } else { "pw".into() },
-                gateway: gateway.map(str::to_string),
-                master_client_id: 0,
-            },
-            state_dir,
+            creds: IbkrTwsCredentials { gateway: gateway.map(str::to_string), master_client_id: 0 },
         }
     }
 
     #[tokio::test]
-    async fn external_gateway_skips_docker() {
-        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+    async fn connects_to_the_address() {
+        let gw = gw(Some("ib-gateway:4004"));
         let addr = attempt(&gw, |addr: String| async move { Ok::<_, String>(addr) }).await;
         assert_eq!(addr, Ok("ib-gateway:4004".to_string()));
     }
 
     /// Unreachable is a failed attempt (down, retried; the gateway restarts
-    /// daily), never stopped, and must never read the logs, whose "login
-    /// failed" would stop the stream.
+    /// daily), never stopped.
     #[tokio::test]
-    async fn unreachable_external_gateway_retries_not_stops() {
-        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+    async fn an_unreachable_gateway_retries_not_stops() {
+        let gw = gw(Some("ib-gateway:4004"));
         let next = attempt(&gw, |_: String| async { Err::<(), _>("connection refused") }).await;
         assert_eq!(next, Err(Next::Retry("IB Gateway at ib-gateway:4004 not reachable: connection refused".into())));
     }
 
-    /// A running container of ours is adopted and reached on loopback.
-    struct Adopt(ContainerInfo);
-
-    impl GatewayDocker for Adopt {
-        fn inspect(&self, _: &str) -> Option<ContainerInfo> {
-            Some(self.0.clone())
-        }
-        fn run(&self, _: &RunSpec) -> Result<(), String> {
-            panic!("adopted, not started")
-        }
-        fn stop_rm(&self, _: &str) -> Result<(), String> {
-            panic!("adopted, not removed")
-        }
-        fn logs_tail(&self, _: &str, _: usize) -> String {
-            "Login failed".into()
-        }
-        fn available(&self) -> bool {
-            true
-        }
-    }
-
     #[tokio::test]
-    async fn managed_gateway_connects_on_loopback() {
-        let dir = std::env::temp_dir().join(format!("oms-ibkr-attempt-{}", Uuid::new_v4()));
-        let base = gw(Arc::new(NoDocker), "trader1", None, dir.clone());
-        let info = ContainerInfo {
-            running: true,
-            api_port: Some(4123),
-            container_port: Some(super::super::gateway::CONTAINER_PORT_PAPER),
-            loopback_only: true,
-            creds_tag: Some(super::super::gateway::creds_tag(&dir, &base.creds).unwrap()),
-        };
-        let gw = Gateway { docker: Arc::new(Adopt(info)), ..base };
-        assert_eq!(attempt(&gw, |addr: String| async move { Ok::<_, String>(addr) }).await, Ok("127.0.0.1:4123".to_string()));
-        // Managed: a refused connect reads the container's logs.
-        let next = attempt(&gw, |_: String| async { Err::<(), _>("refused") }).await;
-        assert!(matches!(next, Err(Next::Stop(m)) if m.contains("login failed")), "managed path classifies logs");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn a_hung_external_connect_times_out_and_retries() {
-        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+    async fn a_hung_connect_times_out_and_retries() {
+        let gw = gw(Some("ib-gateway:4004"));
         let next = attempt_within(&gw, Duration::from_millis(20), |_: String| std::future::pending::<Result<(), String>>()).await;
         assert_eq!(next, Err(Next::Retry("IB Gateway at ib-gateway:4004 not reachable: timed out".into())));
     }
@@ -852,23 +715,20 @@ mod tests {
     /// Real money: a PAPER connection must never trade through a gateway
     /// logged into a live account, nor LIVE through a paper one.
     #[tokio::test]
-    async fn an_external_gateway_must_match_the_environment() {
-        let paper = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
-        let live = Gateway { env: "LIVE", ..gw(Arc::new(NoDocker), "", Some("ib-gateway:4003"), PathBuf::from("/nonexistent")) };
+    async fn the_gateway_must_match_the_environment() {
+        let paper = gw(Some("ib-gateway:4004"));
+        let live = Gateway { env: "LIVE", ..gw(Some("ib-gateway:4003")) };
         assert_eq!(
-            external_mismatch(&paper, with_accounts(&["U123", "DU456"]).as_ref()).await,
+            account_check(&paper, with_accounts(&["U123", "DU456"]).as_ref()).await,
             Some(Next::Stop("IB Gateway at ib-gateway:4004 is logged into a live account but this connection is PAPER".into()))
         );
         assert_eq!(
-            external_mismatch(&live, with_accounts(&["DU456", "DF7"]).as_ref()).await,
+            account_check(&live, with_accounts(&["DU456", "DF7"]).as_ref()).await,
             Some(Next::Stop("IB Gateway at ib-gateway:4003 is logged into a paper account but this connection is LIVE".into()))
         );
-        assert_eq!(external_mismatch(&paper, with_accounts(&["DU456", "DF7"]).as_ref()).await, None);
-        assert_eq!(external_mismatch(&live, with_accounts(&["U123"]).as_ref()).await, None);
-        assert!(matches!(external_mismatch(&paper, with_accounts(&[]).as_ref()).await, Some(Next::Retry(_))), "no accounts: not trusted");
-        // Managed: the OMS logged in itself with this environment's mode.
-        let managed = gw(Arc::new(NoDocker), "trader1", None, PathBuf::from("/nonexistent"));
-        assert_eq!(external_mismatch(&managed, with_accounts(&["U123"]).as_ref()).await, None);
+        assert_eq!(account_check(&paper, with_accounts(&["DU456", "DF7"]).as_ref()).await, None);
+        assert_eq!(account_check(&live, with_accounts(&["U123"]).as_ref()).await, None);
+        assert!(matches!(account_check(&paper, with_accounts(&[]).as_ref()).await, Some(Next::Retry(_))), "no accounts: not trusted");
     }
 
     // ---- supervise: what the health shows after each pass ----
@@ -892,17 +752,17 @@ mod tests {
         Arc::new(std::sync::RwLock::new(None))
     }
 
-    /// The reported bug: an unreachable external gateway read "connecting".
+    /// The reported bug: an unreachable gateway read "connecting".
     #[tokio::test]
-    async fn an_unreachable_external_gateway_is_down_with_a_retry_time() {
+    async fn an_unreachable_gateway_is_down_with_a_retry_time() {
         let (_fake, adapter) = rig();
         let (ctx, _rx, reg) = ctx(adapter);
-        let gw = gw(Arc::new(NoDocker), "", Some("openoms-ibgw:4004"), PathBuf::from("/nonexistent"));
+        let gw = gw(Some("ib-gw:4004"));
         let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, |_addr: String| async {
             Err::<Arc<dyn TwsClient>, _>("failed to lookup address information".to_string())
         }));
         let h = until(&reg, |h| h.state == StreamState::Down).await;
-        assert_eq!(h.last_error.as_deref(), Some("IB Gateway at openoms-ibgw:4004 not reachable: failed to lookup address information"));
+        assert_eq!(h.last_error.as_deref(), Some("IB Gateway at ib-gw:4004 not reachable: failed to lookup address information"));
         assert!(h.next_retry_at.is_some_and(|t| t > chrono::Utc::now()), "down says when it retries");
         assert!(h.last_checked_at.is_some());
         task.abort();
@@ -912,7 +772,7 @@ mod tests {
     async fn a_paper_live_mismatch_stops_the_stream() {
         let (_fake, adapter) = rig();
         let (ctx, _rx, reg) = ctx(adapter);
-        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+        let gw = gw(Some("ib-gateway:4004"));
         let live_account = with_accounts(&["U123"]);
         let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, move |_addr: String| {
             let c = live_account.clone() as Arc<dyn TwsClient>;
@@ -924,27 +784,29 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), task).await.expect("a stopped stream ends its task").unwrap();
     }
 
+    /// A credential stored before the address was required: stopped with
+    /// what to set, no connect attempt and no retry loop.
     #[tokio::test]
-    async fn a_failed_login_stops_the_stream() {
+    async fn no_address_stops_the_stream_and_says_what_to_set() {
         let (_fake, adapter) = rig();
         let (ctx, _rx, reg) = ctx(adapter);
-        let dir = std::env::temp_dir().join(format!("oms-ibkr-stop-{}", Uuid::new_v4()));
-        let base = gw(Arc::new(NoDocker), "trader1", None, dir.clone());
-        let info = ContainerInfo {
-            running: true,
-            api_port: Some(4123),
-            container_port: Some(super::super::gateway::CONTAINER_PORT_PAPER),
-            loopback_only: true,
-            creds_tag: Some(super::super::gateway::creds_tag(&dir, &base.creds).unwrap()),
-        };
-        let gw = Gateway { docker: Arc::new(Adopt(info)), ..base };
-        let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, |_addr: String| async {
-            Err::<Arc<dyn TwsClient>, _>("refused".to_string())
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = connects.clone();
+        let task = tokio::spawn(supervise_with(gw(None), slot(), ctx, FAST, move |_addr: String| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err::<Arc<dyn TwsClient>, _>("unexpected".to_string()) }
         }));
         let h = until(&reg, |h| h.state == StreamState::Stopped).await;
-        assert!(h.last_error.as_deref().is_some_and(|m| m.starts_with("IBKR login failed")));
+        assert!(h.last_error.as_deref().is_some_and(|m| m.starts_with("set the Gateway address")), "{:?}", h.last_error);
+        assert_eq!(h.next_retry_at, None);
         tokio::time::timeout(Duration::from_secs(1), task).await.expect("stopped").unwrap();
-        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 0, "no connect attempt");
+    }
+
+    #[tokio::test]
+    async fn a_port_for_the_other_environment_stops_the_stream() {
+        let next = attempt(&gw(Some("ib-gateway:4003")), |addr: String| async move { Ok::<_, String>(addr) }).await;
+        assert!(matches!(next, Err(Next::Stop(m)) if m.contains("live port")));
     }
 
     #[tokio::test]
@@ -987,7 +849,7 @@ mod tests {
         fake.accounts.lock().unwrap().push("DU1".into());
         *fake.ping_error.lock().unwrap() = Some("socket closed".into());
         let (ctx, _rx, reg) = ctx(adapter);
-        let gw = gw(Arc::new(NoDocker), "", Some("ib-gateway:4004"), PathBuf::from("/nonexistent"));
+        let gw = gw(Some("ib-gateway:4004"));
         let task = tokio::spawn(supervise_with(gw, slot(), ctx, FAST, move |_addr: String| {
             let c = fake.clone() as Arc<dyn TwsClient>;
             async move { Ok::<_, String>(c) }

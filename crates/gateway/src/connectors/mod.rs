@@ -163,13 +163,6 @@ pub trait Connector: Send + Sync {
     fn public_feed(&self) -> Option<PublicFeed> {
         None
     }
-
-    /// Releases what the connection holds outside this process once it is
-    /// disabled or removed (not on a plain reload), after its execution stream
-    /// has been stopped.
-    fn on_removed(&self, _env: &str) -> BoxFuture<'static, ()> {
-        Box::pin(async {})
-    }
 }
 
 /// Run a verification call under the credential-test timeout, mapping its

@@ -1,13 +1,11 @@
 pub mod adapter;
 pub mod client;
 pub mod exchanges;
-pub mod gateway;
 pub mod probe;
 pub mod resolve;
 pub mod stream;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::future::BoxFuture;
@@ -15,7 +13,7 @@ use serde::Deserialize;
 
 use crate::connectors::RegistrationDeps;
 use crate::credentials::BrokerCredentials;
-use crate::credentials::Shown::{Clear, Hidden};
+use crate::credentials::Shown::Clear;
 use crate::venue::{environments, field, Venue, DOCS};
 use crate::verify::TestOutcome;
 
@@ -47,39 +45,34 @@ pub(crate) fn set_live_client(connection_code: &str, client: Option<Arc<dyn clie
     };
 }
 
-/// Connection codes last connected to an external gateway, with its
-/// `host:port`, so removing one leaves Docker alone (`on_removed` gets no
-/// credential) and a credential test knows which gateway the live client is on.
-static EXTERNAL: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+/// The gateway address (`host:port`) each connection was last connected
+/// with, so a credential test knows which gateway the live client is on.
+static ADDRESS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
 
-fn set_external(connection_code: &str, addr: Option<String>) {
-    let mut map = EXTERNAL.lock().unwrap_or_else(|e| e.into_inner());
+fn set_address(connection_code: &str, addr: Option<String>) {
+    let mut map = ADDRESS.lock().unwrap_or_else(|e| e.into_inner());
     match addr {
         Some(a) => map.insert(connection_code.to_string(), a),
         None => map.remove(connection_code),
     };
 }
 
-/// The external gateway `connection_code` was last connected to; `None` = managed.
-fn external_addr(connection_code: &str) -> Option<String> {
-    EXTERNAL.lock().unwrap_or_else(|e| e.into_inner()).get(connection_code).cloned()
+fn address_of(connection_code: &str) -> Option<String> {
+    ADDRESS.lock().unwrap_or_else(|e| e.into_inner()).get(connection_code).cloned()
 }
 
-fn is_external(connection_code: &str) -> bool {
-    external_addr(connection_code).is_some()
-}
+/// IB Gateway's (gnzsnz image) API ports for paper and live trading.
+pub const PAPER_PORT: u16 = 4004;
+pub const LIVE_PORT: u16 = 4003;
 
-/// An IBKR login for the IB Gateway container, or the address of an IB
-/// Gateway run as its own service (then the login lives there).
-/// Stored as `{"kind":"IbkrTws", …}` (see [`crate::credentials::BrokerCredentials`]).
+/// The address of an IB Gateway or TWS the user runs (the IBKR login lives
+/// there, not in the OMS). Stored as `{"kind":"IbkrTws", …}` (see
+/// [`crate::credentials::BrokerCredentials`]); fields of older credentials
+/// (`username`, `password`) are ignored.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct IbkrTwsCredentials {
-    #[serde(default)]
-    pub username: String,
-    #[serde(default)]
-    pub password: String,
-    /// `host:port` of an IB Gateway the OMS does not start (e.g. a compose
-    /// service); `None` (or empty) = the OMS runs it in Docker on 127.0.0.1.
+    /// `host:port` of the gateway; `None` (or empty) only in a credential
+    /// stored before the address was required, which does not connect.
     #[serde(default, deserialize_with = "gateway_address", skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
     /// The TWS API client id the OMS connects as (default 0). Client 0 with
@@ -99,11 +92,10 @@ fn gateway_address<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Stri
 }
 
 impl IbkrTwsCredentials {
-    /// The external gateway's `(host, port)`, or `None` for an OMS-managed one.
-    /// Errors never echo the address.
-    pub fn external(&self) -> Result<Option<(String, u16)>, String> {
+    /// The gateway's `(host, port)`. Errors never echo the address.
+    pub fn address(&self) -> Result<(String, u16), String> {
         let Some(addr) = self.gateway.as_deref().map(str::trim).filter(|a| !a.is_empty()) else {
-            return Ok(None);
+            return Err(MISSING.into());
         };
         let bad = || "gateway address must be host:port, e.g. ib-gateway:4004".to_string();
         let (host, port) = addr.rsplit_once(':').ok_or_else(bad)?;
@@ -113,48 +105,34 @@ impl IbkrTwsCredentials {
             return Err(bad());
         }
         match port.parse::<u16>() {
-            Ok(p) if p > 0 => Ok(Some((host.to_string(), p))),
+            Ok(p) if p > 0 => Ok((host.to_string(), p)),
             _ => Err("gateway port must be a number from 1 to 65535".into()),
         }
     }
 
-    /// An external gateway's port is the gnzsnz image's port for this
-    /// environment's trading mode, when it is one of the two: a PAPER
-    /// connection on the live port (or the reverse) is refused. Another port
-    /// passes; the accounts check on connect still guards it.
-    pub fn check_environment(&self, env: &str) -> Result<(), String> {
-        use gateway::{CONTAINER_PORT_LIVE as LIVE, CONTAINER_PORT_PAPER as PAPER};
-        let Some((_, port)) = self.external()? else { return Ok(()) };
+    /// The address, checked against the environment: its port is IB Gateway's
+    /// port for this environment's trading mode, when it is one of the two
+    /// ([`PAPER_PORT`], [`LIVE_PORT`]): a PAPER connection on the live port (or
+    /// the reverse) is refused. Another port passes; the accounts check on
+    /// connect still guards it.
+    pub fn address_for(&self, env: &str) -> Result<(String, u16), String> {
+        let (host, port) = self.address()?;
         match (env.eq_ignore_ascii_case("live"), port) {
-            (false, LIVE) => Err(format!("port {LIVE} is IB Gateway's live port; a PAPER connection uses {PAPER}")),
-            (true, PAPER) => Err(format!("port {PAPER} is IB Gateway's paper port; a LIVE connection uses {LIVE}")),
-            _ => Ok(()),
+            (false, LIVE_PORT) => Err(format!("port {LIVE_PORT} is IB Gateway's live port; a PAPER connection uses {PAPER_PORT}")),
+            (true, PAPER_PORT) => Err(format!("port {PAPER_PORT} is IB Gateway's paper port; a LIVE connection uses {LIVE_PORT}")),
+            _ => Ok((host, port)),
         }
-    }
-
-    /// Complete enough to connect: a valid gateway address, or else a login
-    /// for the gateway the OMS starts.
-    pub fn check(&self) -> Result<(), String> {
-        if self.external()?.is_some() {
-            return Ok(());
-        }
-        if self.username.trim().is_empty() || self.password.is_empty() {
-            return Err("username and password are required unless a gateway address is set".into());
-        }
-        Ok(())
     }
 }
+
+const MISSING: &str = "set the Gateway address (host:port of your IB Gateway or TWS)";
 
 /// Save-time check for [`Manifest::validate`]: names the field to fix.
 fn validate(creds: &BrokerCredentials, env: &str) -> Result<(), (&'static str, String)> {
     // Every other field is text, so only the client id can fail to decode;
     // serde's message would echo the value, so it is not passed on.
     let c: IbkrTwsCredentials = creds.parse().map_err(|_| ("master_client_id", "not a whole number".to_string()))?;
-    if c.gateway.is_some() {
-        return c.check().and_then(|()| c.check_environment(env)).map_err(|why| ("gateway", why));
-    }
-    let field = if c.username.trim().is_empty() { "username" } else { "password" };
-    c.check().map_err(|why| (field, why))
+    c.address_for(env).map(drop).map_err(|why| ("gateway", why))
 }
 
 /// A client id stored as a number or as the form's text (empty = 0).
@@ -174,7 +152,7 @@ static MANIFEST: Manifest = Manifest {
     credential_kind: "IbkrTws",
     venue,
     field_types: &[],
-    redaction: &[("username", Clear), ("password", Hidden), ("gateway", Clear), ("master_client_id", Clear)],
+    redaction: &[("gateway", Clear), ("master_client_id", Clear)],
     live_only: false,
     universe: false,
     quotes: QuoteScope::NonCrypto,
@@ -192,21 +170,12 @@ impl Connector for IbkrTws {
         &MANIFEST
     }
 
-    /// Builds the adapter now; the execution stream owns the gateway: it starts
-    /// or adopts the container, connects, and hands the client to the adapter.
+    /// Builds the adapter now; the execution stream connects to the gateway
+    /// and hands the client to the adapter. A missing or bad address stops
+    /// that stream (with the reason) rather than failing the connection.
     fn connect(&self, env: &'static str, creds: &BrokerCredentials, _: &RegistrationDeps) -> Result<Connected, String> {
         let creds: IbkrTwsCredentials = typed(creds, MANIFEST.credential_kind)?;
-        creds.check()?;
-        creds.check_environment(env)?;
-        let external = creds.external()?.map(|(host, port)| format!("{host}:{port}"));
-        set_external(&connection_code(env), external.clone());
-        let external = external.is_some();
-        // An external gateway needs no env file: no state dir either.
-        let state_dir = if external {
-            PathBuf::new()
-        } else {
-            state_dir().ok_or("no HOME or XDG_STATE_HOME to keep the IB Gateway env file under")?
-        };
+        set_address(&connection_code(env), creds.address().ok().map(|(host, port)| format!("{host}:{port}")));
         let slot: adapter::ClientSlot = Arc::new(RwLock::new(None));
         let adapter = Arc::new(adapter::IbkrTwsAdapter::new(slot.clone()));
         let stream_adapter = adapter.clone();
@@ -217,13 +186,7 @@ impl Connector for IbkrTws {
             daily_stats: Some(adapter.clone()),
             adapter,
             venue_stream: Some(Arc::new(move |health, tx| {
-                let gw = stream::Gateway {
-                    docker: Arc::new(gateway::DockerCli),
-                    code: format!("{}-{env}", MANIFEST.code),
-                    env,
-                    creds: creds.clone(),
-                    state_dir: state_dir.clone(),
-                };
+                let gw = stream::Gateway { code: connection_code(env), env, creds: creds.clone() };
                 let ctx = stream::Ctx { adapter: stream_adapter.clone(), health, tx };
                 Box::pin(stream::supervise(gw, slot.clone(), ctx))
             })),
@@ -236,8 +199,7 @@ impl Connector for IbkrTws {
 
     /// Says whether IB Gateway is up and logged in, and whether the OMS can
     /// trade through it: the running session if there is one (on the same
-    /// gateway), else a short probe of the external address, else the state
-    /// of the OMS's own container. Never starts a container. See [`probe`].
+    /// gateway), else a short probe of the address. See [`probe`].
     fn verify<'a>(&'a self, env: &'a str, creds: &'a BrokerCredentials) -> BoxFuture<'a, TestOutcome> {
         Box::pin(async move {
             let creds: IbkrTwsCredentials = match typed(creds, MANIFEST.credential_kind) {
@@ -245,44 +207,24 @@ impl Connector for IbkrTws {
                 Err(e) => return TestOutcome::Failed(e),
             };
             let code = connection_code(env);
-            let addr = creds.external().ok().flatten().map(|(host, port)| format!("{host}:{port}"));
+            let addr = creds.address().ok().map(|(host, port)| format!("{host}:{port}"));
             // The session's client only speaks for these credentials when it
             // is on the same gateway (an edited address is probed afresh).
-            let live = live_client(&code).filter(|_| external_addr(&code) == addr);
-            let target = probe::Target { env, code: &code, creds: &creds, live, docker: Arc::new(gateway::DockerCli) };
+            let live = live_client(&code).filter(|_| addr.is_some() && address_of(&code) == addr);
+            let target = probe::Target { env, creds: &creds, live };
             probe::test(target, crate::verify::TEST_TIMEOUT, |addr, client_id| async move {
                 client::IbapiClient::connect(&addr, client_id).await.map(|c| Arc::new(c) as Arc<dyn client::TwsClient>)
             })
             .await
         })
     }
-
-    /// Stops and removes the connection's IB Gateway container; nothing for
-    /// an external gateway, which the OMS neither started nor may stop.
-    fn on_removed(&self, env: &str) -> BoxFuture<'static, ()> {
-        let code = connection_code(env);
-        if is_external(&code) {
-            return Box::pin(async {});
-        }
-        Box::pin(gateway::remove(Arc::new(gateway::DockerCli), code))
-    }
-}
-
-/// `$XDG_STATE_HOME/oms/ibkr`, else `~/.local/state/oms/ibkr`: where the
-/// short-lived gateway env file is written (mode 0600, deleted after `docker run`).
-fn state_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("oms").join("ibkr"))
 }
 
 fn venue() -> Venue {
     Venue {
         code: "IBKR_TWS",
         name: "Interactive Brokers (TWS API)",
-        description: "Stocks, futures and options via IB Gateway",
+        description: "Stocks, futures and options via your IB Gateway or TWS",
         docs_url: format!("{DOCS}/interactive-brokers/"),
         // No catalog to load: instruments are imported from a CSV or search,
         // and futures sync on their own. `None` keeps the "load now?" prompt away.
@@ -293,9 +235,7 @@ fn venue() -> Venue {
             Some("https://www.interactivebrokers.com/portal/"),
         ),
         fields: vec![
-            field("username", "IBKR username").optional(),
-            field("password", "Password").secret().optional(),
-            field("gateway", "Gateway address (optional): host:port of an IB Gateway you run yourself, e.g. ib-gateway:4004 (paper) or :4003 (live). Leave empty to let the OMS start it with Docker.").optional(),
+            field("gateway", "Gateway address: host:port of your IB Gateway or TWS (e.g. ib-gateway:4004 paper / :4003 live, or 127.0.0.1:4002 for a local gateway)"),
             field("master_client_id", "API client id (0 also sees orders entered in TWS; to see other API clients' orders set IB Gateway's Master API client ID to this value)").prefill("0", "0"),
         ],
     }
@@ -308,63 +248,61 @@ mod tests {
     #[test]
     fn client_id_comes_from_credentials() {
         let parse = |v: serde_json::Value| serde_json::from_value::<IbkrTwsCredentials>(v).map(|c| c.master_client_id);
-        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p"})).unwrap(), 0, "default: master");
-        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": 7})).unwrap(), 7);
-        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": "12"})).unwrap(), 12);
-        assert_eq!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": ""})).unwrap(), 0);
-        assert!(parse(serde_json::json!({"username": "u", "password": "p", "master_client_id": "x"})).is_err());
+        assert_eq!(parse(serde_json::json!({"gateway": "gw:4004"})).unwrap(), 0, "default: master");
+        assert_eq!(parse(serde_json::json!({"gateway": "gw:4004", "master_client_id": 7})).unwrap(), 7);
+        assert_eq!(parse(serde_json::json!({"gateway": "gw:4004", "master_client_id": "12"})).unwrap(), 12);
+        assert_eq!(parse(serde_json::json!({"gateway": "gw:4004", "master_client_id": ""})).unwrap(), 0);
+        assert!(parse(serde_json::json!({"gateway": "gw:4004", "master_client_id": "x"})).is_err());
     }
 
-    fn creds(username: &str, password: &str, gateway: &str) -> IbkrTwsCredentials {
-        serde_json::from_value(serde_json::json!({"username": username, "password": password, "gateway": gateway})).unwrap()
+    fn creds(gateway: &str) -> IbkrTwsCredentials {
+        serde_json::from_value(serde_json::json!({"gateway": gateway})).unwrap()
     }
 
     #[test]
     fn gateway_address_parses() {
-        let ext = |g: &str| creds("", "", g).external();
-        assert_eq!(ext("ib-gateway:4004").unwrap(), Some(("ib-gateway".into(), 4004)));
-        assert_eq!(ext(" ib-gateway:4004 ").unwrap(), Some(("ib-gateway".into(), 4004)), "trimmed");
-        assert_eq!(ext("").unwrap(), None);
-        assert_eq!(ext("   ").unwrap(), None);
-        assert_eq!(ext("[::1]:4004").unwrap(), Some(("[::1]".into(), 4004)), "bracketed IPv6");
-        for bad in ["ib-gateway", "ib-gateway:99999", ":4004", "ib-gateway:0", "ib-gateway:", "ib gateway:4004", "::1:4004", "fe80::1:4004"] {
-            assert!(ext(bad).is_err(), "{bad:?} accepted");
+        let addr = |g: &str| creds(g).address();
+        assert_eq!(addr("ib-gateway:4004").unwrap(), ("ib-gateway".into(), 4004));
+        assert_eq!(addr(" ib-gateway:4004 ").unwrap(), ("ib-gateway".into(), 4004), "trimmed");
+        assert_eq!(addr("[::1]:4004").unwrap(), ("[::1]".into(), 4004), "bracketed IPv6");
+        for bad in ["", "   ", "ib-gateway", "ib-gateway:99999", ":4004", "ib-gateway:0", "ib-gateway:", "ib gateway:4004", "::1:4004", "fe80::1:4004"] {
+            assert!(addr(bad).is_err(), "{bad:?} accepted");
         }
-        // Stored without the field (older credential): managed.
-        let old: IbkrTwsCredentials = serde_json::from_value(serde_json::json!({"username": "u", "password": "p"})).unwrap();
-        assert_eq!(old.external().unwrap(), None);
+    }
+
+    /// A credential stored when the OMS ran IB Gateway itself still decodes;
+    /// with no address it says what to set.
+    #[test]
+    fn an_old_login_credential_decodes_and_asks_for_the_address() {
+        let old: IbkrTwsCredentials = serde_json::from_value(serde_json::json!({"username": "u", "password": "p", "master_client_id": 3})).unwrap();
+        assert_eq!(old.master_client_id, 3);
+        assert_eq!(old.address().unwrap_err(), MISSING);
+        let with_addr: IbkrTwsCredentials = serde_json::from_value(serde_json::json!({"username": "u", "password": "p", "gateway": "gw:4004"})).unwrap();
+        assert_eq!(with_addr.address().unwrap(), ("gw".into(), 4004));
     }
 
     #[test]
-    fn managed_needs_login() {
-        let why = "username and password are required unless a gateway address is set";
-        assert_eq!(creds("", "p", "").check().unwrap_err(), why);
-        assert_eq!(creds("u", "", "").check().unwrap_err(), why);
-        assert_eq!(creds(" ", "p", "").check().unwrap_err(), why);
-        assert!(creds("u", "p", "").check().is_ok());
+    fn the_port_must_suit_the_environment() {
+        assert!(creds("gw:4004").address_for("PAPER").is_ok());
+        assert!(creds("gw:4003").address_for("LIVE").is_ok());
+        assert!(creds("127.0.0.1:4002").address_for("LIVE").is_ok(), "another port: the accounts check guards it");
+        assert!(creds("gw:4003").address_for("PAPER").unwrap_err().contains("live port"));
+        assert!(creds("gw:4004").address_for("LIVE").unwrap_err().contains("paper port"));
     }
 
     #[test]
-    fn external_needs_no_login() {
-        assert!(creds("", "", "ib-gateway:4004").check().is_ok());
-        assert!(creds("u", "p", "ib-gateway:4003").check().is_ok());
-        assert!(creds("", "", "ib-gateway").check().is_err());
-    }
-
-    #[test]
-    fn an_external_connection_is_remembered_until_it_goes_managed() {
-        let code = "IBKR_TWS-EXTTEST";
-        assert!(!is_external(code));
-        set_external(code, Some("ib-gateway:4004".into()));
-        assert!(is_external(code));
-        assert_eq!(external_addr(code).as_deref(), Some("ib-gateway:4004"));
-        set_external(code, None);
-        assert!(!is_external(code));
+    fn the_address_a_connection_used_is_remembered() {
+        let code = "IBKR_TWS-ADDRTEST";
+        assert_eq!(address_of(code), None);
+        set_address(code, Some("ib-gateway:4004".into()));
+        assert_eq!(address_of(code).as_deref(), Some("ib-gateway:4004"));
+        set_address(code, None);
+        assert_eq!(address_of(code), None);
     }
 
     #[test]
     fn gateway_errors_never_echo_the_address() {
-        let e = creds("", "", "SECRETHOST:99999").check().unwrap_err();
+        let e = creds("SECRETHOST:99999").address().unwrap_err();
         assert!(!e.contains("SECRETHOST"), "{e}");
     }
 }

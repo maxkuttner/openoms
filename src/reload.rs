@@ -536,7 +536,7 @@ mod tests {
     async fn an_ibkr_tws_credential_change_is_applied_on_reload() {
         let creds = BrokerCredentials::from_typed(
             "IbkrTws",
-            &gateway::connectors::ibkr_tws::IbkrTwsCredentials { username: "u".into(), password: "p".into(), gateway: None, master_client_id: 0 },
+            &gateway::connectors::ibkr_tws::IbkrTwsCredentials { gateway: Some("ib-gateway:4004".into()), master_client_id: 0 },
         );
         let mut c = conn("ibkr-tws-paper", "ACTIVE", CredentialState::Configured(creds));
         c.kind = "IBKR_TWS".into();

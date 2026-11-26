@@ -1352,10 +1352,8 @@ async fn apply_reload(
     for connector in gateway::connectors::all().iter().filter(|c| c.manifest().exec_stream) {
         let code = connector.manifest().code;
         for env_name in ["PAPER", "LIVE"] {
-            if state.registry().get(code, env_name).is_none()
-                && stop_execution_stream(&state, code, env_name, &reload::exec_stream_code(code, env_name)).await
-            {
-                connector.on_removed(env_name).await;
+            if state.registry().get(code, env_name).is_none() {
+                stop_execution_stream(&state, code, env_name, &reload::exec_stream_code(code, env_name)).await;
             }
         }
     }
@@ -1414,14 +1412,12 @@ fn reload_store_error(error: sqlx::Error) -> AdminError {
     }
 }
 
-/// Stops a connection's execution stream; true when one was running.
-async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str, code: &str) -> bool {
-    let stopped = state.streams().abort_and_remove(code).await;
-    if stopped {
+/// Stops a connection's execution stream, if one is running.
+async fn stop_execution_stream(state: &AppState, broker: &str, environment: &str, code: &str) {
+    if state.streams().abort_and_remove(code).await {
         state.stream_health().handle(broker, environment, gateway::stream_health::StreamKind::Execution)
             .set_stopped("connection disabled, unconfigured, or removed");
     }
-    stopped
 }
 
 async fn stop_databento_feed(state: &AppState) {

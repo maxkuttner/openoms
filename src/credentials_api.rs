@@ -520,8 +520,7 @@ mod tests {
         assert_eq!(text_field(&sub(&[]), &optional_text(), Some("ib-gateway:4004")).unwrap(), "ib-gateway:4004");
     }
 
-    /// Clearing a non-secret optional field in the form must clear it: that is
-    /// how an external-gateway IBKR connection goes back to managed mode.
+    /// Clearing a non-secret optional field in the form must clear it.
     #[test]
     fn optional_text_field_submitted_empty_clears() {
         let s = sub(&[("gateway", "")]);
@@ -559,18 +558,16 @@ mod tests {
             assert!(matches!(&r, Err(CredentialError::BadField { name: "gateway", .. })), "{bad:?}: {r:?}");
         }
         let ok = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("gateway", " ib-gateway:4004 "), ("master_client_id", "0")])).expect("external");
-        assert_eq!(ok.text("gateway").as_deref(), Some("ib-gateway:4004"), "trimmed");
-        assert_eq!(ok.text("username").as_deref(), Some(""));
+        let ok: gateway::connectors::ibkr_tws::IbkrTwsCredentials = ok.parse().unwrap();
+        assert_eq!(ok.address().unwrap(), ("ib-gateway".into(), 4004), "read trimmed");
     }
 
     #[test]
-    fn ibkr_tws_managed_without_login_is_refused() {
-        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("master_client_id", "0")]));
-        assert!(
-            matches!(&r, Err(CredentialError::BadField { name: "password", why }) if why == "username and password are required unless a gateway address is set"),
-            "{r:?}"
-        );
-        assert!(parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("password", "p"), ("master_client_id", "0")])).is_ok());
+    fn ibkr_tws_needs_a_gateway_address() {
+        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("master_client_id", "0")]));
+        assert!(matches!(&r, Err(CredentialError::MissingField("gateway"))), "{r:?}");
+        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("gateway", " "), ("master_client_id", "0")]));
+        assert!(matches!(&r, Err(CredentialError::BadField { name: "gateway", why }) if why.starts_with("set the Gateway address")), "{r:?}");
     }
 
     #[test]
@@ -593,29 +590,6 @@ mod tests {
         ));
         assert!(save("PAPER", "ib-gateway:4004").is_ok());
         assert!(save("LIVE", "ib-gateway:4003").is_ok());
-    }
-
-    #[test]
-    fn ibkr_tws_missing_password_points_at_password() {
-        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("master_client_id", "0")]));
-        assert!(matches!(&r, Err(CredentialError::BadField { name: "password", .. })), "{r:?}");
-        let r = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("password", "p"), ("master_client_id", "0")]));
-        assert!(matches!(&r, Err(CredentialError::BadField { name: "username", .. })), "{r:?}");
-    }
-
-    /// Review focus: clearing the address of a stored external connection
-    /// goes back to managed mode, which then needs a login.
-    #[test]
-    fn ibkr_tws_clearing_the_gateway_switches_to_managed() {
-        let stored = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("username", "u"), ("password", "p"), ("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
-        let managed = parse_broker("IBKR_TWS", "PAPER", Some(&stored), &sub(&[("username", "u"), ("password", ""), ("gateway", ""), ("master_client_id", "0")])).unwrap();
-        assert_eq!(managed.text("gateway").as_deref(), Some(""));
-        assert_eq!(managed.text("password").as_deref(), Some("p"), "blank secret keeps");
-        let external = parse_broker("IBKR_TWS", "PAPER", None, &sub(&[("gateway", "ib-gateway:4004"), ("master_client_id", "0")])).unwrap();
-        assert!(matches!(
-            parse_broker("IBKR_TWS", "PAPER", Some(&external), &sub(&[("gateway", ""), ("master_client_id", "0")])),
-            Err(CredentialError::BadField { name: "username", .. })
-        ));
     }
 
     #[test]
