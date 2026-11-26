@@ -5,6 +5,26 @@ description: What changed in each OpenOMS release.
 
 Generated from the commit history by `cz bump` on every release.
 
+## v0.19.0 (2026-11-26)
+
+### BREAKING CHANGE
+
+- IBKR TWS connections need a Gateway address: run IB
+Gateway or TWS yourself and set its host:port in the connection's
+credentials.
+
+### Fix
+
+- **streams**: review fixes for stream status and the IBKR heartbeat
+- **streams**: cockpit shows live/connecting/down/stopped with check and retry times
+- **streams**: one status set for every stream, with a real heartbeat
+- **ibkr_tws**: the credential test says whether IB Gateway is up and logged in
+- **ibkr_tws**: no instrument-universe prompt after saving credentials
+
+### Refactor
+
+- **ibkr_tws**: connect only to a gateway you run; drop OMS-managed Docker
+
 ## v0.18.0 (2026-11-25)
 
 ### Feat
