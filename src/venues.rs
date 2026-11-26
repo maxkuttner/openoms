@@ -163,6 +163,7 @@ mod tests {
         assert_eq!(universe("BINANCE"), Some("About 2,000 spot pairs"));
         assert_eq!(universe("ALPACA"), Some("About 14,400 stocks and ETFs"));
         assert_eq!(universe("IBKR"), None);
+        assert_eq!(universe("IBKR_TWS"), None, "nothing to load: no \"load now?\" prompt after saving");
     }
 
     #[test]

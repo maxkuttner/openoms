@@ -258,7 +258,9 @@ fn venue() -> Venue {
         name: "Interactive Brokers (TWS API)",
         description: "Stocks, futures and options via IB Gateway",
         docs_url: format!("{DOCS}/interactive-brokers/"),
-        universe: Some("Imported on demand from a CSV or search"),
+        // No catalog to load: instruments are imported from a CSV or search,
+        // and futures sync on their own. `None` keeps the "load now?" prompt away.
+        universe: None,
         environments: environments(
             "paper trading account",
             Some("https://www.interactivebrokers.com/portal/"),

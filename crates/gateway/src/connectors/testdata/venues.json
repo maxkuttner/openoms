@@ -254,7 +254,7 @@
     "name": "Interactive Brokers (TWS API)",
     "description": "Stocks, futures and options via IB Gateway",
     "docs_url": "https://openoms.dev/integrations/interactive-brokers/",
-    "universe": "Imported on demand from a CSV or search",
+    "universe": null,
     "environments": [
       {
         "code": "PAPER",
